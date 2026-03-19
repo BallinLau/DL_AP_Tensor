@@ -1,0 +1,32 @@
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Training artifacts
+checkpoints/
+logs/
+cachedir/
+data/outputs/
+*.pt
+*.pth
+*.pkl
+
+# Coverage / local reports
+.coverage
+htmlcov/
+
+# Large generated test data
+tests/fc2_input_episode1_ori.csv

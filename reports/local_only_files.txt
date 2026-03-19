@@ -1,0 +1,5 @@
+CODEBASE_ANALYSIS.md
+methodology_audit.md
+skills/update-docs/SKILL.md
+skills/update-docs/agents/openai.yaml
+skills/update-docs/references/update-checklist.md

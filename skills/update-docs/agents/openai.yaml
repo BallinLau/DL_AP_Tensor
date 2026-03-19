@@ -1,0 +1,4 @@
+interface:
+  display_name: "Update Docs"
+  short_description: "Sync README, API docs, and usage examples after code changes"
+  default_prompt: "Use $update-docs to update README, API docs, and examples to match recent code changes."
