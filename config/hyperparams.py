@@ -113,6 +113,9 @@ class HyperParams:
 
     # FC1 重建损失权重
     fc1_recon_weight: float = 1.0
+    # Stage2 额外约束 forecast-state 递推：
+    # (Hatcf_t, LnKF_t) -> (Hatcf_{t+1}, LnKF_{t+1}) 也要贴近真实下一期
+    fc1_forecast_recon_weight: float = 1.0
     # Stage2 先做若干轮 FC1 teacher forcing 预训练（使用真实 Hatc_t/LnK_t 输入）
     fc1_teacher_forcing_epochs: int = 5
     fc1_teacher_forcing_weight: float = 1.0

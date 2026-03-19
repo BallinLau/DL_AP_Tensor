@@ -1333,7 +1333,11 @@ class Episode:
 
         # 可选：FC1 输出与真实 hatcf / lnkf 的重建误差
         recon_weight = getattr(self.hyperparams, "fc1_recon_weight", 0.0)
+        forecast_recon_weight = float(
+            getattr(self.hyperparams, "fc1_forecast_recon_weight", 0.0)
+        )
         recon_loss = torch.tensor(0.0, device=self.device)
+        recon_loss_forecast = torch.tensor(0.0, device=self.device)
         if self.add_FC1loss:
             hatcf_pred = c_children  # (batch, 2, 1)
             lnkf_pred = k_children   # (batch, 2, 1)
@@ -1357,9 +1361,33 @@ class Episode:
                     children_t.shape[-1]
                 )
                 recon_loss = torch.tensor(0.0, device=self.device)
+
+            # 额外加一条 forecast-state 闭环监督：
+            # 用 (Hatcf_t, LnKF_t) 做当前态输入，直接约束下一期预测贴近真实值。
+            # 这条项补上“递推口径”目标，而不仅是 true-state teacher-forcing 口径。
+            if (
+                forecast_recon_weight > 0.0
+                and parent.shape[1] >= 7
+                and children_t.shape[-1] >= 9
+                and use_true_prev_macro
+            ):
+                _, _, _, c_children_forecast, k_children_forecast = model.forward_step(
+                    x_prev=parent[:, 4:5],
+                    x_curr=children_t[:, :, 4:5],
+                    hatcf_prev=parent[:, 5:6],
+                    lnkf_prev=parent[:, 6:7],
+                    return_physical=True
+                )
+                recon_loss_forecast = (
+                    (c_children_forecast - hatcf_true).pow(2)
+                    + (k_children_forecast - lnkf_true).pow(2)
+                ).mean()
         if not torch.isfinite(recon_loss):
             logger.warning("Non-finite recon loss detected. Replace with 0.0 for stability.")
             recon_loss = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(recon_loss_forecast):
+            logger.warning("Non-finite forecast recon loss detected. Replace with 0.0 for stability.")
+            recon_loss_forecast = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(mean_anchor_loss):
             logger.warning("Non-finite mean-anchor loss detected. Replace with 0.0 for stability.")
             mean_anchor_loss = torch.tensor(0.0, device=self.device)
@@ -1370,7 +1398,9 @@ class Episode:
 
         if bool(getattr(self, "_fc1_teacher_forcing_stage", False)) and self.add_FC1loss:
             teacher_weight = float(getattr(self.hyperparams, "fc1_teacher_forcing_weight", 1.0))
-            total_sdf_loss = teacher_weight * recon_loss
+            total_sdf_loss = teacher_weight * (
+                recon_loss + forecast_recon_weight * recon_loss_forecast
+            )
             moment_weight_eff = 0.0
             mean_anchor_weight_eff = 0.0
         else:
@@ -1378,6 +1408,7 @@ class Episode:
                 main_loss
                 + moment_weight_eff * moment_loss
                 + recon_weight * recon_loss
+                + forecast_recon_weight * recon_loss_forecast
                 + mean_anchor_weight_eff * mean_anchor_loss
             )
 
@@ -1395,12 +1426,14 @@ class Episode:
                 'sdf_main_loss': float(main_loss.detach().item()),
                 'sdf_moment_loss': float(moment_loss.detach().item()),
                 'sdf_recon_loss': float(recon_loss.detach().item()),
+                'sdf_recon_loss_forecast': float(recon_loss_forecast.detach().item()),
                 'sdf_mean_anchor_loss': float(mean_anchor_loss.detach().item()),
                 'sdf_mean_anchor_weight': float(mean_anchor_weight_eff),
                 'sdf_mean_anchor_target': (
                     float(mean_anchor_target) if mean_anchor_target is not None else float('nan')
                 ),
                 'sdf_moment_weight': float(moment_weight_eff),
+                'sdf_forecast_recon_weight': float(forecast_recon_weight),
                 'sdf_hj_warmup_factor': float(hj_warmup_factor),
                 'sdf_teacher_forcing_stage': float(1.0 if self._fc1_teacher_forcing_stage else 0.0),
                 'sdf_use_true_prev_macro': float(1.0 if use_true_prev_macro else 0.0),
