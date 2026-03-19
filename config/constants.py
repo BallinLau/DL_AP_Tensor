@@ -73,20 +73,20 @@ class Config:
     BARZ_LOGIT_TEMP = 10.0
     
     # ========== 模型架构参数 ==========
-    # 共享层维度
-    SHARE_LAYER_HIDDEN_DIMS = [128, 128, 64]
-    
-    # 各 Head 维度
-    Q_HEAD_DIMS = [32, 16]
-    BP0_HEAD_DIMS = [32, 16]
-    BPI_HEAD_DIMS = [32, 16]
-    P0_HEAD_DIMS = [32, 16]
-    PI_HEAD_DIMS = [32, 16]
-    
-    # SDF & FC1 维度
-    SDF_HIDDEN_DIMS = [64, 32]
+    # 共享层维度 (INCREASED for higher memory usage)
+    SHARE_LAYER_HIDDEN_DIMS = [256, 256, 128, 64]
+
+    # 各 Head 维度 (INCREASED)
+    Q_HEAD_DIMS = [64, 32, 16]
+    BP0_HEAD_DIMS = [64, 32, 16]
+    BPI_HEAD_DIMS = [64, 32, 16]
+    P0_HEAD_DIMS = [64, 32, 16]
+    PI_HEAD_DIMS = [64, 32, 16]
+
+    # SDF & FC1 维度 (INCREASED)
+    SDF_HIDDEN_DIMS = [128, 64, 32]
     FC1_INPUT_DIM = 4      # (x_{t-1}, x_t, ĉf_{t-1}, ln Kf_{t-1})
-    FC1_HIDDEN_DIMS = [32, 16]
+    FC1_HIDDEN_DIMS = [64, 32, 16]
     
     # FC2 维度
     FC2_INPUT_DIM = 201    # 100(b分位点) + 100(z分位点) + x
@@ -100,7 +100,7 @@ class Config:
     QUANTILE_NUM = 100     # 分位数数量
     
     # ========== 训练参数 ==========
-    BATCH_SIZE = 512
+    BATCH_SIZE = 4096
     LEARNING_RATE = 5e-4
     WEIGHT_DECAY = 1e-3
     MAX_GRAD_NORM = 1.0

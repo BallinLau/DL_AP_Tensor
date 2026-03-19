@@ -18,7 +18,7 @@ class HyperParams:
     
     # ========== 训练基础参数 ==========
     epochs: int = 100
-    batch_size: int = 512
+    batch_size: int = 8192
     
     # ========== 优化器参数 ==========
     # SDF & FC1
@@ -104,10 +104,10 @@ class HyperParams:
     high_loss_lr_switch: float = 10.0
     high_loss_lr: float = 1e-4
     
-    # ========== 数据生成参数 ==========
-    n_samples: int = 10000
-    n_paths: int = 1000
-    simulate_horizon: int = 20
+    # ========== 数据生成参数 (INCREASED for higher memory usage) ==========
+    n_samples: int = 100000
+    n_paths: int = 2000
+    simulate_horizon: int = 200
     # 训练数据批次是否优先走 tensor 管线（避免训练前 pandas 拼装）
     use_tensor_pipeline: bool = True
 

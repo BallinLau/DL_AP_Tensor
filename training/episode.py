@@ -28,6 +28,7 @@ from losses.sdf_loss import moment_penalty
 from data.data_utils import build_sdf_pairs_from_macro_ts
 from .gradient_utils import gradient_protection, compute_gradient_norm
 from .scheduler import LossWeightScheduler, LearningRateScheduler
+from utils.gpu_monitor import GPUMonitor, print_memory_summary
 
 
 logger = logging.getLogger(__name__)
@@ -92,7 +93,8 @@ class Episode:
         config: type = Config,
         hyperparams: HyperParams = None,
         device: torch.device = None,
-        episode_id: int = 0
+        episode_id: int = 0,
+        gpu_monitor = None
     ):
         """
         Args:
@@ -105,6 +107,7 @@ class Episode:
             hyperparams: 超参数
             device: 设备
             episode_id: Episode 编号
+            gpu_monitor: GPU 监控器（可选，用于共享监控数据）
         """
         self.models = models
         self.optimizers = optimizers
@@ -112,6 +115,10 @@ class Episode:
         self.hyperparams = hyperparams or HyperParams()
         self.device = device or config.DEVICE
         self.episode_id = episode_id
+        
+        # GPU 监控器（使用外部传入的或创建新的）
+        self.gpu_monitor = gpu_monitor if gpu_monitor is not None else GPUMonitor(self.device, log_interval=10)
+        self.gpu_monitor.reset_peak_stats()
         
         # 损失函数
         self.loss_fns = self._init_loss_functions()
@@ -2817,6 +2824,11 @@ class Episode:
         use_policy_value = 'policy_value' in train_modules and 'policy_value' in self.models
         use_fc2 = 'fc2' in train_modules and 'fc2' in self.models
 
+        # 记录 episode 开始时的 GPU 显存
+        logger.info(f"Episode {self.episode_id} starting - GPU Memory:")
+        mem_info = self.gpu_monitor.log_memory("episode_start")
+        print_memory_summary(mem_info, prefix=f"  [Episode {self.episode_id}] ")
+
         try:
             if mode == 'mode0':
                 if use_sdf_fc1 or use_policy_value:
@@ -3038,12 +3050,18 @@ class Episode:
         if self.df_sdf is None and self.tensor_sdf is not None:
             self.df_sdf = self._table_to_dataframe(self.tensor_sdf)
 
+        # 记录 episode 结束时的 GPU 显存
+        logger.info(f"Episode {self.episode_id} completed - GPU Memory:")
+        mem_info = self.gpu_monitor.log_memory("episode_end")
+        logger.info(f"GPU Memory at episode end: {mem_info}")
+        
         summary = {
             'episode_id': self.episode_id,
             'episode_mode': mode,
             'total_steps': self.step_count,
             'module_summaries': module_summaries,
-            'loss_history': self.loss_history
+            'loss_history': self.loss_history,
+            'gpu_memory': self.gpu_monitor.get_summary()
         }
         if 'policy_value' in module_summaries and isinstance(module_summaries['policy_value'], dict):
             summary['convergence'] = module_summaries['policy_value'].get('convergence')

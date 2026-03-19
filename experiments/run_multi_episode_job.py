@@ -12,6 +12,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 import sys
+import json
 
 import torch
 
@@ -33,6 +34,7 @@ from experiments.run_utils import (  # noqa: E402
     plot_distributions,
     plot_macro_series,
 )
+from utils.gpu_monitor import get_monitor, reset_monitor
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,6 +131,10 @@ def main():
     post0_n_paths = args.post0_n_paths if args.post0_n_paths is not None else hyperparams.n_paths
     simulate_group_size = args.simulate_group_size if args.simulate_group_size is not None else Config.SIMULATE_GROUP_SIZE
 
+    # Initialize GPU monitor
+    gpu_monitor = get_monitor(device, log_interval=10)
+    print(f"GPU Monitor initialized: {device}")
+
     summaries = []
     episode = Episode(
             models=models,
@@ -137,6 +143,7 @@ def main():
             hyperparams=hyperparams,
             device=device,
             episode_id=0,
+            gpu_monitor=gpu_monitor,
         )
     for ep in range(args.n_episodes):
         episode.episode_id = ep  # update episode ID for logging/saving
@@ -195,7 +202,11 @@ def main():
         plot_distributions(ep, episode.df, models["policy_value"], device, resolve_base_dir(run_root, ROOT))
         plot_macro_series(ep, episode.df_macro, resolve_base_dir(run_root, ROOT))
 
-        summaries.append({"episode_mode": episode_mode, "module_summaries": ep_summary})
+        summaries.append({
+            "episode_mode": episode_mode,
+            "module_summaries": ep_summary,
+            "gpu_memory": summary.get("gpu_memory", {})
+        })
         print(
             f"[Episode {ep}] mode={episode_mode} "
             f"batch_size={hyperparams.batch_size} "
@@ -208,6 +219,14 @@ def main():
 
     print("All episodes done.")
     print(summaries)
+
+    # Save GPU memory monitoring results to JSON
+    gpu_monitor = get_monitor()
+    if gpu_monitor:
+        gpu_json_path = resolve_base_dir(run_root, ROOT) / "gpu_memory_monitoring.json"
+        gpu_monitor.save_to_json(gpu_json_path)
+        print(f"GPU memory monitoring saved to: {gpu_json_path}")
+        reset_monitor()
 
     final_sim = SimulateTS(
         models=models,
