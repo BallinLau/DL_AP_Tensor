@@ -41,6 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-episodes", type=int, default=10, help="Number of episodes to run")
     parser.add_argument("--epochs", type=int, default=None, help="Override epochs per stage")
     parser.add_argument("--n-paths", type=int, default=None, help="Override n_paths for data")
+    parser.add_argument("--post0-n-paths", type=int, default=None, help="Override n_paths for episodes > 0; default keeps full n_paths")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override training batch size")
+    parser.add_argument("--simulate-group-size", type=int, default=None, help="Override firm count per simulated path for episodes > 0")
     parser.add_argument("--simulate-horizon", type=int, default=None, help="Override simulate horizon")
     parser.add_argument("--device", type=str, default=None, help="Force device, e.g. cuda:0 or cpu")
     parser.add_argument("--quick-test", action="store_true", help="Shrink workload for smoke tests (n_paths=10, epochs=20, horizon=20)")
@@ -73,13 +76,37 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.n_paths = 10
         hyperparams.epochs = 20
         hyperparams.simulate_horizon = 15
+        hyperparams.batch_size = min(hyperparams.batch_size, 1024)
     if args.n_paths is not None:
         hyperparams.n_paths = args.n_paths
+    if args.batch_size is not None:
+        hyperparams.batch_size = args.batch_size
     if args.epochs is not None:
         hyperparams.epochs = args.epochs
     if args.simulate_horizon is not None:
         hyperparams.simulate_horizon = args.simulate_horizon
     return hyperparams
+
+
+def _format_cuda_mem(n_bytes: int | float) -> str:
+    return f"{float(n_bytes) / (1024 ** 2):.1f} MB"
+
+
+def log_gpu_stats(prefix: str, device: torch.device):
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(idx)
+    allocated = torch.cuda.memory_allocated(idx)
+    reserved = torch.cuda.memory_reserved(idx)
+    max_allocated = torch.cuda.max_memory_allocated(idx)
+    print(f"{prefix} GPU: {props.name}")
+    print(
+        f"{prefix}   Allocated: {_format_cuda_mem(allocated)} / "
+        f"{_format_cuda_mem(props.total_memory)} ({allocated / max(props.total_memory, 1) * 100:.1f}%)"
+    )
+    print(f"{prefix}   Reserved: {_format_cuda_mem(reserved)}")
+    print(f"{prefix}   Max Allocated: {_format_cuda_mem(max_allocated)}")
 
 
 def make_run_root(arg_path: Path | None) -> Path:
@@ -99,6 +126,8 @@ def main():
     models = build_models(device)
     optimizers = build_optimizers(models)
     hyperparams = configure_hyperparams(args)
+    post0_n_paths = args.post0_n_paths if args.post0_n_paths is not None else hyperparams.n_paths
+    simulate_group_size = args.simulate_group_size if args.simulate_group_size is not None else Config.SIMULATE_GROUP_SIZE
 
     summaries = []
     episode = Episode(
@@ -111,11 +140,13 @@ def main():
         )
     for ep in range(args.n_episodes):
         episode.episode_id = ep  # update episode ID for logging/saving
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
         data_kwargs = {
             "n_samples": hyperparams.n_samples,
-            "n_paths": hyperparams.n_paths if ep == 0 else min(100, hyperparams.n_paths),
-            "group_size": 2 if ep == 0 else Config.SIMULATE_GROUP_SIZE,
+            "n_paths": hyperparams.n_paths if ep == 0 else post0_n_paths,
+            "group_size": 2 if ep == 0 else simulate_group_size,
             "n_branches": Config.BRANCH_NUM,
         }
         if ep == 0:
@@ -165,6 +196,14 @@ def main():
         plot_macro_series(ep, episode.df_macro, resolve_base_dir(run_root, ROOT))
 
         summaries.append({"episode_mode": episode_mode, "module_summaries": ep_summary})
+        print(
+            f"[Episode {ep}] mode={episode_mode} "
+            f"batch_size={hyperparams.batch_size} "
+            f"n_paths={data_kwargs['n_paths']} "
+            f"group_size={data_kwargs['group_size']} "
+            f"horizon={hyperparams.simulate_horizon}"
+        )
+        log_gpu_stats(f"[Episode {ep}]", device)
         print(f"Episode {ep} ({episode_mode}) done: {ep_summary}")
 
     print("All episodes done.")
@@ -174,7 +213,7 @@ def main():
         models=models,
         config=Config,
         n_paths=hyperparams.n_paths,
-        group_size=Config.SIMULATE_GROUP_SIZE,
+        group_size=simulate_group_size,
         branch_num=Config.BRANCH_NUM,
         horizon=hyperparams.simulate_horizon,
         device=device,

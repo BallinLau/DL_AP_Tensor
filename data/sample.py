@@ -31,6 +31,7 @@ from .data_utils import (
     build_firm_state_tensor
 )
 from .tensor_data import TensorTable
+from .sample_parallel import build_policy_value_tables_parallel
 
 
 class Sample:
@@ -133,6 +134,20 @@ class Sample:
               - df_firm: firm-level DataFrame
               - df_macro: macro-level DataFrame (按 path 聚合)
         """
+        if self.sampling_mode == 'uniform':
+            firm_table, macro_table = build_policy_value_tables_parallel(
+                self, include_macro=(self.data_mode == 'simulate')
+            )
+            df_firm = self._firm_tensor_table_to_df(firm_table)
+            if self.data_mode == 'simulate':
+                df_macro = self._macro_tensor_table_to_df(macro_table) if macro_table is not None else pd.DataFrame()
+                if 'policy_value' in self.models and self.models['policy_value'] is not None:
+                    df_firm = self.fill_fc1(df_firm, df_macro)
+                    df_firm, df_macro = self.fill_policy_value(df_firm, df_macro)
+                    df_macro = self._update_macro_from_policy(df_firm, df_macro)
+                return df_firm, df_macro
+            return df_firm
+
         all_firm_data = []
         all_macro_data = []
         
@@ -160,6 +175,36 @@ class Sample:
         
         # sample 模式只返回 df_firm
         return df_firm
+
+    def _firm_tensor_table_to_df(self, table: TensorTable) -> pd.DataFrame:
+        df = table.to_dataframe()
+        for col in ['path', 'firm', 'branch']:
+            df[col] = np.rint(df[col]).astype(np.int64)
+        df['ID'] = df['firm'].astype(str)
+        df['t'] = np.where(
+            df['branch'] == 0,
+            't',
+            't+1_' + (df['branch'] - 1).astype(np.int64).astype(str)
+        )
+        keep_cols = [
+            'path', 'ID', 't', 'branch', 'b', 'z', 'ETA', 'i', 'x',
+            'Hatcf', 'LnKF', 'M', 'K', 'Entry'
+        ]
+        return df[keep_cols]
+
+    def _macro_tensor_table_to_df(self, table: TensorTable) -> pd.DataFrame:
+        df_macro = table.to_dataframe()
+        for col in ['path', 't_code', 'branch', 'n_firms', 'n_entrants']:
+            if col in df_macro.columns:
+                df_macro[col] = np.rint(df_macro[col]).astype(np.int64)
+        df_macro['t'] = np.where(
+            df_macro['branch'] == -1,
+            't',
+            't+1_' + df_macro['branch'].astype(np.int64).astype(str)
+        )
+        if 't_code' in df_macro.columns:
+            df_macro = df_macro.drop(columns=['t_code'])
+        return df_macro
 
     def build_sdf_fc1_df(self) -> pd.DataFrame:
         """
@@ -199,9 +244,13 @@ class Sample:
         构建 Policy/Value 训练数据（tensor 版本）。
 
         说明：
-        - 这里先实现 sample-style 截面构造（parent + children）
-        - 不依赖 DataFrame 作为中间态
+        - uniform 采样模式下，走 path-parallel GPU 批量构造
+        - 其他采样模式保留旧实现以保持兼容
         """
+        if self.sampling_mode == 'uniform':
+            firm_table, _ = build_policy_value_tables_parallel(self, include_macro=False)
+            return firm_table
+
         device = self.device
         rows: List[torch.Tensor] = []
         firm_offset = 0
@@ -303,21 +352,7 @@ class Sample:
 
         新实现：先在 GPU 上生成 tensor，再在末端转换为 DataFrame。
         """
-        df = self.build_policy_value_tensor().to_dataframe()
-        for col in ['path', 'firm', 'branch']:
-            df[col] = np.rint(df[col]).astype(np.int64)
-        df['ID'] = df['firm'].astype(str)
-        df['t'] = np.where(
-            df['branch'] == 0,
-            't',
-            't+1_' + (df['branch'] - 1).astype(np.int64).astype(str)
-        )
-        # 与旧版字段保持一致
-        keep_cols = [
-            'path', 'ID', 't', 'branch', 'b', 'z', 'ETA', 'i', 'x',
-            'Hatcf', 'LnKF', 'M', 'K', 'Entry'
-        ]
-        return df[keep_cols]
+        return self._firm_tensor_table_to_df(self.build_policy_value_tensor())
 
     def build_fc2_df(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """

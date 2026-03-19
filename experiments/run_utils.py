@@ -66,7 +66,7 @@ def build_hyperparams():
     hp = HyperParams(
         n_samples=2000,
         n_paths=200,
-        batch_size=512,
+        batch_size=4096,
         epochs=20,
         simulate_horizon=100,
     )

@@ -27,6 +27,7 @@ from .data_utils import (
     compute_quantile_features
 )
 from .tensor_data import TensorTable, TensorSimulationOutput, cat_rows
+from .simulate_ts_parallel import simulate_tensor_parallel
 
 
 class SimulateTS:
@@ -135,26 +136,12 @@ class SimulateTS:
     def simulate_tensor(self) -> TensorSimulationOutput:
         """
         运行完整模拟并返回 tensor-native 结果。
+
+        说明：
+        - 时间维度仍按递推顺序推进
+        - path 与 firm 维度在设备上并行批量计算
         """
-        firm_rows: List[torch.Tensor] = []
-        macro_rows: List[torch.Tensor] = []
-
-        for path_idx in tqdm(range(self.n_paths), desc="Simulating paths (tensor)"):
-            path_firm, path_macro = self._simulate_path_tensor(path_idx)
-            firm_rows.append(path_firm)
-            macro_rows.append(path_macro)
-
-        firm_tensor = cat_rows(firm_rows, len(self.FIRM_COLUMNS), self.device)
-        macro_tensor = cat_rows(macro_rows, len(self.MACRO_COLUMNS), self.device)
-        return TensorSimulationOutput(
-            firm=TensorTable(firm_tensor, self.FIRM_COLUMNS),
-            macro=TensorTable(macro_tensor, self.MACRO_COLUMNS),
-            meta={
-                'n_paths': self.n_paths,
-                'horizon': self.horizon,
-                'branch_num': self.branch_num
-            }
-        )
+        return simulate_tensor_parallel(self)
     
     def _simulate_path(self, path_idx: int) -> Tuple[List, List]:
         """
