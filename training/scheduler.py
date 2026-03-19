@@ -209,6 +209,12 @@ class LearningRateScheduler:
         
         self.current_step = 0
         self.current_lr = base_lr
+        self.group_base_lrs = [
+            float(param_group.get('base_lr', param_group.get('lr', base_lr)))
+            for param_group in self.optimizer.param_groups
+        ]
+        if self.group_base_lrs:
+            self.base_lr = max(self.group_base_lrs)
     
     def step(self):
         """
@@ -216,9 +222,14 @@ class LearningRateScheduler:
         """
         self.current_step += 1
         self.current_lr = self._compute_lr()
-        
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = self.current_lr
+        if not self.optimizer.param_groups:
+            return
+
+        denom = max(self.base_lr, 1e-12)
+        scale = self.current_lr / denom
+        for idx, param_group in enumerate(self.optimizer.param_groups):
+            group_base_lr = self.group_base_lrs[idx] if idx < len(self.group_base_lrs) else self.base_lr
+            param_group['lr'] = max(self.min_lr, group_base_lr * scale)
     
     def _compute_lr(self) -> float:
         """
@@ -266,7 +277,8 @@ class LearningRateScheduler:
         """
         return {
             'current_step': self.current_step,
-            'current_lr': self.current_lr
+            'current_lr': self.current_lr,
+            'group_base_lrs': list(self.group_base_lrs),
         }
     
     def load_state_dict(self, state: Dict):
@@ -275,6 +287,7 @@ class LearningRateScheduler:
         """
         self.current_step = state['current_step']
         self.current_lr = state['current_lr']
+        self.group_base_lrs = list(state.get('group_base_lrs', self.group_base_lrs))
 
 
 class EpisodeScheduler:

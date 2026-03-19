@@ -125,9 +125,9 @@ def main():
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     Config.DEVICE = device
 
-    models = build_models(device)
-    optimizers = build_optimizers(models)
     hyperparams = configure_hyperparams(args)
+    models = build_models(device)
+    optimizers = build_optimizers(models, hyperparams)
     post0_n_paths = args.post0_n_paths if args.post0_n_paths is not None else hyperparams.n_paths
     simulate_group_size = args.simulate_group_size if args.simulate_group_size is not None else Config.SIMULATE_GROUP_SIZE
 

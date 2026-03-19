@@ -113,6 +113,11 @@ class HyperParams:
 
     # FC1 重建损失权重
     fc1_recon_weight: float = 1.0
+    # Stage2 先做若干轮 FC1 teacher forcing 预训练（使用真实 Hatc_t/LnK_t 输入）
+    fc1_teacher_forcing_epochs: int = 5
+    fc1_teacher_forcing_weight: float = 1.0
+    # 在 stage2/joint 中，若 batch 提供真实 Hatc_t/LnK_t，则优先用真实当前态驱动 FC1
+    fc1_use_true_macro_state_in_stage2: bool = True
     # SDF 矩约束权重（常规阶段）
     sdf_moment_weight: float = 1.0
     # SDF 第一阶段（无 FC1 监督）专用学习率与矩约束权重
@@ -124,6 +129,9 @@ class HyperParams:
     sdf_log_mean_target: float = field(default_factory=lambda: math.log(0.98))
     sdf_log_mean_anchor_weight_stage1: float = 1.0
     sdf_log_mean_anchor_weight_stage2: float = 5.0
+    # Stage2 联合训练初期，对 HJ 相关项做 warmup，避免 FC1 还未收敛时被过早牵引
+    sdf_stage2_hj_warmup_epochs: int = 5
+    sdf_stage2_hj_warmup_start: float = 0.2
 
     # ========== Policy/Value: Q 优先训练与形状约束 ==========
     # 在 policy/value 联合训练前先进行 q-only 预训练轮数

@@ -151,10 +151,13 @@ class Episode:
         self._current_epoch_idx = 0
         self._q_only_stage = False
         self._bp_only_stage = False
+        self._fc1_teacher_forcing_stage = False
         self._policy_q_freeze_active = False
         self._policy_value_grad_backup = {}
         self._policy_bp_freeze_active = False
         self._policy_bp_grad_backup = {}
+        self._sdf_fc1_teacher_freeze_active = False
+        self._sdf_fc1_grad_backup = {}
     
     def _init_loss_functions(self) -> Dict:
         """
@@ -890,29 +893,30 @@ class Episode:
 
     def _configure_sdf_lr_for_phase(self):
         """
-        在 SDF 第一阶段（无 FC1 监督）使用更小学习率，其他阶段恢复默认。
+        在 SDF 第一阶段/第二阶段按子模块设置学习率。
         """
         if 'sdf_fc1' not in self.optimizers or 'sdf_fc1' not in self.lr_schedulers:
             return
 
         opt = self.optimizers['sdf_fc1']
         scheduler = self.lr_schedulers['sdf_fc1']
-        if self._sdf_base_lr_backup is None:
-            self._sdf_base_lr_backup = scheduler.base_lr
-
-        target_lr = getattr(self.hyperparams, "sdf_stage1_lr", scheduler.base_lr)
-        if not self.add_FC1loss:
-            scheduler.base_lr = target_lr
-            scheduler.current_lr = target_lr
-            for group in opt.param_groups:
-                group['lr'] = target_lr
-        else:
+        sdf_lr = float(getattr(self.hyperparams, "sdf_stage1_lr", getattr(self.hyperparams, "sdf_lr", scheduler.base_lr)))
+        if self.add_FC1loss:
             stage2_lr = getattr(self.hyperparams, "sdf_stage2_lr", None)
-            restore_lr = self._sdf_base_lr_backup if stage2_lr is None else float(stage2_lr)
-            scheduler.base_lr = restore_lr
-            scheduler.current_lr = restore_lr
-            for group in opt.param_groups:
-                group['lr'] = restore_lr
+            if stage2_lr is not None:
+                sdf_lr = float(stage2_lr)
+        fc1_lr = float(getattr(self.hyperparams, "fc1_lr", sdf_lr))
+
+        group_base_lrs = []
+        for group in opt.param_groups:
+            group_name = str(group.get('group_name', ''))
+            target_lr = fc1_lr if group_name == 'fc1' else sdf_lr
+            group['lr'] = target_lr
+            group_base_lrs.append(target_lr)
+
+        scheduler.group_base_lrs = list(group_base_lrs)
+        scheduler.base_lr = max(group_base_lrs) if group_base_lrs else sdf_lr
+        scheduler.current_lr = scheduler.base_lr
 
     def _set_policy_q_only_freeze(self, enable: bool):
         """
@@ -982,6 +986,50 @@ class Episode:
                     p.requires_grad = self._policy_bp_grad_backup[name]
             self._policy_bp_grad_backup = {}
             self._policy_bp_freeze_active = False
+
+    def _set_sdf_fc1_teacher_only_freeze(self, enable: bool):
+        """
+        FC1 teacher forcing 阶段：仅更新 FC1_C / FC1_K，不更新 SDF/value。
+        """
+        if 'sdf_fc1' not in self.models:
+            return
+
+        model = self.models['sdf_fc1']
+        if enable:
+            if self._sdf_fc1_teacher_freeze_active:
+                return
+            self._sdf_fc1_grad_backup = {
+                name: p.requires_grad for name, p in model.named_parameters()
+            }
+            for p in model.parameters():
+                p.requires_grad = False
+            for p in model.fc1_model.parameters():
+                p.requires_grad = True
+            self._sdf_fc1_teacher_freeze_active = True
+        else:
+            if not self._sdf_fc1_teacher_freeze_active:
+                return
+            for name, p in model.named_parameters():
+                if name in self._sdf_fc1_grad_backup:
+                    p.requires_grad = self._sdf_fc1_grad_backup[name]
+            self._sdf_fc1_grad_backup = {}
+            self._sdf_fc1_teacher_freeze_active = False
+
+    def _compute_stage2_hj_warmup_factor(self) -> float:
+        """
+        Stage2 联合训练初期，线性放大 HJ 相关项权重，避免 FC1 被过早牵引。
+        """
+        if not self.add_FC1loss or bool(getattr(self, "_fc1_teacher_forcing_stage", False)):
+            return 1.0
+        warmup_epochs = max(0, int(getattr(self.hyperparams, "sdf_stage2_hj_warmup_epochs", 0)))
+        if warmup_epochs <= 0:
+            return 1.0
+        start = float(getattr(self.hyperparams, "sdf_stage2_hj_warmup_start", 0.2))
+        start = min(max(start, 0.0), 1.0)
+        if self._current_epoch_idx >= warmup_epochs:
+            return 1.0
+        progress = float(self._current_epoch_idx + 1) / float(max(1, warmup_epochs))
+        return float(start + (1.0 - start) * progress)
     
     def generate_data(
         self,
@@ -1074,6 +1122,7 @@ class Episode:
         # 先恢复，再按当前 step 规则决定是否冻结
         self._set_policy_q_only_freeze(False)
         self._set_policy_bp_only_freeze(False)
+        self._set_sdf_fc1_teacher_only_freeze(False)
         q_only_step = (
             'policy_value' in train_modules and
             set(policy_loss_terms) == {'q'} and
@@ -1085,9 +1134,14 @@ class Episode:
             len(policy_loss_terms) == 2 and
             bool(getattr(self, "_bp_only_stage", False))
         )
+        fc1_teacher_step = (
+            'sdf_fc1' in train_modules and
+            bool(getattr(self, "_fc1_teacher_forcing_stage", False))
+        )
         self._set_policy_q_only_freeze(q_only_step)
         if not q_only_step:
             self._set_policy_bp_only_freeze(bp_only_step)
+        self._set_sdf_fc1_teacher_only_freeze(fc1_teacher_step)
         
         losses = {}
         
@@ -1171,6 +1225,7 @@ class Episode:
         finally:
             self._set_policy_q_only_freeze(False)
             self._set_policy_bp_only_freeze(False)
+            self._set_sdf_fc1_teacher_only_freeze(False)
         
         # 更新调度器
         self.weight_scheduler.step(losses)
@@ -1214,18 +1269,28 @@ class Episode:
 
         children_t = torch.stack(children, dim=1)  # (batch, 2, feat)
 
+        use_true_prev_macro = bool(
+            self.add_FC1loss and
+            parent.shape[1] >= 9 and
+            getattr(self.hyperparams, "fc1_use_true_macro_state_in_stage2", True)
+        )
+        if self._fc1_teacher_forcing_stage and parent.shape[1] >= 9:
+            use_true_prev_macro = True
+        c_prev_input = parent[:, 7:8] if use_true_prev_macro else parent[:, 5:6]
+        k_prev_input = parent[:, 8:9] if use_true_prev_macro else parent[:, 6:7]
+
         # 前向传播：一次性处理两条子路径
         w_parent, w_children, M, c_children, k_children = model.forward_step(
             x_prev=parent[:, 4:5],
             x_curr=children_t[:, :, 4:5],
-            hatcf_prev=parent[:, 5:6],
-            lnkf_prev=parent[:, 6:7],
+            hatcf_prev=c_prev_input,
+            lnkf_prev=k_prev_input,
             return_physical=True
         )
         
         # 提取父节点状态并计算 w
-        c_parent = parent[:, 5:6]
-        k_parent = parent[:, 6:7]
+        c_parent = c_prev_input
+        k_parent = k_prev_input
         
         # 计算损失
         # 构造残差并按 parent 聚合
@@ -1299,12 +1364,22 @@ class Episode:
             logger.warning("Non-finite mean-anchor loss detected. Replace with 0.0 for stability.")
             mean_anchor_loss = torch.tensor(0.0, device=self.device)
 
-        total_sdf_loss = (
-            main_loss
-            + moment_weight * moment_loss
-            + recon_weight * recon_loss
-            + mean_anchor_weight * mean_anchor_loss
-        )
+        hj_warmup_factor = self._compute_stage2_hj_warmup_factor()
+        moment_weight_eff = float(moment_weight) * hj_warmup_factor
+        mean_anchor_weight_eff = float(mean_anchor_weight) * hj_warmup_factor
+
+        if bool(getattr(self, "_fc1_teacher_forcing_stage", False)) and self.add_FC1loss:
+            teacher_weight = float(getattr(self.hyperparams, "fc1_teacher_forcing_weight", 1.0))
+            total_sdf_loss = teacher_weight * recon_loss
+            moment_weight_eff = 0.0
+            mean_anchor_weight_eff = 0.0
+        else:
+            total_sdf_loss = (
+                main_loss
+                + moment_weight_eff * moment_loss
+                + recon_weight * recon_loss
+                + mean_anchor_weight_eff * mean_anchor_loss
+            )
 
         # 诊断：每步记录 M 的矩和 FC1 跨期增量分布
         with torch.no_grad():
@@ -1319,13 +1394,16 @@ class Episode:
             self._latest_sdf_terms = {
                 'sdf_main_loss': float(main_loss.detach().item()),
                 'sdf_moment_loss': float(moment_loss.detach().item()),
-                'sdf_moment_weight': float(moment_weight),
                 'sdf_recon_loss': float(recon_loss.detach().item()),
                 'sdf_mean_anchor_loss': float(mean_anchor_loss.detach().item()),
-                'sdf_mean_anchor_weight': float(mean_anchor_weight),
+                'sdf_mean_anchor_weight': float(mean_anchor_weight_eff),
                 'sdf_mean_anchor_target': (
                     float(mean_anchor_target) if mean_anchor_target is not None else float('nan')
                 ),
+                'sdf_moment_weight': float(moment_weight_eff),
+                'sdf_hj_warmup_factor': float(hj_warmup_factor),
+                'sdf_teacher_forcing_stage': float(1.0 if self._fc1_teacher_forcing_stage else 0.0),
+                'sdf_use_true_prev_macro': float(1.0 if use_true_prev_macro else 0.0),
             }
             self._latest_sdf_diag = {
                 'sdf_log_mean_M': float(torch.log(mu).item()),
@@ -2752,12 +2830,20 @@ class Episode:
             )
 
         prev_flag = self.add_FC1loss
+        prev_teacher_flag = self._fc1_teacher_forcing_stage
         self.add_FC1loss = True
         try:
             sdf_batches = self._create_sdf_batches_from_macro_tensor(
                 sdf_table, batch_size=batch_size, n_branches=n_branches
             )
             if sdf_batches:
+                tf_epochs = max(0, int(getattr(self.hyperparams, "fc1_teacher_forcing_epochs", 0)))
+                if tf_epochs > 0:
+                    self._fc1_teacher_forcing_stage = True
+                    module_summaries['sdf_fc1_teacher_forcing'] = self._run_batches(
+                        sdf_batches, tf_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(tf) '
+                    )
+                    self._fc1_teacher_forcing_stage = False
                 module_summaries['sdf_fc1_stage2'] = self._run_batches(
                     sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(stage2) '
                 )
@@ -2765,6 +2851,7 @@ class Episode:
                 module_summaries['sdf_fc1'] = module_summaries['sdf_fc1_stage2']
         finally:
             self.add_FC1loss = prev_flag
+            self._fc1_teacher_forcing_stage = prev_teacher_flag
 
     def _resolve_episode_mode(self, episode_mode: Optional[str]) -> str:
         if episode_mode is None:

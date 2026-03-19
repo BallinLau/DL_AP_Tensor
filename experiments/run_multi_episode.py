@@ -140,9 +140,9 @@ def main():
     Config.DEVICE = device
 
     n_episodes = args.n_episodes  # episode 0 + simulate episodes
-    models = build_models(device)
-    optimizers = build_optimizers(models)
     hyperparams = build_hyperparams()
+    models = build_models(device)
+    optimizers = build_optimizers(models, hyperparams)
 
     summaries = []
     for ep in range(n_episodes):

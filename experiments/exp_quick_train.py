@@ -37,11 +37,51 @@ def build_models(device: torch.device):
     return models
 
 
-def build_optimizers(models):
+def build_optimizers(models, hyperparams: HyperParams | None = None):
     """Simple AdamW optimizers for each model."""
+    hp = hyperparams or HyperParams()
     optimizers = {}
     for name, model in models.items():
-        optimizers[name] = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        if name == 'sdf_fc1':
+            optimizers[name] = torch.optim.AdamW(
+                [
+                    {
+                        'params': model.sdf_model.parameters(),
+                        'lr': hp.sdf_lr,
+                        'base_lr': hp.sdf_lr,
+                        'weight_decay': hp.sdf_weight_decay,
+                        'group_name': 'sdf_core',
+                    },
+                    {
+                        'params': model.value_model.parameters(),
+                        'lr': hp.sdf_lr,
+                        'base_lr': hp.sdf_lr,
+                        'weight_decay': hp.sdf_weight_decay,
+                        'group_name': 'value',
+                    },
+                    {
+                        'params': model.fc1_model.parameters(),
+                        'lr': hp.fc1_lr,
+                        'base_lr': hp.fc1_lr,
+                        'weight_decay': hp.fc1_weight_decay,
+                        'group_name': 'fc1',
+                    },
+                ]
+            )
+        elif name == 'policy_value':
+            optimizers[name] = torch.optim.AdamW(
+                model.parameters(),
+                lr=hp.policy_lr,
+                weight_decay=hp.policy_weight_decay,
+            )
+        elif name == 'fc2':
+            optimizers[name] = torch.optim.AdamW(
+                model.parameters(),
+                lr=hp.fc2_lr,
+                weight_decay=hp.fc2_weight_decay,
+            )
+        else:
+            optimizers[name] = torch.optim.AdamW(model.parameters(), lr=hp.lr, weight_decay=1e-4)
     return optimizers
 
 
@@ -74,9 +114,9 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     Config.DEVICE = device
 
-    models = build_models(device)
-    optimizers = build_optimizers(models)
     hyperparams = build_hyperparams()
+    models = build_models(device)
+    optimizers = build_optimizers(models, hyperparams)
 
     episode = Episode(
         models=models,

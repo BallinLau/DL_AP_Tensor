@@ -55,10 +55,50 @@ def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ck
     return models
 
 
-def build_optimizers(models):
+def build_optimizers(models, hyperparams: Optional[HyperParams] = None):
+    hp = hyperparams or HyperParams()
     opts = {}
     for name, model in models.items():
-        opts[name] = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        if name == "sdf_fc1":
+            opts[name] = torch.optim.AdamW(
+                [
+                    {
+                        "params": model.sdf_model.parameters(),
+                        "lr": hp.sdf_lr,
+                        "base_lr": hp.sdf_lr,
+                        "weight_decay": hp.sdf_weight_decay,
+                        "group_name": "sdf_core",
+                    },
+                    {
+                        "params": model.value_model.parameters(),
+                        "lr": hp.sdf_lr,
+                        "base_lr": hp.sdf_lr,
+                        "weight_decay": hp.sdf_weight_decay,
+                        "group_name": "value",
+                    },
+                    {
+                        "params": model.fc1_model.parameters(),
+                        "lr": hp.fc1_lr,
+                        "base_lr": hp.fc1_lr,
+                        "weight_decay": hp.fc1_weight_decay,
+                        "group_name": "fc1",
+                    },
+                ]
+            )
+        elif name == "policy_value":
+            opts[name] = torch.optim.AdamW(
+                model.parameters(),
+                lr=hp.policy_lr,
+                weight_decay=hp.policy_weight_decay,
+            )
+        elif name == "fc2":
+            opts[name] = torch.optim.AdamW(
+                model.parameters(),
+                lr=hp.fc2_lr,
+                weight_decay=hp.fc2_weight_decay,
+            )
+        else:
+            opts[name] = torch.optim.AdamW(model.parameters(), lr=hp.lr, weight_decay=1e-4)
     return opts
 
 
