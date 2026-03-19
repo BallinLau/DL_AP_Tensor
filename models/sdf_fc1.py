@@ -5,8 +5,8 @@ SDF: 随机贴现因子网络
 FC1: 宏观状态预测网络（FC1_C 预测 ĉf，FC1_K 预测 ln Kf）
 
 关键口径：
-- FC1 输出默认在标准化空间
-- 写回 df 前必须 inverse_transform
+- FC1 直接在 physical scale 上预测增量与水平
+- 不再依赖 scaler / inverse_transform
 - df 中保存的一律是 physical scale
 
 树状分支结构（支持任意 N 个分支）：
@@ -22,7 +22,7 @@ SDF 计算（对每条路径 j）：
 import torch
 import torch.nn as nn
 from typing import Tuple, Optional, List, Union
-from .base import MLP, MLPWithScaler
+from .base import MLP
 
 import sys
 sys.path.append('..')
@@ -330,15 +330,15 @@ class FC1Model(nn.Module):
         if hidden_dims is None:
             hidden_dims = Config.FC1_HIDDEN_DIMS
         
-        # FC1_C: 预测 ĉf
-        self.FC1_C = MLPWithScaler(
+        # FC1_C: 直接在物理尺度预测 Δĉf
+        self.FC1_C = MLP(
             input_dim=input_dim,
             hidden_dims=hidden_dims,
             output_dim=1
         )
         
-        # FC1_K: 预测 ln Kf
-        self.FC1_K = MLPWithScaler(
+        # FC1_K: 直接在物理尺度预测 Δln Kf
+        self.FC1_K = MLP(
             input_dim=input_dim,
             hidden_dims=hidden_dims,
             output_dim=1
@@ -351,15 +351,14 @@ class FC1Model(nn.Module):
         lnkf: torch.Tensor
     ):
         """
-        拟合两个子网络的标准化参数
+        兼容旧接口。FC1 已不再使用 scaler，因此这里是 no-op。
         
         Args:
             x: 输入特征
-            hatcf: Δĉf 目标值
-            lnkf: Δln Kf 目标值
+            hatcf: 兼容保留
+            lnkf: 兼容保留
         """
-        self.FC1_C.fit_scaler(x, hatcf)
-        self.FC1_K.fit_scaler(x, lnkf)
+        return None
     
     def forward(
         self, 
@@ -371,7 +370,7 @@ class FC1Model(nn.Module):
         
         Args:
             x: (batch, 4) - (x_{t-1}, x_t, ĉf_{t-1}, ln Kf_{t-1})
-            return_physical: 是否返回物理尺度（默认 True）
+            return_physical: 兼容保留。FC1 始终返回物理尺度。
         
         Returns:
             hatcf: (batch, 1) - 预测的 ĉf_{t+1}
@@ -380,12 +379,8 @@ class FC1Model(nn.Module):
         if x.shape[-1] < 4:
             raise ValueError("FC1 input must include (x_prev, x_curr, hatcf_prev, lnkf_prev)")
 
-        if return_physical:
-            delta_hatcf = self.FC1_C.forward_physical(x)
-            delta_lnkf = self.FC1_K.forward_physical(x)
-        else:
-            delta_hatcf = self.FC1_C.forward_normalized(x)
-            delta_lnkf = self.FC1_K.forward_normalized(x)
+        delta_hatcf = self.FC1_C(x)
+        delta_lnkf = self.FC1_K(x)
 
         # 采用增量建模：y_{t+1} = y_t + Δy
         hatcf_prev = x[..., 2:3]
@@ -396,11 +391,11 @@ class FC1Model(nn.Module):
         return hatcf, lnkf
     
     def forward_normalized(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """返回标准化空间的输出"""
+        """兼容旧接口。FC1 不再区分 normalized / physical。"""
         return self.forward(x, return_physical=False)
     
     def forward_physical(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """返回物理尺度的输出"""
+        """返回物理尺度输出。"""
         return self.forward(x, return_physical=True)
 
 

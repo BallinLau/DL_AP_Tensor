@@ -111,8 +111,8 @@ class HyperParams:
     # 训练数据批次是否优先走 tensor 管线（避免训练前 pandas 拼装）
     use_tensor_pipeline: bool = True
 
-    # FC1 重建损失权重（0 表示关闭）
-    fc1_recon_weight: float = 0.0
+    # FC1 重建损失权重
+    fc1_recon_weight: float = 1.0
     # SDF 矩约束权重（常规阶段）
     sdf_moment_weight: float = 1.0
     # SDF 第一阶段（无 FC1 监督）专用学习率与矩约束权重
@@ -182,12 +182,12 @@ class HyperParams:
     pv_eta_resample_enabled: bool = True
     pv_eta_resample_active_share: float = 0.25
     # bp 项自适应权重：使 (FOC+KKT) 与 Bellman 主项同量级
-    bp_adaptive_enabled: bool = True
+    bp_adaptive_enabled: bool = False
     bp_target_main_ratio: float = 0.3
     bp_adaptive_min_scale: float = 1.0
     bp_adaptive_max_scale: float = 200.0
     # 每个 epoch 增加若干 bp-only 精修步（仅更新 bp 相关头）
-    bp_refine_steps_per_epoch: int = 1
+    bp_refine_steps_per_epoch: int = 0
     bp_refine_batch_cap: int = 32
     # FOC/KKT 的 ∂P'/∂bp 是否使用 Phat'（避免 P=max(Phat,0) 在违约区梯度为0）
     # 注意：仅影响梯度通道；Bellman 主方程仍使用 P（含显式 P=0 违约语义）

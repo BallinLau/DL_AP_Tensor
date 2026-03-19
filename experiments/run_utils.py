@@ -87,6 +87,9 @@ def build_hyperparams():
     hp.sdf_moment_weight = 5.0
     hp.sdf_log_mean_anchor_weight_stage1 = 1.0
     hp.sdf_log_mean_anchor_weight_stage2 = 5.0
+    # 先关闭 bp 的额外边界推进，避免 bp 长期贴到 1
+    hp.bp_adaptive_enabled = False
+    hp.bp_refine_steps_per_epoch = 0
     # P0/PI 对上游 M 的鲁棒化（避免 M 偏高直接抬高 P）
     hp.pv_use_clipped_m = True
     hp.pv_m_clamp_min = 0.7
