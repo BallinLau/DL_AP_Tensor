@@ -213,20 +213,31 @@ def plot_surfaces(ep: int, pv_model: PolicyValueModel, ref_state: dict, device: 
 def plot_distributions(ep: int, df: pd.DataFrame, pv_model: PolicyValueModel, device: torch.device, base_dir: Path):
     figs_dir = base_dir / "experiments" / "figs"
 
-    if "M" in df.columns:
+    def _split_parent_child(df_in: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        if "branch" not in df_in.columns:
+            return df_in, df_in
+        if (df_in["branch"] < 0).any():
+            parent_mask = df_in["branch"] < 0
+            child_mask = df_in["branch"] >= 0
+        else:
+            parent_mask = df_in["branch"] == 0
+            child_mask = df_in["branch"] > 0
+        return df_in[parent_mask].copy(), df_in[child_mask].copy()
+
+    parent_df, child_df = _split_parent_child(df)
+
+    if "M" in df.columns and not child_df.empty:
         plt.figure(figsize=(5, 3))
-        df["M"].dropna().hist(bins=40)
-        plt.title(f"EP{ep} M distribution")
+        child_df["M"].dropna().hist(bins=40)
+        plt.title(f"EP{ep} M distribution (child states)")
         plt.xlabel("M")
         plt.ylabel("count")
         plt.tight_layout()
         plt.savefig(figs_dir / f"ep{ep}_m_hist.png", dpi=150)
         plt.close()
 
-    if "branch" in df.columns:
-        parent_df = df[df["branch"] <= 0].copy()
-    else:
-        parent_df = df
+    if parent_df.empty:
+        return
 
     cols = ["b", "z", "ETA", "i", "x", "Hatcf", "LnKF"]
     X = torch.tensor(parent_df[cols].values, device=device, dtype=torch.float32)
