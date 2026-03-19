@@ -207,7 +207,14 @@ def main():
             "lnkf": parent_df["LnKF"].median(),
         }
         plot_surfaces(ep, models["policy_value"], ref_state, device, get_base_dir())
-        plot_distributions(ep, episode.df, models["policy_value"], device, get_base_dir())
+        plot_distributions(
+            ep,
+            episode.df,
+            models["policy_value"],
+            device,
+            get_base_dir(),
+            df_macro=episode.df_macro,
+        )
         plot_macro_series(ep, episode.df_macro, get_base_dir())
 
         summaries.append(ep_summary)

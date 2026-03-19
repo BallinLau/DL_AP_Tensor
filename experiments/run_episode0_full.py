@@ -192,14 +192,26 @@ def plot_surfaces(pv_model: PolicyValueModel, ref_state: dict, device: torch.dev
         plt.close()
 
 
-def plot_distributions(df: pd.DataFrame, pv_model: PolicyValueModel, device: torch.device):
+def plot_distributions(
+    df: pd.DataFrame,
+    pv_model: PolicyValueModel,
+    device: torch.device,
+    df_macro: pd.DataFrame | None = None,
+):
     figs_dir = ROOT / "experiments" / "figs"
 
+    if df_macro is not None and not df_macro.empty and "M" in df_macro.columns:
+        m_source = df_macro["M"].dropna()
+    elif "M" in df.columns:
+        m_source = df["M"].dropna()
+    else:
+        m_source = None
+
     # M distribution
-    if "M" in df.columns:
+    if m_source is not None and len(m_source) > 0:
         plt.figure(figsize=(5, 3))
-        df["M"].dropna().hist(bins=40)
-        plt.title("M distribution")
+        m_source.hist(bins=40)
+        plt.title("M distribution (macro states)")
         plt.xlabel("M")
         plt.ylabel("count")
         plt.tight_layout()
@@ -325,7 +337,7 @@ def main():
             "lnkf": parent_df["LnKF"].median(),
         }
         plot_surfaces(models["policy_value"], ref_state, device)
-        plot_distributions(episode.df, models["policy_value"], device)
+        plot_distributions(episode.df, models["policy_value"], device, df_macro=episode.df_macro)
 
         all_summaries.append(
             {

@@ -210,7 +210,14 @@ def plot_surfaces(ep: int, pv_model: PolicyValueModel, ref_state: dict, device: 
         plt.close()
 
 
-def plot_distributions(ep: int, df: pd.DataFrame, pv_model: PolicyValueModel, device: torch.device, base_dir: Path):
+def plot_distributions(
+    ep: int,
+    df: pd.DataFrame,
+    pv_model: PolicyValueModel,
+    device: torch.device,
+    base_dir: Path,
+    df_macro: pd.DataFrame | None = None,
+):
     figs_dir = base_dir / "experiments" / "figs"
 
     def _split_parent_child(df_in: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -226,10 +233,16 @@ def plot_distributions(ep: int, df: pd.DataFrame, pv_model: PolicyValueModel, de
 
     parent_df, child_df = _split_parent_child(df)
 
-    if "M" in df.columns and not child_df.empty:
+    m_source = None
+    if df_macro is not None and not df_macro.empty and "M" in df_macro.columns:
+        m_source = df_macro["M"].dropna()
+    elif "M" in df.columns and not child_df.empty:
+        m_source = child_df["M"].dropna()
+
+    if m_source is not None and len(m_source) > 0:
         plt.figure(figsize=(5, 3))
-        child_df["M"].dropna().hist(bins=40)
-        plt.title(f"EP{ep} M distribution (child states)")
+        m_source.hist(bins=40)
+        plt.title(f"EP{ep} M distribution (macro states)")
         plt.xlabel("M")
         plt.ylabel("count")
         plt.tight_layout()
