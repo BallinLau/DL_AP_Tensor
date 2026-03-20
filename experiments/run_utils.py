@@ -235,20 +235,34 @@ def plot_distributions(
 
     parent_df, child_df = _split_parent_child(df)
 
-    m_source = None
+    m_child_source = None
+    m_parent_source = None
     if df_macro is not None and not df_macro.empty and "M" in df_macro.columns:
-        m_source = df_macro["M"].dropna()
+        macro_parent_df, macro_child_df = _split_parent_child(df_macro)
+        m_child_source = macro_child_df["M"].dropna()
+        m_parent_source = macro_parent_df["M"].dropna()
     elif "M" in df.columns and not child_df.empty:
-        m_source = child_df["M"].dropna()
+        m_child_source = child_df["M"].dropna()
+        m_parent_source = parent_df["M"].dropna()
 
-    if m_source is not None and len(m_source) > 0:
+    if m_child_source is not None and len(m_child_source) > 0:
         plt.figure(figsize=(5, 3))
-        m_source.hist(bins=40)
-        plt.title(f"EP{ep} M distribution (macro states)")
+        m_child_source.hist(bins=40)
+        plt.title(f"EP{ep} M distribution (child macro states)")
         plt.xlabel("M")
         plt.ylabel("count")
         plt.tight_layout()
         plt.savefig(figs_dir / f"ep{ep}_m_hist.png", dpi=150)
+        plt.close()
+
+    if m_parent_source is not None and len(m_parent_source) > 0:
+        plt.figure(figsize=(5, 3))
+        m_parent_source.hist(bins=40)
+        plt.title(f"EP{ep} M distribution (parent macro states)")
+        plt.xlabel("M")
+        plt.ylabel("count")
+        plt.tight_layout()
+        plt.savefig(figs_dir / f"ep{ep}_m_parent_hist.png", dpi=150)
         plt.close()
 
     if parent_df.empty:

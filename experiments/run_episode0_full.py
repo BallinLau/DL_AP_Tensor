@@ -200,29 +200,49 @@ def plot_distributions(
 ):
     figs_dir = ROOT / "experiments" / "figs"
 
-    if df_macro is not None and not df_macro.empty and "M" in df_macro.columns:
-        m_source = df_macro["M"].dropna()
-    elif "M" in df.columns:
-        m_source = df["M"].dropna()
-    else:
-        m_source = None
+    def _split_parent_child(df_in: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        if "branch" not in df_in.columns:
+            return df_in, df_in
+        if (df_in["branch"] < 0).any():
+            parent_mask = df_in["branch"] < 0
+            child_mask = df_in["branch"] >= 0
+        else:
+            parent_mask = df_in["branch"] == 0
+            child_mask = df_in["branch"] > 0
+        return df_in[parent_mask].copy(), df_in[child_mask].copy()
 
-    # M distribution
-    if m_source is not None and len(m_source) > 0:
+    parent_df, child_df = _split_parent_child(df)
+
+    if df_macro is not None and not df_macro.empty and "M" in df_macro.columns:
+        macro_parent_df, macro_child_df = _split_parent_child(df_macro)
+        m_child_source = macro_child_df["M"].dropna()
+        m_parent_source = macro_parent_df["M"].dropna()
+    elif "M" in df.columns:
+        m_child_source = child_df["M"].dropna()
+        m_parent_source = parent_df["M"].dropna()
+    else:
+        m_child_source = None
+        m_parent_source = None
+
+    if m_child_source is not None and len(m_child_source) > 0:
         plt.figure(figsize=(5, 3))
-        m_source.hist(bins=40)
-        plt.title("M distribution (macro states)")
+        m_child_source.hist(bins=40)
+        plt.title("M distribution (child macro states)")
         plt.xlabel("M")
         plt.ylabel("count")
         plt.tight_layout()
         plt.savefig(figs_dir / "m_hist.png", dpi=150)
         plt.close()
 
-    # bp distribution from model on parent rows (branch == 0 or -1)
-    if "branch" in df.columns:
-        parent_df = df[df["branch"] <= 0].copy()
-    else:
-        parent_df = df
+    if m_parent_source is not None and len(m_parent_source) > 0:
+        plt.figure(figsize=(5, 3))
+        m_parent_source.hist(bins=40)
+        plt.title("M distribution (parent macro states)")
+        plt.xlabel("M")
+        plt.ylabel("count")
+        plt.tight_layout()
+        plt.savefig(figs_dir / "m_parent_hist.png", dpi=150)
+        plt.close()
 
     cols = ["b", "z", "ETA", "i", "x", "Hatcf", "LnKF"]
     X = torch.tensor(parent_df[cols].values, device=device, dtype=torch.float32)
