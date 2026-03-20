@@ -400,9 +400,6 @@ class SimulateTS:
             dim=0
         ).reshape(1, -1).to(torch.float32)
 
-        # 用资源核算得到的宏观量回写到状态，保持时序一致
-        state['hatcf'] = Hatc.detach()
-        state['lnkf'] = LnK.detach()
         full_bar_i = torch.zeros_like(state['b'])
         full_bar_z = torch.zeros_like(state['b'])
         full_bp = state['b'].clone()
@@ -574,10 +571,6 @@ class SimulateTS:
             'hatcf': state['hatcf'],
             'lnkf': state['lnkf']
         }
-        
-        # 更新 state 中的宏观 proxy
-        state['hatcf'] = macro_row['Hatc']
-        state['lnkf'] = macro_row['LnK']
         
         # 更新内生状态（杠杆和资本）
         state['bar_i'] = output.bar_i.reshape(-1)

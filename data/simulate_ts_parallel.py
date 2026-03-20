@@ -244,9 +244,6 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         dim=1,
     ).to(torch.float32)
 
-    state["hatcf"] = torch.where(alive_any, Hatc.detach(), state["hatcf"])
-    state["lnkf"] = torch.where(alive_any, LnK.detach(), state["lnkf"])
-
     full_bar_i = torch.zeros_like(state["b"])
     full_bar_z = torch.zeros_like(state["b"])
     full_bp = state["b"].clone()
