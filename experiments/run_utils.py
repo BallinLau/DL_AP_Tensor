@@ -120,7 +120,9 @@ def build_hyperparams():
     hp.w_q = 1.0
     hp.w_fc2 = 1.0
     # SDF 两阶段稳定配置（与 notebook 口径对齐）
-    hp.fc1_recon_weight = 1.0
+    hp.fc1_recon_weight = 0.0
+    hp.fc1_forecast_recon_weight = 1.0
+    hp.fc1_use_true_macro_state_in_stage2 = False
     hp.sdf_stage1_lr = 1e-4
     hp.sdf_stage2_lr = 2e-4
     hp.sdf_stage1_moment_weight = 5.0

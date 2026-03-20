@@ -111,16 +111,19 @@ class HyperParams:
     # 训练数据批次是否优先走 tensor 管线（避免训练前 pandas 拼装）
     use_tensor_pipeline: bool = True
 
-    # FC1 重建损失权重
-    fc1_recon_weight: float = 1.0
+    # Stage2 true-state 重建损失权重：
+    # (Hatc_t, LnK_t) -> (Hatc_{t+1}, LnK_{t+1})
+    # 默认关闭，只保留 forecast-state 闭环监督。
+    fc1_recon_weight: float = 0.0
     # Stage2 额外约束 forecast-state 递推：
     # (Hatcf_t, LnKF_t) -> (Hatcf_{t+1}, LnKF_{t+1}) 也要贴近真实下一期
     fc1_forecast_recon_weight: float = 1.0
     # Stage2 先做若干轮 FC1 teacher forcing 预训练（使用真实 Hatc_t/LnK_t 输入）
     fc1_teacher_forcing_epochs: int = 5
     fc1_teacher_forcing_weight: float = 1.0
-    # 在 stage2/joint 中，若 batch 提供真实 Hatc_t/LnK_t，则优先用真实当前态驱动 FC1
-    fc1_use_true_macro_state_in_stage2: bool = True
+    # 在 stage2/joint 中，若 batch 提供真实 Hatc_t/LnK_t，是否优先用真实当前态驱动 FC1。
+    # 默认关闭，joint 阶段使用 forecast-state 输入以约束递推闭环。
+    fc1_use_true_macro_state_in_stage2: bool = False
     # SDF 矩约束权重（常规阶段）
     sdf_moment_weight: float = 1.0
     # SDF 第一阶段（无 FC1 监督）专用学习率与矩约束权重

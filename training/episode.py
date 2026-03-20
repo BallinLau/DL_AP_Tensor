@@ -1369,7 +1369,6 @@ class Episode:
                 forecast_recon_weight > 0.0
                 and parent.shape[1] >= 7
                 and children_t.shape[-1] >= 9
-                and use_true_prev_macro
             ):
                 _, _, _, c_children_forecast, k_children_forecast = model.forward_step(
                     x_prev=parent[:, 4:5],
