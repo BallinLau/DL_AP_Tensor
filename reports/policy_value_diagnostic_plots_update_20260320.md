@@ -47,10 +47,17 @@ CFip - CF0p
 #### `contdiff`
 
 ```math
-g M P'_I (1-\bar z'_I) - M P'_0 (1-\bar z'_0)
+g\,M\,P_{t+1}(bp_I)\,(1-\bar z_{t+1}(bp_I))
+-
+M\,P_{t+1}(bp_0)\,(1-\bar z_{t+1}(bp_0))
 ```
 
-表示 continuation 项在投资与不投资之间的差异。
+这里的 `P_{t+1}` 是下一期总股权价值 `P`，不是 `P^I_{t+1}` 或 `P^0_{t+1}` 分头。
+
+也就是说，这张图比较的是：
+
+- 投资分支对应的 child state（由 `bp_I` 诱导）下的下一期总股权 continuation
+- 不投资分支对应的 child state（由 `bp_0` 诱导）下的下一期总股权 continuation
 
 ### 2. 诊断图的用途
 
@@ -66,8 +73,31 @@ PI - P0
 =
 (CFip - CF0p)
 +
-\left[g M P'_I (1-\bar z'_I) - M P'_0 (1-\bar z'_0)\right]
+\left[
+g\,M\,P_{t+1}(bp_I)\,(1-\bar z_{t+1}(bp_I))
+-
+M\,P_{t+1}(bp_0)\,(1-\bar z_{t+1}(bp_0))
+\right]
 ```
+
+## 理论口径补充：为什么不是乘当前期 `(1-\bar z_t)`
+
+理论里的 `P^0` 和 `P^I` Bellman 方程都是**条件于当前期存活**的价值。
+
+因此：
+
+- 当前期是否 default，由当期总股权价值
+  ```math
+  P_t = \max\{0, \int \max(P_t^0, P_t^I)\,dH(i)\}
+  ```
+  这一层处理；
+- Bellman continuation 里乘的是**下一期 survival**，也就是
+  ```math
+  (1-\bar z_{t+1})
+  ```
+  而不是当前期 `(1-\bar z_t)`。
+
+这与理论文稿和当前实现是一致的。
 
 ## 训练后最终模拟的 `b` 分布图
 
@@ -107,3 +137,30 @@ PI - P0
 1. 把 `bar_i` 的异常区域拆解为“当期现金流差”与“continuation 差”
 2. 单独观察最终模拟中段时点的 `b` 分布
 3. 为下一步判断应该改 `PI/P0` 哪一段、还是继续改 `M/FC1` 提供直接证据
+
+## 后续可视化修正：只显示当前期存活区域
+
+进一步讨论后确认：
+
+- 高 `b`、低 `z` 区域中有不少状态在当前期其实已经应当 default
+- 这些状态虽然能在静态网格上算出 `bar_i`，但在真实时序模拟中并不会进入下一期继续执行投资决策
+
+因此，当前 `(b,z)` 投资相关截面图已增加 current-survival mask。
+
+具体来说，以下图形现在只在当前存活区域显示：
+
+- `bari`
+- `bp`
+- `pidiff`
+- `cfdiff`
+- `contdiff`
+
+mask 条件为：
+
+```math
+P_t > 0
+\quad\text{and}\quad
+\bar z_t < 0.5
+```
+
+这样可以避免把“当前期已经 default 的状态”错误解读为真实投资区。

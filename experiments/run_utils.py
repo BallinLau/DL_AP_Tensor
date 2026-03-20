@@ -256,6 +256,7 @@ def plot_surfaces(
         pi_diff = diagnostics["pidiff"].reshape(B.shape).cpu().numpy()
         cf_diff = diagnostics["cfdiff"].reshape(B.shape).cpu().numpy()
         cont_diff = diagnostics["contdiff"].reshape(B.shape).cpu().numpy()
+        survive_mask = (P > 0.0) & (bar_z < 0.5)
 
     for name, arr in [
         ("p0", P0),
@@ -269,8 +270,11 @@ def plot_surfaces(
         ("cfdiff", cf_diff),
         ("contdiff", cont_diff),
     ]:
+        plot_arr = arr
+        if name in {"bari", "bp", "pidiff", "cfdiff", "contdiff"}:
+            plot_arr = np.where(survive_mask, arr, np.nan)
         plt.figure(figsize=(6, 4))
-        cs = plt.contourf(B.cpu().numpy(), Z.cpu().numpy(), arr, levels=30, cmap="viridis")
+        cs = plt.contourf(B.cpu().numpy(), Z.cpu().numpy(), plot_arr, levels=30, cmap="viridis")
         plt.colorbar(cs)
         plt.xlabel("b")
         plt.ylabel("z")
@@ -281,7 +285,7 @@ def plot_surfaces(
 
         fig = plt.figure(figsize=(7, 5))
         ax = fig.add_subplot(111, projection="3d")
-        ax.plot_surface(B.cpu().numpy(), Z.cpu().numpy(), arr, cmap="viridis", linewidth=0, antialiased=True)
+        ax.plot_surface(B.cpu().numpy(), Z.cpu().numpy(), plot_arr, cmap="viridis", linewidth=0, antialiased=True)
         ax.set_xlabel("b")
         ax.set_ylabel("z")
         ax.set_zlabel(name.upper())

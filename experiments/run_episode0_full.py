@@ -224,11 +224,14 @@ def plot_surfaces(pv_model: PolicyValueModel, sdf_model: SDFFC1Combined | None, 
         out, diagnostics = _compute_policy_diagnostic_surfaces(pv_model, sdf_model, base)
         P0 = out.P0.reshape(B.shape).cpu().numpy()
         PI = out.PI.reshape(B.shape).cpu().numpy()
+        P = out.P.reshape(B.shape).cpu().numpy()
+        bar_z = out.bar_z.reshape(B.shape).cpu().numpy()
         bp = out.bp.reshape(B.shape).cpu().numpy()
         Q = out.Q.reshape(B.shape).cpu().numpy()
         pi_diff = diagnostics["pidiff"].reshape(B.shape).cpu().numpy()
         cf_diff = diagnostics["cfdiff"].reshape(B.shape).cpu().numpy()
         cont_diff = diagnostics["contdiff"].reshape(B.shape).cpu().numpy()
+        survive_mask = (P > 0.0) & (bar_z < 0.5)
 
     figs_dir = ROOT / "experiments" / "figs"
     for name, arr in [
@@ -240,9 +243,12 @@ def plot_surfaces(pv_model: PolicyValueModel, sdf_model: SDFFC1Combined | None, 
         ("cfdiff", cf_diff),
         ("contdiff", cont_diff),
     ]:
+        plot_arr = arr
+        if name in {"bp", "pidiff", "cfdiff", "contdiff"}:
+            plot_arr = np.where(survive_mask, arr, np.nan)
         # Heatmap with b as x-axis, z as y-axis
         plt.figure(figsize=(6, 4))
-        cs = plt.contourf(B.cpu().numpy(), Z.cpu().numpy(), arr, levels=30, cmap="viridis")
+        cs = plt.contourf(B.cpu().numpy(), Z.cpu().numpy(), plot_arr, levels=30, cmap="viridis")
         plt.colorbar(cs)
         plt.xlabel("b")
         plt.ylabel("z")
@@ -254,7 +260,7 @@ def plot_surfaces(pv_model: PolicyValueModel, sdf_model: SDFFC1Combined | None, 
         # 3D surface
         fig = plt.figure(figsize=(7, 5))
         ax = fig.add_subplot(111, projection="3d")
-        ax.plot_surface(B.cpu().numpy(), Z.cpu().numpy(), arr, cmap="viridis", linewidth=0, antialiased=True)
+        ax.plot_surface(B.cpu().numpy(), Z.cpu().numpy(), plot_arr, cmap="viridis", linewidth=0, antialiased=True)
         ax.set_xlabel("b")
         ax.set_ylabel("z")
         ax.set_zlabel(name.upper())
