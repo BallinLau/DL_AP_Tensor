@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 
 from config import Config, HyperParams
 from models import SDFFC1Combined, PolicyValueModel, FC2Model
+from losses import P0Loss, PILoss
 
 
 def resolve_base_dir(run_root: Optional[Path], project_root: Path) -> Path:
@@ -167,7 +168,65 @@ def save_stage_df(ep: int, name: str, base_dir: Path, df_firm: pd.DataFrame = No
         df_macro.to_pickle(out_dir / f"ep{ep}_stage_{name}_macro.pkl")
 
 
-def plot_surfaces(ep: int, pv_model: PolicyValueModel, ref_state: dict, device: torch.device, base_dir: Path):
+def _compute_policy_diagnostic_surfaces(
+    pv_model: PolicyValueModel,
+    sdf_model: SDFFC1Combined | None,
+    base: torch.Tensor,
+):
+    p0_loss = P0Loss()
+    pi_loss = PILoss()
+
+    out = pv_model(base)
+    bp0 = out.bp0
+    bpI = out.bpI
+
+    child_p0_state = base.clone()
+    child_p0_state[:, 0:1] = bp0
+    child_pI_state = base.clone()
+    child_pI_state[:, 0:1] = bpI
+
+    out_p0_child = pv_model(child_p0_state)
+    out_pI_child = pv_model(child_pI_state)
+
+    x = base[:, 4:5]
+    z = base[:, 1:2]
+    b = base[:, 0:1]
+    i = base[:, 3:4]
+    eta = base[:, 2:3]
+
+    cf0 = p0_loss.compute_cashflow_p0(x, z, b, out.Q, out_p0_child.Q, eta)
+    cfi = pi_loss.compute_cashflow_pi(x, z, b, i, out.Q, out_pI_child.Q, eta)
+
+    if sdf_model is not None:
+        _, _, m_next, _, _ = sdf_model.forward_step(
+            x_prev=base[:, 4:5],
+            x_curr=base[:, 4:5],
+            hatcf_prev=base[:, 5:6],
+            lnkf_prev=base[:, 6:7],
+            return_physical=True,
+        )
+    else:
+        m_next = torch.ones_like(out.P0)
+
+    cont0 = m_next * out_p0_child.P * (1.0 - out_p0_child.bar_z)
+    contI = Config.G * m_next * out_pI_child.P * (1.0 - out_pI_child.bar_z)
+
+    diagnostics = {
+        "pidiff": out.PI - out.P0,
+        "cfdiff": cfi - cf0,
+        "contdiff": contI - cont0,
+    }
+    return out, diagnostics
+
+
+def plot_surfaces(
+    ep: int,
+    pv_model: PolicyValueModel,
+    sdf_model: SDFFC1Combined | None,
+    ref_state: dict,
+    device: torch.device,
+    base_dir: Path,
+):
     figs_dir = base_dir / "experiments" / "figs"
     b_grid = torch.linspace(0, 1, 50, device=device)
     z_grid = torch.linspace(-4, 4, 50, device=device)
@@ -186,7 +245,7 @@ def plot_surfaces(ep: int, pv_model: PolicyValueModel, ref_state: dict, device: 
         dim=1,
     )
     with torch.no_grad():
-        out = pv_model(base)
+        out, diagnostics = _compute_policy_diagnostic_surfaces(pv_model, sdf_model, base)
         P0 = out.P0.reshape(B.shape).cpu().numpy()
         PI = out.PI.reshape(B.shape).cpu().numpy()
         P = out.P.reshape(B.shape).cpu().numpy()
@@ -194,8 +253,22 @@ def plot_surfaces(ep: int, pv_model: PolicyValueModel, ref_state: dict, device: 
         bar_z = out.bar_z.reshape(B.shape).cpu().numpy()
         bp = out.bp.reshape(B.shape).cpu().numpy()
         Q = out.Q.reshape(B.shape).cpu().numpy()
+        pi_diff = diagnostics["pidiff"].reshape(B.shape).cpu().numpy()
+        cf_diff = diagnostics["cfdiff"].reshape(B.shape).cpu().numpy()
+        cont_diff = diagnostics["contdiff"].reshape(B.shape).cpu().numpy()
 
-    for name, arr in [("p0", P0), ("pi", PI), ("p", P), ("bari", bar_i), ("barz", bar_z), ("bp", bp), ("q", Q)]:
+    for name, arr in [
+        ("p0", P0),
+        ("pi", PI),
+        ("p", P),
+        ("bari", bar_i),
+        ("barz", bar_z),
+        ("bp", bp),
+        ("q", Q),
+        ("pidiff", pi_diff),
+        ("cfdiff", cf_diff),
+        ("contdiff", cont_diff),
+    ]:
         plt.figure(figsize=(6, 4))
         cs = plt.contourf(B.cpu().numpy(), Z.cpu().numpy(), arr, levels=30, cmap="viridis")
         plt.colorbar(cs)
@@ -465,4 +538,42 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
     plt.legend()
     plt.tight_layout()
     plt.savefig(figs_dir / f"ep{ep}_macro_delta_lnc.png", dpi=150)
+    plt.close()
+
+
+def plot_firm_b_window_distribution(
+    df_firm: pd.DataFrame,
+    base_dir: Path,
+    filename: str = "final_b_hist_t50_t150_parent.png",
+    t_min: int = 50,
+    t_max: int = 150,
+) -> None:
+    if df_firm is None or df_firm.empty or "b" not in df_firm.columns or "t" not in df_firm.columns:
+        return
+
+    use_df = df_firm.copy()
+    if "branch" in use_df.columns:
+        if (use_df["branch"] < 0).any():
+            use_df = use_df[use_df["branch"] < 0].copy()
+        else:
+            use_df = use_df[use_df["branch"] == 0].copy()
+
+    use_df = use_df[(use_df["t"] >= t_min) & (use_df["t"] <= t_max)].copy()
+    if use_df.empty:
+        return
+
+    b = pd.to_numeric(use_df["b"], errors="coerce").dropna()
+    if b.empty:
+        return
+
+    figs_dir = base_dir / "experiments" / "figs"
+    figs_dir.mkdir(parents=True, exist_ok=True)
+
+    plt.figure(figsize=(6, 4))
+    b.hist(bins=50)
+    plt.title(f"b distribution (parent firm states, t={t_min}-{t_max})")
+    plt.xlabel("b")
+    plt.ylabel("count")
+    plt.tight_layout()
+    plt.savefig(figs_dir / filename, dpi=150)
     plt.close()

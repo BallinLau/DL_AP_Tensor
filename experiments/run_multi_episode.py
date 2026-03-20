@@ -40,6 +40,7 @@ from experiments.run_utils import (  # noqa: E402
     plot_surfaces,
     plot_distributions,
     plot_macro_series,
+    plot_firm_b_window_distribution,
 )
 
 # Per-run cache directory (set in main). Lives outside code tree at ROOT.parent / cachedir.
@@ -206,7 +207,14 @@ def main():
             "hatcf": parent_df["Hatcf"].median(),
             "lnkf": parent_df["LnKF"].median(),
         }
-        plot_surfaces(ep, models["policy_value"], ref_state, device, get_base_dir())
+        plot_surfaces(
+            ep,
+            models["policy_value"],
+            models.get("sdf_fc1"),
+            ref_state,
+            device,
+            get_base_dir(),
+        )
         plot_distributions(
             ep,
             episode.df,
@@ -240,6 +248,7 @@ def main():
     df_firm_sim.to_pickle(out_dir / "final_simulate_firm.pkl")
     df_macro_sim.to_pickle(out_dir / "final_simulate_macro.pkl")
     plot_macro_series(-1, df_macro_sim, get_base_dir())
+    plot_firm_b_window_distribution(df_firm_sim, get_base_dir())
 
 
 if __name__ == "__main__":

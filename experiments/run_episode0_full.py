@@ -27,6 +27,7 @@ sys.path.append(str(ROOT))
 
 from config import Config, HyperParams  # noqa: E402
 from models import SDFFC1Combined, PolicyValueModel, FC2Model  # noqa: E402
+from losses import P0Loss, PILoss  # noqa: E402
 from training.episode import Episode  # noqa: E402
 from data.simulate_ts import SimulateTS  # noqa: E402
 
@@ -150,7 +151,58 @@ def save_stage_df(episode_idx: int, name: str, df_firm: pd.DataFrame = None, df_
         df_macro.to_pickle(out_dir / f"episode{episode_idx}_stage_{name}_macro.pkl")
 
 
-def plot_surfaces(pv_model: PolicyValueModel, ref_state: dict, device: torch.device):
+def _compute_policy_diagnostic_surfaces(
+    pv_model: PolicyValueModel,
+    sdf_model: SDFFC1Combined | None,
+    base: torch.Tensor,
+):
+    p0_loss = P0Loss()
+    pi_loss = PILoss()
+
+    out = pv_model(base)
+    bp0 = out.bp0
+    bpI = out.bpI
+
+    child_p0_state = base.clone()
+    child_p0_state[:, 0:1] = bp0
+    child_pI_state = base.clone()
+    child_pI_state[:, 0:1] = bpI
+
+    out_p0_child = pv_model(child_p0_state)
+    out_pI_child = pv_model(child_pI_state)
+
+    x = base[:, 4:5]
+    z = base[:, 1:2]
+    b = base[:, 0:1]
+    i = base[:, 3:4]
+    eta = base[:, 2:3]
+
+    cf0 = p0_loss.compute_cashflow_p0(x, z, b, out.Q, out_p0_child.Q, eta)
+    cfi = pi_loss.compute_cashflow_pi(x, z, b, i, out.Q, out_pI_child.Q, eta)
+
+    if sdf_model is not None:
+        _, _, m_next, _, _ = sdf_model.forward_step(
+            x_prev=base[:, 4:5],
+            x_curr=base[:, 4:5],
+            hatcf_prev=base[:, 5:6],
+            lnkf_prev=base[:, 6:7],
+            return_physical=True,
+        )
+    else:
+        m_next = torch.ones_like(out.P0)
+
+    cont0 = m_next * out_p0_child.P * (1.0 - out_p0_child.bar_z)
+    contI = Config.G * m_next * out_pI_child.P * (1.0 - out_pI_child.bar_z)
+
+    diagnostics = {
+        "pidiff": out.PI - out.P0,
+        "cfdiff": cfi - cf0,
+        "contdiff": contI - cont0,
+    }
+    return out, diagnostics
+
+
+def plot_surfaces(pv_model: PolicyValueModel, sdf_model: SDFFC1Combined | None, ref_state: dict, device: torch.device):
     """Plot P0/PI/bp/Q heatmaps (b as x, z as y) and 3D surfaces."""
     b_grid = torch.linspace(0, 1, 50, device=device)
     z_grid = torch.linspace(-1, 1, 50, device=device)
@@ -169,14 +221,25 @@ def plot_surfaces(pv_model: PolicyValueModel, ref_state: dict, device: torch.dev
         dim=1,
     )
     with torch.no_grad():
-        out = pv_model(base)
+        out, diagnostics = _compute_policy_diagnostic_surfaces(pv_model, sdf_model, base)
         P0 = out.P0.reshape(B.shape).cpu().numpy()
         PI = out.PI.reshape(B.shape).cpu().numpy()
         bp = out.bp.reshape(B.shape).cpu().numpy()
         Q = out.Q.reshape(B.shape).cpu().numpy()
+        pi_diff = diagnostics["pidiff"].reshape(B.shape).cpu().numpy()
+        cf_diff = diagnostics["cfdiff"].reshape(B.shape).cpu().numpy()
+        cont_diff = diagnostics["contdiff"].reshape(B.shape).cpu().numpy()
 
     figs_dir = ROOT / "experiments" / "figs"
-    for name, arr in [("p0", P0), ("pi", PI), ("bp", bp), ("q", Q)]:
+    for name, arr in [
+        ("p0", P0),
+        ("pi", PI),
+        ("bp", bp),
+        ("q", Q),
+        ("pidiff", pi_diff),
+        ("cfdiff", cf_diff),
+        ("contdiff", cont_diff),
+    ]:
         # Heatmap with b as x-axis, z as y-axis
         plt.figure(figsize=(6, 4))
         cs = plt.contourf(B.cpu().numpy(), Z.cpu().numpy(), arr, levels=30, cmap="viridis")
@@ -365,7 +428,7 @@ def main():
             "hatcf": parent_df["Hatcf"].median(),
             "lnkf": parent_df["LnKF"].median(),
         }
-        plot_surfaces(models["policy_value"], ref_state, device)
+        plot_surfaces(models["policy_value"], models.get("sdf_fc1"), ref_state, device)
         plot_distributions(episode.df, models["policy_value"], device, df_macro=episode.df_macro)
 
         all_summaries.append(
