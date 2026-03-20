@@ -1336,8 +1336,18 @@ class Episode:
         forecast_recon_weight = float(
             getattr(self.hyperparams, "fc1_forecast_recon_weight", 0.0)
         )
+        hatc_recon_inner_weight = float(
+            getattr(self.hyperparams, "fc1_hatc_recon_weight", 1.0)
+        )
+        lnk_recon_inner_weight = float(
+            getattr(self.hyperparams, "fc1_lnk_recon_weight", 1.0)
+        )
         recon_loss = torch.tensor(0.0, device=self.device)
         recon_loss_forecast = torch.tensor(0.0, device=self.device)
+        recon_loss_hatc = torch.tensor(0.0, device=self.device)
+        recon_loss_lnk = torch.tensor(0.0, device=self.device)
+        recon_loss_forecast_hatc = torch.tensor(0.0, device=self.device)
+        recon_loss_forecast_lnk = torch.tensor(0.0, device=self.device)
         if self.add_FC1loss:
             hatcf_pred = c_children  # (batch, 2, 1)
             lnkf_pred = k_children   # (batch, 2, 1)
@@ -1347,12 +1357,10 @@ class Episode:
                 # 带 M 列时，真值位于 8/9 列
                 hatcf_true = children_t[:, :, 8:9]
                 lnkf_true = children_t[:, :, 9:10]
-                recon_loss = ((hatcf_pred - hatcf_true).pow(2) + (lnkf_pred - lnkf_true).pow(2)).mean()
             elif children_t.shape[-1] >= 9:
                 # 旧布局（无 M 列）时，真值位于 7/8 列
                 hatcf_true = children_t[:, :, 7:8]
                 lnkf_true = children_t[:, :, 8:9]
-                recon_loss = ((hatcf_pred - hatcf_true).pow(2) + (lnkf_pred - lnkf_true).pow(2)).mean()
             else:
                 # 兼容旧批次格式（无完整 FC1 真值列）时跳过重建损失，避免空切片导致 NaN
                 logger.warning(
@@ -1361,6 +1369,16 @@ class Episode:
                     children_t.shape[-1]
                 )
                 recon_loss = torch.tensor(0.0, device=self.device)
+                hatcf_true = None
+                lnkf_true = None
+
+            if hatcf_true is not None and lnkf_true is not None:
+                recon_loss_hatc = (hatcf_pred - hatcf_true).pow(2).mean()
+                recon_loss_lnk = (lnkf_pred - lnkf_true).pow(2).mean()
+                recon_loss = (
+                    hatc_recon_inner_weight * recon_loss_hatc
+                    + lnk_recon_inner_weight * recon_loss_lnk
+                )
 
             # 额外加一条 forecast-state 闭环监督：
             # 用 (Hatcf_t, LnKF_t) 做当前态输入，直接约束下一期预测贴近真实值。
@@ -1377,16 +1395,26 @@ class Episode:
                     lnkf_prev=parent[:, 6:7],
                     return_physical=True
                 )
+                recon_loss_forecast_hatc = (c_children_forecast - hatcf_true).pow(2).mean()
+                recon_loss_forecast_lnk = (k_children_forecast - lnkf_true).pow(2).mean()
                 recon_loss_forecast = (
-                    (c_children_forecast - hatcf_true).pow(2)
-                    + (k_children_forecast - lnkf_true).pow(2)
-                ).mean()
+                    hatc_recon_inner_weight * recon_loss_forecast_hatc
+                    + lnk_recon_inner_weight * recon_loss_forecast_lnk
+                )
         if not torch.isfinite(recon_loss):
             logger.warning("Non-finite recon loss detected. Replace with 0.0 for stability.")
             recon_loss = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(recon_loss_forecast):
             logger.warning("Non-finite forecast recon loss detected. Replace with 0.0 for stability.")
             recon_loss_forecast = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(recon_loss_hatc):
+            recon_loss_hatc = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(recon_loss_lnk):
+            recon_loss_lnk = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(recon_loss_forecast_hatc):
+            recon_loss_forecast_hatc = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(recon_loss_forecast_lnk):
+            recon_loss_forecast_lnk = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(mean_anchor_loss):
             logger.warning("Non-finite mean-anchor loss detected. Replace with 0.0 for stability.")
             mean_anchor_loss = torch.tensor(0.0, device=self.device)
@@ -1425,7 +1453,11 @@ class Episode:
                 'sdf_main_loss': float(main_loss.detach().item()),
                 'sdf_moment_loss': float(moment_loss.detach().item()),
                 'sdf_recon_loss': float(recon_loss.detach().item()),
+                'sdf_recon_loss_hatc': float(recon_loss_hatc.detach().item()),
+                'sdf_recon_loss_lnk': float(recon_loss_lnk.detach().item()),
                 'sdf_recon_loss_forecast': float(recon_loss_forecast.detach().item()),
+                'sdf_recon_loss_forecast_hatc': float(recon_loss_forecast_hatc.detach().item()),
+                'sdf_recon_loss_forecast_lnk': float(recon_loss_forecast_lnk.detach().item()),
                 'sdf_mean_anchor_loss': float(mean_anchor_loss.detach().item()),
                 'sdf_mean_anchor_weight': float(mean_anchor_weight_eff),
                 'sdf_mean_anchor_target': (
@@ -1433,6 +1465,8 @@ class Episode:
                 ),
                 'sdf_moment_weight': float(moment_weight_eff),
                 'sdf_forecast_recon_weight': float(forecast_recon_weight),
+                'sdf_hatc_recon_inner_weight': float(hatc_recon_inner_weight),
+                'sdf_lnk_recon_inner_weight': float(lnk_recon_inner_weight),
                 'sdf_hj_warmup_factor': float(hj_warmup_factor),
                 'sdf_teacher_forcing_stage': float(1.0 if self._fc1_teacher_forcing_stage else 0.0),
                 'sdf_use_true_prev_macro': float(1.0 if use_true_prev_macro else 0.0),

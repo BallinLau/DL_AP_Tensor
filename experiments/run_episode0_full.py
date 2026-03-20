@@ -121,6 +121,11 @@ def build_hyperparams():
     hp.w_pi = 1.0
     hp.w_q = 1.0
     hp.w_fc2 = 1.0
+    hp.fc1_recon_weight = 0.0
+    hp.fc1_forecast_recon_weight = 1.0
+    hp.fc1_hatc_recon_weight = 1.0
+    hp.fc1_lnk_recon_weight = 0.25
+    hp.fc1_use_true_macro_state_in_stage2 = False
     return hp
 
 

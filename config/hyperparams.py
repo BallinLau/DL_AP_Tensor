@@ -118,6 +118,10 @@ class HyperParams:
     # Stage2 额外约束 forecast-state 递推：
     # (Hatcf_t, LnKF_t) -> (Hatcf_{t+1}, LnKF_{t+1}) 也要贴近真实下一期
     fc1_forecast_recon_weight: float = 1.0
+    # FC1 重建项内部按目标拆分权重。
+    # 经验上 LnK 的原始尺度波动更大，若不单独降权，容易主导 FC1 训练并把 M 分布拉坏。
+    fc1_hatc_recon_weight: float = 1.0
+    fc1_lnk_recon_weight: float = 0.25
     # Stage2 先做若干轮 FC1 teacher forcing 预训练（使用真实 Hatc_t/LnK_t 输入）
     fc1_teacher_forcing_epochs: int = 5
     fc1_teacher_forcing_weight: float = 1.0
