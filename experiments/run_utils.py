@@ -127,6 +127,7 @@ def build_hyperparams():
     hp.fc1_delta_penalty_weight = 10.0
     hp.fc1_delta_hatc_abs_max = 0.50
     hp.fc1_delta_lnk_abs_max = 0.30
+    hp.fc1_jacobian_penalty_weight = 1.0
     hp.fc1_use_true_macro_state_in_stage2 = False
     hp.sdf_stage1_lr = 1e-4
     hp.sdf_stage2_lr = 2e-4

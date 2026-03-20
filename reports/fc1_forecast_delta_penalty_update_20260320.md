@@ -247,3 +247,95 @@ delta_penalty =
 3. 若仍然异常
 
 如果 `M` 分布仍明显双峰或长尾，下一步再考虑加入更强的局部平滑项，例如 Jacobian / Lipschitz penalty，而不是马上上区域性符号约束。
+
+## 后续追加：Jacobian / 局部平滑约束
+
+在继续实验后，观察到：
+
+- 调强后的增量惩罚确实让 `child M` 分布有所改善
+- 但改善仍不足，分布依然呈现混合形态
+
+因此进一步追加了 `forecast-state` 的 Jacobian penalty，用来约束 `FC1` 响应面的局部陡峭度。
+
+### 新增超参数
+
+文件：
+
+- [config/hyperparams.py](/Users/ballinliu/Desktop/PHD/Project1/DL_AP_Tensor/config/hyperparams.py)
+
+新增：
+
+- `fc1_jacobian_penalty_weight = 1.0`
+
+### 约束形式
+
+在 forecast-state 输入下，记：
+
+```math
+\Delta \hat c = F_c(x_t, x_{t+1}, \hat c_t^f, \ln K_t^f)
+```
+
+```math
+\Delta \ln K = F_k(x_t, x_{t+1}, \hat c_t^f, \ln K_t^f)
+```
+
+则 Jacobian penalty 近似为：
+
+```math
+\mathcal L_{\text{jac}}^c
+=
+\left\|\frac{\partial \Delta \hat c}{\partial \hat c_t^f}\right\|^2
++
+\left\|\frac{\partial \Delta \hat c}{\partial \ln K_t^f}\right\|^2
+```
+
+```math
+\mathcal L_{\text{jac}}^k
+=
+\left\|\frac{\partial \Delta \ln K}{\partial \hat c_t^f}\right\|^2
++
+\left\|\frac{\partial \Delta \ln K}{\partial \ln K_t^f}\right\|^2
+```
+
+总项为：
+
+```math
+\mathcal L_{\text{jac}}
+=
+\omega_c \mathcal L_{\text{jac}}^c
++
+\omega_k \mathcal L_{\text{jac}}^k
+```
+
+其中当前沿用：
+
+- `ω_c = fc1_hatc_recon_weight = 1.0`
+- `ω_k = fc1_lnk_recon_weight = 0.25`
+
+### 经济解释
+
+这条约束并不规定：
+
+- 哪个区域 `Δhatcf` 必须为正
+- 哪个区域 `Δlnkf` 必须为小
+
+它只要求：
+
+- `FC1` 对当前 forecast state 的局部响应不要过于敏感
+
+如果 parent state 只发生很小扰动，child state 不应被立刻送进完全不同的 regime。
+
+### 为什么需要它
+
+前面的增量惩罚解决的是：
+
+- “一步跳得太远”
+
+而 Jacobian penalty 解决的是：
+
+- “即使跳得没有特别远，但响应面太陡，仍然会把相邻 parent state 映射到不同 child regime”
+
+因此，这两条约束是互补的：
+
+1. `delta penalty` 管幅度
+2. `jacobian penalty` 管局部形状

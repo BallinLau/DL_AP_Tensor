@@ -127,6 +127,9 @@ class HyperParams:
     fc1_delta_penalty_weight: float = 10.0
     fc1_delta_hatc_abs_max: float = 0.50
     fc1_delta_lnk_abs_max: float = 0.30
+    # Forecast-state 响应面局部平滑约束（Jacobian penalty）。
+    # 用于抑制 FC1 对 (hatcf_prev, lnkf_prev) 的过强局部敏感性，减少 child state regime splitting。
+    fc1_jacobian_penalty_weight: float = 1.0
     # Stage2 先做若干轮 FC1 teacher forcing 预训练（使用真实 Hatc_t/LnK_t 输入）
     fc1_teacher_forcing_epochs: int = 5
     fc1_teacher_forcing_weight: float = 1.0

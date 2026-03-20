@@ -1345,6 +1345,9 @@ class Episode:
         delta_penalty_weight = float(
             getattr(self.hyperparams, "fc1_delta_penalty_weight", 0.0)
         )
+        jacobian_penalty_weight = float(
+            getattr(self.hyperparams, "fc1_jacobian_penalty_weight", 0.0)
+        )
         delta_hatc_abs_max = float(
             getattr(self.hyperparams, "fc1_delta_hatc_abs_max", float("inf"))
         )
@@ -1360,6 +1363,9 @@ class Episode:
         delta_penalty = torch.tensor(0.0, device=self.device)
         delta_penalty_hatc = torch.tensor(0.0, device=self.device)
         delta_penalty_lnk = torch.tensor(0.0, device=self.device)
+        jacobian_penalty = torch.tensor(0.0, device=self.device)
+        jacobian_penalty_hatc = torch.tensor(0.0, device=self.device)
+        jacobian_penalty_lnk = torch.tensor(0.0, device=self.device)
         if self.add_FC1loss:
             hatcf_pred = c_children  # (batch, 2, 1)
             lnkf_pred = k_children   # (batch, 2, 1)
@@ -1400,11 +1406,13 @@ class Episode:
                 and parent.shape[1] >= 7
                 and children_t.shape[-1] >= 9
             ):
+                hatcf_prev_forecast = parent[:, 5:6].detach().clone().requires_grad_(True)
+                lnkf_prev_forecast = parent[:, 6:7].detach().clone().requires_grad_(True)
                 _, _, _, c_children_forecast, k_children_forecast = model.forward_step(
                     x_prev=parent[:, 4:5],
                     x_curr=children_t[:, :, 4:5],
-                    hatcf_prev=parent[:, 5:6],
-                    lnkf_prev=parent[:, 6:7],
+                    hatcf_prev=hatcf_prev_forecast,
+                    lnkf_prev=lnkf_prev_forecast,
                     return_physical=True
                 )
                 recon_loss_forecast_hatc = (c_children_forecast - hatcf_true).pow(2).mean()
@@ -1425,6 +1433,44 @@ class Episode:
                     hatc_recon_inner_weight * delta_penalty_hatc
                     + lnk_recon_inner_weight * delta_penalty_lnk
                 )
+
+                if jacobian_penalty_weight > 0.0:
+                    grad_hat_wrt_hat = torch.autograd.grad(
+                        c_children_forecast.sum(),
+                        hatcf_prev_forecast,
+                        create_graph=True,
+                        retain_graph=True,
+                    )[0]
+                    grad_hat_wrt_lnk = torch.autograd.grad(
+                        c_children_forecast.sum(),
+                        lnkf_prev_forecast,
+                        create_graph=True,
+                        retain_graph=True,
+                    )[0]
+                    grad_lnk_wrt_hat = torch.autograd.grad(
+                        k_children_forecast.sum(),
+                        hatcf_prev_forecast,
+                        create_graph=True,
+                        retain_graph=True,
+                    )[0]
+                    grad_lnk_wrt_lnk = torch.autograd.grad(
+                        k_children_forecast.sum(),
+                        lnkf_prev_forecast,
+                        create_graph=True,
+                        retain_graph=True,
+                    )[0]
+                    jacobian_penalty_hatc = (
+                        grad_hat_wrt_hat.pow(2).mean()
+                        + grad_hat_wrt_lnk.pow(2).mean()
+                    )
+                    jacobian_penalty_lnk = (
+                        grad_lnk_wrt_hat.pow(2).mean()
+                        + grad_lnk_wrt_lnk.pow(2).mean()
+                    )
+                    jacobian_penalty = (
+                        hatc_recon_inner_weight * jacobian_penalty_hatc
+                        + lnk_recon_inner_weight * jacobian_penalty_lnk
+                    )
         if not torch.isfinite(recon_loss):
             logger.warning("Non-finite recon loss detected. Replace with 0.0 for stability.")
             recon_loss = torch.tensor(0.0, device=self.device)
@@ -1445,6 +1491,12 @@ class Episode:
             delta_penalty_hatc = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(delta_penalty_lnk):
             delta_penalty_lnk = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(jacobian_penalty):
+            jacobian_penalty = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(jacobian_penalty_hatc):
+            jacobian_penalty_hatc = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(jacobian_penalty_lnk):
+            jacobian_penalty_lnk = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(mean_anchor_loss):
             logger.warning("Non-finite mean-anchor loss detected. Replace with 0.0 for stability.")
             mean_anchor_loss = torch.tensor(0.0, device=self.device)
@@ -1459,6 +1511,7 @@ class Episode:
                 recon_loss
                 + forecast_recon_weight * recon_loss_forecast
                 + delta_penalty_weight * delta_penalty
+                + jacobian_penalty_weight * jacobian_penalty
             )
             moment_weight_eff = 0.0
             mean_anchor_weight_eff = 0.0
@@ -1469,6 +1522,7 @@ class Episode:
                 + recon_weight * recon_loss
                 + forecast_recon_weight * recon_loss_forecast
                 + delta_penalty_weight * delta_penalty
+                + jacobian_penalty_weight * jacobian_penalty
                 + mean_anchor_weight_eff * mean_anchor_loss
             )
 
@@ -1494,6 +1548,9 @@ class Episode:
                 'sdf_delta_penalty': float(delta_penalty.detach().item()),
                 'sdf_delta_penalty_hatc': float(delta_penalty_hatc.detach().item()),
                 'sdf_delta_penalty_lnk': float(delta_penalty_lnk.detach().item()),
+                'sdf_jacobian_penalty': float(jacobian_penalty.detach().item()),
+                'sdf_jacobian_penalty_hatc': float(jacobian_penalty_hatc.detach().item()),
+                'sdf_jacobian_penalty_lnk': float(jacobian_penalty_lnk.detach().item()),
                 'sdf_mean_anchor_loss': float(mean_anchor_loss.detach().item()),
                 'sdf_mean_anchor_weight': float(mean_anchor_weight_eff),
                 'sdf_mean_anchor_target': (
@@ -1506,6 +1563,7 @@ class Episode:
                 'sdf_delta_penalty_weight': float(delta_penalty_weight),
                 'sdf_delta_hatc_abs_max': float(delta_hatc_abs_max),
                 'sdf_delta_lnk_abs_max': float(delta_lnk_abs_max),
+                'sdf_jacobian_penalty_weight': float(jacobian_penalty_weight),
                 'sdf_hj_warmup_factor': float(hj_warmup_factor),
                 'sdf_teacher_forcing_stage': float(1.0 if self._fc1_teacher_forcing_stage else 0.0),
                 'sdf_use_true_prev_macro': float(1.0 if use_true_prev_macro else 0.0),
