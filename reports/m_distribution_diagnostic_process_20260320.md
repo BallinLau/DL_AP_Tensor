@@ -1,0 +1,107 @@
+# `M` 分布异常诊断过程记录（2026-03-20）
+
+## 问题背景
+
+在多次 `modea` 训练后，`child macro states` 的 `M` 直方图表现出明显异常：
+
+- 不是围绕 `1` 附近的小幅波动
+- 存在低 `M` 堆积
+- 同时又有较厚的中高值区域和长尾
+
+这与理论上期望的“单峰、均值接近 `0.98` 的正值分布”不一致。
+
+## 诊断步骤
+
+### 1. 排除画图口径问题
+
+先后修正了以下可视化问题：
+
+1. `M` 直方图不再混入 firm panel 的重复计数，改为直接使用 `df_macro["M"]`
+2. `M` 主图与 `parent/child` 分开
+3. `bp` 只画真正的 parent states
+
+修正后，异常分布依然存在，因此问题不在画图。
+
+### 2. 确认 `SimulateTS` 中 `M` 的递推口径
+
+检查发现，模拟里原先会把 `state["hatcf"] / state["lnkf"]` 回写成 realized `Hatc/LnK`。
+
+这会导致：
+
+- `M` 不再纯粹来自 forecast-state 递推
+- child `M` 的解释混杂了 forecast state 与 realized macro
+
+后续已改为：
+
+- `M` 只来自 `state["hatcf"] / state["lnkf"]`
+- realized `Hatc/LnK` 只写入输出表，不回写到状态
+
+### 3. 用 `ep3_stage_modea_macro.pkl` 做 child-state 分组
+
+对 [ep3_stage_modea_macro.pkl](/Users/ballinliu/Desktop/ep3_stage_modea_macro.pkl) 的 child macro states 按 `M` 分组后，发现：
+
+- `M` 的均值并不一定错，但形状明显裂开
+- 不同 `M` 组的 `hatcf / lnkf` 呈现明显不同的 regime
+
+### 4. 配对 parent-child，检查一步增量
+
+将 child macro state 与对应 parent state 配对后，发现：
+
+- 低 `M` 区域的 `ΔlnK` 偏大
+- 高 `M` 区域的 `Δhatcf` 偏大
+- 整体不是一个平滑的小扰动递推，而是一个明显 state-dependent 的分裂映射
+
+### 5. 直接扫描 `ep3_sdf_fc1.pt` 的响应面
+
+固定 `x_t, x_{t+1}` 在均值附近，对 `(hatcf_prev, lnkf_prev)` 网格做 one-step 扫描：
+
+- 当 `hatcf_prev` 较高、`lnkf_prev` 较低时，会出现
+  - `Δhatcf < 0`
+  - `Δlnkf` 偏大
+  - 指数项很负
+  - `M` 被压到接近 0
+
+- 当 `hatcf_prev` 很低、`lnkf_prev` 较高时，会出现
+  - `Δhatcf` 很大且为正
+  - `M` 被推高
+
+## 关键结论
+
+### 结论 1：问题不在 parent 初始分布
+
+`parent` 的整体分布仍然接近初始化时的高斯分布：
+
+- `hatcf ~ N(-2, 1)` 附近
+- `lnkf ~ N(4, 1)` 附近
+
+因此，不是 parent 被“中途改坏”。
+
+### 结论 2：问题在 `parent -> child` 的 forecast-state 映射
+
+同一个接近高斯的 parent 分布，经过当前 `FC1/SDF` 一步映射后，被送进了多个不同的 child regime。
+
+也就是说，异常的不是初始分布，而是响应面本身。
+
+### 结论 3：`M` 的主导项是指数项，不是 `ratio`
+
+将 `M` 分解后发现：
+
+- `corr(M, exponent_term)` 高于 `corr(M, ratio_term)`
+- `ratio` 有作用，但不是第一主因
+
+因此，child `M` 的异常主要来自：
+
+```math
+\exp(-4 \Delta \ln K + 3 \Delta \hat c)
+```
+
+这部分在不同 parent 区域上给出了完全不同的动态。
+
+## 由此得到的修正方向
+
+不再优先从“均值锚”或“分布图展示”入手，而是直接约束一步 forecast-state 递推：
+
+1. 对 `Hatc/LnK` 重建项拆分并下调 `LnK` 的内部权重
+2. 对 `forecast-state` 的一步增量幅度加约束
+
+第二条的目标不是硬编码经济方向，而是避免单步递推过大，把 child 状态撕裂成多个 regime。

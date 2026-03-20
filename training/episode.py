@@ -1342,12 +1342,24 @@ class Episode:
         lnk_recon_inner_weight = float(
             getattr(self.hyperparams, "fc1_lnk_recon_weight", 1.0)
         )
+        delta_penalty_weight = float(
+            getattr(self.hyperparams, "fc1_delta_penalty_weight", 0.0)
+        )
+        delta_hatc_abs_max = float(
+            getattr(self.hyperparams, "fc1_delta_hatc_abs_max", float("inf"))
+        )
+        delta_lnk_abs_max = float(
+            getattr(self.hyperparams, "fc1_delta_lnk_abs_max", float("inf"))
+        )
         recon_loss = torch.tensor(0.0, device=self.device)
         recon_loss_forecast = torch.tensor(0.0, device=self.device)
         recon_loss_hatc = torch.tensor(0.0, device=self.device)
         recon_loss_lnk = torch.tensor(0.0, device=self.device)
         recon_loss_forecast_hatc = torch.tensor(0.0, device=self.device)
         recon_loss_forecast_lnk = torch.tensor(0.0, device=self.device)
+        delta_penalty = torch.tensor(0.0, device=self.device)
+        delta_penalty_hatc = torch.tensor(0.0, device=self.device)
+        delta_penalty_lnk = torch.tensor(0.0, device=self.device)
         if self.add_FC1loss:
             hatcf_pred = c_children  # (batch, 2, 1)
             lnkf_pred = k_children   # (batch, 2, 1)
@@ -1401,6 +1413,18 @@ class Episode:
                     hatc_recon_inner_weight * recon_loss_forecast_hatc
                     + lnk_recon_inner_weight * recon_loss_forecast_lnk
                 )
+                d_hatcf_forecast = c_children_forecast - parent[:, 5:6].unsqueeze(1)
+                d_lnkf_forecast = k_children_forecast - parent[:, 6:7].unsqueeze(1)
+                delta_penalty_hatc = torch.relu(
+                    d_hatcf_forecast.abs() - delta_hatc_abs_max
+                ).pow(2).mean()
+                delta_penalty_lnk = torch.relu(
+                    d_lnkf_forecast.abs() - delta_lnk_abs_max
+                ).pow(2).mean()
+                delta_penalty = (
+                    hatc_recon_inner_weight * delta_penalty_hatc
+                    + lnk_recon_inner_weight * delta_penalty_lnk
+                )
         if not torch.isfinite(recon_loss):
             logger.warning("Non-finite recon loss detected. Replace with 0.0 for stability.")
             recon_loss = torch.tensor(0.0, device=self.device)
@@ -1415,6 +1439,12 @@ class Episode:
             recon_loss_forecast_hatc = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(recon_loss_forecast_lnk):
             recon_loss_forecast_lnk = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(delta_penalty):
+            delta_penalty = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(delta_penalty_hatc):
+            delta_penalty_hatc = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(delta_penalty_lnk):
+            delta_penalty_lnk = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(mean_anchor_loss):
             logger.warning("Non-finite mean-anchor loss detected. Replace with 0.0 for stability.")
             mean_anchor_loss = torch.tensor(0.0, device=self.device)
@@ -1426,7 +1456,9 @@ class Episode:
         if bool(getattr(self, "_fc1_teacher_forcing_stage", False)) and self.add_FC1loss:
             teacher_weight = float(getattr(self.hyperparams, "fc1_teacher_forcing_weight", 1.0))
             total_sdf_loss = teacher_weight * (
-                recon_loss + forecast_recon_weight * recon_loss_forecast
+                recon_loss
+                + forecast_recon_weight * recon_loss_forecast
+                + delta_penalty_weight * delta_penalty
             )
             moment_weight_eff = 0.0
             mean_anchor_weight_eff = 0.0
@@ -1436,6 +1468,7 @@ class Episode:
                 + moment_weight_eff * moment_loss
                 + recon_weight * recon_loss
                 + forecast_recon_weight * recon_loss_forecast
+                + delta_penalty_weight * delta_penalty
                 + mean_anchor_weight_eff * mean_anchor_loss
             )
 
@@ -1458,6 +1491,9 @@ class Episode:
                 'sdf_recon_loss_forecast': float(recon_loss_forecast.detach().item()),
                 'sdf_recon_loss_forecast_hatc': float(recon_loss_forecast_hatc.detach().item()),
                 'sdf_recon_loss_forecast_lnk': float(recon_loss_forecast_lnk.detach().item()),
+                'sdf_delta_penalty': float(delta_penalty.detach().item()),
+                'sdf_delta_penalty_hatc': float(delta_penalty_hatc.detach().item()),
+                'sdf_delta_penalty_lnk': float(delta_penalty_lnk.detach().item()),
                 'sdf_mean_anchor_loss': float(mean_anchor_loss.detach().item()),
                 'sdf_mean_anchor_weight': float(mean_anchor_weight_eff),
                 'sdf_mean_anchor_target': (
@@ -1467,6 +1503,9 @@ class Episode:
                 'sdf_forecast_recon_weight': float(forecast_recon_weight),
                 'sdf_hatc_recon_inner_weight': float(hatc_recon_inner_weight),
                 'sdf_lnk_recon_inner_weight': float(lnk_recon_inner_weight),
+                'sdf_delta_penalty_weight': float(delta_penalty_weight),
+                'sdf_delta_hatc_abs_max': float(delta_hatc_abs_max),
+                'sdf_delta_lnk_abs_max': float(delta_lnk_abs_max),
                 'sdf_hj_warmup_factor': float(hj_warmup_factor),
                 'sdf_teacher_forcing_stage': float(1.0 if self._fc1_teacher_forcing_stage else 0.0),
                 'sdf_use_true_prev_macro': float(1.0 if use_true_prev_macro else 0.0),

@@ -124,6 +124,9 @@ def build_hyperparams():
     hp.fc1_forecast_recon_weight = 1.0
     hp.fc1_hatc_recon_weight = 1.0
     hp.fc1_lnk_recon_weight = 0.25
+    hp.fc1_delta_penalty_weight = 1.0
+    hp.fc1_delta_hatc_abs_max = 0.75
+    hp.fc1_delta_lnk_abs_max = 0.35
     hp.fc1_use_true_macro_state_in_stage2 = False
     hp.sdf_stage1_lr = 1e-4
     hp.sdf_stage2_lr = 2e-4
