@@ -124,9 +124,9 @@ class HyperParams:
     fc1_lnk_recon_weight: float = 0.25
     # Forecast-state 一步增量幅度约束。
     # 不预设方向，只惩罚过大的单步跳跃，避免递推响应面把 child state 撕裂成多个 regime。
-    fc1_delta_penalty_weight: float = 1.0
-    fc1_delta_hatc_abs_max: float = 0.75
-    fc1_delta_lnk_abs_max: float = 0.35
+    fc1_delta_penalty_weight: float = 10.0
+    fc1_delta_hatc_abs_max: float = 0.50
+    fc1_delta_lnk_abs_max: float = 0.30
     # Stage2 先做若干轮 FC1 teacher forcing 预训练（使用真实 Hatc_t/LnK_t 输入）
     fc1_teacher_forcing_epochs: int = 5
     fc1_teacher_forcing_weight: float = 1.0

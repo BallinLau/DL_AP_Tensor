@@ -42,9 +42,14 @@
 
 新增：
 
-- `fc1_delta_penalty_weight = 1.0`
-- `fc1_delta_hatc_abs_max = 0.75`
-- `fc1_delta_lnk_abs_max = 0.35`
+- 初始版本：
+  - `fc1_delta_penalty_weight = 1.0`
+  - `fc1_delta_hatc_abs_max = 0.75`
+  - `fc1_delta_lnk_abs_max = 0.35`
+- 调强后的版本：
+  - `fc1_delta_penalty_weight = 10.0`
+  - `fc1_delta_hatc_abs_max = 0.50`
+  - `fc1_delta_lnk_abs_max = 0.30`
 
 解释：
 
@@ -54,7 +59,7 @@
 
 #### 为什么选 `0.75` 和 `0.35`
 
-这两个阈值不是理论常数，而是基于当前 `ep3` 诊断结果给出的 first-pass calibration。
+这些阈值不是理论常数，而是基于当前 `ep3` 诊断结果给出的 first-pass calibration。
 
 对 [ep3_stage_modea_macro.pkl](/Users/ballinliu/Desktop/ep3_stage_modea_macro.pkl) 的 child macro states 分组后，发现：
 
@@ -81,7 +86,7 @@
 - `low M` 区域常伴随 `Δhatcf < 0` 且 `Δlnkf` 偏大
 - `high M` 区域常伴随很大的正 `Δhatcf`
 
-因此，本次阈值的设计原则是：
+因此，初始版阈值的设计原则是：
 
 1. 不压正常小波动
 2. 只抑制明显过猛的一步跳跃
@@ -93,6 +98,61 @@
 - teacher-forcing 阶段 `Δlnkf` 的经验分位数（如 p90）
 
 这样可以把当前手工阈值替换为完全数据驱动的阈值。
+
+## 为什么又进一步调强
+
+在加入初始版增量惩罚后，检查新日志 [dl_tensor_high_mem_output.278534](/Users/ballinliu/Desktop/dl_tensor_high_mem_output.278534) 发现：
+
+- `sdf_delta_penalty` 已经不是 0，说明罚项确实触发了
+- 但 `child M` 分布仍然没有明显改善
+
+具体地，`stage2` 末期日志显示：
+
+- `sdf_delta_penalty ≈ 0.185`
+- `sdf_delta_penalty_hatc ≈ 0.178`
+- `sdf_delta_penalty_lnk ≈ 0.026`
+
+同时：
+
+- `sdf_moment_loss ≈ 1.825`
+- `sdf_moment_weight = 5.0`
+
+这意味着 moment 相关项对总损失的贡献大约在 `9` 左右，而增量惩罚只有 `0.185 × 1.0` 的量级。  
+换句话说，罚项虽然生效了，但被更强的 SDF 矩约束项淹没，难以真正改变递推映射。
+
+从同一份日志看，极端一步跳跃也仍然存在：
+
+- `sdf_dhatcf_p90 ≈ 1.51`
+- `sdf_dlnkf_p90 ≈ 0.62`
+
+而初始阈值只设在：
+
+- `|Δhatcf| <= 0.75`
+- `|Δlnkf| <= 0.35`
+
+说明：
+
+1. 超阈值现象很多
+2. 但原先的惩罚权重不够大
+3. 仅靠初始版参数，不足以在训练中与 moment/HJ 项竞争梯度
+
+因此本次把增量约束进一步调强为：
+
+- `fc1_delta_penalty_weight = 10.0`
+- `fc1_delta_hatc_abs_max = 0.50`
+- `fc1_delta_lnk_abs_max = 0.30`
+
+调整逻辑是：
+
+1. **提高权重**：让这条约束真正进入主导梯度量级，而不是只做边缘修正
+2. **收紧 `Hatc` 阈值**：因为日志显示当前主要超标的是 `Hatc`，不是 `LnK`
+3. **小幅收紧 `LnK` 阈值**：继续压制会拉坏 `M` 指数项的资本一步跳跃
+
+这次调强的目标不是追求“立刻得到完美分布”，而是先验证：
+
+- 增量惩罚在足够强时，是否真的能改变 child-state 递推形状
+
+如果调强后仍然无法明显改善 `M` 分布，那么下一步就不该继续只调参数，而应该上更结构性的响应面平滑约束。
 
 ### 2. 在 `stage2` 里对 forecast-state 输出加入增量惩罚
 
