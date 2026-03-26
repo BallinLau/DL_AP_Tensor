@@ -276,6 +276,105 @@ def plot_surfaces(pv_model: PolicyValueModel, sdf_model: SDFFC1Combined | None, 
         plt.close()
 
 
+def plot_bp_diagnostic_curves(
+    pv_model: PolicyValueModel,
+    sdf_model: SDFFC1Combined | None,
+    ref_state: dict,
+    device: torch.device,
+):
+    figs_dir = ROOT / "experiments" / "figs"
+    p0_loss = P0Loss()
+    pi_loss = PILoss()
+    target_states = [
+        ("safe", 0.10, 0.80),
+        ("mid", 0.35, 0.20),
+        ("risky", 0.60, -0.20),
+        ("distress", 0.80, -0.60),
+    ]
+    bp_grid = torch.linspace(0.0, 1.0, 201, device=device).unsqueeze(-1)
+
+    for label, b_val, z_val in target_states:
+        parent = torch.tensor(
+            [[b_val, z_val, ref_state["eta"], ref_state["i"], ref_state["x"], ref_state["hatcf"], ref_state["lnkf"]]],
+            device=device,
+            dtype=torch.float32,
+        )
+        with torch.no_grad():
+            parent_out = pv_model(parent)
+            if float(parent_out.P.item()) <= 0.0 or float(parent_out.bar_z.item()) >= 0.5:
+                continue
+
+            child = parent.repeat(bp_grid.shape[0], 1)
+            child[:, 0:1] = bp_grid
+            child_out = pv_model(child)
+
+            x = parent[:, 4:5].expand_as(bp_grid)
+            z = parent[:, 1:2].expand_as(bp_grid)
+            b = parent[:, 0:1].expand_as(bp_grid)
+            i = parent[:, 3:4].expand_as(bp_grid)
+            eta = parent[:, 2:3].expand_as(bp_grid)
+            q_parent = parent_out.Q.expand_as(bp_grid)
+
+            cf0 = p0_loss.compute_cashflow_p0(x, z, b, q_parent, child_out.Q, eta)
+            cfi = pi_loss.compute_cashflow_pi(x, z, b, i, q_parent, child_out.Q, eta)
+
+            if sdf_model is not None:
+                _, _, m_next, _, _ = sdf_model.forward_step(
+                    x_prev=parent[:, 4:5].expand_as(bp_grid),
+                    x_curr=parent[:, 4:5].expand_as(bp_grid),
+                    hatcf_prev=parent[:, 5:6].expand_as(bp_grid),
+                    lnkf_prev=parent[:, 6:7].expand_as(bp_grid),
+                    return_physical=True,
+                )
+            else:
+                m_next = torch.ones_like(bp_grid)
+
+            cont0 = m_next * child_out.P * (1.0 - child_out.bar_z)
+            contI = Config.G * m_next * child_out.P * (1.0 - child_out.bar_z)
+            v0_diag = cf0 + cont0
+            vi_diag = cfi + contI
+
+            bp_np = bp_grid.squeeze(-1).cpu().numpy()
+            q_np = child_out.Q.squeeze(-1).cpu().numpy()
+            p_np = child_out.P.squeeze(-1).cpu().numpy()
+            barz_np = child_out.bar_z.squeeze(-1).cpu().numpy()
+            v0_np = v0_diag.squeeze(-1).cpu().numpy()
+            vi_np = vi_diag.squeeze(-1).cpu().numpy()
+            bp0_star = float(parent_out.bp0.item())
+            bpI_star = float(parent_out.bpI.item())
+            bp_star = float(parent_out.bp.item())
+
+        fig, axes = plt.subplots(2, 2, figsize=(10, 7))
+        ax_q, ax_p, ax_barz, ax_v = axes.flatten()
+        ax_q.plot(bp_np, q_np, label="Q(bp)")
+        ax_q.set_title("Q(bp)")
+        ax_p.plot(bp_np, p_np, label="P_{t+1}(bp)", color="tab:green")
+        ax_p.set_title("P_{t+1}(bp)")
+        ax_barz.plot(bp_np, barz_np, label="bar_z_{t+1}(bp)", color="tab:red")
+        ax_barz.set_title("bar_z_{t+1}(bp)")
+        ax_v.plot(bp_np, v0_np, label="V0 diag(bp)", color="tab:blue")
+        ax_v.plot(bp_np, vi_np, label="VI diag(bp)", color="tab:orange")
+        ax_v.set_title("One-step V0/VI diagnostics")
+        for ax in axes.flatten():
+            ax.axvline(bp0_star, color="tab:blue", linestyle="--", linewidth=1, label="bp0*")
+            ax.axvline(bpI_star, color="tab:orange", linestyle="--", linewidth=1, label="bpI*")
+            ax.axvline(bp_star, color="black", linestyle=":", linewidth=1, label="bp*")
+            ax.set_xlabel("bp")
+            ax.grid(True, alpha=0.25)
+        handles, labels = ax_v.get_legend_handles_labels()
+        uniq = {}
+        for h, l in zip(handles, labels):
+            uniq.setdefault(l, h)
+        fig.legend(list(uniq.values()), list(uniq.keys()), loc="upper center", ncol=5, frameon=False)
+        fig.suptitle(
+            f"bp diagnostics: {label} state "
+            f"(b={b_val:.2f}, z={z_val:.2f}, P={float(parent_out.P.item()):.3f}, bar_z={float(parent_out.bar_z.item()):.3f})"
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
+        fig.savefig(figs_dir / f"bp_diag_{label}.png", dpi=150)
+        plt.close(fig)
+
+
 def plot_distributions(
     df: pd.DataFrame,
     pv_model: PolicyValueModel,
@@ -441,6 +540,7 @@ def main():
             "lnkf": parent_df["LnKF"].median(),
         }
         plot_surfaces(models["policy_value"], models.get("sdf_fc1"), ref_state, device)
+        plot_bp_diagnostic_curves(models["policy_value"], models.get("sdf_fc1"), ref_state, device)
         plot_distributions(episode.df, models["policy_value"], device, df_macro=episode.df_macro)
 
         all_summaries.append(

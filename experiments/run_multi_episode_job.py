@@ -31,6 +31,7 @@ from experiments.run_utils import (  # noqa: E402
     save_models,
     save_stage_df,
     plot_surfaces,
+    plot_bp_diagnostic_curves,
     plot_distributions,
     plot_macro_series,
     plot_firm_b_window_distribution,
@@ -200,6 +201,14 @@ def main():
             "lnkf": parent_df["LnKF"].median(),
         }
         plot_surfaces(
+            ep,
+            models["policy_value"],
+            models.get("sdf_fc1"),
+            ref_state,
+            device,
+            resolve_base_dir(run_root, ROOT),
+        )
+        plot_bp_diagnostic_curves(
             ep,
             models["policy_value"],
             models.get("sdf_fc1"),
