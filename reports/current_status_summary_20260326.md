@@ -170,6 +170,105 @@ P_t > 0 \quad \text{and} \quad \bar z_t < 0.5
 - 还是 continuation 被低估
 - 还是当期融资现金流项过强，压过了未来违约代价
 
+### 2.1.3 新增的 `argmax(V)` 与 `FOC/KKT` 截面该怎么看
+
+后续又在同一组 `bp` 诊断图中加入了：
+
+- `argmax V0`
+- `argmax VI`
+- `FOC0(bp)` / `FOCI(bp)`
+- `KKT0 point penalty` / `KKTI point penalty`
+
+它们的用途是：判断**网络给出的 `bp0* / bpI*`，到底是不是它自己训练目标意义下的最优解**。
+
+#### `argmax V0 / argmax VI`
+
+这里的：
+
+```math
+\arg\max_{bp} V0(bp), \qquad \arg\max_{bp} VI(bp)
+```
+
+是用图中 one-step diagnostics 直接扫出来的数值最优点。
+
+如果观察到：
+
+- `bp0*` 很高
+- 但 `argmax V0` 很低
+
+或
+
+- `bpI*` 很高
+- 但 `argmax VI` 很低
+
+那么这说明：
+
+```math
+\text{网络输出的 } bp^* \text{ 并没有实现图上这条 value curve 的 argmax。}
+```
+
+这种情况下，问题已经不只是“高杠杆看起来不合理”，而是：
+
+- `bp` 头学到的 surrogate 目标
+- 与图里计算出来的值函数目标
+
+两者之间已经发生脱节。
+
+#### `FOC0(bp)` / `FOCI(bp)`
+
+这两条曲线现在直接复用了训练里的 FOC 定义：
+
+- `FOC0(bp)`：不投资分支的债务选择一阶条件
+- `FOCI(bp)`：投资分支的债务选择一阶条件
+
+它们不是随手构造的辅助量，而是训练中真正用于 `bp` 学习的对象。
+
+解读方式：
+
+- 若某个内点 `bp` 是最优点，理论上对应的 `FOC(bp)` 应接近 `0`
+- 若 `bp` 在下边界附近，理论上应满足下边界符号条件
+- 若 `bp` 在上边界附近，理论上应满足上边界符号条件
+
+因此：
+
+- 若 `bp*` 靠近 1，但 `FOC(bp)` 在那附近并不支持上边界最优
+- 或者 `FOC` 过零点与 `bp*` 相差很大
+
+就说明训练 surrogate 本身和网络输出并不一致。
+
+#### `KKT point penalty`
+
+这两个量把训练里真正使用的 KKT 逻辑按点展开出来：
+
+- `KKT0 point penalty`
+- `KKTI point penalty`
+
+它们越小，表示该 `bp` 越符合当前训练口径下的 KKT 条件。
+
+所以最重要的对比是：
+
+- `bp0* / bpI*` 是否落在 `KKT penalty` 较小的区域
+- `argmax V0 / argmax VI` 是否也在这些区域附近
+
+如果出现下面这种情况：
+
+- `bp*` 很高
+- `argmax V` 很低
+- `KKT penalty` 在高 `bp` 也不低
+
+那么可以直接判断：
+
+```math
+\text{当前 } bp \text{ 头既没有贴合 value argmax，也没有真正贴合训练的 KKT/FOC 结构。}
+```
+
+这时问题就不再只是经济解释，而是：
+
+- `bp` 输出头
+- 与训练损失 / surrogate
+
+之间的实现一致性本身出了问题。
+
 ### 2.2 `SimulateTS` 递推口径修正
 
 已经修正：

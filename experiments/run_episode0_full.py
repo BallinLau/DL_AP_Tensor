@@ -285,6 +285,7 @@ def plot_bp_diagnostic_curves(
     figs_dir = ROOT / "experiments" / "figs"
     p0_loss = P0Loss()
     pi_loss = PILoss()
+    hp = build_hyperparams()
     target_states = [
         ("safe", 0.10, 0.80),
         ("mid", 0.35, 0.20),
@@ -301,39 +302,74 @@ def plot_bp_diagnostic_curves(
         )
         with torch.no_grad():
             parent_out = pv_model(parent)
-            if float(parent_out.P.item()) <= 0.0 or float(parent_out.bar_z.item()) >= 0.5:
-                continue
+        if float(parent_out.P.item()) <= 0.0 or float(parent_out.bar_z.item()) >= 0.5:
+            continue
 
-            child = parent.repeat(bp_grid.shape[0], 1)
-            child[:, 0:1] = bp_grid
-            child_out = pv_model(child)
+        bp_var = bp_grid.clone().detach().requires_grad_(True)
+        child = parent.repeat(bp_var.shape[0], 1)
+        child[:, 0:1] = bp_var
+        child_out = pv_model(child)
 
-            x = parent[:, 4:5].expand_as(bp_grid)
-            z = parent[:, 1:2].expand_as(bp_grid)
-            b = parent[:, 0:1].expand_as(bp_grid)
-            i = parent[:, 3:4].expand_as(bp_grid)
-            eta = parent[:, 2:3].expand_as(bp_grid)
-            q_parent = parent_out.Q.expand_as(bp_grid)
+        x = parent[:, 4:5].expand_as(bp_var)
+        z = parent[:, 1:2].expand_as(bp_var)
+        b = parent[:, 0:1].expand_as(bp_var)
+        i = parent[:, 3:4].expand_as(bp_var)
+        eta = parent[:, 2:3].expand_as(bp_var)
+        q_parent = parent_out.Q.expand_as(bp_var)
 
-            cf0 = p0_loss.compute_cashflow_p0(x, z, b, q_parent, child_out.Q, eta)
-            cfi = pi_loss.compute_cashflow_pi(x, z, b, i, q_parent, child_out.Q, eta)
+        cf0 = p0_loss.compute_cashflow_p0(x, z, b, q_parent, child_out.Q, eta)
+        cfi = pi_loss.compute_cashflow_pi(x, z, b, i, q_parent, child_out.Q, eta)
 
+        with torch.no_grad():
             if sdf_model is not None:
                 _, _, m_next, _, _ = sdf_model.forward_step(
-                    x_prev=parent[:, 4:5].expand_as(bp_grid),
-                    x_curr=parent[:, 4:5].expand_as(bp_grid),
-                    hatcf_prev=parent[:, 5:6].expand_as(bp_grid),
-                    lnkf_prev=parent[:, 6:7].expand_as(bp_grid),
+                    x_prev=parent[:, 4:5].expand_as(bp_var),
+                    x_curr=parent[:, 4:5].expand_as(bp_var),
+                    hatcf_prev=parent[:, 5:6].expand_as(bp_var),
+                    lnkf_prev=parent[:, 6:7].expand_as(bp_var),
                     return_physical=True,
                 )
             else:
-                m_next = torch.ones_like(bp_grid)
+                m_next = torch.ones_like(bp_var)
 
-            cont0 = m_next * child_out.P * (1.0 - child_out.bar_z)
-            contI = Config.G * m_next * child_out.P * (1.0 - child_out.bar_z)
-            v0_diag = cf0 + cont0
-            vi_diag = cfi + contI
+        cont0 = m_next * child_out.P * (1.0 - child_out.bar_z)
+        contI = Config.G * m_next * child_out.P * (1.0 - child_out.bar_z)
+        v0_diag = cf0 + cont0
+        vi_diag = cfi + contI
 
+        use_phat_for_bp_foc = bool(getattr(hp, "bp_foc_use_phat_children", True))
+        p_child_for_foc = child_out.Phat if use_phat_for_bp_foc else child_out.P
+        foc0 = p0_loss.compute_foc_residual_from_bp(
+            CF0p=[cf0],
+            M_list=[m_next],
+            P_children=[p_child_for_foc],
+            bar_z_children=[child_out.bar_z],
+            bp=bp_var,
+            eta=[eta],
+        )[0]
+        foci = pi_loss.compute_foc_residual_from_bp(
+            CFip=[cfi],
+            M_list=[m_next],
+            P_children=[p_child_for_foc],
+            bar_z_children=[child_out.bar_z],
+            bp=bp_var,
+            eta=[eta],
+        )[0]
+
+        eps_default = float(getattr(hp, "kkt_boundary_eps", 0.02))
+        eps_low = getattr(hp, "kkt_boundary_eps_low", None)
+        eps_high = getattr(hp, "kkt_boundary_eps_high", None)
+        eps_low = eps_default if eps_low is None else float(eps_low)
+        eps_high = eps_default if eps_high is None else float(eps_high)
+        temp = float(getattr(hp, "kkt_boundary_temp", 40.0))
+        w_high_cfg = float(getattr(hp, "kkt_high_weight", 3.0))
+        w_low = torch.sigmoid(temp * (eps_low - bp_var))
+        w_high = torch.sigmoid(temp * (bp_var - (1.0 - eps_high)))
+        w_inner = (1.0 - w_low) * (1.0 - w_high)
+        kkt0_point = w_inner * foc0.pow(2) + w_low * torch.relu(foc0) + w_high * w_high_cfg * torch.relu(-foc0)
+        kkti_point = w_inner * foci.pow(2) + w_low * torch.relu(foci) + w_high * w_high_cfg * torch.relu(-foci)
+
+        with torch.no_grad():
             bp_np = bp_grid.squeeze(-1).cpu().numpy()
             q_np = child_out.Q.squeeze(-1).cpu().numpy()
             q_unit_np = (
@@ -347,12 +383,18 @@ def plot_bp_diagnostic_curves(
             contI_np = contI.squeeze(-1).cpu().numpy()
             v0_np = v0_diag.squeeze(-1).cpu().numpy()
             vi_np = vi_diag.squeeze(-1).cpu().numpy()
+            foc0_np = foc0.squeeze(-1).cpu().numpy()
+            foci_np = foci.squeeze(-1).cpu().numpy()
+            kkt0_np = kkt0_point.squeeze(-1).cpu().numpy()
+            kkti_np = kkti_point.squeeze(-1).cpu().numpy()
             bp0_star = float(parent_out.bp0.item())
             bpI_star = float(parent_out.bpI.item())
             bp_star = float(parent_out.bp.item())
+            bp_v0_argmax = float(bp_np[int(np.argmax(v0_np))])
+            bp_vi_argmax = float(bp_np[int(np.argmax(vi_np))])
 
-        fig, axes = plt.subplots(3, 2, figsize=(11, 10))
-        ax_q, ax_qunit, ax_p, ax_barz, ax_cf, ax_cont = axes.flatten()
+        fig, axes = plt.subplots(4, 2, figsize=(11, 13))
+        ax_q, ax_qunit, ax_p, ax_barz, ax_cf, ax_cont, ax_foc, ax_kkt = axes.flatten()
         ax_q.plot(bp_np, q_np, color="tab:blue")
         ax_q.set_title("Q(bp)")
         ax_qunit.plot(bp_np, q_unit_np, color="tab:purple")
@@ -371,6 +413,15 @@ def plot_bp_diagnostic_curves(
         ax_cont.plot(bp_np, contI_np, label="contI(bp)", color="tab:orange")
         ax_cont.set_title("Continuation terms")
         ax_cont.legend(frameon=False, fontsize=8)
+        ax_foc.plot(bp_np, foc0_np, label="FOC0(bp)", color="tab:blue")
+        ax_foc.plot(bp_np, foci_np, label="FOCI(bp)", color="tab:orange")
+        ax_foc.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+        ax_foc.set_title("Training FOC residuals")
+        ax_foc.legend(frameon=False, fontsize=8)
+        ax_kkt.plot(bp_np, kkt0_np, label="KKT0 point penalty", color="tab:blue")
+        ax_kkt.plot(bp_np, kkti_np, label="KKTI point penalty", color="tab:orange")
+        ax_kkt.set_title("Training KKT point penalties")
+        ax_kkt.legend(frameon=False, fontsize=8)
         for ax in axes.flatten():
             ax.axvline(bp0_star, color="tab:blue", linestyle="--", linewidth=1)
             ax.axvline(bpI_star, color="tab:orange", linestyle="--", linewidth=1)
@@ -384,7 +435,8 @@ def plot_bp_diagnostic_curves(
         fig.text(
             0.5,
             0.955,
-            f"bp0*={bp0_star:.3f}  |  bpI*={bpI_star:.3f}  |  bp*={bp_star:.3f}",
+            f"bp0*={bp0_star:.3f}  |  bpI*={bpI_star:.3f}  |  bp*={bp_star:.3f}  "
+            f"|  argmax V0={bp_v0_argmax:.3f}  |  argmax VI={bp_vi_argmax:.3f}",
             ha="center",
             va="top",
             fontsize=9,
