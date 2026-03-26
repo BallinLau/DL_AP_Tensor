@@ -371,59 +371,79 @@ def plot_bp_diagnostic_curves(
 
             bp_np = bp_grid.squeeze(-1).cpu().numpy()
             q_np = child_out.Q.squeeze(-1).cpu().numpy()
+            q_unit_np = (
+                child_out.Q.squeeze(-1) / torch.clamp_min(bp_grid.squeeze(-1), 1e-6)
+            ).cpu().numpy()
             p_np = child_out.P.squeeze(-1).cpu().numpy()
             barz_np = child_out.bar_z.squeeze(-1).cpu().numpy()
+            cf0_np = cf0.squeeze(-1).cpu().numpy()
+            cfi_np = cfi.squeeze(-1).cpu().numpy()
+            cont0_np = cont0.squeeze(-1).cpu().numpy()
+            contI_np = contI.squeeze(-1).cpu().numpy()
             v0_np = v0_diag.squeeze(-1).cpu().numpy()
             vi_np = vi_diag.squeeze(-1).cpu().numpy()
             bp0_star = float(parent_out.bp0.item())
             bpI_star = float(parent_out.bpI.item())
             bp_star = float(parent_out.bp.item())
 
-        fig, axes = plt.subplots(2, 2, figsize=(10, 7))
-        ax_q, ax_p, ax_barz, ax_v = axes.flatten()
+        fig, axes = plt.subplots(3, 2, figsize=(11, 10))
+        ax_q, ax_qunit, ax_p, ax_barz, ax_cf, ax_cont = axes.flatten()
 
-        ax_q.plot(bp_np, q_np, label="Q(bp)")
+        ax_q.plot(bp_np, q_np, color="tab:blue")
         ax_q.set_title("Q(bp)")
         ax_q.set_xlabel("bp")
         ax_q.set_ylabel("Q")
 
-        ax_p.plot(bp_np, p_np, label="P_{t+1}(bp)", color="tab:green")
+        ax_qunit.plot(bp_np, q_unit_np, color="tab:purple")
+        ax_qunit.set_title("q_unit(bp)=Q(bp)/bp")
+        ax_qunit.set_xlabel("bp")
+        ax_qunit.set_ylabel("q_unit")
+
+        ax_p.plot(bp_np, p_np, color="tab:green")
         ax_p.set_title("P_{t+1}(bp)")
         ax_p.set_xlabel("bp")
         ax_p.set_ylabel("P")
 
-        ax_barz.plot(bp_np, barz_np, label="bar_z_{t+1}(bp)", color="tab:red")
+        ax_barz.plot(bp_np, barz_np, color="tab:red")
         ax_barz.set_title("bar_z_{t+1}(bp)")
         ax_barz.set_xlabel("bp")
         ax_barz.set_ylabel("bar_z")
 
-        ax_v.plot(bp_np, v0_np, label="V0 diag(bp)", color="tab:blue")
-        ax_v.plot(bp_np, vi_np, label="VI diag(bp)", color="tab:orange")
-        ax_v.set_title("One-step V0/VI diagnostics")
-        ax_v.set_xlabel("bp")
-        ax_v.set_ylabel("value")
+        ax_cf.plot(bp_np, cf0_np, label="CF0(bp)", color="tab:blue")
+        ax_cf.plot(bp_np, cfi_np, label="CFI(bp)", color="tab:orange")
+        ax_cf.plot(bp_np, v0_np, label="V0 diag(bp)", color="tab:blue", linestyle="--", alpha=0.7)
+        ax_cf.plot(bp_np, vi_np, label="VI diag(bp)", color="tab:orange", linestyle="--", alpha=0.7)
+        ax_cf.set_title("Current cash flow and one-step V")
+        ax_cf.set_xlabel("bp")
+        ax_cf.set_ylabel("value")
+        ax_cf.legend(frameon=False, fontsize=8)
+
+        ax_cont.plot(bp_np, cont0_np, label="cont0(bp)", color="tab:blue")
+        ax_cont.plot(bp_np, contI_np, label="contI(bp)", color="tab:orange")
+        ax_cont.set_title("Continuation terms")
+        ax_cont.set_xlabel("bp")
+        ax_cont.set_ylabel("continuation")
+        ax_cont.legend(frameon=False, fontsize=8)
 
         for ax in axes.flatten():
-            ax.axvline(bp0_star, color="tab:blue", linestyle="--", linewidth=1, label="bp0*")
-            ax.axvline(bpI_star, color="tab:orange", linestyle="--", linewidth=1, label="bpI*")
-            ax.axvline(bp_star, color="black", linestyle=":", linewidth=1, label="bp*")
+            ax.axvline(bp0_star, color="tab:blue", linestyle="--", linewidth=1)
+            ax.axvline(bpI_star, color="tab:orange", linestyle="--", linewidth=1)
+            ax.axvline(bp_star, color="black", linestyle=":", linewidth=1)
             ax.grid(True, alpha=0.25)
 
-        handles, labels = ax_v.get_legend_handles_labels()
-        seen = set()
-        uniq_handles = []
-        uniq_labels = []
-        for h, l in zip(handles, labels):
-            if l not in seen:
-                seen.add(l)
-                uniq_handles.append(h)
-                uniq_labels.append(l)
-        fig.legend(uniq_handles, uniq_labels, loc="upper center", ncol=5, frameon=False)
         fig.suptitle(
             f"EP{ep} bp diagnostics: {label} state "
             f"(b={b_val:.2f}, z={z_val:.2f}, P={float(parent_out.P.item()):.3f}, bar_z={float(parent_out.bar_z.item()):.3f})"
         )
-        fig.tight_layout(rect=[0, 0, 1, 0.94])
+        fig.text(
+            0.5,
+            0.955,
+            f"bp0*={bp0_star:.3f}  |  bpI*={bpI_star:.3f}  |  bp*={bp_star:.3f}",
+            ha="center",
+            va="top",
+            fontsize=9,
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.92])
         fig.savefig(figs_dir / f"ep{ep}_bp_diag_{label}.png", dpi=150)
         plt.close(fig)
 
