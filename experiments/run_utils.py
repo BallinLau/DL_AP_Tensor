@@ -139,6 +139,7 @@ def build_hyperparams():
     # 先关闭 bp 的额外边界推进，避免 bp 长期贴到 1
     hp.bp_adaptive_enabled = False
     hp.bp_refine_steps_per_epoch = 0
+    hp.bp_foc_use_phat_children = False
     # P0/PI 对上游 M 的鲁棒化（避免 M 偏高直接抬高 P）
     hp.pv_use_clipped_m = True
     hp.pv_m_clamp_min = 0.7

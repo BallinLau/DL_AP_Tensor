@@ -215,9 +215,10 @@ class HyperParams:
     # 每个 epoch 增加若干 bp-only 精修步（仅更新 bp 相关头）
     bp_refine_steps_per_epoch: int = 0
     bp_refine_batch_cap: int = 32
-    # FOC/KKT 的 ∂P'/∂bp 是否使用 Phat'（避免 P=max(Phat,0) 在违约区梯度为0）
-    # 注意：仅影响梯度通道；Bellman 主方程仍使用 P（含显式 P=0 违约语义）
-    bp_foc_use_phat_children: bool = True
+    # FOC/KKT 的 ∂P'/∂bp 默认与 Bellman 主方程保持一致，直接使用 P'。
+    # 这样 surrogate 与实际 payoff 对齐，避免 bp 头沿着 Phat' 在违约区继续收到与 P=0 不一致的梯度。
+    # 若做对照实验，可临时改回 True，让 FOC/KKT 使用 Phat' 作为梯度通道。
+    bp_foc_use_phat_children: bool = False
 
     # ========== Episode 收敛判定（非 AIO Bellman 残差） ==========
     # 判定条件：Q/P0/PI 各自主残差的 mean(abs) 与 p90(abs) 同时过阈值

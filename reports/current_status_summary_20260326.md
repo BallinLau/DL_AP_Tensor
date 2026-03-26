@@ -269,6 +269,131 @@ P_t > 0 \quad \text{and} \quad \bar z_t < 0.5
 
 之间的实现一致性本身出了问题。
 
+### 2.1.4 `bp` 的真实 value 导数与训练 surrogate 并不相同
+
+后续在 safe-state 截面里进一步确认：
+
+- `argmax V0 = 0`
+- `argmax VI = 0`
+- 但网络输出的 `bp0* / bpI*` 仍可能落在明显更高的区域
+
+这说明当前 `bp` 头并不一定在实现：
+
+```math
+\arg\max_{bp} V_t(bp)
+```
+
+更准确地说，当前训练里的 `bp` surrogate 与真实 one-step value 的导数并不完全一致。
+
+若把当前分支的一步价值写成：
+
+```math
+V(bp)=CF(bp)+M(bp)\,P(bp)\,(1-\bar z(bp))
+```
+
+那么严格导数应为：
+
+```math
+\frac{dV}{dbp}
+=
+\frac{dCF}{dbp}
++
+\frac{dM}{dbp}P(1-\bar z)
++
+M(1-\bar z)\frac{dP}{dbp}
+-
+MP\frac{d\bar z}{dbp}
+```
+
+而当前实现里的训练 surrogate 更接近：
+
+```math
+FOC^{impl}(bp)
+=
+\frac{dCF}{dbp}
++
+M(1-\bar z)\frac{d\tilde P}{dbp}
+```
+
+其中：
+
+```math
+\tilde P=
+\begin{cases}
+\hat P, & \text{若 } bp\_foc\_use\_phat\_children=True \\
+P, & \text{若 } bp\_foc\_use\_phat\_children=False
+\end{cases}
+```
+
+因此 surrogate 相比真实导数，至少少了两项：
+
+```math
+\frac{dM}{dbp}P(1-\bar z)
+```
+
+和
+
+```math
+-MP\frac{d\bar z}{dbp}
+```
+
+同时在默认旧设置下，还把：
+
+```math
+\frac{dP}{dbp}
+```
+
+替换成了
+
+```math
+\frac{d\hat P}{dbp}
+```
+
+这会在 `\hat P<0`、而 `P=\max(0,\hat P)=0` 的区域带来最大的错配。
+
+因此当前我们看到的现象，本质上可以写成：
+
+```math
+\arg\max_{bp} V(bp) \neq \arg\max_{bp} \widetilde V(bp)
+```
+
+而网络输出的 `bp^*` 更可能被后者推动。
+
+### 2.1.5 当前最小修正：让 `bp` 的 FOC/KKT 先与 Bellman payoff 对齐
+
+基于上面的错配，当前 refactor 分支已经做了一个最小改动：
+
+```math
+bp\_foc\_use\_phat\_children = False
+```
+
+也就是先让 `bp` 的 FOC/KKT 通道默认改为使用：
+
+```math
+P_{t+1}
+```
+
+而不是：
+
+```math
+\hat P_{t+1}
+```
+
+这样做的目的不是一次性把 `bp` 训练完全修正，而是先消掉最明显的一层对象错配：
+
+- Bellman 主目标用的是 `P_{t+1}`
+- `bp` 的 surrogate 也先改成用 `P_{t+1}`
+
+这样至少保证：
+
+```math
+\text{value payoff object}
+\quad \text{和} \quad
+\text{bp surrogate object}
+```
+
+在最关键的 child-value 层面先一致起来。
+
 ### 2.2 `SimulateTS` 递推口径修正
 
 已经修正：
