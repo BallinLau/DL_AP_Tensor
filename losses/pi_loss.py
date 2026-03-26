@@ -5,8 +5,8 @@ PI Loss: 投资相关损失
 叠加 b>1 惩罚、z 值惩罚与单调性惩罚，确保投资决策合理性。
 
 支持任意数量的分支路径：
-- parent: (PI_t, CFip_t, ...) → t 期父节点
-- children: [(P_{t+1}^{(j)}, bar_z_{t+1}^{(j)}, ...)] → N 条模拟路径
+- parent: (VI_t, CFip_t, ...) → t 期父节点的 survival-conditioned invest value
+- children: [(P_{t+1}^{(j)}, bar_z_{t+1}^{(j)}, ...)] → N 条模拟路径上的下一期总股权价值
 
 L_PI = loss_bellman + loss_foc + mono_penalty
 """
@@ -30,7 +30,13 @@ from .utils import (
 
 class PILoss(nn.Module):
     """
-    PI（投资时股价）损失函数
+    PI（接口名保留）损失函数
+
+    语义上，这里的 `PI` 应解释为：
+    - 当前期仍存活条件下的投资价值 `VI`
+
+    而 Bellman RHS 使用的 `P_children` 是：
+    - 下一期总股权价值 `P_{t+1}`
     
     包含：
     - Bellman 残差损失
@@ -118,7 +124,9 @@ class PILoss(nn.Module):
         """
         计算投资 Bellman 残差（支持任意分支数）
         
-        loss^{(j)} = PI - CFip - g * M^{(j)} * P'^{(j)} * (1 - bar_z'^{(j)})
+        语义上：
+
+        loss^{(j)} = VI_t - CFip_t - g * M^{(j)} * P_{t+1}^{(j)} * (1 - bar_z_{t+1}^{(j)})
         """
         n_branches = len(P_children)
         if isinstance(CFip, (list, tuple)):

@@ -249,7 +249,9 @@ def plot_surfaces(
         P0 = out.P0.reshape(B.shape).cpu().numpy()
         PI = out.PI.reshape(B.shape).cpu().numpy()
         P = out.P.reshape(B.shape).cpu().numpy()
+        bar_i_cond = out.bar_i_cond.reshape(B.shape).cpu().numpy()
         bar_i = out.bar_i.reshape(B.shape).cpu().numpy()
+        chi = out.chi.reshape(B.shape).cpu().numpy()
         bar_z = out.bar_z.reshape(B.shape).cpu().numpy()
         bp = out.bp.reshape(B.shape).cpu().numpy()
         Q = out.Q.reshape(B.shape).cpu().numpy()
@@ -262,7 +264,9 @@ def plot_surfaces(
         ("p0", P0),
         ("pi", PI),
         ("p", P),
+        ("bari_cond", bar_i_cond),
         ("bari", bar_i),
+        ("chi", chi),
         ("barz", bar_z),
         ("bp", bp),
         ("q", Q),
@@ -271,7 +275,7 @@ def plot_surfaces(
         ("contdiff", cont_diff),
     ]:
         plot_arr = arr
-        if name in {"bari", "bp", "pidiff", "cfdiff", "contdiff"}:
+        if name in {"bari_cond", "bari", "chi", "bp", "pidiff", "cfdiff", "contdiff"}:
             plot_arr = np.where(survive_mask, arr, np.nan)
         plt.figure(figsize=(6, 4))
         cs = plt.contourf(B.cpu().numpy(), Z.cpu().numpy(), plot_arr, levels=30, cmap="viridis")

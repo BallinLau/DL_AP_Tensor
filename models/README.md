@@ -12,7 +12,18 @@ Firm-state (7D):
 ```
 
 ### Output (PolicyValueOutput)
-- `Q`, `bp0`, `bpI`, `P0`, `PI`, `bar_i`, `bar_z`, `P`, `Phat`, `bp`
+- Conditional-value split:
+  - `V0`, `VI`: survival-conditioned no-invest / invest values
+  - `Vhat`: conditional total value after integrating over `i`
+  - `chi`: current soft survival gate
+  - `bar_i_cond`: conditional investment weight
+  - `bar_i`: effective investment weight after gating by `chi`
+- Backward-compatible aliases:
+  - `P0 == V0`
+  - `PI == VI`
+  - `Phat == Vhat`
+- Existing outputs retained:
+  - `Q`, `bp0`, `bpI`, `bar_z`, `P`, `bp`
 
 ### Update rule
 `update_leverage(b_old, bp, eta)`:

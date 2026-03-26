@@ -59,7 +59,9 @@ class DummyPV(torch.nn.Module):
         q = (0.30 + 0.10 * torch.tanh(z) - 0.08 * b).clamp(min=0.0, max=1.0)
         p0 = (0.15 + 0.08 * torch.tanh(z) - 0.06 * b).clamp(min=0.0)
         pi = (0.18 + 0.09 * torch.tanh(z) - 0.05 * b).clamp(min=0.0)
-        bar_i = torch.sigmoid(0.10 + 0.20 * z)
+        bar_i_cond = torch.sigmoid(0.10 + 0.20 * z)
+        chi = 1.0 - torch.sigmoid(-1.00 + 1.20 * b - 0.30 * z)
+        bar_i = chi * bar_i_cond
         bar_z = torch.sigmoid(-1.00 + 1.20 * b - 0.30 * z)
         p = ((1 - bar_i) * p0 + bar_i * pi) * (1 - bar_z)
         bp0 = torch.sigmoid(-0.10 + 0.90 * b)
@@ -69,6 +71,11 @@ class DummyPV(torch.nn.Module):
             Q=q,
             bp0=bp0,
             bpI=bpI,
+            V0=p0,
+            VI=pi,
+            Vhat=p,
+            chi=chi,
+            bar_i_cond=bar_i_cond,
             P0=p0,
             PI=pi,
             bar_i=bar_i,

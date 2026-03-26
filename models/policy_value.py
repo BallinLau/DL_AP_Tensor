@@ -20,12 +20,17 @@ class PolicyValueOutput(NamedTuple):
     Q: torch.Tensor          # 债券价值
     bp0: torch.Tensor        # 不投资时杠杆候选
     bpI: torch.Tensor        # 投资时杠杆候选
-    P0: torch.Tensor         # 不投资时股票价值
-    PI: torch.Tensor         # 投资时股票价值
-    bar_i: torch.Tensor      # 投资门槛
+    V0: torch.Tensor         # 当前存活条件下，不投资价值
+    VI: torch.Tensor         # 当前存活条件下，投资价值
+    Vhat: torch.Tensor       # 对 i 积分后的条件总价值
+    chi: torch.Tensor        # 当前期软存活门
+    bar_i_cond: torch.Tensor # 条件投资门槛
+    P0: torch.Tensor         # 兼容旧接口：等同于 V0
+    PI: torch.Tensor         # 兼容旧接口：等同于 VI
+    bar_i: torch.Tensor      # 实际生效的投资权重（已乘 chi）
     bar_z: torch.Tensor      # 破产门槛
-    P: torch.Tensor          # 综合股票价值
-    Phat: torch.Tensor       # P hat (中间值)
+    P: torch.Tensor          # 无条件总股权价值
+    Phat: torch.Tensor       # 兼容旧接口：等同于 Vhat
     bp: torch.Tensor         # 综合杠杆候选
 
 
@@ -116,38 +121,45 @@ class PolicyValueModel(nn.Module):
         # SharedModel 输出
         Q, bp0, bpI = self.shared_model(firm_state)
         
-        # CombinedModel 输出
-        P0, PI, bar_i = self.combined_model(firm_state)
+        # CombinedModel 输出：当前存活条件下的两条价值与条件投资门槛
+        V0, VI, bar_i_cond = self.combined_model(firm_state)
 
-        # 计算 Phat/P，同时基于积分结果得到 bar_z（P>0 则 bar_z=0，否则=1）
-        Phat, P, bar_z = self.cal_phats(firm_state, P0, PI)
+        # 条件总价值 Vhat 与总股权价值/当前软存活门
+        Vhat, P, chi, bar_z = self.cal_phats(firm_state, V0, VI)
+        bar_i = chi * bar_i_cond
         bp = self.cal_bp(bp0, bpI, bar_i)
         
         return PolicyValueOutput(
             Q=Q,
             bp0=bp0,
             bpI=bpI,
-            P0=P0,
-            PI=PI,
+            V0=V0,
+            VI=VI,
+            Vhat=Vhat,
+            chi=chi,
+            bar_i_cond=bar_i_cond,
+            P0=V0,
+            PI=VI,
             bar_i=bar_i,
             bar_z=bar_z,
             P=P,
-            Phat=Phat,
+            Phat=Vhat,
             bp=bp
         )
     
     def cal_phats(
         self,
         firm_state: torch.Tensor,
-        P0: torch.Tensor,
-        PI: torch.Tensor,
+        V0: torch.Tensor,
+        VI: torch.Tensor,
         simulated_i: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        计算 Phat、P、bar_z
+        计算 Vhat、P、chi、bar_z
 
-        按 Cal_Phats 思路：保持其他状态不变，枚举 i 的若干取值，重新计算 (P0, PI)，对 max(P0, PI)
-        在 i 维度上求平均作为 Phat；再用平滑映射得到 P 与 bar_z，避免硬阈值导致梯度死区。
+        按 Cal_Phats 思路：保持其他状态不变，枚举 i 的若干取值，重新计算 (V0, VI)，对 max(V0, VI)
+        在 i 维度上求平均作为条件总价值 Vhat；再由 Vhat 构造当前期软存活门 chi，
+        并得到无条件总股权价值 P 与软违约概率代理 bar_z。
         """
         device = firm_state.device
         batch_size = firm_state.size(0)
@@ -156,27 +168,27 @@ class PolicyValueModel(nn.Module):
             # 使用少量均匀点近似积分
             simulated_i = torch.linspace(0.0, Config.I_THRESHOLD, steps=5, device=device).unsqueeze(-1)
 
-        P0_list = []
-        PI_list = []
+        V0_list = []
+        VI_list = []
         for i_val in simulated_i:
             modified = firm_state.clone()
             modified[:, SIMMODEL.I] = i_val.expand(batch_size)
-            P0_i, PI_i, _ = self.combined_model(modified)
-            P0_list.append(P0_i)
-            PI_list.append(PI_i)
+            V0_i, VI_i, _ = self.combined_model(modified)
+            V0_list.append(V0_i)
+            VI_list.append(VI_i)
 
-        P0_stack = torch.stack(P0_list, dim=0)  # (n_i, batch, 1)
-        PI_stack = torch.stack(PI_list, dim=0)  # (n_i, batch, 1)
-        max_vals = torch.max(P0_stack, PI_stack)
-        Phat = max_vals.mean(dim=0)  # (batch, 1)
+        V0_stack = torch.stack(V0_list, dim=0)  # (n_i, batch, 1)
+        VI_stack = torch.stack(VI_list, dim=0)  # (n_i, batch, 1)
+        max_vals = torch.max(V0_stack, VI_stack)
+        Vhat = max_vals.mean(dim=0)  # (batch, 1)
 
         barz_temp = float(getattr(Config, "BARZ_LOGIT_TEMP", 10.0))
-        # 论文口径：P = max(0, Phat)，需要允许出现明确的 P=0 违约区域。
-        P = torch.clamp_min(Phat, 0.0)
-        # 使用 Phat 生成平滑违约概率代理，保留负值区域梯度
-        bar_z = torch.sigmoid(-barz_temp * Phat)
+        # 最小改造：先由条件总价值构造当前期软存活门，再保留原有 clamp 版总价值。
+        chi = torch.sigmoid(barz_temp * Vhat)
+        P = torch.clamp_min(Vhat, 0.0)
+        bar_z = 1.0 - chi
 
-        return Phat, P, bar_z
+        return Vhat, P, chi, bar_z
     
     def cal_bp(
         self,
@@ -242,7 +254,7 @@ class PolicyValueModel(nn.Module):
         self, 
         firm_state: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """只获取 CombinedModel 输出"""
+        """只获取 CombinedModel 输出（V0, VI, bar_i_cond）"""
         return self.combined_model(firm_state)
     
     def get_bar_z(self, firm_state: torch.Tensor) -> torch.Tensor:
@@ -289,7 +301,7 @@ class PolicyValueModel(nn.Module):
 
 class CalPhats:
     """
-    计算 Phat, P, bar_z 的工具类
+    计算 Vhat, P, chi, bar_z 的工具类
     
     用于在训练和模拟中统一计算逻辑
     """
@@ -301,20 +313,21 @@ class CalPhats:
     def __call__(
         self, 
         firm_state: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        计算 bar_z, Phat, P
+        计算 Vhat, P, chi, bar_z
         
         Args:
             firm_state: (batch, 7)
         
         Returns:
-            bar_z: (batch, 1)
-            Phat: (batch, 1)
+            Vhat: (batch, 1)
             P: (batch, 1)
+            chi: (batch, 1)
+            bar_z: (batch, 1)
         """
         # Combined model 输出
-        P0, PI, bar_i = self.combined_model(firm_state)
+        V0, VI, bar_i_cond = self.combined_model(firm_state)
         
         # bar_z
         base_state = torch.cat([
@@ -323,8 +336,9 @@ class CalPhats:
         ], dim=-1)
         bar_z = self.barz_model(base_state)
         
-        # Phat 和 P
-        Phat = bar_i * PI + (1 - bar_i) * P0
-        P = (1 - bar_z) * Phat
+        # 条件总价值、软存活门与无条件总值
+        Vhat = bar_i_cond * VI + (1 - bar_i_cond) * V0
+        chi = 1 - bar_z
+        P = chi * torch.clamp_min(Vhat, 0.0)
         
-        return bar_z, Phat, P
+        return Vhat, P, chi, bar_z

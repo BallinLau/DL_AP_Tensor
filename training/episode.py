@@ -1585,7 +1585,7 @@ class Episode:
     
     def _compute_p0_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        计算 P0 损失（支持任意 N 分支）
+        计算 P0 损失（接口名保留；语义上对应 conditional value V0）
         """
         model = self.models['policy_value']
         loss_fn = self.loss_fns['p0']
@@ -1621,14 +1621,27 @@ class Episode:
         output_t = model(parent_state)
 
         def _get_out(out, name: str, idx: int) -> torch.Tensor:
+            alias = {
+                'P0': 'V0',
+                'PI': 'VI',
+                'Phat': 'Vhat',
+            }
             if isinstance(out, dict):
-                return out[name]
+                if name in out:
+                    return out[name]
+                if name in alias and alias[name] in out:
+                    return out[alias[name]]
+                raise KeyError(name)
             if hasattr(out, name):
                 return getattr(out, name)
+            if name in alias and hasattr(out, alias[name]):
+                return getattr(out, alias[name])
             return out[:, idx:idx + 1]
 
         bp0_t = _get_out(output_t, 'bp0', 1)
         bpI_t = _get_out(output_t, 'bpI', 2)
+        bar_i_cond_t = _get_out(output_t, 'bar_i_cond', 4)
+        chi_t = _get_out(output_t, 'chi', 3)
         bar_i_t = _get_out(output_t, 'bar_i', 4)
         bp_t = _get_out(output_t, 'bp', -1)
         if bp_t.shape != bp0_t.shape:
@@ -1652,8 +1665,10 @@ class Episode:
         childp0_state[:, 0:1] = bp_for_p0
         outputp0_children = model(childp0_state)
         
-        # 提取 P0 和所需变量
+        # 左边对象按理论口径解释为 conditional no-invest value V0；
+        # Bellman RHS 继续使用 child 的总股权价值 P_{t+1}。
         P0 = _get_out(output_t, 'P0', 3)
+        Vhat_t = _get_out(output_t, 'Phat', 8)
         P_children = [_get_out(out, 'P', 7) for out in output_children]
         # FOC/KKT 梯度通道可选用 Phat，避免 P=max(Phat,0) 在违约区产生大面积零梯度
         use_phat_for_bp_foc = bool(getattr(self.hyperparams, "bp_foc_use_phat_children", True))
@@ -1747,13 +1762,17 @@ class Episode:
                 'p0_M_raw_p90': float(torch.quantile(raw_m, 0.90).item()),
                 'p0_M_used_p90': float(torch.quantile(use_m, 0.90).item()),
                 'p0_bp_foc_use_phat': float(1.0 if use_phat_for_bp_foc else 0.0),
+                'p0_bar_i_cond_mean': float(bar_i_cond_t.mean().item()),
+                'p0_bar_i_eff_mean': float(bar_i_t.mean().item()),
+                'p0_chi_mean': float(chi_t.mean().item()),
+                'p0_vhat_mean': float(Vhat_t.mean().item()),
             }
             self._latest_p0_terms.update(getattr(loss_fn, 'latest_foc_diag', {}))
         return total_loss
     
     def _compute_pi_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        计算 PI 损失（支持任意 N 分支）
+        计算 PI 损失（接口名保留；语义上对应 conditional value VI）
         """
         model = self.models['policy_value']
         loss_fn = self.loss_fns['pi']
@@ -1789,15 +1808,28 @@ class Episode:
         output_t = model(parent_state)
 
         def _get_out(out, name: str, idx: int) -> torch.Tensor:
+            alias = {
+                'P0': 'V0',
+                'PI': 'VI',
+                'Phat': 'Vhat',
+            }
             if isinstance(out, dict):
-                return out[name]
+                if name in out:
+                    return out[name]
+                if name in alias and alias[name] in out:
+                    return out[alias[name]]
+                raise KeyError(name)
             if hasattr(out, name):
                 return getattr(out, name)
+            if name in alias and hasattr(out, alias[name]):
+                return getattr(out, alias[name])
             return out[:, idx:idx + 1]
 
 
         bp0_t = _get_out(output_t, 'bp0', 1)
         bpI_t = _get_out(output_t, 'bpI', 2)
+        bar_i_cond_t = _get_out(output_t, 'bar_i_cond', 4)
+        chi_t = _get_out(output_t, 'chi', 3)
         bar_i_t = _get_out(output_t, 'bar_i', 4)
         bp_t = _get_out(output_t, 'bp', -1)
         if bp_t.shape != bp0_t.shape:
@@ -1821,9 +1853,11 @@ class Episode:
         childpI_state[:, 0:1] = bp_for_pi
         outputpI_children = model(childpI_state)
         
-        # 提取 PI 和所需变量
+        # 左边对象按理论口径解释为 conditional invest value VI；
+        # Bellman RHS 继续使用 child 的总股权价值 P_{t+1}。
         Q = _get_out(output_t, 'Q', 0)
         PI = _get_out(output_t, 'PI', 4)
+        Vhat_t = _get_out(output_t, 'Phat', 8)
         P_children = [_get_out(out, 'P', 7) for out in output_children]
         # FOC/KKT 梯度通道可选用 Phat，避免 P=max(Phat,0) 在违约区产生大面积零梯度
         use_phat_for_bp_foc = bool(getattr(self.hyperparams, "bp_foc_use_phat_children", True))
@@ -1923,6 +1957,10 @@ class Episode:
                 'pi_M_raw_p90': float(torch.quantile(raw_m, 0.90).item()),
                 'pi_M_used_p90': float(torch.quantile(use_m, 0.90).item()),
                 'pi_bp_foc_use_phat': float(1.0 if use_phat_for_bp_foc else 0.0),
+                'pi_bar_i_cond_mean': float(bar_i_cond_t.mean().item()),
+                'pi_bar_i_eff_mean': float(bar_i_t.mean().item()),
+                'pi_chi_mean': float(chi_t.mean().item()),
+                'pi_vhat_mean': float(Vhat_t.mean().item()),
             }
             self._latest_pi_terms.update(getattr(loss_fn, 'latest_foc_diag', {}))
         return total_loss
@@ -1974,14 +2012,27 @@ class Episode:
         output_t = model(parent_state)
 
         def _get_out(out, name: str, idx: int) -> torch.Tensor:
+            alias = {
+                'P0': 'V0',
+                'PI': 'VI',
+                'Phat': 'Vhat',
+            }
             if isinstance(out, dict):
-                return out[name]
+                if name in out:
+                    return out[name]
+                if name in alias and alias[name] in out:
+                    return out[alias[name]]
+                raise KeyError(name)
             if hasattr(out, name):
                 return getattr(out, name)
+            if name in alias and hasattr(out, alias[name]):
+                return getattr(out, alias[name])
             return out[:, idx:idx + 1]
 
         bp0_t = _get_out(output_t, 'bp0', 1)
         bpI_t = _get_out(output_t, 'bpI', 2)
+        bar_i_cond_t = _get_out(output_t, 'bar_i_cond', 4)
+        chi_t = _get_out(output_t, 'chi', 3)
         bar_i_t = _get_out(output_t, 'bar_i', 5)
         bp_t = _get_out(output_t, 'bp', -1)
         if bp_t.shape != bp0_t.shape:
@@ -2105,6 +2156,9 @@ class Episode:
                 'q_warm_weight': float(warm_weight),
                 'q_pretrain_mode': float(1.0 if q_only_stage else 0.0),
                 'q_freeze_mode': float(1.0 if q_freeze_mode else 0.0),
+                'q_bar_i_cond_mean': float(bar_i_cond_t.mean().item()),
+                'q_bar_i_eff_mean': float(bar_i_t.mean().item()),
+                'q_chi_mean': float(chi_t.mean().item()),
             }
         return total_loss
     
@@ -2416,10 +2470,21 @@ class Episode:
 
     @staticmethod
     def _policy_get_out(out, name: str, idx: int) -> torch.Tensor:
+        alias = {
+            'P0': 'V0',
+            'PI': 'VI',
+            'Phat': 'Vhat',
+        }
         if isinstance(out, dict):
-            return out[name]
+            if name in out:
+                return out[name]
+            if name in alias and alias[name] in out:
+                return out[alias[name]]
+            raise KeyError(name)
         if hasattr(out, name):
             return getattr(out, name)
+        if name in alias and hasattr(out, alias[name]):
+            return getattr(out, alias[name])
         return out[:, idx:idx + 1]
 
     @staticmethod

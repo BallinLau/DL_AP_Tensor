@@ -342,9 +342,9 @@ class CombinedModel(nn.Module):
         Args:
             firm_state: (batch, 7) - 完整 firm state
         Returns:
-            P0: (batch, 1) - 不投资时的股票价值
-            PI: (batch, 1) - 投资时的股票价值
-            bar_i: (batch, 1) - 投资门槛（PI > P0 时为 1）
+            V0: (batch, 1) - 当前存活条件下，不投资价值
+            VI: (batch, 1) - 当前存活条件下，投资价值
+            bar_i_cond: (batch, 1) - 条件投资门槛（VI > V0 时趋近于 1）
         """
         # 提取 base state
         base_state = torch.cat([
@@ -359,18 +359,18 @@ class CombinedModel(nn.Module):
         h = self.share_layer(base_state)
         
         # 各 head 输出
-        P0 = self.p0_head(h)
-        PI = self.pI_head(h, i)
+        V0 = self.p0_head(h)
+        VI = self.pI_head(h, i)
         
-        # 计算投资门槛（软化版本，用于可导训练）
-        bar_i = torch.sigmoid(10 * (PI - P0))  # 平滑的指示函数
+        # 条件于当前仍存活时的投资比较
+        bar_i_cond = torch.sigmoid(10 * (VI - V0))
         
-        return P0, PI, bar_i
+        return V0, VI, bar_i_cond
     
     def get_hard_bar_i(self, firm_state: torch.Tensor) -> torch.Tensor:
         """获取硬投资门槛（用于模拟）"""
-        P0, PI, _ = self.forward(firm_state)
-        return (PI > P0).float()
+        V0, VI, _ = self.forward(firm_state)
+        return (VI > V0).float()
 
 
 class BarzModel(nn.Module):

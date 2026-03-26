@@ -5,8 +5,8 @@ P0 Loss: 股价相关损失（不投资情形）
 叠加单调性惩罚与 z 值惩罚，确保经济意义一致性。
 
 支持任意数量的分支路径：
-- parent: (P0_t, CF0p_t, ...) → t 期父节点
-- children: [(P_{t+1}^{(j)}, bar_z_{t+1}^{(j)}, ...)] → N 条模拟路径
+- parent: (V0_t, CF0p_t, ...) → t 期父节点的 survival-conditioned no-invest value
+- children: [(P_{t+1}^{(j)}, bar_z_{t+1}^{(j)}, ...)] → N 条模拟路径上的下一期总股权价值
 
 L_P0 = loss_bellman + loss_foc + mono_penalty
 """
@@ -30,7 +30,13 @@ from .utils import (
 
 class P0Loss(nn.Module):
     """
-    P0（不投资时股价）损失函数
+    P0（接口名保留）损失函数
+
+    语义上，这里的 `P0` 应解释为：
+    - 当前期仍存活条件下的不投资价值 `V0`
+
+    而 Bellman RHS 使用的 `P_children` 是：
+    - 下一期总股权价值 `P_{t+1}`
     
     包含：
     - Bellman 残差损失
@@ -110,13 +116,15 @@ class P0Loss(nn.Module):
         """
         计算 Bellman 残差（支持任意分支数）
         
-        loss^{(j)} = P0 - CF0p - M^{(j)} * P'^{(j)} * (1 - bar_z'^{(j)})
+        语义上：
+
+        loss^{(j)} = V0_t - CF0p_t - M^{(j)} * P_{t+1}^{(j)} * (1 - bar_z_{t+1}^{(j)})
         
         Args:
-            P0: 当期股价
+            P0: 当前期 survival-conditioned no-invest value（历史接口名保留）
             CF0p: 当期现金流
             M_list: List[torch.Tensor] - 各路径的 SDF
-            P_children: List[torch.Tensor] - 各路径的未来股价
+            P_children: List[torch.Tensor] - 各路径的下一期总股权价值
             bar_z_children: List[torch.Tensor] - 各路径的违约阈值
         
         Returns:

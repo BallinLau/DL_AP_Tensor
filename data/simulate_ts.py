@@ -40,7 +40,7 @@ class SimulateTS:
     FIRM_COLUMNS = [
         'path', 't', 'branch', 'ID', 'entry',
         'b', 'z', 'ETA', 'i', 'x', 'Hatcf', 'LnKF',
-        'K', 'M', 'Q', 'P0', 'PI', 'Bar_i', 'Bar_z', 'P',
+        'K', 'M', 'Q', 'P0', 'PI', 'Bar_i_cond', 'Bar_i', 'Chi', 'Bar_z', 'P',
         'bp0', 'bpI', 'bp', 'Y', 'I', 'Phi', 'C'
     ]
     MACRO_COLUMNS = [
@@ -326,7 +326,9 @@ class SimulateTS:
             q = output.Q.reshape(-1)
             p0 = output.P0.reshape(-1)
             pi = output.PI.reshape(-1)
+            bar_i_cond = output.bar_i_cond.reshape(-1)
             bar_i = output.bar_i.reshape(-1)
+            chi = output.chi.reshape(-1)
             bar_z = output.bar_z.reshape(-1)
             p = output.P.reshape(-1)
             bp0 = output.bp0.reshape(-1)
@@ -336,7 +338,9 @@ class SimulateTS:
             q = torch.zeros_like(b)
             p0 = torch.zeros_like(b)
             pi = torch.zeros_like(b)
+            bar_i_cond = torch.zeros_like(b)
             bar_i = torch.zeros_like(b)
+            chi = torch.zeros_like(b)
             bar_z = torch.zeros_like(b)
             p = torch.zeros_like(b)
             bp0 = b.clone()
@@ -364,7 +368,9 @@ class SimulateTS:
                 q,
                 p0,
                 pi,
+                bar_i_cond,
                 bar_i,
+                chi,
                 bar_z,
                 p,
                 bp0,
@@ -541,7 +547,9 @@ class SimulateTS:
                 'Q': output.Q[j].item(),
                 'P0': output.P0[j].item(),
                 'PI': output.PI[j].item(),
+                'Bar_i_cond': output.bar_i_cond[j].item(),
                 'Bar_i': output.bar_i[j].item(),
+                'Chi': output.chi[j].item(),
                 'Bar_z': output.bar_z[j].item(),
                 'P': output.P[j].item(),
                 'bp0': output.bp0[j].item(),

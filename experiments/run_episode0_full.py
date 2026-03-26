@@ -225,6 +225,9 @@ def plot_surfaces(pv_model: PolicyValueModel, sdf_model: SDFFC1Combined | None, 
         P0 = out.P0.reshape(B.shape).cpu().numpy()
         PI = out.PI.reshape(B.shape).cpu().numpy()
         P = out.P.reshape(B.shape).cpu().numpy()
+        bar_i_cond = out.bar_i_cond.reshape(B.shape).cpu().numpy()
+        bar_i = out.bar_i.reshape(B.shape).cpu().numpy()
+        chi = out.chi.reshape(B.shape).cpu().numpy()
         bar_z = out.bar_z.reshape(B.shape).cpu().numpy()
         bp = out.bp.reshape(B.shape).cpu().numpy()
         Q = out.Q.reshape(B.shape).cpu().numpy()
@@ -237,6 +240,9 @@ def plot_surfaces(pv_model: PolicyValueModel, sdf_model: SDFFC1Combined | None, 
     for name, arr in [
         ("p0", P0),
         ("pi", PI),
+        ("bari_cond", bar_i_cond),
+        ("bari", bar_i),
+        ("chi", chi),
         ("bp", bp),
         ("q", Q),
         ("pidiff", pi_diff),
@@ -244,7 +250,7 @@ def plot_surfaces(pv_model: PolicyValueModel, sdf_model: SDFFC1Combined | None, 
         ("contdiff", cont_diff),
     ]:
         plot_arr = arr
-        if name in {"bp", "pidiff", "cfdiff", "contdiff"}:
+        if name in {"bari_cond", "bari", "chi", "bp", "pidiff", "cfdiff", "contdiff"}:
             plot_arr = np.where(survive_mask, arr, np.nan)
         # Heatmap with b as x-axis, z as y-axis
         plt.figure(figsize=(6, 4))
