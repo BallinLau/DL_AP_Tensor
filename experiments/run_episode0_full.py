@@ -414,6 +414,13 @@ def plot_bp_diagnostic_curves(
             dcontI_np = np.gradient(contI_np, bp_np)
             dv0_np = np.gradient(v0_np, bp_np)
             dvi_np = np.gradient(vi_np, bp_np)
+            p_zero_idx = np.where(p_np <= 1e-8)[0]
+            bp_p_zero = float(bp_np[p_zero_idx[0]]) if len(p_zero_idx) > 0 else None
+            z_half_idx = np.where(barz_np >= 0.5)[0]
+            bp_z_half = float(bp_np[z_half_idx[0]]) if len(z_half_idx) > 0 else None
+            foc_mid_np = 0.5 * (foc0_np + foci_np)
+            foc_jump_idx = int(np.argmax(np.abs(np.diff(foc_mid_np))))
+            bp_foc_jump = float(bp_np[foc_jump_idx + 1])
 
         fig, axes = plt.subplots(6, 2, figsize=(11, 19))
         (
@@ -504,6 +511,51 @@ def plot_bp_diagnostic_curves(
         fig.tight_layout(rect=[0, 0, 1, 0.92])
         fig.savefig(figs_dir / f"bp_diag_{label}.png", dpi=150)
         plt.close(fig)
+
+        fig2, (ax_b1, ax_b2) = plt.subplots(2, 1, figsize=(8.5, 7.5), sharex=True)
+        ax_b1.plot(bp_np, p_np, label="P_{t+1}(bp)", color="tab:green")
+        ax_b1_t = ax_b1.twinx()
+        ax_b1_t.plot(bp_np, barz_np, label="bar_z_{t+1}(bp)", color="tab:red")
+        ax_b1.set_ylabel("P")
+        ax_b1_t.set_ylabel("bar_z")
+        ax_b1.set_title("Survival/default boundary")
+        ax_b2.plot(bp_np, foc0_np, label="FOC0(bp)", color="tab:blue")
+        ax_b2.plot(bp_np, foci_np, label="FOCI(bp)", color="tab:orange")
+        ax_b2.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+        ax_b2.set_xlabel("bp")
+        ax_b2.set_ylabel("FOC")
+        ax_b2.set_title("FOC around boundary")
+        boundary_lines = [
+            ("P=0", bp_p_zero, "tab:green"),
+            ("bar_z=0.5", bp_z_half, "tab:red"),
+            ("FOC jump", bp_foc_jump, "tab:purple"),
+            ("bp*", bp_star, "black"),
+        ]
+        for _, xval, color in boundary_lines:
+            if xval is None:
+                continue
+            ax_b1.axvline(xval, color=color, linestyle="--", linewidth=1)
+            ax_b1_t.axvline(xval, color=color, linestyle="--", linewidth=1)
+            ax_b2.axvline(xval, color=color, linestyle="--", linewidth=1)
+        lines1, labels1 = ax_b1.get_legend_handles_labels()
+        lines2, labels2 = ax_b1_t.get_legend_handles_labels()
+        ax_b1.legend(lines1 + lines2, labels1 + labels2, frameon=False, fontsize=8, loc="center right")
+        ax_b2.legend(frameon=False, fontsize=8)
+        boundary_text = " | ".join(
+            [
+                f"P=0 @ {bp_p_zero:.3f}" if bp_p_zero is not None else "P=0 @ NA",
+                f"bar_z=0.5 @ {bp_z_half:.3f}" if bp_z_half is not None else "bar_z=0.5 @ NA",
+                f"FOC jump @ {bp_foc_jump:.3f}",
+                f"bp* @ {bp_star:.3f}",
+            ]
+        )
+        fig2.suptitle(f"bp boundary summary: {label} state (b={b_val:.2f}, z={z_val:.2f})")
+        fig2.text(0.5, 0.955, boundary_text, ha="center", va="top", fontsize=9)
+        ax_b1.grid(True, alpha=0.25)
+        ax_b2.grid(True, alpha=0.25)
+        fig2.tight_layout(rect=[0, 0, 1, 0.92])
+        fig2.savefig(figs_dir / f"bp_boundary_{label}.png", dpi=150)
+        plt.close(fig2)
 
 
 def plot_distributions(
