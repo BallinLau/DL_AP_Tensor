@@ -837,6 +837,135 @@ class Episode:
             w_surv = w_stack.mean(dim=1)
         return w_surv.clamp(min=0.0, max=1.0)
 
+    def _compute_bp_value_supervision_loss(
+        self,
+        *,
+        parent_state: torch.Tensor,
+        parent_Q: torch.Tensor,
+        bp_pred: torch.Tensor,
+        M_list: List[torch.Tensor],
+        eta_children: List[torch.Tensor],
+        branch_kind: str,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        用粗网格近似 argmax V(bp)，给 bp 一个直接的全局 value-level 训练信号。
+
+        关键约束：
+        - 目标搜索在 `torch.no_grad()` 下执行，不额外保留计算图
+        - 小网格 + sample cap，保证速度
+        - 全程在 GPU 上向量化，避免 Python 循环扫点
+        """
+        enabled = bool(getattr(self.hyperparams, "bp_value_supervision_enabled", False))
+        weight = float(getattr(self.hyperparams, "bp_value_weight", 0.0))
+        if (not enabled) or weight <= 0.0 or parent_state.numel() == 0:
+            z = torch.tensor(0.0, device=self.device)
+            return z, {
+                'bp_value_enabled': 0.0,
+                'bp_value_weight': float(weight),
+                'bp_value_target_mean': 0.0,
+                'bp_value_pred_mean': 0.0,
+                'bp_value_feasible_ratio': 0.0,
+                'bp_value_sample_n': 0.0,
+            }
+
+        sample_cap = int(getattr(self.hyperparams, "bp_value_sample_cap", 256))
+        grid_points = int(getattr(self.hyperparams, "bp_value_grid_points", 21))
+        survival_only = bool(getattr(self.hyperparams, "bp_value_survival_only", True))
+        barz_threshold = float(getattr(self.hyperparams, "bp_value_barz_threshold", 0.5))
+        sample_cap = max(1, sample_cap)
+        grid_points = max(5, grid_points)
+
+        batch_n = parent_state.shape[0]
+        if batch_n <= sample_cap:
+            sample_idx = torch.arange(batch_n, device=self.device)
+        else:
+            sample_idx = torch.linspace(
+                0, batch_n - 1, steps=sample_cap, device=self.device
+            ).round().long().unique(sorted=True)
+
+        parent_sub = parent_state.index_select(0, sample_idx)
+        q_parent_sub = parent_Q.index_select(0, sample_idx)
+        bp_pred_sub = bp_pred.index_select(0, sample_idx)
+        m_sub_list = [m.index_select(0, sample_idx) for m in M_list]
+        eta_sub_list = [eta.index_select(0, sample_idx) for eta in eta_children]
+
+        S = parent_sub.shape[0]
+        G = grid_points
+        bp_grid = torch.linspace(0.0, 1.0, steps=G, device=self.device).view(1, G, 1)
+
+        x_grid = parent_sub[:, 4:5].unsqueeze(1).expand(S, G, 1)
+        z_grid = parent_sub[:, 1:2].unsqueeze(1).expand(S, G, 1)
+        b_parent_grid = parent_sub[:, 0:1].unsqueeze(1).expand(S, G, 1)
+        i_grid = parent_sub[:, 3:4].unsqueeze(1).expand(S, G, 1)
+        q_parent_grid = q_parent_sub.unsqueeze(1).expand(S, G, 1)
+
+        pv_model = self.models['policy_value']
+        p0_loss = self.loss_fns['p0']
+        pi_loss = self.loss_fns['pi']
+
+        with torch.no_grad():
+            branch_values = []
+            branch_P = []
+            branch_barz = []
+            for eta_sub, m_sub in zip(eta_sub_list, m_sub_list):
+                eta_grid = eta_sub.unsqueeze(1).expand(S, G, 1)
+                child_state = parent_sub.unsqueeze(1).expand(S, G, parent_sub.shape[1]).clone()
+                child_state[:, :, 0:1] = eta_grid * bp_grid + (1.0 - eta_grid) * b_parent_grid
+                child_out = pv_model(child_state.reshape(S * G, -1))
+
+                q_child = child_out.Q.reshape(S, G, 1)
+                p_child = child_out.P.reshape(S, G, 1)
+                bar_z_child = child_out.bar_z.reshape(S, G, 1)
+                m_grid = m_sub.unsqueeze(1).expand(S, G, 1)
+
+                if branch_kind == 'p0':
+                    cf = p0_loss.compute_cashflow_p0(
+                        x_grid, z_grid, b_parent_grid, q_parent_grid, q_child, eta_grid
+                    )
+                    cont = m_grid * p_child * (1.0 - bar_z_child)
+                else:
+                    cf = pi_loss.compute_cashflow_pi(
+                        x_grid, z_grid, b_parent_grid, i_grid, q_parent_grid, q_child, eta_grid
+                    )
+                    cont = Config.G * m_grid * p_child * (1.0 - bar_z_child)
+
+                branch_values.append((cf + cont).squeeze(-1))
+                branch_P.append(p_child.squeeze(-1))
+                branch_barz.append(bar_z_child.squeeze(-1))
+
+            value_grid = torch.stack(branch_values, dim=1).mean(dim=1)  # (S,G)
+            p_grid = torch.stack(branch_P, dim=1).mean(dim=1)  # (S,G)
+            barz_grid = torch.stack(branch_barz, dim=1).mean(dim=1)  # (S,G)
+
+            if survival_only:
+                feasible = (p_grid > 0.0) & (barz_grid < barz_threshold)
+                masked_value = value_grid.masked_fill(~feasible, -1e12)
+                best_idx = masked_value.argmax(dim=1)
+                has_feasible = feasible.any(dim=1)
+                best_idx = torch.where(
+                    has_feasible,
+                    best_idx,
+                    torch.zeros_like(best_idx),
+                )
+                feasible_ratio = float(has_feasible.float().mean().item())
+            else:
+                best_idx = value_grid.argmax(dim=1)
+                feasible_ratio = 1.0
+
+            bp_target = bp_grid.view(G).index_select(0, best_idx).unsqueeze(-1)
+
+        loss = (bp_pred_sub - bp_target).pow(2).mean()
+        with torch.no_grad():
+            diag = {
+                'bp_value_enabled': 1.0,
+                'bp_value_weight': float(weight),
+                'bp_value_target_mean': float(bp_target.mean().item()),
+                'bp_value_pred_mean': float(bp_pred_sub.mean().item()),
+                'bp_value_feasible_ratio': float(feasible_ratio),
+                'bp_value_sample_n': float(S),
+            }
+        return loss, diag
+
     def _compute_conditional_signed_foc_terms(
         self,
         foc_residuals: List[torch.Tensor],
@@ -1783,8 +1912,17 @@ class Episode:
         bp_terms_after_eta = eta_active_boost * bp_terms_base
         bp_adapt_scale = self._compute_bp_adaptive_scale(main_loss, bp_terms_after_eta)
         bp_terms = bp_adapt_scale * bp_terms_after_eta
+        bp_value_loss, bp_value_diag = self._compute_bp_value_supervision_loss(
+            parent_state=parent_state,
+            parent_Q=Q,
+            bp_pred=bp_for_p0,
+            M_list=M_list,
+            eta_children=eta_children,
+            branch_kind='p0',
+        )
+        bp_value_weight = float(getattr(self.hyperparams, "bp_value_weight", 1.0))
 
-        total_loss = main_loss + penalty_z + bp_terms
+        total_loss = main_loss + penalty_z + bp_terms + bp_value_weight * bp_value_loss
         with torch.no_grad():
             raw_m = torch.cat([m.reshape(-1) for m in raw_M_list], dim=0)
             use_m = torch.cat([m.reshape(-1) for m in M_list], dim=0)
@@ -1810,6 +1948,8 @@ class Episode:
                 'p0_foc_cond_abs_mean': float(foc_diag['foc_cond_abs_mean']),
                 'p0_foc_active_n': float(foc_diag.get('foc_active_n', 0.0)),
                 'p0_foc_survival_weight_mean': float(foc_diag.get('foc_survival_weight_mean', 1.0)),
+                'p0_bp_value_loss': float(bp_value_loss.item()),
+                'p0_bp_value_weight': float(bp_value_weight),
                 'p0_log_mean_M_raw': float(torch.log(raw_m.mean().clamp_min(1e-8)).item()),
                 'p0_log_mean_M_used': float(torch.log(use_m.mean().clamp_min(1e-8)).item()),
                 'p0_M_raw_p90': float(torch.quantile(raw_m, 0.90).item()),
@@ -1821,6 +1961,7 @@ class Episode:
                 'p0_vhat_mean': float(Vhat_t.mean().item()),
             }
             self._latest_p0_terms.update(getattr(loss_fn, 'latest_foc_diag', {}))
+            self._latest_p0_terms.update({f'p0_{k}': v for k, v in bp_value_diag.items() if k != 'bp_value_weight'})
         return total_loss
     
     def _compute_pi_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -1984,8 +2125,17 @@ class Episode:
         bp_terms_after_eta = eta_active_boost * bp_terms_base
         bp_adapt_scale = self._compute_bp_adaptive_scale(main_loss, bp_terms_after_eta)
         bp_terms = bp_adapt_scale * bp_terms_after_eta
+        bp_value_loss, bp_value_diag = self._compute_bp_value_supervision_loss(
+            parent_state=parent_state,
+            parent_Q=Q,
+            bp_pred=bp_for_pi,
+            M_list=M_list,
+            eta_children=eta_children,
+            branch_kind='pi',
+        )
+        bp_value_weight = float(getattr(self.hyperparams, "bp_value_weight", 1.0))
 
-        total_loss = main_loss + penalty_z + penalty_b + bp_terms
+        total_loss = main_loss + penalty_z + penalty_b + bp_terms + bp_value_weight * bp_value_loss
         with torch.no_grad():
             raw_m = torch.cat([m.reshape(-1) for m in raw_M_list], dim=0)
             use_m = torch.cat([m.reshape(-1) for m in M_list], dim=0)
@@ -2012,6 +2162,8 @@ class Episode:
                 'pi_foc_cond_abs_mean': float(foc_diag['foc_cond_abs_mean']),
                 'pi_foc_active_n': float(foc_diag.get('foc_active_n', 0.0)),
                 'pi_foc_survival_weight_mean': float(foc_diag.get('foc_survival_weight_mean', 1.0)),
+                'pi_bp_value_loss': float(bp_value_loss.item()),
+                'pi_bp_value_weight': float(bp_value_weight),
                 'pi_log_mean_M_raw': float(torch.log(raw_m.mean().clamp_min(1e-8)).item()),
                 'pi_log_mean_M_used': float(torch.log(use_m.mean().clamp_min(1e-8)).item()),
                 'pi_M_raw_p90': float(torch.quantile(raw_m, 0.90).item()),
@@ -2023,6 +2175,7 @@ class Episode:
                 'pi_vhat_mean': float(Vhat_t.mean().item()),
             }
             self._latest_pi_terms.update(getattr(loss_fn, 'latest_foc_diag', {}))
+            self._latest_pi_terms.update({f'pi_{k}': v for k, v in bp_value_diag.items() if k != 'bp_value_weight'})
         return total_loss
     
     def _compute_q_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:

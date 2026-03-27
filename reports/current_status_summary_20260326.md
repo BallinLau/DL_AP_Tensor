@@ -783,3 +783,222 @@ P_t = \max(0,\hat V_t)
 - 新建一个 worktree 目录专门做结构改造
 
 这比手工复制整个项目更适合作为科研代码的版本管理方式。
+
+## 7. 每个 Episode 变慢的原因与优化
+
+### 7.1 主要瓶颈不在训练主循环，而在 episode 末尾诊断
+
+最近每个 episode 的 wall-clock 明显变长，排查后确认主要不是：
+
+- `bp_survival_reweight`
+- `FOC/KKT` 本体
+- 或主训练 batch 的前向/反向
+
+而是 **每个 episode 结束后的诊断与出图阶段**。
+
+在 [run_multi_episode_job.py](/Users/ballinliu/Desktop/PHD/Project1/DL_AP_Tensor/experiments/run_multi_episode_job.py) 中，每轮 `run_episode()` 结束后还会继续执行：
+
+- `save_stage_df`
+- `save_models`
+- `plot_surfaces`
+- `plot_bp_diagnostic_curves`
+- `plot_distributions`
+- `plot_macro_series`
+
+其中最重的是 `plot_bp_diagnostic_curves`，因为它会：
+
+1. 固定 parent 状态，扫描一整条 `bp_grid`
+2. 对每个网格点重新构造 child state
+3. 重跑 `policy_value` 前向，必要时还重跑 `sdf_fc1.forward_step`
+4. 继续生成 `Q/P/bar_z/CF/cont/V` 等曲线
+5. 额外保存大尺寸 `diag` 和 `boundary` 图
+
+这部分是 **episode 末尾额外的诊断成本**，而不是训练 loss 本身导致的 GPU 负担。
+
+### 7.2 已做的轻量化
+
+为了避免诊断拖垮训练，当前已经把 `bp` 诊断改成轻量版：
+
+- 默认只画 `safe` 状态
+- `bp_grid` 从 `201` 降到 `101`
+- 多 episode 训练时默认每 `5` 个 episode 才画一次，最后一轮强制画
+- 诊断用的 `FOC/KKT` 从重型 `autograd.grad` 改成有限差分近似
+
+这些修改的目标不是改变训练结果，而是让：
+
+```math
+\text{训练主循环耗时} \gg \text{诊断额外耗时}
+```
+
+重新成立。
+
+## 8. 为什么 `bp` child-survival reweight 不够
+
+我们尝试过让 `bp` 的 FOC/KKT 只在 child 仍具继续经营意义的区域有较大权重：
+
+```math
+w_{surv}(bp)
+=
+\sigma(\tau_P P_{t+1}(bp))
+\cdot
+\sigma(\tau_z(0.5-\bar z_{t+1}(bp)))
+```
+
+并在训练中使用：
+
+```math
+L_{bp}^{FOC}=w_{surv}(bp)\cdot(FOC(bp))^2
+```
+
+```math
+L_{bp}^{KKT}=w_{surv}(bp)\cdot KKT(bp)
+```
+
+这个改动本身是生效的，但实验结果表明它 **不足以把 `bp` 拉回左侧存活区**。
+
+原因是：
+
+1. 它只削弱了 `FOC/KKT` surrogate
+2. 但没有改变当前 `V(bp)` 的形状
+3. 如果无约束的 `V(bp)` 本来就在右侧 default 区取得最大值，那么 `bp` 仍会被主目标推向右侧
+
+也就是说：
+
+```math
+\text{reweight 只是在 default 区静音 surrogate，}
+\quad
+\text{却没有给 } bp \text{ 新的全局 value-level 信号。}
+```
+
+## 9. 新修改：GPU 粗网格 `argmax V` supervision
+
+### 9.1 修改动机
+
+当前 `V(bp)` 明显不是凹函数，也不是单峰函数。
+
+因此：
+
+- `FOC = 0`
+- `KKT penalty` 小
+
+最多只能刻画某个 **局部驻点**，不能保证得到：
+
+```math
+\arg\max_{bp} V(bp)
+```
+
+这就是为什么单靠 `FOC + KKT`，会反复出现：
+
+```math
+bp^* \neq \arg\max V(bp)
+```
+
+或者即使相等，那个最大值本身也落在 default 区右边。
+
+### 9.2 修改内容
+
+因此在当前分支中，给 `bp` 新增了一条 **粗网格、GPU 向量化、无梯度目标搜索** 的 value supervision。
+
+对每个 batch，额外做下面这件事：
+
+1. 从当前 batch 中抽取不超过 `sample_cap` 个样本
+2. 在 GPU 上构造一个小网格：
+
+```math
+\mathcal G = \{0, \tfrac{1}{G-1}, \dots, 1\}
+```
+
+3. 对每个样本、每个 `bp \in \mathcal G`，一次性向量化计算近似 one-step value：
+
+不投资：
+
+```math
+V_t^0(bp)\approx CF_t^0(bp)+M_t P_{t+1}(bp)(1-\bar z_{t+1}(bp))
+```
+
+投资：
+
+```math
+V_t^I(bp)\approx CF_t^I(bp)+g\,M_t P_{t+1}(bp)(1-\bar z_{t+1}(bp))
+```
+
+4. 若开启 `survival_only`，则只在满足下面条件的粗网格点中找最大值：
+
+```math
+P_{t+1}(bp) > 0,\qquad \bar z_{t+1}(bp) < z_{th}
+```
+
+5. 得到目标点：
+
+```math
+b^\dagger = \arg\max_{bp \in \mathcal G \cap \mathcal S} V(bp)
+```
+
+6. 对网络当前输出的 `bp_\theta` 加监督：
+
+```math
+L_{bp}^{value} = (bp_\theta - b^\dagger)^2
+```
+
+并把它加进 `P0/PI` 的训练损失：
+
+```math
+L = L_{main} + L_{FOC/KKT} + \lambda_{value} L_{bp}^{value}
+```
+
+### 9.3 为什么数学上有效
+
+因为这条新损失不再依赖：
+
+- 局部导数是否过零
+- `FOC/KKT` 是否把右侧平台也视为“可接受”
+
+它直接给出的是：
+
+```math
+\text{当前粗网格上最好的 } bp
+```
+
+所以它补上的是 **全局 value-level 信息**，而不只是局部最优条件。
+
+在非凹、存在生存/违约 regime switch 的问题里，这比单纯再调 `FOC/KKT` 更对症。
+
+### 9.4 为什么经济上有效
+
+如果用户理论上关心的是：
+
+```math
+\text{当前企业在 continue 意义下，应该选什么下一期债务}
+```
+
+那么训练时就不该只让 `bp` 满足某个局部 FOC，而应该让它对齐到：
+
+```math
+\text{当前状态下真正能带来更高 continue value 的债务选择。}
+```
+
+当 `survival_only=True` 时，这条监督进一步对应：
+
+```math
+\arg\max_{bp \in \mathcal S} V(bp)
+```
+
+也就是：
+
+- 不是允许 `bp` 去追求“明天股权几乎归零”的赌博解
+- 而是在仍有继续经营意义的区域里，寻找更合理的最优债务
+
+### 9.5 为什么速度还能接受
+
+这条修改专门按“训练内可承受”的方式实现：
+
+- **target search 在 `torch.no_grad()` 下完成**
+  不额外保留大计算图
+- **小网格**
+  默认 `21` 个 `bp` 点
+- **sample cap**
+  默认每个 batch 只抽 `256` 个样本做 target search
+- **GPU 向量化**
+  把 `(sample, bp_grid)` 展平成一个大 batch 一次前向，不在 Python 层逐点循环
+
+因此它的额外成本远低于“把每个样本都做高精度网格搜索”，也不会像之前那样把 episode 末尾诊断的开销搬进训练主循环。

@@ -236,6 +236,15 @@ class HyperParams:
     bp_survival_tau_p: float = 20.0
     bp_survival_tau_z: float = 20.0
     bp_survival_barz_threshold: float = 0.5
+    # ========== bp 训练：粗网格 value supervision（GPU 上向量化） ==========
+    # 仅靠 FOC/KKT 难以处理非凹、存在 regime switch 的 V(bp)。
+    # 这里用小网格近似 survive-set 内的 argmax V，给 bp 一个直接的全局 value-level 信号。
+    bp_value_supervision_enabled: bool = True
+    bp_value_weight: float = 1.0
+    bp_value_grid_points: int = 21
+    bp_value_sample_cap: int = 256
+    bp_value_survival_only: bool = True
+    bp_value_barz_threshold: float = 0.5
 
     # ========== Episode 收敛判定（非 AIO Bellman 残差） ==========
     # 判定条件：Q/P0/PI 各自主残差的 mean(abs) 与 p90(abs) 同时过阈值

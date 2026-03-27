@@ -149,6 +149,12 @@ def build_hyperparams():
     hp.bp_survival_tau_p = 20.0
     hp.bp_survival_tau_z = 20.0
     hp.bp_survival_barz_threshold = 0.5
+    hp.bp_value_supervision_enabled = True
+    hp.bp_value_weight = 1.0
+    hp.bp_value_grid_points = 21
+    hp.bp_value_sample_cap = 256
+    hp.bp_value_survival_only = True
+    hp.bp_value_barz_threshold = 0.5
     # P0/PI 对上游 M 的鲁棒化（避免 M 偏高直接抬高 P）
     hp.pv_use_clipped_m = True
     hp.pv_m_clamp_min = 0.7

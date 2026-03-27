@@ -141,6 +141,12 @@ def build_hyperparams():
     hp.bp_survival_tau_p = 20.0
     hp.bp_survival_tau_z = 20.0
     hp.bp_survival_barz_threshold = 0.5
+    hp.bp_value_supervision_enabled = True
+    hp.bp_value_weight = 1.0
+    hp.bp_value_grid_points = 21
+    hp.bp_value_sample_cap = 256
+    hp.bp_value_survival_only = True
+    hp.bp_value_barz_threshold = 0.5
     return hp
 
 
