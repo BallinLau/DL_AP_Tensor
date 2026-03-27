@@ -158,6 +158,47 @@ P_t > 0 \quad \text{and} \quad \bar z_t < 0.5
 \text{当前 safe 区高 } bp \text{ 的主因是净发债收入，而不是经营利润或 continuation。}
 ```
 
+后续又继续加入了两个导数面板：
+
+9. `Derivative decomposition: V0`  
+   - `dCF0/dbp`
+   - `dcont0/dbp`
+   - `dV0/dbp`
+
+10. `Derivative decomposition: VI`  
+   - `dCFI/dbp`
+   - `dcontI/dbp`
+   - `dVI/dbp`
+
+这两张图回答的是一个更精确的问题：
+
+```math
+\text{最优 } bp \text{ 到底是被 value 的哪个边际项推出来的？}
+```
+
+它们比只看 `V(bp)` 的水平更重要，因为最优点取决于：
+
+```math
+\frac{dV}{dbp}
+=
+\frac{dCF}{dbp}
++
+\frac{dCont}{dbp}
+```
+
+因此：
+
+- 如果低 `bp` 区 `Cont(bp)` 水平很大，但 `dCont/dbp` 始终为负且很快衰减
+- 同时在最优点附近 `dCF/dbp` 仍然为正并主导
+
+那么就说明：
+
+```math
+\text{continuation 在左侧确实重要，但最优点附近的边际仍主要由 } CF \text{ 决定。}
+```
+
+这能避免把“continuation 水平在左边很大”误读成“最优点一定由 continuation 主导”。
+
 图上的三条竖线分别是：
 
 - `bp0*`：不投资分支最优候选

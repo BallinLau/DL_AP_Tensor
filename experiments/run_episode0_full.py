@@ -408,8 +408,14 @@ def plot_bp_diagnostic_curves(
             bp_star = float(parent_out.bp.item())
             bp_v0_argmax = float(bp_np[int(np.argmax(v0_np))])
             bp_vi_argmax = float(bp_np[int(np.argmax(vi_np))])
+            dcf0_np = np.gradient(cf0_np, bp_np)
+            dcfi_np = np.gradient(cfi_np, bp_np)
+            dcont0_np = np.gradient(cont0_np, bp_np)
+            dcontI_np = np.gradient(contI_np, bp_np)
+            dv0_np = np.gradient(v0_np, bp_np)
+            dvi_np = np.gradient(vi_np, bp_np)
 
-        fig, axes = plt.subplots(5, 2, figsize=(11, 16))
+        fig, axes = plt.subplots(6, 2, figsize=(11, 19))
         (
             ax_q,
             ax_qunit,
@@ -421,6 +427,8 @@ def plot_bp_diagnostic_curves(
             ax_kkt,
             ax_cf0_decomp,
             ax_cfi_decomp,
+            ax_dv0,
+            ax_dvi,
         ) = axes.flatten()
         ax_q.plot(bp_np, q_np, color="tab:blue")
         ax_q.set_title("Q(bp)")
@@ -462,6 +470,18 @@ def plot_bp_diagnostic_curves(
         ax_cfi_decomp.plot(bp_np, cfi_np, label="CFI(bp)", color="tab:orange", linestyle="--")
         ax_cfi_decomp.set_title("CFI decomposition")
         ax_cfi_decomp.legend(frameon=False, fontsize=8)
+        ax_dv0.plot(bp_np, dcf0_np, label="dCF0/dbp", color="tab:blue")
+        ax_dv0.plot(bp_np, dcont0_np, label="dcont0/dbp", color="tab:orange")
+        ax_dv0.plot(bp_np, dv0_np, label="dV0/dbp", color="black", linestyle="--")
+        ax_dv0.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+        ax_dv0.set_title("Derivative decomposition: V0")
+        ax_dv0.legend(frameon=False, fontsize=8)
+        ax_dvi.plot(bp_np, dcfi_np, label="dCFI/dbp", color="tab:blue")
+        ax_dvi.plot(bp_np, dcontI_np, label="dcontI/dbp", color="tab:orange")
+        ax_dvi.plot(bp_np, dvi_np, label="dVI/dbp", color="black", linestyle="--")
+        ax_dvi.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+        ax_dvi.set_title("Derivative decomposition: VI")
+        ax_dvi.legend(frameon=False, fontsize=8)
         for ax in axes.flatten():
             ax.axvline(bp0_star, color="tab:blue", linestyle="--", linewidth=1)
             ax.axvline(bpI_star, color="tab:orange", linestyle="--", linewidth=1)
