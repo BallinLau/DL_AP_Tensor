@@ -694,7 +694,8 @@ class Episode:
         self,
         bp: torch.Tensor,
         foc_residuals: List[torch.Tensor],
-        eta_children: Optional[List[torch.Tensor]] = None
+        eta_children: Optional[List[torch.Tensor]] = None,
+        sample_weight: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         对有界控制变量 bp ∈ [0,1] 施加 KKT 条件：
@@ -728,6 +729,8 @@ class Episode:
         else:
             active_mask = torch.ones_like(bp)
             foc_mean = foc_stack.mean(dim=1)  # (B, 1), signed
+        if sample_weight is not None:
+            active_mask = active_mask * sample_weight.clamp(min=0.0, max=1.0)
         active_ratio = float(active_mask.mean().item())
         if active_ratio <= 1e-8:
             z = torch.tensor(0.0, device=self.device)
@@ -792,6 +795,48 @@ class Episode:
             }
         return penalty, diag
 
+    def _compute_bp_survival_weight(
+        self,
+        P_children: List[torch.Tensor],
+        bar_z_children: List[torch.Tensor],
+        eta_children: Optional[List[torch.Tensor]] = None,
+    ) -> Optional[torch.Tensor]:
+        """
+        基于 child 的总股权价值与存活门，构造 bp surrogate 的软存活权重。
+
+        w_surv ≈ sigmoid(tau_p * P_{t+1}) * sigmoid(tau_z * (z_th - bar_z_{t+1}))
+        再按 eta-active 分支做平均，使 default 区右侧的局部驻点不再主导 bp 训练。
+        """
+        if not bool(getattr(self.hyperparams, "bp_survival_reweight_enabled", True)):
+            return None
+        if not P_children or not bar_z_children:
+            return None
+
+        tau_p = float(getattr(self.hyperparams, "bp_survival_tau_p", 20.0))
+        tau_z = float(getattr(self.hyperparams, "bp_survival_tau_z", 20.0))
+        z_th = float(getattr(self.hyperparams, "bp_survival_barz_threshold", 0.5))
+        tau_p = max(1.0, tau_p)
+        tau_z = max(1.0, tau_z)
+
+        branch_weights = []
+        for p_child, bar_z_child in zip(P_children, bar_z_children):
+            w_p = torch.sigmoid(tau_p * p_child)
+            w_z = torch.sigmoid(tau_z * (z_th - bar_z_child))
+            branch_weights.append(w_p * w_z)
+        w_stack = torch.stack(
+            [w if w.dim() == 2 else w.unsqueeze(-1) for w in branch_weights], dim=1
+        )  # (B,N,1)
+
+        if eta_children is not None and len(eta_children) == w_stack.shape[1]:
+            eta_stack = torch.stack(
+                [e if e.dim() == 2 else e.unsqueeze(-1) for e in eta_children], dim=1
+            ).to(w_stack.dtype).clamp(min=0.0, max=1.0)
+            eta_count = eta_stack.sum(dim=1)
+            w_surv = (eta_stack * w_stack).sum(dim=1) / (eta_count + 1e-6)
+        else:
+            w_surv = w_stack.mean(dim=1)
+        return w_surv.clamp(min=0.0, max=1.0)
+
     def _compute_conditional_signed_foc_terms(
         self,
         foc_residuals: List[torch.Tensor],
@@ -799,7 +844,8 @@ class Episode:
         z_parent: torch.Tensor,
         alpha_z: float,
         beta_z: float,
-        z0: float
+        z0: float,
+        sample_weight: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
         """
         FOC 采用“条件在再融资事件上的 signed moment”：
@@ -834,18 +880,17 @@ class Episode:
 
         foc_cond_signed = (eta_stack * foc_stack).sum(dim=1) / (eta_count + 1e-6)  # (B,1), signed
         foc_cond_abs = (eta_stack * foc_stack.abs()).sum(dim=1) / (eta_count + 1e-6)  # (B,1), non-negative
-
-        foc_signed_moment = foc_cond_signed[active_bool].mean()
+        if sample_weight is not None:
+            sw = sample_weight[active_bool].clamp(min=0.0, max=1.0)
+        else:
+            sw = torch.ones_like(foc_cond_signed[active_bool])
+        sw_sum = sw.sum().clamp_min(1e-6)
+        foc_signed_moment = (sw * foc_cond_signed[active_bool]).sum() / sw_sum
         loss_foc = foc_signed_moment.pow(2)
 
         # 仅在 eta 活跃子样本上评估 z-penalty，避免被 eta=0 样本稀释。
-        penalty_z_foc = compute_z_penalty(
-            foc_cond_abs[active_bool],
-            z_parent[active_bool],
-            alpha_z,
-            beta_z,
-            z0
-        )
+        z_weight = torch.sigmoid(beta * (z_parent[active_bool] - z0))
+        penalty_z_foc = alpha * ((sw * z_weight * foc_cond_abs[active_bool]).sum() / sw_sum)
 
         with torch.no_grad():
             diag = {
@@ -853,6 +898,7 @@ class Episode:
                 'foc_signed_moment': float(foc_signed_moment.item()),
                 'foc_cond_abs_mean': float(foc_cond_abs[active_bool].mean().item()),
                 'foc_active_n': float(active_n),
+                'foc_survival_weight_mean': float(sample_weight.mean().item()) if sample_weight is not None else 1.0,
             }
         return loss_foc, penalty_z_foc, diag
 
@@ -1713,16 +1759,22 @@ class Episode:
             bp=bp_for_p0,
             eta=eta_children
         )
+        bp_surv_weight = self._compute_bp_survival_weight(
+            P_children=P_children,
+            bar_z_children=bar_z_children,
+            eta_children=eta_children,
+        )
         loss_foc, penalty_z_foc, foc_diag = self._compute_conditional_signed_foc_terms(
             foc_residuals=foc_residuals,
             eta_children=eta_children,
             z_parent=parent_state[:, 1:2],
             alpha_z=loss_fn.alpha_z,
             beta_z=loss_fn.beta_z,
-            z0=loss_fn.z0
+            z0=loss_fn.z0,
+            sample_weight=bp_surv_weight,
         )
         kkt_penalty_base, kkt_diag = self._compute_bp_kkt_penalty(
-            bp_for_p0, foc_residuals, eta_children=eta_children
+            bp_for_p0, foc_residuals, eta_children=eta_children, sample_weight=bp_surv_weight
         )
         p0_kkt_w = float(getattr(self.hyperparams, "p0_kkt_weight", 1.0))
         kkt_penalty = p0_kkt_w * kkt_penalty_base
@@ -1757,6 +1809,7 @@ class Episode:
                 'p0_foc_signed_moment': float(foc_diag['foc_signed_moment']),
                 'p0_foc_cond_abs_mean': float(foc_diag['foc_cond_abs_mean']),
                 'p0_foc_active_n': float(foc_diag.get('foc_active_n', 0.0)),
+                'p0_foc_survival_weight_mean': float(foc_diag.get('foc_survival_weight_mean', 1.0)),
                 'p0_log_mean_M_raw': float(torch.log(raw_m.mean().clamp_min(1e-8)).item()),
                 'p0_log_mean_M_used': float(torch.log(use_m.mean().clamp_min(1e-8)).item()),
                 'p0_M_raw_p90': float(torch.quantile(raw_m, 0.90).item()),
@@ -1907,16 +1960,22 @@ class Episode:
             bp=bp_for_pi,
             eta=eta_children
         )
+        bp_surv_weight = self._compute_bp_survival_weight(
+            P_children=P_children,
+            bar_z_children=bar_z_children,
+            eta_children=eta_children,
+        )
         loss_foc, penalty_z_foc, foc_diag = self._compute_conditional_signed_foc_terms(
             foc_residuals=foc_residuals,
             eta_children=eta_children,
             z_parent=parent_state[:, 1:2],
             alpha_z=loss_fn.alpha_z,
             beta_z=loss_fn.beta_z,
-            z0=loss_fn.z0
+            z0=loss_fn.z0,
+            sample_weight=bp_surv_weight,
         )
         kkt_penalty_base, kkt_diag = self._compute_bp_kkt_penalty(
-            bp_for_pi, foc_residuals, eta_children=eta_children
+            bp_for_pi, foc_residuals, eta_children=eta_children, sample_weight=bp_surv_weight
         )
         pi_kkt_w = float(getattr(self.hyperparams, "pi_kkt_weight", 1.0))
         kkt_penalty = pi_kkt_w * kkt_penalty_base
@@ -1952,6 +2011,7 @@ class Episode:
                 'pi_foc_signed_moment': float(foc_diag['foc_signed_moment']),
                 'pi_foc_cond_abs_mean': float(foc_diag['foc_cond_abs_mean']),
                 'pi_foc_active_n': float(foc_diag.get('foc_active_n', 0.0)),
+                'pi_foc_survival_weight_mean': float(foc_diag.get('foc_survival_weight_mean', 1.0)),
                 'pi_log_mean_M_raw': float(torch.log(raw_m.mean().clamp_min(1e-8)).item()),
                 'pi_log_mean_M_used': float(torch.log(use_m.mean().clamp_min(1e-8)).item()),
                 'pi_M_raw_p90': float(torch.quantile(raw_m, 0.90).item()),

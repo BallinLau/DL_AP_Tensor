@@ -208,14 +208,17 @@ def main():
             device,
             resolve_base_dir(run_root, ROOT),
         )
-        plot_bp_diagnostic_curves(
-            ep,
-            models["policy_value"],
-            models.get("sdf_fc1"),
-            ref_state,
-            device,
-            resolve_base_dir(run_root, ROOT),
-        )
+        if hyperparams.bp_diag_enabled and (
+            ep % max(1, hyperparams.bp_diag_every_n_episodes) == 0 or ep == args.n_episodes - 1
+        ):
+            plot_bp_diagnostic_curves(
+                ep,
+                models["policy_value"],
+                models.get("sdf_fc1"),
+                ref_state,
+                device,
+                resolve_base_dir(run_root, ROOT),
+            )
         plot_distributions(
             ep,
             episode.df,

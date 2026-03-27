@@ -519,6 +519,136 @@ g\,M_t\,P_{t+1}(bp_I)\,(1-\bar z_{t+1}(bp_I))
 M_t\,P_{t+1}(bp_0)\,(1-\bar z_{t+1}(bp_0))
 ```
 
+## 3. 最新修改：`bp` 训练只让 child 存活区主导
+
+### 3.1 问题的新判定
+
+在新增的 `bp_diag_*` 与 `bp_boundary_*` 图里，已经多次观察到同一模式：
+
+- `P_{t+1}(bp)` 在某个边界 `bp_c` 后迅速掉到 `0`
+- `\bar z_{t+1}(bp)` 同时升到 `0.5` 以上
+- `FOC` 在该边界附近发生明显跳变
+- 但 `bp^*` 仍然可能落在 `bp_c` 右侧，甚至接近 `1`
+
+这说明当前 `bp` 训练存在一个结构性问题：
+
+```math
+\text{default 区右侧的局部驻点，也被 surrogate 当成了“可接受最优”。}
+```
+
+换句话说，训练并没有区分：
+
+1. child 仍然继续经营的存活区
+2. child 已经进入下一期股权清零 / 高违约概率的死亡平台区
+
+### 3.2 数学上的修正思路
+
+设 child 存活权重为：
+
+```math
+w_{surv}(bp)=\chi_{t+1}(bp)
+```
+
+最硬版可写成：
+
+```math
+w_{surv}(bp)=\mathbf{1}\{P_{t+1}(bp)>0,\ \bar z_{t+1}(bp)<0.5\}
+```
+
+为保持可导，当前实现采用 soft 版：
+
+```math
+w_{surv}(bp)
+=
+\sigma(\tau_P P_{t+1}(bp))
+\cdot
+\sigma(\tau_z (z_{th}-\bar z_{t+1}(bp)))
+```
+
+其中：
+
+- `\tau_P` 控制对 `P_{t+1}` 的门控斜率
+- `\tau_z` 控制对 `\bar z_{t+1}` 的门控斜率
+- `z_{th}` 当前取 `0.5`
+
+于是 `bp` surrogate 的 pointwise 训练项改成：
+
+```math
+L_{bp}^{FOC}
+=
+w_{surv}\cdot (FOC(bp))^2
+```
+
+```math
+L_{bp}^{KKT}
+=
+w_{surv}\cdot KKT(bp)
+```
+
+这一步的数学含义是：
+
+- 当某个 `bp` 已经把 child 推到
+  ```math
+  P_{t+1}\approx 0,\quad \bar z_{t+1}\gtrsim 0.5
+  ```
+  时，它在 `bp` 训练里的权重会自动下降
+- 训练将主要由左侧 still-alive 区域的 FOC/KKT 信号主导
+
+因此它针对的是当前最具体的问题：
+
+```math
+\text{不是“平台区更优”，而是“平台区也被当作有效局部解”。}
+```
+
+### 3.3 经济学上的合理性
+
+这一修正并不是技术性地“硬压低 `bp`”，而是把 `bp` 的经济意义重新对齐到：
+
+```math
+\text{当前企业若继续经营，应当如何选择下一期债务。}
+```
+
+如果某个 `bp` 已经把 child 直接推入：
+
+- 下一期股权清零
+- 极高违约概率
+- continuation 基本消失
+
+那么这个 `bp` 就不应该和正常 continue 区内的内点最优条件并列对待。
+
+所以这一步的经济解释是：
+
+- `bp` 的 FOC/KKT 应由 continue 区内的最优性主导
+- default 区右侧的死亡平台，不应继续给 `bp` 输出头提供“正当性”
+
+### 3.4 预期效果
+
+若该修正有效，后续重新训练后应观察到：
+
+1. `bp^*` 更少落在 `P_{t+1}=0` 的 crossing 右侧
+2. `bp^*` 更接近 `argmax V0 / argmax VI`
+3. `bp_boundary` 图里，右侧死亡平台对训练的牵引明显减弱
+
+### 3.5 诊断图轻量化
+
+为了避免 `bp` 诊断显著拖慢每个 episode，当前 refactor 分支同时把诊断逻辑切到了轻量版：
+
+- 默认只画 `safe` 状态
+- `bp_grid` 从 `201` 降到 `101`
+- `run_multi_episode_job.py` 中改为每 `5` 个 episode 画一次，最后一轮强制画
+- 诊断图中的 `FOC/KKT` 改成有限差分近似，而不再使用训练级别的 `autograd.grad`
+
+这样做的原因是：
+
+- 训练需要高质量梯度
+- 诊断只需要看
+  ```math
+  \text{shape, crossing, argmax, jump}
+  ```
+  这些局部几何特征
+
+因此有限差分已经足够，不需要继续在诊断阶段保留大计算图。
+
 ## 3. 当前最重要的理论澄清
 
 ### 3.1 Bellman 方程本身是 conditional-on-survival 的

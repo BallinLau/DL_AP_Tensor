@@ -219,6 +219,23 @@ class HyperParams:
     # 这样 surrogate 与实际 payoff 对齐，避免 bp 头沿着 Phat' 在违约区继续收到与 P=0 不一致的梯度。
     # 若做对照实验，可临时改回 True，让 FOC/KKT 使用 Phat' 作为梯度通道。
     bp_foc_use_phat_children: bool = False
+    # ========== bp 诊断图（默认轻量版） ==========
+    bp_diag_enabled: bool = True
+    # 多 episode 训练时每隔多少个 episode 生成一次 bp 诊断；最后一轮仍会强制生成
+    bp_diag_every_n_episodes: int = 5
+    # 逗号分隔的状态名集合：safe,mid,risky,distress
+    bp_diag_states: str = "safe"
+    # bp 诊断扫描网格点数；诊断只需看形状，101 通常足够
+    bp_diag_grid_points: int = 101
+    # 诊断图默认用有限差分近似 FOC/KKT，避免 episode 末尾额外跑 autograd.grad
+    bp_diag_use_autograd_foc: bool = False
+    # ========== bp 训练：child 存活区加权 ==========
+    # 仅让 child 仍具继续经营意义的区域主导 bp 的 FOC/KKT 训练，
+    # 避免 default 右侧局部驻点被当成正常内点最优。
+    bp_survival_reweight_enabled: bool = True
+    bp_survival_tau_p: float = 20.0
+    bp_survival_tau_z: float = 20.0
+    bp_survival_barz_threshold: float = 0.5
 
     # ========== Episode 收敛判定（非 AIO Bellman 残差） ==========
     # 判定条件：Q/P0/PI 各自主残差的 mean(abs) 与 p90(abs) 同时过阈值
