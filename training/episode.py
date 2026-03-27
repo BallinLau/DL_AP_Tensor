@@ -890,7 +890,7 @@ class Episode:
 
         # 仅在 eta 活跃子样本上评估 z-penalty，避免被 eta=0 样本稀释。
         z_weight = torch.sigmoid(beta_z * (z_parent[active_bool] - z0))
-        penalty_z_foc = alpha * ((sw * z_weight * foc_cond_abs[active_bool]).sum() / sw_sum)
+        penalty_z_foc = alpha_z * ((sw * z_weight * foc_cond_abs[active_bool]).sum() / sw_sum)
 
         with torch.no_grad():
             diag = {
