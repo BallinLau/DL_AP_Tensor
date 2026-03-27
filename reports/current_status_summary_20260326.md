@@ -125,6 +125,39 @@ P_t > 0 \quad \text{and} \quad \bar z_t < 0.5
    - continuation 项本身。  
    - 若它们在高 `bp` 已经明显恶化，但总值仍偏向高 `bp`，就说明当前融资收益仍压过未来损失。
 
+后续又新增了两个 `CF decomposition` 面板，用来继续拆 `CF0/CFI` 的来源：
+
+7. `CF0 decomposition`  
+   - `prod(bp)`：税后经营利润  
+   - `debt_adj0(bp)`：不投资分支的净发债收入  
+   - `-eq_cost0(bp)`：股权融资成本的负向贡献  
+   - `CF0(bp)`：以上三项合成后的 no-invest 当前现金流
+
+8. `CFI decomposition`  
+   - `prod(bp)`：税后经营利润  
+   - `debt_adjI(bp)`：投资分支的净发债收入  
+   - `-i(bp)`：投资成本  
+   - `-eq_costI(bp)`：股权融资成本的负向贡献  
+   - `CFI(bp)`：以上几项合成后的 invest 当前现金流
+
+这两个分解面板的作用是判断：
+
+```math
+\text{到底是哪一项把 safe 区的 } V(bp) \text{ 推向高杠杆。}
+```
+
+如果观察到：
+
+- `prod(bp)` 基本平缓甚至下降
+- `debt_adj0(bp)` / `debt_adjI(bp)` 随 `bp` 明显上升
+- 而 `CF0(bp)` / `CFI(bp)` 的峰值主要跟着 `debt_adj` 走
+
+那么就可以更明确地判断：
+
+```math
+\text{当前 safe 区高 } bp \text{ 的主因是净发债收入，而不是经营利润或 continuation。}
+```
+
 图上的三条竖线分别是：
 
 - `bp0*`：不投资分支最优候选

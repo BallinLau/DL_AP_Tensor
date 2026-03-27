@@ -356,6 +356,16 @@ def plot_bp_diagnostic_curves(
         cf0 = p0_loss.compute_cashflow_p0(x, z, b, q_parent, child_out.Q, eta)
         cfi = pi_loss.compute_cashflow_pi(x, z, b, i, q_parent, child_out.Q, eta)
 
+        # Decompose current cash flow into economically interpretable pieces.
+        prod = torch.exp(x + z) - Config.DELTA - b
+        prod = prod - Config.TAU * torch.relu(prod)
+        debt0 = ((1.0 - Config.KAPPA_B) * child_out.Q - q_parent) * eta
+        raw0 = prod + debt0
+        eqcost0 = Config.KAPPA_E * torch.relu(-raw0)
+        debtI = ((1.0 - Config.KAPPA_B) * Config.G * child_out.Q - q_parent) * eta
+        rawI = prod - i + debtI
+        eqcostI = Config.KAPPA_E * torch.relu(-rawI)
+
         with torch.no_grad():
             if sdf_model is not None:
                 _, _, m_next, _, _ = sdf_model.forward_step(
@@ -415,6 +425,12 @@ def plot_bp_diagnostic_curves(
             barz_np = child_out.bar_z.squeeze(-1).cpu().numpy()
             cf0_np = cf0.squeeze(-1).cpu().numpy()
             cfi_np = cfi.squeeze(-1).cpu().numpy()
+            prod_np = prod.squeeze(-1).cpu().numpy()
+            debt0_np = debt0.squeeze(-1).cpu().numpy()
+            debtI_np = debtI.squeeze(-1).cpu().numpy()
+            invest_np = i.squeeze(-1).cpu().numpy()
+            eqcost0_np = eqcost0.squeeze(-1).cpu().numpy()
+            eqcostI_np = eqcostI.squeeze(-1).cpu().numpy()
             cont0_np = cont0.squeeze(-1).cpu().numpy()
             contI_np = contI.squeeze(-1).cpu().numpy()
             v0_np = v0_diag.squeeze(-1).cpu().numpy()
@@ -429,8 +445,19 @@ def plot_bp_diagnostic_curves(
             bp_v0_argmax = float(bp_np[int(np.argmax(v0_np))])
             bp_vi_argmax = float(bp_np[int(np.argmax(vi_np))])
 
-        fig, axes = plt.subplots(4, 2, figsize=(11, 13))
-        ax_q, ax_qunit, ax_p, ax_barz, ax_cf, ax_cont, ax_foc, ax_kkt = axes.flatten()
+        fig, axes = plt.subplots(5, 2, figsize=(11, 16))
+        (
+            ax_q,
+            ax_qunit,
+            ax_p,
+            ax_barz,
+            ax_cf,
+            ax_cont,
+            ax_foc,
+            ax_kkt,
+            ax_cf0_decomp,
+            ax_cfi_decomp,
+        ) = axes.flatten()
 
         ax_q.plot(bp_np, q_np, color="tab:blue")
         ax_q.set_title("Q(bp)")
@@ -482,6 +509,25 @@ def plot_bp_diagnostic_curves(
         ax_kkt.set_xlabel("bp")
         ax_kkt.set_ylabel("penalty")
         ax_kkt.legend(frameon=False, fontsize=8)
+
+        ax_cf0_decomp.plot(bp_np, prod_np, label="prod(bp)", color="tab:green")
+        ax_cf0_decomp.plot(bp_np, debt0_np, label="debt_adj0(bp)", color="tab:purple")
+        ax_cf0_decomp.plot(bp_np, -eqcost0_np, label="-eq_cost0(bp)", color="tab:red")
+        ax_cf0_decomp.plot(bp_np, cf0_np, label="CF0(bp)", color="tab:blue", linestyle="--")
+        ax_cf0_decomp.set_title("CF0 decomposition")
+        ax_cf0_decomp.set_xlabel("bp")
+        ax_cf0_decomp.set_ylabel("value")
+        ax_cf0_decomp.legend(frameon=False, fontsize=8)
+
+        ax_cfi_decomp.plot(bp_np, prod_np, label="prod(bp)", color="tab:green")
+        ax_cfi_decomp.plot(bp_np, debtI_np, label="debt_adjI(bp)", color="tab:purple")
+        ax_cfi_decomp.plot(bp_np, -invest_np, label="-i(bp)", color="tab:brown")
+        ax_cfi_decomp.plot(bp_np, -eqcostI_np, label="-eq_costI(bp)", color="tab:red")
+        ax_cfi_decomp.plot(bp_np, cfi_np, label="CFI(bp)", color="tab:orange", linestyle="--")
+        ax_cfi_decomp.set_title("CFI decomposition")
+        ax_cfi_decomp.set_xlabel("bp")
+        ax_cfi_decomp.set_ylabel("value")
+        ax_cfi_decomp.legend(frameon=False, fontsize=8)
 
         for ax in axes.flatten():
             ax.axvline(bp0_star, color="tab:blue", linestyle="--", linewidth=1)
