@@ -259,6 +259,106 @@ P_t > 0 \quad \text{and} \quad \bar z_t < 0.5
 
 这里的：
 
+## 3. `Q` 训练链当前的新判断
+
+从最近的 `safe state` 诊断图看，`Q` 这条线已经暴露出一个独立问题：
+
+- `q_unit(bp)` 几乎是一条接近常数的小正线
+- 量级只有 `1e-4 ~ 1e-5`
+- `Q(bp)=bp \cdot q_unit(bp)` 只是机械地随 `bp` 线性增加一点
+- `CF0/CFI` 里的 `debt_adj` 基本消失，导致 `dCF/dbp \approx 0`
+
+这说明当前问题已经不只是 recovery 规格或 `bp` surrogate 的问题，而是：
+
+```math
+q\_head \text{ 很可能没有真正学出 } Q(b,z,\eta,x,\hat c,\ln K)
+```
+
+### 3.1 为什么怀疑是 `Q` 自己没学起来
+
+在当前 `q_loss` 里：
+
+- `M` 已被 clamp 到 `[0.5, 1.5]`
+- `safe state` 下 `P_{t+1}` 仍为正
+- `bar_z` 也未接近 1
+
+按这种方程环境，`Q` 正常不应普遍塌到 `1e-5` 量级。
+
+因此更像是：
+
+- `q_head` 在当前共享特征上学成了近常数的小正值
+- 而不是方程自然推出了极小 `Q`
+
+### 3.2 为什么默认 `q_head_only` 容易出问题
+
+此前默认配置是：
+
+- `q_pretrain_epochs = 0`
+- `q_warmstart_epochs = 0`
+- `q_pretrain_trainable_scope = q_head_only`
+
+这意味着：
+
+- 没有任何 `Q-only` 的独立学习窗口
+- 即使开预训练，也只允许 `q_head` 自己在 frozen `share_layer` 特征上拟合
+
+如果共享表征主要是为 `P/bp` 服务的，那么 `Q` 很容易学成：
+
+```math
+q_{unit}(h) \approx \text{一个接近常数的小正数}
+```
+
+于是 `Q = b \cdot q_{unit}` 就会整体塌到很低量级。
+
+### 3.3 本次默认改动
+
+为了先把 `Q` 这条线单独救起来，当前默认口径改为：
+
+- `q_pretrain_epochs = 10`
+- `q_warmstart_epochs = 10`
+- `q_pretrain_trainable_scope = q_path`
+
+含义是：
+
+1. 先给 `Q` 一个独立的预训练窗口
+2. 预训练期允许 `share_layer + q_head` 一起适配
+3. 不再要求 `q_head` 单独在 frozen 特征上硬拟合
+
+### 3.4 为什么这个改动有效
+
+#### 数学上
+
+如果当前共享特征 `h` 本身对债券价值没有可分辨信息，那么即使 `q_head` 非线性再强，
+它也只能在一个错误的表示上学出近常数解。
+
+让 `q_path` 一起动，相当于同时优化：
+
+```math
+h_\theta(s), \quad q_\psi(h_\theta(s))
+```
+
+而不是只优化：
+
+```math
+q_\psi(h_{\text{frozen}}(s))
+```
+
+这会显著提高 `Q` 对状态和 `bp` 的辨识能力。
+
+#### 经济上
+
+只有当 `Q` 先恢复到合理量级并呈现合理形状时，
+后面的：
+
+- `debt_adj`
+- `CF0/CFI`
+- `bp` 最优债务选择
+
+才有解释价值。
+
+否则如果 `Q` 自己就是一条接近零的常数曲线，
+后续所有关于“高杠杆是因为融资收益太强/太弱”的经济解释都会失真。
+
 ```math
 \arg\max_{bp} V0(bp), \qquad \arg\max_{bp} VI(bp)
 ```
