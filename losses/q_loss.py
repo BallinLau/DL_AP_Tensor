@@ -76,11 +76,17 @@ class QLoss(nn.Module):
         z: torch.Tensor
     ) -> torch.Tensor:
         """
-        计算“总债价值”口径下的违约回收目标：
-        Q_default_target = b_+ * recovery_unit
+        计算违约时的总回收价值。
+
+        与论文 Bondprice 公式保持一致，违约回收来自企业可回收资产，
+        而不是债务面值的线性倍数：
+
+            recovery_total = φ * (1 - δ + exp(x+z))
+
+        这里保留 b 参数仅为兼容现有调用链；理论上该回收值不应乘 b。
         """
-        b_nonneg = torch.clamp(b, min=0.0)
-        return b_nonneg * self.compute_recovery_value(x, z)
+        _ = b
+        return self.compute_recovery_value(x, z)
     
     def compute_main_residual(
         self,
@@ -158,7 +164,7 @@ class QLoss(nn.Module):
         """
         计算 bar_z 相关约束
         
-        当 bar_z > 0（违约）时，Q 应接近总债价值口径回收目标
+        当 bar_z > 0（违约）时，Q 应接近论文定义的资产回收价值
         """
         recovery_total = self.compute_total_recovery(b, x, z)
         constraint = (Q - recovery_total) * bar_z
@@ -185,7 +191,7 @@ class QLoss(nn.Module):
         margin: float = 1e-1
     ) -> torch.Tensor:
         """
-        b ≥ 1 边界条件：债券价格应等于回收价值
+        b ≥ 1 边界条件：债券价格应等于资产回收价值
         """
         mask = (b >= 1 - margin).float()
         recovery_total = self.compute_total_recovery(b, x, z)
