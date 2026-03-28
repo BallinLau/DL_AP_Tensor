@@ -1,14 +1,14 @@
 """
 Q Loss: 债券价格损失
 
-核心目标：拟合债券价格方程残差，叠加边界条件约束（b≤0、b≥1）与 bar_z 相关约束，
+核心目标：拟合债券价格方程残差，叠加高杠杆边界条件（b≥1）与 bar_z 相关约束，
 确保债券定价合理性。
 
 支持任意数量的分支路径：
 - parent: (Q_t, b_t, ...) → t 期父节点
 - children: [(Qsp_{t+1}^{(j)}, bar_z_{t+1}^{(j)}, ...)] → N 条模拟路径
 
-L_Q = main_q + loss3 + loss4 + loss5 + penalty_z_all
+L_Q = main_q + loss3 + loss5 + penalty_z_all
 """
 
 import torch
@@ -177,10 +177,13 @@ class QLoss(nn.Module):
         margin: float = 1e-1
     ) -> torch.Tensor:
         """
-        b ≤ 0 边界条件：债券价格应接近 0
+        低杠杆边界损失已弃用。
+
+        结构层已显式规定 Q = b * q_unit，因此 b=0 时天然满足 Q=0。
+        继续对整段 b<=margin 施加 Q≈0 约束会在小正债务区错误压扁 Q。
         """
-        mask = (b <= margin).float()
-        return Q.pow(2) * mask
+        _ = (b, margin)
+        return torch.zeros_like(Q)
     
     def compute_boundary_loss_high(
         self,
@@ -258,7 +261,7 @@ class QLoss(nn.Module):
             z, self.alpha_z, self.beta_z, self.z0
         )
         
-        total_loss = main_q + loss3 + loss4 + loss5 + penalty_z_main + penalty_z_loss3
+        total_loss = main_q + loss3 + loss5 + penalty_z_main + penalty_z_loss3
         
         loss_dict = {
             'main_q': main_q,
@@ -336,7 +339,7 @@ class QLoss(nn.Module):
             z, self.alpha_z, self.beta_z, self.z0
         )
         
-        total_loss = main_q + loss3 + loss4 + loss5 + penalty_z
+        total_loss = main_q + loss3 + loss5 + penalty_z
         
         loss_dict = {
             'main_q': main_q,
