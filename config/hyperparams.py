@@ -163,9 +163,9 @@ class HyperParams:
     pv_m_clamp_min: float = 0.7
     pv_m_clamp_max: float = 1.3
     # Q 对 b/z 的形状正则权重与区间
-    q_shape_weight_z: float = 1.0
-    q_shape_weight_b_low: float = 1.0
-    q_shape_weight_b_high: float = 1.0
+    q_shape_weight_z: float = 0.0
+    q_shape_weight_b_low: float = 0.0
+    q_shape_weight_b_high: float = 0.0
     q_shape_b_low: float = 0.2
     q_shape_b_high: float = 0.8
     # Q-only 阶段是否冻结非 Q 分支参数（保持经济方程不改写）
@@ -236,13 +236,22 @@ class HyperParams:
     bp_survival_tau_p: float = 20.0
     bp_survival_tau_z: float = 20.0
     bp_survival_barz_threshold: float = 0.5
+<<<<<<< HEAD
     # ========== bp 训练：粗网格 value supervision（GPU 上向量化） ==========
     # 仅靠 FOC/KKT 难以处理非凹、存在 regime switch 的 V(bp)。
     # 这里用小网格近似 survive-set 内的 argmax V，给 bp 一个直接的全局 value-level 信号。
+=======
+    # ========== bp 训练：coarse-grid value 对齐 ==========
+    # 仅用少量 GPU 网格点近似 argmax V(bp)，为 bp 输出提供全局 value-level 信号。
+>>>>>>> 99b2267 (Disable q-shape prior for ablation)
     bp_value_supervision_enabled: bool = True
     bp_value_weight: float = 1.0
     bp_value_grid_points: int = 21
     bp_value_sample_cap: int = 256
+<<<<<<< HEAD
+=======
+    # True 时只在 child 仍存活的网格点集合上找 argmax V
+>>>>>>> 99b2267 (Disable q-shape prior for ablation)
     bp_value_survival_only: bool = True
     bp_value_barz_threshold: float = 0.5
 

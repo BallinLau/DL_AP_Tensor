@@ -149,6 +149,12 @@ def build_hyperparams():
     hp.bp_diag_states = "safe"
     hp.bp_diag_grid_points = 101
     hp.bp_diag_use_autograd_foc = False
+    hp.q_pretrain_epochs = 10
+    hp.q_warmstart_epochs = 10
+    hp.q_pretrain_trainable_scope = "q_path"
+    hp.q_shape_weight_z = 0.0
+    hp.q_shape_weight_b_low = 0.0
+    hp.q_shape_weight_b_high = 0.0
     hp.bp_survival_reweight_enabled = True
     hp.bp_survival_tau_p = 20.0
     hp.bp_survival_tau_z = 20.0
