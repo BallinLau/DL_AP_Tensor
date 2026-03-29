@@ -71,6 +71,11 @@ def parse_args() -> argparse.Namespace:
         choices=["modea", "modeb"],
         help="When --post0-mode=alternate, choose which mode starts at episode 1",
     )
+    parser.add_argument(
+        "--q-only-ablation",
+        action="store_true",
+        help="Run a Q-only ablation: only train policy_value, and keep the whole run inside q-only stage.",
+    )
     return parser.parse_args()
 
 
@@ -89,6 +94,13 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.epochs = args.epochs
     if args.simulate_horizon is not None:
         hyperparams.simulate_horizon = args.simulate_horizon
+    if args.q_only_ablation:
+        q_only_epochs = int(hyperparams.epochs)
+        hyperparams.q_pretrain_epochs = q_only_epochs
+        hyperparams.q_warmstart_epochs = q_only_epochs
+        hyperparams.bp_diag_enabled = True
+        hyperparams.bp_diag_every_n_episodes = 1
+        hyperparams.bp_diag_states = "safe"
     return hyperparams
 
 
@@ -171,8 +183,8 @@ def main():
             else:
                 episode_mode = args.post0_mode
 
-        train_modules = ["sdf_fc1", "policy_value"]
-        if args.enable_fc2:
+        train_modules = ["policy_value"] if args.q_only_ablation else ["sdf_fc1", "policy_value"]
+        if args.enable_fc2 and not args.q_only_ablation:
             train_modules.append("fc2")
         simulate_kwargs = {
             "horizon_mode1": 1,
@@ -239,7 +251,8 @@ def main():
             f"batch_size={hyperparams.batch_size} "
             f"n_paths={data_kwargs['n_paths']} "
             f"group_size={data_kwargs['group_size']} "
-            f"horizon={hyperparams.simulate_horizon}"
+            f"horizon={hyperparams.simulate_horizon} "
+            f"q_only_ablation={int(args.q_only_ablation)}"
         )
         log_gpu_stats(f"[Episode {ep}]", device)
         print(f"Episode {ep} ({episode_mode}) done: {ep_summary}")
