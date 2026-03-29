@@ -15,6 +15,7 @@ import sys
 import json
 
 import torch
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
@@ -27,6 +28,7 @@ from experiments.run_utils import (  # noqa: E402
     build_models,
     build_optimizers,
     build_hyperparams,
+    build_policy_ref_state,
     ensure_dirs,
     save_models,
     save_stage_df,
@@ -76,10 +78,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run a Q-only ablation: only train policy_value, and keep the whole run inside q-only stage.",
     )
+    parser.add_argument(
+        "--q-joint-continuation-ablation",
+        action="store_true",
+        help="Run policy_value only with q-only pretrain followed by joint continuation, and export stage-end artifacts.",
+    )
+    parser.add_argument(
+        "--q-only-epochs",
+        type=int,
+        default=None,
+        help="Override q-only epochs for q-joint continuation ablation.",
+    )
+    parser.add_argument(
+        "--joint-epochs",
+        type=int,
+        default=None,
+        help="Override joint continuation epochs for q-joint continuation ablation.",
+    )
     return parser.parse_args()
 
 
 def configure_hyperparams(args: argparse.Namespace):
+    if args.q_only_ablation and args.q_joint_continuation_ablation:
+        raise ValueError("Cannot enable both --q-only-ablation and --q-joint-continuation-ablation")
     hyperparams = build_hyperparams()
     if args.quick_test:
         hyperparams.n_paths = 10
@@ -98,6 +119,15 @@ def configure_hyperparams(args: argparse.Namespace):
         q_only_epochs = int(hyperparams.epochs)
         hyperparams.q_pretrain_epochs = q_only_epochs
         hyperparams.q_warmstart_epochs = q_only_epochs
+        hyperparams.bp_diag_enabled = True
+        hyperparams.bp_diag_every_n_episodes = 1
+        hyperparams.bp_diag_states = "safe"
+    if args.q_joint_continuation_ablation:
+        q_only_epochs = int(args.q_only_epochs if args.q_only_epochs is not None else hyperparams.q_pretrain_epochs)
+        joint_epochs = int(args.joint_epochs if args.joint_epochs is not None else hyperparams.epochs)
+        hyperparams.q_pretrain_epochs = q_only_epochs
+        hyperparams.q_warmstart_epochs = q_only_epochs
+        hyperparams.epochs = q_only_epochs + joint_epochs
         hyperparams.bp_diag_enabled = True
         hyperparams.bp_diag_every_n_episodes = 1
         hyperparams.bp_diag_states = "safe"
@@ -129,6 +159,90 @@ def make_run_root(arg_path: Path | None) -> Path:
     if arg_path is not None:
         return arg_path.expanduser().resolve()
     return ROOT.parent / "cachedir" / datetime.now().strftime("%Y%m%d_%H%M")
+
+
+def materialize_episode_outputs(episode: Episode) -> None:
+    if episode.df is None and episode.tensor_firm is not None:
+        episode.df = episode._table_to_dataframe(episode.tensor_firm)
+    if episode.df_macro is None and episode.tensor_macro is not None:
+        episode.df_macro = episode._table_to_dataframe(episode.tensor_macro)
+    if episode.df_sdf is None and episode.tensor_sdf is not None:
+        episode.df_sdf = episode._table_to_dataframe(episode.tensor_sdf)
+
+
+def make_json_safe(value):
+    if isinstance(value, dict):
+        return {k: make_json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [make_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [make_json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def export_policy_stage_artifacts(
+    episode: Episode,
+    ep: int,
+    episode_mode: str,
+    stage_tag: str,
+    stage_summary: dict,
+    run_root: Path,
+    models: dict,
+    hyperparams,
+    device: torch.device,
+    sdf_model,
+):
+    materialize_episode_outputs(episode)
+    if episode.df is None or episode.df.empty:
+        print(f"[Episode {ep}] skip stage export for {stage_tag}: empty firm DataFrame")
+        return
+
+    base_dir = resolve_base_dir(run_root, ROOT)
+    ref_state = build_policy_ref_state(episode.df)
+    save_models(models, ep, base_dir, tag=stage_tag)
+    plot_surfaces(
+        ep,
+        models["policy_value"],
+        sdf_model,
+        ref_state,
+        device,
+        base_dir,
+        tag=stage_tag,
+    )
+    if hyperparams.bp_diag_enabled:
+        plot_bp_diagnostic_curves(
+            ep,
+            models["policy_value"],
+            sdf_model,
+            ref_state,
+            device,
+            base_dir,
+            hyperparams=hyperparams,
+            tag=stage_tag,
+        )
+    plot_distributions(
+        ep,
+        episode.df,
+        models["policy_value"],
+        device,
+        base_dir,
+        df_macro=episode.df_macro,
+        tag=stage_tag,
+    )
+
+    out_dir = base_dir / "data" / "outputs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = out_dir / f"ep{ep}_{stage_tag}_summary.json"
+    payload = {
+        "episode_id": ep,
+        "episode_mode": episode_mode,
+        "stage_tag": stage_tag,
+        "stage_summary": make_json_safe(stage_summary),
+    }
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
 def main():
@@ -183,13 +297,43 @@ def main():
             else:
                 episode_mode = args.post0_mode
 
-        train_modules = ["policy_value"] if args.q_only_ablation else ["sdf_fc1", "policy_value"]
-        if args.enable_fc2 and not args.q_only_ablation:
+        train_modules = ["policy_value"] if (args.q_only_ablation or args.q_joint_continuation_ablation) else ["sdf_fc1", "policy_value"]
+        if args.enable_fc2 and not (args.q_only_ablation or args.q_joint_continuation_ablation):
             train_modules.append("fc2")
         simulate_kwargs = {
             "horizon_mode1": 1,
             "horizon": hyperparams.simulate_horizon,
         }
+        stage_exports = []
+
+        def on_policy_stage(stage_summary: dict):
+            if not args.q_joint_continuation_ablation:
+                return
+            phase_to_tag = {
+                "q_only_end": "qonly_end",
+                "joint_end": "joint_end",
+                "policy_end": "policy_end",
+            }
+            stage_tag = phase_to_tag.get(stage_summary.get("phase", "policy_stage"), str(stage_summary.get("phase", "policy_stage")))
+            sdf_model_for_plots = None if args.q_joint_continuation_ablation else models.get("sdf_fc1")
+            export_policy_stage_artifacts(
+                episode=episode,
+                ep=ep,
+                episode_mode=episode_mode,
+                stage_tag=stage_tag,
+                stage_summary=stage_summary,
+                run_root=run_root,
+                models=models,
+                hyperparams=hyperparams,
+                device=device,
+                sdf_model=sdf_model_for_plots,
+            )
+            stage_exports.append({
+                "phase": stage_summary.get("phase"),
+                "tag": stage_tag,
+                "epoch": stage_summary.get("epoch"),
+            })
+
         summary = episode.run_episode(
             n_epochs=hyperparams.epochs,
             batch_size=hyperparams.batch_size,
@@ -197,25 +341,23 @@ def main():
             train_modules=train_modules,
             simulate_kwargs=simulate_kwargs,
             episode_mode=episode_mode,
+            policy_stage_callback=on_policy_stage if args.q_joint_continuation_ablation else None,
             **data_kwargs,
         )
         ep_summary = summary.get("module_summaries", summary)
+        if stage_exports:
+            ep_summary["policy_stage_exports"] = stage_exports
+        materialize_episode_outputs(episode)
         save_stage_df(ep, episode_mode, resolve_base_dir(run_root, ROOT), episode.df, episode.df_macro, episode.df_sdf)
 
         save_models(models, ep, resolve_base_dir(run_root, ROOT))
 
-        parent_df = episode.df[episode.df["branch"] <= 0] if "branch" in episode.df.columns else episode.df
-        ref_state = {
-            "eta": 1.0,
-            "i": parent_df["i"].median(),
-            "x": parent_df["x"].median(),
-            "hatcf": parent_df["Hatcf"].median(),
-            "lnkf": parent_df["LnKF"].median(),
-        }
+        ref_state = build_policy_ref_state(episode.df)
+        sdf_model_for_plots = None if (args.q_only_ablation or args.q_joint_continuation_ablation) else models.get("sdf_fc1")
         plot_surfaces(
             ep,
             models["policy_value"],
-            models.get("sdf_fc1"),
+            sdf_model_for_plots,
             ref_state,
             device,
             resolve_base_dir(run_root, ROOT),
@@ -226,10 +368,11 @@ def main():
             plot_bp_diagnostic_curves(
                 ep,
                 models["policy_value"],
-                models.get("sdf_fc1"),
+                sdf_model_for_plots,
                 ref_state,
                 device,
                 resolve_base_dir(run_root, ROOT),
+                hyperparams=hyperparams,
             )
         plot_distributions(
             ep,
@@ -252,7 +395,8 @@ def main():
             f"n_paths={data_kwargs['n_paths']} "
             f"group_size={data_kwargs['group_size']} "
             f"horizon={hyperparams.simulate_horizon} "
-            f"q_only_ablation={int(args.q_only_ablation)}"
+            f"q_only_ablation={int(args.q_only_ablation)} "
+            f"q_joint_continuation_ablation={int(args.q_joint_continuation_ablation)}"
         )
         log_gpu_stats(f"[Episode {ep}]", device)
         print(f"Episode {ep} ({episode_mode}) done: {ep_summary}")

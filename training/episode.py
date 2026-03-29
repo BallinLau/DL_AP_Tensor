@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from tqdm import tqdm
 import logging
 
@@ -2304,36 +2304,25 @@ class Episode:
             z_parent, loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
         )
 
-        # Q 形状正则：
-        # 1) dQ/dz > 0
-        # 2) 低杠杆区 dQ/db > 0
-        # 3) 高杠杆区 dQ/db < 0
+        # q_unit 形状正则：
+        # 1) dq_unit/dz > 0
+        # 2) dq_unit/db < 0
+        q_unit = model.get_q_unit(parent_state)
         q_grads = torch.autograd.grad(
-            outputs=Q.sum(),
+            outputs=q_unit.sum(),
             inputs=parent_state,
             create_graph=True,
             retain_graph=True
         )[0]
-        dQ_db = q_grads[:, 0:1]
-        dQ_dz = q_grads[:, 1:2]
-        b_low = float(getattr(self.hyperparams, "q_shape_b_low", 0.2))
-        b_high = float(getattr(self.hyperparams, "q_shape_b_high", 0.8))
-        low_mask = (b_parent <= b_low).float()
-        high_mask = (b_parent >= b_high).float()
-
-        def _masked_mean(v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-            return (v * mask).sum() / (mask.sum() + 1e-6)
-
-        q_shape_z = torch.relu(-dQ_dz).mean()
-        q_shape_b_low = _masked_mean(torch.relu(-dQ_db), low_mask)
-        q_shape_b_high = _masked_mean(torch.relu(dQ_db), high_mask)
+        dq_db = q_grads[:, 0:1]
+        dq_dz = q_grads[:, 1:2]
+        q_shape_z = torch.relu(-dq_dz).mean()
+        q_shape_b = torch.relu(dq_db).mean()
         w_shape_z = float(getattr(self.hyperparams, "q_shape_weight_z", 1.0))
         w_shape_b_low = float(getattr(self.hyperparams, "q_shape_weight_b_low", 1.0))
-        w_shape_b_high = float(getattr(self.hyperparams, "q_shape_weight_b_high", 1.0))
         q_shape_penalty = (
             w_shape_z * q_shape_z +
-            w_shape_b_low * q_shape_b_low +
-            w_shape_b_high * q_shape_b_high
+            w_shape_b_low * q_shape_b
         )
 
         physics_loss = (
@@ -2362,8 +2351,8 @@ class Episode:
                 'q_bdry_low': float(loss4.item()),
                 'q_bdry_high': float(loss5.item()),
                 'q_shape_z': float(q_shape_z.item()),
-                'q_shape_b_low': float(q_shape_b_low.item()),
-                'q_shape_b_high': float(q_shape_b_high.item()),
+                'q_shape_b_low': float(q_shape_b.item()),
+                'q_shape_b_high': 0.0,
                 'q_physics': float(physics_loss.item()),
                 'q_warmstart': float(warm_loss.item()),
                 'q_warm_weight': float(warm_weight),
@@ -2372,6 +2361,9 @@ class Episode:
                 'q_bar_i_cond_mean': float(bar_i_cond_t.mean().item()),
                 'q_bar_i_eff_mean': float(bar_i_t.mean().item()),
                 'q_chi_mean': float(chi_t.mean().item()),
+                'q_unit_mean': float(q_unit.mean().item()),
+                'dq_unit_db_mean': float(dq_db.mean().item()),
+                'dq_unit_dz_mean': float(dq_dz.mean().item()),
             }
         return total_loss
     
@@ -3018,7 +3010,8 @@ class Episode:
         n_epochs: int,
         log_interval: int,
         train_modules: List[str],
-        desc_prefix: str = ''
+        desc_prefix: str = '',
+        policy_stage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict:
         """
         使用预生成的 batches 执行训练循环
@@ -3035,6 +3028,7 @@ class Episode:
             q_warmstart_epochs = 0
             q_only_epochs = 0
 
+        stage_summaries: Dict[str, Dict[str, Any]] = {}
         for epoch in range(n_epochs):
             self._current_epoch_idx = epoch
             self._q_only_stage = bool(
@@ -3124,6 +3118,22 @@ class Episode:
                     f"dLnKF[p10,p50,p90]=({avg_losses['sdf_dlnkf_p10']:.4f}, "
                     f"{avg_losses['sdf_dlnkf_p50']:.4f}, {avg_losses['sdf_dlnkf_p90']:.4f})"
                 )
+            if (
+                'policy_value' in train_modules and
+                q_only_epochs > 0 and
+                epoch + 1 == q_only_epochs
+            ):
+                q_only_summary = {
+                    'phase': 'q_only_end',
+                    'epoch': epoch + 1,
+                    'n_epochs': n_epochs,
+                    'q_only_epochs': q_only_epochs,
+                    'joint_epochs': max(0, n_epochs - q_only_epochs),
+                    'final_losses': dict(avg_losses),
+                }
+                stage_summaries['q_only_end'] = q_only_summary
+                if policy_stage_callback is not None:
+                    policy_stage_callback(q_only_summary)
         self._q_only_stage = False
         self._bp_only_stage = False
         convergence = None
@@ -3135,6 +3145,31 @@ class Episode:
         }
         if convergence is not None:
             result['convergence'] = convergence
+        if 'policy_value' in train_modules:
+            if q_only_epochs > 0 and n_epochs > q_only_epochs:
+                final_phase = 'joint_end'
+            elif q_only_epochs > 0:
+                final_phase = 'q_only_end'
+            else:
+                final_phase = 'policy_end'
+            final_summary = {
+                'phase': final_phase,
+                'epoch': n_epochs,
+                'n_epochs': n_epochs,
+                'q_only_epochs': q_only_epochs,
+                'joint_epochs': max(0, n_epochs - q_only_epochs),
+                'final_losses': dict(avg_losses),
+            }
+            if convergence is not None:
+                final_summary['convergence'] = convergence
+            if final_phase in stage_summaries:
+                stage_summaries[final_phase].update(final_summary)
+            else:
+                stage_summaries[final_phase] = final_summary
+                if policy_stage_callback is not None:
+                    policy_stage_callback(final_summary)
+        if stage_summaries:
+            result['stage_summaries'] = stage_summaries
         return result
 
     def _simulate_df(
@@ -3326,7 +3361,8 @@ class Episode:
         train_mode: str = '2time',
         train_modules: Optional[List[str]] = None,
         simulate_kwargs: Optional[Dict] = None,
-        episode_mode: Optional[str] = None
+        episode_mode: Optional[str] = None,
+        policy_stage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict:
         """
         按 Episode 逻辑执行训练（三模式）：
@@ -3404,7 +3440,12 @@ class Episode:
                         )
                     if pv_batches:
                         module_summaries['policy_value'] = self._run_batches(
-                            pv_batches, n_epochs, log_interval, ['policy_value'], desc_prefix='Policy/Value '
+                            pv_batches,
+                            n_epochs,
+                            log_interval,
+                            ['policy_value'],
+                            desc_prefix='Policy/Value ',
+                            policy_stage_callback=policy_stage_callback,
                         )
 
                 if use_sdf_fc1 or use_fc2:
@@ -3464,7 +3505,12 @@ class Episode:
                         )
                     if pv_batches:
                         module_summaries['policy_value'] = self._run_batches(
-                            pv_batches, n_epochs, log_interval, ['policy_value'], desc_prefix='Policy/Value '
+                            pv_batches,
+                            n_epochs,
+                            log_interval,
+                            ['policy_value'],
+                            desc_prefix='Policy/Value ',
+                            policy_stage_callback=policy_stage_callback,
                         )
 
                 if use_sdf_fc1 or use_fc2:
@@ -3530,7 +3576,12 @@ class Episode:
                         )
                     if pv_batches:
                         module_summaries['policy_value'] = self._run_batches(
-                            pv_batches, n_epochs, log_interval, ['policy_value'], desc_prefix='Policy/Value '
+                            pv_batches,
+                            n_epochs,
+                            log_interval,
+                            ['policy_value'],
+                            desc_prefix='Policy/Value ',
+                            policy_stage_callback=policy_stage_callback,
                         )
 
                 if use_sdf_fc1:

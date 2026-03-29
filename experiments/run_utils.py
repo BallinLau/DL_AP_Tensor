@@ -19,6 +19,18 @@ def resolve_base_dir(run_root: Optional[Path], project_root: Path) -> Path:
     return run_root if run_root is not None else project_root
 
 
+def _artifact_suffix(tag: Optional[str]) -> str:
+    return f"_{tag}" if tag else ""
+
+
+def _episode_prefix(ep: int, tag: Optional[str] = None) -> str:
+    return f"ep{ep}{_artifact_suffix(tag)}"
+
+
+def _episode_title_prefix(ep: int, tag: Optional[str] = None) -> str:
+    return f"EP{ep}" if not tag else f"EP{ep} [{tag}]"
+
+
 def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ckpt_prefix: str | None = None, strict: bool = True):
     models = {
         "sdf_fc1": SDFFC1Combined(
@@ -140,6 +152,9 @@ def build_hyperparams():
     hp.q_pretrain_epochs = 10
     hp.q_warmstart_epochs = 10
     hp.q_pretrain_trainable_scope = "q_path"
+    hp.q_shape_weight_z = 1.0
+    hp.q_shape_weight_b_low = 1.0
+    hp.q_shape_weight_b_high = 0.0
     # 先关闭 bp 的额外边界推进，避免 bp 长期贴到 1
     hp.bp_adaptive_enabled = False
     hp.bp_refine_steps_per_epoch = 0
@@ -172,10 +187,11 @@ def ensure_dirs(base_dir: Path):
     (base_dir / "experiments" / "figs").mkdir(parents=True, exist_ok=True)
 
 
-def save_models(models, episode: int, base_dir: Path):
-    torch.save(models["sdf_fc1"].state_dict(), base_dir / "checkpoints" / f"ep{episode}_sdf_fc1.pt")
-    torch.save(models["policy_value"].state_dict(), base_dir / "checkpoints" / f"ep{episode}_policy_value.pt")
-    torch.save(models["fc2"].state_dict(), base_dir / "checkpoints" / f"ep{episode}_fc2.pt")
+def save_models(models, episode: int, base_dir: Path, tag: Optional[str] = None):
+    prefix = _episode_prefix(episode, tag)
+    torch.save(models["sdf_fc1"].state_dict(), base_dir / "checkpoints" / f"{prefix}_sdf_fc1.pt")
+    torch.save(models["policy_value"].state_dict(), base_dir / "checkpoints" / f"{prefix}_policy_value.pt")
+    torch.save(models["fc2"].state_dict(), base_dir / "checkpoints" / f"{prefix}_fc2.pt")
 
 
 def save_stage_df(ep: int, name: str, base_dir: Path, df_firm: pd.DataFrame = None, df_macro: pd.DataFrame = None, df_sdf: pd.DataFrame = None):
@@ -186,6 +202,21 @@ def save_stage_df(ep: int, name: str, base_dir: Path, df_firm: pd.DataFrame = No
         target_df.to_pickle(out_dir / f"ep{ep}_stage_{name}.pkl")
     if df_macro is not None:
         df_macro.to_pickle(out_dir / f"ep{ep}_stage_{name}_macro.pkl")
+
+
+def build_policy_ref_state(df: pd.DataFrame) -> dict:
+    if df is None or df.empty:
+        raise ValueError("Cannot build policy diagnostic state from an empty DataFrame")
+    parent_df = df[df["branch"] <= 0] if "branch" in df.columns else df
+    if parent_df.empty:
+        parent_df = df
+    return {
+        "eta": 1.0,
+        "i": parent_df["i"].median(),
+        "x": parent_df["x"].median(),
+        "hatcf": parent_df["Hatcf"].median(),
+        "lnkf": parent_df["LnKF"].median(),
+    }
 
 
 def _compute_policy_diagnostic_surfaces(
@@ -246,8 +277,11 @@ def plot_surfaces(
     ref_state: dict,
     device: torch.device,
     base_dir: Path,
+    tag: Optional[str] = None,
 ):
     figs_dir = base_dir / "experiments" / "figs"
+    prefix = _episode_prefix(ep, tag)
+    title_prefix = _episode_title_prefix(ep, tag)
     b_grid = torch.linspace(0, 1, 50, device=device)
     z_grid = torch.linspace(-4, 4, 50, device=device)
     B, Z = torch.meshgrid(b_grid, z_grid, indexing="ij")
@@ -302,9 +336,9 @@ def plot_surfaces(
         plt.colorbar(cs)
         plt.xlabel("b")
         plt.ylabel("z")
-        plt.title(f"EP{ep} {name.upper()} heatmap")
+        plt.title(f"{title_prefix} {name.upper()} heatmap")
         plt.tight_layout()
-        plt.savefig(figs_dir / f"ep{ep}_{name}_heatmap.png", dpi=150)
+        plt.savefig(figs_dir / f"{prefix}_{name}_heatmap.png", dpi=150)
         plt.close()
 
         fig = plt.figure(figsize=(7, 5))
@@ -313,9 +347,9 @@ def plot_surfaces(
         ax.set_xlabel("b")
         ax.set_ylabel("z")
         ax.set_zlabel(name.upper())
-        ax.set_title(f"EP{ep} {name.upper()} surface")
+        ax.set_title(f"{title_prefix} {name.upper()} surface")
         plt.tight_layout()
-        plt.savefig(figs_dir / f"ep{ep}_{name}_surface.png", dpi=150)
+        plt.savefig(figs_dir / f"{prefix}_{name}_surface.png", dpi=150)
         plt.close()
 
 
@@ -326,11 +360,15 @@ def plot_bp_diagnostic_curves(
     ref_state: dict,
     device: torch.device,
     base_dir: Path,
+    hyperparams: Optional[HyperParams] = None,
+    tag: Optional[str] = None,
 ):
     figs_dir = base_dir / "experiments" / "figs"
     p0_loss = P0Loss()
     pi_loss = PILoss()
-    hp = build_hyperparams()
+    hp = hyperparams or build_hyperparams()
+    prefix = _episode_prefix(ep, tag)
+    title_prefix = _episode_title_prefix(ep, tag)
 
     target_state_map = [
         ("safe", 0.10, 1.50),
@@ -575,7 +613,7 @@ def plot_bp_diagnostic_curves(
             ax.grid(True, alpha=0.25)
 
         fig.suptitle(
-            f"EP{ep} bp diagnostics: {label} state "
+            f"{title_prefix} bp diagnostics: {label} state "
             f"(b={b_val:.2f}, z={z_val:.2f}, P={float(parent_out.P.item()):.3f}, "
             f"bar_z={float(parent_out.bar_z.item()):.3f}, "
             f"parent={'default' if parent_default_flag else 'survive'})"
@@ -590,7 +628,7 @@ def plot_bp_diagnostic_curves(
             fontsize=9,
         )
         fig.tight_layout(rect=[0, 0, 1, 0.92])
-        fig.savefig(figs_dir / f"ep{ep}_bp_diag_{label}.png", dpi=150)
+        fig.savefig(figs_dir / f"{prefix}_bp_diag_{label}.png", dpi=150)
         plt.close(fig)
 
         # Separate boundary figure: emphasize the survival/default regime switch.
@@ -635,14 +673,14 @@ def plot_bp_diagnostic_curves(
             ]
         )
         fig2.suptitle(
-            f"EP{ep} bp boundary summary: {label} state "
+            f"{title_prefix} bp boundary summary: {label} state "
             f"(b={b_val:.2f}, z={z_val:.2f}, parent={'default' if parent_default_flag else 'survive'})"
         )
         fig2.text(0.5, 0.955, boundary_text, ha="center", va="top", fontsize=9)
         ax_b1.grid(True, alpha=0.25)
         ax_b2.grid(True, alpha=0.25)
         fig2.tight_layout(rect=[0, 0, 1, 0.92])
-        fig2.savefig(figs_dir / f"ep{ep}_bp_boundary_{label}.png", dpi=150)
+        fig2.savefig(figs_dir / f"{prefix}_bp_boundary_{label}.png", dpi=150)
         plt.close(fig2)
 
 
@@ -653,8 +691,11 @@ def plot_distributions(
     device: torch.device,
     base_dir: Path,
     df_macro: pd.DataFrame | None = None,
+    tag: Optional[str] = None,
 ):
     figs_dir = base_dir / "experiments" / "figs"
+    prefix = _episode_prefix(ep, tag)
+    title_prefix = _episode_title_prefix(ep, tag)
 
     def _split_parent_child(df_in: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         if "branch" not in df_in.columns:
@@ -682,21 +723,21 @@ def plot_distributions(
     if m_child_source is not None and len(m_child_source) > 0:
         plt.figure(figsize=(5, 3))
         m_child_source.hist(bins=40)
-        plt.title(f"EP{ep} M distribution (child macro states)")
+        plt.title(f"{title_prefix} M distribution (child macro states)")
         plt.xlabel("M")
         plt.ylabel("count")
         plt.tight_layout()
-        plt.savefig(figs_dir / f"ep{ep}_m_hist.png", dpi=150)
+        plt.savefig(figs_dir / f"{prefix}_m_hist.png", dpi=150)
         plt.close()
 
     if m_parent_source is not None and len(m_parent_source) > 0:
         plt.figure(figsize=(5, 3))
         m_parent_source.hist(bins=40)
-        plt.title(f"EP{ep} M distribution (parent macro states)")
+        plt.title(f"{title_prefix} M distribution (parent macro states)")
         plt.xlabel("M")
         plt.ylabel("count")
         plt.tight_layout()
-        plt.savefig(figs_dir / f"ep{ep}_m_parent_hist.png", dpi=150)
+        plt.savefig(figs_dir / f"{prefix}_m_parent_hist.png", dpi=150)
         plt.close()
 
     if parent_df.empty:
@@ -709,11 +750,11 @@ def plot_distributions(
 
     plt.figure(figsize=(5, 3))
     plt.hist(bp, bins=40)
-    plt.title(f"EP{ep} bp distribution (parent states)")
+    plt.title(f"{title_prefix} bp distribution (parent states)")
     plt.xlabel("bp")
     plt.ylabel("count")
     plt.tight_layout()
-    plt.savefig(figs_dir / f"ep{ep}_bp_hist.png", dpi=150)
+    plt.savefig(figs_dir / f"{prefix}_bp_hist.png", dpi=150)
     plt.close()
 
 
