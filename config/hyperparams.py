@@ -153,7 +153,7 @@ class HyperParams:
 
     # ========== Policy/Value: Q 优先训练与形状约束 ==========
     # 在 policy/value 联合训练前先进行 q-only 预训练轮数
-    q_pretrain_epochs: int = 0
+    q_pretrain_epochs: int = 10
     # Q 损失中对 M 的处理（先 detach 并截断，减少 SDF 噪声传导）
     q_use_detached_m: bool = True
     q_m_clamp_min: float = 0.5
@@ -171,11 +171,11 @@ class HyperParams:
     # Q-only 阶段是否冻结非 Q 分支参数（保持经济方程不改写）
     q_freeze_non_q_in_pretrain: bool = True
     # Q-only 阶段可训练参数范围：'q_head_only' 或 'q_path'(share_layer+q_head)
-    q_pretrain_trainable_scope: str = 'q_head_only'
+    q_pretrain_trainable_scope: str = 'q_path'
     # 兼容旧配置（不再推荐）：Q-only 阶段路径解耦开关
     q_decouple_policy_in_pretrain: bool = False
     # 论文式结构化 warm-start（Q 监督预训练）
-    q_warmstart_epochs: int = 0
+    q_warmstart_epochs: int = 10
     q_warmstart_weight: float = 1.0
     q_warm_A: float = 1.0
     q_warm_b_star: float = 0.05

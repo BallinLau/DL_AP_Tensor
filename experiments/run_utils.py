@@ -136,6 +136,10 @@ def build_hyperparams():
     hp.sdf_moment_weight = 5.0
     hp.sdf_log_mean_anchor_weight_stage1 = 1.0
     hp.sdf_log_mean_anchor_weight_stage2 = 5.0
+    # 显式覆盖 Q 训练入口，避免 HyperParams 默认值和运行入口脱节。
+    hp.q_pretrain_epochs = 10
+    hp.q_warmstart_epochs = 10
+    hp.q_pretrain_trainable_scope = "q_path"
     # 先关闭 bp 的额外边界推进，避免 bp 长期贴到 1
     hp.bp_adaptive_enabled = False
     hp.bp_refine_steps_per_epoch = 0
