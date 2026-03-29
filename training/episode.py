@@ -2304,36 +2304,25 @@ class Episode:
             z_parent, loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
         )
 
-        # Q 形状正则：
-        # 1) dQ/dz > 0
-        # 2) 低杠杆区 dQ/db > 0
-        # 3) 高杠杆区 dQ/db < 0
+        # q_unit 形状正则：
+        # 1) dq_unit/dz > 0
+        # 2) dq_unit/db < 0
+        q_unit = model.get_q_unit(parent_state)
         q_grads = torch.autograd.grad(
-            outputs=Q.sum(),
+            outputs=q_unit.sum(),
             inputs=parent_state,
             create_graph=True,
             retain_graph=True
         )[0]
-        dQ_db = q_grads[:, 0:1]
-        dQ_dz = q_grads[:, 1:2]
-        b_low = float(getattr(self.hyperparams, "q_shape_b_low", 0.2))
-        b_high = float(getattr(self.hyperparams, "q_shape_b_high", 0.8))
-        low_mask = (b_parent <= b_low).float()
-        high_mask = (b_parent >= b_high).float()
-
-        def _masked_mean(v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-            return (v * mask).sum() / (mask.sum() + 1e-6)
-
-        q_shape_z = torch.relu(-dQ_dz).mean()
-        q_shape_b_low = _masked_mean(torch.relu(-dQ_db), low_mask)
-        q_shape_b_high = _masked_mean(torch.relu(dQ_db), high_mask)
+        dq_db = q_grads[:, 0:1]
+        dq_dz = q_grads[:, 1:2]
+        q_shape_z = torch.relu(-dq_dz).mean()
+        q_shape_b = torch.relu(dq_db).mean()
         w_shape_z = float(getattr(self.hyperparams, "q_shape_weight_z", 1.0))
         w_shape_b_low = float(getattr(self.hyperparams, "q_shape_weight_b_low", 1.0))
-        w_shape_b_high = float(getattr(self.hyperparams, "q_shape_weight_b_high", 1.0))
         q_shape_penalty = (
             w_shape_z * q_shape_z +
-            w_shape_b_low * q_shape_b_low +
-            w_shape_b_high * q_shape_b_high
+            w_shape_b_low * q_shape_b
         )
 
         physics_loss = (
@@ -2362,8 +2351,8 @@ class Episode:
                 'q_bdry_low': float(loss4.item()),
                 'q_bdry_high': float(loss5.item()),
                 'q_shape_z': float(q_shape_z.item()),
-                'q_shape_b_low': float(q_shape_b_low.item()),
-                'q_shape_b_high': float(q_shape_b_high.item()),
+                'q_shape_b_low': float(q_shape_b.item()),
+                'q_shape_b_high': 0.0,
                 'q_physics': float(physics_loss.item()),
                 'q_warmstart': float(warm_loss.item()),
                 'q_warm_weight': float(warm_weight),
@@ -2372,6 +2361,9 @@ class Episode:
                 'q_bar_i_cond_mean': float(bar_i_cond_t.mean().item()),
                 'q_bar_i_eff_mean': float(bar_i_t.mean().item()),
                 'q_chi_mean': float(chi_t.mean().item()),
+                'q_unit_mean': float(q_unit.mean().item()),
+                'dq_unit_db_mean': float(dq_db.mean().item()),
+                'dq_unit_dz_mean': float(dq_dz.mean().item()),
             }
         return total_loss
     

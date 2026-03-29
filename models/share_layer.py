@@ -284,6 +284,15 @@ class SharedModel(nn.Module):
         b_nonneg = torch.clamp(firm_state[:, SIMMODEL.B:SIMMODEL.B+1], min=0.0)
         return b_nonneg * q_unit
 
+    def get_q_unit(self, firm_state: torch.Tensor) -> torch.Tensor:
+        """只获取单位债价格 q_unit"""
+        base_state = torch.cat([
+            firm_state[:, :SIMMODEL.I],
+            firm_state[:, SIMMODEL.X:]
+        ], dim=-1)
+        h = self.share_layer(base_state)
+        return self.q_head(h)
+
 
 class CombinedModel(nn.Module):
     """

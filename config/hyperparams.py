@@ -162,9 +162,12 @@ class HyperParams:
     pv_use_clipped_m: bool = True
     pv_m_clamp_min: float = 0.7
     pv_m_clamp_max: float = 1.3
-    # Q 对 b/z 的形状正则权重与区间
-    q_shape_weight_z: float = 0.0
-    q_shape_weight_b_low: float = 0.0
+    # Q 形状正则改为约束单位债价格 q_unit：
+    # 1) dq_unit/dz >= 0
+    # 2) dq_unit/db <= 0
+    q_shape_weight_z: float = 1.0
+    q_shape_weight_b_low: float = 1.0
+    # 兼容旧字段；当前实现不再单独使用高 b 区权重
     q_shape_weight_b_high: float = 0.0
     q_shape_b_low: float = 0.2
     q_shape_b_high: float = 0.8

@@ -140,8 +140,8 @@ def build_hyperparams():
     hp.q_pretrain_epochs = 10
     hp.q_warmstart_epochs = 10
     hp.q_pretrain_trainable_scope = "q_path"
-    hp.q_shape_weight_z = 0.0
-    hp.q_shape_weight_b_low = 0.0
+    hp.q_shape_weight_z = 1.0
+    hp.q_shape_weight_b_low = 1.0
     hp.q_shape_weight_b_high = 0.0
     hp.bp_survival_reweight_enabled = True
     hp.bp_survival_tau_p = 20.0
