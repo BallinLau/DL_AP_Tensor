@@ -485,6 +485,18 @@ def plot_bp_diagnostic_curves(
             v0_diag = cf0 + cont0
             vi_diag = cfi + contI
 
+            # Compare invest branch under multiple i values on the same bp grid.
+            i_compare_vals = torch.linspace(0.0, Config.I_THRESHOLD, steps=5, device=device)
+            cfi_compare = []
+            vi_compare = []
+            for i_val in i_compare_vals:
+                i_cmp = torch.full_like(bp_var, float(i_val.item()))
+                cfi_cmp = pi_loss.compute_cashflow_pi(x, z, b, i_cmp, q_parent, child_out.Q, eta)
+                vi_cmp = cfi_cmp + contI
+                cfi_compare.append(cfi_cmp.squeeze(-1).cpu().numpy())
+                vi_compare.append(vi_cmp.squeeze(-1).cpu().numpy())
+            i_compare_np = i_compare_vals.cpu().numpy()
+
         with torch.no_grad():
             bp_np = bp_grid.squeeze(-1).cpu().numpy()
             q_np = child_out.Q.squeeze(-1).cpu().numpy()
@@ -578,9 +590,32 @@ def plot_bp_diagnostic_curves(
         ax_barz.set_ylabel("bar_z")
 
         ax_cf.plot(bp_np, cf0_np, label="CF0(bp)", color="tab:blue")
-        ax_cf.plot(bp_np, cfi_np, label="CFI(bp)", color="tab:orange")
         ax_cf.plot(bp_np, v0_np, label="V0 diag(bp)", color="tab:blue", linestyle="--", alpha=0.7)
-        ax_cf.plot(bp_np, vi_np, label="VI diag(bp)", color="tab:orange", linestyle="--", alpha=0.7)
+        compare_colors = plt.cm.plasma(np.linspace(0.15, 0.90, len(i_compare_np)))
+        ref_i_val = float(parent[:, 3:4].item())
+        ref_idx = int(np.argmin(np.abs(i_compare_np - ref_i_val)))
+        for idx, (i_val, cfi_curve, vi_curve, color) in enumerate(zip(i_compare_np, cfi_compare, vi_compare, compare_colors)):
+            is_ref = idx == ref_idx
+            line_alpha = 0.95 if is_ref else 0.55
+            line_width = 2.0 if is_ref else 1.1
+            label_suffix = " [ref]" if is_ref else ""
+            ax_cf.plot(
+                bp_np,
+                cfi_curve,
+                color=color,
+                linewidth=line_width,
+                alpha=line_alpha,
+                label=f"CFI(i={i_val:.3f}){label_suffix}",
+            )
+            ax_cf.plot(
+                bp_np,
+                vi_curve,
+                color=color,
+                linewidth=line_width,
+                alpha=line_alpha,
+                linestyle="--",
+                label=f"VI(i={i_val:.3f}){label_suffix}",
+            )
         ax_cf.set_title("Current cash flow and one-step V")
         ax_cf.set_xlabel("bp")
         ax_cf.set_ylabel("value")
