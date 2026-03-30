@@ -70,7 +70,7 @@ class Config:
     W_SURPLUS_FLOOR = 1e-3
     # P/bar_z 平滑温度（避免硬阈值导致梯度死区）
     P_SOFTPLUS_BETA = 8.0
-    BARZ_LOGIT_TEMP = 10.0
+    BARZ_LOGIT_TEMP = 3.0
     
     # ========== 模型架构参数 ==========
     # 共享层维度 (INCREASED for higher memory usage)

@@ -4,6 +4,7 @@ Policy & Value wrapper with separated Q and PV/BP blocks.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, NamedTuple, Tuple
 
 from .share_layer import ShareLayer, QHead, BpHead, PHead, BarzModel, BariModel
@@ -144,6 +145,7 @@ class PVBPModel(nn.Module):
         # Keep these auxiliary nets for diagnostics/backward compatibility helpers.
         self.barz_model = BarzModel(input_dim=base_state_dim, dropout=dropout)
         self.bari_model = BariModel(input_dim=base_state_dim, dropout=dropout)
+        self.chi_warmup_factor = 1.0
 
     @staticmethod
     def extract_base_state(firm_state: torch.Tensor) -> torch.Tensor:
@@ -191,9 +193,16 @@ class PVBPModel(nn.Module):
         max_vals = torch.max(v0_stack, vi_stack)
         Vhat = max_vals.mean(dim=0)
 
-        barz_temp = float(getattr(Config, "BARZ_LOGIT_TEMP", 10.0))
-        chi = torch.sigmoid(barz_temp * Vhat)
-        P = torch.clamp_min(Vhat, 0.0)
+        p_beta = max(float(getattr(Config, "P_SOFTPLUS_BETA", 8.0)), 1e-6)
+        P = F.softplus(p_beta * Vhat) / p_beta
+
+        barz_temp = float(getattr(Config, "BARZ_LOGIT_TEMP", 3.0))
+        base_chi = torch.sigmoid(barz_temp * Vhat)
+        chi_warmup_factor = min(max(float(getattr(self, "chi_warmup_factor", 1.0)), 0.0), 1.0)
+        if chi_warmup_factor < 1.0:
+            chi = chi_warmup_factor * base_chi + (1.0 - chi_warmup_factor) * torch.ones_like(base_chi)
+        else:
+            chi = base_chi
         bar_z = 1.0 - chi
         return Vhat, P, chi, bar_z
 

@@ -1221,6 +1221,32 @@ class Episode:
             return 1.0
         progress = float(self._current_epoch_idx + 1) / float(max(1, warmup_epochs))
         return float(start + (1.0 - start) * progress)
+
+    def _compute_pvbp_anti_collapse_warmup_factor(self, q_stage_epochs: int) -> float:
+        """
+        PVBP 阶段前几轮，保持 chi 更接近 1，避免 P/bar_z 过早塌到全默认吸收态。
+        """
+        if not bool(getattr(self, "_pvbp_only_stage", False)):
+            return 1.0
+        warmup_epochs = max(0, int(getattr(self.hyperparams, "pvbp_anti_collapse_warmup_epochs", 0)))
+        if warmup_epochs <= 0:
+            return 1.0
+        start = float(getattr(self.hyperparams, "pvbp_anti_collapse_start", 0.25))
+        start = min(max(start, 0.0), 1.0)
+        local_epoch = int(self._current_epoch_idx) - int(q_stage_epochs)
+        if local_epoch >= warmup_epochs:
+            return 1.0
+        progress = float(local_epoch + 1) / float(max(1, warmup_epochs))
+        return float(start + (1.0 - start) * progress)
+
+    def _set_policy_runtime_controls(self, q_stage_epochs: int):
+        if 'policy_value' not in self.models:
+            return
+        model = self.models['policy_value']
+        pvbp_model = getattr(model, 'pvbp_model', None)
+        if pvbp_model is None:
+            return
+        pvbp_model.chi_warmup_factor = self._compute_pvbp_anti_collapse_warmup_factor(q_stage_epochs)
     
     def generate_data(
         self,
@@ -3076,6 +3102,7 @@ class Episode:
             self._pvbp_only_stage = bool(
                 policy_staged_training and pvbp_stage_epochs > 0 and epoch >= q_stage_epochs
             )
+            self._set_policy_runtime_controls(q_stage_epochs)
             policy_loss_terms = None
             if policy_staged_training:
                 if self._q_only_stage:
@@ -3182,6 +3209,7 @@ class Episode:
         self._q_only_stage = False
         self._pvbp_only_stage = False
         self._bp_only_stage = False
+        self._set_policy_runtime_controls(0)
         convergence = None
         if 'policy_value' in train_modules and 'policy_value' in self.models:
             convergence = self.evaluate_bellman_convergence(batches)

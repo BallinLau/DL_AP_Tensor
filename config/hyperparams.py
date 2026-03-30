@@ -164,6 +164,8 @@ class HyperParams:
     # Stage B: PV/BP-only
     q_stage_epochs: int = 100
     pvbp_stage_epochs: int = 100
+    pvbp_anti_collapse_warmup_epochs: int = 20
+    pvbp_anti_collapse_start: float = 0.25
     # Q 损失中对 M 的处理（先 detach 并截断，减少 SDF 噪声传导）
     q_use_detached_m: bool = True
     q_m_clamp_min: float = 0.5
