@@ -146,6 +146,8 @@ def main():
     optimizers = build_optimizers(models, hyperparams)
 
     summaries = []
+    sample_group_size = Config.GROUP_SIZE
+    simulate_group_size = Config.SIMULATE_GROUP_SIZE
     for ep in range(n_episodes):
         episode = Episode(
             models=models,
@@ -157,12 +159,6 @@ def main():
         )
 
         # data settings per episode
-        data_kwargs = {
-            "n_samples": hyperparams.n_samples,
-            "n_paths": hyperparams.n_paths if ep == 0 else min(100, hyperparams.n_paths),
-            "group_size": 2 if ep == 0 else Config.SIMULATE_GROUP_SIZE,
-            "n_branches": Config.BRANCH_NUM,
-        }
         if ep == 0:
             episode_mode = "mode0"
         else:
@@ -175,6 +171,14 @@ def main():
                     episode_mode = "modeb" if start == "modea" else "modea"
             else:
                 episode_mode = args.post0_mode
+
+        data_kwargs = {
+            "n_samples": hyperparams.n_samples,
+            "n_paths": hyperparams.n_paths if ep == 0 else min(100, hyperparams.n_paths),
+            "sample_group_size": sample_group_size,
+            "simulate_group_size": simulate_group_size,
+            "n_branches": Config.BRANCH_NUM,
+        }
 
         train_modules = ["sdf_fc1", "policy_value"]
         if args.enable_fc2:

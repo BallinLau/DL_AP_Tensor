@@ -3403,6 +3403,8 @@ class Episode:
         n_samples: int = 10000,
         n_paths: int = 100,
         group_size: int = 100,
+        sample_group_size: Optional[int] = None,
+        simulate_group_size: Optional[int] = None,
         n_branches: int = 2,
         train_mode: str = '2time',
         train_modules: Optional[List[str]] = None,
@@ -3412,17 +3414,20 @@ class Episode:
     ) -> Dict:
         """
         按 Episode 逻辑执行训练（三模式）：
-        - mode0: Sample 训 SDF/PV，再 SimulateTS(h=1) 训 SDF 二阶段（可选 FC2）
-        - modeA: Sample 训 PV，再 SimulateTS(h=1) 训 SDF 二阶段（可选 FC2）
-        - modeB: SimulateTS(h=T) 直接训练 PV/SDF（可选 FC2）
+        - mode0: Sample(sample_group_size) 训 SDF/PV，再 SimulateTS(simulate_group_size, h=1) 训 SDF 二阶段（可选 FC2）
+        - modeA: Sample(sample_group_size) 训 PV，再 SimulateTS(simulate_group_size, h=1) 训 SDF 二阶段（可选 FC2）
+        - modeB: SimulateTS(simulate_group_size, h=T) 直接训练 PV/SDF（可选 FC2）
         """
         simulate_kwargs = dict(simulate_kwargs or {})
         train_modules = train_modules or ['sdf_fc1', 'policy_value', 'fc2']
         self.train_mode = train_mode
         self.add_FC1loss = False
 
+        sample_group_size = int(group_size if sample_group_size is None else sample_group_size)
+        simulate_group_size = int(group_size if simulate_group_size is None else simulate_group_size)
+
         horizon_mode1 = int(simulate_kwargs.pop('horizon_mode1', 1))
-        horizon_modeb = int(simulate_kwargs.pop('horizon', getattr(self.hyperparams, 'simulate_horizon', 20)))
+        horizon_modeb = int(simulate_kwargs.pop('horizon', getattr(self.hyperparams, 'simulate_horizon', 10)))
         mode = self._resolve_episode_mode(episode_mode)
         tensor_pipeline = self._use_tensor_pipeline()
 
@@ -3447,7 +3452,7 @@ class Episode:
                         config=self.config,
                         n_samples=n_samples,
                         n_paths=n_paths,
-                        group_size=group_size,
+                        group_size=sample_group_size,
                         branch_num=n_branches
                     )
                 else:
@@ -3498,7 +3503,7 @@ class Episode:
                     if tensor_pipeline:
                         self._simulate_tensor(
                             n_paths=n_paths,
-                            group_size=group_size,
+                            group_size=simulate_group_size,
                             n_branches=n_branches,
                             horizon=horizon_mode1,
                             simulate_kwargs=simulate_kwargs,
@@ -3507,7 +3512,7 @@ class Episode:
                     else:
                         self._simulate_df(
                             n_paths=n_paths,
-                            group_size=group_size,
+                            group_size=simulate_group_size,
                             n_branches=n_branches,
                             horizon=horizon_mode1,
                             simulate_kwargs=simulate_kwargs
@@ -3534,7 +3539,7 @@ class Episode:
                         config=self.config,
                         n_samples=n_samples,
                         n_paths=n_paths,
-                        group_size=group_size,
+                        group_size=sample_group_size,
                         branch_num=n_branches
                     )
                     if tensor_pipeline:
@@ -3563,7 +3568,7 @@ class Episode:
                     if tensor_pipeline:
                         self._simulate_tensor(
                             n_paths=n_paths,
-                            group_size=group_size,
+                            group_size=simulate_group_size,
                             n_branches=n_branches,
                             horizon=horizon_mode1,
                             simulate_kwargs=simulate_kwargs,
@@ -3572,7 +3577,7 @@ class Episode:
                     else:
                         self._simulate_df(
                             n_paths=n_paths,
-                            group_size=group_size,
+                            group_size=simulate_group_size,
                             n_branches=n_branches,
                             horizon=horizon_mode1,
                             simulate_kwargs=simulate_kwargs
@@ -3596,7 +3601,7 @@ class Episode:
                 if tensor_pipeline:
                     self._simulate_tensor(
                         n_paths=n_paths,
-                        group_size=group_size,
+                        group_size=simulate_group_size,
                         n_branches=n_branches,
                         horizon=horizon_modeb,
                         simulate_kwargs=simulate_kwargs,
@@ -3605,7 +3610,7 @@ class Episode:
                 else:
                     self._simulate_df(
                         n_paths=n_paths,
-                        group_size=group_size,
+                        group_size=simulate_group_size,
                         n_branches=n_branches,
                         horizon=horizon_modeb,
                         simulate_kwargs=simulate_kwargs

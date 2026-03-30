@@ -49,7 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-paths", type=int, default=None, help="Override n_paths for data")
     parser.add_argument("--post0-n-paths", type=int, default=None, help="Override n_paths for episodes > 0; default keeps full n_paths")
     parser.add_argument("--batch-size", type=int, default=None, help="Override training batch size")
-    parser.add_argument("--simulate-group-size", type=int, default=None, help="Override firm count per simulated path for episodes > 0")
+    parser.add_argument("--sample-group-size", type=int, default=None, help="Override firm count per sampled path (Sample data source)")
+    parser.add_argument("--simulate-group-size", type=int, default=None, help="Override firm count per simulated path (SimulateTS data source)")
     parser.add_argument("--simulate-horizon", type=int, default=None, help="Override simulate horizon")
     parser.add_argument(
         "--final-sim",
@@ -58,7 +59,7 @@ def parse_args() -> argparse.Namespace:
         help="Whether to run the extra final SimulateTS export after training. Defaults to off for q-only / q-joint ablations.",
     )
     parser.add_argument("--device", type=str, default=None, help="Force device, e.g. cuda:0 or cpu")
-    parser.add_argument("--quick-test", action="store_true", help="Shrink workload for smoke tests (n_paths=10, epochs=20, horizon=20)")
+    parser.add_argument("--quick-test", action="store_true", help="Shrink workload for smoke tests (n_paths=10, epochs=20, horizon=10)")
     parser.add_argument(
         "--enable-fc2",
         action=argparse.BooleanOptionalAction,
@@ -115,7 +116,7 @@ def configure_hyperparams(args: argparse.Namespace):
     if args.quick_test:
         hyperparams.n_paths = 10
         hyperparams.epochs = 20
-        hyperparams.simulate_horizon = 15
+        hyperparams.simulate_horizon = 10
         hyperparams.batch_size = min(hyperparams.batch_size, 1024)
     if args.n_paths is not None:
         hyperparams.n_paths = args.n_paths
@@ -275,6 +276,7 @@ def main():
     models = build_models(device)
     optimizers = build_optimizers(models, hyperparams)
     post0_n_paths = args.post0_n_paths if args.post0_n_paths is not None else hyperparams.n_paths
+    sample_group_size = args.sample_group_size if args.sample_group_size is not None else Config.GROUP_SIZE
     simulate_group_size = args.simulate_group_size if args.simulate_group_size is not None else Config.SIMULATE_GROUP_SIZE
     run_final_sim = args.final_sim
     if run_final_sim is None:
@@ -300,12 +302,6 @@ def main():
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
 
-        data_kwargs = {
-            "n_samples": hyperparams.n_samples,
-            "n_paths": hyperparams.n_paths if ep == 0 else post0_n_paths,
-            "group_size": 2 if ep == 0 else simulate_group_size,
-            "n_branches": Config.BRANCH_NUM,
-        }
         if ep == 0:
             episode_mode = "mode0"
         else:
@@ -318,6 +314,14 @@ def main():
                     episode_mode = "modeb" if start == "modea" else "modea"
             else:
                 episode_mode = args.post0_mode
+
+        data_kwargs = {
+            "n_samples": hyperparams.n_samples,
+            "n_paths": hyperparams.n_paths if ep == 0 else post0_n_paths,
+            "sample_group_size": sample_group_size,
+            "simulate_group_size": simulate_group_size,
+            "n_branches": Config.BRANCH_NUM,
+        }
 
         train_modules = ["policy_value"] if (args.q_only_ablation or args.q_joint_continuation_ablation) else ["sdf_fc1", "policy_value"]
         if args.enable_fc2 and not (args.q_only_ablation or args.q_joint_continuation_ablation):
@@ -415,7 +419,8 @@ def main():
             f"[Episode {ep}] mode={episode_mode} "
             f"batch_size={hyperparams.batch_size} "
             f"n_paths={data_kwargs['n_paths']} "
-            f"group_size={data_kwargs['group_size']} "
+            f"sample_group_size={data_kwargs['sample_group_size']} "
+            f"simulate_group_size={data_kwargs['simulate_group_size']} "
             f"horizon={hyperparams.simulate_horizon} "
             f"q_only_ablation={int(args.q_only_ablation)} "
             f"q_joint_continuation_ablation={int(args.q_joint_continuation_ablation)}"

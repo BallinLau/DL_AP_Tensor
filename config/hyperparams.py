@@ -111,7 +111,7 @@ class HyperParams:
     # ========== 数据生成参数 (INCREASED for higher memory usage) ==========
     n_samples: int = 100000
     n_paths: int = 2000
-    simulate_horizon: int = 200
+    simulate_horizon: int = 10
     # 训练数据批次是否优先走 tensor 管线（避免训练前 pandas 拼装）
     use_tensor_pipeline: bool = True
 
