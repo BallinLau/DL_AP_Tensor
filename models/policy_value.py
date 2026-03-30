@@ -102,6 +102,10 @@ class PolicyValueModel(nn.Module):
             firm_state[:, :SIMMODEL.I],
             firm_state[:, SIMMODEL.X:]
         ], dim=-1)
+
+    def get_q_unit(self, firm_state: torch.Tensor) -> torch.Tensor:
+        """只获取单位债价格 q_unit"""
+        return self.shared_model.get_q_unit(firm_state)
     
     def forward(
         self, 
