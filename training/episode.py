@@ -23,7 +23,7 @@ from data import Sample, SimulateTS, TensorTable, TensorSimulationOutput
 from data.data_utils import compute_quantile_features
 from losses import SDFLoss, P0Loss, PILoss, QLoss, FC2Loss
 from losses.FC2losspipe import FC2LossPipe
-from losses.utils import compute_z_penalty, compute_aio_residual
+from losses.utils import compute_z_penalty, compute_aio_residual, compute_monotonicity_penalty
 from losses.sdf_loss import moment_penalty
 from data.data_utils import build_sdf_pairs_from_macro_ts
 from .gradient_utils import gradient_protection, compute_gradient_norm
@@ -1247,6 +1247,52 @@ class Episode:
         if pvbp_model is None:
             return
         pvbp_model.chi_warmup_factor = self._compute_pvbp_anti_collapse_warmup_factor(q_stage_epochs)
+
+    def _compute_value_gate_monotonicity_penalty(
+        self,
+        parent_state: torch.Tensor,
+        value: torch.Tensor,
+        chi: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        约束 value/gate 的基本经济方向：
+        - value 对 b 递减、对 z 递增
+        - chi 对 b 递减、对 z 递增
+        等价地，bar_z 对 b 递增、对 z 递减。
+        """
+        zero = torch.tensor(0.0, device=parent_state.device)
+        if not parent_state.requires_grad:
+            return zero, {
+                'mono_value_b': 0.0,
+                'mono_value_z': 0.0,
+                'mono_chi_b': 0.0,
+                'mono_chi_z': 0.0,
+                'mono_total': 0.0,
+            }
+
+        mono_value_b = compute_monotonicity_penalty(value, parent_state, 0, 'negative')
+        mono_value_z = compute_monotonicity_penalty(value, parent_state, 1, 'positive')
+        mono_chi_b = compute_monotonicity_penalty(chi, parent_state, 0, 'negative')
+        mono_chi_z = compute_monotonicity_penalty(chi, parent_state, 1, 'positive')
+
+        w_value_b = float(getattr(self.hyperparams, "pv_mono_weight_b", 1.0))
+        w_value_z = float(getattr(self.hyperparams, "pv_mono_weight_z", 1.0))
+        w_chi_b = float(getattr(self.hyperparams, "chi_mono_weight_b", 0.5))
+        w_chi_z = float(getattr(self.hyperparams, "chi_mono_weight_z", 0.5))
+
+        total = (
+            w_value_b * mono_value_b +
+            w_value_z * mono_value_z +
+            w_chi_b * mono_chi_b +
+            w_chi_z * mono_chi_z
+        )
+        return total, {
+            'mono_value_b': float(mono_value_b.item()),
+            'mono_value_z': float(mono_value_z.item()),
+            'mono_chi_b': float(mono_chi_b.item()),
+            'mono_chi_z': float(mono_chi_z.item()),
+            'mono_total': float(total.item()),
+        }
     
     def generate_data(
         self,
@@ -1844,7 +1890,7 @@ class Episode:
             M_list = raw_M_list
         
         # 前向传播
-        parent_state = strip_extra(parent)
+        parent_state = strip_extra(parent).clone().detach().requires_grad_(True)
         output_t = model(parent_state)
 
         def _get_out(out, name: str, idx: int) -> torch.Tensor:
@@ -1975,7 +2021,13 @@ class Episode:
         )
         bp_value_weight = float(getattr(self.hyperparams, "bp_value_weight", 1.0))
 
-        total_loss = main_loss + penalty_z + bp_terms + bp_value_weight * bp_value_loss
+        mono_penalty, mono_diag = self._compute_value_gate_monotonicity_penalty(
+            parent_state=parent_state,
+            value=P0,
+            chi=chi_t,
+        )
+
+        total_loss = main_loss + penalty_z + mono_penalty + bp_terms + bp_value_weight * bp_value_loss
         with torch.no_grad():
             raw_m = torch.cat([m.reshape(-1) for m in raw_M_list], dim=0)
             use_m = torch.cat([m.reshape(-1) for m in M_list], dim=0)
@@ -2003,6 +2055,7 @@ class Episode:
                 'p0_foc_survival_weight_mean': float(foc_diag.get('foc_survival_weight_mean', 1.0)),
                 'p0_bp_value_loss': float(bp_value_loss.item()),
                 'p0_bp_value_weight': float(bp_value_weight),
+                'p0_mono_penalty': float(mono_penalty.item()),
                 'p0_log_mean_M_raw': float(torch.log(raw_m.mean().clamp_min(1e-8)).item()),
                 'p0_log_mean_M_used': float(torch.log(use_m.mean().clamp_min(1e-8)).item()),
                 'p0_M_raw_p90': float(torch.quantile(raw_m, 0.90).item()),
@@ -2013,6 +2066,7 @@ class Episode:
                 'p0_chi_mean': float(chi_t.mean().item()),
                 'p0_vhat_mean': float(Vhat_t.mean().item()),
             }
+            self._latest_p0_terms.update({f'p0_{k}': v for k, v in mono_diag.items()})
             self._latest_p0_terms.update(getattr(loss_fn, 'latest_foc_diag', {}))
             self._latest_p0_terms.update({f'p0_{k}': v for k, v in bp_value_diag.items() if k != 'bp_value_weight'})
         return total_loss
@@ -2051,7 +2105,7 @@ class Episode:
             M_list = raw_M_list
         
         # 前向传播
-        parent_state = strip_extra(parent)
+        parent_state = strip_extra(parent).clone().detach().requires_grad_(True)
         output_t = model(parent_state)
 
         def _get_out(out, name: str, idx: int) -> torch.Tensor:
@@ -2189,7 +2243,13 @@ class Episode:
         )
         bp_value_weight = float(getattr(self.hyperparams, "bp_value_weight", 1.0))
 
-        total_loss = main_loss + penalty_z + penalty_b + bp_terms + bp_value_weight * bp_value_loss
+        mono_penalty, mono_diag = self._compute_value_gate_monotonicity_penalty(
+            parent_state=parent_state,
+            value=PI,
+            chi=chi_t,
+        )
+
+        total_loss = main_loss + penalty_z + penalty_b + mono_penalty + bp_terms + bp_value_weight * bp_value_loss
         with torch.no_grad():
             raw_m = torch.cat([m.reshape(-1) for m in raw_M_list], dim=0)
             use_m = torch.cat([m.reshape(-1) for m in M_list], dim=0)
@@ -2218,6 +2278,7 @@ class Episode:
                 'pi_foc_survival_weight_mean': float(foc_diag.get('foc_survival_weight_mean', 1.0)),
                 'pi_bp_value_loss': float(bp_value_loss.item()),
                 'pi_bp_value_weight': float(bp_value_weight),
+                'pi_mono_penalty': float(mono_penalty.item()),
                 'pi_log_mean_M_raw': float(torch.log(raw_m.mean().clamp_min(1e-8)).item()),
                 'pi_log_mean_M_used': float(torch.log(use_m.mean().clamp_min(1e-8)).item()),
                 'pi_M_raw_p90': float(torch.quantile(raw_m, 0.90).item()),
@@ -2228,6 +2289,7 @@ class Episode:
                 'pi_chi_mean': float(chi_t.mean().item()),
                 'pi_vhat_mean': float(Vhat_t.mean().item()),
             }
+            self._latest_pi_terms.update({f'pi_{k}': v for k, v in mono_diag.items()})
             self._latest_pi_terms.update(getattr(loss_fn, 'latest_foc_diag', {}))
             self._latest_pi_terms.update({f'pi_{k}': v for k, v in bp_value_diag.items() if k != 'bp_value_weight'})
         return total_loss

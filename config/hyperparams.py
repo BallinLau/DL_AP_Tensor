@@ -164,8 +164,15 @@ class HyperParams:
     # Stage B: PV/BP-only
     q_stage_epochs: int = 100
     pvbp_stage_epochs: int = 100
-    pvbp_anti_collapse_warmup_epochs: int = 20
-    pvbp_anti_collapse_start: float = 0.25
+    pvbp_anti_collapse_warmup_epochs: int = 5
+    pvbp_anti_collapse_start: float = 0.85
+    # PV/BP value 面形状约束：value 对 b 递减、对 z 递增
+    pv_mono_weight_b: float = 1.0
+    pv_mono_weight_z: float = 1.0
+    # default gate 形状约束：chi 对 b 递减、对 z 递增
+    # 等价于 bar_z 对 b 递增、对 z 递减
+    chi_mono_weight_b: float = 0.5
+    chi_mono_weight_z: float = 0.5
     # Q 损失中对 M 的处理（先 detach 并截断，减少 SDF 噪声传导）
     q_use_detached_m: bool = True
     q_m_clamp_min: float = 0.5
