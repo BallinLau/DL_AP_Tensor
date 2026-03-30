@@ -63,8 +63,8 @@ def parse_args() -> argparse.Namespace:
         "--post0-mode",
         type=str.lower,
         default="modeb",
-        choices=["modea", "modeb", "alternate"],
-        help="Episode>0 mode: modea, modeb, or alternate between them (default: modeb)",
+        choices=["mode0", "modea", "modeb", "alternate"],
+        help="Episode>0 mode: mode0, modea, modeb, or alternate. Episode 0 is always mode0.",
     )
     parser.add_argument(
         "--alternate-start",

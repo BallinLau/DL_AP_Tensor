@@ -2307,7 +2307,15 @@ class Episode:
         # q_unit 形状正则：
         # 1) dq_unit/dz > 0
         # 2) dq_unit/db < 0
-        q_unit = model.get_q_unit(parent_state)
+        if hasattr(model, "get_q_unit"):
+            q_unit = model.get_q_unit(parent_state)
+        elif hasattr(model, "shared_model") and hasattr(model.shared_model, "get_q_unit"):
+            q_unit = model.shared_model.get_q_unit(parent_state)
+        else:
+            raise AttributeError(
+                "PolicyValueModel is missing get_q_unit and shared_model.get_q_unit; "
+                "please sync models/policy_value.py and models/share_layer.py."
+            )
         q_grads = torch.autograd.grad(
             outputs=q_unit.sum(),
             inputs=parent_state,
