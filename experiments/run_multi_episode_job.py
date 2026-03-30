@@ -310,7 +310,7 @@ def main():
             if not args.q_joint_continuation_ablation:
                 return
             phase_to_tag = {
-                "q_only_end": "qonly_end",
+                "q_only_end": "q_only_end",
                 "joint_end": "joint_end",
                 "policy_end": "policy_end",
             }
