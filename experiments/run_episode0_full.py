@@ -5,6 +5,8 @@ plot policy/value surfaces plus M and bp distributions.
 Outputs:
 - checkpoints/episode0_sdf_fc1.pt
 - checkpoints/episode0_policy_value.pt
+- checkpoints/episode0_policy_value_q.pt
+- checkpoints/episode0_policy_value_pvbp.pt
 - checkpoints/episode0_fc2.pt (if trained)
 - data/outputs/episode0_stage_sdf1.pkl
 - data/outputs/episode0_stage_pv.pkl
@@ -30,6 +32,7 @@ from models import SDFFC1Combined, PolicyValueModel, FC2Model  # noqa: E402
 from losses import P0Loss, PILoss  # noqa: E402
 from training.episode import Episode  # noqa: E402
 from data.simulate_ts import SimulateTS  # noqa: E402
+from experiments.run_utils import build_optimizers as build_split_optimizers  # noqa: E402
 
 
 def ensure_dirs():
@@ -59,49 +62,7 @@ def build_models(device: torch.device):
 
 def build_optimizers(models, hyperparams: HyperParams | None = None):
     hp = hyperparams or HyperParams()
-    opts = {}
-    for name, model in models.items():
-        if name == "sdf_fc1":
-            opts[name] = torch.optim.AdamW(
-                [
-                    {
-                        "params": model.sdf_model.parameters(),
-                        "lr": hp.sdf_lr,
-                        "base_lr": hp.sdf_lr,
-                        "weight_decay": hp.sdf_weight_decay,
-                        "group_name": "sdf_core",
-                    },
-                    {
-                        "params": model.value_model.parameters(),
-                        "lr": hp.sdf_lr,
-                        "base_lr": hp.sdf_lr,
-                        "weight_decay": hp.sdf_weight_decay,
-                        "group_name": "value",
-                    },
-                    {
-                        "params": model.fc1_model.parameters(),
-                        "lr": hp.fc1_lr,
-                        "base_lr": hp.fc1_lr,
-                        "weight_decay": hp.fc1_weight_decay,
-                        "group_name": "fc1",
-                    },
-                ]
-            )
-        elif name == "policy_value":
-            opts[name] = torch.optim.AdamW(
-                model.parameters(),
-                lr=hp.policy_lr,
-                weight_decay=hp.policy_weight_decay,
-            )
-        elif name == "fc2":
-            opts[name] = torch.optim.AdamW(
-                model.parameters(),
-                lr=hp.fc2_lr,
-                weight_decay=hp.fc2_weight_decay,
-            )
-        else:
-            opts[name] = torch.optim.AdamW(model.parameters(), lr=hp.lr, weight_decay=1e-4)
-    return opts
+    return build_split_optimizers(models, hp)
 
 
 def build_hyperparams():
@@ -137,6 +98,12 @@ def build_hyperparams():
     hp.bp_diag_states = "safe"
     hp.bp_diag_grid_points = 101
     hp.bp_diag_use_autograd_foc = False
+    hp.q_pretrain_epochs = 10
+    hp.q_warmstart_epochs = 10
+    hp.q_pretrain_trainable_scope = "q_path"
+    hp.q_shape_weight_z = 1.0
+    hp.q_shape_weight_b_low = 1.0
+    hp.q_shape_weight_b_high = 0.0
     hp.bp_survival_reweight_enabled = True
     hp.bp_survival_tau_p = 20.0
     hp.bp_survival_tau_z = 20.0
@@ -147,12 +114,19 @@ def build_hyperparams():
     hp.bp_value_sample_cap = 256
     hp.bp_value_survival_only = True
     hp.bp_value_barz_threshold = 0.5
+    hp.policy_separate_q_pvbp_training = True
+    hp.q_stage_epochs = 100
+    hp.pvbp_stage_epochs = 100
+    hp.q_pretrain_epochs = hp.q_stage_epochs
+    hp.q_warmstart_epochs = hp.q_stage_epochs
     return hp
 
 
 def save_models(models, episode_idx: int = 0):
     torch.save(models["sdf_fc1"].state_dict(), ROOT / "checkpoints" / f"episode{episode_idx}_sdf_fc1.pt")
     torch.save(models["policy_value"].state_dict(), ROOT / "checkpoints" / f"episode{episode_idx}_policy_value.pt")
+    torch.save(models["policy_value"].q_model.state_dict(), ROOT / "checkpoints" / f"episode{episode_idx}_policy_value_q.pt")
+    torch.save(models["policy_value"].pvbp_model.state_dict(), ROOT / "checkpoints" / f"episode{episode_idx}_policy_value_pvbp.pt")
     if models.get("fc2") is not None:
         torch.save(models["fc2"].state_dict(), ROOT / "checkpoints" / f"episode{episode_idx}_fc2.pt")
 

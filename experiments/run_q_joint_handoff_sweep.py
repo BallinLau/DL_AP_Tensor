@@ -1,5 +1,5 @@
 """
-Dedicated Q-only -> joint handoff sweep runner.
+Dedicated Q-stage -> PV/BP-stage handoff sweep runner.
 
 This script is specialized for the "handoff stability" test:
 - episode 0 only
@@ -8,8 +8,8 @@ This script is specialized for the "handoff stability" test:
 - fresh initialization for each q-only epoch setting
 
 For each sweep point it exports:
-- q_only_end artifacts
-- joint_end artifacts
+- q_stage_end artifacts
+- pvbp_stage_end artifacts
 - per-state Q/q_unit/P/bar_z curves as JSON
 - aggregate metrics as CSV/JSON
 """
@@ -53,15 +53,24 @@ STATE_MAP: List[Tuple[str, float, float]] = [
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sweep q-only epochs for joint handoff stability")
+    parser = argparse.ArgumentParser(description="Sweep Q-stage epochs for PV/BP handoff stability")
     parser.add_argument("--run-root", type=Path, default=None, help="Override output root")
     parser.add_argument(
+        "--q-stage-epochs-list",
         "--q-only-epochs-list",
+        dest="q_stage_epochs_list",
         type=str,
         default="20,40,60,80,100",
-        help="Comma-separated q-only epochs to sweep",
+        help="Comma-separated Q-stage epochs to sweep",
     )
-    parser.add_argument("--joint-epochs", type=int, default=100, help="Joint epochs after q-only")
+    parser.add_argument(
+        "--pvbp-stage-epochs",
+        "--joint-epochs",
+        dest="pvbp_stage_epochs",
+        type=int,
+        default=100,
+        help="PV/BP-stage epochs after Q-stage",
+    )
     parser.add_argument("--n-samples", type=int, default=None, help="Override sample count")
     parser.add_argument("--n-paths", type=int, default=500, help="Override sample paths")
     parser.add_argument("--batch-size", type=int, default=None, help="Override training batch size")
@@ -95,7 +104,7 @@ def parse_int_list(text: str) -> List[int]:
             continue
         values.append(int(token))
     if not values:
-        raise ValueError("q-only epoch list is empty")
+        raise ValueError("Q-stage epoch list is empty")
     return values
 
 
@@ -103,7 +112,7 @@ def make_run_root(arg_path: Path | None) -> Path:
     if arg_path is not None:
         return arg_path.expanduser().resolve()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return (ROOT.parent / "cachedir" / f"dl_tensor_q_handoff_sweep_{timestamp}").resolve()
+    return (ROOT / "cachedir" / f"dl_tensor_q_handoff_sweep_{timestamp}").resolve()
 
 
 def materialize_episode_outputs(episode: Episode) -> None:
@@ -136,8 +145,6 @@ def resolve_states(enabled: str) -> List[Tuple[str, float, float]]:
 def get_q_unit(model: PolicyValueModel, firm_state: torch.Tensor, out_q: torch.Tensor) -> torch.Tensor:
     if hasattr(model, "get_q_unit"):
         return model.get_q_unit(firm_state)
-    if hasattr(model, "shared_model") and hasattr(model.shared_model, "get_q_unit"):
-        return model.shared_model.get_q_unit(firm_state)
     return out_q / torch.clamp_min(firm_state[:, 0:1], 1e-6)
 
 
@@ -148,8 +155,8 @@ def compute_q_curve_exports(
     grid_points: int,
     enabled_states: List[Tuple[str, float, float]],
     stage_tag: str,
-    q_only_epochs: int,
-    joint_epochs: int,
+    q_stage_epochs: int,
+    pvbp_stage_epochs: int,
 ) -> Tuple[List[Dict], Dict]:
     metrics: List[Dict] = []
     curves_payload: Dict[str, Dict] = {}
@@ -195,8 +202,9 @@ def compute_q_curve_exports(
             {
                 "stage": stage_tag,
                 "state": label,
-                "q_only_epochs": q_only_epochs,
-                "joint_epochs": joint_epochs,
+                "q_stage_epochs": q_stage_epochs,
+                "pvbp_stage_epochs": pvbp_stage_epochs,
+                "q_only_epochs": q_stage_epochs,
                 "parent_P": float(parent_out.P.item()),
                 "parent_bar_z": float(parent_out.bar_z.item()),
                 "q_max": float(np.max(q_np)),
@@ -233,6 +241,8 @@ def save_policy_value_checkpoint(models: Dict[str, torch.nn.Module], run_dir: Pa
     ckpt_dir = run_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     torch.save(models["policy_value"].state_dict(), ckpt_dir / f"ep0_{stage_tag}_policy_value.pt")
+    torch.save(models["policy_value"].q_model.state_dict(), ckpt_dir / f"ep0_{stage_tag}_policy_value_q.pt")
+    torch.save(models["policy_value"].pvbp_model.state_dict(), ckpt_dir / f"ep0_{stage_tag}_policy_value_pvbp.pt")
 
 
 def export_stage_artifacts(
@@ -245,8 +255,8 @@ def export_stage_artifacts(
     stage_summary: Dict,
     grid_points: int,
     enabled_states: List[Tuple[str, float, float]],
-    q_only_epochs: int,
-    joint_epochs: int,
+    q_stage_epochs: int,
+    pvbp_stage_epochs: int,
     skip_plots: bool,
 ) -> List[Dict]:
     materialize_episode_outputs(episode)
@@ -303,8 +313,8 @@ def export_stage_artifacts(
         grid_points=grid_points,
         enabled_states=enabled_states,
         stage_tag=stage_tag,
-        q_only_epochs=q_only_epochs,
-        joint_epochs=joint_epochs,
+        q_stage_epochs=q_stage_epochs,
+        pvbp_stage_epochs=pvbp_stage_epochs,
     )
 
     with (metrics_dir / f"ep0_{stage_tag}_summary.json").open("w", encoding="utf-8") as f:
@@ -322,7 +332,7 @@ def export_stage_artifacts(
     return metrics
 
 
-def configure_hyperparams(args: argparse.Namespace, q_only_epochs: int):
+def configure_hyperparams(args: argparse.Namespace, q_stage_epochs: int):
     hp = build_hyperparams()
     if args.quick_test:
         hp.n_samples = min(hp.n_samples, 1000)
@@ -334,9 +344,11 @@ def configure_hyperparams(args: argparse.Namespace, q_only_epochs: int):
         hp.n_samples = args.n_samples
     if args.batch_size is not None:
         hp.batch_size = args.batch_size
-    hp.q_pretrain_epochs = q_only_epochs
-    hp.q_warmstart_epochs = q_only_epochs
-    hp.epochs = q_only_epochs + int(args.joint_epochs)
+    hp.q_stage_epochs = max(100, q_stage_epochs)
+    hp.pvbp_stage_epochs = max(100, int(args.pvbp_stage_epochs))
+    hp.q_pretrain_epochs = hp.q_stage_epochs
+    hp.q_warmstart_epochs = hp.q_stage_epochs
+    hp.epochs = hp.q_stage_epochs + hp.pvbp_stage_epochs
     hp.bp_diag_enabled = True
     hp.bp_diag_every_n_episodes = 1
     hp.bp_diag_states = ",".join([s[0] for s in resolve_states(args.states)])
@@ -351,27 +363,27 @@ def main():
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     Config.DEVICE = device
 
-    q_only_list = parse_int_list(args.q_only_epochs_list)
+    q_stage_list = parse_int_list(args.q_stage_epochs_list)
     enabled_states = resolve_states(args.states)
 
     print(f"Run root: {run_root}")
     print(f"Device: {device}")
-    print(f"Q-only sweep: {q_only_list}")
-    print(f"Joint epochs: {args.joint_epochs}")
+    print(f"Q-stage sweep: {q_stage_list}")
+    print(f"PV/BP-stage epochs: {args.pvbp_stage_epochs}")
     print(f"States: {[s[0] for s in enabled_states]}")
     print(f"Skip plots: {int(args.skip_plots)}")
 
     all_metrics: List[Dict] = []
     run_manifest: List[Dict] = []
 
-    for q_only_epochs in q_only_list:
-        joint_epochs = int(args.joint_epochs)
-        run_dir = run_root / f"qonly_{q_only_epochs:03d}_joint_{joint_epochs:03d}"
+    for q_stage_epochs in q_stage_list:
+        pvbp_stage_epochs = int(args.pvbp_stage_epochs)
+        run_dir = run_root / f"qstage_{q_stage_epochs:03d}_pvbp_{pvbp_stage_epochs:03d}"
         ensure_dirs(run_dir)
-        print(f"\n=== Sweep run: q_only={q_only_epochs}, joint={joint_epochs} ===")
+        print(f"\n=== Sweep run: q_stage={q_stage_epochs}, pvbp_stage={pvbp_stage_epochs} ===")
         print(f"Run dir: {run_dir}")
 
-        hyperparams = configure_hyperparams(args, q_only_epochs)
+        hyperparams = configure_hyperparams(args, q_stage_epochs)
         models = {"policy_value": PolicyValueModel().to(device)}
         optimizers = build_optimizers(models, hyperparams)
         episode = Episode(
@@ -387,8 +399,8 @@ def main():
 
         def on_policy_stage(stage_summary: Dict):
             phase_to_tag = {
-                "q_only_end": "q_only_end",
-                "joint_end": "joint_end",
+                "q_stage_end": "q_stage_end",
+                "pvbp_stage_end": "pvbp_stage_end",
                 "policy_end": "policy_end",
             }
             stage_tag = phase_to_tag.get(stage_summary.get("phase", "policy_stage"), str(stage_summary.get("phase", "policy_stage")))
@@ -402,8 +414,8 @@ def main():
                 stage_summary=stage_summary,
                 grid_points=args.grid_points,
                 enabled_states=enabled_states,
-                q_only_epochs=q_only_epochs,
-                joint_epochs=joint_epochs,
+                q_stage_epochs=q_stage_epochs,
+                pvbp_stage_epochs=pvbp_stage_epochs,
                 skip_plots=args.skip_plots,
             )
             all_metrics.extend(stage_metrics)
@@ -433,8 +445,9 @@ def main():
 
         module_summaries = summary.get("module_summaries", summary)
         run_payload = {
-            "q_only_epochs": q_only_epochs,
-            "joint_epochs": joint_epochs,
+            "q_stage_epochs": q_stage_epochs,
+            "pvbp_stage_epochs": pvbp_stage_epochs,
+            "q_only_epochs": q_stage_epochs,
             "run_dir": str(run_dir),
             "stage_exports": stage_exports,
             "module_summaries": make_json_safe(module_summaries),
@@ -445,13 +458,13 @@ def main():
 
     if all_metrics:
         metrics_df = pd.DataFrame(all_metrics)
-        metrics_df.sort_values(["q_only_epochs", "stage", "state"], inplace=True)
+        metrics_df.sort_values(["q_stage_epochs", "stage", "state"], inplace=True)
         metrics_df.to_csv(run_root / "handoff_metrics.csv", index=False)
         with (run_root / "handoff_metrics.json").open("w", encoding="utf-8") as f:
             json.dump(make_json_safe(metrics_df.to_dict(orient="records")), f, indent=2, ensure_ascii=False)
 
         summary_cols = [
-            "q_only_epochs",
+            "q_stage_epochs",
             "stage",
             "state",
             "parent_P",

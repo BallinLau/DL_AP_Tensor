@@ -9,28 +9,36 @@ Training orchestration for episodes and modules.
 
 ### Policy/Value: Q-first training hooks
 - `train_step(..., policy_loss_terms=...)` now supports selective optimization among `['q', 'p0', 'pi']`.
-- `_run_batches(...)` supports Q pretraining via `HyperParams.q_pretrain_epochs` and `HyperParams.q_warmstart_epochs`:
-  - `epoch < max(q_pretrain_epochs, q_warmstart_epochs)`: optimize `q` only
-  - otherwise: optimize `p0 + pi + q` jointly
+- `_run_batches(...)` now supports separated policy training via
+  `HyperParams.policy_separate_q_pvbp_training`:
+  - Stage A: `q_stage_epochs` epochs, optimize `q` only
+  - Stage B: `pvbp_stage_epochs` epochs, optimize `p0 + pi` only
+  - no automatic return to one-step `p0 + pi + q` joint backward
+- `Q` and `PV/BP` now use separate optimizers:
+  - `policy_value_q`
+  - `policy_value_pvbp`
 - `_compute_q_loss(...)` now includes:
   - AIO residual aggregation (`compute_aio_residual`) instead of pure branch-product aggregation
   - Optional `M` detach + clamp (`q_use_detached_m`, `q_m_clamp_min`, `q_m_clamp_max`)
   - Q-only parameter freezing (`q_freeze_non_q_in_pretrain`):
     - keep original economic equation (`bar_i`, `bp`, `bar_z` stay model outputs)
-    - freeze non-Q parameters during Q-only stage
+    - freeze non-Q parameters during Q stage
     - trainable scope controlled by `q_pretrain_trainable_scope`:
       - `q_head_only` (default, strict freeze)
       - `q_path` (`share_layer + q_head`)
-  - Warm-start supervision (`q_warmstart_*`):
-    - add `MSE(Q, Q_warm_target)` in early epochs
-    - target is a structured prior over `(b,z,x)` with Gaussian shape in `b`
   - Q-shape regularization:
     - `dQ/dz > 0`
     - `dQ/db > 0` on low-`b` region
     - `dQ/db < 0` on high-`b` region
   - Additional diagnostics in loss dict:
-    - `q_physics`, `q_warmstart`, `q_warm_weight`
+    - `q_physics`
     - `q_pretrain_mode`, `q_freeze_mode`
+
+### Policy/Value architecture
+- `PolicyValueModel` is now a compatibility wrapper around two independent blocks:
+  - `QModel`: old-debt pricing only
+  - `PVBPModel`: `bp0 / bpI / V0 / VI / bar_i_cond` and derived `P / bar_z / bp`
+- Old checkpoints with monolithic `shared_model.* / combined_model.*` keys are treated as legacy and skipped by split-aware loaders.
 
 ### Episode flow
 - Episode 0:

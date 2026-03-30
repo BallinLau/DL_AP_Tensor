@@ -51,6 +51,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None, help="Override training batch size")
     parser.add_argument("--simulate-group-size", type=int, default=None, help="Override firm count per simulated path for episodes > 0")
     parser.add_argument("--simulate-horizon", type=int, default=None, help="Override simulate horizon")
+    parser.add_argument(
+        "--final-sim",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether to run the extra final SimulateTS export after training. Defaults to off for q-only / q-joint ablations.",
+    )
     parser.add_argument("--device", type=str, default=None, help="Force device, e.g. cuda:0 or cpu")
     parser.add_argument("--quick-test", action="store_true", help="Shrink workload for smoke tests (n_paths=10, epochs=20, horizon=20)")
     parser.add_argument(
@@ -81,19 +87,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--q-joint-continuation-ablation",
         action="store_true",
-        help="Run policy_value only with q-only pretrain followed by joint continuation, and export stage-end artifacts.",
+        help="Run policy_value only with staged Q training followed by staged PV/BP training, and export stage-end artifacts.",
     )
     parser.add_argument(
+        "--q-stage-epochs",
         "--q-only-epochs",
+        dest="q_stage_epochs",
         type=int,
         default=None,
-        help="Override q-only epochs for q-joint continuation ablation.",
+        help="Override Q-stage epochs for staged policy_value training.",
     )
     parser.add_argument(
+        "--pvbp-stage-epochs",
         "--joint-epochs",
+        dest="pvbp_stage_epochs",
         type=int,
         default=None,
-        help="Override joint continuation epochs for q-joint continuation ablation.",
+        help="Override PV/BP-stage epochs for staged policy_value training.",
     )
     return parser.parse_args()
 
@@ -116,18 +126,22 @@ def configure_hyperparams(args: argparse.Namespace):
     if args.simulate_horizon is not None:
         hyperparams.simulate_horizon = args.simulate_horizon
     if args.q_only_ablation:
-        q_only_epochs = int(hyperparams.epochs)
+        q_only_epochs = max(100, int(hyperparams.epochs))
+        hyperparams.q_stage_epochs = q_only_epochs
+        hyperparams.pvbp_stage_epochs = 0
         hyperparams.q_pretrain_epochs = q_only_epochs
         hyperparams.q_warmstart_epochs = q_only_epochs
         hyperparams.bp_diag_enabled = True
         hyperparams.bp_diag_every_n_episodes = 1
         hyperparams.bp_diag_states = "safe"
     if args.q_joint_continuation_ablation:
-        q_only_epochs = int(args.q_only_epochs if args.q_only_epochs is not None else hyperparams.q_pretrain_epochs)
-        joint_epochs = int(args.joint_epochs if args.joint_epochs is not None else hyperparams.epochs)
-        hyperparams.q_pretrain_epochs = q_only_epochs
-        hyperparams.q_warmstart_epochs = q_only_epochs
-        hyperparams.epochs = q_only_epochs + joint_epochs
+        q_stage_epochs = int(args.q_stage_epochs if args.q_stage_epochs is not None else hyperparams.q_stage_epochs)
+        pvbp_stage_epochs = int(args.pvbp_stage_epochs if args.pvbp_stage_epochs is not None else hyperparams.pvbp_stage_epochs)
+        hyperparams.q_stage_epochs = max(100, q_stage_epochs)
+        hyperparams.pvbp_stage_epochs = max(100, pvbp_stage_epochs)
+        hyperparams.q_pretrain_epochs = hyperparams.q_stage_epochs
+        hyperparams.q_warmstart_epochs = hyperparams.q_stage_epochs
+        hyperparams.epochs = hyperparams.q_stage_epochs + hyperparams.pvbp_stage_epochs
         hyperparams.bp_diag_enabled = True
         hyperparams.bp_diag_every_n_episodes = 1
         hyperparams.bp_diag_states = "safe"
@@ -158,7 +172,7 @@ def log_gpu_stats(prefix: str, device: torch.device):
 def make_run_root(arg_path: Path | None) -> Path:
     if arg_path is not None:
         return arg_path.expanduser().resolve()
-    return ROOT.parent / "cachedir" / datetime.now().strftime("%Y%m%d_%H%M")
+    return (ROOT / "cachedir" / datetime.now().strftime("%Y%m%d_%H%M")).resolve()
 
 
 def materialize_episode_outputs(episode: Episode) -> None:
@@ -249,6 +263,10 @@ def main():
     args = parse_args()
     run_root = make_run_root(args.run_root)
     ensure_dirs(run_root)
+    print(f"Run root: {run_root}")
+    print(f"Checkpoints dir: {run_root / 'checkpoints'}")
+    print(f"Outputs dir: {run_root / 'data' / 'outputs'}")
+    print(f"Figures dir: {run_root / 'experiments' / 'figs'}")
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     Config.DEVICE = device
@@ -258,10 +276,14 @@ def main():
     optimizers = build_optimizers(models, hyperparams)
     post0_n_paths = args.post0_n_paths if args.post0_n_paths is not None else hyperparams.n_paths
     simulate_group_size = args.simulate_group_size if args.simulate_group_size is not None else Config.SIMULATE_GROUP_SIZE
+    run_final_sim = args.final_sim
+    if run_final_sim is None:
+        run_final_sim = not (args.q_only_ablation or args.q_joint_continuation_ablation)
 
     # Initialize GPU monitor
     gpu_monitor = get_monitor(device, log_interval=10)
     print(f"GPU Monitor initialized: {device}")
+    print(f"Final simulation enabled: {int(bool(run_final_sim))}")
 
     summaries = []
     episode = Episode(
@@ -310,8 +332,8 @@ def main():
             if not args.q_joint_continuation_ablation:
                 return
             phase_to_tag = {
-                "q_only_end": "q_only_end",
-                "joint_end": "joint_end",
+                "q_stage_end": "q_stage_end",
+                "pvbp_stage_end": "pvbp_stage_end",
                 "policy_end": "policy_end",
             }
             stage_tag = phase_to_tag.get(stage_summary.get("phase", "policy_stage"), str(stage_summary.get("phase", "policy_stage")))
@@ -412,22 +434,25 @@ def main():
         print(f"GPU memory monitoring saved to: {gpu_json_path}")
         reset_monitor()
 
-    final_sim = SimulateTS(
-        models=models,
-        config=Config,
-        n_paths=hyperparams.n_paths,
-        group_size=simulate_group_size,
-        branch_num=Config.BRANCH_NUM,
-        horizon=hyperparams.simulate_horizon,
-        device=device,
-    )
-    df_firm_sim, df_macro_sim = final_sim.simulate()
-    out_dir = resolve_base_dir(run_root, ROOT) / "data" / "outputs"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    df_firm_sim.to_pickle(out_dir / "final_simulate_firm.pkl")
-    df_macro_sim.to_pickle(out_dir / "final_simulate_macro.pkl")
-    plot_macro_series(-1, df_macro_sim, resolve_base_dir(run_root, ROOT))
-    plot_firm_b_window_distribution(df_firm_sim, resolve_base_dir(run_root, ROOT))
+    if run_final_sim:
+        final_sim = SimulateTS(
+            models=models,
+            config=Config,
+            n_paths=hyperparams.n_paths,
+            group_size=simulate_group_size,
+            branch_num=Config.BRANCH_NUM,
+            horizon=hyperparams.simulate_horizon,
+            device=device,
+        )
+        df_firm_sim, df_macro_sim = final_sim.simulate()
+        out_dir = resolve_base_dir(run_root, ROOT) / "data" / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        df_firm_sim.to_pickle(out_dir / "final_simulate_firm.pkl")
+        df_macro_sim.to_pickle(out_dir / "final_simulate_macro.pkl")
+        plot_macro_series(-1, df_macro_sim, resolve_base_dir(run_root, ROOT))
+        plot_firm_b_window_distribution(df_firm_sim, resolve_base_dir(run_root, ROOT))
+    else:
+        print("Skipping final SimulateTS export for this run.")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,14 @@
 
 日期：2026-03-30
 
+> 注：这份文档描述的是重构前的过渡性对照实验。
+> 在后续理论/实现审查中，训练方案已经进一步收敛为：
+> `Q stage -> PV/BP stage`，不再推荐恢复一步内 `Q + P/V/bp` joint backward。
+> 现阶段应优先参考
+> [`reports/q_p_training_separation_plan_20260330.md`](/Users/ballinliu/Desktop/PHD/Project1/DL_AP_Tensor/reports/q_p_training_separation_plan_20260330.md)
+> 和
+> [`reports/q_pv_bp_refactor_checklist_20260330.md`](/Users/ballinliu/Desktop/PHD/Project1/DL_AP_Tensor/reports/q_pv_bp_refactor_checklist_20260330.md)。
+
 ## 目标
 
 把下面这个最小对照实验直接接入主运行入口：
@@ -160,11 +168,21 @@ runner 代码负责：
 ```bash
 python experiments/run_multi_episode_job.py \
   --n-episodes 1 \
-  --post0-mode mode0 \
   --q-joint-continuation-ablation \
   --q-only-epochs 10 \
   --joint-epochs 10
 ```
+
+默认输出目录：
+
+- 现在默认写到仓库内的 `cachedir/YYYYMMDD_HHMM/`
+- 启动时脚本会显式打印：
+  - `Run root`
+  - `Checkpoints dir`
+  - `Outputs dir`
+  - `Figures dir`
+
+如果希望手动指定目录，仍可使用 `--run-root /abs/path/to/run_dir`
 
 如果想做快速 smoke test：
 

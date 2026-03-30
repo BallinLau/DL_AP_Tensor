@@ -32,6 +32,10 @@ class HyperParams:
     # Policy & Value
     policy_lr: float = 1e-3
     policy_weight_decay: float = 1e-6
+    q_lr: float = 1e-3
+    q_weight_decay: float = 1e-6
+    pvbp_lr: float = 1e-3
+    pvbp_weight_decay: float = 1e-6
     
     # FC2
     fc2_lr: float = 1e-4
@@ -154,6 +158,12 @@ class HyperParams:
     # ========== Policy/Value: Q 优先训练与形状约束 ==========
     # 在 policy/value 联合训练前先进行 q-only 预训练轮数
     q_pretrain_epochs: int = 10
+    policy_separate_q_pvbp_training: bool = True
+    # 重构后默认采用两阶段训练：
+    # Stage A: Q-only
+    # Stage B: PV/BP-only
+    q_stage_epochs: int = 100
+    pvbp_stage_epochs: int = 100
     # Q 损失中对 M 的处理（先 detach 并截断，减少 SDF 噪声传导）
     q_use_detached_m: bool = True
     q_m_clamp_min: float = 0.5
@@ -162,10 +172,13 @@ class HyperParams:
     pv_use_clipped_m: bool = True
     pv_m_clamp_min: float = 0.7
     pv_m_clamp_max: float = 1.3
-    # Q 对 b/z 的形状正则权重与区间
+    # Q 形状正则改为约束单位债价格 q_unit：
+    # 1) dq_unit/dz >= 0
+    # 2) dq_unit/db <= 0
     q_shape_weight_z: float = 1.0
     q_shape_weight_b_low: float = 1.0
-    q_shape_weight_b_high: float = 1.0
+    # 兼容旧字段；当前实现不再单独使用高 b 区权重
+    q_shape_weight_b_high: float = 0.0
     q_shape_b_low: float = 0.2
     q_shape_b_high: float = 0.8
     # Q-only 阶段是否冻结非 Q 分支参数（保持经济方程不改写）

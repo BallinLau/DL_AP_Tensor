@@ -57,13 +57,38 @@ def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ck
             "fc2": "fc2",
         }
         for key, stem in mapping.items():
-            ckpt_path = ckpt_dir / f"{prefix}{stem}.pt"
-            if ckpt_path.exists():
-                state = torch.load(ckpt_path, map_location=device)
-                models[key].load_state_dict(state, strict=strict)
-                print(f"[build_models] loaded {ckpt_path}")
+            if key == "policy_value":
+                split_q = ckpt_dir / f"{prefix}{stem}_q.pt"
+                split_pvbp = ckpt_dir / f"{prefix}{stem}_pvbp.pt"
+                merged = ckpt_dir / f"{prefix}{stem}.pt"
+                if split_q.exists() and split_pvbp.exists():
+                    q_state = torch.load(split_q, map_location=device)
+                    pvbp_state = torch.load(split_pvbp, map_location=device)
+                    models[key].q_model.load_state_dict(q_state, strict=strict)
+                    models[key].pvbp_model.load_state_dict(pvbp_state, strict=strict)
+                    print(f"[build_models] loaded {split_q}")
+                    print(f"[build_models] loaded {split_pvbp}")
+                elif merged.exists():
+                    state = torch.load(merged, map_location=device)
+                    is_old_joint_ckpt = any(
+                        str(k).startswith("shared_model.") or str(k).startswith("combined_model.")
+                        for k in state.keys()
+                    )
+                    if is_old_joint_ckpt:
+                        print(f"[build_models] skip incompatible legacy policy_value ckpt: {merged}")
+                    else:
+                        models[key].load_state_dict(state, strict=strict)
+                        print(f"[build_models] loaded {merged}")
+                else:
+                    print(f"[build_models] skip missing ckpt: {split_q} / {split_pvbp} / {merged}")
             else:
-                print(f"[build_models] skip missing ckpt: {ckpt_path}")
+                ckpt_path = ckpt_dir / f"{prefix}{stem}.pt"
+                if ckpt_path.exists():
+                    state = torch.load(ckpt_path, map_location=device)
+                    models[key].load_state_dict(state, strict=strict)
+                    print(f"[build_models] loaded {ckpt_path}")
+                else:
+                    print(f"[build_models] skip missing ckpt: {ckpt_path}")
 
     return models
 
@@ -99,10 +124,15 @@ def build_optimizers(models, hyperparams: Optional[HyperParams] = None):
                 ]
             )
         elif name == "policy_value":
-            opts[name] = torch.optim.AdamW(
-                model.parameters(),
-                lr=hp.policy_lr,
-                weight_decay=hp.policy_weight_decay,
+            opts["policy_value_q"] = torch.optim.AdamW(
+                model.q_model.parameters(),
+                lr=hp.q_lr,
+                weight_decay=hp.q_weight_decay,
+            )
+            opts["policy_value_pvbp"] = torch.optim.AdamW(
+                model.pvbp_model.parameters(),
+                lr=hp.pvbp_lr,
+                weight_decay=hp.pvbp_weight_decay,
             )
         elif name == "fc2":
             opts[name] = torch.optim.AdamW(
@@ -150,7 +180,14 @@ def build_hyperparams():
     hp.sdf_log_mean_anchor_weight_stage2 = 5.0
     # 显式覆盖 Q 训练入口，避免 HyperParams 默认值和运行入口脱节。
     hp.q_pretrain_epochs = 10
+    hp.q_stage_epochs = 100
+    hp.pvbp_stage_epochs = 100
+    hp.policy_separate_q_pvbp_training = True
     hp.q_warmstart_epochs = 10
+    hp.q_lr = hp.policy_lr
+    hp.q_weight_decay = hp.policy_weight_decay
+    hp.pvbp_lr = hp.policy_lr
+    hp.pvbp_weight_decay = hp.policy_weight_decay
     hp.q_pretrain_trainable_scope = "q_path"
     hp.q_shape_weight_z = 1.0
     hp.q_shape_weight_b_low = 1.0
@@ -191,6 +228,8 @@ def save_models(models, episode: int, base_dir: Path, tag: Optional[str] = None)
     prefix = _episode_prefix(episode, tag)
     torch.save(models["sdf_fc1"].state_dict(), base_dir / "checkpoints" / f"{prefix}_sdf_fc1.pt")
     torch.save(models["policy_value"].state_dict(), base_dir / "checkpoints" / f"{prefix}_policy_value.pt")
+    torch.save(models["policy_value"].q_model.state_dict(), base_dir / "checkpoints" / f"{prefix}_policy_value_q.pt")
+    torch.save(models["policy_value"].pvbp_model.state_dict(), base_dir / "checkpoints" / f"{prefix}_policy_value_pvbp.pt")
     torch.save(models["fc2"].state_dict(), base_dir / "checkpoints" / f"{prefix}_fc2.pt")
 
 

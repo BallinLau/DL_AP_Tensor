@@ -2,7 +2,8 @@
 Quick experimental runner for a tiny Episode-0 training on sample data.
 
 This is meant as a smoke test: it builds fresh models, runs one short
-`run_episode` on sample-generated data, and prints loss summaries.
+`run_episode` on sample-generated data under the split
+`Q stage -> PV/BP stage` policy schedule, and prints loss summaries.
 """
 
 import sys
@@ -15,6 +16,7 @@ sys.path.append(str(ROOT))
 from config import Config, HyperParams  # noqa: E402
 from models import SDFFC1Combined, PolicyValueModel, FC2Model  # noqa: E402
 from training.episode import Episode  # noqa: E402
+from experiments.run_utils import build_optimizers as build_split_optimizers  # noqa: E402
 
 
 def build_models(device: torch.device):
@@ -38,51 +40,9 @@ def build_models(device: torch.device):
 
 
 def build_optimizers(models, hyperparams: HyperParams | None = None):
-    """Simple AdamW optimizers for each model."""
+    """Use the split-aware optimizer builder shared with the main runners."""
     hp = hyperparams or HyperParams()
-    optimizers = {}
-    for name, model in models.items():
-        if name == 'sdf_fc1':
-            optimizers[name] = torch.optim.AdamW(
-                [
-                    {
-                        'params': model.sdf_model.parameters(),
-                        'lr': hp.sdf_lr,
-                        'base_lr': hp.sdf_lr,
-                        'weight_decay': hp.sdf_weight_decay,
-                        'group_name': 'sdf_core',
-                    },
-                    {
-                        'params': model.value_model.parameters(),
-                        'lr': hp.sdf_lr,
-                        'base_lr': hp.sdf_lr,
-                        'weight_decay': hp.sdf_weight_decay,
-                        'group_name': 'value',
-                    },
-                    {
-                        'params': model.fc1_model.parameters(),
-                        'lr': hp.fc1_lr,
-                        'base_lr': hp.fc1_lr,
-                        'weight_decay': hp.fc1_weight_decay,
-                        'group_name': 'fc1',
-                    },
-                ]
-            )
-        elif name == 'policy_value':
-            optimizers[name] = torch.optim.AdamW(
-                model.parameters(),
-                lr=hp.policy_lr,
-                weight_decay=hp.policy_weight_decay,
-            )
-        elif name == 'fc2':
-            optimizers[name] = torch.optim.AdamW(
-                model.parameters(),
-                lr=hp.fc2_lr,
-                weight_decay=hp.fc2_weight_decay,
-            )
-        else:
-            optimizers[name] = torch.optim.AdamW(model.parameters(), lr=hp.lr, weight_decay=1e-4)
-    return optimizers
+    return build_split_optimizers(models, hp)
 
 
 def build_hyperparams():
@@ -107,6 +67,11 @@ def build_hyperparams():
     hp.w_pi = 1.0
     hp.w_q = 1.0
     hp.w_fc2 = 1.0
+    hp.policy_separate_q_pvbp_training = True
+    hp.q_stage_epochs = 100
+    hp.pvbp_stage_epochs = 100
+    hp.q_pretrain_epochs = hp.q_stage_epochs
+    hp.q_warmstart_epochs = hp.q_stage_epochs
     return hp
 
 
@@ -128,7 +93,7 @@ def main():
     )
 
     summary = episode.run_episode(
-        n_epochs=1,
+        n_epochs=hyperparams.epochs,
         batch_size=128,
         log_interval=10,
         n_samples=hyperparams.n_samples,

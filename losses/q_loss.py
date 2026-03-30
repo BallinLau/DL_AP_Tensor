@@ -56,6 +56,8 @@ class QLoss(nn.Module):
         self.alpha_z = alpha_z if alpha_z is not None else Config.ALPHA_Z
         self.beta_z = beta_z if beta_z is not None else Config.BETA_Z
         self.z0 = z0 if z0 is not None else Config.Z0
+        # 归一化主残差的数值稳定项，避免 Q≈0 时绝对误差口径过于宽松。
+        self.relative_residual_eps = 1e-4
     
     def compute_recovery_value(
         self,
@@ -122,6 +124,40 @@ class QLoss(nn.Module):
             
             residuals.append(residual)
         
+        return residuals
+
+    def compute_main_relative_residual(
+        self,
+        Q: torch.Tensor,
+        b: torch.Tensor,
+        bar_i: torch.Tensor,
+        M_list: List[torch.Tensor],
+        Qsp_children: List[torch.Tensor],
+        bar_z_children: List[torch.Tensor],
+        x_children: List[torch.Tensor],
+        z_children: List[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        """
+        计算归一化后的债券定价残差。
+
+        目的不是改变理论方程，而是改变数值尺度：
+        当 Q 与 RHS 同时很小时，绝对残差平方会过于宽松，容易允许近零塌缩解。
+        这里改为相对误差口径，让训练关心“相对定价错误”。
+        """
+        multiplier = bar_i * (self.g - 1) + 1
+        b_nonneg = torch.clamp(b, min=0.0)
+
+        residuals = []
+        for M, Qsp, bar_z, x, z in zip(M_list, Qsp_children, bar_z_children, x_children, z_children):
+            recovery_total = self.compute_total_recovery(b_nonneg, x, z)
+            rhs = M * (
+                (b_nonneg + Qsp * multiplier) * (1 - bar_z) +
+                recovery_total * multiplier * bar_z
+            )
+            denom = self.relative_residual_eps + Q.abs() + rhs.abs()
+            residual = (rhs - Q) / denom
+            residuals.append(residual)
+
         return residuals
     
     def compute_main_residual_legacy(
@@ -237,7 +273,7 @@ class QLoss(nn.Module):
         loss_dict = {}
         
         # 主残差
-        residuals = self.compute_main_residual(
+        residuals = self.compute_main_relative_residual(
             Q, b, bar_i, M_list, Qsp_children,
             bar_zsp_children, x_children, z_children
         )

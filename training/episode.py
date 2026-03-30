@@ -151,11 +151,13 @@ class Episode:
         self._current_epoch_idx = 0
         self._q_only_stage = False
         self._bp_only_stage = False
+        self._pvbp_only_stage = False
         self._fc1_teacher_forcing_stage = False
         self._policy_q_freeze_active = False
         self._policy_value_grad_backup = {}
         self._policy_bp_freeze_active = False
         self._policy_bp_grad_backup = {}
+        self._policy_pvbp_freeze_active = False
         self._sdf_fc1_teacher_freeze_active = False
         self._sdf_fc1_grad_backup = {}
     
@@ -1095,7 +1097,7 @@ class Episode:
 
     def _set_policy_q_only_freeze(self, enable: bool):
         """
-        Q-only 阶段冻结非 Q 参数，保持损失方程结构不变。
+        Q-only 阶段：仅允许 Q block 训练。
         """
         if 'policy_value' not in self.models:
             return
@@ -1104,63 +1106,77 @@ class Episode:
         if not bool(getattr(self.hyperparams, "q_freeze_non_q_in_pretrain", True)):
             enable = False
 
+        for p in model.parameters():
+            p.requires_grad = not enable
+
         if enable:
-            if self._policy_q_freeze_active:
-                return
-            self._policy_value_grad_backup = {
-                name: p.requires_grad for name, p in model.named_parameters()
-            }
-            for p in model.parameters():
-                p.requires_grad = False
-            # Q 头始终可训练
-            for p in model.shared_model.q_head.parameters():
-                p.requires_grad = True
             scope = str(getattr(self.hyperparams, "q_pretrain_trainable_scope", "q_path")).lower()
             if scope not in {"q_head_only", "q_path"}:
                 scope = "q_path"
-            # q_path: 允许共享表征与 Q 头联合适配
             if scope == "q_path":
-                for p in model.shared_model.share_layer.parameters():
+                for p in model.q_model.parameters():
                     p.requires_grad = True
-            self._policy_q_freeze_active = True
-        else:
-            if not self._policy_q_freeze_active:
-                return
-            for name, p in model.named_parameters():
-                if name in self._policy_value_grad_backup:
-                    p.requires_grad = self._policy_value_grad_backup[name]
-            self._policy_value_grad_backup = {}
-            self._policy_q_freeze_active = False
+            else:
+                for p in model.q_model.q_head.parameters():
+                    p.requires_grad = True
+        self._policy_q_freeze_active = enable
 
-    def _set_policy_bp_only_freeze(self, enable: bool):
+    def _set_policy_pvbp_only_freeze(self, enable: bool):
         """
-        bp-only 精修阶段：仅更新 bp0/bpI 头参数。
+        PV/BP 阶段：仅允许 PVBP block 训练，Q block 保持冻结。
         """
         if 'policy_value' not in self.models:
             return
 
         model = self.models['policy_value']
+        for p in model.parameters():
+            p.requires_grad = not enable
         if enable:
-            if self._policy_bp_freeze_active:
-                return
-            self._policy_bp_grad_backup = {
-                name: p.requires_grad for name, p in model.named_parameters()
-            }
-            for p in model.parameters():
-                p.requires_grad = False
-            for p in model.shared_model.bp0_head.parameters():
+            for p in model.pvbp_model.parameters():
                 p.requires_grad = True
-            for p in model.shared_model.bpI_head.parameters():
+        self._policy_pvbp_freeze_active = enable
+
+    def _set_policy_bp_only_freeze(self, enable: bool):
+        """
+        bp-only 精修阶段：仅更新 PVBP block 中的 bp0/bpI 头参数。
+        """
+        if 'policy_value' not in self.models:
+            return
+
+        model = self.models['policy_value']
+        for p in model.parameters():
+            p.requires_grad = not enable
+        if enable:
+            for p in model.pvbp_model.bp0_head.parameters():
                 p.requires_grad = True
-            self._policy_bp_freeze_active = True
-        else:
-            if not self._policy_bp_freeze_active:
-                return
-            for name, p in model.named_parameters():
-                if name in self._policy_bp_grad_backup:
-                    p.requires_grad = self._policy_bp_grad_backup[name]
-            self._policy_bp_grad_backup = {}
-            self._policy_bp_freeze_active = False
+            for p in model.pvbp_model.bpI_head.parameters():
+                p.requires_grad = True
+        self._policy_bp_freeze_active = enable
+
+    def _resolve_optimizer_keys(
+        self,
+        train_modules: List[str],
+        policy_loss_terms: Optional[List[str]] = None,
+    ) -> List[str]:
+        keys: List[str] = []
+        for name in train_modules:
+            if name != 'policy_value':
+                if name in self.optimizers:
+                    keys.append(name)
+                continue
+            terms = set(policy_loss_terms or [])
+            if terms == {'q'} and len(policy_loss_terms or []) == 1:
+                if 'policy_value_q' in self.optimizers:
+                    keys.append('policy_value_q')
+            elif terms == {'p0', 'pi'} and len(policy_loss_terms or []) == 2:
+                if 'policy_value_pvbp' in self.optimizers:
+                    keys.append('policy_value_pvbp')
+            else:
+                if 'policy_value_q' in self.optimizers:
+                    keys.append('policy_value_q')
+                if 'policy_value_pvbp' in self.optimizers:
+                    keys.append('policy_value_pvbp')
+        return keys
 
     def _set_sdf_fc1_teacher_only_freeze(self, enable: bool):
         """
@@ -1296,6 +1312,7 @@ class Episode:
 
         # 先恢复，再按当前 step 规则决定是否冻结
         self._set_policy_q_only_freeze(False)
+        self._set_policy_pvbp_only_freeze(False)
         self._set_policy_bp_only_freeze(False)
         self._set_sdf_fc1_teacher_only_freeze(False)
         q_only_step = (
@@ -1303,10 +1320,13 @@ class Episode:
             set(policy_loss_terms) == {'q'} and
             len(policy_loss_terms) == 1
         )
-        bp_only_step = (
+        pvbp_only_step = (
             'policy_value' in train_modules and
             set(policy_loss_terms) == {'p0', 'pi'} and
-            len(policy_loss_terms) == 2 and
+            len(policy_loss_terms) == 2
+        )
+        bp_only_step = (
+            pvbp_only_step and
             bool(getattr(self, "_bp_only_stage", False))
         )
         fc1_teacher_step = (
@@ -1314,9 +1334,14 @@ class Episode:
             bool(getattr(self, "_fc1_teacher_forcing_stage", False))
         )
         self._set_policy_q_only_freeze(q_only_step)
-        if not q_only_step:
+        if bp_only_step:
+            self._set_policy_bp_only_freeze(True)
+        elif pvbp_only_step:
+            self._set_policy_pvbp_only_freeze(True)
+        elif not q_only_step:
             self._set_policy_bp_only_freeze(bp_only_step)
         self._set_sdf_fc1_teacher_only_freeze(fc1_teacher_step)
+        active_optimizer_keys = self._resolve_optimizer_keys(train_modules, policy_loss_terms)
         
         losses = {}
         
@@ -1326,9 +1351,8 @@ class Episode:
                 self.models[name].train()
         
         # 清零梯度
-        for name in train_modules:
-            if name in self.optimizers:
-                self.optimizers[name].zero_grad()
+        for opt_key in active_optimizer_keys:
+            self.optimizers[opt_key].zero_grad()
         
         try:
             # 计算损失
@@ -1394,18 +1418,20 @@ class Episode:
                             logger.warning(f"NaN gradient detected in {name}")
                 
                 # 优化器步骤
-                for name in train_modules:
-                    if name in self.optimizers:
-                        self.optimizers[name].step()
+                for opt_key in active_optimizer_keys:
+                    self.optimizers[opt_key].step()
         finally:
             self._set_policy_q_only_freeze(False)
+            self._set_policy_pvbp_only_freeze(False)
             self._set_policy_bp_only_freeze(False)
             self._set_sdf_fc1_teacher_only_freeze(False)
-        
+
         # 更新调度器
         self.weight_scheduler.step(losses)
-        for scheduler in self.lr_schedulers.values():
-            scheduler.step()
+        for key in active_optimizer_keys:
+            scheduler = self.lr_schedulers.get(key)
+            if scheduler is not None:
+                scheduler.step()
         
         self.step_count += 1
         
@@ -1823,7 +1849,6 @@ class Episode:
             bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
         # P0 分支使用不投资场景的杠杆候选 bp0
         bp_for_p0 = bp0_t
-        b_parent = parent_state[:, 0:1]
 
         output_children = []
         eta_children = []
@@ -1832,7 +1857,9 @@ class Episode:
             child_state_raw = strip_extra(child)
             eta_child = child[:, 2:3]
             child_state = child_state_raw.clone()
-            child_state[:, 0:1] = eta_child * bp_for_p0 + (1 - eta_child) * b_parent
+            # 按 main_4.tex 的 Bellman 口径，continuation 中的 debt argument
+            # 应保持为当期选定的 contract b'，而不是 eta' 混合后的 realized debt。
+            child_state[:, 0:1] = bp_for_p0
             output_children.append(model(child_state))
             eta_children.append(eta_child)
             
@@ -2030,7 +2057,6 @@ class Episode:
             bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
         # PI 分支使用投资场景的杠杆候选 bpI
         bp_for_pi = bpI_t
-        b_parent = parent_state[:, 0:1]
 
         output_children = []
         eta_children = []
@@ -2039,7 +2065,9 @@ class Episode:
             child_state_raw = strip_extra(child)
             eta_child = child[:, 2:3]
             child_state = child_state_raw.clone()
-            child_state[:, 0:1] = eta_child * bp_for_pi + (1 - eta_child) * b_parent
+            # 按 main_4.tex 的 Bellman 口径，continuation 中的 debt argument
+            # 应保持为当期选定的 contract b'，而不是 eta' 混合后的 realized debt。
+            child_state[:, 0:1] = bp_for_pi
             output_children.append(model(child_state))
             eta_children.append(eta_child)
             
@@ -2309,12 +2337,9 @@ class Episode:
         # 2) dq_unit/db < 0
         if hasattr(model, "get_q_unit"):
             q_unit = model.get_q_unit(parent_state)
-        elif hasattr(model, "shared_model") and hasattr(model.shared_model, "get_q_unit"):
-            q_unit = model.shared_model.get_q_unit(parent_state)
         else:
             raise AttributeError(
-                "PolicyValueModel is missing get_q_unit and shared_model.get_q_unit; "
-                "please sync models/policy_value.py and models/share_layer.py."
+                "PolicyValueModel is missing get_q_unit; please sync models/policy_value.py."
             )
         q_grads = torch.autograd.grad(
             outputs=q_unit.sum(),
@@ -2746,14 +2771,13 @@ class Episode:
             bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
 
         bp_for_p0 = bp0_t
-        b_parent = parent_state[:, 0:1]
         output_children = []
         eta_children = []
         for child in children:
             child_state_raw = self._policy_strip_extra(child)
             eta_child = child[:, 2:3]
             child_state = child_state_raw.clone()
-            child_state[:, 0:1] = eta_child * bp_for_p0 + (1 - eta_child) * b_parent
+            child_state[:, 0:1] = bp_for_p0
             output_children.append(model(child_state))
             eta_children.append(eta_child)
 
@@ -2806,14 +2830,13 @@ class Episode:
             bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
 
         bp_for_pi = bpI_t
-        b_parent = parent_state[:, 0:1]
         output_children = []
         eta_children = []
         for child in children:
             child_state_raw = self._policy_strip_extra(child)
             eta_child = child[:, 2:3]
             child_state = child_state_raw.clone()
-            child_state[:, 0:1] = eta_child * bp_for_pi + (1 - eta_child) * b_parent
+            child_state[:, 0:1] = bp_for_pi
             output_children.append(model(child_state))
             eta_children.append(eta_child)
 
@@ -3027,26 +3050,40 @@ class Episode:
         if 'sdf_fc1' in train_modules:
             self._configure_sdf_lr_for_phase()
 
-        q_pretrain_epochs = 0
-        if 'policy_value' in train_modules:
-            q_pretrain_epochs = max(0, int(getattr(self.hyperparams, "q_pretrain_epochs", 0)))
-            q_warmstart_epochs = max(0, int(getattr(self.hyperparams, "q_warmstart_epochs", 0)))
-            q_only_epochs = max(q_pretrain_epochs, q_warmstart_epochs)
+        policy_staged_training = bool(
+            'policy_value' in train_modules and
+            getattr(self.hyperparams, "policy_separate_q_pvbp_training", True)
+        )
+        if policy_staged_training:
+            q_stage_cfg = max(
+                int(getattr(self.hyperparams, "q_stage_epochs", 100)),
+                int(getattr(self.hyperparams, "q_pretrain_epochs", 0)),
+                int(getattr(self.hyperparams, "q_warmstart_epochs", 0)),
+            )
+            pvbp_stage_cfg = int(getattr(self.hyperparams, "pvbp_stage_epochs", 100))
+            q_stage_epochs = 0 if q_stage_cfg <= 0 else max(100, q_stage_cfg)
+            pvbp_stage_epochs = 0 if pvbp_stage_cfg <= 0 else max(100, pvbp_stage_cfg)
+            total_epochs = max(n_epochs, q_stage_epochs + pvbp_stage_epochs)
         else:
-            q_warmstart_epochs = 0
-            q_only_epochs = 0
+            q_stage_epochs = 0
+            pvbp_stage_epochs = 0
+            total_epochs = n_epochs
 
         stage_summaries: Dict[str, Dict[str, Any]] = {}
-        for epoch in range(n_epochs):
+        for epoch in range(total_epochs):
             self._current_epoch_idx = epoch
-            self._q_only_stage = bool(
-                'policy_value' in train_modules and q_only_epochs > 0 and epoch < q_only_epochs
+            self._q_only_stage = bool(policy_staged_training and q_stage_epochs > 0 and epoch < q_stage_epochs)
+            self._pvbp_only_stage = bool(
+                policy_staged_training and pvbp_stage_epochs > 0 and epoch >= q_stage_epochs
             )
             policy_loss_terms = None
-            if 'policy_value' in train_modules and q_only_epochs > 0:
-                policy_loss_terms = ['q'] if self._q_only_stage else ['p0', 'pi', 'q']
+            if policy_staged_training:
+                if self._q_only_stage:
+                    policy_loss_terms = ['q']
+                elif self._pvbp_only_stage:
+                    policy_loss_terms = ['p0', 'pi']
             epoch_losses = []
-            for batch in tqdm(batches, desc=f"{desc_prefix}Epoch {epoch+1}/{n_epochs}"):
+            for batch in tqdm(batches, desc=f"{desc_prefix}Epoch {epoch+1}/{total_epochs}"):
                 losses = self.train_step(
                     batch,
                     train_modules,
@@ -3057,7 +3094,8 @@ class Episode:
                 if self.step_count % log_interval == 0:
                     avg_loss = np.mean([l['total'] for l in epoch_losses[-log_interval:]])
                     lr = None
-                    for name in train_modules:
+                    optimizer_keys = self._resolve_optimizer_keys(train_modules, policy_loss_terms)
+                    for name in optimizer_keys:
                         lr = self.lr_schedulers.get(name)
                         if lr is not None:
                             break
@@ -3127,22 +3165,22 @@ class Episode:
                     f"{avg_losses['sdf_dlnkf_p50']:.4f}, {avg_losses['sdf_dlnkf_p90']:.4f})"
                 )
             if (
-                'policy_value' in train_modules and
-                q_only_epochs > 0 and
-                epoch + 1 == q_only_epochs
+                policy_staged_training and
+                epoch + 1 == q_stage_epochs
             ):
                 q_only_summary = {
-                    'phase': 'q_only_end',
+                    'phase': 'q_stage_end',
                     'epoch': epoch + 1,
-                    'n_epochs': n_epochs,
-                    'q_only_epochs': q_only_epochs,
-                    'joint_epochs': max(0, n_epochs - q_only_epochs),
+                    'n_epochs': total_epochs,
+                    'q_stage_epochs': q_stage_epochs,
+                    'pvbp_stage_epochs': pvbp_stage_epochs,
                     'final_losses': dict(avg_losses),
                 }
-                stage_summaries['q_only_end'] = q_only_summary
+                stage_summaries['q_stage_end'] = q_only_summary
                 if policy_stage_callback is not None:
                     policy_stage_callback(q_only_summary)
         self._q_only_stage = False
+        self._pvbp_only_stage = False
         self._bp_only_stage = False
         convergence = None
         if 'policy_value' in train_modules and 'policy_value' in self.models:
@@ -3154,18 +3192,18 @@ class Episode:
         if convergence is not None:
             result['convergence'] = convergence
         if 'policy_value' in train_modules:
-            if q_only_epochs > 0 and n_epochs > q_only_epochs:
-                final_phase = 'joint_end'
-            elif q_only_epochs > 0:
-                final_phase = 'q_only_end'
+            if policy_staged_training and total_epochs > q_stage_epochs:
+                final_phase = 'pvbp_stage_end'
+            elif policy_staged_training:
+                final_phase = 'q_stage_end'
             else:
                 final_phase = 'policy_end'
             final_summary = {
                 'phase': final_phase,
-                'epoch': n_epochs,
-                'n_epochs': n_epochs,
-                'q_only_epochs': q_only_epochs,
-                'joint_epochs': max(0, n_epochs - q_only_epochs),
+                'epoch': total_epochs,
+                'n_epochs': total_epochs,
+                'q_stage_epochs': q_stage_epochs,
+                'pvbp_stage_epochs': pvbp_stage_epochs,
                 'final_losses': dict(avg_losses),
             }
             if convergence is not None:
