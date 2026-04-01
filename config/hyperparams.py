@@ -164,6 +164,7 @@ class HyperParams:
     # Stage B: PV/BP-only
     q_stage_epochs: int = 100
     pvbp_stage_epochs: int = 100
+    q_refresh_stage_epochs: int = 20
     pvbp_alternating_enabled: bool = True
     pvbp_value_steps_per_epoch: int = 1
     pvbp_policy_steps_per_epoch: int = 1

@@ -150,6 +150,7 @@ class Episode:
         self._sdf_base_lr_backup = None
         self._current_epoch_idx = 0
         self._q_only_stage = False
+        self._q_refresh_stage = False
         self._bp_only_stage = False
         self._value_only_stage = False
         self._pvbp_only_stage = False
@@ -3183,12 +3184,15 @@ class Episode:
                 int(getattr(self.hyperparams, "q_warmstart_epochs", 0)),
             )
             pvbp_stage_cfg = int(getattr(self.hyperparams, "pvbp_stage_epochs", 100))
+            q_refresh_cfg = int(getattr(self.hyperparams, "q_refresh_stage_epochs", 0))
             q_stage_epochs = 0 if q_stage_cfg <= 0 else max(100, q_stage_cfg)
             pvbp_stage_epochs = 0 if pvbp_stage_cfg <= 0 else max(100, pvbp_stage_cfg)
-            total_epochs = max(n_epochs, q_stage_epochs + pvbp_stage_epochs)
+            q_refresh_stage_epochs = 0 if q_refresh_cfg <= 0 else q_refresh_cfg
+            total_epochs = max(n_epochs, q_stage_epochs + pvbp_stage_epochs + q_refresh_stage_epochs)
         else:
             q_stage_epochs = 0
             pvbp_stage_epochs = 0
+            q_refresh_stage_epochs = 0
             total_epochs = n_epochs
 
         stage_summaries: Dict[str, Dict[str, Any]] = {}
@@ -3196,12 +3200,19 @@ class Episode:
             self._current_epoch_idx = epoch
             self._q_only_stage = bool(policy_staged_training and q_stage_epochs > 0 and epoch < q_stage_epochs)
             self._pvbp_only_stage = bool(
-                policy_staged_training and pvbp_stage_epochs > 0 and epoch >= q_stage_epochs
+                policy_staged_training and
+                pvbp_stage_epochs > 0 and
+                q_stage_epochs <= epoch < (q_stage_epochs + pvbp_stage_epochs)
+            )
+            self._q_refresh_stage = bool(
+                policy_staged_training and
+                q_refresh_stage_epochs > 0 and
+                epoch >= (q_stage_epochs + pvbp_stage_epochs)
             )
             self._set_policy_runtime_controls(q_stage_epochs)
             policy_loss_terms = None
             if policy_staged_training:
-                if self._q_only_stage:
+                if self._q_only_stage or self._q_refresh_stage:
                     policy_loss_terms = ['q']
                 elif self._pvbp_only_stage:
                     policy_loss_terms = ['p0', 'pi']
@@ -3354,14 +3365,51 @@ class Episode:
                     'n_epochs': total_epochs,
                     'q_stage_epochs': q_stage_epochs,
                     'pvbp_stage_epochs': pvbp_stage_epochs,
+                    'q_refresh_stage_epochs': q_refresh_stage_epochs,
                     'final_losses': dict(avg_losses),
                 }
                 stage_summaries['q_stage_end'] = q_only_summary
                 if policy_stage_callback is not None:
                     policy_stage_callback(q_only_summary)
+            if (
+                policy_staged_training and
+                pvbp_stage_epochs > 0 and
+                epoch + 1 == q_stage_epochs + pvbp_stage_epochs
+            ):
+                pvbp_summary = {
+                    'phase': 'pvbp_stage_end',
+                    'epoch': epoch + 1,
+                    'n_epochs': total_epochs,
+                    'q_stage_epochs': q_stage_epochs,
+                    'pvbp_stage_epochs': pvbp_stage_epochs,
+                    'q_refresh_stage_epochs': q_refresh_stage_epochs,
+                    'final_losses': dict(avg_losses),
+                }
+                stage_summaries['pvbp_stage_end'] = pvbp_summary
+                if policy_stage_callback is not None:
+                    policy_stage_callback(pvbp_summary)
+            if (
+                policy_staged_training and
+                q_refresh_stage_epochs > 0 and
+                epoch + 1 == q_stage_epochs + pvbp_stage_epochs + q_refresh_stage_epochs
+            ):
+                q_refresh_summary = {
+                    'phase': 'q_refresh_end',
+                    'epoch': epoch + 1,
+                    'n_epochs': total_epochs,
+                    'q_stage_epochs': q_stage_epochs,
+                    'pvbp_stage_epochs': pvbp_stage_epochs,
+                    'q_refresh_stage_epochs': q_refresh_stage_epochs,
+                    'final_losses': dict(avg_losses),
+                }
+                stage_summaries['q_refresh_end'] = q_refresh_summary
+                if policy_stage_callback is not None:
+                    policy_stage_callback(q_refresh_summary)
         self._q_only_stage = False
+        self._q_refresh_stage = False
         self._pvbp_only_stage = False
         self._bp_only_stage = False
+        self._value_only_stage = False
         self._set_policy_runtime_controls(0)
         convergence = None
         if 'policy_value' in train_modules and 'policy_value' in self.models:
@@ -3373,7 +3421,9 @@ class Episode:
         if convergence is not None:
             result['convergence'] = convergence
         if 'policy_value' in train_modules:
-            if policy_staged_training and total_epochs > q_stage_epochs:
+            if policy_staged_training and q_refresh_stage_epochs > 0 and total_epochs > (q_stage_epochs + pvbp_stage_epochs):
+                final_phase = 'q_refresh_end'
+            elif policy_staged_training and total_epochs > q_stage_epochs:
                 final_phase = 'pvbp_stage_end'
             elif policy_staged_training:
                 final_phase = 'q_stage_end'
@@ -3385,6 +3435,7 @@ class Episode:
                 'n_epochs': total_epochs,
                 'q_stage_epochs': q_stage_epochs,
                 'pvbp_stage_epochs': pvbp_stage_epochs,
+                'q_refresh_stage_epochs': q_refresh_stage_epochs,
                 'final_losses': dict(avg_losses),
             }
             if convergence is not None:
