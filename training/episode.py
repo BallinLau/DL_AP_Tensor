@@ -23,7 +23,7 @@ from data import Sample, SimulateTS, TensorTable, TensorSimulationOutput
 from data.data_utils import compute_quantile_features
 from losses import SDFLoss, P0Loss, PILoss, QLoss, FC2Loss
 from losses.FC2losspipe import FC2LossPipe
-from losses.utils import compute_z_penalty, compute_aio_residual
+from losses.utils import compute_z_penalty, compute_aio_residual, compute_monotonicity_penalty
 from losses.sdf_loss import moment_penalty
 from data.data_utils import build_sdf_pairs_from_macro_ts
 from .gradient_utils import gradient_protection, compute_gradient_norm
