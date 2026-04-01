@@ -912,7 +912,10 @@ class Episode:
             for eta_sub, m_sub in zip(eta_sub_list, m_sub_list):
                 eta_grid = eta_sub.unsqueeze(1).expand(S, G, 1)
                 child_state = parent_sub.unsqueeze(1).expand(S, G, parent_sub.shape[1]).clone()
-                child_state[:, :, 0:1] = eta_grid * bp_grid + (1.0 - eta_grid) * b_parent_grid
+                # Align bp value supervision with the Bellman continuation object:
+                # the continuation debt argument should stay at the chosen contract b',
+                # not the eta'-mixed realized debt.
+                child_state[:, :, 0:1] = bp_grid
                 child_out = pv_model(child_state.reshape(S * G, -1))
 
                 q_child = child_out.Q.reshape(S, G, 1)
