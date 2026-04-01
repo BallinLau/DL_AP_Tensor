@@ -177,7 +177,9 @@ class PVBPModel(nn.Module):
         device = firm_state.device
         batch_size = firm_state.size(0)
         if simulated_i is None:
-            simulated_i = torch.linspace(0.0, Config.I_THRESHOLD, steps=5, device=device).unsqueeze(-1)
+            n_i_points = int(getattr(Config, "PV_I_INTEGRATION_POINTS", 11))
+            n_i_points = max(3, n_i_points)
+            simulated_i = torch.linspace(0.0, Config.I_THRESHOLD, steps=n_i_points, device=device).unsqueeze(-1)
 
         v0_list = []
         vi_list = []

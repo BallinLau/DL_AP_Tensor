@@ -52,6 +52,7 @@ class Config:
     
     # 投资与再融资
     I_THRESHOLD = 0.2     # 投资成本上限
+    PV_I_INTEGRATION_POINTS = 11  # Vhat/P/chi/bar_z 对 i 的离散积分点数
     ZETA = 0.03           # 再融资可得性概率
     # 模拟阶段杠杆支持集（用于保持违约区域可识别）
     SIM_B_INIT_MIN = 0.0
