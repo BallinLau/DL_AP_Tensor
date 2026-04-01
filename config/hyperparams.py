@@ -164,6 +164,9 @@ class HyperParams:
     # Stage B: PV/BP-only
     q_stage_epochs: int = 100
     pvbp_stage_epochs: int = 100
+    pvbp_alternating_enabled: bool = True
+    pvbp_value_steps_per_epoch: int = 1
+    pvbp_policy_steps_per_epoch: int = 1
     pvbp_anti_collapse_warmup_epochs: int = 5
     pvbp_anti_collapse_start: float = 0.85
     # PV/BP value 面形状约束：value 对 b 递减、对 z 递增

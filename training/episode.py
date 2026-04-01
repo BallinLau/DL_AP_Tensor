@@ -151,12 +151,14 @@ class Episode:
         self._current_epoch_idx = 0
         self._q_only_stage = False
         self._bp_only_stage = False
+        self._value_only_stage = False
         self._pvbp_only_stage = False
         self._fc1_teacher_forcing_stage = False
         self._policy_q_freeze_active = False
         self._policy_value_grad_backup = {}
         self._policy_bp_freeze_active = False
         self._policy_bp_grad_backup = {}
+        self._policy_value_only_freeze_active = False
         self._policy_pvbp_freeze_active = False
         self._sdf_fc1_teacher_freeze_active = False
         self._sdf_fc1_grad_backup = {}
@@ -1156,6 +1158,26 @@ class Episode:
                 p.requires_grad = True
         self._policy_bp_freeze_active = enable
 
+    def _set_policy_value_only_freeze(self, enable: bool):
+        """
+        value-only 阶段：仅更新 PVBP block 中除 bp0/bpI 外的参数，
+        让 value/gate 面先对齐，再单独交给 bp 头做策略跟随。
+        """
+        if 'policy_value' not in self.models:
+            return
+
+        model = self.models['policy_value']
+        for p in model.parameters():
+            p.requires_grad = not enable
+        if enable:
+            for p in model.pvbp_model.parameters():
+                p.requires_grad = True
+            for p in model.pvbp_model.bp0_head.parameters():
+                p.requires_grad = False
+            for p in model.pvbp_model.bpI_head.parameters():
+                p.requires_grad = False
+        self._policy_value_only_freeze_active = enable
+
     def _resolve_optimizer_keys(
         self,
         train_modules: List[str],
@@ -1390,6 +1412,7 @@ class Episode:
         self._set_policy_q_only_freeze(False)
         self._set_policy_pvbp_only_freeze(False)
         self._set_policy_bp_only_freeze(False)
+        self._set_policy_value_only_freeze(False)
         self._set_sdf_fc1_teacher_only_freeze(False)
         q_only_step = (
             'policy_value' in train_modules and
@@ -1405,6 +1428,10 @@ class Episode:
             pvbp_only_step and
             bool(getattr(self, "_bp_only_stage", False))
         )
+        value_only_step = (
+            pvbp_only_step and
+            bool(getattr(self, "_value_only_stage", False))
+        )
         fc1_teacher_step = (
             'sdf_fc1' in train_modules and
             bool(getattr(self, "_fc1_teacher_forcing_stage", False))
@@ -1412,6 +1439,8 @@ class Episode:
         self._set_policy_q_only_freeze(q_only_step)
         if bp_only_step:
             self._set_policy_bp_only_freeze(True)
+        elif value_only_step:
+            self._set_policy_value_only_freeze(True)
         elif pvbp_only_step:
             self._set_policy_pvbp_only_freeze(True)
         elif not q_only_step:
@@ -1500,6 +1529,7 @@ class Episode:
             self._set_policy_q_only_freeze(False)
             self._set_policy_pvbp_only_freeze(False)
             self._set_policy_bp_only_freeze(False)
+            self._set_policy_value_only_freeze(False)
             self._set_sdf_fc1_teacher_only_freeze(False)
 
         # 更新调度器
@@ -3176,28 +3206,84 @@ class Episode:
                 elif self._pvbp_only_stage:
                     policy_loss_terms = ['p0', 'pi']
             epoch_losses = []
-            for batch in tqdm(batches, desc=f"{desc_prefix}Epoch {epoch+1}/{total_epochs}"):
-                losses = self.train_step(
-                    batch,
-                    train_modules,
-                    policy_loss_terms=policy_loss_terms
-                )
-                epoch_losses.append(losses)
-                
-                if self.step_count % log_interval == 0:
-                    avg_loss = np.mean([l['total'] for l in epoch_losses[-log_interval:]])
-                    lr = None
-                    optimizer_keys = self._resolve_optimizer_keys(train_modules, policy_loss_terms)
-                    for name in optimizer_keys:
-                        lr = self.lr_schedulers.get(name)
-                        if lr is not None:
-                            break
-                    current_lr = lr.get_lr() if lr else 0
-                    
-                    logger.info(
-                        f"Step {self.step_count}: "
-                        f"loss={avg_loss:.6f}, lr={current_lr:.2e}"
+            pvbp_alternating = bool(
+                self._pvbp_only_stage and
+                getattr(self.hyperparams, "pvbp_alternating_enabled", True)
+            )
+
+            def _run_epoch_pass(
+                pass_batches: List[Dict[str, torch.Tensor]],
+                pass_desc: str,
+                pass_train_modules: List[str],
+                pass_policy_loss_terms: Optional[List[str]],
+                value_only: bool = False,
+                bp_only: bool = False,
+            ) -> List[Dict[str, float]]:
+                pass_losses: List[Dict[str, float]] = []
+                prev_value_only = self._value_only_stage
+                prev_bp_only = self._bp_only_stage
+                self._value_only_stage = value_only
+                self._bp_only_stage = bp_only
+                try:
+                    for batch in tqdm(pass_batches, desc=pass_desc):
+                        losses = self.train_step(
+                            batch,
+                            pass_train_modules,
+                            policy_loss_terms=pass_policy_loss_terms
+                        )
+                        pass_losses.append(losses)
+                        epoch_losses.append(losses)
+
+                        if self.step_count % log_interval == 0:
+                            recent = epoch_losses[-min(log_interval, len(epoch_losses)):]
+                            avg_loss = np.mean([l['total'] for l in recent])
+                            lr = None
+                            optimizer_keys = self._resolve_optimizer_keys(
+                                pass_train_modules,
+                                pass_policy_loss_terms
+                            )
+                            for name in optimizer_keys:
+                                lr = self.lr_schedulers.get(name)
+                                if lr is not None:
+                                    break
+                            current_lr = lr.get_lr() if lr else 0
+                            logger.info(
+                                f"Step {self.step_count}: "
+                                f"loss={avg_loss:.6f}, lr={current_lr:.2e}"
+                            )
+                finally:
+                    self._value_only_stage = prev_value_only
+                    self._bp_only_stage = prev_bp_only
+                return pass_losses
+
+            if pvbp_alternating:
+                value_steps = max(1, int(getattr(self.hyperparams, "pvbp_value_steps_per_epoch", 1)))
+                policy_steps = max(1, int(getattr(self.hyperparams, "pvbp_policy_steps_per_epoch", 1)))
+                for v in range(value_steps):
+                    _run_epoch_pass(
+                        batches,
+                        f"{desc_prefix}PVBP value {v+1}/{value_steps} (epoch {epoch+1}/{total_epochs})",
+                        train_modules,
+                        ['p0', 'pi'],
+                        value_only=True,
+                        bp_only=False,
                     )
+                for p in range(policy_steps):
+                    _run_epoch_pass(
+                        batches,
+                        f"{desc_prefix}PVBP policy {p+1}/{policy_steps} (epoch {epoch+1}/{total_epochs})",
+                        train_modules,
+                        ['p0', 'pi'],
+                        value_only=False,
+                        bp_only=True,
+                    )
+            else:
+                _run_epoch_pass(
+                    batches,
+                    f"{desc_prefix}Epoch {epoch+1}/{total_epochs}",
+                    train_modules,
+                    policy_loss_terms,
+                )
 
             # 每个 epoch 追加 bp-only 精修：只优化 P0/PI 且仅更新 bp 头。
             bp_refine_steps = max(0, int(getattr(self.hyperparams, "bp_refine_steps_per_epoch", 0)))
@@ -3205,6 +3291,7 @@ class Episode:
             if (
                 'policy_value' in train_modules and
                 not self._q_only_stage and
+                not pvbp_alternating and
                 bp_refine_steps > 0 and
                 len(batches) > 0
             ):
