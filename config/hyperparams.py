@@ -173,6 +173,10 @@ class HyperParams:
     # 等价于 bar_z 对 b 递增、对 z 递减
     chi_mono_weight_b: float = 0.5
     chi_mono_weight_z: float = 0.5
+    # 连续加权的高杠杆违约纪律：不设固定 b-cut，而是让约束随 b 平滑增强
+    gate_high_b_weight_power: float = 2.0
+    gate_high_b_weight_scale: float = 2.0
+    barz_mono_weight_b_high: float = 1.0
     # Q 损失中对 M 的处理（先 detach 并截断，减少 SDF 噪声传导）
     q_use_detached_m: bool = True
     q_m_clamp_min: float = 0.5
@@ -186,8 +190,11 @@ class HyperParams:
     # 2) dq_unit/db <= 0
     q_shape_weight_z: float = 1.0
     q_shape_weight_b_low: float = 1.0
-    # 兼容旧字段；当前实现不再单独使用高 b 区权重
+    # 保留 q_unit 的单调约束，同时额外对总量 Q 的高杠杆正斜率做连续加权惩罚
     q_shape_weight_b_high: float = 0.0
+    q_shape_weight_b_total: float = 1.0
+    q_total_slope_weight_power: float = 2.0
+    q_total_slope_weight_scale: float = 2.0
     q_shape_b_low: float = 0.2
     q_shape_b_high: float = 0.8
     # Q-only 阶段是否冻结非 Q 分支参数（保持经济方程不改写）

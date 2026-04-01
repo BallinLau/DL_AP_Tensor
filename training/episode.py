@@ -23,7 +23,7 @@ from data import Sample, SimulateTS, TensorTable, TensorSimulationOutput
 from data.data_utils import compute_quantile_features
 from losses import SDFLoss, P0Loss, PILoss, QLoss, FC2Loss
 from losses.FC2losspipe import FC2LossPipe
-from losses.utils import compute_z_penalty, compute_aio_residual, compute_monotonicity_penalty
+from losses.utils import compute_z_penalty, compute_aio_residual
 from losses.sdf_loss import moment_penalty
 from data.data_utils import build_sdf_pairs_from_macro_ts
 from .gradient_utils import gradient_protection, compute_gradient_norm
@@ -1267,30 +1267,62 @@ class Episode:
                 'mono_value_z': 0.0,
                 'mono_chi_b': 0.0,
                 'mono_chi_z': 0.0,
+                'mono_barz_b_high': 0.0,
                 'mono_total': 0.0,
             }
 
-        mono_value_b = compute_monotonicity_penalty(value, parent_state, 0, 'negative')
-        mono_value_z = compute_monotonicity_penalty(value, parent_state, 1, 'positive')
-        mono_chi_b = compute_monotonicity_penalty(chi, parent_state, 0, 'negative')
-        mono_chi_z = compute_monotonicity_penalty(chi, parent_state, 1, 'positive')
+        value_grad = torch.autograd.grad(
+            outputs=value.sum(),
+            inputs=parent_state,
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+        chi_grad = torch.autograd.grad(
+            outputs=chi.sum(),
+            inputs=parent_state,
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+
+        value_b = value_grad[:, 0:1]
+        value_z = value_grad[:, 1:2]
+        chi_b = chi_grad[:, 0:1]
+        chi_z = chi_grad[:, 1:2]
+        bar_z_b = -chi_b
+
+        mono_value_b = torch.relu(value_b).mean()
+        mono_value_z = torch.relu(-value_z).mean()
+        mono_chi_b = torch.relu(chi_b).mean()
+        mono_chi_z = torch.relu(-chi_z).mean()
+
+        b_nonneg = torch.clamp(parent_state[:, 0:1], min=0.0)
+        gate_weight_power = float(getattr(self.hyperparams, "gate_high_b_weight_power", 2.0))
+        gate_weight_scale = float(getattr(self.hyperparams, "gate_high_b_weight_scale", 2.0))
+        high_b_weight = 1.0 + gate_weight_scale * b_nonneg.pow(gate_weight_power)
+        mono_barz_b_high = (
+            (high_b_weight * torch.relu(-bar_z_b)).sum() /
+            high_b_weight.sum().clamp_min(1e-8)
+        )
 
         w_value_b = float(getattr(self.hyperparams, "pv_mono_weight_b", 1.0))
         w_value_z = float(getattr(self.hyperparams, "pv_mono_weight_z", 1.0))
         w_chi_b = float(getattr(self.hyperparams, "chi_mono_weight_b", 0.5))
         w_chi_z = float(getattr(self.hyperparams, "chi_mono_weight_z", 0.5))
+        w_barz_b_high = float(getattr(self.hyperparams, "barz_mono_weight_b_high", 1.0))
 
         total = (
             w_value_b * mono_value_b +
             w_value_z * mono_value_z +
             w_chi_b * mono_chi_b +
-            w_chi_z * mono_chi_z
+            w_chi_z * mono_chi_z +
+            w_barz_b_high * mono_barz_b_high
         )
         return total, {
             'mono_value_b': float(mono_value_b.item()),
             'mono_value_z': float(mono_value_z.item()),
             'mono_chi_b': float(mono_chi_b.item()),
             'mono_chi_z': float(mono_chi_z.item()),
+            'mono_barz_b_high': float(mono_barz_b_high.item()),
             'mono_total': float(total.item()),
         }
     
@@ -2439,11 +2471,28 @@ class Episode:
         dq_dz = q_grads[:, 1:2]
         q_shape_z = torch.relu(-dq_dz).mean()
         q_shape_b = torch.relu(dq_db).mean()
+        q_total_grads = torch.autograd.grad(
+            outputs=Q.sum(),
+            inputs=parent_state,
+            create_graph=True,
+            retain_graph=True
+        )[0]
+        dQ_db = q_total_grads[:, 0:1]
+        b_nonneg = torch.clamp(b_parent, min=0.0)
+        q_total_weight_power = float(getattr(self.hyperparams, "q_total_slope_weight_power", 2.0))
+        q_total_weight_scale = float(getattr(self.hyperparams, "q_total_slope_weight_scale", 2.0))
+        q_total_weight = 1.0 + q_total_weight_scale * b_nonneg.pow(q_total_weight_power)
+        q_shape_b_total = (
+            (q_total_weight * torch.relu(dQ_db)).sum() /
+            q_total_weight.sum().clamp_min(1e-8)
+        )
         w_shape_z = float(getattr(self.hyperparams, "q_shape_weight_z", 1.0))
         w_shape_b_low = float(getattr(self.hyperparams, "q_shape_weight_b_low", 1.0))
+        w_shape_b_total = float(getattr(self.hyperparams, "q_shape_weight_b_total", 1.0))
         q_shape_penalty = (
             w_shape_z * q_shape_z +
-            w_shape_b_low * q_shape_b
+            w_shape_b_low * q_shape_b +
+            w_shape_b_total * q_shape_b_total
         )
 
         physics_loss = (
@@ -2473,7 +2522,7 @@ class Episode:
                 'q_bdry_high': float(loss5.item()),
                 'q_shape_z': float(q_shape_z.item()),
                 'q_shape_b_low': float(q_shape_b.item()),
-                'q_shape_b_high': 0.0,
+                'q_shape_b_high': float(q_shape_b_total.item()),
                 'q_physics': float(physics_loss.item()),
                 'q_warmstart': float(warm_loss.item()),
                 'q_warm_weight': float(warm_weight),
@@ -2485,6 +2534,7 @@ class Episode:
                 'q_unit_mean': float(q_unit.mean().item()),
                 'dq_unit_db_mean': float(dq_db.mean().item()),
                 'dq_unit_dz_mean': float(dq_dz.mean().item()),
+                'dQ_db_mean': float(dQ_db.mean().item()),
             }
         return total_loss
     
