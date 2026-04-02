@@ -149,6 +149,9 @@ class HyperParams:
     # Stage2 先做若干轮 FC1 teacher forcing 预训练（使用真实 Hatc_t/LnK_t 输入）
     fc1_teacher_forcing_epochs: int = 5
     fc1_teacher_forcing_weight: float = 1.0
+    # 识别实验：只训练 FC1 的 forecast/law consistency，不训练 SDF Euler/moment/anchor。
+    # 用来排除 “FC1 结果差是不是被 SDF 目标冲突拖坏”。
+    fc1_forecast_only_ablation: bool = False
     # 在 stage2/joint 中，若 batch 提供真实 Hatc_t/LnK_t，是否优先用真实当前态驱动 FC1。
     # 默认关闭，joint 阶段使用 forecast-state 输入以约束递推闭环。
     fc1_use_true_macro_state_in_stage2: bool = False

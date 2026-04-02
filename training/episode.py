@@ -1563,6 +1563,10 @@ class Episode:
             'sdf_fc1' in train_modules and
             bool(getattr(self, "_fc1_teacher_forcing_stage", False))
         )
+        fc1_forecast_only_step = (
+            'sdf_fc1' in train_modules and
+            bool(getattr(self.hyperparams, "fc1_forecast_only_ablation", False))
+        )
         self._set_policy_q_only_freeze(q_only_step)
         if bp_only_step:
             self._set_policy_bp_only_freeze(True)
@@ -1572,7 +1576,7 @@ class Episode:
             self._set_policy_pvbp_only_freeze(True)
         elif not q_only_step:
             self._set_policy_bp_only_freeze(bp_only_step)
-        self._set_sdf_fc1_teacher_only_freeze(fc1_teacher_step)
+        self._set_sdf_fc1_teacher_only_freeze(fc1_teacher_step or fc1_forecast_only_step)
         active_optimizer_keys = self._resolve_optimizer_keys(train_modules, policy_loss_terms)
         
         losses = {}
@@ -1991,11 +1995,27 @@ class Episode:
         hj_warmup_factor = self._compute_stage2_hj_warmup_factor()
         moment_weight_eff = float(moment_weight) * hj_warmup_factor
         mean_anchor_weight_eff = float(mean_anchor_weight) * hj_warmup_factor
+        fc1_forecast_only_ablation = bool(
+            getattr(self.hyperparams, "fc1_forecast_only_ablation", False)
+        )
 
-        if bool(getattr(self, "_fc1_teacher_forcing_stage", False)) and self.add_FC1loss:
+        if (
+            bool(getattr(self, "_fc1_teacher_forcing_stage", False))
+            and self.add_FC1loss
+        ):
             teacher_weight = float(getattr(self.hyperparams, "fc1_teacher_forcing_weight", 1.0))
             total_sdf_loss = teacher_weight * (
                 recon_loss
+                + forecast_recon_weight * law_consistency_loss
+                + x_response_loss
+                + delta_penalty_weight * delta_penalty
+                + jacobian_penalty_weight * jacobian_penalty
+            )
+            moment_weight_eff = 0.0
+            mean_anchor_weight_eff = 0.0
+        elif fc1_forecast_only_ablation and self.add_FC1loss:
+            total_sdf_loss = (
+                recon_weight * recon_loss
                 + forecast_recon_weight * law_consistency_loss
                 + x_response_loss
                 + delta_penalty_weight * delta_penalty
@@ -2066,6 +2086,7 @@ class Episode:
                 'sdf_jacobian_penalty_weight': float(jacobian_penalty_weight),
                 'sdf_hj_warmup_factor': float(hj_warmup_factor),
                 'sdf_teacher_forcing_stage': float(1.0 if self._fc1_teacher_forcing_stage else 0.0),
+                'sdf_forecast_only_ablation': float(1.0 if fc1_forecast_only_ablation else 0.0),
                 'sdf_use_true_prev_macro': float(1.0 if use_true_prev_macro else 0.0),
             }
             self._latest_sdf_diag = {

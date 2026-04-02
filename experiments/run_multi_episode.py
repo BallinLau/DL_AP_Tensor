@@ -132,6 +132,12 @@ def main():
         choices=["modea", "modeb"],
         help="When --post0-mode=alternate, choose which mode starts at episode 1",
     )
+    parser.add_argument(
+        "--fc1-forecast-only-ablation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Train sdf_fc1 in forecast-only identification mode: disable Euler/moment/anchor and update only FC1 forecast heads.",
+    )
     args = parser.parse_args()
 
     global RUN_ROOT
@@ -142,6 +148,8 @@ def main():
 
     n_episodes = args.n_episodes  # episode 0 + simulate episodes
     hyperparams = build_hyperparams()
+    if args.fc1_forecast_only_ablation is not None:
+        hyperparams.fc1_forecast_only_ablation = bool(args.fc1_forecast_only_ablation)
     models = build_models(device)
     optimizers = build_optimizers(models, hyperparams)
 

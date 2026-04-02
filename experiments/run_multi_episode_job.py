@@ -53,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--simulate-group-size", type=int, default=None, help="Override firm count per simulated path (SimulateTS data source)")
     parser.add_argument("--simulate-horizon", type=int, default=None, help="Override simulate horizon")
     parser.add_argument(
+        "--fc1-forecast-only-ablation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Train sdf_fc1 in forecast-only identification mode: disable Euler/moment/anchor and update only FC1 forecast heads.",
+    )
+    parser.add_argument(
         "--final-sim",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -126,6 +132,8 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.epochs = args.epochs
     if args.simulate_horizon is not None:
         hyperparams.simulate_horizon = args.simulate_horizon
+    if args.fc1_forecast_only_ablation is not None:
+        hyperparams.fc1_forecast_only_ablation = bool(args.fc1_forecast_only_ablation)
     if args.q_only_ablation:
         q_only_epochs = max(100, int(hyperparams.epochs))
         hyperparams.q_stage_epochs = q_only_epochs
