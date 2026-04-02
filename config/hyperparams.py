@@ -128,6 +128,12 @@ class HyperParams:
     # 先只做 level consistency；x-response consistency 后续单独加入。
     fc1_hatc_law_consistency_weight: float = 1.0
     fc1_lnk_law_consistency_weight: float = 0.25
+    # 显式 x-response consistency：
+    # 比较按 x 分箱后的 E[Hatcf_pred|x-bin] 与 E[Hatc_true|x-bin]，
+    # 以及 LnK 的对应 conditional response。
+    fc1_hatc_x_response_weight: float = 0.25
+    fc1_lnk_x_response_weight: float = 0.10
+    fc1_x_response_bins: int = 7
     # FC1 重建项内部按目标拆分权重。
     # 经验上 LnK 的原始尺度波动更大，若不单独降权，容易主导 FC1 训练并把 M 分布拉坏。
     fc1_hatc_recon_weight: float = 1.0

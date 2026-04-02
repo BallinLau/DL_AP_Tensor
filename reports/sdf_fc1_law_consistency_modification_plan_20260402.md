@@ -79,7 +79,9 @@
 
 ## 本次实际落地内容
 
-本次只做第一步：
+### 第一轮实际落地
+
+先做第一步：
 
 1. 在 `_compute_sdf_loss()` 中显式拆出：
    - `sdf_law_consistency_loss_hatc`
@@ -95,7 +97,7 @@
 
 ## 这一步之后要看什么
 
-下一轮实验应重点看：
+第一轮之后应重点看：
 
 - `sdf_law_consistency_loss_hatc`
 - `sdf_law_consistency_loss_lnk`
@@ -108,3 +110,32 @@
 - `slope`
 - `std_ratio`
 - `x-response` 是否更接近
+
+### 第二轮实际落地
+
+在第一轮结果几乎没有改善后，进一步确认：
+
+- 仅把 forecast-state recon 重命名为 law consistency 不会改变优化方向
+- 当前真正缺少的是 `x -> Hatc` 条件响应的显式约束
+
+因此第二轮新增：
+
+- `fc1_hatc_x_response_weight`
+- `fc1_lnk_x_response_weight`
+- `fc1_x_response_bins`
+
+并在 `_compute_sdf_loss()` 中加入：
+
+- `sdf_x_response_loss_hatc`
+- `sdf_x_response_loss_lnk`
+- `sdf_x_response_loss`
+
+定义方式是：
+
+- 对 batch 内 `x_curr` 分箱
+- 在每个 `x-bin` 上比较
+  - `mean(Hatcf_pred | x-bin)`
+  - `mean(Hatc_true | x-bin)`
+- 对 `LnK` 也做同样处理
+
+这样做的目的不是单纯继续压逐点 MSE，而是显式约束 aggregate law 的条件响应形状。

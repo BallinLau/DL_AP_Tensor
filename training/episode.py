@@ -264,6 +264,45 @@ class Episode:
         return out
 
     @staticmethod
+    def _binned_response_loss_t(
+        x: torch.Tensor,
+        y_true: torch.Tensor,
+        y_pred: torch.Tensor,
+        n_bins: int,
+    ) -> torch.Tensor:
+        """
+        Compare conditional responses E[y | x-bin] between truth and prediction.
+        This targets shape alignment of the aggregate law, not just pointwise MSE.
+        """
+        mask = torch.isfinite(x) & torch.isfinite(y_true) & torch.isfinite(y_pred)
+        if int(mask.sum().item()) < max(4, n_bins):
+            return torch.zeros((), device=x.device, dtype=x.dtype)
+        x_use = x[mask]
+        yt = y_true[mask]
+        yp = y_pred[mask]
+        x_min = x_use.min()
+        x_max = x_use.max()
+        if float((x_max - x_min).abs().item()) < 1e-8:
+            return torch.zeros((), device=x.device, dtype=x.dtype)
+        edges = torch.linspace(
+            float(x_min.item()),
+            float(x_max.item()),
+            steps=max(2, int(n_bins)) + 1,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        bin_idx = torch.bucketize(x_use, edges[1:-1], right=False)
+        losses = []
+        for b in range(max(2, int(n_bins))):
+            mk = bin_idx == b
+            if int(mk.sum().item()) == 0:
+                continue
+            losses.append((yp[mk].mean() - yt[mk].mean()).pow(2))
+        if not losses:
+            return torch.zeros((), device=x.device, dtype=x.dtype)
+        return torch.stack(losses).mean()
+
+    @staticmethod
     def _macro_forecast_r2(df_macro: Optional[pd.DataFrame]) -> Dict[str, float]:
         """
         计算宏观 law consistency / forecast fit 诊断。
@@ -1737,6 +1776,15 @@ class Episode:
         lnk_law_consistency_weight = float(
             getattr(self.hyperparams, "fc1_lnk_law_consistency_weight", 0.25)
         )
+        hatc_x_response_weight = float(
+            getattr(self.hyperparams, "fc1_hatc_x_response_weight", 0.0)
+        )
+        lnk_x_response_weight = float(
+            getattr(self.hyperparams, "fc1_lnk_x_response_weight", 0.0)
+        )
+        x_response_bins = int(
+            getattr(self.hyperparams, "fc1_x_response_bins", 7)
+        )
         hatc_recon_inner_weight = float(
             getattr(self.hyperparams, "fc1_hatc_recon_weight", 1.0)
         )
@@ -1764,6 +1812,9 @@ class Episode:
         law_consistency_loss_hatc = torch.tensor(0.0, device=self.device)
         law_consistency_loss_lnk = torch.tensor(0.0, device=self.device)
         law_consistency_loss = torch.tensor(0.0, device=self.device)
+        x_response_loss_hatc = torch.tensor(0.0, device=self.device)
+        x_response_loss_lnk = torch.tensor(0.0, device=self.device)
+        x_response_loss = torch.tensor(0.0, device=self.device)
         delta_penalty = torch.tensor(0.0, device=self.device)
         delta_penalty_hatc = torch.tensor(0.0, device=self.device)
         delta_penalty_lnk = torch.tensor(0.0, device=self.device)
@@ -1828,6 +1879,23 @@ class Episode:
                     + lnk_law_consistency_weight * law_consistency_loss_lnk
                 )
                 recon_loss_forecast = law_consistency_loss
+                x_curr_flat = children_t[:, :, 4:5].reshape(-1)
+                x_response_loss_hatc = self._binned_response_loss_t(
+                    x_curr_flat,
+                    hatcf_true.reshape(-1),
+                    c_children_forecast.reshape(-1),
+                    n_bins=x_response_bins,
+                )
+                x_response_loss_lnk = self._binned_response_loss_t(
+                    x_curr_flat,
+                    lnkf_true.reshape(-1),
+                    k_children_forecast.reshape(-1),
+                    n_bins=x_response_bins,
+                )
+                x_response_loss = (
+                    hatc_x_response_weight * x_response_loss_hatc
+                    + lnk_x_response_weight * x_response_loss_lnk
+                )
                 d_hatcf_forecast = c_children_forecast - parent[:, 5:6].unsqueeze(1)
                 d_lnkf_forecast = k_children_forecast - parent[:, 6:7].unsqueeze(1)
                 delta_penalty_hatc = torch.relu(
@@ -1898,6 +1966,12 @@ class Episode:
             law_consistency_loss_lnk = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(law_consistency_loss):
             law_consistency_loss = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(x_response_loss_hatc):
+            x_response_loss_hatc = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(x_response_loss_lnk):
+            x_response_loss_lnk = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(x_response_loss):
+            x_response_loss = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(delta_penalty):
             delta_penalty = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(delta_penalty_hatc):
@@ -1922,7 +1996,8 @@ class Episode:
             teacher_weight = float(getattr(self.hyperparams, "fc1_teacher_forcing_weight", 1.0))
             total_sdf_loss = teacher_weight * (
                 recon_loss
-                + forecast_recon_weight * recon_loss_forecast
+                + forecast_recon_weight * law_consistency_loss
+                + x_response_loss
                 + delta_penalty_weight * delta_penalty
                 + jacobian_penalty_weight * jacobian_penalty
             )
@@ -1934,6 +2009,7 @@ class Episode:
                 + moment_weight_eff * moment_loss
                 + recon_weight * recon_loss
                 + forecast_recon_weight * law_consistency_loss
+                + x_response_loss
                 + delta_penalty_weight * delta_penalty
                 + jacobian_penalty_weight * jacobian_penalty
                 + mean_anchor_weight_eff * mean_anchor_loss
@@ -1961,6 +2037,9 @@ class Episode:
                 'sdf_law_consistency_loss': float(law_consistency_loss.detach().item()),
                 'sdf_law_consistency_loss_hatc': float(law_consistency_loss_hatc.detach().item()),
                 'sdf_law_consistency_loss_lnk': float(law_consistency_loss_lnk.detach().item()),
+                'sdf_x_response_loss': float(x_response_loss.detach().item()),
+                'sdf_x_response_loss_hatc': float(x_response_loss_hatc.detach().item()),
+                'sdf_x_response_loss_lnk': float(x_response_loss_lnk.detach().item()),
                 'sdf_delta_penalty': float(delta_penalty.detach().item()),
                 'sdf_delta_penalty_hatc': float(delta_penalty_hatc.detach().item()),
                 'sdf_delta_penalty_lnk': float(delta_penalty_lnk.detach().item()),
@@ -1976,6 +2055,9 @@ class Episode:
                 'sdf_forecast_recon_weight': float(forecast_recon_weight),
                 'sdf_hatc_law_consistency_weight': float(hatc_law_consistency_weight),
                 'sdf_lnk_law_consistency_weight': float(lnk_law_consistency_weight),
+                'sdf_hatc_x_response_weight': float(hatc_x_response_weight),
+                'sdf_lnk_x_response_weight': float(lnk_x_response_weight),
+                'sdf_x_response_bins': float(x_response_bins),
                 'sdf_hatc_recon_inner_weight': float(hatc_recon_inner_weight),
                 'sdf_lnk_recon_inner_weight': float(lnk_recon_inner_weight),
                 'sdf_delta_penalty_weight': float(delta_penalty_weight),
