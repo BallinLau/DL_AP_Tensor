@@ -122,6 +122,12 @@ class HyperParams:
     # Stage2 额外约束 forecast-state 递推：
     # (Hatcf_t, LnKF_t) -> (Hatcf_{t+1}, LnKF_{t+1}) 也要贴近真实下一期
     fc1_forecast_recon_weight: float = 1.0
+    # 显式 aggregate law consistency 权重：
+    # 固定当前 sdf_fc1 给出的 (Hatcf_t, LnKF_t) law 后，
+    # 约束 forecast-state 下一期输出贴近 simulate implied 的真实下一期。
+    # 先只做 level consistency；x-response consistency 后续单独加入。
+    fc1_hatc_law_consistency_weight: float = 1.0
+    fc1_lnk_law_consistency_weight: float = 0.25
     # FC1 重建项内部按目标拆分权重。
     # 经验上 LnK 的原始尺度波动更大，若不单独降权，容易主导 FC1 训练并把 M 分布拉坏。
     fc1_hatc_recon_weight: float = 1.0

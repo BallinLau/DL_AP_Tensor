@@ -1731,6 +1731,12 @@ class Episode:
         forecast_recon_weight = float(
             getattr(self.hyperparams, "fc1_forecast_recon_weight", 0.0)
         )
+        hatc_law_consistency_weight = float(
+            getattr(self.hyperparams, "fc1_hatc_law_consistency_weight", 1.0)
+        )
+        lnk_law_consistency_weight = float(
+            getattr(self.hyperparams, "fc1_lnk_law_consistency_weight", 0.25)
+        )
         hatc_recon_inner_weight = float(
             getattr(self.hyperparams, "fc1_hatc_recon_weight", 1.0)
         )
@@ -1755,6 +1761,9 @@ class Episode:
         recon_loss_lnk = torch.tensor(0.0, device=self.device)
         recon_loss_forecast_hatc = torch.tensor(0.0, device=self.device)
         recon_loss_forecast_lnk = torch.tensor(0.0, device=self.device)
+        law_consistency_loss_hatc = torch.tensor(0.0, device=self.device)
+        law_consistency_loss_lnk = torch.tensor(0.0, device=self.device)
+        law_consistency_loss = torch.tensor(0.0, device=self.device)
         delta_penalty = torch.tensor(0.0, device=self.device)
         delta_penalty_hatc = torch.tensor(0.0, device=self.device)
         delta_penalty_lnk = torch.tensor(0.0, device=self.device)
@@ -1810,12 +1819,15 @@ class Episode:
                     lnkf_prev=lnkf_prev_forecast,
                     return_physical=True
                 )
-                recon_loss_forecast_hatc = (c_children_forecast - hatcf_true).pow(2).mean()
-                recon_loss_forecast_lnk = (k_children_forecast - lnkf_true).pow(2).mean()
-                recon_loss_forecast = (
-                    hatc_recon_inner_weight * recon_loss_forecast_hatc
-                    + lnk_recon_inner_weight * recon_loss_forecast_lnk
+                law_consistency_loss_hatc = (c_children_forecast - hatcf_true).pow(2).mean()
+                law_consistency_loss_lnk = (k_children_forecast - lnkf_true).pow(2).mean()
+                recon_loss_forecast_hatc = law_consistency_loss_hatc
+                recon_loss_forecast_lnk = law_consistency_loss_lnk
+                law_consistency_loss = (
+                    hatc_law_consistency_weight * law_consistency_loss_hatc
+                    + lnk_law_consistency_weight * law_consistency_loss_lnk
                 )
+                recon_loss_forecast = law_consistency_loss
                 d_hatcf_forecast = c_children_forecast - parent[:, 5:6].unsqueeze(1)
                 d_lnkf_forecast = k_children_forecast - parent[:, 6:7].unsqueeze(1)
                 delta_penalty_hatc = torch.relu(
@@ -1880,6 +1892,12 @@ class Episode:
             recon_loss_forecast_hatc = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(recon_loss_forecast_lnk):
             recon_loss_forecast_lnk = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(law_consistency_loss_hatc):
+            law_consistency_loss_hatc = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(law_consistency_loss_lnk):
+            law_consistency_loss_lnk = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(law_consistency_loss):
+            law_consistency_loss = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(delta_penalty):
             delta_penalty = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(delta_penalty_hatc):
@@ -1915,7 +1933,7 @@ class Episode:
                 main_loss
                 + moment_weight_eff * moment_loss
                 + recon_weight * recon_loss
-                + forecast_recon_weight * recon_loss_forecast
+                + forecast_recon_weight * law_consistency_loss
                 + delta_penalty_weight * delta_penalty
                 + jacobian_penalty_weight * jacobian_penalty
                 + mean_anchor_weight_eff * mean_anchor_loss
@@ -1940,6 +1958,9 @@ class Episode:
                 'sdf_recon_loss_forecast': float(recon_loss_forecast.detach().item()),
                 'sdf_recon_loss_forecast_hatc': float(recon_loss_forecast_hatc.detach().item()),
                 'sdf_recon_loss_forecast_lnk': float(recon_loss_forecast_lnk.detach().item()),
+                'sdf_law_consistency_loss': float(law_consistency_loss.detach().item()),
+                'sdf_law_consistency_loss_hatc': float(law_consistency_loss_hatc.detach().item()),
+                'sdf_law_consistency_loss_lnk': float(law_consistency_loss_lnk.detach().item()),
                 'sdf_delta_penalty': float(delta_penalty.detach().item()),
                 'sdf_delta_penalty_hatc': float(delta_penalty_hatc.detach().item()),
                 'sdf_delta_penalty_lnk': float(delta_penalty_lnk.detach().item()),
@@ -1953,6 +1974,8 @@ class Episode:
                 ),
                 'sdf_moment_weight': float(moment_weight_eff),
                 'sdf_forecast_recon_weight': float(forecast_recon_weight),
+                'sdf_hatc_law_consistency_weight': float(hatc_law_consistency_weight),
+                'sdf_lnk_law_consistency_weight': float(lnk_law_consistency_weight),
                 'sdf_hatc_recon_inner_weight': float(hatc_recon_inner_weight),
                 'sdf_lnk_recon_inner_weight': float(lnk_recon_inner_weight),
                 'sdf_delta_penalty_weight': float(delta_penalty_weight),
