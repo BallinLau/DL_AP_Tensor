@@ -842,17 +842,38 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
                 return c
         return None
 
-    def _safe_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    def _fit_stats(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
         mask = np.isfinite(y_true) & np.isfinite(y_pred)
         if mask.sum() < 2:
-            return float("nan")
+            return {}
         yt = y_true[mask]
         yp = y_pred[mask]
-        sst = float(np.sum((yt - yt.mean()) ** 2))
-        if sst <= 1e-12:
-            return float("nan")
-        sse = float(np.sum((yt - yp) ** 2))
-        return 1.0 - sse / sst
+        resid = yt - yp
+        yt_mean = float(yt.mean())
+        yp_mean = float(yp.mean())
+        y_std = float(np.std(yt))
+        p_std = float(np.std(yp))
+        sst = float(np.sum((yt - yt_mean) ** 2))
+        sse = float(np.sum(resid ** 2))
+        out = {
+            "r2": float("nan") if sst <= 1e-12 else float(1.0 - sse / sst),
+            "rmse": float(np.sqrt(np.mean(resid ** 2))),
+            "mae": float(np.mean(np.abs(resid))),
+            "mean_resid": float(np.mean(resid)),
+            "std_ratio": float(p_std / y_std) if y_std > 1e-12 else float("nan"),
+            "corr": float("nan"),
+            "slope": float("nan"),
+            "intercept": float("nan"),
+        }
+        if y_std > 1e-12 and p_std > 1e-12:
+            out["corr"] = float(np.corrcoef(yp, yt)[0, 1])
+        x_centered = yp - yp_mean
+        denom = float(np.sum(x_centered ** 2))
+        if denom > 1e-12:
+            slope = float(np.sum(x_centered * (yt - yt_mean)) / denom)
+            out["slope"] = slope
+            out["intercept"] = float(yt_mean - slope * yp_mean)
+        return out
 
     def _plot_scatter_with_identity(
         x_true: np.ndarray,
@@ -885,7 +906,7 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
                 for br in unique_branch:
                     br_mask = (b == br)
                     if np.any(br_mask):
-                        br_r2 = _safe_r2(x[br_mask], y[br_mask])
+                        br_r2 = _fit_stats(x[br_mask], y[br_mask]).get("r2", float("nan"))
                         br_label = f"branch={int(br)}" if float(br).is_integer() else f"branch={br}"
                         if np.isfinite(br_r2):
                             br_label += f" (R2={br_r2:.4f})"
@@ -924,17 +945,22 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
     if hatc_true_col is None or lnk_true_col is None:
         return
 
-    r2_hatc = float("nan")
-    r2_lnk = float("nan")
+    hatc_stats = {}
+    lnk_stats = {}
     if hatc_pred_col is not None:
-        r2_hatc = _safe_r2(use_df[hatc_true_col].to_numpy(), use_df[hatc_pred_col].to_numpy())
+        hatc_stats = _fit_stats(use_df[hatc_true_col].to_numpy(), use_df[hatc_pred_col].to_numpy())
     if lnk_pred_col is not None:
-        r2_lnk = _safe_r2(use_df[lnk_true_col].to_numpy(), use_df[lnk_pred_col].to_numpy())
+        lnk_stats = _fit_stats(use_df[lnk_true_col].to_numpy(), use_df[lnk_pred_col].to_numpy())
 
     if hatc_pred_col is not None:
         title_hatc = f"EP{ep} Hatc pred vs true"
-        if np.isfinite(r2_hatc):
-            title_hatc += f" (R2={r2_hatc:.4f})"
+        if hatc_stats:
+            title_hatc += (
+                f" (R2={hatc_stats.get('r2', float('nan')):.4f}, "
+                f"corr={hatc_stats.get('corr', float('nan')):.4f}, "
+                f"slope={hatc_stats.get('slope', float('nan')):.4f}, "
+                f"stdr={hatc_stats.get('std_ratio', float('nan')):.4f})"
+            )
         _plot_scatter_with_identity(
             use_df[hatc_true_col].to_numpy(),
             use_df[hatc_pred_col].to_numpy(),
@@ -947,8 +973,13 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
 
     if lnk_pred_col is not None:
         title_lnk = f"EP{ep} LnK pred vs true"
-        if np.isfinite(r2_lnk):
-            title_lnk += f" (R2={r2_lnk:.4f})"
+        if lnk_stats:
+            title_lnk += (
+                f" (R2={lnk_stats.get('r2', float('nan')):.4f}, "
+                f"corr={lnk_stats.get('corr', float('nan')):.4f}, "
+                f"slope={lnk_stats.get('slope', float('nan')):.4f}, "
+                f"stdr={lnk_stats.get('std_ratio', float('nan')):.4f})"
+            )
         _plot_scatter_with_identity(
             use_df[lnk_true_col].to_numpy(),
             use_df[lnk_pred_col].to_numpy(),

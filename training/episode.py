@@ -177,9 +177,96 @@ class Episode:
         }
 
     @staticmethod
+    def _macro_fit_stats_np(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+        """Rich consistency stats for aggregate law diagnostics."""
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        if mask.sum() < 2:
+            return {}
+        yt = y_true[mask]
+        yp = y_pred[mask]
+        resid = yt - yp
+        yt_mean = float(yt.mean())
+        yp_mean = float(yp.mean())
+        y_std = float(np.std(yt))
+        p_std = float(np.std(yp))
+        sst = float(np.sum((yt - yt_mean) ** 2))
+        sse = float(np.sum(resid ** 2))
+        out: Dict[str, float] = {
+            'n_obs': float(mask.sum()),
+            'mean_true': yt_mean,
+            'mean_pred': yp_mean,
+            'mean_resid': float(resid.mean()),
+            'mae_resid': float(np.mean(np.abs(resid))),
+            'rmse_resid': float(np.sqrt(np.mean(resid ** 2))),
+            'std_true': y_std,
+            'std_pred': p_std,
+            'std_ratio': float(p_std / y_std) if y_std > 1e-12 else float('nan'),
+            'r2': float('nan') if sst <= 1e-12 else float(1.0 - sse / sst),
+        }
+        if y_std > 1e-12 and p_std > 1e-12:
+            out['corr'] = float(np.corrcoef(yp, yt)[0, 1])
+        else:
+            out['corr'] = float('nan')
+        x_centered = yp - yp_mean
+        denom = float(np.sum(x_centered ** 2))
+        if denom > 1e-12:
+            slope = float(np.sum(x_centered * (yt - yt_mean)) / denom)
+            intercept = float(yt_mean - slope * yp_mean)
+        else:
+            slope = float('nan')
+            intercept = float('nan')
+        out['slope'] = slope
+        out['intercept'] = intercept
+        return out
+
+    @staticmethod
+    def _macro_fit_stats_t(y_true: torch.Tensor, y_pred: torch.Tensor) -> Dict[str, float]:
+        mask = torch.isfinite(y_true) & torch.isfinite(y_pred)
+        if int(mask.sum().item()) < 2:
+            return {}
+        yt = y_true[mask]
+        yp = y_pred[mask]
+        resid = yt - yp
+        yt_mean_t = yt.mean()
+        yp_mean_t = yp.mean()
+        y_centered = yt - yt_mean_t
+        p_centered = yp - yp_mean_t
+        y_std_t = yt.std(unbiased=False)
+        p_std_t = yp.std(unbiased=False)
+        sst = (y_centered ** 2).sum()
+        sse = (resid ** 2).sum()
+        out: Dict[str, float] = {
+            'n_obs': float(mask.sum().item()),
+            'mean_true': float(yt_mean_t.item()),
+            'mean_pred': float(yp_mean_t.item()),
+            'mean_resid': float(resid.mean().item()),
+            'mae_resid': float(resid.abs().mean().item()),
+            'rmse_resid': float(torch.sqrt((resid ** 2).mean()).item()),
+            'std_true': float(y_std_t.item()),
+            'std_pred': float(p_std_t.item()),
+            'std_ratio': float((p_std_t / y_std_t).item()) if float(y_std_t.item()) > 1e-12 else float('nan'),
+            'r2': float('nan') if float(sst.item()) <= 1e-12 else float((1.0 - sse / sst).item()),
+        }
+        if float(y_std_t.item()) > 1e-12 and float(p_std_t.item()) > 1e-12:
+            corr = (y_centered * p_centered).mean() / (y_std_t * p_std_t)
+            out['corr'] = float(corr.item())
+        else:
+            out['corr'] = float('nan')
+        denom = (p_centered ** 2).sum()
+        if float(denom.item()) > 1e-12:
+            slope = (p_centered * y_centered).sum() / denom
+            intercept = yt_mean_t - slope * yp_mean_t
+            out['slope'] = float(slope.item())
+            out['intercept'] = float(intercept.item())
+        else:
+            out['slope'] = float('nan')
+            out['intercept'] = float('nan')
+        return out
+
+    @staticmethod
     def _macro_forecast_r2(df_macro: Optional[pd.DataFrame]) -> Dict[str, float]:
         """
-        计算宏观预测(FC1 proxy)与实现值(realized)的 R^2。
+        计算宏观 law consistency / forecast fit 诊断。
         兼容列名：realized(Hatc/LnK), forecast(hatcf/lnkf 或 Hatcf/LnKF)。
         """
         if df_macro is None or df_macro.empty:
@@ -190,18 +277,6 @@ class Episode:
                 if c in df.columns:
                     return c
             return None
-
-        def _safe_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-            mask = np.isfinite(y_true) & np.isfinite(y_pred)
-            if mask.sum() < 2:
-                return float('nan')
-            yt = y_true[mask]
-            yp = y_pred[mask]
-            sst = float(np.sum((yt - yt.mean()) ** 2))
-            if sst <= 1e-12:
-                return float('nan')
-            sse = float(np.sum((yt - yp) ** 2))
-            return 1.0 - sse / sst
 
         use_df = df_macro
         hatc_true_col = _pick_col(use_df, ['Hatc', 'hatc'])
@@ -214,33 +289,49 @@ class Episode:
 
         out: Dict[str, float] = {'n_t': float(len(use_df)), 'n_obs': float(len(use_df))}
         if hatc_pred_col is not None:
-            out['r2_hatc'] = _safe_r2(
+            hatc_stats = Episode._macro_fit_stats_np(
                 use_df[hatc_true_col].to_numpy(),
                 use_df[hatc_pred_col].to_numpy()
             )
+            out.update({f"{k}_hatc": v for k, v in hatc_stats.items() if k != 'n_obs'})
             if 'branch' in use_df.columns:
                 by_branch_hatc: Dict[str, float] = {}
                 for br, grp in use_df.groupby('branch'):
                     key = f"{int(br)}" if float(br).is_integer() else str(br)
-                    by_branch_hatc[key] = _safe_r2(
+                    by_branch_hatc[key] = Episode._macro_fit_stats_np(
                         grp[hatc_true_col].to_numpy(),
                         grp[hatc_pred_col].to_numpy()
-                    )
+                    ).get('r2', float('nan'))
                 out['r2_hatc_by_branch'] = by_branch_hatc
+                branch_mask = use_df['branch'].isin([0, 1])
+                if branch_mask.any():
+                    hatc_b01 = Episode._macro_fit_stats_np(
+                        use_df.loc[branch_mask, hatc_true_col].to_numpy(),
+                        use_df.loc[branch_mask, hatc_pred_col].to_numpy()
+                    )
+                    out.update({f"{k}_hatc_branch01": v for k, v in hatc_b01.items() if k != 'n_obs'})
         if lnk_pred_col is not None:
-            out['r2_lnk'] = _safe_r2(
+            lnk_stats = Episode._macro_fit_stats_np(
                 use_df[lnk_true_col].to_numpy(),
                 use_df[lnk_pred_col].to_numpy()
             )
+            out.update({f"{k}_lnk": v for k, v in lnk_stats.items() if k != 'n_obs'})
             if 'branch' in use_df.columns:
                 by_branch_lnk: Dict[str, float] = {}
                 for br, grp in use_df.groupby('branch'):
                     key = f"{int(br)}" if float(br).is_integer() else str(br)
-                    by_branch_lnk[key] = _safe_r2(
+                    by_branch_lnk[key] = Episode._macro_fit_stats_np(
                         grp[lnk_true_col].to_numpy(),
                         grp[lnk_pred_col].to_numpy()
-                    )
+                    ).get('r2', float('nan'))
                 out['r2_lnk_by_branch'] = by_branch_lnk
+                branch_mask = use_df['branch'].isin([0, 1])
+                if branch_mask.any():
+                    lnk_b01 = Episode._macro_fit_stats_np(
+                        use_df.loc[branch_mask, lnk_true_col].to_numpy(),
+                        use_df.loc[branch_mask, lnk_pred_col].to_numpy()
+                    )
+                    out.update({f"{k}_lnk_branch01": v for k, v in lnk_b01.items() if k != 'n_obs'})
         if 'branch' in use_df.columns:
             out['n_obs_by_branch'] = {
                 (f"{int(br)}" if float(br).is_integer() else str(br)): float(len(grp))
@@ -251,7 +342,7 @@ class Episode:
     @staticmethod
     def _macro_forecast_r2_tensor(macro_table: Optional[TensorTable]) -> Dict[str, float]:
         """
-        tensor 版本宏观 R² 诊断，避免训练前 DataFrame 依赖。
+        tensor 版本宏观 law consistency / forecast fit 诊断。
         """
         if macro_table is None or macro_table.data.numel() == 0:
             return {}
@@ -265,24 +356,14 @@ class Episode:
         p_hatc = data[:, col['hatcf']]
         p_lnk = data[:, col['lnkf']]
 
-        def _safe_r2_t(yt: torch.Tensor, yp: torch.Tensor) -> float:
-            mask = torch.isfinite(yt) & torch.isfinite(yp)
-            if int(mask.sum().item()) < 2:
-                return float('nan')
-            yt = yt[mask]
-            yp = yp[mask]
-            sst = ((yt - yt.mean()) ** 2).sum()
-            if float(sst.item()) <= 1e-12:
-                return float('nan')
-            sse = ((yt - yp) ** 2).sum()
-            return float((1.0 - sse / sst).item())
-
         out: Dict[str, Any] = {
             'n_t': float(data.shape[0]),
             'n_obs': float(data.shape[0]),
-            'r2_hatc': _safe_r2_t(y_hatc, p_hatc),
-            'r2_lnk': _safe_r2_t(y_lnk, p_lnk),
         }
+        hatc_stats = Episode._macro_fit_stats_t(y_hatc, p_hatc)
+        lnk_stats = Episode._macro_fit_stats_t(y_lnk, p_lnk)
+        out.update({f"{k}_hatc": v for k, v in hatc_stats.items() if k != 'n_obs'})
+        out.update({f"{k}_lnk": v for k, v in lnk_stats.items() if k != 'n_obs'})
         if 'branch' in col:
             br = data[:, col['branch']].long()
             br_vals = torch.unique(br)
@@ -292,12 +373,18 @@ class Episode:
             for b in br_vals:
                 mk = br == b
                 key = f"{int(b.item())}"
-                r2_hatc_by_branch[key] = _safe_r2_t(y_hatc[mk], p_hatc[mk])
-                r2_lnk_by_branch[key] = _safe_r2_t(y_lnk[mk], p_lnk[mk])
+                r2_hatc_by_branch[key] = Episode._macro_fit_stats_t(y_hatc[mk], p_hatc[mk]).get('r2', float('nan'))
+                r2_lnk_by_branch[key] = Episode._macro_fit_stats_t(y_lnk[mk], p_lnk[mk]).get('r2', float('nan'))
                 n_obs_by_branch[key] = float(mk.sum().item())
             out['r2_hatc_by_branch'] = r2_hatc_by_branch
             out['r2_lnk_by_branch'] = r2_lnk_by_branch
             out['n_obs_by_branch'] = n_obs_by_branch
+            mk01 = (br == 0) | (br == 1)
+            if int(mk01.sum().item()) >= 2:
+                hatc_b01 = Episode._macro_fit_stats_t(y_hatc[mk01], p_hatc[mk01])
+                lnk_b01 = Episode._macro_fit_stats_t(y_lnk[mk01], p_lnk[mk01])
+                out.update({f"{k}_hatc_branch01": v for k, v in hatc_b01.items() if k != 'n_obs'})
+                out.update({f"{k}_lnk_branch01": v for k, v in lnk_b01.items() if k != 'n_obs'})
         return out
 
     def _use_tensor_pipeline(self) -> bool:
@@ -3565,10 +3652,18 @@ class Episode:
 
         if macro_r2_diag:
             logger.info(
-                "Macro R2 before SDF recon | n_t=%.0f, R2(Hatc)=%.6f, R2(LnK)=%.6f",
+                "Macro law consistency before SDF recon | n_t=%.0f, "
+                "Hatc[R2=%.6f,corr=%.6f,slope=%.6f,stdr=%.6f], "
+                "LnK[R2=%.6f,corr=%.6f,slope=%.6f,stdr=%.6f]",
                 macro_r2_diag.get('n_t', float('nan')),
                 macro_r2_diag.get('r2_hatc', float('nan')),
+                macro_r2_diag.get('corr_hatc', float('nan')),
+                macro_r2_diag.get('slope_hatc', float('nan')),
+                macro_r2_diag.get('std_ratio_hatc', float('nan')),
                 macro_r2_diag.get('r2_lnk', float('nan')),
+                macro_r2_diag.get('corr_lnk', float('nan')),
+                macro_r2_diag.get('slope_lnk', float('nan')),
+                macro_r2_diag.get('std_ratio_lnk', float('nan')),
             )
             module_summaries['macro_diag_before_sdf2'] = macro_r2_diag
 
