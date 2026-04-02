@@ -936,6 +936,56 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
         fig.savefig(save_path, dpi=150)
         plt.close(fig)
 
+    def _plot_x_response(
+        x_vals: np.ndarray,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        title: str,
+        ylabel: str,
+        save_path: Path,
+    ) -> None:
+        mask = np.isfinite(x_vals) & np.isfinite(y_true) & np.isfinite(y_pred)
+        if mask.sum() < 5:
+            return
+        x = x_vals[mask]
+        yt = y_true[mask]
+        yp = y_pred[mask]
+        order = np.argsort(x)
+        x = x[order]
+        yt = yt[order]
+        yp = yp[order]
+        if len(x) >= 20:
+            bins = min(20, max(5, len(x) // 200))
+            edges = np.quantile(x, np.linspace(0.0, 1.0, bins + 1))
+            x_mid = []
+            yt_mid = []
+            yp_mid = []
+            for lo, hi in zip(edges[:-1], edges[1:]):
+                if hi <= lo:
+                    continue
+                mk = (x >= lo) & (x <= hi if hi == edges[-1] else x < hi)
+                if mk.sum() < 3:
+                    continue
+                x_mid.append(float(x[mk].mean()))
+                yt_mid.append(float(yt[mk].mean()))
+                yp_mid.append(float(yp[mk].mean()))
+            if len(x_mid) >= 3:
+                x = np.asarray(x_mid)
+                yt = np.asarray(yt_mid)
+                yp = np.asarray(yp_mid)
+
+        fig, ax = plt.subplots(figsize=(6.2, 4.2))
+        ax.plot(x, yt, color="tab:blue", linewidth=2.0, label="Hatc true")
+        ax.plot(x, yp, color="tab:orange", linewidth=2.0, linestyle="--", label="hatcf pred")
+        ax.set_title(title)
+        ax.set_xlabel("x")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+
     figs_dir = base_dir / "experiments" / "figs"
     use_df = df_macro
     branch_arr = use_df["branch"].to_numpy() if "branch" in use_df.columns else None
@@ -975,6 +1025,40 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
             branch_vals=branch_arr,
             stats_text=stats_hatc,
         )
+        if "branch" in use_df.columns:
+            branch01_df = use_df[use_df["branch"].isin([0, 1])]
+            if len(branch01_df) >= 2:
+                branch01_stats = _fit_stats(
+                    branch01_df[hatc_true_col].to_numpy(),
+                    branch01_df[hatc_pred_col].to_numpy(),
+                )
+                stats_hatc_b01 = None
+                if branch01_stats:
+                    stats_hatc_b01 = (
+                        f"R2={branch01_stats.get('r2', float('nan')):.4f} | "
+                        f"corr={branch01_stats.get('corr', float('nan')):.4f} | "
+                        f"slope={branch01_stats.get('slope', float('nan')):.4f} | "
+                        f"stdr={branch01_stats.get('std_ratio', float('nan')):.4f}"
+                    )
+                _plot_scatter_with_identity(
+                    branch01_df[hatc_true_col].to_numpy(),
+                    branch01_df[hatc_pred_col].to_numpy(),
+                    f"EP{ep} Hatc pred vs true (branch 0/1)",
+                    "Hatc true",
+                    "Hatc pred",
+                    figs_dir / f"ep{ep}_macro_hatc_branch01.png",
+                    branch_vals=branch01_df["branch"].to_numpy(),
+                    stats_text=stats_hatc_b01,
+                )
+        if "x" in use_df.columns:
+            _plot_x_response(
+                use_df["x"].to_numpy(),
+                use_df[hatc_true_col].to_numpy(),
+                use_df[hatc_pred_col].to_numpy(),
+                f"EP{ep} x response: Hatc true vs hatcf pred",
+                "macro consumption object",
+                figs_dir / f"ep{ep}_macro_hatc_vs_x.png",
+            )
 
     if lnk_pred_col is not None:
         title_lnk = f"EP{ep} LnK pred vs true"
@@ -996,6 +1080,40 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
             branch_vals=branch_arr,
             stats_text=stats_lnk,
         )
+        if "branch" in use_df.columns:
+            branch01_df = use_df[use_df["branch"].isin([0, 1])]
+            if len(branch01_df) >= 2:
+                branch01_stats = _fit_stats(
+                    branch01_df[lnk_true_col].to_numpy(),
+                    branch01_df[lnk_pred_col].to_numpy(),
+                )
+                stats_lnk_b01 = None
+                if branch01_stats:
+                    stats_lnk_b01 = (
+                        f"R2={branch01_stats.get('r2', float('nan')):.4f} | "
+                        f"corr={branch01_stats.get('corr', float('nan')):.4f} | "
+                        f"slope={branch01_stats.get('slope', float('nan')):.4f} | "
+                        f"stdr={branch01_stats.get('std_ratio', float('nan')):.4f}"
+                    )
+                _plot_scatter_with_identity(
+                    branch01_df[lnk_true_col].to_numpy(),
+                    branch01_df[lnk_pred_col].to_numpy(),
+                    f"EP{ep} LnK pred vs true (branch 0/1)",
+                    "LnK true",
+                    "LnK pred",
+                    figs_dir / f"ep{ep}_macro_lnk_branch01.png",
+                    branch_vals=branch01_df["branch"].to_numpy(),
+                    stats_text=stats_lnk_b01,
+                )
+        if "x" in use_df.columns:
+            _plot_x_response(
+                use_df["x"].to_numpy(),
+                use_df[lnk_true_col].to_numpy(),
+                use_df[lnk_pred_col].to_numpy(),
+                f"EP{ep} x response: LnK true vs lnkf pred",
+                "macro capital object",
+                figs_dir / f"ep{ep}_macro_lnk_vs_x.png",
+            )
 
     # Delta 图仍按 t 聚合均值构造，但使用全样本口径（不筛 branch）
     if "t" not in use_df.columns:
