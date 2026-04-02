@@ -882,7 +882,8 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
         xlabel: str,
         ylabel: str,
         save_path: Path,
-        branch_vals: np.ndarray | None = None
+        branch_vals: np.ndarray | None = None,
+        stats_text: str | None = None,
     ) -> None:
         mask = np.isfinite(x_true) & np.isfinite(y_pred)
         if mask.sum() < 2:
@@ -899,7 +900,7 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
         pad = 0.05 * (hi - lo)
         lo -= pad
         hi += pad
-        plt.figure(figsize=(5, 5))
+        fig, ax = plt.subplots(figsize=(6.2, 6.0))
         if b is not None and len(b) == len(x):
             unique_branch = sorted(pd.unique(pd.Series(b).dropna()))
             if unique_branch:
@@ -910,7 +911,7 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
                         br_label = f"branch={int(br)}" if float(br).is_integer() else f"branch={br}"
                         if np.isfinite(br_r2):
                             br_label += f" (R2={br_r2:.4f})"
-                        plt.scatter(
+                        ax.scatter(
                             x[br_mask],
                             y[br_mask],
                             s=9,
@@ -919,19 +920,21 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
                             label=br_label
                         )
             else:
-                plt.scatter(x, y, s=8, alpha=0.25, edgecolors="none", label="samples")
+                ax.scatter(x, y, s=8, alpha=0.25, edgecolors="none", label="samples")
         else:
-            plt.scatter(x, y, s=8, alpha=0.25, edgecolors="none", label="samples")
-        plt.plot([lo, hi], [lo, hi], "r--", linewidth=1.5, label="y=x")
-        plt.xlim(lo, hi)
-        plt.ylim(lo, hi)
-        plt.xlabel(xlabel)
-        plt.ylabel(ylabel)
-        plt.title(title)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=150)
-        plt.close()
+            ax.scatter(x, y, s=8, alpha=0.25, edgecolors="none", label="samples")
+        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.5, label="y=x")
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        if stats_text:
+            fig.text(0.5, 0.93, stats_text, ha="center", va="top", fontsize=9)
+        ax.legend(loc="upper left", frameon=True)
+        fig.tight_layout(rect=[0, 0, 1, 0.90 if stats_text else 0.96])
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
 
     figs_dir = base_dir / "experiments" / "figs"
     use_df = df_macro
@@ -954,12 +957,13 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
 
     if hatc_pred_col is not None:
         title_hatc = f"EP{ep} Hatc pred vs true"
+        stats_hatc = None
         if hatc_stats:
-            title_hatc += (
-                f" (R2={hatc_stats.get('r2', float('nan')):.4f}, "
-                f"corr={hatc_stats.get('corr', float('nan')):.4f}, "
-                f"slope={hatc_stats.get('slope', float('nan')):.4f}, "
-                f"stdr={hatc_stats.get('std_ratio', float('nan')):.4f})"
+            stats_hatc = (
+                f"R2={hatc_stats.get('r2', float('nan')):.4f} | "
+                f"corr={hatc_stats.get('corr', float('nan')):.4f} | "
+                f"slope={hatc_stats.get('slope', float('nan')):.4f} | "
+                f"stdr={hatc_stats.get('std_ratio', float('nan')):.4f}"
             )
         _plot_scatter_with_identity(
             use_df[hatc_true_col].to_numpy(),
@@ -968,17 +972,19 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
             "Hatc true",
             "Hatc pred",
             figs_dir / f"ep{ep}_macro_hatc.png",
-            branch_vals=branch_arr
+            branch_vals=branch_arr,
+            stats_text=stats_hatc,
         )
 
     if lnk_pred_col is not None:
         title_lnk = f"EP{ep} LnK pred vs true"
+        stats_lnk = None
         if lnk_stats:
-            title_lnk += (
-                f" (R2={lnk_stats.get('r2', float('nan')):.4f}, "
-                f"corr={lnk_stats.get('corr', float('nan')):.4f}, "
-                f"slope={lnk_stats.get('slope', float('nan')):.4f}, "
-                f"stdr={lnk_stats.get('std_ratio', float('nan')):.4f})"
+            stats_lnk = (
+                f"R2={lnk_stats.get('r2', float('nan')):.4f} | "
+                f"corr={lnk_stats.get('corr', float('nan')):.4f} | "
+                f"slope={lnk_stats.get('slope', float('nan')):.4f} | "
+                f"stdr={lnk_stats.get('std_ratio', float('nan')):.4f}"
             )
         _plot_scatter_with_identity(
             use_df[lnk_true_col].to_numpy(),
@@ -987,7 +993,8 @@ def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
             "LnK true",
             "LnK pred",
             figs_dir / f"ep{ep}_macro_lnk.png",
-            branch_vals=branch_arr
+            branch_vals=branch_arr,
+            stats_text=stats_lnk,
         )
 
     # Delta 图仍按 t 聚合均值构造，但使用全样本口径（不筛 branch）
