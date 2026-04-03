@@ -451,6 +451,7 @@ def main():
             "module_summaries": ep_summary,
             "gpu_memory": summary.get("gpu_memory", {})
         })
+        plot_outer_drift(summaries, resolve_base_dir(run_root, ROOT) / "experiments" / "figs")
         print(
             f"[Episode {ep}] mode={episode_mode} "
             f"batch_size={hyperparams.batch_size} "

@@ -266,6 +266,7 @@ def main():
         plot_macro_series(ep, episode.df_macro, get_base_dir())
 
         summaries.append(ep_summary)
+        plot_outer_drift(summaries, get_base_dir() / "experiments" / "figs")
         print(f"Episode {ep} ({episode_mode}) done: {ep_summary}")
 
     print("All episodes done.")
