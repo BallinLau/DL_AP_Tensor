@@ -226,8 +226,6 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         ],
         dim=1,
     ).to(torch.float32)
-    state["hatc_curr"] = Hatc.detach()
-    state["lnk_curr"] = LnK.detach()
 
     K_total = torch.zeros(n_paths, device=device)
     C_total = torch.zeros(n_paths, device=device)
@@ -255,6 +253,8 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         ],
         dim=1,
     ).to(torch.float32)
+    state["hatc_curr"] = Hatc.detach()
+    state["lnk_curr"] = LnK.detach()
 
     full_bar_i = torch.zeros_like(state["b"])
     full_bar_z = torch.zeros_like(state["b"])
