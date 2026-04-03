@@ -48,26 +48,6 @@ class SimulateTS:
         'n_firms', 'M', 'x', 'hatcf', 'lnkf'
     ]
 
-    @staticmethod
-    def _fc1_summary_from_state_tensor(state: Dict, device: torch.device) -> torch.Tensor:
-        b = state['b'].reshape(-1).to(device=device, dtype=torch.float32)
-        z = state['z'].reshape(-1).to(device=device, dtype=torch.float32)
-        alive = state.get('alive')
-        if alive is not None:
-            mask = alive.reshape(-1).bool()
-            if mask.numel() == b.numel() and mask.any():
-                b = b[mask]
-                z = z[mask]
-        if b.numel() == 0:
-            return torch.zeros(1, 4, device=device, dtype=torch.float32)
-        b_std = b.std(unbiased=False) if b.numel() > 1 else torch.tensor(0.0, device=device)
-        z_std = z.std(unbiased=False) if z.numel() > 1 else torch.tensor(0.0, device=device)
-        return torch.tensor(
-            [[b.mean().item(), b_std.item(), z.mean().item(), z_std.item()]],
-            device=device,
-            dtype=torch.float32,
-        )
-
     def __init__(
         self,
         models: Dict,
@@ -683,9 +663,8 @@ class SimulateTS:
                 new_state['K'] = k_prev.clone()
 
             if 'sdf_fc1' in self.models and self.models['sdf_fc1'] is not None:
-                summary_prev = self._fc1_summary_from_state_tensor(state, device)
                 hatcf, lnkf, M = self._predict_macro_fc1_tensor(
-                    state['x'], new_state['x'], state['hatcf'], state['lnkf'], summary_prev=summary_prev
+                    state['x'], new_state['x'], state['hatcf'], state['lnkf']
                 )
                 new_state['hatcf'] = hatcf
                 new_state['lnkf'] = lnkf
@@ -780,9 +759,8 @@ class SimulateTS:
             
             # 使用 FC1 更新宏观 proxy
             if 'sdf_fc1' in self.models and self.models['sdf_fc1'] is not None:
-                summary_prev = self._fc1_summary_from_state_tensor(state, device)
                 hatcf, lnkf = self._predict_macro_fc1(
-                    state['x'], new_state['x'], state['hatcf'], state['lnkf'], summary_prev=summary_prev
+                    state['x'], new_state['x'], state['hatcf'], state['lnkf']
                 )
                 new_state['hatcf'] = hatcf
                 new_state['lnkf'] = lnkf
@@ -792,7 +770,6 @@ class SimulateTS:
                     x_curr=torch.tensor([new_state['x']], device=device, dtype=torch.float32),
                     hatcf_prev=torch.tensor([state['hatcf']], device=device, dtype=torch.float32),
                     lnkf_prev=torch.tensor([state['lnkf']], device=device, dtype=torch.float32),
-                    summary_prev=summary_prev,
                     return_physical=True
                 )
                 new_state['M'] = M.squeeze().item()
@@ -815,8 +792,7 @@ class SimulateTS:
         x_t: float, 
         x_t1: float, 
         hatcf_t: float, 
-        lnkf_t: float,
-        summary_prev: Optional[torch.Tensor] = None,
+        lnkf_t: float
     ) -> Tuple[float, float]:
         """
         使用 FC1 预测下期宏观状态
@@ -829,7 +805,7 @@ class SimulateTS:
                 device=self.device,
                 dtype=torch.float32
             )
-            hatcf_t1, lnkf_t1 = model.forward_fc1(fc1_input, summary_prev=summary_prev, return_physical=True)
+            hatcf_t1, lnkf_t1 = model.forward_fc1(fc1_input, return_physical=True)
         
         return hatcf_t1.item(), lnkf_t1.item()
 
@@ -838,8 +814,7 @@ class SimulateTS:
         x_t: torch.Tensor,
         x_t1: torch.Tensor,
         hatcf_t: torch.Tensor,
-        lnkf_t: torch.Tensor,
-        summary_prev: Optional[torch.Tensor] = None,
+        lnkf_t: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         使用 FC1 预测下期宏观状态（全 tensor 版本）。
@@ -851,7 +826,6 @@ class SimulateTS:
                 x_curr=x_t1.reshape(1).to(dtype=torch.float32, device=self.device),
                 hatcf_prev=hatcf_t.reshape(1).to(dtype=torch.float32, device=self.device),
                 lnkf_prev=lnkf_t.reshape(1).to(dtype=torch.float32, device=self.device),
-                summary_prev=summary_prev,
                 return_physical=True
             )
         return hatcf_t1.reshape(()), lnkf_t1.reshape(()), M.reshape(())

@@ -147,7 +147,6 @@ class Episode:
         self._latest_p0_terms = {}
         self._latest_pi_terms = {}
         self._latest_q_terms = {}
-        self._latest_fc2_terms = {}
         self._sdf_base_lr_backup = None
         self._current_epoch_idx = 0
         self._q_only_stage = False
@@ -482,143 +481,12 @@ class Episode:
         valid = (pos < sorted_keys.numel()) & (sorted_keys[pos_clamped] == parent_keys)
         return valid, sorted_child_idx[pos_clamped]
 
-    @staticmethod
-    def _fc1_summary_cols() -> List[str]:
-        return ['fc1_b_mean_t', 'fc1_b_std_t', 'fc1_z_mean_t', 'fc1_z_std_t']
-
-    @staticmethod
-    def _summarize_bz_block_t(b_vals: torch.Tensor, z_vals: torch.Tensor) -> torch.Tensor:
-        b = b_vals.reshape(-1).to(torch.float32)
-        z = z_vals.reshape(-1).to(torch.float32)
-        mask = torch.isfinite(b) & torch.isfinite(z)
-        if mask.sum().item() == 0:
-            return torch.zeros(4, device=b_vals.device, dtype=torch.float32)
-        b = b[mask]
-        z = z[mask]
-        b_std = b.std(unbiased=False) if b.numel() > 1 else torch.zeros((), device=b.device)
-        z_std = z.std(unbiased=False) if z.numel() > 1 else torch.zeros((), device=z.device)
-        return torch.stack([b.mean(), b_std, z.mean(), z_std]).to(torch.float32)
-
-    def _attach_fc1_summary_to_sdf_tensor(self, sdf_table: TensorTable, firm_table: Optional[TensorTable]) -> TensorTable:
-        if all(name in sdf_table.columns for name in self._fc1_summary_cols()):
-            return sdf_table
-        if firm_table is None or sdf_table.data.numel() == 0:
-            cols = list(sdf_table.columns)
-            for name in self._fc1_summary_cols():
-                if name not in cols:
-                    cols.append(name)
-            if len(cols) == len(sdf_table.columns):
-                return sdf_table
-            zeros = torch.zeros((sdf_table.data.shape[0], 4), device=sdf_table.data.device, dtype=sdf_table.data.dtype)
-            return TensorTable(data=torch.cat([sdf_table.data, zeros], dim=1), columns=cols)
-
-        data = firm_table.data
-        col = {name: i for i, name in enumerate(firm_table.columns)}
-        required = ['path', 'branch', 'b', 'z']
-        if any(k not in col for k in required):
-            return self._attach_fc1_summary_to_sdf_tensor(sdf_table, None)
-
-        path = data[:, col['path']].long()
-        branch = data[:, col['branch']].long()
-        parent_branch = -1 if int(branch.min().item()) < 0 else 0
-        parent_mask = branch == parent_branch
-        if parent_mask.sum().item() == 0:
-            return self._attach_fc1_summary_to_sdf_tensor(sdf_table, None)
-
-        t_parent = data[:, col['t']].long() if ('t' in col and parent_branch < 0) else torch.zeros_like(path)
-        path_p = path[parent_mask]
-        t_p = t_parent[parent_mask]
-        b_p = data[parent_mask, col['b']]
-        z_p = data[parent_mask, col['z']]
-        key_max_t = int(torch.cat([t_p, torch.zeros(1, device=t_p.device, dtype=t_p.dtype)]).max().item()) + 2 if t_p.numel() > 0 else 2
-        keys = self._encode_int_keys(path_p, torch.zeros_like(path_p), t_p, max_id=1, max_t=key_max_t)
-        order = torch.argsort(keys)
-        keys = keys[order]
-        b_p = b_p[order]
-        z_p = z_p[order]
-
-        unique_keys = []
-        summaries = []
-        start = 0
-        while start < keys.numel():
-            end = start + 1
-            while end < keys.numel() and keys[end] == keys[start]:
-                end += 1
-            unique_keys.append(keys[start])
-            summaries.append(self._summarize_bz_block_t(b_p[start:end], z_p[start:end]))
-            start = end
-
-        summary_keys = torch.stack(unique_keys) if unique_keys else torch.empty((0,), device=data.device, dtype=torch.long)
-        summary_vals = torch.stack(summaries, dim=0) if summaries else torch.empty((0, 4), device=data.device, dtype=torch.float32)
-
-        sdf_data = sdf_table.data
-        sdf_col = {name: i for i, name in enumerate(sdf_table.columns)}
-        sdf_path = sdf_data[:, sdf_col['path']].long()
-        sdf_t_parent = (sdf_data[:, sdf_col['t']].long() - 1) if 't' in sdf_col else torch.zeros_like(sdf_path)
-        sdf_keys = self._encode_int_keys(sdf_path, torch.zeros_like(sdf_path), sdf_t_parent, max_id=1, max_t=key_max_t)
-        summary_idx = torch.arange(summary_keys.shape[0], device=sdf_keys.device, dtype=torch.long)
-        valid, matched_idx = self._match_keys(sdf_keys, summary_keys, summary_idx)
-        out_summary = torch.zeros((sdf_keys.shape[0], 4), device=sdf_data.device, dtype=torch.float32)
-        if valid.any():
-            out_summary[valid] = summary_vals[matched_idx[valid]]
-        return TensorTable(
-            data=torch.cat([sdf_data, out_summary.to(dtype=sdf_data.dtype)], dim=1),
-            columns=list(sdf_table.columns) + self._fc1_summary_cols()
-        )
-
-    def _attach_fc1_summary_to_sdf_df(self, df_sdf: pd.DataFrame, df_firm: Optional[pd.DataFrame]) -> pd.DataFrame:
-        if df_sdf is None or df_sdf.empty:
-            return df_sdf
-        if all(name in df_sdf.columns for name in self._fc1_summary_cols()):
-            return df_sdf
-        if df_firm is None or df_firm.empty:
-            out = df_sdf.copy()
-            for name in self._fc1_summary_cols():
-                out[name] = 0.0
-            return out
-
-        firm = df_firm.copy()
-        parent_branch = -1 if 'branch' in firm.columns and firm['branch'].min() < 0 else 0
-        firm = firm[firm['branch'] == parent_branch].copy()
-        if firm.empty:
-            out = df_sdf.copy()
-            for name in self._fc1_summary_cols():
-                out[name] = 0.0
-            return out
-
-        group_keys = ['path']
-        if 't' in firm.columns and parent_branch < 0:
-            group_keys.append('t')
-        summary = (
-            firm.groupby(group_keys)
-            .agg(
-                fc1_b_mean_t=('b', 'mean'),
-                fc1_b_std_t=('b', lambda x: float(np.nan_to_num(np.nanstd(np.asarray(x, dtype=float), ddof=0), nan=0.0))),
-                fc1_z_mean_t=('z', 'mean'),
-                fc1_z_std_t=('z', lambda x: float(np.nan_to_num(np.nanstd(np.asarray(x, dtype=float), ddof=0), nan=0.0))),
-            )
-            .reset_index()
-        )
-
-        out = df_sdf.copy()
-        if 't' in out.columns and 't' in summary.columns:
-            out['t_parent'] = pd.to_numeric(out['t'], errors='coerce') - 1
-            summary = summary.rename(columns={'t': 't_parent'})
-            out = out.merge(summary, on=['path', 't_parent'], how='left')
-            out = out.drop(columns=['t_parent'])
-        else:
-            out = out.merge(summary, on=['path'], how='left')
-        for name in self._fc1_summary_cols():
-            out[name] = out[name].fillna(0.0)
-        return out
-
     def _build_batches_from_parent_children(
         self,
         parent: torch.Tensor,
         children: List[torch.Tensor],
         batch_size: int,
-        eta_resample: bool = True,
-        fc1_summary_prev: Optional[torch.Tensor] = None,
+        eta_resample: bool = True
     ) -> List[Dict[str, torch.Tensor]]:
         if parent is None or parent.numel() == 0:
             return []
@@ -664,8 +532,6 @@ class Episode:
                 'child0': children[0][idx] if len(children) > 0 else None,
                 'child1': children[1][idx] if len(children) > 1 else None
             }
-            if fc1_summary_prev is not None:
-                batch['fc1_summary_prev'] = fc1_summary_prev[idx]
             batches.append(batch)
         return batches
 
@@ -845,9 +711,7 @@ class Episode:
 
         unique_keys = torch.unique(key)
         parent_rows: List[torch.Tensor] = []
-        summary_rows: List[torch.Tensor] = []
         child_rows: List[List[torch.Tensor]] = [[] for _ in range(n_branches)]
-        summary_cols = [col[name] for name in self._fc1_summary_cols() if name in col]
 
         for gk in unique_keys:
             gm = key == gk
@@ -884,10 +748,6 @@ class Episode:
                     x_t, hatcf_t, lnkf_t
                 ])
             parent_rows.append(p)
-            if len(summary_cols) == len(self._fc1_summary_cols()):
-                summary_rows.append(group_children[0][summary_cols].to(torch.float32))
-            else:
-                summary_rows.append(torch.zeros(4, device=self.device, dtype=torch.float32))
 
             for k in range(n_branches):
                 x_t1 = group_children[k][col['x_t1']]
@@ -921,15 +781,8 @@ class Episode:
         if not parent_rows:
             return []
         parent = torch.stack(parent_rows, dim=0).to(torch.float32)
-        fc1_summary_prev = torch.stack(summary_rows, dim=0).to(torch.float32)
         children = [torch.stack(rows, dim=0).to(torch.float32) for rows in child_rows]
-        return self._build_batches_from_parent_children(
-            parent,
-            children,
-            batch_size=batch_size,
-            eta_resample=False,
-            fc1_summary_prev=fc1_summary_prev,
-        )
+        return self._build_batches_from_parent_children(parent, children, batch_size=batch_size, eta_resample=False)
     
     def _init_weight_scheduler(self) -> LossWeightScheduler:
         """
@@ -1780,7 +1633,6 @@ class Episode:
                 
                 fc2_loss = self._compute_fc2_loss(batch)
                 losses['fc2'] = fc2_loss.item()
-                losses.update(self._latest_fc2_terms)
                 total_loss = total_loss + self.weight_scheduler['fc2'] * fc2_loss
             
             losses['total'] = total_loss.item()
@@ -1860,10 +1712,6 @@ class Episode:
             parent.shape[1] >= 9 and
             getattr(self.hyperparams, "fc1_use_true_macro_state_in_stage2", True)
         )
-        use_fc1_summary = bool(getattr(self.hyperparams, "fc1_use_cross_section_summary", False))
-        fc1_summary_prev = batch.get('fc1_summary_prev')
-        if not use_fc1_summary:
-            fc1_summary_prev = None
         if self._fc1_teacher_forcing_stage and parent.shape[1] >= 9:
             use_true_prev_macro = True
         c_prev_input = parent[:, 7:8] if use_true_prev_macro else parent[:, 5:6]
@@ -1875,7 +1723,6 @@ class Episode:
             x_curr=children_t[:, :, 4:5],
             hatcf_prev=c_prev_input,
             lnkf_prev=k_prev_input,
-            summary_prev=fc1_summary_prev,
             return_physical=True
         )
         
@@ -2025,7 +1872,6 @@ class Episode:
                     x_curr=children_t[:, :, 4:5],
                     hatcf_prev=hatcf_prev_forecast,
                     lnkf_prev=lnkf_prev_forecast,
-                    summary_prev=fc1_summary_prev,
                     return_physical=True
                 )
                 law_consistency_loss_hatc = (c_children_forecast - hatcf_true).pow(2).mean()
@@ -2926,36 +2772,7 @@ class Episode:
         self._last_fc2_pipe = pipe
         fc2_loss = pipe.loss(model, pv_model)
         if isinstance(fc2_loss, tuple):
-            fc2_value, fc2_outputs = fc2_loss
-            diagnostics = fc2_outputs.get('diagnostics', {}) if isinstance(fc2_outputs, dict) else {}
-            self._latest_fc2_terms = {
-                'fc2_parent_loss': float(diagnostics.get('loss_parent', float('nan'))),
-                'fc2_children_loss': float(diagnostics.get('loss_children', float('nan'))),
-                'fc2_total_loss': float(diagnostics.get('loss_total', float('nan'))),
-                'fc2_hatc_parent_corr': float(diagnostics.get('parent_hatc', {}).get('corr', float('nan'))),
-                'fc2_hatc_parent_slope': float(diagnostics.get('parent_hatc', {}).get('slope', float('nan'))),
-                'fc2_hatc_parent_std_ratio': float(diagnostics.get('parent_hatc', {}).get('std_ratio', float('nan'))),
-                'fc2_hatc_parent_rmse': float(diagnostics.get('parent_hatc', {}).get('rmse_resid', float('nan'))),
-                'fc2_lnk_parent_corr': float(diagnostics.get('parent_lnk', {}).get('corr', float('nan'))),
-                'fc2_lnk_parent_slope': float(diagnostics.get('parent_lnk', {}).get('slope', float('nan'))),
-                'fc2_lnk_parent_std_ratio': float(diagnostics.get('parent_lnk', {}).get('std_ratio', float('nan'))),
-                'fc2_lnk_parent_rmse': float(diagnostics.get('parent_lnk', {}).get('rmse_resid', float('nan'))),
-                'fc2_hatc_children_corr': float(diagnostics.get('children_hatc', {}).get('corr', float('nan'))),
-                'fc2_hatc_children_slope': float(diagnostics.get('children_hatc', {}).get('slope', float('nan'))),
-                'fc2_hatc_children_std_ratio': float(diagnostics.get('children_hatc', {}).get('std_ratio', float('nan'))),
-                'fc2_hatc_children_rmse': float(diagnostics.get('children_hatc', {}).get('rmse_resid', float('nan'))),
-                'fc2_lnk_children_corr': float(diagnostics.get('children_lnk', {}).get('corr', float('nan'))),
-                'fc2_lnk_children_slope': float(diagnostics.get('children_lnk', {}).get('slope', float('nan'))),
-                'fc2_lnk_children_std_ratio': float(diagnostics.get('children_lnk', {}).get('std_ratio', float('nan'))),
-                'fc2_lnk_children_rmse': float(diagnostics.get('children_lnk', {}).get('rmse_resid', float('nan'))),
-            }
-            fc2_loss = fc2_value
-        else:
-            self._latest_fc2_terms = {
-                'fc2_parent_loss': float('nan'),
-                'fc2_children_loss': float('nan'),
-                'fc2_total_loss': float(fc2_loss.detach().item()),
-            }
+            fc2_loss = fc2_loss[0]
         return fc2_loss
     
     def create_batches(
@@ -2996,9 +2813,7 @@ class Episode:
         df_sdf 列要求：x_t, x_t1, Hatcf_t, LnKF_t, path, branch
         """
         parent_rows = []
-        summary_rows = []
         children_rows = [[] for _ in range(n_branches)]
-        summary_names = self._fc1_summary_cols()
 
         if self.add_FC1loss:
             if self.train_mode != '2time' and 't' in df_sdf.columns:
@@ -3026,10 +2841,6 @@ class Episode:
                 if self.add_FC1loss else
                 [0.0, 0.0, 0.0, 0.0, x_t, hatcf_t, lnkf_t]
             )
-            if all(name in group.columns for name in summary_names):
-                summary_rows.append([float(group[name].iloc[0]) for name in summary_names])
-            else:
-                summary_rows.append([0.0, 0.0, 0.0, 0.0])
             for k in range(n_branches):
                 x_t1 = group['x_t1'].loc[group.branch == k].iloc[0]
                 if self.add_FC1loss:
@@ -3045,7 +2856,6 @@ class Episode:
             return []
         
         parent = torch.tensor(parent_rows, device=self.device, dtype=torch.float32)
-        fc1_summary_prev = torch.tensor(summary_rows, device=self.device, dtype=torch.float32)
         children = [
             torch.tensor(rows, device=self.device, dtype=torch.float32)
             for rows in children_rows
@@ -3066,7 +2876,6 @@ class Episode:
                 'child0': children[0][idx] if len(children) > 0 else None,
                 'child1': children[1][idx] if len(children) > 1 else None
             }
-            batch['fc1_summary_prev'] = fc1_summary_prev[idx]
             batches.append(batch)
         
         return batches
@@ -3986,12 +3795,10 @@ class Episode:
 
         if self._use_tensor_pipeline() and self.tensor_macro is not None:
             sdf_table = self._build_sdf_pairs_from_macro_tensor(self.tensor_macro)
-            sdf_table = self._attach_fc1_summary_to_sdf_tensor(sdf_table, self.tensor_firm)
         else:
             if macro_df is None or macro_df.empty:
                 return
             df_macro_sdf = build_sdf_pairs_from_macro_ts(macro_df.copy(), include_hatc_lnk_t1=True)
-            df_macro_sdf = self._attach_fc1_summary_to_sdf_df(df_macro_sdf, self.df)
             sdf_table = TensorTable(
                 data=torch.tensor(df_macro_sdf.values, device=self.device, dtype=torch.float32),
                 columns=list(df_macro_sdf.columns)

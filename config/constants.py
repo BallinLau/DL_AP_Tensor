@@ -86,10 +86,7 @@ class Config:
 
     # SDF & FC1 维度 (INCREASED)
     SDF_HIDDEN_DIMS = [128, 64, 32]
-    SDF_INPUT_DIM = 4
-    FC1_BASE_INPUT_DIM = 4
-    FC1_SUMMARY_DIM = 4    # (b_mean_t, b_std_t, z_mean_t, z_std_t)
-    FC1_INPUT_DIM = FC1_BASE_INPUT_DIM + FC1_SUMMARY_DIM
+    FC1_INPUT_DIM = 4      # (x_{t-1}, x_t, ĉf_{t-1}, ln Kf_{t-1})
     FC1_HIDDEN_DIMS = [64, 32, 16]
     
     # FC2 维度

@@ -25,22 +25,6 @@ MACRO_COLUMNS = [
 ]
 
 
-def _fc1_summary_from_bz(b: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-    b_f = b.to(torch.float32)
-    z_f = z.to(torch.float32)
-    b_std = b_f.std(dim=-1, unbiased=False, keepdim=True) if b_f.shape[-1] > 1 else torch.zeros_like(b_f[..., :1])
-    z_std = z_f.std(dim=-1, unbiased=False, keepdim=True) if z_f.shape[-1] > 1 else torch.zeros_like(z_f[..., :1])
-    return torch.cat(
-        [
-            b_f.mean(dim=-1, keepdim=True),
-            b_std,
-            z_f.mean(dim=-1, keepdim=True),
-            z_std,
-        ],
-        dim=-1,
-    )
-
-
 def build_policy_value_tables_parallel(sample, include_macro: bool = False) -> Tuple[TensorTable, Optional[TensorTable]]:
     if sample.sampling_mode != 'uniform':
         raise NotImplementedError('parallel sample builder currently supports sampling_mode=uniform only')
@@ -107,14 +91,12 @@ def build_policy_value_tables_parallel(sample, include_macro: bool = False) -> T
     ).view(n_paths, branch_num, group_size)
 
     if sample.models.get('sdf_fc1') is not None:
-        summary_prev = _fc1_summary_from_bz(b, z)
         with torch.no_grad():
             _, _, M_t1, hatcf_t1, lnkf_t1 = sample.models['sdf_fc1'].forward_step(
                 x_prev=x_t.unsqueeze(1).expand(n_paths, branch_num).reshape(-1).to(torch.float32),
                 x_curr=x_t1.reshape(-1).to(torch.float32),
                 hatcf_prev=hatcf_t.unsqueeze(1).expand(n_paths, branch_num).reshape(-1).to(torch.float32),
                 lnkf_prev=lnkf_t.unsqueeze(1).expand(n_paths, branch_num).reshape(-1).to(torch.float32),
-                summary_prev=summary_prev.unsqueeze(1).expand(n_paths, branch_num, -1).reshape(-1, summary_prev.shape[-1]),
                 return_physical=True,
             )
         M_branch = M_t1.reshape(n_paths, branch_num)

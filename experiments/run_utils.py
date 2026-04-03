@@ -34,7 +34,7 @@ def _episode_title_prefix(ep: int, tag: Optional[str] = None) -> str:
 def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ckpt_prefix: str | None = None, strict: bool = True):
     models = {
         "sdf_fc1": SDFFC1Combined(
-            sdf_input_dim=Config.SDF_INPUT_DIM,
+            sdf_input_dim=Config.FC1_INPUT_DIM,
             fc1_input_dim=Config.FC1_INPUT_DIM,
             sdf_hidden_dims=Config.SDF_HIDDEN_DIMS,
             fc1_hidden_dims=Config.FC1_HIDDEN_DIMS,
