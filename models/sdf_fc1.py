@@ -330,6 +330,9 @@ class FC1Model(nn.Module):
         if hidden_dims is None:
             hidden_dims = Config.FC1_HIDDEN_DIMS
         
+        self.input_dim = input_dim
+        self.base_input_dim = Config.FC1_BASE_INPUT_DIM
+
         # FC1_C: 直接在物理尺度预测 Δĉf
         self.FC1_C = MLP(
             input_dim=input_dim,
@@ -360,8 +363,17 @@ class FC1Model(nn.Module):
         """
         return None
     
+    def _align_input_dim(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] == self.input_dim:
+            return x
+        if x.shape[-1] > self.input_dim:
+            raise ValueError(f"FC1 input dim {x.shape[-1]} exceeds configured input_dim={self.input_dim}")
+        pad_shape = list(x.shape[:-1]) + [self.input_dim - x.shape[-1]]
+        pad = torch.zeros(*pad_shape, device=x.device, dtype=x.dtype)
+        return torch.cat([x, pad], dim=-1)
+
     def forward(
-        self, 
+        self,
         x: torch.Tensor,
         return_physical: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -376,8 +388,9 @@ class FC1Model(nn.Module):
             hatcf: (batch, 1) - 预测的 ĉf_{t+1}
             lnkf: (batch, 1) - 预测的 ln Kf_{t+1}
         """
-        if x.shape[-1] < 4:
+        if x.shape[-1] < self.base_input_dim:
             raise ValueError("FC1 input must include (x_prev, x_curr, hatcf_prev, lnkf_prev)")
+        x = self._align_input_dim(x)
 
         delta_hatcf = self.FC1_C(x)
         delta_lnkf = self.FC1_K(x)
@@ -452,11 +465,18 @@ class SDFFC1Combined(nn.Module):
         return self.sdf_model.get_M_legacy(w, kf, cf, eps)
     
     def forward_fc1(
-        self, 
+        self,
         x: torch.Tensor,
+        summary_prev: Optional[torch.Tensor] = None,
         return_physical: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """预测宏观状态（输入: x_{t-1}, x_t, ĉf_{t-1}, lnKf_{t-1}）"""
+        if summary_prev is not None:
+            if summary_prev.dim() != x.dim():
+                raise ValueError(
+                    f"summary_prev dim {summary_prev.dim()} must match FC1 input dim {x.dim()}"
+                )
+            x = torch.cat([x, summary_prev], dim=-1)
         return self.fc1_model(x, return_physical)
     
     def fit_fc1_scalers(
@@ -474,6 +494,7 @@ class SDFFC1Combined(nn.Module):
         x_curr: torch.Tensor,
         hatcf_prev: torch.Tensor,
         lnkf_prev: torch.Tensor,
+        summary_prev: Optional[torch.Tensor] = None,
         return_physical: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -507,7 +528,17 @@ class SDFFC1Combined(nn.Module):
 
             fc1_input = torch.cat([x_prev, x_curr, hatcf_prev, lnkf_prev], dim=-1)
             flat = fc1_input.reshape(-1, fc1_input.shape[-1])
-            hatcf_curr, lnkf_curr = self.forward_fc1(flat, return_physical=return_physical)
+            summary_flat = None
+            if summary_prev is not None:
+                summary_prev = to_col(summary_prev)
+                if summary_prev.dim() == 2:
+                    summary_prev = summary_prev.unsqueeze(1).expand(-1, n_children, -1)
+                summary_flat = summary_prev.reshape(-1, summary_prev.shape[-1])
+            hatcf_curr, lnkf_curr = self.forward_fc1(
+                flat,
+                summary_prev=summary_flat,
+                return_physical=return_physical
+            )
             hatcf_curr = hatcf_curr.view(batch, n_children, 1)
             lnkf_curr = lnkf_curr.view(batch, n_children, 1)
 
@@ -533,7 +564,11 @@ class SDFFC1Combined(nn.Module):
 
         # 单分支路径：(batch, 1)
         fc1_input = torch.cat([x_prev, x_curr, hatcf_prev, lnkf_prev], dim=-1)
-        hatcf_curr, lnkf_curr = self.forward_fc1(fc1_input, return_physical=return_physical)
+        hatcf_curr, lnkf_curr = self.forward_fc1(
+            fc1_input,
+            summary_prev=summary_prev,
+            return_physical=return_physical
+        )
 
         w_prev = self.value_model(torch.cat([x_prev, hatcf_prev, lnkf_prev], dim=-1))
         w_curr = self.value_model(torch.cat([x_curr, hatcf_curr, lnkf_curr], dim=-1))

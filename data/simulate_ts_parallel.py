@@ -9,6 +9,32 @@ from .data_utils import sample_ar1, sample_bernoulli, sample_stationary_ar1, sam
 from .tensor_data import TensorSimulationOutput, TensorTable, cat_rows
 
 
+def _fc1_summary_from_state_batched(state: Dict[str, torch.Tensor], device: torch.device) -> torch.Tensor:
+    b = state["b"].to(device=device, dtype=torch.float32)
+    z = state["z"].to(device=device, dtype=torch.float32)
+    alive = state.get("alive")
+    if alive is not None:
+        mask = alive.to(device=device).bool()
+        counts = mask.sum(dim=1, keepdim=True).clamp_min(1)
+        b_mean = (b * mask).sum(dim=1, keepdim=True) / counts
+        z_mean = (z * mask).sum(dim=1, keepdim=True) / counts
+        b_center = torch.where(mask, b - b_mean, torch.zeros_like(b))
+        z_center = torch.where(mask, z - z_mean, torch.zeros_like(z))
+        b_std = torch.sqrt((b_center.pow(2).sum(dim=1, keepdim=True) / counts).clamp_min(0.0))
+        z_std = torch.sqrt((z_center.pow(2).sum(dim=1, keepdim=True) / counts).clamp_min(0.0))
+        zero_mask = (mask.sum(dim=1, keepdim=True) == 0)
+        b_mean = torch.where(zero_mask, torch.zeros_like(b_mean), b_mean)
+        z_mean = torch.where(zero_mask, torch.zeros_like(z_mean), z_mean)
+        b_std = torch.where(zero_mask, torch.zeros_like(b_std), b_std)
+        z_std = torch.where(zero_mask, torch.zeros_like(z_std), z_std)
+    else:
+        b_mean = b.mean(dim=1, keepdim=True)
+        z_mean = z.mean(dim=1, keepdim=True)
+        b_std = b.std(dim=1, keepdim=True, unbiased=False) if b.shape[1] > 1 else torch.zeros_like(b_mean)
+        z_std = z.std(dim=1, keepdim=True, unbiased=False) if z.shape[1] > 1 else torch.zeros_like(z_mean)
+    return torch.cat([b_mean, b_std, z_mean, z_std], dim=1)
+
+
 def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
     """
     Simulate all paths in parallel on device.
@@ -286,12 +312,14 @@ def _expand_branches_batched(sim, state: Dict[str, torch.Tensor]) -> List[Dict[s
             K_next = k_prev.clone()
 
         if sim.models.get("sdf_fc1") is not None:
+            summary_prev = _fc1_summary_from_state_batched(state, device)
             hatcf_next, lnkf_next, M_next = _predict_macro_fc1_batched(
                 sim,
                 state["x"],
                 x_next,
                 state["hatcf"],
                 state["lnkf"],
+                summary_prev=summary_prev,
             )
             hatcf_out = torch.where(alive_any, hatcf_next, state["hatcf"])
             lnkf_out = torch.where(alive_any, lnkf_next, state["lnkf"])
@@ -331,6 +359,7 @@ def _predict_macro_fc1_batched(
     x_t1: torch.Tensor,
     hatcf_t: torch.Tensor,
     lnkf_t: torch.Tensor,
+    summary_prev: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     model = sim.models["sdf_fc1"]
     with torch.no_grad():
@@ -339,6 +368,7 @@ def _predict_macro_fc1_batched(
             x_curr=x_t1.to(device=sim.device, dtype=torch.float32),
             hatcf_prev=hatcf_t.to(device=sim.device, dtype=torch.float32),
             lnkf_prev=lnkf_t.to(device=sim.device, dtype=torch.float32),
+            summary_prev=None if summary_prev is None else summary_prev.to(device=sim.device, dtype=torch.float32),
             return_physical=True,
         )
     return hatcf_t1.reshape(-1), lnkf_t1.reshape(-1), M.reshape(-1)

@@ -60,6 +60,20 @@ class Sample:
         'path', 'firm', 'branch', 'Entry',
         'b', 'z', 'ETA', 'i', 'x', 'Hatcf', 'LnKF', 'M', 'K'
     ]
+
+    @staticmethod
+    def _fc1_summary_from_bz_t(b: torch.Tensor, z: torch.Tensor, device: torch.device) -> torch.Tensor:
+        b_f = b.reshape(-1).to(device=device, dtype=torch.float32)
+        z_f = z.reshape(-1).to(device=device, dtype=torch.float32)
+        if b_f.numel() == 0:
+            return torch.zeros(1, 4, device=device, dtype=torch.float32)
+        b_std = b_f.std(unbiased=False) if b_f.numel() > 1 else torch.tensor(0.0, device=device)
+        z_std = z_f.std(unbiased=False) if z_f.numel() > 1 else torch.tensor(0.0, device=device)
+        return torch.tensor(
+            [[b_f.mean().item(), b_std.item(), z_f.mean().item(), z_std.item()]],
+            device=device,
+            dtype=torch.float32,
+        )
     
     def __init__(
         self,
@@ -304,12 +318,14 @@ class Sample:
                 i_t1 = sample_uniform(self.group_size, 0.0, self.config.I_THRESHOLD, device)
 
                 if 'sdf_fc1' in self.models and self.models['sdf_fc1'] is not None:
+                    summary_prev = self._fc1_summary_from_bz_t(b, z, device)
                     with torch.no_grad():
                         _, _, M_t1, hatcf_t1, lnkf_t1 = self.models['sdf_fc1'].forward_step(
                             x_prev=x_t.reshape(1).to(torch.float32),
                             x_curr=x_t1.reshape(1).to(torch.float32),
                             hatcf_prev=hatcf_t.reshape(1).to(torch.float32),
                             lnkf_prev=lnkf_t.reshape(1).to(torch.float32),
+                            summary_prev=summary_prev,
                             return_physical=True
                         )
                     m_child = M_t1.reshape(()).expand(self.group_size)
@@ -403,6 +419,7 @@ class Sample:
         
         # 记录每个 branch 的 t+1 期宏观状态（用于进入者判断）
         branch_states = {}
+        summary_prev = self._fc1_summary_from_bz_t(b, z, self.device)
         for branch_k in range(self.branch_num):
             x_t1 = sample_ar1(
                 torch.tensor(x_t, device=self.device),
@@ -413,7 +430,9 @@ class Sample:
             
             # FC1 预测宏观状态（如果有模型）
             if 'sdf_fc1' in self.models and self.models['sdf_fc1'] is not None:
-                hatcf_t1, lnkf_t1, M_t1 = self._predict_macro(x_t, x_t1, hatcf_t, lnkf_t)
+                hatcf_t1, lnkf_t1, M_t1 = self._predict_macro(
+                    x_t, x_t1, hatcf_t, lnkf_t, summary_prev=summary_prev
+                )
             else:
                 # 简单演化
                 hatcf_t1 = hatcf_t + np.random.randn() * 0.01
@@ -662,7 +681,8 @@ class Sample:
         x_t: float, 
         x_t1: float, 
         hatcf_t: float, 
-        lnkf_t: float
+        lnkf_t: float,
+        summary_prev: Optional[torch.Tensor] = None,
     ) -> Tuple[float, float, Optional[float]]:
         """
         使用 FC1 预测下期宏观状态
@@ -676,6 +696,7 @@ class Sample:
                 x_curr=torch.tensor([x_t1], device=self.device, dtype=torch.float32),
                 hatcf_prev=torch.tensor([hatcf_t], device=self.device, dtype=torch.float32),
                 lnkf_prev=torch.tensor([lnkf_t], device=self.device, dtype=torch.float32),
+                summary_prev=summary_prev,
                 return_physical=True
             )
         
@@ -739,8 +760,16 @@ class Sample:
                 x_t1 = df.loc[idx, 'x']
                 hatcf_t = df.loc[parent_idx, 'Hatcf']
                 lnkf_t = df.loc[parent_idx, 'LnKF']
+                siblings = df[(df['path'] == path) & (df['branch'] == 0)]
+                summary_prev = self._fc1_summary_from_bz_t(
+                    torch.tensor(siblings['b'].to_numpy(dtype=float), device=self.device),
+                    torch.tensor(siblings['z'].to_numpy(dtype=float), device=self.device),
+                    self.device,
+                )
                 
-                hatcf_t1, lnkf_t1, M_t1 = self._predict_macro(x_t, x_t1, hatcf_t, lnkf_t)
+                hatcf_t1, lnkf_t1, M_t1 = self._predict_macro(
+                    x_t, x_t1, hatcf_t, lnkf_t, summary_prev=summary_prev
+                )
                 
                 df.loc[idx, 'Hatcf'] = hatcf_t1
                 df.loc[idx, 'LnKF'] = lnkf_t1

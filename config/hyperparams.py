@@ -149,6 +149,8 @@ class HyperParams:
     # Stage2 先做若干轮 FC1 teacher forcing 预训练（使用真实 Hatc_t/LnK_t 输入）
     fc1_teacher_forcing_epochs: int = 5
     fc1_teacher_forcing_weight: float = 1.0
+    # 小实验：给 FC1 增加当前横截面 summary（仍保持前馈）
+    fc1_use_cross_section_summary: bool = True
     # 识别实验：只训练 FC1 的 forecast/law consistency，不训练 SDF Euler/moment/anchor。
     # 用来排除 “FC1 结果差是不是被 SDF 目标冲突拖坏”。
     fc1_forecast_only_ablation: bool = False
