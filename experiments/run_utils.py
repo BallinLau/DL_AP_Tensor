@@ -1426,8 +1426,13 @@ def plot_outer_drift(all_summaries, figs_dir: Path) -> None:
     scalar_series: dict[str, list[float]] = {}
     surface_series: dict[str, list[float]] = {}
 
-    for ep_summary in all_summaries:
-        drift = ep_summary.get("outer_drift", {}) if isinstance(ep_summary, dict) else {}
+    for raw_summary in all_summaries:
+        if not isinstance(raw_summary, dict):
+            continue
+        ep_summary = raw_summary.get("module_summaries", raw_summary)
+        if not isinstance(ep_summary, dict):
+            continue
+        drift = ep_summary.get("outer_drift", {})
         for key, value in drift.items():
             if isinstance(value, (int, float, np.floating)):
                 scalar_series.setdefault(key, []).append(float(value))
