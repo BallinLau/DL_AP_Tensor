@@ -29,6 +29,11 @@ from experiments.run_utils import (  # noqa: E402
     build_optimizers,
     build_hyperparams,
     build_policy_ref_state,
+    build_outer_drift_ref_state,
+    compute_macro_moment_summary,
+    compute_macro_outer_drift,
+    compute_policy_surface_snapshot,
+    compute_policy_surface_drift,
     ensure_dirs,
     save_models,
     save_stage_df,
@@ -297,6 +302,9 @@ def main():
 
     summaries = []
     prev_macro_source_df = None
+    prev_macro_df_for_drift = None
+    prev_surface_snapshot = None
+    drift_ref_state = build_outer_drift_ref_state()
     episode = Episode(
             models=models,
             optimizers=optimizers,
@@ -384,8 +392,23 @@ def main():
         if stage_exports:
             ep_summary["policy_stage_exports"] = stage_exports
         materialize_episode_outputs(episode)
+        outer_drift = {}
         if episode.df_macro is not None and not episode.df_macro.empty:
+            outer_drift.update(compute_macro_outer_drift(prev_macro_df_for_drift, episode.df_macro))
+            outer_drift["current_macro_moments"] = compute_macro_moment_summary(episode.df_macro)
             prev_macro_source_df = episode.df_macro.copy()
+            prev_macro_df_for_drift = episode.df_macro.copy()
+        current_surface_snapshot = compute_policy_surface_snapshot(
+            models["policy_value"],
+            device=device,
+            ref_state=drift_ref_state,
+        )
+        surface_drift = compute_policy_surface_drift(prev_surface_snapshot, current_surface_snapshot)
+        if surface_drift:
+            outer_drift["policy_surface_drift"] = surface_drift
+        prev_surface_snapshot = current_surface_snapshot
+        if outer_drift:
+            ep_summary["outer_drift"] = outer_drift
         save_stage_df(ep, episode_mode, resolve_base_dir(run_root, ROOT), episode.df, episode.df_macro, episode.df_sdf)
 
         save_models(models, ep, resolve_base_dir(run_root, ROOT))

@@ -258,6 +258,214 @@ def build_policy_ref_state(df: pd.DataFrame) -> dict:
     }
 
 
+def build_outer_drift_ref_state() -> dict:
+    """
+    Fixed reference state for cross-episode surface drift.
+
+    Use a constant state so drift is not contaminated by episode-specific medians.
+    """
+    return {
+        "eta": 1.0,
+        "i": float(Config.I_THRESHOLD) * 0.5,
+        "x": float(Config.XBAR),
+        "hatcf": -2.0,
+        "lnkf": 4.0,
+    }
+
+
+def _split_parent_child(df_in: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if "branch" not in df_in.columns:
+        return df_in, df_in
+    if (df_in["branch"] < 0).any():
+        parent_mask = df_in["branch"] < 0
+        child_mask = df_in["branch"] >= 0
+    else:
+        parent_mask = df_in["branch"] == 0
+        child_mask = df_in["branch"] > 0
+    return df_in[parent_mask].copy(), df_in[child_mask].copy()
+
+
+def _pick_col(df: pd.DataFrame, candidates) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _binned_x_curve(
+    x_vals: np.ndarray,
+    y_vals: np.ndarray,
+    edges: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    mask = np.isfinite(x_vals) & np.isfinite(y_vals)
+    if mask.sum() < 3:
+        return np.asarray([]), np.asarray([])
+    x = x_vals[mask]
+    y = y_vals[mask]
+    mids = []
+    means = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        if hi <= lo:
+            continue
+        mk = (x >= lo) & (x <= hi if hi == edges[-1] else x < hi)
+        if mk.sum() < 3:
+            continue
+        mids.append(float(x[mk].mean()))
+        means.append(float(y[mk].mean()))
+    return np.asarray(mids), np.asarray(means)
+
+
+def compute_macro_moment_summary(df_macro: pd.DataFrame | None) -> dict:
+    if df_macro is None or df_macro.empty:
+        return {}
+    _, child_df = _split_parent_child(df_macro)
+    use_df = child_df if not child_df.empty else df_macro
+    out: dict[str, float] = {"n_rows": float(len(use_df))}
+    for label, cols in [
+        ("hatc", ["Hatc", "hatc"]),
+        ("lnk", ["LnK", "lnk"]),
+        ("hatcf", ["hatcf", "Hatcf"]),
+        ("lnkf", ["lnkf", "LnKF"]),
+        ("m", ["M"]),
+        ("x", ["x"]),
+    ]:
+        col = _pick_col(use_df, cols)
+        if col is None:
+            continue
+        vals = pd.to_numeric(use_df[col], errors="coerce").to_numpy()
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            continue
+        out[f"{label}_mean"] = float(np.mean(vals))
+        out[f"{label}_std"] = float(np.std(vals))
+    return out
+
+
+def compute_macro_outer_drift(
+    prev_df_macro: pd.DataFrame | None,
+    curr_df_macro: pd.DataFrame | None,
+    n_bins: int = 15,
+) -> dict:
+    if prev_df_macro is None or curr_df_macro is None or prev_df_macro.empty or curr_df_macro.empty:
+        return {}
+
+    prev_parent, prev_child = _split_parent_child(prev_df_macro)
+    curr_parent, curr_child = _split_parent_child(curr_df_macro)
+    prev_use = prev_child if not prev_child.empty else prev_df_macro
+    curr_use = curr_child if not curr_child.empty else curr_df_macro
+
+    out: dict[str, float] = {}
+
+    prev_mom = compute_macro_moment_summary(prev_df_macro)
+    curr_mom = compute_macro_moment_summary(curr_df_macro)
+    for key in set(prev_mom.keys()) & set(curr_mom.keys()):
+        if key.endswith("_mean") or key.endswith("_std"):
+            out[f"delta_{key}"] = float(curr_mom[key] - prev_mom[key])
+            out[f"abs_delta_{key}"] = float(abs(curr_mom[key] - prev_mom[key]))
+
+    x_col_prev = _pick_col(prev_use, ["x"])
+    x_col_curr = _pick_col(curr_use, ["x"])
+    if x_col_prev is None or x_col_curr is None:
+        return out
+
+    x_all = np.concatenate(
+        [
+            pd.to_numeric(prev_use[x_col_prev], errors="coerce").to_numpy(),
+            pd.to_numeric(curr_use[x_col_curr], errors="coerce").to_numpy(),
+        ]
+    )
+    x_all = x_all[np.isfinite(x_all)]
+    if x_all.size < max(10, n_bins):
+        return out
+    edges = np.quantile(x_all, np.linspace(0.0, 1.0, n_bins + 1))
+    edges = np.unique(edges)
+    if edges.size < 4:
+        return out
+
+    for label, cols in [
+        ("hatc_true", ["Hatc", "hatc"]),
+        ("lnk_true", ["LnK", "lnk"]),
+        ("hatc_pred", ["hatcf", "Hatcf"]),
+        ("lnk_pred", ["lnkf", "LnKF"]),
+    ]:
+        prev_col = _pick_col(prev_use, cols)
+        curr_col = _pick_col(curr_use, cols)
+        if prev_col is None or curr_col is None:
+            continue
+        _, prev_curve = _binned_x_curve(
+            pd.to_numeric(prev_use[x_col_prev], errors="coerce").to_numpy(),
+            pd.to_numeric(prev_use[prev_col], errors="coerce").to_numpy(),
+            edges,
+        )
+        _, curr_curve = _binned_x_curve(
+            pd.to_numeric(curr_use[x_col_curr], errors="coerce").to_numpy(),
+            pd.to_numeric(curr_use[curr_col], errors="coerce").to_numpy(),
+            edges,
+        )
+        if prev_curve.size == 0 or curr_curve.size == 0:
+            continue
+        n = min(prev_curve.size, curr_curve.size)
+        diff = curr_curve[:n] - prev_curve[:n]
+        out[f"{label}_x_curve_rmse"] = float(np.sqrt(np.mean(diff ** 2)))
+        out[f"{label}_x_curve_maxabs"] = float(np.max(np.abs(diff)))
+
+    return out
+
+
+def compute_policy_surface_snapshot(
+    pv_model: PolicyValueModel,
+    device: torch.device,
+    ref_state: Optional[dict] = None,
+    grid_points: int = 31,
+) -> dict[str, np.ndarray]:
+    ref = ref_state or build_outer_drift_ref_state()
+    b_grid = torch.linspace(0, 1, grid_points, device=device)
+    z_grid = torch.linspace(-4, 4, grid_points, device=device)
+    B, Z = torch.meshgrid(b_grid, z_grid, indexing="ij")
+    base = torch.stack(
+        [
+            B.reshape(-1),
+            Z.reshape(-1),
+            torch.full_like(B.reshape(-1), ref["eta"]),
+            torch.full_like(B.reshape(-1), ref["i"]),
+            torch.full_like(B.reshape(-1), ref["x"]),
+            torch.full_like(B.reshape(-1), ref["hatcf"]),
+            torch.full_like(B.reshape(-1), ref["lnkf"]),
+        ],
+        dim=1,
+    )
+    with torch.no_grad():
+        out = pv_model(base)
+    shape = B.shape
+    return {
+        "Q": out.Q.reshape(shape).detach().cpu().numpy(),
+        "P": out.P.reshape(shape).detach().cpu().numpy(),
+        "bar_z": out.bar_z.reshape(shape).detach().cpu().numpy(),
+        "bp": out.bp.reshape(shape).detach().cpu().numpy(),
+    }
+
+
+def compute_policy_surface_drift(
+    prev_snapshot: Optional[dict[str, np.ndarray]],
+    curr_snapshot: Optional[dict[str, np.ndarray]],
+) -> dict:
+    if not prev_snapshot or not curr_snapshot:
+        return {}
+    out: dict[str, float] = {}
+    for key in ["Q", "P", "bar_z", "bp"]:
+        if key not in prev_snapshot or key not in curr_snapshot:
+            continue
+        prev_arr = np.asarray(prev_snapshot[key], dtype=float)
+        curr_arr = np.asarray(curr_snapshot[key], dtype=float)
+        if prev_arr.shape != curr_arr.shape or prev_arr.size == 0:
+            continue
+        diff = curr_arr - prev_arr
+        out[f"{key}_mae"] = float(np.mean(np.abs(diff)))
+        out[f"{key}_rmse"] = float(np.sqrt(np.mean(diff ** 2)))
+        out[f"{key}_maxabs"] = float(np.max(np.abs(diff)))
+    return out
+
+
 def _compute_policy_diagnostic_surfaces(
     pv_model: PolicyValueModel,
     sdf_model: SDFFC1Combined | None,
