@@ -45,6 +45,7 @@ from experiments.run_utils import (  # noqa: E402
     plot_surfaces,
     plot_distributions,
     plot_macro_series,
+    plot_outer_drift,
     plot_firm_b_window_distribution,
 )
 
@@ -270,6 +271,7 @@ def main():
     print("All episodes done.")
     print(summaries)
     plot_stage_losses(summaries, get_base_dir() / "experiments" / "figs")
+    plot_outer_drift(summaries, get_base_dir() / "experiments" / "figs")
 
     # 额外模拟一次使用最终模型的数据，并导出以便宏观画图
     final_sim = SimulateTS(

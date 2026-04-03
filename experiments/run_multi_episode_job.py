@@ -41,6 +41,7 @@ from experiments.run_utils import (  # noqa: E402
     plot_bp_diagnostic_curves,
     plot_distributions,
     plot_macro_series,
+    plot_outer_drift,
     plot_firm_b_window_distribution,
 )
 from utils.gpu_monitor import get_monitor, reset_monitor
@@ -465,6 +466,7 @@ def main():
 
     print("All episodes done.")
     print(summaries)
+    plot_outer_drift(summaries, resolve_base_dir(run_root, ROOT) / "experiments" / "figs")
 
     # Save GPU memory monitoring results to JSON
     gpu_monitor = get_monitor()

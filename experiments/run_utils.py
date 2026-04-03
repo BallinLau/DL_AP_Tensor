@@ -1411,3 +1411,90 @@ def plot_firm_b_window_distribution(
     plt.tight_layout()
     plt.savefig(figs_dir / filename, dpi=150)
     plt.close()
+
+
+def plot_outer_drift(all_summaries, figs_dir: Path) -> None:
+    """
+    Plot episode-to-episode outer-drift diagnostics stored in ep_summary["outer_drift"].
+    """
+    if not all_summaries:
+        return
+
+    figs_dir.mkdir(parents=True, exist_ok=True)
+    eps = list(range(len(all_summaries)))
+
+    scalar_series: dict[str, list[float]] = {}
+    surface_series: dict[str, list[float]] = {}
+
+    for ep_summary in all_summaries:
+        drift = ep_summary.get("outer_drift", {}) if isinstance(ep_summary, dict) else {}
+        for key, value in drift.items():
+            if isinstance(value, (int, float, np.floating)):
+                scalar_series.setdefault(key, []).append(float(value))
+            elif isinstance(value, dict):
+                target = surface_series if key == "policy_surface_drift" else scalar_series
+                for sub_key, sub_val in value.items():
+                    if isinstance(sub_val, (int, float, np.floating)):
+                        target.setdefault(f"{key}.{sub_key}", []).append(float(sub_val))
+
+    def _plot_group(series: dict[str, list[float]], filename: str, title: str, keys: list[str]) -> None:
+        available = [k for k in keys if k in series]
+        if not available:
+            return
+        plt.figure(figsize=(7, 4.5))
+        for key in available:
+            vals = series[key]
+            padded = vals + [float("nan")] * (len(eps) - len(vals))
+            plt.plot(eps, padded, marker="o", label=key)
+        plt.xlabel("episode")
+        plt.ylabel("drift")
+        plt.title(title)
+        plt.grid(True, alpha=0.25)
+        plt.legend(frameon=False, fontsize=8)
+        plt.tight_layout()
+        plt.savefig(figs_dir / filename, dpi=150)
+        plt.close()
+
+    _plot_group(
+        scalar_series,
+        "outer_drift_macro_moments.png",
+        "Outer Drift: Macro Moment Changes",
+        [
+            "abs_delta_hatc_mean",
+            "abs_delta_hatc_std",
+            "abs_delta_lnk_mean",
+            "abs_delta_lnk_std",
+            "abs_delta_hatcf_mean",
+            "abs_delta_hatcf_std",
+            "abs_delta_lnkf_mean",
+            "abs_delta_lnkf_std",
+            "abs_delta_m_mean",
+            "abs_delta_m_std",
+        ],
+    )
+    _plot_group(
+        scalar_series,
+        "outer_drift_macro_xcurves.png",
+        "Outer Drift: Macro X-Response Curves",
+        [
+            "hatc_true_x_curve_rmse",
+            "hatc_pred_x_curve_rmse",
+            "lnk_true_x_curve_rmse",
+            "lnk_pred_x_curve_rmse",
+        ],
+    )
+    _plot_group(
+        surface_series,
+        "outer_drift_policy_surfaces.png",
+        "Outer Drift: Policy Surface Changes",
+        [
+            "policy_surface_drift.Q_rmse",
+            "policy_surface_drift.P_rmse",
+            "policy_surface_drift.bar_z_rmse",
+            "policy_surface_drift.bp_rmse",
+            "policy_surface_drift.Q_maxabs",
+            "policy_surface_drift.P_maxabs",
+            "policy_surface_drift.bar_z_maxabs",
+            "policy_surface_drift.bp_maxabs",
+        ],
+    )
