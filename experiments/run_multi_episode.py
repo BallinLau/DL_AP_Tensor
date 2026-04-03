@@ -156,6 +156,7 @@ def main():
     summaries = []
     sample_group_size = Config.GROUP_SIZE
     simulate_group_size = Config.SIMULATE_GROUP_SIZE
+    prev_macro_source_df = None
     for ep in range(n_episodes):
         episode = Episode(
             models=models,
@@ -165,6 +166,7 @@ def main():
             device=device,
             episode_id=ep,
         )
+        episode.macro_source_df = prev_macro_source_df
 
         # data settings per episode
         if ep == 0:
@@ -205,6 +207,8 @@ def main():
             **data_kwargs,
         )
         ep_summary = summary.get("module_summaries", summary)
+        if episode.df_macro is not None and not episode.df_macro.empty:
+            prev_macro_source_df = episode.df_macro.copy()
         save_stage_df(ep, episode_mode, get_base_dir(), episode.df, episode.df_macro, episode.df_sdf)
 
         # save models after each episode

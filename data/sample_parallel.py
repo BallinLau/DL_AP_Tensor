@@ -34,15 +34,18 @@ def build_policy_value_tables_parallel(sample, include_macro: bool = False) -> T
     group_size = sample.group_size
     branch_num = sample.branch_num
 
-    x_t = sample_stationary_ar1(n_paths, sample.config.RHO_X, sample.config.SIGMA_X, sample.config.XBAR, device)
+    macro_parent = sample._sample_parent_macro_state(n_paths, device)
+    if macro_parent is not None:
+        x_t, hatcf_t, lnkf_t = macro_parent
+    else:
+        x_t = sample_stationary_ar1(n_paths, sample.config.RHO_X, sample.config.SIGMA_X, sample.config.XBAR, device)
+        hatcf_t, lnkf_t = generate_initial_macro_proxy(n_paths, device)
     b = sample_uniform(n_paths * group_size, 0.0, 1.0, device).view(n_paths, group_size)
     z = sample_stationary_ar1(
         n_paths * group_size, sample.config.RHO_Z, sample.config.SIGMA_Z, sample.config.ZBAR, device
     ).view(n_paths, group_size)
     eta = sample_bernoulli(n_paths * group_size, sample.config.ZETA, device).view(n_paths, group_size)
     i = sample_uniform(n_paths * group_size, 0.0, sample.config.I_THRESHOLD, device).view(n_paths, group_size)
-    hatcf_t, lnkf_t = generate_initial_macro_proxy(n_paths, device)
-
     if sample.data_mode == 'simulate':
         weights = torch.rand(n_paths, group_size, device=device)
         weights = weights / weights.sum(dim=1, keepdim=True).clamp(min=1e-8)

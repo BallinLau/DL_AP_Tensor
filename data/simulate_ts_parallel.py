@@ -102,6 +102,8 @@ def _initialize_batched_state(sim, max_firms: int) -> Dict[str, torch.Tensor]:
         "K": K,
         "hatcf": hatcf,
         "lnkf": lnkf,
+        "hatc_curr": hatcf.clone(),
+        "lnk_curr": lnkf.clone(),
         "M": torch.ones(n_paths, device=device),
         "alive": alive,
         "entry": entry,
@@ -141,6 +143,8 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             ],
             dim=1,
         )
+        state["hatc_curr"] = torch.full((n_paths,), -10.0, device=device)
+        state["lnk_curr"] = torch.full((n_paths,), -10.0, device=device)
         firm_empty = torch.empty((0, len(sim.FIRM_COLUMNS)), device=device, dtype=torch.float32)
         return firm_empty, macro_rows
 
@@ -222,6 +226,8 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         ],
         dim=1,
     ).to(torch.float32)
+    state["hatc_curr"] = Hatc.detach()
+    state["lnk_curr"] = LnK.detach()
 
     K_total = torch.zeros(n_paths, device=device)
     C_total = torch.zeros(n_paths, device=device)
@@ -290,8 +296,8 @@ def _expand_branches_batched(sim, state: Dict[str, torch.Tensor]) -> List[Dict[s
                 sim,
                 state["x"],
                 x_next,
-                state["hatcf"],
-                state["lnkf"],
+                state.get("hatc_curr", state["hatcf"]),
+                state.get("lnk_curr", state["lnkf"]),
             )
             hatcf_out = torch.where(alive_any, hatcf_next, state["hatcf"])
             lnkf_out = torch.where(alive_any, lnkf_next, state["lnkf"])
@@ -312,6 +318,8 @@ def _expand_branches_batched(sim, state: Dict[str, torch.Tensor]) -> List[Dict[s
                 "K": torch.where(active2d, K_next, state["K"]),
                 "hatcf": hatcf_out,
                 "lnkf": lnkf_out,
+                "hatc_curr": state.get("hatc_curr", state["hatcf"]).clone(),
+                "lnk_curr": state.get("lnk_curr", state["lnkf"]).clone(),
                 "M": M_out,
                 "alive": state["alive"].clone(),
                 "entry": torch.zeros_like(state["entry"]),

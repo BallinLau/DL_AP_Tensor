@@ -133,6 +133,7 @@ class Episode:
         self.df = None
         self.df_macro = None
         self.df_sdf = None
+        self.macro_source_df: Optional[pd.DataFrame] = None
         self.tensor_firm: Optional[TensorTable] = None
         self.tensor_macro: Optional[TensorTable] = None
         self.tensor_sdf: Optional[TensorTable] = None
@@ -1475,6 +1476,7 @@ class Episode:
                 n_samples=None,
                 n_paths=n_paths,
                 group_size=group_size,
+                macro_source_df=self.macro_source_df,
                 **kwargs
             )
             self.df = sampler.build_df()
@@ -1857,16 +1859,16 @@ class Episode:
                     + lnk_recon_inner_weight * recon_loss_lnk
                 )
 
-            # 额外加一条 forecast-state 闭环监督：
-            # 用 (Hatcf_t, LnKF_t) 做当前态输入，直接约束下一期预测贴近真实值。
-            # 这条项补上“递推口径”目标，而不仅是 true-state teacher-forcing 口径。
+            # 当前口径统一为：
+            # (x_t, x_{t+1}, Hatc_t, LnK_t) -> (Hatc_{t+1}, LnK_{t+1})
+            # 因此这里的 law consistency 直接使用真实当前 macro state 作为 FC1 输入。
             if (
                 forecast_recon_weight > 0.0
                 and parent.shape[1] >= 7
                 and children_t.shape[-1] >= 9
             ):
-                hatcf_prev_forecast = parent[:, 5:6].detach().clone().requires_grad_(True)
-                lnkf_prev_forecast = parent[:, 6:7].detach().clone().requires_grad_(True)
+                hatcf_prev_forecast = c_prev_input.detach().clone().requires_grad_(True)
+                lnkf_prev_forecast = k_prev_input.detach().clone().requires_grad_(True)
                 _, _, _, c_children_forecast, k_children_forecast = model.forward_step(
                     x_prev=parent[:, 4:5],
                     x_curr=children_t[:, :, 4:5],
@@ -1900,8 +1902,8 @@ class Episode:
                     hatc_x_response_weight * x_response_loss_hatc
                     + lnk_x_response_weight * x_response_loss_lnk
                 )
-                d_hatcf_forecast = c_children_forecast - parent[:, 5:6].unsqueeze(1)
-                d_lnkf_forecast = k_children_forecast - parent[:, 6:7].unsqueeze(1)
+                d_hatcf_forecast = c_children_forecast - c_prev_input.unsqueeze(1)
+                d_lnkf_forecast = k_children_forecast - k_prev_input.unsqueeze(1)
                 delta_penalty_hatc = torch.relu(
                     d_hatcf_forecast.abs() - delta_hatc_abs_max
                 ).pow(2).mean()
@@ -3906,7 +3908,8 @@ class Episode:
                         n_samples=n_samples,
                         n_paths=n_paths,
                         group_size=sample_group_size,
-                        branch_num=n_branches
+                        branch_num=n_branches,
+                        macro_source_df=self.macro_source_df,
                     )
                 else:
                     sampler = None
@@ -3993,7 +3996,8 @@ class Episode:
                         n_samples=n_samples,
                         n_paths=n_paths,
                         group_size=sample_group_size,
-                        branch_num=n_branches
+                        branch_num=n_branches,
+                        macro_source_df=self.macro_source_df,
                     )
                     if tensor_pipeline:
                         self.tensor_firm = sampler.build_policy_value_tensor()

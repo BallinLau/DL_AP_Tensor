@@ -405,6 +405,8 @@ class SimulateTS:
             ],
             dim=0
         ).reshape(1, -1).to(torch.float32)
+        state['hatc_curr'] = Hatc.item()
+        state['lnk_curr'] = LnK.item()
 
         full_bar_i = torch.zeros_like(state['b'])
         full_bar_z = torch.zeros_like(state['b'])
@@ -462,6 +464,8 @@ class SimulateTS:
             'K': K,
             'hatcf': hatcf.item(),
             'lnkf': lnkf.item(),
+            'hatc_curr': hatcf.item(),
+            'lnk_curr': lnkf.item(),
             'M':1,
             'ids': ids,
             'alive': torch.ones(n, dtype=torch.bool, device=device),
@@ -760,7 +764,10 @@ class SimulateTS:
             # 使用 FC1 更新宏观 proxy
             if 'sdf_fc1' in self.models and self.models['sdf_fc1'] is not None:
                 hatcf, lnkf = self._predict_macro_fc1(
-                    state['x'], new_state['x'], state['hatcf'], state['lnkf']
+                    state['x'],
+                    new_state['x'],
+                    state.get('hatc_curr', state['hatcf']),
+                    state.get('lnk_curr', state['lnkf'])
                 )
                 new_state['hatcf'] = hatcf
                 new_state['lnkf'] = lnkf
@@ -768,8 +775,8 @@ class SimulateTS:
                 _, _, M, _, _ = self.models['sdf_fc1'].forward_step(
                     x_prev=torch.tensor([state['x']], device=device, dtype=torch.float32),
                     x_curr=torch.tensor([new_state['x']], device=device, dtype=torch.float32),
-                    hatcf_prev=torch.tensor([state['hatcf']], device=device, dtype=torch.float32),
-                    lnkf_prev=torch.tensor([state['lnkf']], device=device, dtype=torch.float32),
+                    hatcf_prev=torch.tensor([state.get('hatc_curr', state['hatcf'])], device=device, dtype=torch.float32),
+                    lnkf_prev=torch.tensor([state.get('lnk_curr', state['lnkf'])], device=device, dtype=torch.float32),
                     return_physical=True
                 )
                 new_state['M'] = M.squeeze().item()
@@ -777,6 +784,8 @@ class SimulateTS:
                 new_state['hatcf'] = state['hatcf']
                 new_state['lnkf'] = state['lnkf']
                 new_state['M'] = None
+            new_state['hatc_curr'] = state.get('hatc_curr', state['hatcf'])
+            new_state['lnk_curr'] = state.get('lnk_curr', state['lnkf'])
             
             # 复制其他状态
             new_state['ids'] = list(state['ids'])

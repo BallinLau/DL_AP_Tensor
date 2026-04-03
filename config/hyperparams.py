@@ -153,8 +153,9 @@ class HyperParams:
     # 用来排除 “FC1 结果差是不是被 SDF 目标冲突拖坏”。
     fc1_forecast_only_ablation: bool = False
     # 在 stage2/joint 中，若 batch 提供真实 Hatc_t/LnK_t，是否优先用真实当前态驱动 FC1。
-    # 默认关闭，joint 阶段使用 forecast-state 输入以约束递推闭环。
-    fc1_use_true_macro_state_in_stage2: bool = False
+    # 当前默认开启，统一口径为：
+    # [x_t, x_{t+1}, Hatc_t, LnK_t] -> [hatcf_{t+1}, lnkf_{t+1}]
+    fc1_use_true_macro_state_in_stage2: bool = True
     # SDF 矩约束权重（常规阶段）
     sdf_moment_weight: float = 1.0
     # SDF 第一阶段（无 FC1 监督）专用学习率与矩约束权重

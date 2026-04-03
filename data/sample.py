@@ -73,6 +73,7 @@ class Sample:
         sampling_mode: str = 'uniform',
         enable_entry: bool = None,
         entry_rate: float = 0.1,
+        macro_source_df: Optional[pd.DataFrame] = None,
         device: torch.device = None
     ):
         """
@@ -103,6 +104,7 @@ class Sample:
         self.sampling_mode = sampling_mode
         self.entry_rate = entry_rate
         self.device = device or config.DEVICE
+        self.macro_source_df = macro_source_df.copy() if macro_source_df is not None else None
         
         # simulate 模式默认启用 entry
         if enable_entry is None:
@@ -123,6 +125,43 @@ class Sample:
         # 如果指定了 n_samples，调整 n_paths
         if n_samples is not None:
             self.n_paths = n_samples // self.rows_per_path
+
+    def _sample_parent_macro_state(
+        self,
+        n_paths: int,
+        device: Optional[torch.device] = None,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        从上一轮 simulate 的 parent macro 表中抽样当前节点宏观状态。
+
+        返回：
+        - x_t
+        - Hatc_t
+        - LnK_t
+
+        如果当前没有可用的 macro source，则返回 None。
+        """
+        if self.macro_source_df is None or self.macro_source_df.empty:
+            return None
+
+        use_df = self.macro_source_df
+        if 'branch' in use_df.columns:
+            parent_df = use_df[use_df['branch'] == -1]
+            if not parent_df.empty:
+                use_df = parent_df
+
+        required = {'x', 'Hatc', 'LnK'}
+        if not required.issubset(use_df.columns):
+            return None
+
+        n = int(n_paths)
+        replace = len(use_df) < n
+        sampled = use_df.sample(n=n, replace=replace)
+        tgt_device = device or self.device
+        x_t = torch.tensor(sampled['x'].to_numpy(), device=tgt_device, dtype=torch.float32)
+        hatc_t = torch.tensor(sampled['Hatc'].to_numpy(), device=tgt_device, dtype=torch.float32)
+        lnk_t = torch.tensor(sampled['LnK'].to_numpy(), device=tgt_device, dtype=torch.float32)
+        return x_t, hatc_t, lnk_t
     
     def build_df(self) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]:
         """
@@ -223,10 +262,14 @@ class Sample:
         bnum = self.branch_num
         device = self.device
 
-        x_t = sample_stationary_ar1(
-            n_paths, self.config.RHO_X, self.config.SIGMA_X, self.config.XBAR, device
-        )
-        hatcf_t, lnkf_t = generate_initial_macro_proxy(n_paths, device)
+        macro_parent = self._sample_parent_macro_state(n_paths, device)
+        if macro_parent is not None:
+            x_t, hatcf_t, lnkf_t = macro_parent
+        else:
+            x_t = sample_stationary_ar1(
+                n_paths, self.config.RHO_X, self.config.SIGMA_X, self.config.XBAR, device
+            )
+            hatcf_t, lnkf_t = generate_initial_macro_proxy(n_paths, device)
 
         # 每个 path 复制到各个分支
         x_t_rep = x_t.repeat_interleave(bnum)
@@ -374,10 +417,18 @@ class Sample:
         data = []
         
         # Step 1: 生成宏观状态 x_t
-        x_t = sample_stationary_ar1(
-            1, self.config.RHO_X, self.config.SIGMA_X, 
-            self.config.XBAR, self.device
-        ).item()
+        macro_parent = self._sample_parent_macro_state(1, self.device)
+        if macro_parent is not None:
+            x_t = float(macro_parent[0].reshape(-1)[0].item())
+            hatcf_t = float(macro_parent[1].reshape(-1)[0].item())
+            lnkf_t = float(macro_parent[2].reshape(-1)[0].item())
+        else:
+            x_t = sample_stationary_ar1(
+                1, self.config.RHO_X, self.config.SIGMA_X,
+                self.config.XBAR, self.device
+            ).item()
+            hatcf_t_tensor, lnkf_t_tensor = generate_initial_macro_proxy(1, self.device)
+            hatcf_t, lnkf_t = hatcf_t_tensor.item(), lnkf_t_tensor.item()
         
         # Step 2: 生成公司状态
         b, z, eta, i = generate_firm_states(
@@ -386,10 +437,6 @@ class Sample:
             mode=self.sampling_mode,
             device=self.device
         )
-        
-        # Step 3: 生成初始宏观 proxy
-        hatcf_t, lnkf_t = generate_initial_macro_proxy(1, self.device)
-        hatcf_t, lnkf_t = hatcf_t.item(), lnkf_t.item()
         
         # 初始化资本（simulate 模式下用随机资本并用权重聚合）
         if self.data_mode == 'simulate':
@@ -694,14 +741,14 @@ class Sample:
             df_macro_local = df_macro.copy()
             # 兼容不同命名（Hatcf/LnKF 或 Hatc/LnK）
             rename_map = {}
-            if 'Hatcf' in df_macro_local.columns:
-                rename_map['Hatcf'] = 'Hatcf_macro'
-            elif 'Hatc' in df_macro_local.columns:
+            if 'Hatc' in df_macro_local.columns:
                 rename_map['Hatc'] = 'Hatcf_macro'
-            if 'LnKF' in df_macro_local.columns:
-                rename_map['LnKF'] = 'LnKF_macro'
-            elif 'LnK' in df_macro_local.columns:
+            elif 'Hatcf' in df_macro_local.columns:
+                rename_map['Hatcf'] = 'Hatcf_macro'
+            if 'LnK' in df_macro_local.columns:
                 rename_map['LnK'] = 'LnKF_macro'
+            elif 'LnKF' in df_macro_local.columns:
+                rename_map['LnKF'] = 'LnKF_macro'
             df_macro_local = df_macro_local.rename(columns=rename_map)
             # macro 中 parent 为 branch=-1，child 为分支编号；firm parent 为 0，child 为 1,2,...
             df['macro_branch'] = np.where(df['branch'] > 0, df['branch'] - 1, -1)

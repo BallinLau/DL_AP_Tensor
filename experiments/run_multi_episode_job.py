@@ -296,6 +296,7 @@ def main():
     print(f"Final simulation enabled: {int(bool(run_final_sim))}")
 
     summaries = []
+    prev_macro_source_df = None
     episode = Episode(
             models=models,
             optimizers=optimizers,
@@ -307,6 +308,7 @@ def main():
         )
     for ep in range(args.n_episodes):
         episode.episode_id = ep  # update episode ID for logging/saving
+        episode.macro_source_df = prev_macro_source_df
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
 
@@ -382,6 +384,8 @@ def main():
         if stage_exports:
             ep_summary["policy_stage_exports"] = stage_exports
         materialize_episode_outputs(episode)
+        if episode.df_macro is not None and not episode.df_macro.empty:
+            prev_macro_source_df = episode.df_macro.copy()
         save_stage_df(ep, episode_mode, resolve_base_dir(run_root, ROOT), episode.df, episode.df_macro, episode.df_sdf)
 
         save_models(models, ep, resolve_base_dir(run_root, ROOT))
