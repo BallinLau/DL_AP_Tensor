@@ -213,6 +213,10 @@
   - `Episode._run_fc2_epochs()` 改成按 path mini-batches 训练；
   - 新增 `fc2_path_batch_size` 超参数，默认按 `1024` 个 paths 组成一个 FC2 batch；
   - tensor-native FC2 路径会在每个 epoch 内重新按 path 切分 `firm_table / macro_table`，而不是整轮 `15000` 条 paths 一次性建图。
+- 已完成第八刀：
+  - 修正 `FC2LossPipe._update_children_state()` 在 tensor-native 路径下对 `child_state` 的原地写入；
+  - 之前的写法先取 `eta_j = child_state[:, j, 2]` 这个 view，再对同一 `child_state[:, j, 0]` 原地赋值，会触发 backward 的 version mismatch；
+  - 现已改为一次性函数式构造 `new_b` 和新的 `updated_child_state`，避免 inplace autograd 冲突。
 - 已完成最小运行验证：
   - 使用合成 `TensorTable` + dummy `FC2` / `policy_value`，`FC2LossPipe.loss(...)` 可直接跑通；
   - `parent / children` diagnostics 可正常生成；

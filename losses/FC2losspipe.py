@@ -724,7 +724,7 @@ class FC2Pipeline:
         if self.tensor_native:
             children_states_list = []
             for i in range(self.path_num):
-                child_state = self.child_states_list[i].clone()
+                child_state = self.child_states_list[i]
                 masked_b = torch.where(
                     updated_alive[i][..., 0] > 0,
                     self.parent_states_list[i][:, 0],
@@ -735,10 +735,10 @@ class FC2Pipeline:
                     bp[i][..., 0],
                     torch.zeros_like(bp[i][..., 0])
                 )
-                for j in range(self.branch_num):
-                    eta_j = child_state[:, j, 2]
-                    child_state[:, j, 0] = masked_bp * eta_j + masked_b * (1 - eta_j)
-                children_states_list.append(child_state)
+                eta = child_state[:, :, 2]
+                new_b = masked_bp.unsqueeze(-1) * eta + masked_b.unsqueeze(-1) * (1 - eta)
+                updated_child_state = torch.cat([new_b.unsqueeze(-1), child_state[:, :, 1:]], dim=-1)
+                children_states_list.append(updated_child_state)
             return {'children_s_full': children_states_list}
         children_s_full = self.Children_s_full.clone()
         masked_b = torch.where(
