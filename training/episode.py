@@ -3776,7 +3776,6 @@ class Episode:
             fc2_batch = {
                 'firm_table': self.tensor_firm,
                 'macro_table': self.tensor_macro,
-                'full_N': getattr(self.hyperparams, 'fc2_full_n', 1000),
             }
         else:
             if (self.df is None or self.df.empty) and self.tensor_firm is not None:

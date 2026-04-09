@@ -91,14 +91,14 @@
 
 ### B. tensor contract 梳理
 
-- [ ] B1. 明确 `FC2` 训练时直接消费哪些 tensor state。
-- [ ] B2. 明确 parent node tensor view 的 contract：
+- [x] B1. 明确 `FC2` 训练时直接消费哪些 tensor state。
+- [x] B2. 明确 parent node tensor view 的 contract：
   - `b_parent`
   - `z_parent`
   - `x_parent`
   - `K_parent`
   - `alive_parent`
-- [ ] B3. 明确 children node tensor view 的 contract：
+- [x] B3. 明确 children node tensor view 的 contract：
   - `b_child`
   - `z_child`
   - `x_child`
@@ -107,19 +107,20 @@
 
 ### C. `losses/FC2losspipe.py` 拆分（tensor-native）
 
-- [ ] C1. 新增 tensor summary 构造函数：
+- [x] C1. 新增 tensor summary 构造函数：
   - 从 parent tensor view 直接提取 `b/z` quantiles 与 `x`。
-- [ ] C2. 新增 children tensor summary 构造函数：
+- [x] C2. 新增 children tensor summary 构造函数：
   - 从 children tensor view 直接提取 `b/z` quantiles 与 `x`。
 - [ ] C3. 新增 `build_fc2_input_from_summary(...)`。
 - [x] C4. 改写 `build_fc2_input_parent()`：
   - 从 parent tensor summary 构造输入。
 - [x] C5. 改写 `build_fc2_input_children()`：
   - 从 children tensor summary 构造输入。
-- [ ] C6. 去掉 FC2 训练主路径中的：
+- [x] C6. 去掉 FC2 训练主路径中的：
   - `fill_df_to_fullN`
   - `df merge`
   - `_build_tensors()` rebuild tensor
+  - `full_N` padded tensor 作为 FC2 tensor-native 主路径内部表示
 
 ### D. `FC2Pipeline.forward()` 显式分层
 
@@ -195,6 +196,11 @@
   - `Episode` 新增 `_latest_fc2_diag`；
   - `FC2` 的 parent/children diagnostics 已挂到训练日志输出；
   - `py_compile` 再次通过。
+- 已完成第四刀：
+  - `FC2LossPipe` 的 tensor-native 主路径已改成 ragged per-path 表示，不再在 pipe 内部构造 `full_N` padded parent/children tensors；
+  - `policy_value` 在 FC2 loss 中只对真实 parent/child rows 前向，不再对 `n_paths * full_N` 的 padded rows 全量前向；
+  - `episode._run_fc2_epochs()` 的 tensor-native FC2 batch 不再传递 `full_N`；
+  - `full_N` 现在只保留在 df fallback 路径中。
 - 已完成最小运行验证：
   - 使用合成 `TensorTable` + dummy `FC2` / `policy_value`，`FC2LossPipe.loss(...)` 可直接跑通；
   - `parent / children` diagnostics 可正常生成；
