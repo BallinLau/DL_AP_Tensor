@@ -101,10 +101,12 @@ class FC2Pipeline:
         macro_table: Optional[TensorTable] = None,
         full_N=None,
         entry_num=None,
+        pv_chunk_size: int = 50000,
         device='cpu'
     ):
         self.device = torch.device(device)
         self.full_N = full_N
+        self.pv_chunk_size = max(int(pv_chunk_size), 1)
         self.branch_num = 2
         self.phi = Config.PHI
         self.delta = Config.DELTA
@@ -495,7 +497,27 @@ class FC2Pipeline:
             return out_full.reshape(*orig_shape, -1)
 
         if valid.any():
-            out = pv_model(flat[valid])
+            valid_flat = flat[valid]
+            out_chunks = []
+            for start in range(0, valid_flat.shape[0], self.pv_chunk_size):
+                chunk = valid_flat[start:start + self.pv_chunk_size]
+                out_chunks.append(pv_model(chunk))
+            if len(out_chunks) == 1:
+                out = out_chunks[0]
+            else:
+                first = out_chunks[0]
+                if isinstance(first, dict):
+                    out = {
+                        k: torch.cat([chunk[k] for chunk in out_chunks], dim=0)
+                        for k in first.keys()
+                    }
+                elif hasattr(first, "_fields"):
+                    out = first.__class__(**{
+                        k: torch.cat([getattr(chunk, k) for chunk in out_chunks], dim=0)
+                        for k in first._fields
+                    })
+                else:
+                    out = torch.cat(out_chunks, dim=0)
         else:
             out = pv_model(torch.zeros(1, flat.shape[-1], device=flat.device, dtype=flat.dtype))
             def _zero_like(v: torch.Tensor):

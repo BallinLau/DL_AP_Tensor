@@ -201,6 +201,10 @@
   - `policy_value` 在 FC2 loss 中只对真实 parent/child rows 前向，不再对 `n_paths * full_N` 的 padded rows 全量前向；
   - `episode._run_fc2_epochs()` 的 tensor-native FC2 batch 不再传递 `full_N`；
   - `full_N` 现在只保留在 df fallback 路径中。
+- 已完成第五刀：
+  - `FC2LossPipe._pv_forward()` 已支持按 row chunk 分批调用 `policy_value`，避免一次性对全部真实 firms rows 建图；
+  - `Episode._run_fc2_epochs()` 在 FC2 epochs 期间会临时冻结 `policy_value` 参数，并在结束后恢复；
+  - 新增了 `fc2_pv_chunk_size` 与 `fc2_freeze_pv_during_epochs` 两个超参数用于控制 FC2 阶段的显存占用。
 - 已完成最小运行验证：
   - 使用合成 `TensorTable` + dummy `FC2` / `policy_value`，`FC2LossPipe.loss(...)` 可直接跑通；
   - `parent / children` diagnostics 可正常生成；

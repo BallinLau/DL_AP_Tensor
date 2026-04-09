@@ -2761,6 +2761,7 @@ class Episode:
                 macro_table=batch.get('macro_table'),
                 full_N=batch.get('full_N', default_full_n),
                 entry_num=batch.get('entry_num', None),
+                pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 50000),
                 device=self.device,
             )
         elif isinstance(batch, pd.DataFrame):
@@ -2773,6 +2774,7 @@ class Episode:
                 df=df,
                 full_N=full_N,
                 entry_num=entry_num,
+                pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 50000),
                 device=self.device,
             )
         elif isinstance(batch, dict) and 'df' in batch:
@@ -2785,6 +2787,7 @@ class Episode:
                 df=df,
                 full_N=full_N,
                 entry_num=entry_num,
+                pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 50000),
                 device=self.device,
             )
         else:
@@ -3784,19 +3787,27 @@ class Episode:
                 return None
             fc2_batch = self.df
         epoch_losses = []
-        for _ in tqdm(range(n_epochs), desc='FC2 Epochs'):
-            losses = self.train_step(fc2_batch, ['fc2'])
-            epoch_losses.append(losses)
-            if self.step_count % log_interval == 0:
-                avg_loss = np.mean([l['total'] for l in epoch_losses[-log_interval:]])
-                lr = self.lr_schedulers.get('fc2')
-                current_lr = lr.get_lr() if lr else 0
-                logger.info(
-                    "FC2 Step %d: loss=%.6f, lr=%.2e",
-                    self.step_count,
-                    avg_loss,
-                    current_lr
-                )
+        pv_model = self.models.get('policy_value')
+        freeze_pv = bool(getattr(self.hyperparams, 'fc2_freeze_pv_during_epochs', True))
+        if freeze_pv and pv_model is not None:
+            pv_model.freeze()
+        try:
+            for _ in tqdm(range(n_epochs), desc='FC2 Epochs'):
+                losses = self.train_step(fc2_batch, ['fc2'])
+                epoch_losses.append(losses)
+                if self.step_count % log_interval == 0:
+                    avg_loss = np.mean([l['total'] for l in epoch_losses[-log_interval:]])
+                    lr = self.lr_schedulers.get('fc2')
+                    current_lr = lr.get_lr() if lr else 0
+                    logger.info(
+                        "FC2 Step %d: loss=%.6f, lr=%.2e",
+                        self.step_count,
+                        avg_loss,
+                        current_lr
+                    )
+        finally:
+            if freeze_pv and pv_model is not None:
+                pv_model.unfreeze()
         if not epoch_losses:
             return None
         avg_losses = {
