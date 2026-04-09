@@ -148,6 +148,7 @@ class Episode:
         self._latest_p0_terms = {}
         self._latest_pi_terms = {}
         self._latest_q_terms = {}
+        self._latest_fc2_diag = {}
         self._sdf_base_lr_backup = None
         self._current_epoch_idx = 0
         self._q_only_stage = False
@@ -1635,6 +1636,7 @@ class Episode:
                 
                 fc2_loss = self._compute_fc2_loss(batch)
                 losses['fc2'] = fc2_loss.item()
+                losses.update(self._latest_fc2_diag)
                 total_loss = total_loss + self.weight_scheduler['fc2'] * fc2_loss
             
             losses['total'] = total_loss.item()
@@ -2750,31 +2752,68 @@ class Episode:
             return torch.tensor(0.0, device=self.device)
 
         pv_model = self.models['policy_value']
+        default_full_n = getattr(self.hyperparams, 'fc2_full_n', 1000)
+        self._latest_fc2_diag = {}
 
-        if isinstance(batch, pd.DataFrame):
-            df = batch
-            full_N = 1000
+        if isinstance(batch, dict) and 'firm_table' in batch:
+            pipe = FC2LossPipe(
+                firm_table=batch['firm_table'],
+                macro_table=batch.get('macro_table'),
+                full_N=batch.get('full_N', default_full_n),
+                entry_num=batch.get('entry_num', None),
+                device=self.device,
+            )
+        elif isinstance(batch, pd.DataFrame):
+            df = batch.copy()
+            full_N = default_full_n
             entry_num = None
+            if df['branch'].min() < 0:
+                df['branch'] = df['branch'] + 1
+            pipe = FC2LossPipe(
+                df=df,
+                full_N=full_N,
+                entry_num=entry_num,
+                device=self.device,
+            )
         elif isinstance(batch, dict) and 'df' in batch:
-            df = batch['df']
-            full_N = batch.get('full_N', 1000)
+            df = batch['df'].copy()
+            full_N = batch.get('full_N', default_full_n)
             entry_num = batch.get('entry_num', None)
+            if df['branch'].min() < 0:
+                df['branch'] = df['branch'] + 1
+            pipe = FC2LossPipe(
+                df=df,
+                full_N=full_N,
+                entry_num=entry_num,
+                device=self.device,
+            )
         else:
             return torch.tensor(0.0, device=self.device)
-        if df['branch'].min() < 0:
-            df['branch'] = df['branch'] + 1
-
-        pipe = FC2LossPipe(
-            df=df,
-            full_N=full_N,
-            entry_num=entry_num,
-            device=self.device,
-        )
         # keep for inspection/debugging
         self._last_fc2_pipe = pipe
         fc2_loss = pipe.loss(model, pv_model)
         if isinstance(fc2_loss, tuple):
-            fc2_loss = fc2_loss[0]
+            fc2_value, fc2_outputs = fc2_loss
+            self._last_fc2_outputs = fc2_outputs
+            diagnostics = fc2_outputs.get('diagnostics', {}) if isinstance(fc2_outputs, dict) else {}
+            flat_diag: Dict[str, float] = {}
+            for section_name in ('parent_hatc', 'parent_lnk', 'children_hatc', 'children_lnk'):
+                section = diagnostics.get(section_name)
+                if isinstance(section, dict):
+                    prefix = f'fc2_{section_name}'
+                    for k, v in section.items():
+                        try:
+                            flat_diag[f'{prefix}_{k}'] = float(v)
+                        except (TypeError, ValueError):
+                            continue
+            for k in ('loss_parent', 'loss_children', 'loss_total'):
+                if k in diagnostics:
+                    try:
+                        flat_diag[f'fc2_{k}'] = float(diagnostics[k])
+                    except (TypeError, ValueError):
+                        pass
+            self._latest_fc2_diag = flat_diag
+            fc2_loss = fc2_value
         return fc2_loss
     
     def create_batches(
@@ -3731,13 +3770,21 @@ class Episode:
     ) -> Optional[Dict]:
         if 'fc2' not in self.models:
             return None
-        if (self.df is None or self.df.empty) and self.tensor_firm is not None:
-            self.df = self._table_to_dataframe(self.tensor_firm)
-        if self.df is None or self.df.empty:
-            return None
+        if self._use_tensor_pipeline() and self.tensor_firm is not None:
+            fc2_batch = {
+                'firm_table': self.tensor_firm,
+                'macro_table': self.tensor_macro,
+                'full_N': getattr(self.hyperparams, 'fc2_full_n', 1000),
+            }
+        else:
+            if (self.df is None or self.df.empty) and self.tensor_firm is not None:
+                self.df = self._table_to_dataframe(self.tensor_firm)
+            if self.df is None or self.df.empty:
+                return None
+            fc2_batch = self.df
         epoch_losses = []
         for _ in tqdm(range(n_epochs), desc='FC2 Epochs'):
-            losses = self.train_step(self.df, ['fc2'])
+            losses = self.train_step(fc2_batch, ['fc2'])
             epoch_losses.append(losses)
             if self.step_count % log_interval == 0:
                 avg_loss = np.mean([l['total'] for l in epoch_losses[-log_interval:]])
