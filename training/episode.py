@@ -3070,6 +3070,67 @@ class Episode:
             batches.append(df_firm[df_firm['path'].isin(batch_paths)].copy())
         return batches
 
+    def _create_fc2_batches_from_tensor(
+        self,
+        firm_table: TensorTable,
+        macro_table: Optional[TensorTable] = None,
+        batch_size: int = 256,
+        shuffle: bool = True,
+    ) -> List[Dict[str, TensorTable]]:
+        """
+        从 tensor-native simulate 输出创建 FC2 训练批次。
+        batch_size 解释为每个 batch 的 path 数量。
+        """
+        if firm_table is None or len(firm_table) == 0:
+            return []
+
+        firm_cols = {name: i for i, name in enumerate(firm_table.columns)}
+        if 'path' not in firm_cols:
+            return [{'firm_table': firm_table, 'macro_table': macro_table}]
+
+        firm_paths_all = torch.round(firm_table.data[:, firm_cols['path']]).to(torch.long)
+        unique_paths = torch.unique(firm_paths_all, sorted=True)
+        if unique_paths.numel() == 0:
+            return []
+
+        if shuffle and unique_paths.numel() > 1:
+            perm = torch.randperm(unique_paths.numel(), device=unique_paths.device)
+            unique_paths = unique_paths[perm]
+
+        if batch_size is None or batch_size <= 0:
+            batch_size = int(unique_paths.numel())
+
+        macro_cols = {name: i for i, name in enumerate(macro_table.columns)} if macro_table is not None else {}
+        macro_paths_all = None
+        if macro_table is not None and 'path' in macro_cols:
+            macro_paths_all = torch.round(macro_table.data[:, macro_cols['path']]).to(torch.long)
+
+        batches: List[Dict[str, TensorTable]] = []
+        for start in range(0, int(unique_paths.numel()), int(batch_size)):
+            batch_paths = unique_paths[start:start + int(batch_size)]
+            firm_mask = torch.isin(firm_paths_all, batch_paths)
+            if not torch.any(firm_mask):
+                continue
+            firm_batch = TensorTable(
+                data=firm_table.data[firm_mask],
+                columns=list(firm_table.columns),
+            )
+            macro_batch = None
+            if macro_table is not None:
+                if macro_paths_all is None:
+                    macro_batch = macro_table
+                else:
+                    macro_mask = torch.isin(macro_paths_all, batch_paths)
+                    macro_batch = TensorTable(
+                        data=macro_table.data[macro_mask],
+                        columns=list(macro_table.columns),
+                    )
+            batches.append({
+                'firm_table': firm_batch,
+                'macro_table': macro_batch,
+            })
+        return batches
+
     def _get_policy_children(self, batch: Dict[str, torch.Tensor]) -> List[torch.Tensor]:
         """
         统一获取 policy/value 所需 children 列表。
@@ -3775,26 +3836,42 @@ class Episode:
     ) -> Optional[Dict]:
         if 'fc2' not in self.models:
             return None
-        if self._use_tensor_pipeline() and self.tensor_firm is not None:
-            fc2_batch = {
-                'firm_table': self.tensor_firm,
-                'macro_table': self.tensor_macro,
-            }
-        else:
-            if (self.df is None or self.df.empty) and self.tensor_firm is not None:
-                self.df = self._table_to_dataframe(self.tensor_firm)
-            if self.df is None or self.df.empty:
-                return None
-            fc2_batch = self.df
         epoch_losses = []
         pv_model = self.models.get('policy_value')
         freeze_pv = bool(getattr(self.hyperparams, 'fc2_freeze_pv_during_epochs', True))
+        fc2_path_batch_size = int(getattr(self.hyperparams, 'fc2_path_batch_size', 256))
         if freeze_pv and pv_model is not None:
             pv_model.freeze()
         try:
             for _ in tqdm(range(n_epochs), desc='FC2 Epochs'):
-                losses = self.train_step(fc2_batch, ['fc2'])
-                epoch_losses.append(losses)
+                if self._use_tensor_pipeline() and self.tensor_firm is not None:
+                    fc2_batches = self._create_fc2_batches_from_tensor(
+                        firm_table=self.tensor_firm,
+                        macro_table=self.tensor_macro,
+                        batch_size=fc2_path_batch_size,
+                        shuffle=True,
+                    )
+                else:
+                    if (self.df is None or self.df.empty) and self.tensor_firm is not None:
+                        self.df = self._table_to_dataframe(self.tensor_firm)
+                    if self.df is None or self.df.empty:
+                        return None
+                    fc2_batches = self._create_fc2_batches(
+                        self.df,
+                        batch_size=fc2_path_batch_size,
+                    )
+                if not fc2_batches:
+                    return None
+
+                batch_losses = []
+                for fc2_batch in fc2_batches:
+                    losses = self.train_step(fc2_batch, ['fc2'])
+                    batch_losses.append(losses)
+                epoch_loss = {
+                    k: float(np.mean([l[k] for l in batch_losses if k in l]))
+                    for k in batch_losses[0].keys()
+                }
+                epoch_losses.append(epoch_loss)
                 if self.step_count % log_interval == 0:
                     avg_loss = np.mean([l['total'] for l in epoch_losses[-log_interval:]])
                     lr = self.lr_schedulers.get('fc2')

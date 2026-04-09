@@ -153,6 +153,7 @@
 - [x] F3. 去掉 `full_N = 1000` 的硬编码，改为从 config / hyperparams 读取。
 - [x] F4. 保留 `self._last_fc2_pipe`，同时新增 `self._last_fc2_outputs`，便于调试。
 - [x] F5. 保证训练日志能读到结构化的 parent/children diagnostics。
+- [x] F6. `FC2` epochs 改成按 path mini-batches 训练，不再每个 epoch 对整轮 paths 一次性建图。
 
 ### G. 验证
 
@@ -208,6 +209,10 @@
 - 已完成第六刀：
   - 修正 tensor-native ragged parent/children 分支，确保其 `policy_value` 调用也走 `_pv_forward()` 的 chunked 路径，而不是直接整批 `pv_model(...)`；
   - 将 `fc2_pv_chunk_size` 的默认值从 `50000` 下调到 `10000`，降低 80G 训练时的峰值显存。
+- 已完成第七刀：
+  - `Episode._run_fc2_epochs()` 改成按 path mini-batches 训练；
+  - 新增 `fc2_path_batch_size` 超参数，默认按 `1024` 个 paths 组成一个 FC2 batch；
+  - tensor-native FC2 路径会在每个 epoch 内重新按 path 切分 `firm_table / macro_table`，而不是整轮 `15000` 条 paths 一次性建图。
 - 已完成最小运行验证：
   - 使用合成 `TensorTable` + dummy `FC2` / `policy_value`，`FC2LossPipe.loss(...)` 可直接跑通；
   - `parent / children` diagnostics 可正常生成；
