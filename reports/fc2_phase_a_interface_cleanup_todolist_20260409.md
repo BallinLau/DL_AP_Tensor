@@ -205,6 +205,9 @@
   - `FC2LossPipe._pv_forward()` 已支持按 row chunk 分批调用 `policy_value`，避免一次性对全部真实 firms rows 建图；
   - `Episode._run_fc2_epochs()` 在 FC2 epochs 期间会临时冻结 `policy_value` 参数，并在结束后恢复；
   - 新增了 `fc2_pv_chunk_size` 与 `fc2_freeze_pv_during_epochs` 两个超参数用于控制 FC2 阶段的显存占用。
+- 已完成第六刀：
+  - 修正 tensor-native ragged parent/children 分支，确保其 `policy_value` 调用也走 `_pv_forward()` 的 chunked 路径，而不是直接整批 `pv_model(...)`；
+  - 将 `fc2_pv_chunk_size` 的默认值从 `50000` 下调到 `10000`，降低 80G 训练时的峰值显存。
 - 已完成最小运行验证：
   - 使用合成 `TensorTable` + dummy `FC2` / `policy_value`，`FC2LossPipe.loss(...)` 可直接跑通；
   - `parent / children` diagnostics 可正常生成；

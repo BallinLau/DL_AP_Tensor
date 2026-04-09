@@ -2761,7 +2761,7 @@ class Episode:
                 macro_table=batch.get('macro_table'),
                 full_N=batch.get('full_N', default_full_n),
                 entry_num=batch.get('entry_num', None),
-                pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 50000),
+                pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 10000),
                 device=self.device,
             )
         elif isinstance(batch, pd.DataFrame):
@@ -2774,7 +2774,7 @@ class Episode:
                 df=df,
                 full_N=full_N,
                 entry_num=entry_num,
-                pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 50000),
+                pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 10000),
                 device=self.device,
             )
         elif isinstance(batch, dict) and 'df' in batch:
@@ -2787,7 +2787,7 @@ class Episode:
                 df=df,
                 full_N=full_N,
                 entry_num=entry_num,
-                pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 50000),
+                pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 10000),
                 device=self.device,
             )
         else:

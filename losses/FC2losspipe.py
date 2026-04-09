@@ -101,7 +101,7 @@ class FC2Pipeline:
         macro_table: Optional[TensorTable] = None,
         full_N=None,
         entry_num=None,
-        pv_chunk_size: int = 50000,
+        pv_chunk_size: int = 10000,
         device='cpu'
     ):
         self.device = torch.device(device)
@@ -575,7 +575,7 @@ class FC2Pipeline:
                     'gathered': gathered,
                 }
 
-            PV_output = pv_model(PV_input)
+            PV_output = self._pv_forward(pv_model, PV_input)
             bar_z_flat = self._get_out(PV_output, 'bar_z', 6)
             bar_i_flat = self._get_out(PV_output, 'bar_i', 5)
             bp_flat = self._get_out(PV_output, 'bp', 9)
@@ -799,7 +799,7 @@ class FC2Pipeline:
                     'alive_mask_children': zero_child,
                     'gathered': gathered,
                 }
-            CV_output = pv_model(CV_input)
+            CV_output = self._pv_forward(pv_model, CV_input)
             bar_z_flat = self._get_out(CV_output, 'bar_z', 6)
             bar_i_flat = self._get_out(CV_output, 'bar_i', 5)
             alive_prob_children = bar_z_flat.clamp(0, 1)

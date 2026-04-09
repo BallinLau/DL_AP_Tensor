@@ -42,7 +42,7 @@ class HyperParams:
     fc2_weight_decay: float = 1e-4
     fc2_as_main_macro_state: bool = False
     fc2_freeze_pv_during_epochs: bool = True
-    fc2_pv_chunk_size: int = 50000
+    fc2_pv_chunk_size: int = 10000
     
     # ========== 学习率调度 ==========
     lr_scheduler_factor: float = 0.5
