@@ -3713,6 +3713,7 @@ class Episode:
         simulate_kwargs: Dict
     ) -> None:
         sim_kwargs = dict(simulate_kwargs)
+        sim_kwargs.setdefault('fc2_as_main_macro_state', getattr(self.hyperparams, 'fc2_as_main_macro_state', False))
         simulator = SimulateTS(
             models=self.models,
             config=self.config,
@@ -3736,6 +3737,7 @@ class Episode:
         export_df: bool = False
     ) -> None:
         sim_kwargs = dict(simulate_kwargs)
+        sim_kwargs.setdefault('fc2_as_main_macro_state', getattr(self.hyperparams, 'fc2_as_main_macro_state', False))
         simulator = SimulateTS(
             models=self.models,
             config=self.config,

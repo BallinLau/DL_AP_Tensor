@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         help="Train sdf_fc1 in forecast-only identification mode: disable Euler/moment/anchor and update only FC1 forecast heads.",
     )
     parser.add_argument(
+        "--fc2-as-main-macro-state",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="When enabled, use FC2 as the node-level main macro state generator on the tensor recursive path.",
+    )
+    parser.add_argument(
         "--final-sim",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -140,6 +146,8 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.simulate_horizon = args.simulate_horizon
     if args.fc1_forecast_only_ablation is not None:
         hyperparams.fc1_forecast_only_ablation = bool(args.fc1_forecast_only_ablation)
+    if args.fc2_as_main_macro_state is not None:
+        hyperparams.fc2_as_main_macro_state = bool(args.fc2_as_main_macro_state)
     if args.q_only_ablation:
         q_only_epochs = max(100, int(hyperparams.epochs))
         hyperparams.q_stage_epochs = q_only_epochs

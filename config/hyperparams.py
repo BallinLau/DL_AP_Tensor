@@ -40,6 +40,7 @@ class HyperParams:
     # FC2
     fc2_lr: float = 1e-4
     fc2_weight_decay: float = 1e-4
+    fc2_as_main_macro_state: bool = False
     
     # ========== 学习率调度 ==========
     lr_scheduler_factor: float = 0.5

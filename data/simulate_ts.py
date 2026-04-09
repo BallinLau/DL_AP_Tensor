@@ -59,6 +59,7 @@ class SimulateTS:
         main_branch: int = 0,
         enable_entry: bool = True,
         enable_exit: bool = True,
+        fc2_as_main_macro_state: bool = False,
         device: torch.device = None
     ):
         """
@@ -88,6 +89,7 @@ class SimulateTS:
         self.main_branch = main_branch
         self.enable_entry = enable_entry
         self.enable_exit = enable_exit
+        self.fc2_as_main_macro_state = fc2_as_main_macro_state
         self.device = device or config.DEVICE
         
         # 设置模型为 eval 模式

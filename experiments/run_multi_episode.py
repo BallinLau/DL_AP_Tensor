@@ -144,6 +144,12 @@ def main():
         default=None,
         help="Train sdf_fc1 in forecast-only identification mode: disable Euler/moment/anchor and update only FC1 forecast heads.",
     )
+    parser.add_argument(
+        "--fc2-as-main-macro-state",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="When enabled, use FC2 as the node-level main macro state generator on the tensor recursive path.",
+    )
     args = parser.parse_args()
 
     global RUN_ROOT
@@ -156,6 +162,8 @@ def main():
     hyperparams = build_hyperparams()
     if args.fc1_forecast_only_ablation is not None:
         hyperparams.fc1_forecast_only_ablation = bool(args.fc1_forecast_only_ablation)
+    if args.fc2_as_main_macro_state is not None:
+        hyperparams.fc2_as_main_macro_state = bool(args.fc2_as_main_macro_state)
     models = build_models(device)
     optimizers = build_optimizers(models, hyperparams)
 

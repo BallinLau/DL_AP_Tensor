@@ -118,6 +118,11 @@ def _initialize_batched_state(sim, max_firms: int) -> Dict[str, torch.Tensor]:
 def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     device = sim.device
     n_paths, n_firms = state["b"].shape
+    if getattr(sim, "fc2_as_main_macro_state", False) and sim.models.get("fc2") is not None:
+        hatcf_fc2, lnkf_fc2 = _predict_macro_fc2_batched(sim, state)
+        alive_any_paths = state["alive"].any(dim=1)
+        state["hatcf"] = torch.where(alive_any_paths, hatcf_fc2, state["hatcf"])
+        state["lnkf"] = torch.where(alive_any_paths, lnkf_fc2, state["lnkf"])
     alive = state["alive"]
     alive_flat = alive.reshape(-1)
     alive_pos = torch.nonzero(alive_flat, as_tuple=False).squeeze(-1)
@@ -350,6 +355,34 @@ def _predict_macro_fc1_batched(
             return_physical=True,
         )
     return hatcf_t1.reshape(-1), lnkf_t1.reshape(-1), M.reshape(-1)
+
+
+def _build_fc2_node_inputs_batched(sim, state: Dict[str, torch.Tensor]) -> torch.Tensor:
+    device = sim.device
+    n_paths = state["b"].shape[0]
+    quantiles = torch.linspace(0, 1, steps=100, device=device)
+    phi = torch.zeros((n_paths, 201), dtype=torch.float32, device=device)
+    alive = state["alive"]
+    for i in range(n_paths):
+        mask = alive[i]
+        if bool(mask.any()):
+            b_vals = state["b"][i, mask].to(torch.float32)
+            z_vals = state["z"][i, mask].to(torch.float32)
+            phi[i, :100] = torch.quantile(b_vals, quantiles)
+            phi[i, 100:200] = torch.quantile(z_vals, quantiles)
+        phi[i, 200] = state["x"][i].to(torch.float32)
+    return phi
+
+
+def _predict_macro_fc2_batched(
+    sim,
+    state: Dict[str, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    model = sim.models["fc2"]
+    phi = _build_fc2_node_inputs_batched(sim, state)
+    with torch.no_grad():
+        out = model(phi)
+    return out["hatc"].reshape(-1), out["lnk"].reshape(-1)
 
 
 def _apply_exit_batched(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
