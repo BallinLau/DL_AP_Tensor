@@ -150,6 +150,12 @@ def main():
         default=None,
         help="When enabled, use FC2 as the node-level main macro state generator on the tensor recursive path.",
     )
+    parser.add_argument(
+        "--fc2-supervised-pretrain-only",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run only FC2 supervised pretrain and skip FC2 closure finetune.",
+    )
     args = parser.parse_args()
 
     global RUN_ROOT
@@ -164,6 +170,8 @@ def main():
         hyperparams.fc1_forecast_only_ablation = bool(args.fc1_forecast_only_ablation)
     if args.fc2_as_main_macro_state is not None:
         hyperparams.fc2_as_main_macro_state = bool(args.fc2_as_main_macro_state)
+    if args.fc2_supervised_pretrain_only is not None:
+        hyperparams.fc2_supervised_pretrain_only = bool(args.fc2_supervised_pretrain_only)
     models = build_models(device)
     optimizers = build_optimizers(models, hyperparams)
 

@@ -167,6 +167,25 @@ class FC2Pipeline:
             quantiles=self.quantiles,
         )
 
+    def _safe_single_quantile_features(self, vals: torch.Tensor) -> torch.Tensor:
+        if vals.numel() == 0:
+            return torch.zeros((self.quantiles.numel(),), dtype=torch.float32, device=self.device)
+        return torch.quantile(vals.to(torch.float32), self.quantiles)
+
+    def _build_dual_fc2_input(
+        self,
+        b_vals: torch.Tensor,
+        z_vals: torch.Tensor,
+        k_vals: torch.Tensor,
+        x_vals: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        shared = torch.zeros((201,), dtype=torch.float32, device=self.device)
+        shared[:200] = self._safe_quantile_features(b_vals, z_vals)
+        if x_vals.numel() > 0:
+            shared[200] = x_vals.to(torch.float32).mean()
+        lnk = torch.cat([shared, self._safe_single_quantile_features(k_vals)], dim=0)
+        return {'hatc': shared, 'lnk': lnk}
+
     def _select_fc2_window(
         self,
         rows: torch.Tensor,
@@ -432,62 +451,66 @@ class FC2Pipeline:
         self.child_present_mask = child_present_mask
 
     def build_fc2_input_parent(self):
+        return self.build_fc2_input_parent_dual()['hatc']
+
+    def build_fc2_input_parent_dual(self) -> Dict[str, torch.Tensor]:
         if self.tensor_native:
-            FC2_input_parent = torch.zeros((self.path_num, 201), dtype=torch.float32, device=self.device)
+            FC2_input_parent_hatc = torch.zeros((self.path_num, 201), dtype=torch.float32, device=self.device)
+            FC2_input_parent_lnk = torch.zeros((self.path_num, 201 + self.quantiles.numel()), dtype=torch.float32, device=self.device)
             for i in range(self.path_num):
                 alive_i = self.parent_alive_list[i]
                 b_vals = self.parent_states_list[i][alive_i, 0]
                 z_vals = self.parent_states_list[i][alive_i, 1]
-                quantile_features = self._safe_quantile_features(b_vals, z_vals)
-                if alive_i.any():
-                    x_feature = self.parent_states_list[i][alive_i, 4].mean().unsqueeze(0)
-                else:
-                    x_feature = torch.zeros((1,), dtype=torch.float32, device=self.device)
-                FC2_input_parent[i, :200] = quantile_features
-                FC2_input_parent[i, 200] = x_feature
-            return FC2_input_parent
-        FC2_input_parent = torch.zeros((self.path_num, 201), dtype=torch.float32, device=self.device)
+                k_vals = self.parent_K_list[i][alive_i, 0]
+                x_vals = self.parent_states_list[i][alive_i, 4]
+                inputs_i = self._build_dual_fc2_input(b_vals, z_vals, k_vals, x_vals)
+                FC2_input_parent_hatc[i] = inputs_i['hatc']
+                FC2_input_parent_lnk[i] = inputs_i['lnk']
+            return {'hatc': FC2_input_parent_hatc, 'lnk': FC2_input_parent_lnk}
+        FC2_input_parent_hatc = torch.zeros((self.path_num, 201), dtype=torch.float32, device=self.device)
+        FC2_input_parent_lnk = torch.zeros((self.path_num, 201 + self.quantiles.numel()), dtype=torch.float32, device=self.device)
         for i in range(self.path_num):
-            b_vals = self.P_s_full[i, self.alive_mask[i], 0]
-            z_vals = self.P_s_full[i, self.alive_mask[i], 1]
-            quantile_features = self._safe_quantile_features(b_vals, z_vals)
-            if self.alive_mask[i].any():
-                x_feature = self.P_s_full[i, self.alive_mask[i], 4].mean().unsqueeze(0)
-            else:
-                x_feature = torch.zeros((1,), dtype=torch.float32, device=self.device)
-            FC2_input_parent[i, :200] = quantile_features
-            FC2_input_parent[i, 200] = x_feature
-        return FC2_input_parent
+            alive_i = self.alive_mask[i]
+            b_vals = self.P_s_full[i, alive_i, 0]
+            z_vals = self.P_s_full[i, alive_i, 1]
+            k_vals = self.K_parent_full[i, alive_i, 0]
+            x_vals = self.P_s_full[i, alive_i, 4]
+            inputs_i = self._build_dual_fc2_input(b_vals, z_vals, k_vals, x_vals)
+            FC2_input_parent_hatc[i] = inputs_i['hatc']
+            FC2_input_parent_lnk[i] = inputs_i['lnk']
+        return {'hatc': FC2_input_parent_hatc, 'lnk': FC2_input_parent_lnk}
 
     def build_fc2_input_children(self, children_s_full, alive_mask):
+        return self.build_fc2_input_children_dual(children_s_full, alive_mask)['hatc']
+
+    def build_fc2_input_children_dual(self, children_s_full, alive_mask):
         if self.tensor_native and isinstance(children_s_full, list):
-            FC2_input_children = torch.zeros((self.path_num, 2, 201), dtype=torch.float32, device=self.device)
+            FC2_input_children_hatc = torch.zeros((self.path_num, 2, 201), dtype=torch.float32, device=self.device)
+            FC2_input_children_lnk = torch.zeros((self.path_num, 2, 201 + self.quantiles.numel()), dtype=torch.float32, device=self.device)
             for i in range(self.path_num):
                 for j in range(2):
                     alive_ij = alive_mask[i][:, j] > 0
                     b_vals = children_s_full[i][alive_ij, j, 0]
                     z_vals = children_s_full[i][alive_ij, j, 1]
-                    quantile_features = self._safe_quantile_features(b_vals, z_vals)
-                    if alive_ij.any():
-                        x_feature = children_s_full[i][alive_ij, j, 4].mean().unsqueeze(0)
-                    else:
-                        x_feature = torch.zeros((1,), dtype=torch.float32, device=self.device)
-                    FC2_input_children[i, j, :200] = quantile_features
-                    FC2_input_children[i, j, 200] = x_feature
-            return FC2_input_children
-        FC2_input_children = torch.zeros((self.path_num, 2, 201), dtype=torch.float32, device=self.device)
+                    k_vals = self.child_K_list[i][alive_ij, j, 0]
+                    x_vals = children_s_full[i][alive_ij, j, 4]
+                    inputs_ij = self._build_dual_fc2_input(b_vals, z_vals, k_vals, x_vals)
+                    FC2_input_children_hatc[i, j] = inputs_ij['hatc']
+                    FC2_input_children_lnk[i, j] = inputs_ij['lnk']
+            return {'hatc': FC2_input_children_hatc, 'lnk': FC2_input_children_lnk}
+        FC2_input_children_hatc = torch.zeros((self.path_num, 2, 201), dtype=torch.float32, device=self.device)
+        FC2_input_children_lnk = torch.zeros((self.path_num, 2, 201 + self.quantiles.numel()), dtype=torch.float32, device=self.device)
         for i in range(self.path_num):
             for j in range(2):
-                b_vals = children_s_full[i, alive_mask[i, :, j].bool(), j, 0]
-                z_vals = children_s_full[i, alive_mask[i, :, j].bool(), j, 1]
-                quantile_features = self._safe_quantile_features(b_vals, z_vals)
-                if alive_mask[i, :, j].any():
-                    x_feature = children_s_full[i, alive_mask[i, :, j].bool(), j, 4].mean().unsqueeze(0)
-                else:
-                    x_feature = torch.zeros((1,), dtype=torch.float32, device=self.device)
-                FC2_input_children[i, j, :200] = quantile_features
-                FC2_input_children[i, j, 200] = x_feature
-        return FC2_input_children
+                alive_ij = alive_mask[i, :, j].bool()
+                b_vals = children_s_full[i, alive_ij, j, 0]
+                z_vals = children_s_full[i, alive_ij, j, 1]
+                k_vals = self.K_children_full[i, alive_ij, j, 0]
+                x_vals = children_s_full[i, alive_ij, j, 4]
+                inputs_ij = self._build_dual_fc2_input(b_vals, z_vals, k_vals, x_vals)
+                FC2_input_children_hatc[i, j] = inputs_ij['hatc']
+                FC2_input_children_lnk[i, j] = inputs_ij['lnk']
+        return {'hatc': FC2_input_children_hatc, 'lnk': FC2_input_children_lnk}
 
     def build_supervised_targets_parent(self) -> torch.Tensor:
         if self.macro_table is None:
@@ -582,7 +605,7 @@ class FC2Pipeline:
         return out[..., idx:idx + 1]
 
     def _forward_parent_fc2(self, fc2_model: torch.nn.Module) -> Dict[str, torch.Tensor]:
-        FC2_input_parent = self.build_fc2_input_parent()
+        FC2_input_parent = self.build_fc2_input_parent_dual()
         fc2_out_parent = fc2_model(FC2_input_parent)
         hatc_parent_pred = fc2_out_parent['hatc']
         lnk_parent_pred = fc2_out_parent['lnk']
@@ -824,8 +847,11 @@ class FC2Pipeline:
         children_s_full: torch.Tensor,
         alive_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        FC2_input_children = self.build_fc2_input_children(children_s_full, alive_mask)
-        flat_children = FC2_input_children.reshape(-1, FC2_input_children.shape[-1])
+        FC2_input_children = self.build_fc2_input_children_dual(children_s_full, alive_mask)
+        flat_children = {
+            'hatc': FC2_input_children['hatc'].reshape(-1, FC2_input_children['hatc'].shape[-1]),
+            'lnk': FC2_input_children['lnk'].reshape(-1, FC2_input_children['lnk'].shape[-1]),
+        }
         fc2_out_children = fc2_model(flat_children)
         hatc_children_pred = fc2_out_children['hatc'].view(self.path_num, 2, 1)
         lnk_children_pred = fc2_out_children['lnk'].view(self.path_num, 2, 1)

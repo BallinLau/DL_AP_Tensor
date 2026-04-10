@@ -2863,9 +2863,9 @@ class Episode:
         if pipe is None or pipe.macro_table is None:
             return torch.tensor(0.0, device=self.device), {}
 
-        parent_x = pipe.build_fc2_input_parent()
+        parent_x = pipe.build_fc2_input_parent_dual()
         parent_y = pipe.build_supervised_targets_parent()
-        child_x = pipe.build_fc2_input_children(pipe.child_states_list, pipe.child_present_list)
+        child_x = pipe.build_fc2_input_children_dual(pipe.child_states_list, pipe.child_present_list)
         child_y = pipe.build_supervised_targets_children()
 
         child_valid = torch.tensor(
@@ -2878,17 +2878,21 @@ class Episode:
             dtype=torch.bool,
         )
 
-        x_parts = [parent_x]
+        x_hatc_parts = [parent_x['hatc']]
+        x_lnk_parts = [parent_x['lnk']]
         y_parts = [parent_y]
-        child_x_flat = child_x.reshape(-1, child_x.shape[-1])
+        child_x_hatc_flat = child_x['hatc'].reshape(-1, child_x['hatc'].shape[-1])
+        child_x_lnk_flat = child_x['lnk'].reshape(-1, child_x['lnk'].shape[-1])
         child_y_flat = child_y.reshape(-1, child_y.shape[-1])
         if child_valid.any():
-            x_parts.append(child_x_flat[child_valid])
+            x_hatc_parts.append(child_x_hatc_flat[child_valid])
+            x_lnk_parts.append(child_x_lnk_flat[child_valid])
             y_parts.append(child_y_flat[child_valid])
-        x_all = torch.cat(x_parts, dim=0)
+        x_hatc_all = torch.cat(x_hatc_parts, dim=0)
+        x_lnk_all = torch.cat(x_lnk_parts, dim=0)
         y_all = torch.cat(y_parts, dim=0)
 
-        pred = model(x_all)
+        pred = model({'hatc': x_hatc_all, 'lnk': x_lnk_all})
         lnk_target = y_all[:, 0:1]
         hatc_target = y_all[:, 1:2]
         hatc_loss = nn.functional.mse_loss(pred['hatc'], hatc_target)
@@ -2932,9 +2936,9 @@ class Episode:
             pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 10000),
             device=self.device,
         )
-        parent_x = pipe.build_fc2_input_parent()
+        parent_x = pipe.build_fc2_input_parent_dual()
         parent_y = pipe.build_supervised_targets_parent()
-        child_x = pipe.build_fc2_input_children(pipe.child_states_list, pipe.child_present_list)
+        child_x = pipe.build_fc2_input_children_dual(pipe.child_states_list, pipe.child_present_list)
         child_y = pipe.build_supervised_targets_children()
 
         child_valid = torch.tensor(
@@ -2947,16 +2951,20 @@ class Episode:
             dtype=torch.bool,
         )
 
-        x_parts = [parent_x]
+        x_hatc_parts = [parent_x['hatc']]
+        x_lnk_parts = [parent_x['lnk']]
         y_parts = [parent_y]
-        child_x_flat = child_x.reshape(-1, child_x.shape[-1])
+        child_x_hatc_flat = child_x['hatc'].reshape(-1, child_x['hatc'].shape[-1])
+        child_x_lnk_flat = child_x['lnk'].reshape(-1, child_x['lnk'].shape[-1])
         child_y_flat = child_y.reshape(-1, child_y.shape[-1])
         if child_valid.any():
-            x_parts.append(child_x_flat[child_valid])
+            x_hatc_parts.append(child_x_hatc_flat[child_valid])
+            x_lnk_parts.append(child_x_lnk_flat[child_valid])
             y_parts.append(child_y_flat[child_valid])
-        x_all = torch.cat(x_parts, dim=0)
+        x_hatc_all = torch.cat(x_hatc_parts, dim=0)
+        x_lnk_all = torch.cat(x_lnk_parts, dim=0)
         y_all = torch.cat(y_parts, dim=0)
-        return TensorDataset(x_all.detach(), y_all.detach())
+        return TensorDataset(x_hatc_all.detach(), x_lnk_all.detach(), y_all.detach())
     
     def create_batches(
         self,
@@ -3981,6 +3989,7 @@ class Episode:
         freeze_pv = bool(getattr(self.hyperparams, 'fc2_freeze_pv_during_epochs', True))
         fc2_path_batch_size = int(getattr(self.hyperparams, 'fc2_path_batch_size', 256))
         pretrain_epochs = int(getattr(self.hyperparams, 'fc2_supervised_pretrain_epochs', 0))
+        pretrain_only = bool(getattr(self.hyperparams, 'fc2_supervised_pretrain_only', False))
         fc2_optimizer = self.optimizers.get('fc2')
 
         if (
@@ -4000,9 +4009,9 @@ class Episode:
                 )
             for _ in tqdm(range(pretrain_epochs), desc='FC2 Supervised Pretrain'):
                 batch_losses = []
-                for x_batch, y_batch in sup_loader:
+                for x_hatc_batch, x_lnk_batch, y_batch in sup_loader:
                     fc2_optimizer.zero_grad(set_to_none=True)
-                    pred = self.models['fc2'](x_batch)
+                    pred = self.models['fc2']({'hatc': x_hatc_batch, 'lnk': x_lnk_batch})
                     lnk_target = y_batch[:, 0:1]
                     hatc_target = y_batch[:, 1:2]
                     hatc_loss = nn.functional.mse_loss(pred['hatc'], hatc_target)
@@ -4058,6 +4067,17 @@ class Episode:
                         avg_loss,
                         current_lr
                     )
+        if pretrain_only:
+            if not pretrain_epoch_losses:
+                logger.warning("fc2_supervised_pretrain_only enabled but no supervised pretrain epochs were run")
+                return None
+            final_pretrain = dict(pretrain_epoch_losses[-1])
+            logger.info("FC2 Supervised Pretrain Only finished: %s", final_pretrain)
+            return {
+                'mode': 'supervised_pretrain_only',
+                'final_losses': final_pretrain,
+                'pretrain_epoch_losses': pretrain_epoch_losses,
+            }
 
         if freeze_pv and pv_model is not None:
             pv_model.freeze()

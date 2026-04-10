@@ -219,6 +219,17 @@
   - 之前的写法先取 `eta_j = child_state[:, j, 2]` 这个 view，再对同一 `child_state[:, j, 0]` 原地赋值，会触发 backward 的 version mismatch；
   - 现已改为一次性函数式构造 `new_b` 和新的 `updated_child_state`，避免 inplace autograd 冲突。
 - 已完成第九刀：
+  - 新增 `fc2_supervised_pretrain_only` 开关，可只运行 `FC2 Supervised Pretrain` 并跳过 closure finetune；
+  - `run_multi_episode.py` 与 `run_multi_episode_job.py` 已新增对应 CLI 开关。
+- 已完成第十刀：
+  - `FC2` 的 `hatc` / `lnk` 输入路径已显式拆开；
+  - `hatc` 仍使用 `[b_quantiles, z_quantiles, x]`；
+  - `lnk` 改为额外吃一份 `K` 的 quantile summary，即 `[b_quantiles, z_quantiles, x, K_quantiles]`；
+  - tensor-native pretrain / closure 路径已统一到这套分头输入 contract。
+- 已完成第十一刀：
+  - 新增独立 slurm 脚本 `run_fc2_supervised_pretrain_only_80g.slurm`；
+  - 可直接运行 “只保留 FC2 Supervised Pretrain” 的版本，不再手动拼接 CLI 参数。
+- 已完成第九刀：
   - 按 `simulate_ts_parallel.py` 的定义重新对齐 `FC2LossPipe` 的 parent / transition / child operator；
   - parent 聚合不再用 `bar_z` 对 `K` 加权，`C` 改回 `max(C, 0)`，并补齐 `+1e-5` 的 `hatc` 口径；
   - child 当前节点改为使用 `child_present` 作为 alive 集合，而不是混入 parent `bar_z`；

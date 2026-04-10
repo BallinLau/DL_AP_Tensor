@@ -9,13 +9,14 @@ FC2: 横截面分布 → 宏观 proxy
 - 宏观量 x
 
 输出：
-- (ĉ, ln K) 宏观 proxy
+- hatc head: [b_quantiles, z_quantiles, x] -> ĉ
+- lnk head: [b_quantiles, z_quantiles, x, K_quantiles] -> ln K
 """
 
 import torch
 import torch.nn as nn
-from typing import Tuple, List, Optional, Dict
-from .base import MLP, MLPWithScaler
+from typing import Tuple, List, Optional, Dict, Union
+from .base import MLP
 
 import sys
 sys.path.append('..')
@@ -35,6 +36,7 @@ class FC2Model(nn.Module):
     def __init__(
         self,
         input_dim: int = None,
+        lnk_input_dim: int = None,
         hidden_dims: List[int] = None,
         output_dim: int = 2,
         quantile_num: int = 100,
@@ -42,20 +44,31 @@ class FC2Model(nn.Module):
     ):
         super().__init__()
         
-        # 输入维度：100(b分位点) + 100(z分位点) + x = 201
+        # hatc 输入维度：100(b分位点) + 100(z分位点) + x = 201
         if input_dim is None:
             input_dim = 2 * quantile_num + 1
+        # lnk 额外吃一份 K 的 quantile summary
+        if lnk_input_dim is None:
+            lnk_input_dim = input_dim + quantile_num
         
         if hidden_dims is None:
             hidden_dims = Config.FC2_HIDDEN_DIMS
         
         self.quantile_num = quantile_num
         self.input_dim = input_dim
+        self.lnk_input_dim = lnk_input_dim
         self.output_dim = output_dim
 
-        # 共享 trunk + 双 head。这样 lnk 不再和 hatc 在最后一层完全绑死。
-        self.trunk = MLP(
+        # hatc / lnk 分开建模；lnk 额外吃 K summary。
+        self.hatc_trunk = MLP(
             input_dim=input_dim,
+            hidden_dims=hidden_dims,
+            output_dim=hidden_dims[-1],
+            activation='gelu',
+            dropout=dropout
+        )
+        self.lnk_trunk = MLP(
+            input_dim=lnk_input_dim,
             hidden_dims=hidden_dims,
             output_dim=hidden_dims[-1],
             activation='gelu',
@@ -64,23 +77,52 @@ class FC2Model(nn.Module):
         self.hatc_head = nn.Linear(hidden_dims[-1], 1)
         self.lnk_head = nn.Linear(hidden_dims[-1], 1)
     
+    def _normalize_inputs(
+        self,
+        phi: Union[torch.Tensor, Dict[str, torch.Tensor]]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(phi, dict):
+            hatc_in = phi['hatc']
+            lnk_in = phi.get('lnk', hatc_in)
+        else:
+            hatc_in = phi
+            lnk_in = phi
+            if phi.shape[-1] == self.input_dim and self.lnk_input_dim > self.input_dim:
+                pad = torch.zeros(
+                    (*phi.shape[:-1], self.lnk_input_dim - self.input_dim),
+                    device=phi.device,
+                    dtype=phi.dtype,
+                )
+                lnk_in = torch.cat([phi, pad], dim=-1)
+            elif phi.shape[-1] == self.lnk_input_dim and self.input_dim < self.lnk_input_dim:
+                hatc_in = phi[..., :self.input_dim]
+        if hatc_in.shape[-1] != self.input_dim:
+            raise ValueError(f"FC2 hatc input dim mismatch: expected {self.input_dim}, got {hatc_in.shape[-1]}")
+        if lnk_in.shape[-1] != self.lnk_input_dim:
+            raise ValueError(f"FC2 lnk input dim mismatch: expected {self.lnk_input_dim}, got {lnk_in.shape[-1]}")
+        return hatc_in, lnk_in
     
     def forward(
         self, 
-        phi: torch.Tensor
+        phi: Union[torch.Tensor, Dict[str, torch.Tensor]]
     ) -> Dict[str, torch.Tensor]:
         """
         前向传播
         
         Args:
-            phi: (batch, 201) - [b_quantiles(100), z_quantiles(100), x]
+            phi:
+                - Tensor: 兼容旧调用，默认同一输入供两个 head 使用
+                - Dict:
+                    {'hatc': (batch, 201), 'lnk': (batch, 301)}
         
         Returns:
             {'hatc': (batch,1), 'lnk': (batch,1)}
         """
-        h = self.trunk(phi)
-        lnk = self.lnk_head(h)
-        hatc = self.hatc_head(h)
+        hatc_in, lnk_in = self._normalize_inputs(phi)
+        hatc_h = self.hatc_trunk(hatc_in)
+        lnk_h = self.lnk_trunk(lnk_in)
+        lnk = self.lnk_head(lnk_h)
+        hatc = self.hatc_head(hatc_h)
 
         return {'hatc': hatc, 'lnk': lnk}
     
