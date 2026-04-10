@@ -243,6 +243,14 @@
     - `fc2_supervised_pretrain_epochs`
     - `fc2_supervised_hatc_weight`
     - `fc2_supervised_lnk_weight`
+- 已完成第十三刀：
+  - `FC2 supervised pretrain` 改为一次性缓存 supervised dataset，再用标准 `DataLoader` 训练；
+  - 不再在每个 pretrain epoch 内重复：
+    - path 切 batch
+    - `FC2Pipe` 重建
+    - ragged path 解析
+    - target 重新抽取；
+  - pretrain 的主要耗时从“重复数据工程”收缩为“单次 dataset 构建 + 普通 MLP mini-batch 训练”。
 - 已完成最小运行验证：
   - 使用合成 `TensorTable` + dummy `FC2` / `policy_value`，`FC2LossPipe.loss(...)` 可直接跑通；
   - `parent / children` diagnostics 可正常生成；

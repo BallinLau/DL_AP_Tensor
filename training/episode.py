@@ -15,6 +15,7 @@ import numpy as np
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from tqdm import tqdm
 import logging
+from torch.utils.data import DataLoader, TensorDataset
 
 import sys
 sys.path.append('..')
@@ -2921,6 +2922,41 @@ class Episode:
             if k not in self.loss_history:
                 self.loss_history[k] = []
             self.loss_history[k].append(v)
+
+    def _build_fc2_supervised_dataset(self) -> Optional[TensorDataset]:
+        if not self._use_tensor_pipeline() or self.tensor_firm is None or self.tensor_macro is None:
+            return None
+        pipe = FC2LossPipe(
+            firm_table=self.tensor_firm,
+            macro_table=self.tensor_macro,
+            pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 10000),
+            device=self.device,
+        )
+        parent_x = pipe.build_fc2_input_parent()
+        parent_y = pipe.build_supervised_targets_parent()
+        child_x = pipe.build_fc2_input_children(pipe.child_states_list, pipe.child_present_list)
+        child_y = pipe.build_supervised_targets_children()
+
+        child_valid = torch.tensor(
+            [
+                bool(pipe.child_present_list[i][:, j].any().item())
+                for i in range(pipe.path_num)
+                for j in range(pipe.branch_num)
+            ],
+            device=self.device,
+            dtype=torch.bool,
+        )
+
+        x_parts = [parent_x]
+        y_parts = [parent_y]
+        child_x_flat = child_x.reshape(-1, child_x.shape[-1])
+        child_y_flat = child_y.reshape(-1, child_y.shape[-1])
+        if child_valid.any():
+            x_parts.append(child_x_flat[child_valid])
+            y_parts.append(child_y_flat[child_valid])
+        x_all = torch.cat(x_parts, dim=0)
+        y_all = torch.cat(y_parts, dim=0)
+        return TensorDataset(x_all.detach(), y_all.detach())
     
     def create_batches(
         self,
@@ -3953,20 +3989,27 @@ class Episode:
             and self._use_tensor_pipeline()
             and self.tensor_firm is not None
         ):
-            for _ in tqdm(range(pretrain_epochs), desc='FC2 Supervised Pretrain'):
-                fc2_batches = self._create_fc2_batches_from_tensor(
-                    firm_table=self.tensor_firm,
-                    macro_table=self.tensor_macro,
-                    batch_size=fc2_path_batch_size,
+            sup_dataset = self._build_fc2_supervised_dataset()
+            if sup_dataset is None or len(sup_dataset) == 0:
+                pretrain_epochs = 0
+            else:
+                sup_loader = DataLoader(
+                    sup_dataset,
+                    batch_size=max(int(getattr(self.hyperparams, 'batch_size', 4096)), 1),
                     shuffle=True,
                 )
-                if not fc2_batches:
-                    break
-
+            for _ in tqdm(range(pretrain_epochs), desc='FC2 Supervised Pretrain'):
                 batch_losses = []
-                for fc2_batch in fc2_batches:
+                for x_batch, y_batch in sup_loader:
                     fc2_optimizer.zero_grad(set_to_none=True)
-                    sup_loss, sup_diag = self._compute_fc2_supervised_loss(fc2_batch)
+                    pred = self.models['fc2'](x_batch)
+                    lnk_target = y_batch[:, 0:1]
+                    hatc_target = y_batch[:, 1:2]
+                    hatc_loss = nn.functional.mse_loss(pred['hatc'], hatc_target)
+                    lnk_loss = nn.functional.mse_loss(pred['lnk'], lnk_target)
+                    hatc_w = float(getattr(self.hyperparams, 'fc2_supervised_hatc_weight', 1.0))
+                    lnk_w = float(getattr(self.hyperparams, 'fc2_supervised_lnk_weight', 1.0))
+                    sup_loss = hatc_w * hatc_loss + lnk_w * lnk_loss
                     sup_loss.backward()
                     grad_norm, had_nan = gradient_protection(
                         self.models['fc2'].parameters(),
@@ -3978,7 +4021,22 @@ class Episode:
                     scheduler = self.lr_schedulers.get('fc2')
                     if scheduler is not None:
                         scheduler.step()
-                    batch_log = dict(sup_diag)
+                    batch_log = {
+                        'fc2_pretrain_loss': float(sup_loss.item()),
+                        'fc2_pretrain_hatc_loss': float(hatc_loss.item()),
+                        'fc2_pretrain_lnk_loss': float(lnk_loss.item()),
+                    }
+                    with torch.no_grad():
+                        for prefix, y_true, y_pred in (
+                            ('fc2_pretrain_hatc', hatc_target, pred['hatc']),
+                            ('fc2_pretrain_lnk', lnk_target, pred['lnk']),
+                        ):
+                            stats = compute_fit_stats_t(y_true, y_pred)
+                            for k, v in stats.items():
+                                try:
+                                    batch_log[f'{prefix}_{k}'] = float(v)
+                                except (TypeError, ValueError):
+                                    continue
                     batch_log['fc2_grad_norm'] = grad_norm
                     batch_log['total'] = float(sup_loss.item())
                     self._latest_fc2_diag = batch_log
