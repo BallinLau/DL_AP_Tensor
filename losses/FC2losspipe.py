@@ -115,6 +115,7 @@ class FC2Pipeline:
         self.firm_table = firm_table.to(self.device) if firm_table is not None else None
         self.macro_table = macro_table.to(self.device) if macro_table is not None else None
         self.tensor_native = self.firm_table is not None
+        self.path_values: List[int] = []
 
         if self.tensor_native:
             self._build_ragged_from_tensor_tables()
@@ -212,6 +213,7 @@ class FC2Pipeline:
             max_ids = max(max_ids, int(ids.numel()))
             selected.append((path_val, parent_rows, child0_rows, child1_rows, ids))
 
+        self.path_values = [path_val for path_val, *_ in selected]
         self.path_num = len(selected)
         self.N = max_ids
         self.parent_states_list: List[torch.Tensor] = []

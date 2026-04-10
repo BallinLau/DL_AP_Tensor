@@ -160,6 +160,7 @@
 - [x] G1. 通过 `py_compile` 静态检查。
 - [x] G2. 确认 FC2 loss 路径仍可运行。
 - [x] G3. 确认 parent/children diagnostics 仍能正常输出。
+- [x] G4. 新增独立 supervised probe，脱离 closure 检查当前 FC2 summary 对 `hatc / lnk` 的直接可预测性。
 
 ---
 
@@ -223,6 +224,16 @@
   - child 当前节点改为使用 `child_present` 作为 alive 集合，而不是混入 parent `bar_z`；
   - child incumbent 的 `K` 更新改为只在 transition 段做一次：`K_{t+1}=K_t[1+(g-1)\\bar i_t]`；
   - child aggregate 阶段不再重复额外乘一次投资更新因子。
+- 已完成第十刀：
+  - 新增独立脚本 `experiments/run_fc2_supervised_probe.py`；
+  - probe 不走 `policy_value + aggregation` 的 closure 训练，只测试当前 `FC2` summary `[b-quantiles, z-quantiles, x]` 对节点级 `hatc / lnk` 的直接预测能力；
+  - 支持 `hatc-only`、`lnk-only`、`joint` 三种任务；
+  - 默认使用 `SimulateTS.simulate_tensor()` 生成 `TensorTable`，再通过 `FC2Pipeline` 复用当前 summary 构造逻辑；
+  - `FC2Pipeline` 额外暴露 `path_values`，确保 probe 对 summary 和 macro target 的 path 对齐是显式可检查的。
+- 已完成第十一步：
+  - 新增 `slurm/run_fc2_supervised_probe_80g.slurm`，用于在 80G 单卡上直接跑 `FC2` supervised probe；
+  - slurm 脚本支持通过环境变量覆盖 `CKPT_DIR / CKPT_PREFIX / OUT_DIR / N_PATHS / GROUP_SIZE / HORIZON / EPOCHS / BATCH_SIZE`；
+  - 同时显式设置 `MPLCONFIGDIR` 到可写目录，避免 probe 首次启动时卡在 matplotlib 字体缓存。
 - 已完成最小运行验证：
   - 使用合成 `TensorTable` + dummy `FC2` / `policy_value`，`FC2LossPipe.loss(...)` 可直接跑通；
   - `parent / children` diagnostics 可正常生成；
