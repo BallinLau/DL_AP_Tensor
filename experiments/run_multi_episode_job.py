@@ -40,7 +40,6 @@ from experiments.run_utils import (  # noqa: E402
     plot_surfaces,
     plot_bp_diagnostic_curves,
     plot_distributions,
-    plot_macro_series,
     plot_outer_drift,
     plot_firm_b_window_distribution,
 )
@@ -460,7 +459,6 @@ def main():
             resolve_base_dir(run_root, ROOT),
             df_macro=episode.df_macro,
         )
-        plot_macro_series(ep, episode.df_macro, resolve_base_dir(run_root, ROOT))
 
         summaries.append({
             "episode_mode": episode_mode,
@@ -508,7 +506,6 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         df_firm_sim.to_pickle(out_dir / "final_simulate_firm.pkl")
         df_macro_sim.to_pickle(out_dir / "final_simulate_macro.pkl")
-        plot_macro_series(-1, df_macro_sim, resolve_base_dir(run_root, ROOT))
         plot_firm_b_window_distribution(df_firm_sim, resolve_base_dir(run_root, ROOT))
     else:
         print("Skipping final SimulateTS export for this run.")

@@ -44,7 +44,6 @@ from experiments.run_utils import (  # noqa: E402
     save_stage_df,
     plot_surfaces,
     plot_distributions,
-    plot_macro_series,
     plot_outer_drift,
     plot_firm_b_window_distribution,
 )
@@ -279,7 +278,6 @@ def main():
             get_base_dir(),
             df_macro=episode.df_macro,
         )
-        plot_macro_series(ep, episode.df_macro, get_base_dir())
 
         summaries.append(ep_summary)
         plot_outer_drift(summaries, get_base_dir() / "experiments" / "figs")
@@ -305,7 +303,6 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     df_firm_sim.to_pickle(out_dir / "final_simulate_firm.pkl")
     df_macro_sim.to_pickle(out_dir / "final_simulate_macro.pkl")
-    plot_macro_series(-1, df_macro_sim, get_base_dir())
     plot_firm_b_window_distribution(df_firm_sim, get_base_dir())
 
 

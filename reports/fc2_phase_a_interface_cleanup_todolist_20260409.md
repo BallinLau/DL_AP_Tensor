@@ -218,6 +218,41 @@
   - 修正 `FC2LossPipe._update_children_state()` 在 tensor-native 路径下对 `child_state` 的原地写入；
   - 之前的写法先取 `eta_j = child_state[:, j, 2]` 这个 view，再对同一 `child_state[:, j, 0]` 原地赋值，会触发 backward 的 version mismatch；
   - 现已改为一次性函数式构造 `new_b` 和新的 `updated_child_state`，避免 inplace autograd 冲突。
+- 已完成第十二刀：
+  - 删除旧的 `macro_diag_before_sdf2 / macro_diag_modeb` summary 输出，不再继续维护这套旧 FC1 口径宏观诊断；
+  - 删除 `ep*_macro_hatc.png / ep*_macro_lnk.png / *_vs_x / *_branch01 / *_delta_*` 这一整套旧 macro 图生成逻辑；
+  - `run_multi_episode.py` 与 `run_multi_episode_job.py` 主流程不再调用 `plot_macro_series(...)`，避免继续浪费算力和时间在这批旧图上。
+- 已完成第十三刀：
+  - `FC2` 的主调用链已从单个 `fc2` 兼容模型切换为两套独立模型：
+    - `fc2_hatc`
+    - `fc2_lnk`
+  - `Episode`、`FC2LossPipe`、`simulate_ts_parallel.py` 已统一支持 split FC2；
+  - `fc2` stage 会自动映射到两套模型、两套优化器与两套 scheduler，不再混用单模型主路径。
+- 已完成第十四刀：
+  - 新增 `fit_after_train` 指标，定义为：
+    - 使用当前 episode 真实 simulate 得到的节点级 target；
+    - 在 `FC2` 训练结束后，直接评估训练后 `FC2` 输出与真实 simulate target 的 gap；
+  - 输出字段包括：
+    - `fc2_fit_after_train_hatc_*`
+    - `fc2_fit_after_train_lnk_*`
+  - 旧的 `macro_diag_before_sdf2` / `macro_diag_modeb` 口径已经彻底退出主流程。
+- 已完成第十五刀：
+  - 新增 `outer_after_resim` 指标，定义为：
+    - 使用训练后的 `FC2` 重新跑一次 simulate；
+    - 再评估训练后 `FC2` 输出与这次 resim 真实 target 的 gap；
+  - 输出字段包括：
+    - `fc2_outer_after_resim_hatc_*`
+    - `fc2_outer_after_resim_lnk_*`
+  - 这样日志里已经明确区分：
+    - 参数更新后的拟合质量：`fit_after_train`
+    - 放回系统后的 outer 质量：`outer_after_resim`
+- 已完成第十六刀：
+  - 主运行时的 legacy FC2 兼容入口已清理：
+    - `Episode`
+    - `FC2LossPipe`
+    - `simulate_ts_parallel.py`
+    已统一按 split FC2 (`fc2_hatc / fc2_lnk`) 执行；
+  - 旧 `fc2.pt` 仅保留在 checkpoint 读取兼容层，不再保留在训练/模拟主路径中。
 - 已完成第九刀：
   - 新增 `fc2_supervised_pretrain_only` 开关，可只运行 `FC2 Supervised Pretrain` 并跳过 closure finetune；
   - `run_multi_episode.py` 与 `run_multi_episode_job.py` 已新增对应 CLI 开关。

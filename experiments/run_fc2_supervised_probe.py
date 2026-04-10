@@ -3,14 +3,12 @@ Standalone FC2 supervised probe.
 
 Goal:
 - bypass policy/value closure training entirely
-- test whether the current FC2 summary
-  [b-quantiles(100), z-quantiles(100), x]
-  contains enough information to predict node-level macro targets
+ - test whether the current split FC2 summaries contain enough information to
+   predict node-level macro targets
 
 Tasks:
 1. hatc-only
 2. lnk-only
-3. joint [hatc, lnk]
 """
 
 from __future__ import annotations
@@ -245,14 +243,21 @@ def _plot_loss_curves(results: Iterable[ProbeResult], path: Path) -> None:
 def build_supervised_probe_dataset(
     pipe: FC2Pipeline,
 ) -> pd.DataFrame:
-    parent_x = pipe.build_fc2_input_parent().detach().cpu()
-    child_x = pipe.build_fc2_input_children(pipe.child_states_list, pipe.child_present_list).detach().cpu()
+    parent_x = {
+        k: v.detach().cpu()
+        for k, v in pipe.build_fc2_input_parent_dual().items()
+    }
+    child_x = {
+        k: v.detach().cpu()
+        for k, v in pipe.build_fc2_input_children_dual(pipe.child_states_list, pipe.child_present_list).items()
+    }
     parent_y = pipe.build_supervised_targets_parent().detach().cpu()
     child_y = pipe.build_supervised_targets_children().detach().cpu()
 
     records: List[Dict[str, float]] = []
     for local_idx, path_val in enumerate(pipe.path_values):
-        feat = parent_x[local_idx]
+        hatc_feat = parent_x["hatc"][local_idx]
+        lnk_feat = parent_x["lnk"][local_idx]
         target = parent_y[local_idx]
         records.append(
             {
@@ -261,13 +266,15 @@ def build_supervised_probe_dataset(
                 "branch": -1.0,
                 "hatc": float(target[1].item()),
                 "lnk": float(target[0].item()),
-                **{f"phi_{k}": float(feat[k].item()) for k in range(feat.shape[0])},
+                **{f"hatc_phi_{k}": float(hatc_feat[k].item()) for k in range(hatc_feat.shape[0])},
+                **{f"lnk_phi_{k}": float(lnk_feat[k].item()) for k in range(lnk_feat.shape[0])},
             }
         )
         for branch_idx in range(pipe.branch_num):
             if not pipe.child_present_list[local_idx][:, branch_idx].any():
                 continue
-            feat = child_x[local_idx, branch_idx]
+            hatc_feat = child_x["hatc"][local_idx, branch_idx]
+            lnk_feat = child_x["lnk"][local_idx, branch_idx]
             target = child_y[local_idx, branch_idx]
             records.append(
                 {
@@ -276,7 +283,8 @@ def build_supervised_probe_dataset(
                     "branch": float(branch_idx),
                     "hatc": float(target[1].item()),
                     "lnk": float(target[0].item()),
-                    **{f"phi_{k}": float(feat[k].item()) for k in range(feat.shape[0])},
+                    **{f"hatc_phi_{k}": float(hatc_feat[k].item()) for k in range(hatc_feat.shape[0])},
+                    **{f"lnk_phi_{k}": float(lnk_feat[k].item()) for k in range(lnk_feat.shape[0])},
                 }
             )
 
@@ -350,11 +358,17 @@ def main() -> None:
     )
 
     probe = build_supervised_probe_dataset(pipe)
-    feature_cols = [f"phi_{k}" for k in range(Config.FC2_INPUT_DIM)]
-    target_specs = {
-        "hatc_only": ["hatc"],
-        "lnk_only": ["lnk"],
-        "joint": ["hatc", "lnk"],
+    hatc_feature_cols = [f"hatc_phi_{k}" for k in range(Config.FC2_INPUT_DIM)]
+    lnk_feature_cols = [f"lnk_phi_{k}" for k in range(Config.FC2_INPUT_DIM + Config.QUANTILE_NUM)]
+    task_specs = {
+        "hatc_only": {
+            "targets": ["hatc"],
+            "features": hatc_feature_cols,
+        },
+        "lnk_only": {
+            "targets": ["lnk"],
+            "features": lnk_feature_cols,
+        },
     }
 
     split = _path_split(probe["path"].to_numpy(), args.seed, args.val_frac, args.test_frac)
@@ -364,19 +378,20 @@ def main() -> None:
     if train_df.empty or val_df.empty or test_df.empty:
         raise ValueError("Train/val/test split produced an empty partition.")
 
-    x_train = train_df[feature_cols].to_numpy(dtype=np.float32)
-    x_val = val_df[feature_cols].to_numpy(dtype=np.float32)
-    x_test = test_df[feature_cols].to_numpy(dtype=np.float32)
-    x_train_n, _, _ = _normalize(x_train, x_train)
-    x_val_n, _, _ = _normalize(x_train, x_val)
-    x_test_n, _, _ = _normalize(x_train, x_test)
-
     hidden_dims = _parse_hidden_dims(args.hidden_dims)
     results_summary: Dict[str, Dict[str, float]] = {}
     probe_results: List[ProbeResult] = []
     pred_cols: Dict[str, np.ndarray] = {}
 
-    for task_name, target_cols in target_specs.items():
+    for task_name, task_spec in task_specs.items():
+        feature_cols = task_spec["features"]
+        target_cols = task_spec["targets"]
+        x_train = train_df[feature_cols].to_numpy(dtype=np.float32)
+        x_val = val_df[feature_cols].to_numpy(dtype=np.float32)
+        x_test = test_df[feature_cols].to_numpy(dtype=np.float32)
+        x_train_n, _, _ = _normalize(x_train, x_train)
+        x_val_n, _, _ = _normalize(x_train, x_val)
+        x_test_n, _, _ = _normalize(x_train, x_test)
         y_train = train_df[target_cols].to_numpy(dtype=np.float32)
         y_val = val_df[target_cols].to_numpy(dtype=np.float32)
         y_test = test_df[target_cols].to_numpy(dtype=np.float32)
@@ -441,8 +456,6 @@ def main() -> None:
             "lnk_true": test_df["lnk"].to_numpy(dtype=float),
             "hatc_pred_hatc_only": pred_cols["hatc_only"][:, 0],
             "lnk_pred_lnk_only": pred_cols["lnk_only"][:, 0],
-            "hatc_pred_joint": pred_cols["joint"][:, 0],
-            "lnk_pred_joint": pred_cols["joint"][:, 1],
         }
     )
     pred_frame.to_csv(args.output_dir / "probe_test_predictions.csv", index=False)
@@ -459,18 +472,6 @@ def main() -> None:
         pred_cols["lnk_only"][:, 0],
         "FC2 probe: lnk-only",
         args.output_dir / "probe_lnk_only_scatter.png",
-    )
-    _plot_scatter(
-        test_df["hatc"].to_numpy(dtype=float),
-        pred_cols["joint"][:, 0],
-        "FC2 probe: joint hatc",
-        args.output_dir / "probe_joint_hatc_scatter.png",
-    )
-    _plot_scatter(
-        test_df["lnk"].to_numpy(dtype=float),
-        pred_cols["joint"][:, 1],
-        "FC2 probe: joint lnk",
-        args.output_dir / "probe_joint_lnk_scatter.png",
     )
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))

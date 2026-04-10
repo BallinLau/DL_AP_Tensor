@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple
 import torch
 from tqdm import tqdm
 
+from config import Config
 from .data_utils import sample_ar1, sample_bernoulli, sample_stationary_ar1, sample_uniform
 from .tensor_data import TensorSimulationOutput, TensorTable, cat_rows
 
@@ -118,7 +119,9 @@ def _initialize_batched_state(sim, max_firms: int) -> Dict[str, torch.Tensor]:
 def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     device = sim.device
     n_paths, n_firms = state["b"].shape
-    if getattr(sim, "fc2_as_main_macro_state", False) and sim.models.get("fc2") is not None:
+    if getattr(sim, "fc2_as_main_macro_state", False) and (
+        sim.models.get("fc2_hatc") is not None and sim.models.get("fc2_lnk") is not None
+    ):
         hatcf_fc2, lnkf_fc2 = _predict_macro_fc2_batched(sim, state)
         alive_any_paths = state["alive"].any(dim=1)
         state["hatcf"] = torch.where(alive_any_paths, hatcf_fc2, state["hatcf"])
@@ -357,32 +360,38 @@ def _predict_macro_fc1_batched(
     return hatcf_t1.reshape(-1), lnkf_t1.reshape(-1), M.reshape(-1)
 
 
-def _build_fc2_node_inputs_batched(sim, state: Dict[str, torch.Tensor]) -> torch.Tensor:
+def _build_fc2_node_inputs_batched(sim, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     device = sim.device
     n_paths = state["b"].shape[0]
-    quantiles = torch.linspace(0, 1, steps=100, device=device)
-    phi = torch.zeros((n_paths, 201), dtype=torch.float32, device=device)
+    quantile_num = int(getattr(Config, "QUANTILE_NUM", 100))
+    quantiles = torch.linspace(0, 1, steps=quantile_num, device=device)
+    phi_hatc = torch.zeros((n_paths, 2 * quantile_num + 1), dtype=torch.float32, device=device)
+    phi_lnk = torch.zeros((n_paths, 3 * quantile_num + 1), dtype=torch.float32, device=device)
     alive = state["alive"]
     for i in range(n_paths):
         mask = alive[i]
         if bool(mask.any()):
             b_vals = state["b"][i, mask].to(torch.float32)
             z_vals = state["z"][i, mask].to(torch.float32)
-            phi[i, :100] = torch.quantile(b_vals, quantiles)
-            phi[i, 100:200] = torch.quantile(z_vals, quantiles)
-        phi[i, 200] = state["x"][i].to(torch.float32)
-    return phi
+            k_vals = state["K"][i, mask].to(torch.float32)
+            phi_hatc[i, :quantile_num] = torch.quantile(b_vals, quantiles)
+            phi_hatc[i, quantile_num:2 * quantile_num] = torch.quantile(z_vals, quantiles)
+            phi_lnk[i, :2 * quantile_num + 1] = phi_hatc[i]
+            phi_lnk[i, 2 * quantile_num + 1:] = torch.quantile(k_vals, quantiles)
+        phi_hatc[i, 2 * quantile_num] = state["x"][i].to(torch.float32)
+        phi_lnk[i, 2 * quantile_num] = state["x"][i].to(torch.float32)
+    return {"hatc": phi_hatc, "lnk": phi_lnk}
 
 
 def _predict_macro_fc2_batched(
     sim,
     state: Dict[str, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    model = sim.models["fc2"]
     phi = _build_fc2_node_inputs_batched(sim, state)
     with torch.no_grad():
-        out = model(phi)
-    return out["hatc"].reshape(-1), out["lnk"].reshape(-1)
+        hatc = sim.models["fc2_hatc"](phi["hatc"])
+        lnk = sim.models["fc2_lnk"](phi["lnk"])
+    return hatc.reshape(-1), lnk.reshape(-1)
 
 
 def _apply_exit_batched(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:

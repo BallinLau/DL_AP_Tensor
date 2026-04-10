@@ -604,9 +604,24 @@ class FC2Pipeline:
             return getattr(out, name)
         return out[..., idx:idx + 1]
 
-    def _forward_parent_fc2(self, fc2_model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    def _fc2_forward(
+        self,
+        fc2_hatc_model: torch.nn.Module,
+        fc2_lnk_model: torch.nn.Module,
+        fc2_input,
+    ) -> Dict[str, torch.Tensor]:
+        return {
+            'hatc': fc2_hatc_model(fc2_input['hatc']),
+            'lnk': fc2_lnk_model(fc2_input['lnk']),
+        }
+
+    def _forward_parent_fc2(
+        self,
+        fc2_hatc_model: torch.nn.Module,
+        fc2_lnk_model: torch.nn.Module,
+    ) -> Dict[str, torch.Tensor]:
         FC2_input_parent = self.build_fc2_input_parent_dual()
-        fc2_out_parent = fc2_model(FC2_input_parent)
+        fc2_out_parent = self._fc2_forward(fc2_hatc_model, fc2_lnk_model, FC2_input_parent)
         hatc_parent_pred = fc2_out_parent['hatc']
         lnk_parent_pred = fc2_out_parent['lnk']
         fc2_output_parent = torch.cat([lnk_parent_pred, hatc_parent_pred], dim=-1)
@@ -843,7 +858,8 @@ class FC2Pipeline:
 
     def _forward_children_fc2(
         self,
-        fc2_model: torch.nn.Module,
+        fc2_hatc_model: torch.nn.Module,
+        fc2_lnk_model: torch.nn.Module,
         children_s_full: torch.Tensor,
         alive_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
@@ -852,7 +868,7 @@ class FC2Pipeline:
             'hatc': FC2_input_children['hatc'].reshape(-1, FC2_input_children['hatc'].shape[-1]),
             'lnk': FC2_input_children['lnk'].reshape(-1, FC2_input_children['lnk'].shape[-1]),
         }
-        fc2_out_children = fc2_model(flat_children)
+        fc2_out_children = self._fc2_forward(fc2_hatc_model, fc2_lnk_model, flat_children)
         hatc_children_pred = fc2_out_children['hatc'].view(self.path_num, 2, 1)
         lnk_children_pred = fc2_out_children['lnk'].view(self.path_num, 2, 1)
         FC2_output_children1 = torch.cat([lnk_children_pred, hatc_children_pred], dim=-1)
@@ -1002,8 +1018,13 @@ class FC2Pipeline:
             'loss': loss_children,
         }
 
-    def forward(self, fc2_model: torch.nn.Module, pv_model: torch.nn.Module):
-        parent_fc2 = self._forward_parent_fc2(fc2_model)
+    def forward(
+        self,
+        fc2_hatc_model: torch.nn.Module,
+        fc2_lnk_model: torch.nn.Module,
+        pv_model: torch.nn.Module,
+    ):
+        parent_fc2 = self._forward_parent_fc2(fc2_hatc_model, fc2_lnk_model)
         parent_policy = self._forward_parent_policy(pv_model, parent_fc2['macro_pred'])
         parent_agg = self._compute_parent_aggregates(
             parent_policy['pv_input'],
@@ -1016,7 +1037,12 @@ class FC2Pipeline:
         )
 
         child_state = self._update_children_state(parent_policy['bar_i'], parent_policy['bp'])
-        children_fc2 = self._forward_children_fc2(fc2_model, child_state['children_s_full'], child_state['alive_mask'])
+        children_fc2 = self._forward_children_fc2(
+            fc2_hatc_model,
+            fc2_lnk_model,
+            child_state['children_s_full'],
+            child_state['alive_mask'],
+        )
         children_policy = self._forward_children_policy(
             pv_model,
             child_state['children_s_full'],
@@ -1091,8 +1117,13 @@ class FC2Pipeline:
             'loss_total': total_loss,
         }
 
-    def loss(self, fc2_model: torch.nn.Module, pv_model: torch.nn.Module):
-        outputs = self.forward(fc2_model, pv_model)
+    def loss(
+        self,
+        fc2_hatc_model: torch.nn.Module,
+        fc2_lnk_model: torch.nn.Module,
+        pv_model: torch.nn.Module,
+    ):
+        outputs = self.forward(fc2_hatc_model, fc2_lnk_model, pv_model)
         outputs['diagnostics'] = {
             'parent_hatc': compute_fit_stats_t(outputs['parent']['macro_actual']['hatc'], outputs['parent']['hatc_pred']),
             'parent_lnk': compute_fit_stats_t(outputs['parent']['macro_actual']['lnk'], outputs['parent']['lnk_pred']),

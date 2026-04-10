@@ -7,7 +7,8 @@ Outputs:
 - checkpoints/episode0_policy_value.pt
 - checkpoints/episode0_policy_value_q.pt
 - checkpoints/episode0_policy_value_pvbp.pt
-- checkpoints/episode0_fc2.pt (if trained)
+- checkpoints/episode0_fc2_hatc.pt (if trained)
+- checkpoints/episode0_fc2_lnk.pt (if trained)
 - data/outputs/episode0_stage_sdf1.pkl
 - data/outputs/episode0_stage_pv.pkl
 - data/outputs/episode0_stage_sdf2.pkl
@@ -28,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
 from config import Config, HyperParams  # noqa: E402
-from models import SDFFC1Combined, PolicyValueModel, FC2Model  # noqa: E402
+from models import SDFFC1Combined, PolicyValueModel, FC2HatcModel, FC2LnkModel  # noqa: E402
 from losses import P0Loss, PILoss  # noqa: E402
 from training.episode import Episode  # noqa: E402
 from data.simulate_ts import SimulateTS  # noqa: E402
@@ -51,8 +52,13 @@ def build_models(device: torch.device):
             w_hidden_dims=Config.SDF_HIDDEN_DIMS,
         ).to(device),
         "policy_value": PolicyValueModel().to(device),
-        "fc2": FC2Model(
+        "fc2_hatc": FC2HatcModel(
             input_dim=Config.FC2_INPUT_DIM,
+            hidden_dims=Config.FC2_HIDDEN_DIMS,
+            quantile_num=Config.QUANTILE_NUM,
+        ).to(device),
+        "fc2_lnk": FC2LnkModel(
+            input_dim=Config.FC2_INPUT_DIM + Config.QUANTILE_NUM,
             hidden_dims=Config.FC2_HIDDEN_DIMS,
             quantile_num=Config.QUANTILE_NUM,
         ).to(device),
@@ -127,8 +133,10 @@ def save_models(models, episode_idx: int = 0):
     torch.save(models["policy_value"].state_dict(), ROOT / "checkpoints" / f"episode{episode_idx}_policy_value.pt")
     torch.save(models["policy_value"].q_model.state_dict(), ROOT / "checkpoints" / f"episode{episode_idx}_policy_value_q.pt")
     torch.save(models["policy_value"].pvbp_model.state_dict(), ROOT / "checkpoints" / f"episode{episode_idx}_policy_value_pvbp.pt")
-    if models.get("fc2") is not None:
-        torch.save(models["fc2"].state_dict(), ROOT / "checkpoints" / f"episode{episode_idx}_fc2.pt")
+    if models.get("fc2_hatc") is not None:
+        torch.save(models["fc2_hatc"].state_dict(), ROOT / "checkpoints" / f"episode{episode_idx}_fc2_hatc.pt")
+    if models.get("fc2_lnk") is not None:
+        torch.save(models["fc2_lnk"].state_dict(), ROOT / "checkpoints" / f"episode{episode_idx}_fc2_lnk.pt")
 
 
 def save_stage_df(episode_idx: int, name: str, df_firm: pd.DataFrame = None, df_macro: pd.DataFrame = None, df_sdf: pd.DataFrame = None):

@@ -10,7 +10,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from config import Config, HyperParams
-from models import SDFFC1Combined, PolicyValueModel, FC2Model
+from models import SDFFC1Combined, PolicyValueModel, FC2HatcModel, FC2LnkModel
 from losses import P0Loss, PILoss
 
 
@@ -41,8 +41,13 @@ def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ck
             w_hidden_dims=Config.SDF_HIDDEN_DIMS,
         ).to(device),
         "policy_value": PolicyValueModel().to(device),
-        "fc2": FC2Model(
+        "fc2_hatc": FC2HatcModel(
             input_dim=Config.FC2_INPUT_DIM,
+            hidden_dims=Config.FC2_HIDDEN_DIMS,
+            quantile_num=Config.QUANTILE_NUM,
+        ).to(device),
+        "fc2_lnk": FC2LnkModel(
+            input_dim=Config.FC2_INPUT_DIM + Config.QUANTILE_NUM,
             hidden_dims=Config.FC2_HIDDEN_DIMS,
             quantile_num=Config.QUANTILE_NUM,
         ).to(device),
@@ -54,7 +59,8 @@ def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ck
         mapping = {
             "sdf_fc1": "sdf_fc1",
             "policy_value": "policy_value",
-            "fc2": "fc2",
+            "fc2_hatc": "fc2_hatc",
+            "fc2_lnk": "fc2_lnk",
         }
         for key, stem in mapping.items():
             if key == "policy_value":
@@ -81,6 +87,48 @@ def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ck
                         print(f"[build_models] loaded {merged}")
                 else:
                     print(f"[build_models] skip missing ckpt: {split_q} / {split_pvbp} / {merged}")
+            elif key in {"fc2_hatc", "fc2_lnk"}:
+                ckpt_path = ckpt_dir / f"{prefix}{stem}.pt"
+                legacy_path = ckpt_dir / f"{prefix}fc2.pt"
+                if ckpt_path.exists():
+                    state = torch.load(ckpt_path, map_location=device)
+                    try:
+                        models[key].load_state_dict(state, strict=strict)
+                        print(f"[build_models] loaded {ckpt_path}")
+                    except RuntimeError as exc:
+                        print(f"[build_models] skip incompatible ckpt: {ckpt_path} ({exc})")
+                elif legacy_path.exists():
+                    state = torch.load(legacy_path, map_location=device)
+                    if key == "fc2_hatc":
+                        trunk_prefix = "hatc_model.trunk."
+                        head_prefix = "hatc_model.head."
+                        legacy_trunk_prefix = "hatc_trunk."
+                        legacy_head_prefix = "hatc_head."
+                    else:
+                        trunk_prefix = "lnk_model.trunk."
+                        head_prefix = "lnk_model.head."
+                        legacy_trunk_prefix = "lnk_trunk."
+                        legacy_head_prefix = "lnk_head."
+                    mapped = {}
+                    for k, v in state.items():
+                        if k.startswith(legacy_trunk_prefix):
+                            mapped["trunk." + k[len(legacy_trunk_prefix):]] = v
+                        elif k.startswith(legacy_head_prefix):
+                            mapped["head." + k[len(legacy_head_prefix):]] = v
+                        elif k.startswith(trunk_prefix):
+                            mapped["trunk." + k[len(trunk_prefix):]] = v
+                        elif k.startswith(head_prefix):
+                            mapped["head." + k[len(head_prefix):]] = v
+                    if mapped:
+                        try:
+                            models[key].load_state_dict(mapped, strict=strict)
+                            print(f"[build_models] loaded legacy split from {legacy_path} -> {key}")
+                        except RuntimeError as exc:
+                            print(f"[build_models] skip incompatible legacy fc2 ckpt: {legacy_path} ({exc})")
+                    else:
+                        print(f"[build_models] skip legacy fc2 ckpt without split keys: {legacy_path}")
+                else:
+                    print(f"[build_models] skip missing ckpt: {ckpt_path} / {legacy_path}")
             else:
                 ckpt_path = ckpt_dir / f"{prefix}{stem}.pt"
                 if ckpt_path.exists():
@@ -138,6 +186,12 @@ def build_optimizers(models, hyperparams: Optional[HyperParams] = None):
                 weight_decay=hp.pvbp_weight_decay,
             )
         elif name == "fc2":
+            opts[name] = torch.optim.AdamW(
+                model.parameters(),
+                lr=hp.fc2_lr,
+                weight_decay=hp.fc2_weight_decay,
+            )
+        elif name in {"fc2_hatc", "fc2_lnk"}:
             opts[name] = torch.optim.AdamW(
                 model.parameters(),
                 lr=hp.fc2_lr,
@@ -233,7 +287,10 @@ def save_models(models, episode: int, base_dir: Path, tag: Optional[str] = None)
     torch.save(models["policy_value"].state_dict(), base_dir / "checkpoints" / f"{prefix}_policy_value.pt")
     torch.save(models["policy_value"].q_model.state_dict(), base_dir / "checkpoints" / f"{prefix}_policy_value_q.pt")
     torch.save(models["policy_value"].pvbp_model.state_dict(), base_dir / "checkpoints" / f"{prefix}_policy_value_pvbp.pt")
-    torch.save(models["fc2"].state_dict(), base_dir / "checkpoints" / f"{prefix}_fc2.pt")
+    if "fc2_hatc" in models:
+        torch.save(models["fc2_hatc"].state_dict(), base_dir / "checkpoints" / f"{prefix}_fc2_hatc.pt")
+    if "fc2_lnk" in models:
+        torch.save(models["fc2_lnk"].state_dict(), base_dir / "checkpoints" / f"{prefix}_fc2_lnk.pt")
 
 
 def save_stage_df(ep: int, name: str, base_dir: Path, df_firm: pd.DataFrame = None, df_macro: pd.DataFrame = None, df_sdf: pd.DataFrame = None):
@@ -1040,341 +1097,6 @@ def plot_distributions(
     plt.ylabel("count")
     plt.tight_layout()
     plt.savefig(figs_dir / f"{prefix}_bp_hist.png", dpi=150)
-    plt.close()
-
-
-def plot_macro_series(ep: int, df_macro: pd.DataFrame, base_dir: Path):
-    if df_macro is None or df_macro.empty:
-        return
-
-    def _pick_col(df: pd.DataFrame, candidates):
-        for c in candidates:
-            if c in df.columns:
-                return c
-        return None
-
-    def _fit_stats(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-        mask = np.isfinite(y_true) & np.isfinite(y_pred)
-        if mask.sum() < 2:
-            return {}
-        yt = y_true[mask]
-        yp = y_pred[mask]
-        resid = yt - yp
-        yt_mean = float(yt.mean())
-        yp_mean = float(yp.mean())
-        y_std = float(np.std(yt))
-        p_std = float(np.std(yp))
-        sst = float(np.sum((yt - yt_mean) ** 2))
-        sse = float(np.sum(resid ** 2))
-        out = {
-            "r2": float("nan") if sst <= 1e-12 else float(1.0 - sse / sst),
-            "rmse": float(np.sqrt(np.mean(resid ** 2))),
-            "mae": float(np.mean(np.abs(resid))),
-            "mean_resid": float(np.mean(resid)),
-            "std_ratio": float(p_std / y_std) if y_std > 1e-12 else float("nan"),
-            "corr": float("nan"),
-            "slope": float("nan"),
-            "intercept": float("nan"),
-        }
-        if y_std > 1e-12 and p_std > 1e-12:
-            out["corr"] = float(np.corrcoef(yp, yt)[0, 1])
-        x_centered = yp - yp_mean
-        denom = float(np.sum(x_centered ** 2))
-        if denom > 1e-12:
-            slope = float(np.sum(x_centered * (yt - yt_mean)) / denom)
-            out["slope"] = slope
-            out["intercept"] = float(yt_mean - slope * yp_mean)
-        return out
-
-    def _plot_scatter_with_identity(
-        x_true: np.ndarray,
-        y_pred: np.ndarray,
-        title: str,
-        xlabel: str,
-        ylabel: str,
-        save_path: Path,
-        branch_vals: np.ndarray | None = None,
-        stats_text: str | None = None,
-    ) -> None:
-        mask = np.isfinite(x_true) & np.isfinite(y_pred)
-        if mask.sum() < 2:
-            return
-        x = x_true[mask]
-        y = y_pred[mask]
-        b = branch_vals[mask] if branch_vals is not None else None
-        lo = float(min(np.min(x), np.min(y)))
-        hi = float(max(np.max(x), np.max(y)))
-        if not np.isfinite(lo) or not np.isfinite(hi):
-            return
-        if hi - lo < 1e-8:
-            hi = lo + 1e-4
-        pad = 0.05 * (hi - lo)
-        lo -= pad
-        hi += pad
-        fig, ax = plt.subplots(figsize=(6.2, 6.0))
-        if b is not None and len(b) == len(x):
-            unique_branch = sorted(pd.unique(pd.Series(b).dropna()))
-            if unique_branch:
-                for br in unique_branch:
-                    br_mask = (b == br)
-                    if np.any(br_mask):
-                        br_r2 = _fit_stats(x[br_mask], y[br_mask]).get("r2", float("nan"))
-                        br_label = f"branch={int(br)}" if float(br).is_integer() else f"branch={br}"
-                        if np.isfinite(br_r2):
-                            br_label += f" (R2={br_r2:.4f})"
-                        ax.scatter(
-                            x[br_mask],
-                            y[br_mask],
-                            s=9,
-                            alpha=0.28,
-                            edgecolors="none",
-                            label=br_label
-                        )
-            else:
-                ax.scatter(x, y, s=8, alpha=0.25, edgecolors="none", label="samples")
-        else:
-            ax.scatter(x, y, s=8, alpha=0.25, edgecolors="none", label="samples")
-        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.5, label="y=x")
-        ax.set_xlim(lo, hi)
-        ax.set_ylim(lo, hi)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        if stats_text:
-            fig.text(0.5, 0.93, stats_text, ha="center", va="top", fontsize=9)
-        ax.legend(loc="upper left", frameon=True)
-        fig.tight_layout(rect=[0, 0, 1, 0.90 if stats_text else 0.96])
-        fig.savefig(save_path, dpi=150)
-        plt.close(fig)
-
-    def _plot_x_response(
-        x_vals: np.ndarray,
-        y_true: np.ndarray,
-        y_pred: np.ndarray,
-        title: str,
-        ylabel: str,
-        save_path: Path,
-    ) -> None:
-        mask = np.isfinite(x_vals) & np.isfinite(y_true) & np.isfinite(y_pred)
-        if mask.sum() < 5:
-            return
-        x = x_vals[mask]
-        yt = y_true[mask]
-        yp = y_pred[mask]
-        order = np.argsort(x)
-        x = x[order]
-        yt = yt[order]
-        yp = yp[order]
-        if len(x) >= 20:
-            bins = min(20, max(5, len(x) // 200))
-            edges = np.quantile(x, np.linspace(0.0, 1.0, bins + 1))
-            x_mid = []
-            yt_mid = []
-            yp_mid = []
-            for lo, hi in zip(edges[:-1], edges[1:]):
-                if hi <= lo:
-                    continue
-                mk = (x >= lo) & (x <= hi if hi == edges[-1] else x < hi)
-                if mk.sum() < 3:
-                    continue
-                x_mid.append(float(x[mk].mean()))
-                yt_mid.append(float(yt[mk].mean()))
-                yp_mid.append(float(yp[mk].mean()))
-            if len(x_mid) >= 3:
-                x = np.asarray(x_mid)
-                yt = np.asarray(yt_mid)
-                yp = np.asarray(yp_mid)
-
-        fig, ax = plt.subplots(figsize=(6.2, 4.2))
-        ax.plot(x, yt, color="tab:blue", linewidth=2.0, label="Hatc true")
-        ax.plot(x, yp, color="tab:orange", linewidth=2.0, linestyle="--", label="hatcf pred")
-        ax.set_title(title)
-        ax.set_xlabel("x")
-        ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.25)
-        ax.legend(frameon=False)
-        fig.tight_layout()
-        fig.savefig(save_path, dpi=150)
-        plt.close(fig)
-
-    figs_dir = base_dir / "experiments" / "figs"
-    use_df = df_macro
-    branch_arr = use_df["branch"].to_numpy() if "branch" in use_df.columns else None
-
-    hatc_true_col = _pick_col(use_df, ["Hatc", "hatc"])
-    lnk_true_col = _pick_col(use_df, ["LnK", "lnk"])
-    hatc_pred_col = _pick_col(use_df, ["hatcf", "Hatcf"])
-    lnk_pred_col = _pick_col(use_df, ["lnkf", "LnKF"])
-
-    if hatc_true_col is None or lnk_true_col is None:
-        return
-
-    hatc_stats = {}
-    lnk_stats = {}
-    if hatc_pred_col is not None:
-        hatc_stats = _fit_stats(use_df[hatc_true_col].to_numpy(), use_df[hatc_pred_col].to_numpy())
-    if lnk_pred_col is not None:
-        lnk_stats = _fit_stats(use_df[lnk_true_col].to_numpy(), use_df[lnk_pred_col].to_numpy())
-
-    if hatc_pred_col is not None:
-        title_hatc = f"EP{ep} Hatc pred vs true"
-        stats_hatc = None
-        if hatc_stats:
-            stats_hatc = (
-                f"R2={hatc_stats.get('r2', float('nan')):.4f} | "
-                f"corr={hatc_stats.get('corr', float('nan')):.4f} | "
-                f"slope={hatc_stats.get('slope', float('nan')):.4f} | "
-                f"stdr={hatc_stats.get('std_ratio', float('nan')):.4f}"
-            )
-        _plot_scatter_with_identity(
-            use_df[hatc_true_col].to_numpy(),
-            use_df[hatc_pred_col].to_numpy(),
-            title_hatc,
-            "Hatc true",
-            "Hatc pred",
-            figs_dir / f"ep{ep}_macro_hatc.png",
-            branch_vals=branch_arr,
-            stats_text=stats_hatc,
-        )
-        if "branch" in use_df.columns:
-            branch01_df = use_df[use_df["branch"].isin([0, 1])]
-            if len(branch01_df) >= 2:
-                branch01_stats = _fit_stats(
-                    branch01_df[hatc_true_col].to_numpy(),
-                    branch01_df[hatc_pred_col].to_numpy(),
-                )
-                stats_hatc_b01 = None
-                if branch01_stats:
-                    stats_hatc_b01 = (
-                        f"R2={branch01_stats.get('r2', float('nan')):.4f} | "
-                        f"corr={branch01_stats.get('corr', float('nan')):.4f} | "
-                        f"slope={branch01_stats.get('slope', float('nan')):.4f} | "
-                        f"stdr={branch01_stats.get('std_ratio', float('nan')):.4f}"
-                    )
-                _plot_scatter_with_identity(
-                    branch01_df[hatc_true_col].to_numpy(),
-                    branch01_df[hatc_pred_col].to_numpy(),
-                    f"EP{ep} Hatc pred vs true (branch 0/1)",
-                    "Hatc true",
-                    "Hatc pred",
-                    figs_dir / f"ep{ep}_macro_hatc_branch01.png",
-                    branch_vals=branch01_df["branch"].to_numpy(),
-                    stats_text=stats_hatc_b01,
-                )
-        if "x" in use_df.columns:
-            _plot_x_response(
-                use_df["x"].to_numpy(),
-                use_df[hatc_true_col].to_numpy(),
-                use_df[hatc_pred_col].to_numpy(),
-                f"EP{ep} x response: Hatc true vs hatcf pred",
-                "macro consumption object",
-                figs_dir / f"ep{ep}_macro_hatc_vs_x.png",
-            )
-
-    if lnk_pred_col is not None:
-        title_lnk = f"EP{ep} LnK pred vs true"
-        stats_lnk = None
-        if lnk_stats:
-            stats_lnk = (
-                f"R2={lnk_stats.get('r2', float('nan')):.4f} | "
-                f"corr={lnk_stats.get('corr', float('nan')):.4f} | "
-                f"slope={lnk_stats.get('slope', float('nan')):.4f} | "
-                f"stdr={lnk_stats.get('std_ratio', float('nan')):.4f}"
-            )
-        _plot_scatter_with_identity(
-            use_df[lnk_true_col].to_numpy(),
-            use_df[lnk_pred_col].to_numpy(),
-            title_lnk,
-            "LnK true",
-            "LnK pred",
-            figs_dir / f"ep{ep}_macro_lnk.png",
-            branch_vals=branch_arr,
-            stats_text=stats_lnk,
-        )
-        if "branch" in use_df.columns:
-            branch01_df = use_df[use_df["branch"].isin([0, 1])]
-            if len(branch01_df) >= 2:
-                branch01_stats = _fit_stats(
-                    branch01_df[lnk_true_col].to_numpy(),
-                    branch01_df[lnk_pred_col].to_numpy(),
-                )
-                stats_lnk_b01 = None
-                if branch01_stats:
-                    stats_lnk_b01 = (
-                        f"R2={branch01_stats.get('r2', float('nan')):.4f} | "
-                        f"corr={branch01_stats.get('corr', float('nan')):.4f} | "
-                        f"slope={branch01_stats.get('slope', float('nan')):.4f} | "
-                        f"stdr={branch01_stats.get('std_ratio', float('nan')):.4f}"
-                    )
-                _plot_scatter_with_identity(
-                    branch01_df[lnk_true_col].to_numpy(),
-                    branch01_df[lnk_pred_col].to_numpy(),
-                    f"EP{ep} LnK pred vs true (branch 0/1)",
-                    "LnK true",
-                    "LnK pred",
-                    figs_dir / f"ep{ep}_macro_lnk_branch01.png",
-                    branch_vals=branch01_df["branch"].to_numpy(),
-                    stats_text=stats_lnk_b01,
-                )
-        if "x" in use_df.columns:
-            _plot_x_response(
-                use_df["x"].to_numpy(),
-                use_df[lnk_true_col].to_numpy(),
-                use_df[lnk_pred_col].to_numpy(),
-                f"EP{ep} x response: LnK true vs lnkf pred",
-                "macro capital object",
-                figs_dir / f"ep{ep}_macro_lnk_vs_x.png",
-            )
-
-    # Delta 图仍按 t 聚合均值构造，但使用全样本口径（不筛 branch）
-    if "t" not in use_df.columns:
-        return
-    series_hatc = use_df.groupby("t")[hatc_true_col].mean().reset_index().rename(columns={hatc_true_col: "hatc_true"})
-    series_lnk = use_df.groupby("t")[lnk_true_col].mean().reset_index().rename(columns={lnk_true_col: "lnk_true"})
-    series = pd.merge(series_hatc, series_lnk, on="t", how="inner").sort_values("t").reset_index(drop=True)
-    if hatc_pred_col is not None:
-        s_hatc_pred = use_df.groupby("t")[hatc_pred_col].mean().reset_index().rename(columns={hatc_pred_col: "hatc_pred"})
-        series = pd.merge(series, s_hatc_pred, on="t", how="left")
-    if lnk_pred_col is not None:
-        s_lnk_pred = use_df.groupby("t")[lnk_pred_col].mean().reset_index().rename(columns={lnk_pred_col: "lnk_pred"})
-        series = pd.merge(series, s_lnk_pred, on="t", how="left")
-
-    # Delta lnK_t = lnK_t - lnK_{t-1}
-    series["d_lnk_true"] = series["lnk_true"].diff()
-    if "lnk_pred" in series.columns:
-        series["d_lnk_pred"] = series["lnk_pred"].diff()
-    d_lnk = series.dropna(subset=["d_lnk_true"])
-
-    plt.figure(figsize=(6, 3))
-    plt.plot(d_lnk["t"], d_lnk["d_lnk_true"], marker="o", label="Delta LnK true")
-    if "d_lnk_pred" in d_lnk.columns:
-        plt.plot(d_lnk["t"], d_lnk["d_lnk_pred"], marker="x", linestyle="--", label="Delta LnK pred")
-    plt.xlabel("t")
-    plt.ylabel("Delta LnK")
-    plt.title(f"EP{ep} Delta LnK vs t")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(figs_dir / f"ep{ep}_macro_delta_lnk.png", dpi=150)
-    plt.close()
-
-    # Delta lnC_t with lnC_t = Hatc_t + LnK_t
-    series["lnc_true"] = series["hatc_true"] + series["lnk_true"]
-    series["d_lnc_true"] = series["lnc_true"].diff()
-    if "hatc_pred" in series.columns and "lnk_pred" in series.columns:
-        series["lnc_pred"] = series["hatc_pred"] + series["lnk_pred"]
-        series["d_lnc_pred"] = series["lnc_pred"].diff()
-    d_lnc = series.dropna(subset=["d_lnc_true"])
-
-    plt.figure(figsize=(6, 3))
-    plt.plot(d_lnc["t"], d_lnc["d_lnc_true"], marker="o", label="Delta lnC true")
-    if "d_lnc_pred" in d_lnc.columns:
-        plt.plot(d_lnc["t"], d_lnc["d_lnc_pred"], marker="x", linestyle="--", label="Delta lnC pred")
-    plt.xlabel("t")
-    plt.ylabel("Delta lnC (Hatc + LnK)")
-    plt.title(f"EP{ep} Delta lnC vs t")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(figs_dir / f"ep{ep}_macro_delta_lnc.png", dpi=150)
     plt.close()
 
 

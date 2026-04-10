@@ -13,7 +13,8 @@ from config import Config, HyperParams
 from models import (
     SDFFC1Combined,
     PolicyValueModel,
-    FC2Model
+    FC2HatcModel,
+    FC2LnkModel,
 )
 from training import Trainer
 from utils import setup_logger, CheckpointManager
@@ -105,11 +106,16 @@ def build_models(config, hyperparams, device):
         n_layers=hyperparams.n_layers
     ).to(device)
     
-    # FC2 Model (optional)
-    models['fc2'] = FC2Model(
-        n_quantiles=config.FC2_N_QUANTILES,
-        hidden_dim=hyperparams.hidden_dim,
-        n_layers=hyperparams.n_layers
+    # FC2 split models
+    models['fc2_hatc'] = FC2HatcModel(
+        input_dim=config.FC2_INPUT_DIM,
+        hidden_dims=[hyperparams.hidden_dim] * hyperparams.n_layers,
+        quantile_num=config.QUANTILE_NUM,
+    ).to(device)
+    models['fc2_lnk'] = FC2LnkModel(
+        input_dim=config.FC2_INPUT_DIM + config.QUANTILE_NUM,
+        hidden_dims=[hyperparams.hidden_dim] * hyperparams.n_layers,
+        quantile_num=config.QUANTILE_NUM,
     ).to(device)
     
     return models

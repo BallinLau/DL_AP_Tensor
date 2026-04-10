@@ -102,7 +102,9 @@ class Episode:
             models: 模型字典
                 - 'sdf_fc1': SDFFC1Combined
                 - 'policy_value': PolicyValueModel
-                - 'fc2': FC2Model (可选)
+                - 'fc2_hatc': FC2HatcModel (可选)
+                - 'fc2_lnk': FC2LnkModel (可选)
+                - 'fc2': FC2Model 兼容旧接口（可选）
             optimizers: 优化器字典
             config: 配置类
             hyperparams: 超参数
@@ -176,8 +178,52 @@ class Episode:
             'p0': P0Loss(),
             'pi': PILoss(),
             'q': QLoss(),
-            'fc2': FC2Loss() if 'fc2' in self.models else None
+            'fc2': FC2Loss() if self._has_fc2_models() else None
         }
+
+    def _get_fc2_models(self) -> Tuple[Optional[nn.Module], Optional[nn.Module]]:
+        hatc_model = self.models.get('fc2_hatc')
+        lnk_model = self.models.get('fc2_lnk')
+        if hatc_model is not None and lnk_model is not None:
+            return hatc_model, lnk_model
+        return None, None
+
+    def _has_fc2_models(self) -> bool:
+        hatc_model, lnk_model = self._get_fc2_models()
+        return hatc_model is not None and lnk_model is not None
+
+    def _get_fc2_model_keys(self) -> List[str]:
+        if 'fc2_hatc' in self.models and 'fc2_lnk' in self.models:
+            return ['fc2_hatc', 'fc2_lnk']
+        return []
+
+    def _get_fc2_optimizer_keys(self) -> List[str]:
+        keys = []
+        if 'fc2_hatc' in self.optimizers and 'fc2_lnk' in self.optimizers:
+            keys.extend(['fc2_hatc', 'fc2_lnk'])
+        return keys
+
+    def _get_fc2_scheduler_keys(self) -> List[str]:
+        keys = []
+        if 'fc2_hatc' in self.lr_schedulers and 'fc2_lnk' in self.lr_schedulers:
+            keys.extend(['fc2_hatc', 'fc2_lnk'])
+        return keys
+
+    def _get_fc2_lr(self) -> float:
+        for key in self._get_fc2_scheduler_keys():
+            scheduler = self.lr_schedulers.get(key)
+            if scheduler is not None:
+                return float(scheduler.get_lr())
+        return 0.0
+
+    def _expand_train_model_keys(self, train_modules: List[str]) -> List[str]:
+        expanded: List[str] = []
+        for name in train_modules:
+            if name == 'fc2':
+                expanded.extend(self._get_fc2_model_keys())
+            elif name in self.models:
+                expanded.append(name)
+        return list(dict.fromkeys(expanded))
 
     @staticmethod
     def _macro_fit_stats_np(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
@@ -1315,6 +1361,9 @@ class Episode:
     ) -> List[str]:
         keys: List[str] = []
         for name in train_modules:
+            if name == 'fc2':
+                keys.extend(self._get_fc2_optimizer_keys())
+                continue
             if name != 'policy_value':
                 if name in self.optimizers:
                     keys.append(name)
@@ -1586,7 +1635,7 @@ class Episode:
         losses = {}
         
         # 设置训练模式
-        for name in train_modules:
+        for name in self._expand_train_model_keys(train_modules):
             if name in self.models:
                 self.models[name].train()
         
@@ -1628,7 +1677,7 @@ class Episode:
                 total_loss = total_loss + self.weight_scheduler['q'] * q_loss
             
             # FC2 Loss
-            if 'fc2' in train_modules and 'fc2' in self.models:
+            if 'fc2' in train_modules and self._has_fc2_models():
                 if self.episode_id > 0 and isinstance(batch, pd.DataFrame):
                     batch.to_csv(f"fc2_input_episode{self.episode_id}_ori.csv", index=False)
                     batch = convert_tree_fast(batch)
@@ -1647,16 +1696,21 @@ class Episode:
                 total_loss.backward()
                 
                 # 梯度保护
-                for name in train_modules:
+                for name in self._expand_train_model_keys(train_modules):
                     if name in self.models:
                         grad_norm, had_nan = gradient_protection(
                             self.models[name].parameters(),
                             max_norm=self.hyperparams.max_grad_norm
                         )
                         losses[f'{name}_grad_norm'] = grad_norm
-                        
                         if had_nan:
                             logger.warning(f"NaN gradient detected in {name}")
+
+                if 'fc2_hatc_grad_norm' in losses or 'fc2_lnk_grad_norm' in losses:
+                    losses['fc2_grad_norm'] = float(max(
+                        losses.get('fc2_hatc_grad_norm', 0.0),
+                        losses.get('fc2_lnk_grad_norm', 0.0),
+                    ))
                 
                 # 优化器步骤
                 for opt_key in active_optimizer_keys:
@@ -2745,8 +2799,8 @@ class Episode:
         """
         计算 FC2 损失（使用 FC2train2.ipynb pipeline，batch 为 DataFrame）
         """
-        model = self.models.get('fc2')
-        if model is None:
+        hatc_model, lnk_model = self._get_fc2_models()
+        if hatc_model is None or lnk_model is None:
             return torch.tensor(0.0, device=self.device)
 
         if 'policy_value' not in self.models or self.models['policy_value'] is None:
@@ -2795,7 +2849,7 @@ class Episode:
             return torch.tensor(0.0, device=self.device)
         # keep for inspection/debugging
         self._last_fc2_pipe = pipe
-        fc2_loss = pipe.loss(model, pv_model)
+        fc2_loss = pipe.loss(hatc_model, lnk_model, pv_model)
         if isinstance(fc2_loss, tuple):
             fc2_value, fc2_outputs = fc2_loss
             self._last_fc2_outputs = fc2_outputs
@@ -2856,8 +2910,8 @@ class Episode:
         return None
 
     def _compute_fc2_supervised_loss(self, batch) -> Tuple[torch.Tensor, Dict[str, float]]:
-        model = self.models.get('fc2')
-        if model is None:
+        hatc_model, lnk_model = self._get_fc2_models()
+        if hatc_model is None or lnk_model is None:
             return torch.tensor(0.0, device=self.device), {}
         pipe = self._build_fc2_pipe(batch)
         if pipe is None or pipe.macro_table is None:
@@ -2892,11 +2946,12 @@ class Episode:
         x_lnk_all = torch.cat(x_lnk_parts, dim=0)
         y_all = torch.cat(y_parts, dim=0)
 
-        pred = model({'hatc': x_hatc_all, 'lnk': x_lnk_all})
+        hatc_pred = hatc_model(x_hatc_all)
+        lnk_pred = lnk_model(x_lnk_all)
         lnk_target = y_all[:, 0:1]
         hatc_target = y_all[:, 1:2]
-        hatc_loss = nn.functional.mse_loss(pred['hatc'], hatc_target)
-        lnk_loss = nn.functional.mse_loss(pred['lnk'], lnk_target)
+        hatc_loss = nn.functional.mse_loss(hatc_pred, hatc_target)
+        lnk_loss = nn.functional.mse_loss(lnk_pred, lnk_target)
 
         hatc_w = float(getattr(self.hyperparams, 'fc2_supervised_hatc_weight', 1.0))
         lnk_w = float(getattr(self.hyperparams, 'fc2_supervised_lnk_weight', 1.0))
@@ -2909,8 +2964,8 @@ class Episode:
                 'fc2_pretrain_lnk_loss': float(lnk_loss.item()),
             }
             for prefix, y_true, y_pred in (
-                ('fc2_pretrain_hatc', hatc_target, pred['hatc']),
-                ('fc2_pretrain_lnk', lnk_target, pred['lnk']),
+                ('fc2_pretrain_hatc', hatc_target, hatc_pred),
+                ('fc2_pretrain_lnk', lnk_target, lnk_pred),
             ):
                 stats = compute_fit_stats_t(y_true, y_pred)
                 for k, v in stats.items():
@@ -2927,12 +2982,16 @@ class Episode:
                 self.loss_history[k] = []
             self.loss_history[k].append(v)
 
-    def _build_fc2_supervised_dataset(self) -> Optional[TensorDataset]:
-        if not self._use_tensor_pipeline() or self.tensor_firm is None or self.tensor_macro is None:
+    def _build_fc2_supervised_dataset_from_tables(
+        self,
+        firm_table: Optional[TensorTable],
+        macro_table: Optional[TensorTable],
+    ) -> Optional[TensorDataset]:
+        if firm_table is None or macro_table is None:
             return None
         pipe = FC2LossPipe(
-            firm_table=self.tensor_firm,
-            macro_table=self.tensor_macro,
+            firm_table=firm_table,
+            macro_table=macro_table,
             pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 10000),
             device=self.device,
         )
@@ -2965,6 +3024,80 @@ class Episode:
         x_lnk_all = torch.cat(x_lnk_parts, dim=0)
         y_all = torch.cat(y_parts, dim=0)
         return TensorDataset(x_hatc_all.detach(), x_lnk_all.detach(), y_all.detach())
+
+    def _build_fc2_supervised_dataset(self) -> Optional[TensorDataset]:
+        if not self._use_tensor_pipeline() or self.tensor_firm is None or self.tensor_macro is None:
+            return None
+        return self._build_fc2_supervised_dataset_from_tables(self.tensor_firm, self.tensor_macro)
+
+    def _evaluate_fc2_dataset_fit(
+        self,
+        sup_dataset: Optional[TensorDataset],
+        prefix: str,
+    ) -> Optional[Dict[str, float]]:
+        hatc_model, lnk_model = self._get_fc2_models()
+        if hatc_model is None or lnk_model is None:
+            return None
+        if sup_dataset is None or len(sup_dataset) == 0:
+            return None
+
+        x_hatc_all, x_lnk_all, y_all = sup_dataset.tensors
+        hatc_target = y_all[:, 1:2]
+        lnk_target = y_all[:, 0:1]
+        with torch.no_grad():
+            hatc_pred = hatc_model(x_hatc_all)
+            lnk_pred = lnk_model(x_lnk_all)
+
+        diag: Dict[str, float] = {
+            f'{prefix}_hatc_loss': float(nn.functional.mse_loss(hatc_pred, hatc_target).item()),
+            f'{prefix}_lnk_loss': float(nn.functional.mse_loss(lnk_pred, lnk_target).item()),
+        }
+        for target_name, y_true, y_pred in (
+            ('hatc', hatc_target, hatc_pred),
+            ('lnk', lnk_target, lnk_pred),
+        ):
+            stats = compute_fit_stats_t(y_true, y_pred)
+            for k, v in stats.items():
+                try:
+                    diag[f'{prefix}_{target_name}_{k}'] = float(v)
+                except (TypeError, ValueError):
+                    continue
+        return diag
+
+    def _evaluate_fc2_fit_after_train(
+        self,
+        sup_dataset: Optional[TensorDataset] = None,
+    ) -> Optional[Dict[str, float]]:
+        if sup_dataset is None:
+            sup_dataset = self._build_fc2_supervised_dataset()
+        return self._evaluate_fc2_dataset_fit(sup_dataset, prefix='fc2_fit_after_train')
+
+    def _compute_fc2_outer_after_resim(
+        self,
+        n_paths: int,
+        group_size: int,
+        n_branches: int,
+        horizon: int,
+        simulate_kwargs: Dict,
+    ) -> Optional[Dict[str, float]]:
+        if not bool(getattr(self.hyperparams, 'fc2_as_main_macro_state', False)):
+            return None
+        if not self._has_fc2_models():
+            return None
+        sim_kwargs = dict(simulate_kwargs)
+        sim_kwargs.setdefault('fc2_as_main_macro_state', True)
+        simulator = SimulateTS(
+            models=self.models,
+            config=self.config,
+            n_paths=n_paths,
+            group_size=group_size,
+            branch_num=n_branches,
+            horizon=int(horizon),
+            **sim_kwargs
+        )
+        out: TensorSimulationOutput = simulator.simulate_tensor()
+        sup_dataset = self._build_fc2_supervised_dataset_from_tables(out.firm, out.macro)
+        return self._evaluate_fc2_dataset_fit(sup_dataset, prefix='fc2_outer_after_resim')
     
     def create_batches(
         self,
@@ -3981,7 +4114,7 @@ class Episode:
         n_epochs: int,
         log_interval: int
     ) -> Optional[Dict]:
-        if 'fc2' not in self.models:
+        if not self._has_fc2_models():
             return None
         pretrain_epoch_losses = []
         epoch_losses = []
@@ -3990,11 +4123,13 @@ class Episode:
         fc2_path_batch_size = int(getattr(self.hyperparams, 'fc2_path_batch_size', 256))
         pretrain_epochs = int(getattr(self.hyperparams, 'fc2_supervised_pretrain_epochs', 0))
         pretrain_only = bool(getattr(self.hyperparams, 'fc2_supervised_pretrain_only', False))
-        fc2_optimizer = self.optimizers.get('fc2')
+        hatc_model, lnk_model = self._get_fc2_models()
+        fc2_optimizer_keys = self._get_fc2_optimizer_keys()
+        sup_dataset: Optional[TensorDataset] = None
 
         if (
             pretrain_epochs > 0
-            and fc2_optimizer is not None
+            and fc2_optimizer_keys
             and self._use_tensor_pipeline()
             and self.tensor_firm is not None
         ):
@@ -4010,26 +4145,36 @@ class Episode:
             for _ in tqdm(range(pretrain_epochs), desc='FC2 Supervised Pretrain'):
                 batch_losses = []
                 for x_hatc_batch, x_lnk_batch, y_batch in sup_loader:
-                    fc2_optimizer.zero_grad(set_to_none=True)
-                    pred = self.models['fc2']({'hatc': x_hatc_batch, 'lnk': x_lnk_batch})
+                    for opt_key in fc2_optimizer_keys:
+                        self.optimizers[opt_key].zero_grad(set_to_none=True)
+                    hatc_pred = hatc_model(x_hatc_batch)
+                    lnk_pred = lnk_model(x_lnk_batch)
                     lnk_target = y_batch[:, 0:1]
                     hatc_target = y_batch[:, 1:2]
-                    hatc_loss = nn.functional.mse_loss(pred['hatc'], hatc_target)
-                    lnk_loss = nn.functional.mse_loss(pred['lnk'], lnk_target)
+                    hatc_loss = nn.functional.mse_loss(hatc_pred, hatc_target)
+                    lnk_loss = nn.functional.mse_loss(lnk_pred, lnk_target)
                     hatc_w = float(getattr(self.hyperparams, 'fc2_supervised_hatc_weight', 1.0))
                     lnk_w = float(getattr(self.hyperparams, 'fc2_supervised_lnk_weight', 1.0))
                     sup_loss = hatc_w * hatc_loss + lnk_w * lnk_loss
                     sup_loss.backward()
-                    grad_norm, had_nan = gradient_protection(
-                        self.models['fc2'].parameters(),
+                    hatc_grad_norm, hatc_had_nan = gradient_protection(
+                        hatc_model.parameters(),
                         max_norm=getattr(self.hyperparams, 'fc2_max_grad_norm', self.hyperparams.max_grad_norm)
                     )
-                    if had_nan:
-                        logger.warning("NaN gradient detected in fc2 supervised pretrain")
-                    fc2_optimizer.step()
-                    scheduler = self.lr_schedulers.get('fc2')
-                    if scheduler is not None:
-                        scheduler.step()
+                    lnk_grad_norm, lnk_had_nan = gradient_protection(
+                        lnk_model.parameters(),
+                        max_norm=getattr(self.hyperparams, 'fc2_max_grad_norm', self.hyperparams.max_grad_norm)
+                    )
+                    if hatc_had_nan:
+                        logger.warning("NaN gradient detected in fc2_hatc supervised pretrain")
+                    if lnk_had_nan:
+                        logger.warning("NaN gradient detected in fc2_lnk supervised pretrain")
+                    for opt_key in fc2_optimizer_keys:
+                        self.optimizers[opt_key].step()
+                    for sched_key in self._get_fc2_scheduler_keys():
+                        scheduler = self.lr_schedulers.get(sched_key)
+                        if scheduler is not None:
+                            scheduler.step()
                     batch_log = {
                         'fc2_pretrain_loss': float(sup_loss.item()),
                         'fc2_pretrain_hatc_loss': float(hatc_loss.item()),
@@ -4037,8 +4182,8 @@ class Episode:
                     }
                     with torch.no_grad():
                         for prefix, y_true, y_pred in (
-                            ('fc2_pretrain_hatc', hatc_target, pred['hatc']),
-                            ('fc2_pretrain_lnk', lnk_target, pred['lnk']),
+                            ('fc2_pretrain_hatc', hatc_target, hatc_pred),
+                            ('fc2_pretrain_lnk', lnk_target, lnk_pred),
                         ):
                             stats = compute_fit_stats_t(y_true, y_pred)
                             for k, v in stats.items():
@@ -4046,7 +4191,9 @@ class Episode:
                                     batch_log[f'{prefix}_{k}'] = float(v)
                                 except (TypeError, ValueError):
                                     continue
-                    batch_log['fc2_grad_norm'] = grad_norm
+                    batch_log['fc2_hatc_grad_norm'] = hatc_grad_norm
+                    batch_log['fc2_lnk_grad_norm'] = lnk_grad_norm
+                    batch_log['fc2_grad_norm'] = float(max(hatc_grad_norm, lnk_grad_norm))
                     batch_log['total'] = float(sup_loss.item())
                     self._latest_fc2_diag = batch_log
                     self._record_manual_losses(batch_log)
@@ -4059,8 +4206,7 @@ class Episode:
                 pretrain_epoch_losses.append(epoch_loss)
                 if self.step_count % log_interval == 0:
                     avg_loss = np.mean([l['total'] for l in pretrain_epoch_losses[-log_interval:]])
-                    lr = self.lr_schedulers.get('fc2')
-                    current_lr = lr.get_lr() if lr else 0
+                    current_lr = self._get_fc2_lr()
                     logger.info(
                         "FC2 Supervised Pretrain Step %d: loss=%.6f, lr=%.2e",
                         self.step_count,
@@ -4072,12 +4218,16 @@ class Episode:
                 logger.warning("fc2_supervised_pretrain_only enabled but no supervised pretrain epochs were run")
                 return None
             final_pretrain = dict(pretrain_epoch_losses[-1])
+            fit_after_train = self._evaluate_fc2_fit_after_train(sup_dataset)
             logger.info("FC2 Supervised Pretrain Only finished: %s", final_pretrain)
-            return {
+            result = {
                 'mode': 'supervised_pretrain_only',
                 'final_losses': final_pretrain,
                 'pretrain_epoch_losses': pretrain_epoch_losses,
             }
+            if fit_after_train:
+                result['fit_after_train'] = fit_after_train
+            return result
 
         if freeze_pv and pv_model is not None:
             pv_model.freeze()
@@ -4113,8 +4263,7 @@ class Episode:
                 epoch_losses.append(epoch_loss)
                 if self.step_count % log_interval == 0:
                     avg_loss = np.mean([l['total'] for l in epoch_losses[-log_interval:]])
-                    lr = self.lr_schedulers.get('fc2')
-                    current_lr = lr.get_lr() if lr else 0
+                    current_lr = self._get_fc2_lr()
                     logger.info(
                         "FC2 Step %d: loss=%.6f, lr=%.2e",
                         self.step_count,
@@ -4137,6 +4286,9 @@ class Episode:
                 k: np.mean([l[k] for l in pretrain_epoch_losses if k in l])
                 for k in pretrain_epoch_losses[0].keys()
             }
+        fit_after_train = self._evaluate_fc2_fit_after_train(sup_dataset)
+        if fit_after_train:
+            result['fit_after_train'] = fit_after_train
         return result
 
     def _run_sdf_recon_from_macro(
@@ -4148,33 +4300,12 @@ class Episode:
         n_branches: int
     ) -> None:
         macro_df = self.df_macro
-        macro_r2_diag: Dict[str, Any] = {}
-        if self._use_tensor_pipeline() and self.tensor_macro is not None:
-            macro_r2_diag = self._macro_forecast_r2_tensor(self.tensor_macro)
-        else:
-            if (macro_df is None or macro_df.empty) and self.tensor_macro is not None:
-                macro_df = self._table_to_dataframe(self.tensor_macro)
-            if macro_df is None or macro_df.empty:
-                return
+        if (macro_df is None or macro_df.empty) and self.tensor_macro is not None:
+            macro_df = self._table_to_dataframe(self.tensor_macro)
+        if not self._use_tensor_pipeline() and (macro_df is None or macro_df.empty):
+            return
+        if macro_df is not None and not macro_df.empty:
             self.df_macro = macro_df
-            macro_r2_diag = self._macro_forecast_r2(macro_df)
-
-        if macro_r2_diag:
-            logger.info(
-                "Macro law consistency before SDF recon | n_t=%.0f, "
-                "Hatc[R2=%.6f,corr=%.6f,slope=%.6f,stdr=%.6f], "
-                "LnK[R2=%.6f,corr=%.6f,slope=%.6f,stdr=%.6f]",
-                macro_r2_diag.get('n_t', float('nan')),
-                macro_r2_diag.get('r2_hatc', float('nan')),
-                macro_r2_diag.get('corr_hatc', float('nan')),
-                macro_r2_diag.get('slope_hatc', float('nan')),
-                macro_r2_diag.get('std_ratio_hatc', float('nan')),
-                macro_r2_diag.get('r2_lnk', float('nan')),
-                macro_r2_diag.get('corr_lnk', float('nan')),
-                macro_r2_diag.get('slope_lnk', float('nan')),
-                macro_r2_diag.get('std_ratio_lnk', float('nan')),
-            )
-            module_summaries['macro_diag_before_sdf2'] = macro_r2_diag
 
         if self._use_tensor_pipeline() and self.tensor_macro is not None:
             sdf_table = self._build_sdf_pairs_from_macro_tensor(self.tensor_macro)
@@ -4273,7 +4404,7 @@ class Episode:
         self.tensor_sdf = None
         use_sdf_fc1 = 'sdf_fc1' in train_modules and 'sdf_fc1' in self.models
         use_policy_value = 'policy_value' in train_modules and 'policy_value' in self.models
-        use_fc2 = 'fc2' in train_modules and 'fc2' in self.models
+        use_fc2 = 'fc2' in train_modules and self._has_fc2_models()
 
         # 记录 episode 开始时的 GPU 显存
         logger.info(f"Episode {self.episode_id} starting - GPU Memory:")
@@ -4358,6 +4489,15 @@ class Episode:
                 if use_fc2:
                     fc2_summary = self._run_fc2_epochs(n_epochs=n_epochs, log_interval=log_interval)
                     if fc2_summary is not None:
+                        outer_diag = self._compute_fc2_outer_after_resim(
+                            n_paths=n_paths,
+                            group_size=simulate_group_size,
+                            n_branches=n_branches,
+                            horizon=horizon_mode1,
+                            simulate_kwargs=simulate_kwargs,
+                        )
+                        if outer_diag:
+                            fc2_summary['outer_after_resim'] = outer_diag
                         module_summaries['fc2'] = fc2_summary
 
                 if use_sdf_fc1:
@@ -4424,6 +4564,15 @@ class Episode:
                 if use_fc2:
                     fc2_summary = self._run_fc2_epochs(n_epochs=n_epochs, log_interval=log_interval)
                     if fc2_summary is not None:
+                        outer_diag = self._compute_fc2_outer_after_resim(
+                            n_paths=n_paths,
+                            group_size=simulate_group_size,
+                            n_branches=n_branches,
+                            horizon=horizon_mode1,
+                            simulate_kwargs=simulate_kwargs,
+                        )
+                        if outer_diag:
+                            fc2_summary['outer_after_resim'] = outer_diag
                         module_summaries['fc2'] = fc2_summary
 
                 if use_sdf_fc1:
@@ -4491,17 +4640,16 @@ class Episode:
                 if use_fc2:
                     fc2_summary = self._run_fc2_epochs(n_epochs=n_epochs, log_interval=log_interval)
                     if fc2_summary is not None:
+                        outer_diag = self._compute_fc2_outer_after_resim(
+                            n_paths=n_paths,
+                            group_size=simulate_group_size,
+                            n_branches=n_branches,
+                            horizon=horizon_modeb,
+                            simulate_kwargs=simulate_kwargs,
+                        )
+                        if outer_diag:
+                            fc2_summary['outer_after_resim'] = outer_diag
                         module_summaries['fc2'] = fc2_summary
-
-                if tensor_pipeline and self.tensor_macro is not None:
-                    macro_r2_diag = self._macro_forecast_r2_tensor(self.tensor_macro)
-                else:
-                    macro_df = self.df_macro
-                    if (macro_df is None or macro_df.empty) and self.tensor_macro is not None:
-                        macro_df = self._table_to_dataframe(self.tensor_macro)
-                    macro_r2_diag = self._macro_forecast_r2(macro_df)
-                if macro_r2_diag:
-                    module_summaries['macro_diag_modeb'] = macro_r2_diag
             else:
                 raise ValueError(f"Unknown episode mode: {mode}")
         finally:

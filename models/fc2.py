@@ -1,16 +1,12 @@
 """
 FC2 模型
 
-FC2: 横截面分布 → 宏观 proxy
+当前主线采用两套彻底分开的模型：
 
-输入：
-- b 的 100 分位点
-- z 的 100 分位点
-- 宏观量 x
+- FC2HatcModel: [b_quantiles, z_quantiles, x] -> ĉ
+- FC2LnkModel:  [b_quantiles, z_quantiles, x, K_quantiles] -> ln K
 
-输出：
-- hatc head: [b_quantiles, z_quantiles, x] -> ĉ
-- lnk head: [b_quantiles, z_quantiles, x, K_quantiles] -> ln K
+保留 FC2Model 仅用于兼容旧脚本/旧 checkpoint。
 """
 
 import torch
@@ -23,16 +19,73 @@ sys.path.append('..')
 from config import Config
 
 
+class FC2ScalarModel(nn.Module):
+    """单目标 FC2 标量模型。"""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: List[int] = None,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = Config.FC2_HIDDEN_DIMS
+
+        self.input_dim = input_dim
+        self.trunk = MLP(
+            input_dim=input_dim,
+            hidden_dims=hidden_dims,
+            output_dim=hidden_dims[-1],
+            activation='gelu',
+            dropout=dropout
+        )
+        self.head = nn.Linear(hidden_dims[-1], 1)
+
+    def forward(self, phi: torch.Tensor) -> torch.Tensor:
+        if phi.shape[-1] != self.input_dim:
+            raise ValueError(f"FC2 scalar input dim mismatch: expected {self.input_dim}, got {phi.shape[-1]}")
+        h = self.trunk(phi)
+        return self.head(h)
+
+
+class FC2HatcModel(FC2ScalarModel):
+    """FC2 hatc-only 模型。"""
+
+    def __init__(
+        self,
+        input_dim: int = None,
+        hidden_dims: List[int] = None,
+        quantile_num: int = 100,
+        dropout: float = 0.1,
+    ):
+        if input_dim is None:
+            input_dim = 2 * quantile_num + 1
+        super().__init__(input_dim=input_dim, hidden_dims=hidden_dims, dropout=dropout)
+
+
+class FC2LnkModel(FC2ScalarModel):
+    """FC2 lnk-only 模型，额外吃一份 K quantile summary。"""
+
+    def __init__(
+        self,
+        input_dim: int = None,
+        hidden_dims: List[int] = None,
+        quantile_num: int = 100,
+        dropout: float = 0.1,
+    ):
+        if input_dim is None:
+            input_dim = 3 * quantile_num + 1
+        super().__init__(input_dim=input_dim, hidden_dims=hidden_dims, dropout=dropout)
+
+
 class FC2Model(nn.Module):
     """
-    FC2 模型：横截面分布 → 宏观 proxy
-    
-    将节点内横截面分布特征映射到宏观状态
-    核心作用：实现 fixed-point consistency
-    
-    (ĉ, ln K) = A(Policy/Value(ĉ, ln K; s_i))
+    兼容旧接口的包装器：
+    - 输入 dict {'hatc': ..., 'lnk': ...}
+    - 输出 dict {'hatc': ..., 'lnk': ...}
     """
-    
+
     def __init__(
         self,
         input_dim: int = None,
@@ -43,40 +96,27 @@ class FC2Model(nn.Module):
         dropout: float = 0.1
     ):
         super().__init__()
-        
-        # hatc 输入维度：100(b分位点) + 100(z分位点) + x = 201
         if input_dim is None:
             input_dim = 2 * quantile_num + 1
-        # lnk 额外吃一份 K 的 quantile summary
         if lnk_input_dim is None:
             lnk_input_dim = input_dim + quantile_num
-        
-        if hidden_dims is None:
-            hidden_dims = Config.FC2_HIDDEN_DIMS
-        
         self.quantile_num = quantile_num
         self.input_dim = input_dim
         self.lnk_input_dim = lnk_input_dim
         self.output_dim = output_dim
-
-        # hatc / lnk 分开建模；lnk 额外吃 K summary。
-        self.hatc_trunk = MLP(
+        self.hatc_model = FC2HatcModel(
             input_dim=input_dim,
             hidden_dims=hidden_dims,
-            output_dim=hidden_dims[-1],
-            activation='gelu',
-            dropout=dropout
+            quantile_num=quantile_num,
+            dropout=dropout,
         )
-        self.lnk_trunk = MLP(
+        self.lnk_model = FC2LnkModel(
             input_dim=lnk_input_dim,
             hidden_dims=hidden_dims,
-            output_dim=hidden_dims[-1],
-            activation='gelu',
-            dropout=dropout
+            quantile_num=quantile_num,
+            dropout=dropout,
         )
-        self.hatc_head = nn.Linear(hidden_dims[-1], 1)
-        self.lnk_head = nn.Linear(hidden_dims[-1], 1)
-    
+
     def _normalize_inputs(
         self,
         phi: Union[torch.Tensor, Dict[str, torch.Tensor]]
@@ -96,36 +136,17 @@ class FC2Model(nn.Module):
                 lnk_in = torch.cat([phi, pad], dim=-1)
             elif phi.shape[-1] == self.lnk_input_dim and self.input_dim < self.lnk_input_dim:
                 hatc_in = phi[..., :self.input_dim]
-        if hatc_in.shape[-1] != self.input_dim:
-            raise ValueError(f"FC2 hatc input dim mismatch: expected {self.input_dim}, got {hatc_in.shape[-1]}")
-        if lnk_in.shape[-1] != self.lnk_input_dim:
-            raise ValueError(f"FC2 lnk input dim mismatch: expected {self.lnk_input_dim}, got {lnk_in.shape[-1]}")
         return hatc_in, lnk_in
-    
+
     def forward(
-        self, 
+        self,
         phi: Union[torch.Tensor, Dict[str, torch.Tensor]]
     ) -> Dict[str, torch.Tensor]:
-        """
-        前向传播
-        
-        Args:
-            phi:
-                - Tensor: 兼容旧调用，默认同一输入供两个 head 使用
-                - Dict:
-                    {'hatc': (batch, 201), 'lnk': (batch, 301)}
-        
-        Returns:
-            {'hatc': (batch,1), 'lnk': (batch,1)}
-        """
         hatc_in, lnk_in = self._normalize_inputs(phi)
-        hatc_h = self.hatc_trunk(hatc_in)
-        lnk_h = self.lnk_trunk(lnk_in)
-        lnk = self.lnk_head(lnk_h)
-        hatc = self.hatc_head(hatc_h)
-
-        return {'hatc': hatc, 'lnk': lnk}
-    
+        return {
+            'hatc': self.hatc_model(hatc_in),
+            'lnk': self.lnk_model(lnk_in),
+        }
 
 
 class FC2WithAggregation(nn.Module):
