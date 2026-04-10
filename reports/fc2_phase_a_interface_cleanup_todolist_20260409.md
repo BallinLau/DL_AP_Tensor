@@ -234,6 +234,15 @@
   - 新增 `slurm/run_fc2_supervised_probe_80g.slurm`，用于在 80G 单卡上直接跑 `FC2` supervised probe；
   - slurm 脚本支持通过环境变量覆盖 `CKPT_DIR / CKPT_PREFIX / OUT_DIR / N_PATHS / GROUP_SIZE / HORIZON / EPOCHS / BATCH_SIZE`；
   - 同时显式设置 `MPLCONFIGDIR` 到可写目录，避免 probe 首次启动时卡在 matplotlib 字体缓存。
+- 已完成第十二刀：
+  - `FC2Model` 从单个共享输出层改为共享 trunk + `hatc/lnk` 双 head，减少两个目标在最后一层的硬耦合；
+  - `FC2Pipeline` 新增 `build_supervised_targets_parent()` 与 `build_supervised_targets_children()`，把节点级 `(lnk, hatc)` 真值 target 暴露为可复用接口；
+  - `Episode._run_fc2_epochs()` 现在支持 `FC2 supervised pretrain -> closure finetune` 两阶段训练；
+  - supervised pretrain 默认使用当前 tensor simulate 的 path mini-batches，直接拟合 `FC2` summary 到节点级 `hatc/lnk`；
+  - 新增超参数：
+    - `fc2_supervised_pretrain_epochs`
+    - `fc2_supervised_hatc_weight`
+    - `fc2_supervised_lnk_weight`
 - 已完成最小运行验证：
   - 使用合成 `TensorTable` + dummy `FC2` / `policy_value`，`FC2LossPipe.loss(...)` 可直接跑通；
   - `parent / children` diagnostics 可正常生成；

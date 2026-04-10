@@ -22,7 +22,7 @@ from config import Config, HyperParams, SIMMODEL
 from data import Sample, SimulateTS, TensorTable, TensorSimulationOutput
 from data.data_utils import compute_quantile_features
 from losses import SDFLoss, P0Loss, PILoss, QLoss, FC2Loss
-from losses.FC2losspipe import FC2LossPipe
+from losses.FC2losspipe import FC2LossPipe, compute_fit_stats_t
 from losses.utils import compute_z_penalty, compute_aio_residual, compute_monotonicity_penalty
 from losses.sdf_loss import moment_penalty
 from data.data_utils import build_sdf_pairs_from_macro_ts
@@ -2818,6 +2818,109 @@ class Episode:
             self._latest_fc2_diag = flat_diag
             fc2_loss = fc2_value
         return fc2_loss
+
+    def _build_fc2_pipe(self, batch) -> Optional[FC2LossPipe]:
+        default_full_n = getattr(self.hyperparams, 'fc2_full_n', 1000)
+        if isinstance(batch, dict) and 'firm_table' in batch:
+            return FC2LossPipe(
+                firm_table=batch['firm_table'],
+                macro_table=batch.get('macro_table'),
+                full_N=batch.get('full_N', default_full_n),
+                entry_num=batch.get('entry_num', None),
+                pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 10000),
+                device=self.device,
+            )
+        if isinstance(batch, pd.DataFrame):
+            df = batch.copy()
+            if df['branch'].min() < 0:
+                df['branch'] = df['branch'] + 1
+            return FC2LossPipe(
+                df=df,
+                full_N=default_full_n,
+                entry_num=None,
+                pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 10000),
+                device=self.device,
+            )
+        if isinstance(batch, dict) and 'df' in batch:
+            df = batch['df'].copy()
+            if df['branch'].min() < 0:
+                df['branch'] = df['branch'] + 1
+            return FC2LossPipe(
+                df=df,
+                full_N=batch.get('full_N', default_full_n),
+                entry_num=batch.get('entry_num', None),
+                pv_chunk_size=getattr(self.hyperparams, 'fc2_pv_chunk_size', 10000),
+                device=self.device,
+            )
+        return None
+
+    def _compute_fc2_supervised_loss(self, batch) -> Tuple[torch.Tensor, Dict[str, float]]:
+        model = self.models.get('fc2')
+        if model is None:
+            return torch.tensor(0.0, device=self.device), {}
+        pipe = self._build_fc2_pipe(batch)
+        if pipe is None or pipe.macro_table is None:
+            return torch.tensor(0.0, device=self.device), {}
+
+        parent_x = pipe.build_fc2_input_parent()
+        parent_y = pipe.build_supervised_targets_parent()
+        child_x = pipe.build_fc2_input_children(pipe.child_states_list, pipe.child_present_list)
+        child_y = pipe.build_supervised_targets_children()
+
+        child_valid = torch.tensor(
+            [
+                bool(pipe.child_present_list[i][:, j].any().item())
+                for i in range(pipe.path_num)
+                for j in range(pipe.branch_num)
+            ],
+            device=self.device,
+            dtype=torch.bool,
+        )
+
+        x_parts = [parent_x]
+        y_parts = [parent_y]
+        child_x_flat = child_x.reshape(-1, child_x.shape[-1])
+        child_y_flat = child_y.reshape(-1, child_y.shape[-1])
+        if child_valid.any():
+            x_parts.append(child_x_flat[child_valid])
+            y_parts.append(child_y_flat[child_valid])
+        x_all = torch.cat(x_parts, dim=0)
+        y_all = torch.cat(y_parts, dim=0)
+
+        pred = model(x_all)
+        lnk_target = y_all[:, 0:1]
+        hatc_target = y_all[:, 1:2]
+        hatc_loss = nn.functional.mse_loss(pred['hatc'], hatc_target)
+        lnk_loss = nn.functional.mse_loss(pred['lnk'], lnk_target)
+
+        hatc_w = float(getattr(self.hyperparams, 'fc2_supervised_hatc_weight', 1.0))
+        lnk_w = float(getattr(self.hyperparams, 'fc2_supervised_lnk_weight', 1.0))
+        total = hatc_w * hatc_loss + lnk_w * lnk_loss
+
+        with torch.no_grad():
+            diag = {
+                'fc2_pretrain_loss': float(total.item()),
+                'fc2_pretrain_hatc_loss': float(hatc_loss.item()),
+                'fc2_pretrain_lnk_loss': float(lnk_loss.item()),
+            }
+            for prefix, y_true, y_pred in (
+                ('fc2_pretrain_hatc', hatc_target, pred['hatc']),
+                ('fc2_pretrain_lnk', lnk_target, pred['lnk']),
+            ):
+                stats = compute_fit_stats_t(y_true, y_pred)
+                for k, v in stats.items():
+                    try:
+                        diag[f'{prefix}_{k}'] = float(v)
+                    except (TypeError, ValueError):
+                        continue
+        return total, diag
+
+    def _record_manual_losses(self, losses: Dict[str, float]) -> None:
+        self.step_count += 1
+        for k, v in losses.items():
+            if k not in self.loss_history:
+                self.loss_history[k] = []
+            self.loss_history[k].append(v)
     
     def create_batches(
         self,
@@ -3836,10 +3939,68 @@ class Episode:
     ) -> Optional[Dict]:
         if 'fc2' not in self.models:
             return None
+        pretrain_epoch_losses = []
         epoch_losses = []
         pv_model = self.models.get('policy_value')
         freeze_pv = bool(getattr(self.hyperparams, 'fc2_freeze_pv_during_epochs', True))
         fc2_path_batch_size = int(getattr(self.hyperparams, 'fc2_path_batch_size', 256))
+        pretrain_epochs = int(getattr(self.hyperparams, 'fc2_supervised_pretrain_epochs', 0))
+        fc2_optimizer = self.optimizers.get('fc2')
+
+        if (
+            pretrain_epochs > 0
+            and fc2_optimizer is not None
+            and self._use_tensor_pipeline()
+            and self.tensor_firm is not None
+        ):
+            for _ in tqdm(range(pretrain_epochs), desc='FC2 Supervised Pretrain'):
+                fc2_batches = self._create_fc2_batches_from_tensor(
+                    firm_table=self.tensor_firm,
+                    macro_table=self.tensor_macro,
+                    batch_size=fc2_path_batch_size,
+                    shuffle=True,
+                )
+                if not fc2_batches:
+                    break
+
+                batch_losses = []
+                for fc2_batch in fc2_batches:
+                    fc2_optimizer.zero_grad(set_to_none=True)
+                    sup_loss, sup_diag = self._compute_fc2_supervised_loss(fc2_batch)
+                    sup_loss.backward()
+                    grad_norm, had_nan = gradient_protection(
+                        self.models['fc2'].parameters(),
+                        max_norm=getattr(self.hyperparams, 'fc2_max_grad_norm', self.hyperparams.max_grad_norm)
+                    )
+                    if had_nan:
+                        logger.warning("NaN gradient detected in fc2 supervised pretrain")
+                    fc2_optimizer.step()
+                    scheduler = self.lr_schedulers.get('fc2')
+                    if scheduler is not None:
+                        scheduler.step()
+                    batch_log = dict(sup_diag)
+                    batch_log['fc2_grad_norm'] = grad_norm
+                    batch_log['total'] = float(sup_loss.item())
+                    self._latest_fc2_diag = batch_log
+                    self._record_manual_losses(batch_log)
+                    batch_losses.append(batch_log)
+
+                epoch_loss = {
+                    k: float(np.mean([l[k] for l in batch_losses if k in l]))
+                    for k in batch_losses[0].keys()
+                }
+                pretrain_epoch_losses.append(epoch_loss)
+                if self.step_count % log_interval == 0:
+                    avg_loss = np.mean([l['total'] for l in pretrain_epoch_losses[-log_interval:]])
+                    lr = self.lr_schedulers.get('fc2')
+                    current_lr = lr.get_lr() if lr else 0
+                    logger.info(
+                        "FC2 Supervised Pretrain Step %d: loss=%.6f, lr=%.2e",
+                        self.step_count,
+                        avg_loss,
+                        current_lr
+                    )
+
         if freeze_pv and pv_model is not None:
             pv_model.freeze()
         try:
@@ -3892,7 +4053,13 @@ class Episode:
             for k in epoch_losses[0].keys()
         }
         logger.info("FC2 Epochs finished: %s", avg_losses)
-        return {'final_losses': avg_losses}
+        result = {'final_losses': avg_losses}
+        if pretrain_epoch_losses:
+            result['pretrain_final_losses'] = {
+                k: np.mean([l[k] for l in pretrain_epoch_losses if k in l])
+                for k in pretrain_epoch_losses[0].keys()
+            }
+        return result
 
     def _run_sdf_recon_from_macro(
         self,

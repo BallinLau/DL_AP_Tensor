@@ -489,6 +489,37 @@ class FC2Pipeline:
                 FC2_input_children[i, j, 200] = x_feature
         return FC2_input_children
 
+    def build_supervised_targets_parent(self) -> torch.Tensor:
+        if self.macro_table is None:
+            raise ValueError("macro_table is required to build FC2 supervised targets")
+        macro_rows = self.macro_table.data.to(device=self.device, dtype=torch.float32)
+        macro_cols = self._col_index(self.macro_table.columns)
+        targets = torch.zeros((self.path_num, 2), dtype=torch.float32, device=self.device)
+        for i, path_val in enumerate(self.path_values):
+            parent_rows, _, _ = self._select_fc2_window(macro_rows, macro_cols, path_val)
+            if parent_rows.numel() == 0:
+                continue
+            row = parent_rows[0]
+            targets[i, 0] = row[macro_cols['lnk'] if 'lnk' in macro_cols else macro_cols['LnK']]
+            targets[i, 1] = row[macro_cols['hatc'] if 'hatc' in macro_cols else macro_cols['Hatc']]
+        return targets
+
+    def build_supervised_targets_children(self) -> torch.Tensor:
+        if self.macro_table is None:
+            raise ValueError("macro_table is required to build FC2 supervised targets")
+        macro_rows = self.macro_table.data.to(device=self.device, dtype=torch.float32)
+        macro_cols = self._col_index(self.macro_table.columns)
+        targets = torch.zeros((self.path_num, self.branch_num, 2), dtype=torch.float32, device=self.device)
+        for i, path_val in enumerate(self.path_values):
+            _, child0_rows, child1_rows = self._select_fc2_window(macro_rows, macro_cols, path_val)
+            for j, rows in enumerate((child0_rows, child1_rows)):
+                if rows.numel() == 0:
+                    continue
+                row = rows[0]
+                targets[i, j, 0] = row[macro_cols['lnk'] if 'lnk' in macro_cols else macro_cols['LnK']]
+                targets[i, j, 1] = row[macro_cols['hatc'] if 'hatc' in macro_cols else macro_cols['Hatc']]
+        return targets
+
     def _pv_forward(self, pv_model: torch.nn.Module, firm_state: torch.Tensor):
         """
         PolicyValueModel expects (batch, 7). Flatten/reshape to support [path, N, 7] or [path, N, 2, 7].

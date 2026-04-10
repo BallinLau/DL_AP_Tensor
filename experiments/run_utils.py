@@ -85,8 +85,11 @@ def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ck
                 ckpt_path = ckpt_dir / f"{prefix}{stem}.pt"
                 if ckpt_path.exists():
                     state = torch.load(ckpt_path, map_location=device)
-                    models[key].load_state_dict(state, strict=strict)
-                    print(f"[build_models] loaded {ckpt_path}")
+                    try:
+                        models[key].load_state_dict(state, strict=strict)
+                        print(f"[build_models] loaded {ckpt_path}")
+                    except RuntimeError as exc:
+                        print(f"[build_models] skip incompatible ckpt: {ckpt_path} ({exc})")
                 else:
                     print(f"[build_models] skip missing ckpt: {ckpt_path}")
 

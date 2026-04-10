@@ -52,15 +52,17 @@ class FC2Model(nn.Module):
         self.quantile_num = quantile_num
         self.input_dim = input_dim
         self.output_dim = output_dim
-        
-        # 主网络
-        self.network = MLP(
+
+        # 共享 trunk + 双 head。这样 lnk 不再和 hatc 在最后一层完全绑死。
+        self.trunk = MLP(
             input_dim=input_dim,
             hidden_dims=hidden_dims,
-            output_dim=output_dim,
+            output_dim=hidden_dims[-1],
             activation='gelu',
             dropout=dropout
         )
+        self.hatc_head = nn.Linear(hidden_dims[-1], 1)
+        self.lnk_head = nn.Linear(hidden_dims[-1], 1)
     
     
     def forward(
@@ -76,11 +78,10 @@ class FC2Model(nn.Module):
         Returns:
             {'hatc': (batch,1), 'lnk': (batch,1)}
         """
-        output = self.network(phi)
-        # 保持原有语义：第 0 维为 lnK，第 1 维为 ĉ
-        lnk = output[:, 0:1]
-        hatc = output[:, 1:2]
-        
+        h = self.trunk(phi)
+        lnk = self.lnk_head(h)
+        hatc = self.hatc_head(h)
+
         return {'hatc': hatc, 'lnk': lnk}
     
 

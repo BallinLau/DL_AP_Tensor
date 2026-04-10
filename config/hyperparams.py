@@ -44,6 +44,9 @@ class HyperParams:
     fc2_freeze_pv_during_epochs: bool = True
     fc2_pv_chunk_size: int = 10000
     fc2_path_batch_size: int = 1024
+    fc2_supervised_pretrain_epochs: int = 40
+    fc2_supervised_hatc_weight: float = 1.0
+    fc2_supervised_lnk_weight: float = 2.0
     
     # ========== 学习率调度 ==========
     lr_scheduler_factor: float = 0.5

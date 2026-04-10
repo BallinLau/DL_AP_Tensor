@@ -245,43 +245,37 @@ def _plot_loss_curves(results: Iterable[ProbeResult], path: Path) -> None:
 def build_supervised_probe_dataset(
     pipe: FC2Pipeline,
 ) -> pd.DataFrame:
-    if pipe.macro_table is None:
-        raise ValueError("macro_table is required for supervised probe.")
-
     parent_x = pipe.build_fc2_input_parent().detach().cpu()
     child_x = pipe.build_fc2_input_children(pipe.child_states_list, pipe.child_present_list).detach().cpu()
-
-    macro_rows = pipe.macro_table.data.to(device=pipe.device, dtype=torch.float32)
-    macro_cols = pipe._col_index(pipe.macro_table.columns)
+    parent_y = pipe.build_supervised_targets_parent().detach().cpu()
+    child_y = pipe.build_supervised_targets_children().detach().cpu()
 
     records: List[Dict[str, float]] = []
     for local_idx, path_val in enumerate(pipe.path_values):
-        parent_rows, child0_rows, child1_rows = pipe._select_fc2_window(macro_rows, macro_cols, path_val)
-        if parent_rows.numel() > 0:
-            row = parent_rows[0]
-            feat = parent_x[local_idx]
-            records.append(
-                {
-                    "path": float(path_val),
-                    "node_type": 0.0,
-                    "branch": -1.0,
-                    "hatc": float(row[macro_cols["Hatc"]].item()),
-                    "lnk": float(row[macro_cols["LnK"]].item()),
-                    **{f"phi_{k}": float(feat[k].item()) for k in range(feat.shape[0])},
-                }
-            )
-        for branch_idx, child_rows in enumerate((child0_rows, child1_rows)):
-            if child_rows.numel() == 0:
+        feat = parent_x[local_idx]
+        target = parent_y[local_idx]
+        records.append(
+            {
+                "path": float(path_val),
+                "node_type": 0.0,
+                "branch": -1.0,
+                "hatc": float(target[1].item()),
+                "lnk": float(target[0].item()),
+                **{f"phi_{k}": float(feat[k].item()) for k in range(feat.shape[0])},
+            }
+        )
+        for branch_idx in range(pipe.branch_num):
+            if not pipe.child_present_list[local_idx][:, branch_idx].any():
                 continue
-            row = child_rows[0]
             feat = child_x[local_idx, branch_idx]
+            target = child_y[local_idx, branch_idx]
             records.append(
                 {
                     "path": float(path_val),
                     "node_type": 1.0,
                     "branch": float(branch_idx),
-                    "hatc": float(row[macro_cols["Hatc"]].item()),
-                    "lnk": float(row[macro_cols["LnK"]].item()),
+                    "hatc": float(target[1].item()),
+                    "lnk": float(target[0].item()),
                     **{f"phi_{k}": float(feat[k].item()) for k in range(feat.shape[0])},
                 }
             )
