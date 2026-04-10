@@ -173,6 +173,7 @@ class PVBPModel(nn.Module):
         V0: torch.Tensor,
         VI: torch.Tensor,
         simulated_i: Optional[torch.Tensor] = None,
+        h: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         device = firm_state.device
         batch_size = firm_state.size(0)
@@ -180,19 +181,18 @@ class PVBPModel(nn.Module):
             n_i_points = int(getattr(Config, "PV_I_INTEGRATION_POINTS", 11))
             n_i_points = max(3, n_i_points)
             simulated_i = torch.linspace(0.0, Config.I_THRESHOLD, steps=n_i_points, device=device).unsqueeze(-1)
+        simulated_i = simulated_i.to(device=device, dtype=firm_state.dtype).reshape(-1, 1)
+        n_i_points = simulated_i.shape[0]
 
-        v0_list = []
-        vi_list = []
-        for i_val in simulated_i:
-            modified = firm_state.clone()
-            modified[:, SIMMODEL.I] = i_val.expand(batch_size)
-            v0_i, vi_i, _ = self.get_combined_output(modified)
-            v0_list.append(v0_i)
-            vi_list.append(vi_i)
+        if h is None:
+            h, _ = self._encode(firm_state)
 
-        v0_stack = torch.stack(v0_list, dim=0)
-        vi_stack = torch.stack(vi_list, dim=0)
-        max_vals = torch.max(v0_stack, vi_stack)
+        # Reuse the node encoding and V0 once, then evaluate all VI(i) in one batched pass.
+        h_grid = h.unsqueeze(0).expand(n_i_points, -1, -1).reshape(n_i_points * batch_size, -1)
+        i_grid = simulated_i.unsqueeze(1).expand(-1, batch_size, -1).reshape(n_i_points * batch_size, 1)
+        vi_stack = self.pI_head(h_grid, i_grid).reshape(n_i_points, batch_size, 1)
+        v0_stack = V0.unsqueeze(0).expand(n_i_points, -1, -1)
+        max_vals = torch.maximum(v0_stack, vi_stack)
         Vhat = max_vals.mean(dim=0)
 
         p_beta = max(float(getattr(Config, "P_SOFTPLUS_BETA", 8.0)), 1e-6)
@@ -231,7 +231,7 @@ class PVBPModel(nn.Module):
         V0 = self.p0_head(h)
         VI = self.pI_head(h, i)
         bar_i_cond = torch.sigmoid(10 * (VI - V0))
-        Vhat, P, chi, bar_z = self.cal_phats(firm_state, V0, VI, simulated_i=simulated_i)
+        Vhat, P, chi, bar_z = self.cal_phats(firm_state, V0, VI, simulated_i=simulated_i, h=h)
         bar_i = chi * bar_i_cond
         bp = self.cal_bp(bp0, bpI, bar_i)
         return PVBPOutput(

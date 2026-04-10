@@ -251,6 +251,14 @@
     - ragged path 解析
     - target 重新抽取；
   - pretrain 的主要耗时从“重复数据工程”收缩为“单次 dataset 构建 + 普通 MLP mini-batch 训练”。
+- 已完成第十四刀：
+  - `PVBPModel.cal_phats()` 改为并行批量计算所有 `i` 积分点；
+  - `share_layer(base_state)` 与 `V0=p0_head(h)` 在 `forward()` 中只计算一次，并显式传入 `cal_phats()`；
+  - 不再对每个 `i` 点重复：
+    - `firm_state.clone()`
+    - `_encode()`
+    - `p0_head(h)`；
+  - 现在仅对 `pI_head(h, i)` 做大 batch 并行评估，再回收成 `Vhat / P / chi / bar_z`。
 - 已完成最小运行验证：
   - 使用合成 `TensorTable` + dummy `FC2` / `policy_value`，`FC2LossPipe.loss(...)` 可直接跑通；
   - `parent / children` diagnostics 可正常生成；
