@@ -314,6 +314,7 @@ class FC2Pipeline:
     def _gather_child_policy_rows(
         self,
         children_states_list: List[torch.Tensor],
+        children_k_list: List[torch.Tensor],
         child_macro_pred: torch.Tensor,
         alive_mask_list: List[torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
@@ -331,7 +332,7 @@ class FC2Pipeline:
                     continue
                 macro_ij = child_macro_pred[i, j].unsqueeze(0).expand(idx.numel(), -1)
                 flat_inputs.append(torch.cat([children_states_list[i][idx, j, :], macro_ij], dim=-1))
-                flat_k.append(self.child_K_list[i][idx, j, :])
+                flat_k.append(children_k_list[i][idx, j, :])
                 flat_base_alive.append(alive_mask_list[i][idx, j].unsqueeze(-1))
                 path_idx.append(torch.full((idx.numel(),), i, dtype=torch.long, device=self.device))
                 branch_idx.append(torch.full((idx.numel(),), j, dtype=torch.long, device=self.device))
@@ -384,6 +385,7 @@ class FC2Pipeline:
         K_parent = torch.ones((self.path_num, self.N, 1), dtype=torch.float32, device=self.device)
         alive_mask = torch.zeros((self.path_num, self.N), dtype=torch.bool, device=self.device)
         entry_mask = torch.zeros((self.path_num, self.N, self.branch_num), dtype=torch.bool, device=self.device)
+        child_present_mask = torch.zeros((self.path_num, self.N, self.branch_num), dtype=torch.bool, device=self.device)
 
         for i, (path, group) in enumerate(df2.groupby('path')):
             vals = torch.tensor(group[['b', 'z', 'ETA', 'i', 'x']].to_numpy(dtype=np.float32), device=self.device)
@@ -402,6 +404,8 @@ class FC2Pipeline:
             Children_s[i, : len(group), 1, :] = vals_child2
             K_children[i, : len(group), 0, 0] = torch.tensor(group['K_child1'].to_numpy(dtype=np.float32), device=self.device)
             K_children[i, : len(group), 1, 0] = torch.tensor(group['K_child2'].to_numpy(dtype=np.float32), device=self.device)
+            child_present_mask[i, : len(group), 0] = torch.tensor(group['b_child1'].notna().to_numpy(), device=self.device)
+            child_present_mask[i, : len(group), 1] = torch.tensor(group['b_child2'].notna().to_numpy(), device=self.device)
 
         Children_s[:, :, :, 0] = 0
 
@@ -423,6 +427,7 @@ class FC2Pipeline:
 
         self.alive_mask = alive_mask
         self.entry_mask = entry_mask
+        self.child_present_mask = child_present_mask
 
     def build_fc2_input_parent(self):
         if self.tensor_native:
@@ -669,13 +674,13 @@ class FC2Pipeline:
             Y = torch.exp(pv_input[:, 4:5] + pv_input[:, 1:2]) * gathered['K']
             Phi = (1 - self.phi) * (1 + torch.exp(pv_input[:, 1:2] + pv_input[:, 3:4])) * gathered['K'] * bar_z_flat
             I = bar_i_flat * gathered['K'] * pv_input[:, 3:4] - bar_z_flat * gathered['K'] + self.delta * gathered['K']
-            C = torch.abs(Y - I - Phi)
+            C = Y - I - Phi
             K_sum = torch.zeros((self.path_num, 1), dtype=torch.float32, device=self.device)
             C_sum = torch.zeros((self.path_num, 1), dtype=torch.float32, device=self.device)
-            K_sum.index_add_(0, gathered['path_idx'], gathered['K'] * updated_alive_flat)
-            C_sum.index_add_(0, gathered['path_idx'], C * updated_alive_flat)
+            K_sum.index_add_(0, gathered['path_idx'], gathered['K'])
+            C_sum.index_add_(0, gathered['path_idx'], C.clamp(min=0.0))
             lnk_parent = torch.log(K_sum + 1e-8)
-            hatc_parent = torch.log(C_sum / (K_sum + 1e-8))
+            hatc_parent = torch.log(C_sum / (K_sum + 1e-8) + 1e-5)
             loss_parent = torch.mean((lnk_parent - lnk_parent_pred) ** 2) + torch.mean((hatc_parent - hatc_parent_pred) ** 2)
             return {
                 'Y': Y,
@@ -689,21 +694,21 @@ class FC2Pipeline:
         Y = torch.exp(pv_input[..., 4:5] + pv_input[..., 1:2]) * self.K_parent_full
         Phi = (1 - self.phi) * (1 + torch.exp(pv_input[..., 1:2] + pv_input[..., 3:4])) * self.K_parent_full * bar_z
         I = bar_i * self.K_parent_full * pv_input[..., 3:4] - bar_z * self.K_parent_full + self.delta * self.K_parent_full
-        C = torch.abs(Y - I - Phi)
+        C = Y - I - Phi
 
         masked_K = torch.where(
-            updated_alive[..., 0:1] > 0,
+            self.alive_mask[..., 0:1] > 0,
             self.K_parent_full,
             torch.zeros_like(self.K_parent_full)
         )
         lnk_parent = torch.log(masked_K.sum(dim=1) + 1e-8)
 
         masked_C = torch.where(
-            updated_alive[..., 0:1] > 0,
-            C,
+            self.alive_mask[..., 0:1] > 0,
+            C.clamp(min=0.0),
             torch.zeros_like(C)
         )
-        hatc_parent = torch.log(torch.sum(masked_C, dim=1) / (torch.sum(masked_K, dim=1) + 1e-8))
+        hatc_parent = torch.log(torch.sum(masked_C, dim=1) / (torch.sum(masked_K, dim=1) + 1e-8) + 1e-5)
 
         loss_parent = torch.mean((lnk_parent - lnk_parent_pred)**2) + torch.mean((hatc_parent - hatc_parent_pred)**2)
         return {
@@ -718,47 +723,67 @@ class FC2Pipeline:
 
     def _update_children_state(
         self,
-        updated_alive: torch.Tensor,
+        bar_i: torch.Tensor,
         bp: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         if self.tensor_native:
             children_states_list = []
+            children_k_list = []
+            child_alive_mask = []
             for i in range(self.path_num):
                 child_state = self.child_states_list[i]
-                masked_b = torch.where(
-                    updated_alive[i][..., 0] > 0,
-                    self.parent_states_list[i][:, 0],
-                    torch.zeros_like(self.parent_states_list[i][:, 0])
+                incumbent_mask = (
+                    self.child_present_list[i]
+                    & (~self.entry_mask_list[i])
+                    & self.parent_alive_list[i].unsqueeze(-1)
                 )
-                masked_bp = torch.where(
-                    updated_alive[i][..., 0] > 0,
-                    bp[i][..., 0],
-                    torch.zeros_like(bp[i][..., 0])
-                )
+                base_b = self.parent_states_list[i][:, 0].unsqueeze(-1).expand(-1, self.branch_num)
+                base_bp = bp[i][..., 0].unsqueeze(-1).expand(-1, self.branch_num)
                 eta = child_state[:, :, 2]
-                new_b = masked_bp.unsqueeze(-1) * eta + masked_b.unsqueeze(-1) * (1 - eta)
-                updated_child_state = torch.cat([new_b.unsqueeze(-1), child_state[:, :, 1:]], dim=-1)
+                new_b = base_bp * eta + base_b * (1 - eta)
+                child_b = torch.where(incumbent_mask, new_b, child_state[:, :, 0])
+                updated_child_state = torch.cat([child_b.unsqueeze(-1), child_state[:, :, 1:]], dim=-1)
+                base_k = self.parent_K_list[i][:, 0].unsqueeze(-1).expand(-1, self.branch_num)
+                base_bar_i = bar_i[i][..., 0].unsqueeze(-1).expand(-1, self.branch_num)
+                new_k = base_k * (1.0 + (self.G - 1.0) * base_bar_i)
+                updated_child_k = torch.where(
+                    incumbent_mask.unsqueeze(-1),
+                    new_k.unsqueeze(-1),
+                    self.child_K_list[i],
+                )
                 children_states_list.append(updated_child_state)
-            return {'children_s_full': children_states_list}
+                children_k_list.append(updated_child_k)
+                child_alive_mask.append(self.child_present_list[i].to(torch.float32))
+            return {
+                'children_s_full': children_states_list,
+                'children_k_full': children_k_list,
+                'alive_mask': child_alive_mask,
+            }
         children_s_full = self.Children_s_full.clone()
-        masked_b = torch.where(
-            updated_alive[..., 0] > 0,
-            self.P_s_full[:, :, 0],
-            torch.zeros_like(self.P_s_full[:, :, 0])
-        )
-        masked_bp = torch.where(
-            updated_alive[..., 0] > 0,
-            bp[..., 0],
-            torch.zeros_like(bp[..., 0])
-        )
+        incumbent_mask = self.child_present_mask & (~self.entry_mask.bool()) & self.alive_mask.unsqueeze(-1).bool()
+        masked_b = self.P_s_full[:, :, 0]
+        masked_bp = bp[..., 0]
         child0 = children_s_full[:, :, 0, :]
         child1 = children_s_full[:, :, 1, :]
         new_b0 = masked_bp * child0[:, :, 2] + masked_b * (1 - child0[:, :, 2])
         new_b1 = masked_bp * child1[:, :, 2] + masked_b * (1 - child1[:, :, 2])
-        child0 = torch.cat([new_b0.unsqueeze(-1), child0[:, :, 1:]], dim=-1)
-        child1 = torch.cat([new_b1.unsqueeze(-1), child1[:, :, 1:]], dim=-1)
+        child0_b = torch.where(incumbent_mask[:, :, 0], new_b0, child0[:, :, 0])
+        child1_b = torch.where(incumbent_mask[:, :, 1], new_b1, child1[:, :, 0])
+        child0 = torch.cat([child0_b.unsqueeze(-1), child0[:, :, 1:]], dim=-1)
+        child1 = torch.cat([child1_b.unsqueeze(-1), child1[:, :, 1:]], dim=-1)
         children_s_full = torch.stack([child0, child1], dim=2)
-        return {'children_s_full': children_s_full}
+        base_k = self.K_parent_full[..., 0]
+        base_bar_i = bar_i[..., 0]
+        new_k = base_k * (1.0 + (self.G - 1.0) * base_bar_i)
+        k0 = torch.where(incumbent_mask[:, :, 0], new_k, self.K_children_full[:, :, 0, 0])
+        k1 = torch.where(incumbent_mask[:, :, 1], new_k, self.K_children_full[:, :, 1, 0])
+        children_k_full = torch.stack([k0.unsqueeze(-1), k1.unsqueeze(-1)], dim=2)
+        alive_mask = self.child_present_mask.to(torch.float32)
+        return {
+            'children_s_full': children_s_full,
+            'children_k_full': children_k_full,
+            'alive_mask': alive_mask,
+        }
 
     def _forward_children_fc2(
         self,
@@ -783,11 +808,12 @@ class FC2Pipeline:
         self,
         pv_model: torch.nn.Module,
         children_s_full: torch.Tensor,
+        children_k_full,
         child_macro_pred: torch.Tensor,
         alive_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         if self.tensor_native:
-            gathered = self._gather_child_policy_rows(children_s_full, child_macro_pred, alive_mask)
+            gathered = self._gather_child_policy_rows(children_s_full, children_k_full, child_macro_pred, alive_mask)
             CV_input = gathered['firm_state']
             if CV_input.shape[0] == 0:
                 zero_child = [torch.zeros((self.child_states_list[i].shape[0], self.branch_num, 1), dtype=torch.float32, device=self.device) for i in range(self.path_num)]
@@ -823,21 +849,20 @@ class FC2Pipeline:
         bar_i_children = self._get_out(CV_output, 'bar_i', 5)
 
         alive_mask_children = alive_mask.clone()
-        alive_prob_children = bar_z_children.clamp(0, 1).squeeze(-1)
-        base_alive_children = alive_mask.float()
-        updated_alive_children = base_alive_children * alive_prob_children
-        alive_mask_children = updated_alive_children.unsqueeze(-1)
+        alive_mask_children = alive_mask.float().unsqueeze(-1)
         return {
             'cv_input': CV_input,
             'cv_output': CV_output,
             'bar_z': bar_z_children,
             'bar_i': bar_i_children,
+            'children_k_full': children_k_full,
             'alive_mask_children': alive_mask_children,
         }
 
     def _compute_children_aggregates(
         self,
         cv_input: torch.Tensor,
+        children_k_full,
         bar_i_children: torch.Tensor,
         bar_z_children: torch.Tensor,
         alive_mask_children: torch.Tensor,
@@ -862,7 +887,6 @@ class FC2Pipeline:
             flat_k = gathered['K']
             flat_bar_i = []
             flat_bar_z = []
-            flat_alive = []
             for i in range(self.path_num):
                 for j in range(self.branch_num):
                     alive_ij = (alive_mask_children[i][:, j, 0] if alive_mask_children[i].dim() == 3 else alive_mask_children[i][:, j]) > 0
@@ -871,24 +895,22 @@ class FC2Pipeline:
                         continue
                     flat_bar_i.append(bar_i_children[i][idx, j, :])
                     flat_bar_z.append(bar_z_children[i][idx, j, :])
-                    flat_alive.append(alive_mask_children[i][idx, j, :])
             flat_bar_i = torch.cat(flat_bar_i, dim=0)
             flat_bar_z = torch.cat(flat_bar_z, dim=0)
-            flat_alive = torch.cat(flat_alive, dim=0)
-            K_children_flat = flat_k * (1 + self.G * flat_bar_i)
+            K_children_flat = flat_k
             Y = torch.exp(cv_input[:, 4:5] + cv_input[:, 1:2]) * K_children_flat
             Phi = (1 - self.phi) * (1 + torch.exp(cv_input[:, 1:2] + cv_input[:, 3:4])) * K_children_flat * flat_bar_z
             I = flat_bar_i * K_children_flat * cv_input[:, 3:4] - flat_bar_z * K_children_flat + self.delta * K_children_flat
-            C = torch.abs(Y - I - Phi)
+            C = Y - I - Phi
             K_sum = torch.zeros((self.path_num * self.branch_num, 1), dtype=torch.float32, device=self.device)
             C_sum = torch.zeros((self.path_num * self.branch_num, 1), dtype=torch.float32, device=self.device)
             linear_idx = gathered['path_idx'] * self.branch_num + gathered['branch_idx']
-            K_sum.index_add_(0, linear_idx, K_children_flat * flat_alive)
-            C_sum.index_add_(0, linear_idx, C * flat_alive)
+            K_sum.index_add_(0, linear_idx, K_children_flat)
+            C_sum.index_add_(0, linear_idx, C.clamp(min=0.0))
             K_sum = K_sum.view(self.path_num, self.branch_num, 1)
             C_sum = C_sum.view(self.path_num, self.branch_num, 1)
             lnk_children = torch.log(K_sum + 1e-8)
-            hatc_children = torch.log(C_sum / (K_sum + 1e-8))
+            hatc_children = torch.log(C_sum / (K_sum + 1e-8) + 1e-5)
             loss_children = torch.mean((lnk_children - lnk_children_pred) ** 2) + torch.mean((hatc_children - hatc_children_pred) ** 2)
             return {
                 'Y': Y,
@@ -900,15 +922,14 @@ class FC2Pipeline:
                 'hatc_actual': hatc_children,
                 'loss': loss_children,
             }
-        bari = bar_i_children
-        K_children_full = self.K_children_full * (1 + self.G * bari)
+        K_children_full = children_k_full
 
         Y = torch.exp(cv_input[..., 4:5] + cv_input[..., 1:2]) * K_children_full
         Phi = (1 - self.phi) * (1 + torch.exp(cv_input[..., 1:2] + cv_input[..., 3:4])) * K_children_full * bar_z_children
         I = bar_i_children * K_children_full * cv_input[..., 3:4] - bar_z_children * K_children_full + self.delta * K_children_full
-        C = torch.abs(Y - I - Phi)
+        C = Y - I - Phi
         lnk_children = torch.log(torch.sum(K_children_full * alive_mask_children[..., 0:1], dim=1) + 1e-8)
-        hatc_children = torch.log(torch.sum(C * alive_mask_children[..., 0:1], dim=1) / (torch.sum(K_children_full * alive_mask_children[..., 0:1], dim=1) + 1e-8))
+        hatc_children = torch.log(torch.sum(C.clamp(min=0.0) * alive_mask_children[..., 0:1], dim=1) / (torch.sum(K_children_full * alive_mask_children[..., 0:1], dim=1) + 1e-8) + 1e-5)
 
         loss_children = torch.mean((lnk_children - lnk_children_pred)**2) + torch.mean((hatc_children - hatc_children_pred)**2)
         return {
@@ -935,16 +956,18 @@ class FC2Pipeline:
             parent_policy.get('gathered'),
         )
 
-        child_state = self._update_children_state(parent_policy['updated_alive'], parent_policy['bp'])
-        children_fc2 = self._forward_children_fc2(fc2_model, child_state['children_s_full'], parent_policy['alive_mask'])
+        child_state = self._update_children_state(parent_policy['bar_i'], parent_policy['bp'])
+        children_fc2 = self._forward_children_fc2(fc2_model, child_state['children_s_full'], child_state['alive_mask'])
         children_policy = self._forward_children_policy(
             pv_model,
             child_state['children_s_full'],
+            child_state['children_k_full'],
             children_fc2['macro_pred'],
-            parent_policy['alive_mask'],
+            child_state['alive_mask'],
         )
         children_agg = self._compute_children_aggregates(
             children_policy['cv_input'],
+            children_policy.get('children_k_full', child_state['children_k_full']),
             children_policy['bar_i'],
             children_policy['bar_z'],
             children_policy['alive_mask_children'],

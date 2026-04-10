@@ -217,6 +217,12 @@
   - 修正 `FC2LossPipe._update_children_state()` 在 tensor-native 路径下对 `child_state` 的原地写入；
   - 之前的写法先取 `eta_j = child_state[:, j, 2]` 这个 view，再对同一 `child_state[:, j, 0]` 原地赋值，会触发 backward 的 version mismatch；
   - 现已改为一次性函数式构造 `new_b` 和新的 `updated_child_state`，避免 inplace autograd 冲突。
+- 已完成第九刀：
+  - 按 `simulate_ts_parallel.py` 的定义重新对齐 `FC2LossPipe` 的 parent / transition / child operator；
+  - parent 聚合不再用 `bar_z` 对 `K` 加权，`C` 改回 `max(C, 0)`，并补齐 `+1e-5` 的 `hatc` 口径；
+  - child 当前节点改为使用 `child_present` 作为 alive 集合，而不是混入 parent `bar_z`；
+  - child incumbent 的 `K` 更新改为只在 transition 段做一次：`K_{t+1}=K_t[1+(g-1)\\bar i_t]`；
+  - child aggregate 阶段不再重复额外乘一次投资更新因子。
 - 已完成最小运行验证：
   - 使用合成 `TensorTable` + dummy `FC2` / `policy_value`，`FC2LossPipe.loss(...)` 可直接跑通；
   - `parent / children` diagnostics 可正常生成；
