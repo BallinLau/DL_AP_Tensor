@@ -95,6 +95,39 @@ def _normalize(train_ref: np.ndarray, arr: np.ndarray) -> tuple[np.ndarray, np.n
     return (arr - mean) / std, mean, std
 
 
+def _fit_poly_baseline_np(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    degree: int = 2,
+) -> tuple[np.ndarray, float, float]:
+    x_vec = np.asarray(x_train, dtype=np.float64).reshape(-1, 1)
+    y_vec = np.asarray(y_train, dtype=np.float64).reshape(-1, 1)
+    mask = np.isfinite(x_vec).reshape(-1) & np.isfinite(y_vec).reshape(-1)
+    if mask.sum() < degree + 1:
+        return np.zeros((degree + 1, 1), dtype=np.float64), 0.0, 1.0
+    x_fit = x_vec[mask]
+    x_mean = float(x_fit.mean())
+    x_scale = float(max(x_fit.std(), 1e-6))
+    x_std = (x_fit - x_mean) / x_scale
+    cols = [np.ones((int(mask.sum()), 1), dtype=np.float64)]
+    for d in range(1, degree + 1):
+        cols.append(x_std ** d)
+    design = np.concatenate(cols, axis=1)
+    coef, *_ = np.linalg.lstsq(design, y_vec[mask], rcond=None)
+    return coef, x_mean, x_scale
+
+
+def _eval_poly_baseline_np(x: np.ndarray, coef: np.ndarray, x_mean: float, x_scale: float) -> np.ndarray:
+    x_vec = np.asarray(x, dtype=np.float64).reshape(-1, 1)
+    degree = int(coef.shape[0] - 1)
+    x_std = (x_vec - x_mean) / max(x_scale, 1e-6)
+    cols = [np.ones_like(x_vec)]
+    for d in range(1, degree + 1):
+        cols.append(x_std ** d)
+    design = np.concatenate(cols, axis=1)
+    return design @ coef
+
+
 def _path_split(paths: np.ndarray, seed: int, val_frac: float, test_frac: float) -> Dict[str, np.ndarray]:
     uniq = np.unique(paths.astype(np.int64))
     rng = np.random.default_rng(seed)
@@ -395,9 +428,26 @@ def main() -> None:
         y_train = train_df[target_cols].to_numpy(dtype=np.float32)
         y_val = val_df[target_cols].to_numpy(dtype=np.float32)
         y_test = test_df[target_cols].to_numpy(dtype=np.float32)
-        y_train_n, y_mean, y_std = _normalize(y_train, y_train)
-        y_val_n, _, _ = _normalize(y_train, y_val)
-        y_test_n, _, _ = _normalize(y_train, y_test)
+        y_train_model = y_train
+        y_val_model = y_val
+        y_test_model = y_test
+        baseline_coef = None
+        baseline_x_mean = 0.0
+        baseline_x_scale = 1.0
+        baseline_train = None
+        baseline_val = None
+        baseline_test = None
+        if task_name == "hatc_only":
+            baseline_coef, baseline_x_mean, baseline_x_scale = _fit_poly_baseline_np(x_train[:, -1], y_train, degree=2)
+            baseline_train = _eval_poly_baseline_np(x_train[:, -1], baseline_coef, baseline_x_mean, baseline_x_scale).astype(np.float32)
+            baseline_val = _eval_poly_baseline_np(x_val[:, -1], baseline_coef, baseline_x_mean, baseline_x_scale).astype(np.float32)
+            baseline_test = _eval_poly_baseline_np(x_test[:, -1], baseline_coef, baseline_x_mean, baseline_x_scale).astype(np.float32)
+            y_train_model = y_train - baseline_train
+            y_val_model = y_val - baseline_val
+            y_test_model = y_test - baseline_test
+        y_train_n, y_mean, y_std = _normalize(y_train_model, y_train_model)
+        y_val_n, _, _ = _normalize(y_train_model, y_val_model)
+        y_test_n, _, _ = _normalize(y_train_model, y_test_model)
 
         result = train_probe(
             task_name,
@@ -419,9 +469,17 @@ def main() -> None:
         probe_results.append(result)
         pred_phys = result.pred_test_norm * y_std + y_mean
         true_phys = result.y_test_norm * y_std + y_mean
+        if baseline_test is not None:
+            pred_phys = pred_phys + baseline_test
+            true_phys = y_test
         pred_cols[task_name] = pred_phys
 
         task_summary: Dict[str, float] = {"best_val_loss_norm": result.best_val_loss}
+        if baseline_coef is not None:
+            for idx, val in enumerate(baseline_coef.reshape(-1).tolist()):
+                task_summary[f"x_baseline_coef_{idx}"] = float(val)
+            task_summary["x_baseline_mean"] = float(baseline_x_mean)
+            task_summary["x_baseline_scale"] = float(baseline_x_scale)
         for idx, col in enumerate(target_cols):
             task_summary.update(_prefixed_stats(col, true_phys[:, idx], pred_phys[:, idx]))
         results_summary[task_name] = task_summary

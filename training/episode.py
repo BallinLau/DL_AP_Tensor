@@ -152,6 +152,8 @@ class Episode:
         self._latest_pi_terms = {}
         self._latest_q_terms = {}
         self._latest_fc2_diag = {}
+        self._latest_fc2_fit_df: Optional[pd.DataFrame] = None
+        self._latest_fc2_outer_df: Optional[pd.DataFrame] = None
         self._sdf_base_lr_backup = None
         self._current_epoch_idx = 0
         self._q_only_stage = False
@@ -215,6 +217,35 @@ class Episode:
             if scheduler is not None:
                 return float(scheduler.get_lr())
         return 0.0
+
+    def _fit_fc2_hatc_x_baseline(
+        self,
+        sup_dataset: Optional[TensorDataset],
+    ) -> Dict[str, float]:
+        hatc_model, _ = self._get_fc2_models()
+        if hatc_model is None or sup_dataset is None or len(sup_dataset) == 0:
+            return {}
+        if not hasattr(hatc_model, "fit_x_baseline"):
+            return {}
+        x_hatc_all, _, y_all = sup_dataset.tensors
+        hatc_target = y_all[:, 1:2]
+        hatc_model.fit_x_baseline(x_hatc_all, hatc_target)
+        diag: Dict[str, float] = {}
+        coef = getattr(hatc_model, "x_baseline_coef", None)
+        if coef is not None:
+            coef_flat = coef.detach().cpu().reshape(-1).tolist()
+            for idx, val in enumerate(coef_flat):
+                diag[f"fc2_hatc_x_baseline_coef_{idx}"] = float(val)
+        x_mean = getattr(hatc_model, "x_baseline_mean", None)
+        if x_mean is not None:
+            diag["fc2_hatc_x_baseline_mean"] = float(x_mean.detach().cpu().reshape(-1)[0].item())
+        x_scale = getattr(hatc_model, "x_baseline_scale", None)
+        if x_scale is not None:
+            diag["fc2_hatc_x_baseline_scale"] = float(x_scale.detach().cpu().reshape(-1)[0].item())
+        fitted = getattr(hatc_model, "x_baseline_fitted", None)
+        if fitted is not None:
+            diag["fc2_hatc_x_baseline_fitted"] = float(bool(fitted.item()))
+        return diag
 
     def _expand_train_model_keys(self, train_modules: List[str]) -> List[str]:
         expanded: List[str] = []
@@ -3034,6 +3065,7 @@ class Episode:
         self,
         sup_dataset: Optional[TensorDataset],
         prefix: str,
+        store_attr: Optional[str] = None,
     ) -> Optional[Dict[str, float]]:
         hatc_model, lnk_model = self._get_fc2_models()
         if hatc_model is None or lnk_model is None:
@@ -3047,6 +3079,17 @@ class Episode:
         with torch.no_grad():
             hatc_pred = hatc_model(x_hatc_all)
             lnk_pred = lnk_model(x_lnk_all)
+
+        if store_attr is not None:
+            pred_df = pd.DataFrame(
+                {
+                    'hatc_true': hatc_target.detach().cpu().numpy().reshape(-1),
+                    'hatc_pred': hatc_pred.detach().cpu().numpy().reshape(-1),
+                    'lnk_true': lnk_target.detach().cpu().numpy().reshape(-1),
+                    'lnk_pred': lnk_pred.detach().cpu().numpy().reshape(-1),
+                }
+            )
+            setattr(self, store_attr, pred_df)
 
         diag: Dict[str, float] = {
             f'{prefix}_hatc_loss': float(nn.functional.mse_loss(hatc_pred, hatc_target).item()),
@@ -3070,7 +3113,11 @@ class Episode:
     ) -> Optional[Dict[str, float]]:
         if sup_dataset is None:
             sup_dataset = self._build_fc2_supervised_dataset()
-        return self._evaluate_fc2_dataset_fit(sup_dataset, prefix='fc2_fit_after_train')
+        return self._evaluate_fc2_dataset_fit(
+            sup_dataset,
+            prefix='fc2_fit_after_train',
+            store_attr='_latest_fc2_fit_df',
+        )
 
     def _compute_fc2_outer_after_resim(
         self,
@@ -3097,7 +3144,11 @@ class Episode:
         )
         out: TensorSimulationOutput = simulator.simulate_tensor()
         sup_dataset = self._build_fc2_supervised_dataset_from_tables(out.firm, out.macro)
-        return self._evaluate_fc2_dataset_fit(sup_dataset, prefix='fc2_outer_after_resim')
+        return self._evaluate_fc2_dataset_fit(
+            sup_dataset,
+            prefix='fc2_outer_after_resim',
+            store_attr='_latest_fc2_outer_df',
+        )
     
     def create_batches(
         self,
@@ -4126,6 +4177,7 @@ class Episode:
         hatc_model, lnk_model = self._get_fc2_models()
         fc2_optimizer_keys = self._get_fc2_optimizer_keys()
         sup_dataset: Optional[TensorDataset] = None
+        hatc_baseline_diag: Dict[str, float] = {}
 
         if (
             pretrain_epochs > 0
@@ -4137,6 +4189,7 @@ class Episode:
             if sup_dataset is None or len(sup_dataset) == 0:
                 pretrain_epochs = 0
             else:
+                hatc_baseline_diag = self._fit_fc2_hatc_x_baseline(sup_dataset)
                 sup_loader = DataLoader(
                     sup_dataset,
                     batch_size=max(int(getattr(self.hyperparams, 'batch_size', 4096)), 1),
@@ -4195,6 +4248,7 @@ class Episode:
                     batch_log['fc2_lnk_grad_norm'] = lnk_grad_norm
                     batch_log['fc2_grad_norm'] = float(max(hatc_grad_norm, lnk_grad_norm))
                     batch_log['total'] = float(sup_loss.item())
+                    batch_log.update(hatc_baseline_diag)
                     self._latest_fc2_diag = batch_log
                     self._record_manual_losses(batch_log)
                     batch_losses.append(batch_log)
@@ -4225,6 +4279,8 @@ class Episode:
                 'final_losses': final_pretrain,
                 'pretrain_epoch_losses': pretrain_epoch_losses,
             }
+            if hatc_baseline_diag:
+                result['hatc_x_baseline'] = hatc_baseline_diag
             if fit_after_train:
                 result['fit_after_train'] = fit_after_train
             return result
@@ -4281,6 +4337,8 @@ class Episode:
         }
         logger.info("FC2 Epochs finished: %s", avg_losses)
         result = {'final_losses': avg_losses}
+        if hatc_baseline_diag:
+            result['hatc_x_baseline'] = hatc_baseline_diag
         if pretrain_epoch_losses:
             result['pretrain_final_losses'] = {
                 k: np.mean([l[k] for l in pretrain_epoch_losses if k in l])
@@ -4402,6 +4460,8 @@ class Episode:
         self.tensor_firm = None
         self.tensor_macro = None
         self.tensor_sdf = None
+        self._latest_fc2_fit_df = None
+        self._latest_fc2_outer_df = None
         use_sdf_fc1 = 'sdf_fc1' in train_modules and 'sdf_fc1' in self.models
         use_policy_value = 'policy_value' in train_modules and 'policy_value' in self.models
         use_fc2 = 'fc2' in train_modules and self._has_fc2_models()

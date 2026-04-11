@@ -58,10 +58,96 @@ class FC2HatcModel(FC2ScalarModel):
         hidden_dims: List[int] = None,
         quantile_num: int = 100,
         dropout: float = 0.1,
+        use_x_baseline: bool = True,
+        baseline_degree: int = 2,
     ):
         if input_dim is None:
             input_dim = 2 * quantile_num + 1
         super().__init__(input_dim=input_dim, hidden_dims=hidden_dims, dropout=dropout)
+        self.use_x_baseline = bool(use_x_baseline)
+        self.baseline_degree = int(baseline_degree)
+        self.x_index = input_dim - 1
+        self.register_buffer(
+            "x_baseline_coef",
+            torch.zeros((self.baseline_degree + 1,), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "x_baseline_mean",
+            torch.zeros((1,), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "x_baseline_scale",
+            torch.ones((1,), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "x_baseline_fitted",
+            torch.tensor(False, dtype=torch.bool),
+        )
+
+    def _x_design(self, x: torch.Tensor) -> torch.Tensor:
+        cols = [torch.ones_like(x)]
+        for d in range(1, self.baseline_degree + 1):
+            cols.append(x ** d)
+        return torch.cat(cols, dim=1)
+
+    def fit_x_baseline(self, phi: torch.Tensor, y: torch.Tensor) -> None:
+        if not self.use_x_baseline:
+            self.x_baseline_coef.zero_()
+            self.x_baseline_mean.zero_()
+            self.x_baseline_scale.fill_(1.0)
+            self.x_baseline_fitted.fill_(False)
+            return
+        if phi.numel() == 0 or y.numel() == 0:
+            self.x_baseline_coef.zero_()
+            self.x_baseline_mean.zero_()
+            self.x_baseline_scale.fill_(1.0)
+            self.x_baseline_fitted.fill_(False)
+            return
+
+        x = phi[:, self.x_index:self.x_index + 1].detach()
+        y_vec = y.reshape(-1, 1).detach()
+        finite = torch.isfinite(x).reshape(-1) & torch.isfinite(y_vec).reshape(-1)
+        if int(finite.sum().item()) < self.baseline_degree + 1:
+            self.x_baseline_coef.zero_()
+            self.x_baseline_mean.zero_()
+            self.x_baseline_scale.fill_(1.0)
+            self.x_baseline_fitted.fill_(False)
+            return
+
+        x_cpu = x[finite].to(dtype=torch.float64, device="cpu")
+        y_cpu = y_vec[finite].to(dtype=torch.float64, device="cpu")
+        x_mean = x_cpu.mean(dim=0, keepdim=True)
+        x_scale = x_cpu.std(dim=0, keepdim=True).clamp(min=1e-6)
+        x_std = (x_cpu - x_mean) / x_scale
+        design = self._x_design(x_std)
+        coef = torch.linalg.lstsq(design, y_cpu).solution.reshape(-1)
+        self.x_baseline_coef.copy_(coef.to(device=self.x_baseline_coef.device, dtype=self.x_baseline_coef.dtype))
+        self.x_baseline_mean.copy_(x_mean.reshape_as(self.x_baseline_mean).to(device=self.x_baseline_mean.device, dtype=self.x_baseline_mean.dtype))
+        self.x_baseline_scale.copy_(x_scale.reshape_as(self.x_baseline_scale).to(device=self.x_baseline_scale.device, dtype=self.x_baseline_scale.dtype))
+        self.x_baseline_fitted.fill_(True)
+
+    def x_baseline(self, phi: torch.Tensor) -> torch.Tensor:
+        if (not self.use_x_baseline) or (not bool(self.x_baseline_fitted.item())):
+            return torch.zeros((phi.shape[0], 1), dtype=phi.dtype, device=phi.device)
+        x = phi[:, self.x_index:self.x_index + 1].to(dtype=phi.dtype)
+        x_mean = self.x_baseline_mean.to(device=phi.device, dtype=phi.dtype)
+        x_scale = self.x_baseline_scale.to(device=phi.device, dtype=phi.dtype).clamp(min=1e-6)
+        x_std = (x - x_mean) / x_scale
+        design = self._x_design(x_std)
+        coef = self.x_baseline_coef.to(device=phi.device, dtype=phi.dtype).unsqueeze(1)
+        return design @ coef
+
+    def forward(self, phi: torch.Tensor) -> torch.Tensor:
+        residual = super().forward(phi)
+        return residual + self.x_baseline(phi)
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        state = dict(state_dict)
+        state.setdefault("x_baseline_coef", self.x_baseline_coef.detach().clone())
+        state.setdefault("x_baseline_mean", self.x_baseline_mean.detach().clone())
+        state.setdefault("x_baseline_scale", self.x_baseline_scale.detach().clone())
+        state.setdefault("x_baseline_fitted", self.x_baseline_fitted.detach().clone())
+        return super().load_state_dict(state, strict=strict)
 
 
 class FC2LnkModel(FC2ScalarModel):

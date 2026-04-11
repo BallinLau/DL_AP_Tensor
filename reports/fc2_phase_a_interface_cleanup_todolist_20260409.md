@@ -305,6 +305,13 @@
     - `_encode()`
     - `p0_head(h)`；
   - 现在仅对 `pI_head(h, i)` 做大 batch 并行评估，再回收成 `Vhat / P / chi / bar_z`。
+- 已完成第十五刀：
+  - `FC2HatcModel` 新增 `x-only baseline + residual` 结构：
+    - 每轮 supervised pretrain 前先用当前 dataset 拟合 `hatc = a0 + a1 x + a2 x^2`
+    - baseline 参数作为模型 buffer 保存进 checkpoint
+    - `forward()` 始终输出 `baseline(x) + residual(phi)`，外部接口保持物理尺度不变；
+  - baseline 在标准化后的 `x` 上拟合，额外保存 `x_mean / x_scale`，避免二次项数值不稳定；
+  - `experiments/run_fc2_supervised_probe.py` 也同步切到同一套 `x-only baseline + residual` 训练口径，减少 probe 与 episode pretrain 的协议偏差。
 - 已完成最小运行验证：
   - 使用合成 `TensorTable` + dummy `FC2` / `policy_value`，`FC2LossPipe.loss(...)` 可直接跑通；
   - `parent / children` diagnostics 可正常生成；
