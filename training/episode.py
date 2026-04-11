@@ -154,6 +154,8 @@ class Episode:
         self._latest_fc2_diag = {}
         self._latest_fc2_fit_df: Optional[pd.DataFrame] = None
         self._latest_fc2_outer_df: Optional[pd.DataFrame] = None
+        self._latest_fc2_current_macro_panel_df: Optional[pd.DataFrame] = None
+        self._latest_fc2_outer_macro_panel_df: Optional[pd.DataFrame] = None
         self._sdf_base_lr_backup = None
         self._current_epoch_idx = 0
         self._q_only_stage = False
@@ -457,6 +459,97 @@ class Episode:
                 for br, grp in use_df.groupby('branch')
             }
         return out
+
+    def _macro_consumption_diagnostics(
+        self,
+        macro_panel: Optional[pd.DataFrame | TensorTable],
+        prefix: str,
+    ) -> Dict[str, float]:
+        if macro_panel is None:
+            return {}
+        if isinstance(macro_panel, TensorTable):
+            df_macro = self._table_to_dataframe(macro_panel)
+        else:
+            df_macro = macro_panel.copy()
+        if df_macro is None or df_macro.empty:
+            return {}
+        df_macro = self._select_fc2_macro_window_df(df_macro)
+        if df_macro is None or df_macro.empty:
+            return {}
+
+        required_cols = {
+            'C_raw',
+            'C_firmclip',
+            'C_aggclip',
+            'Hatc_firmclip',
+            'Hatc_aggclip',
+            'C_raw_over_K',
+            'C_pos_mass',
+            'C_neg_mass',
+            'neg_c_mass_share',
+            'feasible_raw',
+        }
+        if not required_cols.issubset(df_macro.columns):
+            return {}
+
+        use_df = df_macro
+
+        out: Dict[str, float] = {
+            f'{prefix}_n_rows': float(len(use_df)),
+            f'{prefix}_feasible_path_share': float(pd.to_numeric(use_df['feasible_raw'], errors='coerce').mean()),
+            f'{prefix}_mean_c_raw_over_k': float(pd.to_numeric(use_df['C_raw_over_K'], errors='coerce').mean()),
+            f'{prefix}_mean_neg_c_mass_share': float(pd.to_numeric(use_df['neg_c_mass_share'], errors='coerce').mean()),
+            f'{prefix}_p90_neg_c_mass_share': float(pd.to_numeric(use_df['neg_c_mass_share'], errors='coerce').quantile(0.9)),
+            f'{prefix}_mean_hatc_firmclip': float(pd.to_numeric(use_df['Hatc_firmclip'], errors='coerce').mean()),
+            f'{prefix}_mean_hatc_aggclip': float(pd.to_numeric(use_df['Hatc_aggclip'], errors='coerce').mean()),
+            f'{prefix}_mean_hatc_clip_gap': float(
+                (pd.to_numeric(use_df['Hatc_firmclip'], errors='coerce') - pd.to_numeric(use_df['Hatc_aggclip'], errors='coerce')).mean()
+            ),
+            f'{prefix}_mean_c_raw': float(pd.to_numeric(use_df['C_raw'], errors='coerce').mean()),
+            f'{prefix}_mean_c_firmclip': float(pd.to_numeric(use_df['C_firmclip'], errors='coerce').mean()),
+            f'{prefix}_mean_c_aggclip': float(pd.to_numeric(use_df['C_aggclip'], errors='coerce').mean()),
+        }
+        return out
+
+    def _select_fc2_macro_window_df(
+        self,
+        macro_panel: Optional[pd.DataFrame | TensorTable],
+    ) -> Optional[pd.DataFrame]:
+        if macro_panel is None:
+            return None
+        if isinstance(macro_panel, TensorTable):
+            df_macro = self._table_to_dataframe(macro_panel)
+        else:
+            df_macro = macro_panel.copy()
+        if df_macro is None or df_macro.empty:
+            return None
+        required = {'path', 't', 'branch'}
+        if not required.issubset(df_macro.columns):
+            return df_macro
+
+        selected: List[pd.DataFrame] = []
+        use_df = df_macro.copy()
+        use_df['path'] = pd.to_numeric(use_df['path'], errors='coerce').astype('Int64')
+        use_df['t'] = pd.to_numeric(use_df['t'], errors='coerce').astype('Int64')
+        use_df['branch'] = pd.to_numeric(use_df['branch'], errors='coerce').astype('Int64')
+
+        for _, grp in use_df.groupby('path', sort=True):
+            parent = grp[grp['branch'] == -1]
+            if parent.empty:
+                continue
+            parent_t = int(parent['t'].max())
+            child_t = parent_t + 1
+            keep = grp[
+                ((grp['t'] == parent_t) & (grp['branch'] == -1))
+                | ((grp['t'] == child_t) & (grp['branch'].isin([0, 1])))
+            ]
+            if not keep.empty:
+                selected.append(keep)
+
+        if not selected:
+            return use_df.sort_values(['path', 't', 'branch']).reset_index(drop=True)
+        out = pd.concat(selected, ignore_index=True)
+        return out.sort_values(['path', 't', 'branch']).reset_index(drop=True)
 
     @staticmethod
     def _macro_forecast_r2_tensor(macro_table: Optional[TensorTable]) -> Dict[str, float]:
@@ -3143,11 +3236,33 @@ class Episode:
             **sim_kwargs
         )
         out: TensorSimulationOutput = simulator.simulate_tensor()
+        self._latest_fc2_outer_macro_panel_df = self._select_fc2_macro_window_df(out.macro)
         sup_dataset = self._build_fc2_supervised_dataset_from_tables(out.firm, out.macro)
-        return self._evaluate_fc2_dataset_fit(
+        diag = self._evaluate_fc2_dataset_fit(
             sup_dataset,
             prefix='fc2_outer_after_resim',
             store_attr='_latest_fc2_outer_df',
+        )
+        if diag is None:
+            return None
+        diag.update(
+            self._macro_consumption_diagnostics(
+                self._latest_fc2_outer_macro_panel_df,
+                prefix='fc2_outer_after_resim_macro_consumption',
+            )
+        )
+        return diag
+
+    def _capture_current_fc2_macro_panel(self) -> Dict[str, float]:
+        macro_panel: Optional[pd.DataFrame | TensorTable]
+        if self.df_macro is not None and not self.df_macro.empty:
+            macro_panel = self.df_macro
+        else:
+            macro_panel = self.tensor_macro
+        self._latest_fc2_current_macro_panel_df = self._select_fc2_macro_window_df(macro_panel)
+        return self._macro_consumption_diagnostics(
+            self._latest_fc2_current_macro_panel_df,
+            prefix='fc2_current_macro_consumption',
         )
     
     def create_batches(
@@ -4462,6 +4577,8 @@ class Episode:
         self.tensor_sdf = None
         self._latest_fc2_fit_df = None
         self._latest_fc2_outer_df = None
+        self._latest_fc2_current_macro_panel_df = None
+        self._latest_fc2_outer_macro_panel_df = None
         use_sdf_fc1 = 'sdf_fc1' in train_modules and 'sdf_fc1' in self.models
         use_policy_value = 'policy_value' in train_modules and 'policy_value' in self.models
         use_fc2 = 'fc2' in train_modules and self._has_fc2_models()
@@ -4547,8 +4664,11 @@ class Episode:
                         )
 
                 if use_fc2:
+                    current_macro_diag = self._capture_current_fc2_macro_panel()
                     fc2_summary = self._run_fc2_epochs(n_epochs=n_epochs, log_interval=log_interval)
                     if fc2_summary is not None:
+                        if current_macro_diag:
+                            fc2_summary['current_macro_consumption_diag'] = current_macro_diag
                         outer_diag = self._compute_fc2_outer_after_resim(
                             n_paths=n_paths,
                             group_size=simulate_group_size,
@@ -4622,8 +4742,11 @@ class Episode:
                         )
 
                 if use_fc2:
+                    current_macro_diag = self._capture_current_fc2_macro_panel()
                     fc2_summary = self._run_fc2_epochs(n_epochs=n_epochs, log_interval=log_interval)
                     if fc2_summary is not None:
+                        if current_macro_diag:
+                            fc2_summary['current_macro_consumption_diag'] = current_macro_diag
                         outer_diag = self._compute_fc2_outer_after_resim(
                             n_paths=n_paths,
                             group_size=simulate_group_size,
@@ -4698,8 +4821,11 @@ class Episode:
                         )
 
                 if use_fc2:
+                    current_macro_diag = self._capture_current_fc2_macro_panel()
                     fc2_summary = self._run_fc2_epochs(n_epochs=n_epochs, log_interval=log_interval)
                     if fc2_summary is not None:
+                        if current_macro_diag:
+                            fc2_summary['current_macro_consumption_diag'] = current_macro_diag
                         outer_diag = self._compute_fc2_outer_after_resim(
                             n_paths=n_paths,
                             group_size=simulate_group_size,

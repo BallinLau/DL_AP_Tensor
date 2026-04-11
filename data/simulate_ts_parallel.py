@@ -10,6 +10,46 @@ from .data_utils import sample_ar1, sample_bernoulli, sample_stationary_ar1, sam
 from .tensor_data import TensorSimulationOutput, TensorTable, cat_rows
 
 
+def _grouped_macro_consumption_diag(
+    K: torch.Tensor,
+    C: torch.Tensor,
+    group_idx: torch.Tensor,
+    n_groups: int,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    K_total = torch.zeros(n_groups, device=device)
+    C_raw = torch.zeros(n_groups, device=device)
+    C_pos_mass = torch.zeros(n_groups, device=device)
+    C_neg_mass = torch.zeros(n_groups, device=device)
+
+    K_total.index_add_(0, group_idx, K)
+    C_raw.index_add_(0, group_idx, C)
+    C_pos_mass.index_add_(0, group_idx, C.clamp(min=0.0))
+    C_neg_mass.index_add_(0, group_idx, (-C).clamp(min=0.0))
+
+    C_firmclip = C_pos_mass
+    C_aggclip = C_raw.clamp(min=0.0)
+    denom = K_total + 1e-8
+    hatc_firmclip = torch.log(C_firmclip / denom + 1e-5)
+    hatc_aggclip = torch.log(C_aggclip / denom + 1e-5)
+    c_raw_over_k = C_raw / denom
+    neg_c_mass_share = C_neg_mass / (C_pos_mass + C_neg_mass + 1e-8)
+    feasible_raw = (C_raw > 0).to(torch.float32)
+    return {
+        "K_total": K_total,
+        "C_raw": C_raw,
+        "C_firmclip": C_firmclip,
+        "C_aggclip": C_aggclip,
+        "Hatc_firmclip": hatc_firmclip,
+        "Hatc_aggclip": hatc_aggclip,
+        "C_raw_over_K": c_raw_over_k,
+        "C_pos_mass": C_pos_mass,
+        "C_neg_mass": C_neg_mass,
+        "neg_c_mass_share": neg_c_mass_share,
+        "feasible_raw": feasible_raw,
+    }
+
+
 def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
     """
     Simulate all paths in parallel on device.
@@ -144,6 +184,16 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                 torch.full((n_paths,), -10.0, device=device),
                 torch.full((n_paths,), -10.0, device=device),
                 torch.zeros(n_paths, device=device),
+                torch.zeros(n_paths, device=device),
+                torch.zeros(n_paths, device=device),
+                torch.full((n_paths,), -10.0, device=device),
+                torch.full((n_paths,), -10.0, device=device),
+                torch.zeros(n_paths, device=device),
+                torch.zeros(n_paths, device=device),
+                torch.zeros(n_paths, device=device),
+                torch.zeros(n_paths, device=device),
+                torch.zeros(n_paths, device=device),
+                torch.zeros(n_paths, device=device),
                 state["M"].to(torch.float32),
                 state["x"].to(torch.float32),
                 state["hatcf"].to(torch.float32),
@@ -235,14 +285,12 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         dim=1,
     ).to(torch.float32)
 
-    K_total = torch.zeros(n_paths, device=device)
-    C_total = torch.zeros(n_paths, device=device)
-    K_total.index_add_(0, path_idx, K)
-    C_total.index_add_(0, path_idx, C.clamp(min=0.0))
+    macro_diag = _grouped_macro_consumption_diag(K, C, path_idx, n_paths, device)
+    K_total = macro_diag["K_total"]
     alive_any = n_alive_per_path > 0
     LnK = torch.where(alive_any, torch.log(K_total + 1e-8), torch.full_like(K_total, -10.0))
-    Hatc_raw = torch.log(C_total / (K_total + 1e-8) + 1e-5)
-    Hatc = torch.where(alive_any, Hatc_raw, torch.full_like(C_total, -10.0))
+    Hatc = torch.where(alive_any, macro_diag["Hatc_firmclip"], torch.full_like(K_total, -10.0))
+    Hatc_aggclip = torch.where(alive_any, macro_diag["Hatc_aggclip"], torch.full_like(K_total, -10.0))
 
     macro_rows = torch.stack(
         [
@@ -250,9 +298,19 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             torch.full((n_paths,), float(t), device=device),
             torch.full((n_paths,), float(branch_k), device=device),
             K_total,
-            C_total,
+            macro_diag["C_firmclip"],
             LnK,
             Hatc,
+            macro_diag["C_raw"],
+            macro_diag["C_firmclip"],
+            macro_diag["C_aggclip"],
+            Hatc,
+            Hatc_aggclip,
+            macro_diag["C_raw_over_K"],
+            macro_diag["C_pos_mass"],
+            macro_diag["C_neg_mass"],
+            macro_diag["neg_c_mass_share"],
+            macro_diag["feasible_raw"],
             n_alive_per_path.to(torch.float32),
             state["M"].to(torch.float32),
             state["x"].to(torch.float32),

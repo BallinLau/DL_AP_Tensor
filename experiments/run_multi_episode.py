@@ -44,6 +44,9 @@ from experiments.run_utils import (  # noqa: E402
     save_stage_df,
     plot_surfaces,
     plot_distributions,
+    plot_fc2_fit_diagnostics,
+    plot_fc2_consumption_distribution,
+    plot_fc2_episode_metrics,
     plot_outer_drift,
     plot_firm_b_window_distribution,
 )
@@ -278,14 +281,28 @@ def main():
             get_base_dir(),
             df_macro=episode.df_macro,
         )
+        plot_fc2_fit_diagnostics(
+            ep,
+            getattr(episode, "_latest_fc2_fit_df", None),
+            getattr(episode, "_latest_fc2_outer_df", None),
+            get_base_dir(),
+        )
+        plot_fc2_consumption_distribution(
+            ep,
+            getattr(episode, "_latest_fc2_current_macro_panel_df", None),
+            getattr(episode, "_latest_fc2_outer_macro_panel_df", None),
+            get_base_dir(),
+        )
 
         summaries.append(ep_summary)
+        plot_fc2_episode_metrics(summaries, get_base_dir() / "experiments" / "figs")
         plot_outer_drift(summaries, get_base_dir() / "experiments" / "figs")
         print(f"Episode {ep} ({episode_mode}) done: {ep_summary}")
 
     print("All episodes done.")
     print(summaries)
     plot_stage_losses(summaries, get_base_dir() / "experiments" / "figs")
+    plot_fc2_episode_metrics(summaries, get_base_dir() / "experiments" / "figs")
     plot_outer_drift(summaries, get_base_dir() / "experiments" / "figs")
 
     # 额外模拟一次使用最终模型的数据，并导出以便宏观画图

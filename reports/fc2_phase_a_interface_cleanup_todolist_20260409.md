@@ -218,6 +218,13 @@
   - 修正 `FC2LossPipe._update_children_state()` 在 tensor-native 路径下对 `child_state` 的原地写入；
   - 之前的写法先取 `eta_j = child_state[:, j, 2]` 这个 view，再对同一 `child_state[:, j, 0]` 原地赋值，会触发 backward 的 version mismatch；
   - 现已改为一次性函数式构造 `new_b` 和新的 `updated_child_state`，避免 inplace autograd 冲突。
+- 已完成第九刀：
+  - 在 `simulate_ts.py / simulate_ts_parallel.py` 中补入 `C_raw / C_firmclip / C_aggclip / Hatc_firmclip / Hatc_aggclip` 这组资源诊断列；
+  - `Episode` 现在会在 `FC2` 训练前记录当前 macro panel 的 `sum C` 诊断，并在 `outer_after_resim` 中再记录一遍；
+  - runner 新增两张逐 episode 图：
+    - `ep*_fc2_before_train_c_raw_distribution.png`
+    - `ep*_fc2_outer_after_resim_c_raw_distribution.png`
+  - 图中会把 `parent` 和 `children` 分开画，用于直接检查 `sum C = \sum_j C_j` 的 path-level 分布是否经常落到负区。
 - 已完成第十二刀：
   - 删除旧的 `macro_diag_before_sdf2 / macro_diag_modeb` summary 输出，不再继续维护这套旧 FC1 口径宏观诊断；
   - 删除 `ep*_macro_hatc.png / ep*_macro_lnk.png / *_vs_x / *_branch01 / *_delta_*` 这一整套旧 macro 图生成逻辑；

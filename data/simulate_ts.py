@@ -45,6 +45,10 @@ class SimulateTS:
     ]
     MACRO_COLUMNS = [
         'path', 't', 'branch', 'K', 'C', 'LnK', 'Hatc',
+        'C_raw', 'C_firmclip', 'C_aggclip',
+        'Hatc_firmclip', 'Hatc_aggclip',
+        'C_raw_over_K', 'C_pos_mass', 'C_neg_mass',
+        'neg_c_mass_share', 'feasible_raw',
         'n_firms', 'M', 'x', 'hatcf', 'lnkf'
     ]
 
@@ -386,19 +390,29 @@ class SimulateTS:
             dim=1
         ).to(torch.float32)
 
-        K_total = K.sum()
-        C_total = C.sum().clamp(min=0.0)
+        macro_diag = self._macro_consumption_diag_single(K, C)
+        K_total = macro_diag['K_total']
         LnK = torch.log(K_total + 1e-8)
-        Hatc = torch.log(C_total / (K_total + 1e-8) + 1e-5)
+        Hatc = macro_diag['Hatc_firmclip']
         macro_row = torch.stack(
             [
                 torch.tensor(float(path_idx), device=device),
                 torch.tensor(float(t), device=device),
                 torch.tensor(float(branch_k), device=device),
                 K_total,
-                C_total,
+                macro_diag['C_firmclip'],
                 LnK,
                 Hatc,
+                macro_diag['C_raw'],
+                macro_diag['C_firmclip'],
+                macro_diag['C_aggclip'],
+                macro_diag['Hatc_firmclip'],
+                macro_diag['Hatc_aggclip'],
+                macro_diag['C_raw_over_K'],
+                macro_diag['C_pos_mass'],
+                macro_diag['C_neg_mass'],
+                macro_diag['neg_c_mass_share'],
+                macro_diag['feasible_raw'],
                 torch.tensor(float(n_alive), device=device),
                 m_scalar,
                 x_scalar,
@@ -500,7 +514,30 @@ class SimulateTS:
         # 构建输入张量
         n = state['alive'].sum().item()
         if n == 0:
-            return [], {'path': path_idx, 't': t, 'branch': branch_k, 'K': 0, 'C': 0, 'LnK': -10, 'Hatc': -10}
+            return [], {
+                'path': path_idx,
+                't': t,
+                'branch': branch_k,
+                'K': 0,
+                'C': 0,
+                'LnK': -10,
+                'Hatc': -10,
+                'C_raw': 0,
+                'C_firmclip': 0,
+                'C_aggclip': 0,
+                'Hatc_firmclip': -10,
+                'Hatc_aggclip': -10,
+                'C_raw_over_K': 0,
+                'C_pos_mass': 0,
+                'C_neg_mass': 0,
+                'neg_c_mass_share': 0,
+                'feasible_raw': 0,
+                'n_firms': 0,
+                'M': state.get('M'),
+                'x': state['x'],
+                'hatcf': state['hatcf'],
+                'lnkf': state['lnkf'],
+            }
         
         alive_mask = state['alive']
         alive_idx = torch.nonzero(alive_mask, as_tuple=False).squeeze(-1)
@@ -569,16 +606,26 @@ class SimulateTS:
             firm_data.append(row)
         
         # 宏观聚合
-        K_total = K.sum().item()
-        C_total = C.sum().clamp(min=0).item()
+        macro_diag = self._macro_consumption_diag_single(K, C)
+        K_total = float(macro_diag['K_total'].item())
         macro_row = {
             'path': path_idx,
             't': t,
             'branch': branch_k,
             'K': K_total,
-            'C': C_total,
+            'C': float(macro_diag['C_firmclip'].item()),
             'LnK': np.log(K_total + 1e-8),
-            'Hatc': np.log(C_total / (K_total + 1e-8) + 1e-5),
+            'Hatc': float(macro_diag['Hatc_firmclip'].item()),
+            'C_raw': float(macro_diag['C_raw'].item()),
+            'C_firmclip': float(macro_diag['C_firmclip'].item()),
+            'C_aggclip': float(macro_diag['C_aggclip'].item()),
+            'Hatc_firmclip': float(macro_diag['Hatc_firmclip'].item()),
+            'Hatc_aggclip': float(macro_diag['Hatc_aggclip'].item()),
+            'C_raw_over_K': float(macro_diag['C_raw_over_K'].item()),
+            'C_pos_mass': float(macro_diag['C_pos_mass'].item()),
+            'C_neg_mass': float(macro_diag['C_neg_mass'].item()),
+            'neg_c_mass_share': float(macro_diag['neg_c_mass_share'].item()),
+            'feasible_raw': float(macro_diag['feasible_raw'].item()),
             'n_firms': n,
             'M': state.get('M'),
             'x': state['x'],
@@ -618,6 +665,37 @@ class SimulateTS:
         C = Y - I - Phi
         
         return Y, I, Phi, C
+
+    def _macro_consumption_diag_single(
+        self,
+        K: torch.Tensor,
+        C: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        K_total = K.sum()
+        C_raw = C.sum()
+        C_pos_mass = C.clamp(min=0.0).sum()
+        C_neg_mass = (-C).clamp(min=0.0).sum()
+        C_firmclip = C_pos_mass
+        C_aggclip = C_raw.clamp(min=0.0)
+        denom = K_total + 1e-8
+        hatc_firmclip = torch.log(C_firmclip / denom + 1e-5)
+        hatc_aggclip = torch.log(C_aggclip / denom + 1e-5)
+        neg_c_mass_share = C_neg_mass / (C_pos_mass + C_neg_mass + 1e-8)
+        feasible_raw = (C_raw > 0).to(torch.float32)
+        c_raw_over_k = C_raw / denom
+        return {
+            'K_total': K_total,
+            'C_raw': C_raw,
+            'C_firmclip': C_firmclip,
+            'C_aggclip': C_aggclip,
+            'Hatc_firmclip': hatc_firmclip,
+            'Hatc_aggclip': hatc_aggclip,
+            'C_raw_over_K': c_raw_over_k,
+            'C_pos_mass': C_pos_mass,
+            'C_neg_mass': C_neg_mass,
+            'neg_c_mass_share': neg_c_mass_share,
+            'feasible_raw': feasible_raw,
+        }
 
     def _expand_branches_tensor(self, state: Dict) -> List[Dict]:
         """

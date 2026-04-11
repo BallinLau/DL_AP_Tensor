@@ -40,6 +40,9 @@ from experiments.run_utils import (  # noqa: E402
     plot_surfaces,
     plot_bp_diagnostic_curves,
     plot_distributions,
+    plot_fc2_fit_diagnostics,
+    plot_fc2_consumption_distribution,
+    plot_fc2_episode_metrics,
     plot_outer_drift,
     plot_firm_b_window_distribution,
 )
@@ -459,12 +462,25 @@ def main():
             resolve_base_dir(run_root, ROOT),
             df_macro=episode.df_macro,
         )
+        plot_fc2_fit_diagnostics(
+            ep,
+            getattr(episode, "_latest_fc2_fit_df", None),
+            getattr(episode, "_latest_fc2_outer_df", None),
+            resolve_base_dir(run_root, ROOT),
+        )
+        plot_fc2_consumption_distribution(
+            ep,
+            getattr(episode, "_latest_fc2_current_macro_panel_df", None),
+            getattr(episode, "_latest_fc2_outer_macro_panel_df", None),
+            resolve_base_dir(run_root, ROOT),
+        )
 
         summaries.append({
             "episode_mode": episode_mode,
             "module_summaries": ep_summary,
             "gpu_memory": summary.get("gpu_memory", {})
         })
+        plot_fc2_episode_metrics(summaries, resolve_base_dir(run_root, ROOT) / "experiments" / "figs")
         plot_outer_drift(summaries, resolve_base_dir(run_root, ROOT) / "experiments" / "figs")
         print(
             f"[Episode {ep}] mode={episode_mode} "
@@ -481,6 +497,7 @@ def main():
 
     print("All episodes done.")
     print(summaries)
+    plot_fc2_episode_metrics(summaries, resolve_base_dir(run_root, ROOT) / "experiments" / "figs")
     plot_outer_drift(summaries, resolve_base_dir(run_root, ROOT) / "experiments" / "figs")
 
     # Save GPU memory monitoring results to JSON

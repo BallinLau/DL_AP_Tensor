@@ -726,6 +726,13 @@ class FC2Pipeline:
                     'C': torch.zeros((0, 1), dtype=torch.float32, device=self.device),
                     'lnk_actual': zero,
                     'hatc_actual': zero,
+                    'hatc_actual_firmclip': zero,
+                    'hatc_actual_aggclip': zero,
+                    'C_raw_sum': zero,
+                    'C_firmclip_sum': zero,
+                    'C_aggclip_sum': zero,
+                    'C_neg_mass_sum': zero,
+                    'feasible_raw': zero,
                     'loss': torch.mean((lnk_parent_pred - zero) ** 2) + torch.mean((hatc_parent_pred - zero) ** 2),
                 }
             # Rebuild the flat policy outputs in the same row order as pv_input.
@@ -747,11 +754,17 @@ class FC2Pipeline:
             I = bar_i_flat * gathered['K'] * pv_input[:, 3:4] - bar_z_flat * gathered['K'] + self.delta * gathered['K']
             C = Y - I - Phi
             K_sum = torch.zeros((self.path_num, 1), dtype=torch.float32, device=self.device)
-            C_sum = torch.zeros((self.path_num, 1), dtype=torch.float32, device=self.device)
+            C_raw_sum = torch.zeros((self.path_num, 1), dtype=torch.float32, device=self.device)
+            C_pos_sum = torch.zeros((self.path_num, 1), dtype=torch.float32, device=self.device)
+            C_neg_sum = torch.zeros((self.path_num, 1), dtype=torch.float32, device=self.device)
             K_sum.index_add_(0, gathered['path_idx'], gathered['K'])
-            C_sum.index_add_(0, gathered['path_idx'], C.clamp(min=0.0))
+            C_raw_sum.index_add_(0, gathered['path_idx'], C)
+            C_pos_sum.index_add_(0, gathered['path_idx'], C.clamp(min=0.0))
+            C_neg_sum.index_add_(0, gathered['path_idx'], (-C).clamp(min=0.0))
+            C_aggclip_sum = C_raw_sum.clamp(min=0.0)
             lnk_parent = torch.log(K_sum + 1e-8)
-            hatc_parent = torch.log(C_sum / (K_sum + 1e-8) + 1e-5)
+            hatc_parent = torch.log(C_pos_sum / (K_sum + 1e-8) + 1e-5)
+            hatc_parent_aggclip = torch.log(C_aggclip_sum / (K_sum + 1e-8) + 1e-5)
             loss_parent = torch.mean((lnk_parent - lnk_parent_pred) ** 2) + torch.mean((hatc_parent - hatc_parent_pred) ** 2)
             return {
                 'Y': Y,
@@ -760,6 +773,13 @@ class FC2Pipeline:
                 'C': C,
                 'lnk_actual': lnk_parent,
                 'hatc_actual': hatc_parent,
+                'hatc_actual_firmclip': hatc_parent,
+                'hatc_actual_aggclip': hatc_parent_aggclip,
+                'C_raw_sum': C_raw_sum,
+                'C_firmclip_sum': C_pos_sum,
+                'C_aggclip_sum': C_aggclip_sum,
+                'C_neg_mass_sum': C_neg_sum,
+                'feasible_raw': (C_raw_sum > 0).to(torch.float32),
                 'loss': loss_parent,
             }
         Y = torch.exp(pv_input[..., 4:5] + pv_input[..., 1:2]) * self.K_parent_full
@@ -779,7 +799,21 @@ class FC2Pipeline:
             C.clamp(min=0.0),
             torch.zeros_like(C)
         )
-        hatc_parent = torch.log(torch.sum(masked_C, dim=1) / (torch.sum(masked_K, dim=1) + 1e-8) + 1e-5)
+        raw_C = torch.where(
+            self.alive_mask[..., 0:1] > 0,
+            C,
+            torch.zeros_like(C)
+        )
+        neg_C = torch.where(
+            self.alive_mask[..., 0:1] > 0,
+            (-C).clamp(min=0.0),
+            torch.zeros_like(C)
+        )
+        C_raw_sum = torch.sum(raw_C, dim=1)
+        C_firmclip_sum = torch.sum(masked_C, dim=1)
+        C_aggclip_sum = C_raw_sum.clamp(min=0.0)
+        hatc_parent = torch.log(C_firmclip_sum / (torch.sum(masked_K, dim=1) + 1e-8) + 1e-5)
+        hatc_parent_aggclip = torch.log(C_aggclip_sum / (torch.sum(masked_K, dim=1) + 1e-8) + 1e-5)
 
         loss_parent = torch.mean((lnk_parent - lnk_parent_pred)**2) + torch.mean((hatc_parent - hatc_parent_pred)**2)
         return {
@@ -789,6 +823,13 @@ class FC2Pipeline:
             'C': C,
             'lnk_actual': lnk_parent,
             'hatc_actual': hatc_parent,
+            'hatc_actual_firmclip': hatc_parent,
+            'hatc_actual_aggclip': hatc_parent_aggclip,
+            'C_raw_sum': C_raw_sum,
+            'C_firmclip_sum': C_firmclip_sum,
+            'C_aggclip_sum': C_aggclip_sum,
+            'C_neg_mass_sum': torch.sum(neg_C, dim=1),
+            'feasible_raw': (C_raw_sum > 0).to(torch.float32),
             'loss': loss_parent,
         }
 
@@ -957,6 +998,13 @@ class FC2Pipeline:
                     'K_children_full': torch.zeros((0, 1), dtype=torch.float32, device=self.device),
                     'lnk_actual': zero,
                     'hatc_actual': zero,
+                    'hatc_actual_firmclip': zero,
+                    'hatc_actual_aggclip': zero,
+                    'C_raw_sum': zero,
+                    'C_firmclip_sum': zero,
+                    'C_aggclip_sum': zero,
+                    'C_neg_mass_sum': zero,
+                    'feasible_raw': zero,
                     'loss': torch.mean((lnk_children_pred - zero) ** 2) + torch.mean((hatc_children_pred - zero) ** 2),
                 }
             flat_k = gathered['K']
@@ -978,14 +1026,22 @@ class FC2Pipeline:
             I = flat_bar_i * K_children_flat * cv_input[:, 3:4] - flat_bar_z * K_children_flat + self.delta * K_children_flat
             C = Y - I - Phi
             K_sum = torch.zeros((self.path_num * self.branch_num, 1), dtype=torch.float32, device=self.device)
-            C_sum = torch.zeros((self.path_num * self.branch_num, 1), dtype=torch.float32, device=self.device)
+            C_raw_sum = torch.zeros((self.path_num * self.branch_num, 1), dtype=torch.float32, device=self.device)
+            C_pos_sum = torch.zeros((self.path_num * self.branch_num, 1), dtype=torch.float32, device=self.device)
+            C_neg_sum = torch.zeros((self.path_num * self.branch_num, 1), dtype=torch.float32, device=self.device)
             linear_idx = gathered['path_idx'] * self.branch_num + gathered['branch_idx']
             K_sum.index_add_(0, linear_idx, K_children_flat)
-            C_sum.index_add_(0, linear_idx, C.clamp(min=0.0))
+            C_raw_sum.index_add_(0, linear_idx, C)
+            C_pos_sum.index_add_(0, linear_idx, C.clamp(min=0.0))
+            C_neg_sum.index_add_(0, linear_idx, (-C).clamp(min=0.0))
             K_sum = K_sum.view(self.path_num, self.branch_num, 1)
-            C_sum = C_sum.view(self.path_num, self.branch_num, 1)
+            C_raw_sum = C_raw_sum.view(self.path_num, self.branch_num, 1)
+            C_pos_sum = C_pos_sum.view(self.path_num, self.branch_num, 1)
+            C_neg_sum = C_neg_sum.view(self.path_num, self.branch_num, 1)
+            C_aggclip_sum = C_raw_sum.clamp(min=0.0)
             lnk_children = torch.log(K_sum + 1e-8)
-            hatc_children = torch.log(C_sum / (K_sum + 1e-8) + 1e-5)
+            hatc_children = torch.log(C_pos_sum / (K_sum + 1e-8) + 1e-5)
+            hatc_children_aggclip = torch.log(C_aggclip_sum / (K_sum + 1e-8) + 1e-5)
             loss_children = torch.mean((lnk_children - lnk_children_pred) ** 2) + torch.mean((hatc_children - hatc_children_pred) ** 2)
             return {
                 'Y': Y,
@@ -995,6 +1051,13 @@ class FC2Pipeline:
                 'K_children_full': K_children_flat,
                 'lnk_actual': lnk_children,
                 'hatc_actual': hatc_children,
+                'hatc_actual_firmclip': hatc_children,
+                'hatc_actual_aggclip': hatc_children_aggclip,
+                'C_raw_sum': C_raw_sum,
+                'C_firmclip_sum': C_pos_sum,
+                'C_aggclip_sum': C_aggclip_sum,
+                'C_neg_mass_sum': C_neg_sum,
+                'feasible_raw': (C_raw_sum > 0).to(torch.float32),
                 'loss': loss_children,
             }
         K_children_full = children_k_full
@@ -1004,7 +1067,14 @@ class FC2Pipeline:
         I = bar_i_children * K_children_full * cv_input[..., 3:4] - bar_z_children * K_children_full + self.delta * K_children_full
         C = Y - I - Phi
         lnk_children = torch.log(torch.sum(K_children_full * alive_mask_children[..., 0:1], dim=1) + 1e-8)
-        hatc_children = torch.log(torch.sum(C.clamp(min=0.0) * alive_mask_children[..., 0:1], dim=1) / (torch.sum(K_children_full * alive_mask_children[..., 0:1], dim=1) + 1e-8) + 1e-5)
+        raw_C = C * alive_mask_children[..., 0:1]
+        pos_C = C.clamp(min=0.0) * alive_mask_children[..., 0:1]
+        neg_C = (-C).clamp(min=0.0) * alive_mask_children[..., 0:1]
+        C_raw_sum = torch.sum(raw_C, dim=1)
+        C_firmclip_sum = torch.sum(pos_C, dim=1)
+        C_aggclip_sum = C_raw_sum.clamp(min=0.0)
+        hatc_children = torch.log(C_firmclip_sum / (torch.sum(K_children_full * alive_mask_children[..., 0:1], dim=1) + 1e-8) + 1e-5)
+        hatc_children_aggclip = torch.log(C_aggclip_sum / (torch.sum(K_children_full * alive_mask_children[..., 0:1], dim=1) + 1e-8) + 1e-5)
 
         loss_children = torch.mean((lnk_children - lnk_children_pred)**2) + torch.mean((hatc_children - hatc_children_pred)**2)
         return {
@@ -1015,6 +1085,13 @@ class FC2Pipeline:
             'K_children_full': K_children_full,
             'lnk_actual': lnk_children,
             'hatc_actual': hatc_children,
+            'hatc_actual_firmclip': hatc_children,
+            'hatc_actual_aggclip': hatc_children_aggclip,
+            'C_raw_sum': C_raw_sum,
+            'C_firmclip_sum': C_firmclip_sum,
+            'C_aggclip_sum': C_aggclip_sum,
+            'C_neg_mass_sum': torch.sum(neg_C, dim=1),
+            'feasible_raw': (C_raw_sum > 0).to(torch.float32),
             'loss': loss_children,
         }
 

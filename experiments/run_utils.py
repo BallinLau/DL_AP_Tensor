@@ -1228,3 +1228,232 @@ def plot_outer_drift(all_summaries, figs_dir: Path) -> None:
             "policy_surface_drift.bp_maxabs",
         ],
     )
+
+
+def plot_fc2_fit_diagnostics(
+    ep: int,
+    fit_df: Optional[pd.DataFrame],
+    outer_df: Optional[pd.DataFrame],
+    base_dir: Path,
+) -> None:
+    figs_dir = base_dir / "experiments" / "figs"
+    figs_dir.mkdir(parents=True, exist_ok=True)
+
+    def _fit_stats(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        if mask.sum() < 2:
+            return {}
+        yt = y_true[mask]
+        yp = y_pred[mask]
+        yt_mean = float(yt.mean())
+        yp_mean = float(yp.mean())
+        yt_std = float(np.std(yt))
+        yp_std = float(np.std(yp))
+        resid = yt - yp
+        sst = float(np.sum((yt - yt_mean) ** 2))
+        sse = float(np.sum(resid ** 2))
+        corr = float(np.corrcoef(yt, yp)[0, 1]) if yt_std > 1e-12 and yp_std > 1e-12 else float("nan")
+        slope = float("nan")
+        intercept = float("nan")
+        denom = float(np.sum((yt - yt_mean) ** 2))
+        if denom > 1e-12:
+            slope = float(np.sum((yt - yt_mean) * (yp - yp_mean)) / denom)
+            intercept = float(yp_mean - slope * yt_mean)
+        return {
+            "r2": float("nan") if sst <= 1e-12 else float(1.0 - sse / sst),
+            "corr": corr,
+            "slope": slope,
+            "std_ratio": float(yp_std / yt_std) if yt_std > 1e-12 else float("nan"),
+        }
+
+    def _plot_one(df: Optional[pd.DataFrame], true_col: str, pred_col: str, title: str, save_path: Path) -> None:
+        if df is None or df.empty or true_col not in df.columns or pred_col not in df.columns:
+            return
+        x = pd.to_numeric(df[true_col], errors="coerce").to_numpy(dtype=float)
+        y = pd.to_numeric(df[pred_col], errors="coerce").to_numpy(dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        if mask.sum() < 2:
+            return
+        x = x[mask]
+        y = y[mask]
+        stats = _fit_stats(x, y)
+        lo = float(min(np.min(x), np.min(y)))
+        hi = float(max(np.max(x), np.max(y)))
+        if hi - lo < 1e-8:
+            hi = lo + 1e-4
+        pad = 0.05 * (hi - lo)
+        lo -= pad
+        hi += pad
+        plt.figure(figsize=(5.8, 5.2))
+        plt.scatter(x, y, s=8, alpha=0.25, edgecolors="none")
+        plt.plot([lo, hi], [lo, hi], "r--", linewidth=1.5)
+        plt.xlim(lo, hi)
+        plt.ylim(lo, hi)
+        plt.xlabel("true")
+        plt.ylabel("pred")
+        if stats:
+            title = (
+                f"{title}\n"
+                f"R2={stats.get('r2', float('nan')):.4f} | "
+                f"corr={stats.get('corr', float('nan')):.4f} | "
+                f"slope={stats.get('slope', float('nan')):.4f} | "
+                f"stdr={stats.get('std_ratio', float('nan')):.4f}"
+            )
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+
+    _plot_one(fit_df, "hatc_true", "hatc_pred", f"EP{ep} FC2 fit-after-train Hatc", figs_dir / f"ep{ep}_fc2_fit_after_train_hatc.png")
+    _plot_one(fit_df, "lnk_true", "lnk_pred", f"EP{ep} FC2 fit-after-train LnK", figs_dir / f"ep{ep}_fc2_fit_after_train_lnk.png")
+    _plot_one(outer_df, "hatc_true", "hatc_pred", f"EP{ep} FC2 outer-after-resim Hatc", figs_dir / f"ep{ep}_fc2_outer_after_resim_hatc.png")
+    _plot_one(outer_df, "lnk_true", "lnk_pred", f"EP{ep} FC2 outer-after-resim LnK", figs_dir / f"ep{ep}_fc2_outer_after_resim_lnk.png")
+
+
+def plot_fc2_consumption_distribution(
+    ep: int,
+    current_macro_df: Optional[pd.DataFrame],
+    outer_macro_df: Optional[pd.DataFrame],
+    base_dir: Path,
+) -> None:
+    figs_dir = base_dir / "experiments" / "figs"
+    figs_dir.mkdir(parents=True, exist_ok=True)
+
+    def _select_rows(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+        if df is None or df.empty or 'C_raw' not in df.columns:
+            return None
+        return df.copy()
+
+    def _plot_one(df: Optional[pd.DataFrame], title: str, save_path: Path) -> None:
+        use_df = _select_rows(df)
+        if use_df is None or use_df.empty:
+            return
+        groups: list[tuple[str, pd.DataFrame]]
+        if 'branch' in use_df.columns:
+            parent_df = use_df[use_df['branch'] == -1]
+            child_df = use_df[use_df['branch'] >= 0]
+            groups = []
+            if not parent_df.empty:
+                groups.append(("parent", parent_df))
+            if not child_df.empty:
+                groups.append(("children", child_df))
+            if not groups:
+                groups = [("all", use_df)]
+        else:
+            groups = [("all", use_df)]
+
+        fig, axes = plt.subplots(1, len(groups), figsize=(7.2 * len(groups), 4.8), squeeze=False)
+        fig.suptitle(title)
+        for ax, (label, grp) in zip(axes[0], groups):
+            c_raw = pd.to_numeric(grp['C_raw'], errors='coerce').to_numpy(dtype=float)
+            c_raw = c_raw[np.isfinite(c_raw)]
+            if c_raw.size == 0:
+                ax.set_visible(False)
+                continue
+            feasible = pd.to_numeric(grp.get('feasible_raw'), errors='coerce')
+            feasible_share = float(feasible.mean()) if feasible is not None else float('nan')
+            neg_share = pd.to_numeric(grp.get('neg_c_mass_share'), errors='coerce')
+            neg_share_mean = float(neg_share.mean()) if neg_share is not None else float('nan')
+            ax.hist(c_raw, bins=40, alpha=0.8, color="#4c78a8", edgecolor="white")
+            ax.axvline(0.0, color="#d62728", linestyle="--", linewidth=1.5)
+            ax.set_xlabel("sum C by path-node")
+            ax.set_ylabel("count")
+            ax.set_title(label)
+            stats_text = "\n".join([
+                f"n={c_raw.size}",
+                f"mean={np.mean(c_raw):.4f}",
+                f"p05={np.quantile(c_raw, 0.05):.4f}",
+                f"p50={np.quantile(c_raw, 0.50):.4f}",
+                f"p95={np.quantile(c_raw, 0.95):.4f}",
+                f"feasible={feasible_share:.3f}",
+                f"neg_share={neg_share_mean:.3f}",
+            ])
+            ax.text(
+                0.98,
+                0.98,
+                stats_text,
+                transform=ax.transAxes,
+                va="top",
+                ha="right",
+                fontsize=9,
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.9, "edgecolor": "#cccccc"},
+            )
+            ax.grid(True, alpha=0.2)
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+
+    _plot_one(
+        current_macro_df,
+        f"EP{ep} FC2 pretrain/input raw sum C distribution",
+        figs_dir / f"ep{ep}_fc2_before_train_c_raw_distribution.png",
+    )
+    _plot_one(
+        outer_macro_df,
+        f"EP{ep} FC2 outer-after-resim raw sum C distribution",
+        figs_dir / f"ep{ep}_fc2_outer_after_resim_c_raw_distribution.png",
+    )
+
+
+def plot_fc2_episode_metrics(all_summaries, figs_dir: Path) -> None:
+    """Plot FC2 fit-after-train and outer-after-resim metrics across episodes."""
+    if not all_summaries:
+        return
+
+    figs_dir.mkdir(parents=True, exist_ok=True)
+    episodes = list(range(len(all_summaries)))
+    tracked_metrics = ("corr", "slope", "std_ratio", "rmse")
+    tracked_targets = ("hatc", "lnk")
+    tracked_groups = ("fit_after_train", "outer_after_resim")
+    series: dict[tuple[str, str, str], list[float]] = {}
+
+    def _append_value(group: str, target: str, metric: str, value: float | int | np.floating | None) -> None:
+        key = (group, target, metric)
+        series.setdefault(key, []).append(float(value) if value is not None else float("nan"))
+
+    for raw_summary in all_summaries:
+        ep_summary = raw_summary.get("module_summaries", raw_summary) if isinstance(raw_summary, dict) else {}
+        fc2_summary = ep_summary.get("fc2", {}) if isinstance(ep_summary, dict) else {}
+        if not isinstance(fc2_summary, dict):
+            fc2_summary = {}
+
+        group_maps = {
+            "fit_after_train": fc2_summary.get("fit_after_train", {}),
+            "outer_after_resim": fc2_summary.get("outer_after_resim", {}),
+        }
+        for group in tracked_groups:
+            metrics_map = group_maps.get(group, {})
+            for target in tracked_targets:
+                for metric in tracked_metrics:
+                    key = f"fc2_{group}_{target}_{metric}"
+                    value = metrics_map.get(key) if isinstance(metrics_map, dict) else None
+                    if isinstance(value, (int, float, np.floating)):
+                        _append_value(group, target, metric, value)
+                    else:
+                        _append_value(group, target, metric, None)
+
+    def _plot_group(group: str, target: str) -> None:
+        available = [
+            metric for metric in tracked_metrics
+            if (group, target, metric) in series
+        ]
+        if not available:
+            return
+        plt.figure(figsize=(7.2, 4.8))
+        for metric in available:
+            values = series[(group, target, metric)]
+            if not any(np.isfinite(values)):
+                continue
+            plt.plot(episodes, values, marker="o", linewidth=1.8, label=metric)
+        plt.xlabel("episode")
+        plt.ylabel("metric value")
+        plt.title(f"FC2 {group.replace('_', '-')} {target} metrics")
+        plt.grid(True, alpha=0.25)
+        plt.legend(frameon=False, fontsize=8)
+        plt.tight_layout()
+        plt.savefig(figs_dir / f"fc2_{group}_{target}_by_episode.png", dpi=150)
+        plt.close()
+
+    for group in tracked_groups:
+        for target in tracked_targets:
+            _plot_group(group, target)
