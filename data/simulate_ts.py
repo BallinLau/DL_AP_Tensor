@@ -393,14 +393,14 @@ class SimulateTS:
         macro_diag = self._macro_consumption_diag_single(K, C)
         K_total = macro_diag['K_total']
         LnK = torch.log(K_total + 1e-8)
-        Hatc = macro_diag['Hatc_firmclip']
+        Hatc = macro_diag['Hatc_aggclip']
         macro_row = torch.stack(
             [
                 torch.tensor(float(path_idx), device=device),
                 torch.tensor(float(t), device=device),
                 torch.tensor(float(branch_k), device=device),
                 K_total,
-                macro_diag['C_firmclip'],
+                macro_diag['C_aggclip'],
                 LnK,
                 Hatc,
                 macro_diag['C_raw'],
@@ -613,9 +613,9 @@ class SimulateTS:
             't': t,
             'branch': branch_k,
             'K': K_total,
-            'C': float(macro_diag['C_firmclip'].item()),
+            'C': float(macro_diag['C_aggclip'].item()),
             'LnK': np.log(K_total + 1e-8),
-            'Hatc': float(macro_diag['Hatc_firmclip'].item()),
+            'Hatc': float(macro_diag['Hatc_aggclip'].item()),
             'C_raw': float(macro_diag['C_raw'].item()),
             'C_firmclip': float(macro_diag['C_firmclip'].item()),
             'C_aggclip': float(macro_diag['C_aggclip'].item()),

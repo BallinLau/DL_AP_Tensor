@@ -289,7 +289,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     K_total = macro_diag["K_total"]
     alive_any = n_alive_per_path > 0
     LnK = torch.where(alive_any, torch.log(K_total + 1e-8), torch.full_like(K_total, -10.0))
-    Hatc = torch.where(alive_any, macro_diag["Hatc_firmclip"], torch.full_like(K_total, -10.0))
+    Hatc = torch.where(alive_any, macro_diag["Hatc_aggclip"], torch.full_like(K_total, -10.0))
     Hatc_aggclip = torch.where(alive_any, macro_diag["Hatc_aggclip"], torch.full_like(K_total, -10.0))
 
     macro_rows = torch.stack(
@@ -298,7 +298,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             torch.full((n_paths,), float(t), device=device),
             torch.full((n_paths,), float(branch_k), device=device),
             K_total,
-            macro_diag["C_firmclip"],
+            macro_diag["C_aggclip"],
             LnK,
             Hatc,
             macro_diag["C_raw"],
