@@ -1011,15 +1011,20 @@ class FC2Pipeline:
             flat_bar_i = []
             flat_bar_z = []
             for i in range(self.path_num):
-                for j in range(self.branch_num):
-                    alive_ij = (alive_mask_children[i][:, j, 0] if alive_mask_children[i].dim() == 3 else alive_mask_children[i][:, j]) > 0
-                    idx = torch.nonzero(alive_ij, as_tuple=False).squeeze(-1)
-                    if idx.numel() == 0:
-                        continue
-                    flat_bar_i.append(bar_i_children[i][idx, j, :])
-                    flat_bar_z.append(bar_z_children[i][idx, j, :])
-            flat_bar_i = torch.cat(flat_bar_i, dim=0)
-            flat_bar_z = torch.cat(flat_bar_z, dim=0)
+                mask_i = gathered['path_idx'] == i
+                if not mask_i.any():
+                    continue
+                slots_i = gathered['slot_idx'][mask_i]
+                branches_i = gathered['branch_idx'][mask_i]
+                flat_bar_i.append(bar_i_children[i][slots_i, branches_i, :])
+                flat_bar_z.append(bar_z_children[i][slots_i, branches_i, :])
+            flat_bar_i = torch.cat(flat_bar_i, dim=0) if flat_bar_i else torch.zeros_like(flat_k)
+            flat_bar_z = torch.cat(flat_bar_z, dim=0) if flat_bar_z else torch.zeros_like(flat_k)
+            if flat_bar_i.shape[0] != cv_input.shape[0] or flat_bar_z.shape[0] != cv_input.shape[0]:
+                raise RuntimeError(
+                    "FC2 tensor-native child aggregation row mismatch: "
+                    f"cv_input={cv_input.shape[0]}, flat_bar_i={flat_bar_i.shape[0]}, flat_bar_z={flat_bar_z.shape[0]}"
+                )
             K_children_flat = flat_k
             Y = torch.exp(cv_input[:, 4:5] + cv_input[:, 1:2]) * K_children_flat
             Phi = (1 - self.phi) * (1 + torch.exp(cv_input[:, 1:2] + cv_input[:, 3:4])) * K_children_flat * flat_bar_z
