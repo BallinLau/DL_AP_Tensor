@@ -8,6 +8,8 @@ Episode 类：训练周期管理
 4. 各模块的训练循环
 """
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -33,6 +35,14 @@ from utils.gpu_monitor import GPUMonitor, print_memory_summary
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FC2SupervisedBundle:
+    x_hatc: torch.Tensor
+    x_lnk: torch.Tensor
+    y: torch.Tensor
+    path_ids: torch.Tensor
 
 
 def convert_tree_fast(df: pd.DataFrame) -> pd.DataFrame:
@@ -222,14 +232,19 @@ class Episode:
 
     def _fit_fc2_hatc_x_baseline(
         self,
-        sup_dataset: Optional[TensorDataset],
+        sup_source: Optional[Any],
     ) -> Dict[str, float]:
         hatc_model, _ = self._get_fc2_models()
-        if hatc_model is None or sup_dataset is None or len(sup_dataset) == 0:
+        if hatc_model is None or sup_source is None:
             return {}
         if not hasattr(hatc_model, "fit_x_baseline"):
             return {}
-        x_hatc_all, _, y_all = sup_dataset.tensors
+        tensors = self._extract_fc2_supervised_tensors(sup_source)
+        if tensors is None:
+            return {}
+        x_hatc_all, _, y_all = tensors
+        if x_hatc_all.shape[0] == 0:
+            return {}
         hatc_target = y_all[:, 1:2]
         hatc_model.fit_x_baseline(x_hatc_all, hatc_target)
         diag: Dict[str, float] = {}
@@ -248,6 +263,71 @@ class Episode:
         if fitted is not None:
             diag["fc2_hatc_x_baseline_fitted"] = float(bool(fitted.item()))
         return diag
+
+    def _extract_fc2_supervised_tensors(
+        self,
+        sup_source: Optional[Any],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if sup_source is None:
+            return None
+        if isinstance(sup_source, FC2SupervisedBundle):
+            return sup_source.x_hatc, sup_source.x_lnk, sup_source.y
+        if isinstance(sup_source, TensorDataset):
+            if len(sup_source.tensors) < 3:
+                return None
+            return sup_source.tensors[0], sup_source.tensors[1], sup_source.tensors[2]
+        return None
+
+    def _fc2_bundle_to_dataset(self, bundle: FC2SupervisedBundle) -> TensorDataset:
+        return TensorDataset(bundle.x_hatc, bundle.x_lnk, bundle.y)
+
+    def _fc2_index_bundle(
+        self,
+        bundle: FC2SupervisedBundle,
+        index: torch.Tensor,
+    ) -> FC2SupervisedBundle:
+        return FC2SupervisedBundle(
+            x_hatc=bundle.x_hatc[index].detach(),
+            x_lnk=bundle.x_lnk[index].detach(),
+            y=bundle.y[index].detach(),
+            path_ids=bundle.path_ids[index].detach(),
+        )
+
+    def _split_fc2_supervised_bundle(
+        self,
+        bundle: FC2SupervisedBundle,
+    ) -> Tuple[FC2SupervisedBundle, FC2SupervisedBundle]:
+        val_frac = float(getattr(self.hyperparams, 'fc2_pretrain_val_frac', 0.2))
+        split_seed = int(getattr(self.hyperparams, 'fc2_pretrain_split_seed', 42))
+        path_ids = bundle.path_ids.detach().cpu().numpy().astype(np.int64)
+        uniq_paths = np.unique(path_ids)
+        if uniq_paths.shape[0] <= 1 or val_frac <= 0.0:
+            full_index = torch.arange(bundle.y.shape[0], device=bundle.y.device, dtype=torch.long)
+            full_bundle = self._fc2_index_bundle(bundle, full_index)
+            return full_bundle, full_bundle
+
+        rng = np.random.default_rng(split_seed)
+        perm = rng.permutation(uniq_paths)
+        n_val = min(max(1, int(round(perm.shape[0] * val_frac))), perm.shape[0] - 1)
+        val_paths = perm[:n_val]
+        train_paths = perm[n_val:]
+
+        path_tensor = bundle.path_ids
+        train_mask = torch.zeros_like(path_tensor, dtype=torch.bool)
+        val_mask = torch.zeros_like(path_tensor, dtype=torch.bool)
+        for path in train_paths.tolist():
+            train_mask |= (path_tensor == int(path))
+        for path in val_paths.tolist():
+            val_mask |= (path_tensor == int(path))
+
+        train_index = torch.nonzero(train_mask, as_tuple=False).reshape(-1)
+        val_index = torch.nonzero(val_mask, as_tuple=False).reshape(-1)
+        if train_index.numel() == 0 or val_index.numel() == 0:
+            full_index = torch.arange(bundle.y.shape[0], device=bundle.y.device, dtype=torch.long)
+            full_bundle = self._fc2_index_bundle(bundle, full_index)
+            return full_bundle, full_bundle
+
+        return self._fc2_index_bundle(bundle, train_index), self._fc2_index_bundle(bundle, val_index)
 
     def _expand_train_model_keys(self, train_modules: List[str]) -> List[str]:
         expanded: List[str] = []
@@ -3106,11 +3186,11 @@ class Episode:
                 self.loss_history[k] = []
             self.loss_history[k].append(v)
 
-    def _build_fc2_supervised_dataset_from_tables(
+    def _build_fc2_supervised_bundle_from_tables(
         self,
         firm_table: Optional[TensorTable],
         macro_table: Optional[TensorTable],
-    ) -> Optional[TensorDataset]:
+    ) -> Optional[FC2SupervisedBundle]:
         if firm_table is None or macro_table is None:
             return None
         pipe = FC2LossPipe(
@@ -3134,9 +3214,16 @@ class Episode:
             dtype=torch.bool,
         )
 
+        parent_path_ids = torch.arange(pipe.path_num, device=self.device, dtype=torch.long)
+        child_path_ids = torch.tensor(
+            [i for i in range(pipe.path_num) for _ in range(pipe.branch_num)],
+            device=self.device,
+            dtype=torch.long,
+        )
         x_hatc_parts = [parent_x['hatc']]
         x_lnk_parts = [parent_x['lnk']]
         y_parts = [parent_y]
+        path_parts = [parent_path_ids]
         child_x_hatc_flat = child_x['hatc'].reshape(-1, child_x['hatc'].shape[-1])
         child_x_lnk_flat = child_x['lnk'].reshape(-1, child_x['lnk'].shape[-1])
         child_y_flat = child_y.reshape(-1, child_y.shape[-1])
@@ -3144,15 +3231,38 @@ class Episode:
             x_hatc_parts.append(child_x_hatc_flat[child_valid])
             x_lnk_parts.append(child_x_lnk_flat[child_valid])
             y_parts.append(child_y_flat[child_valid])
+            path_parts.append(child_path_ids[child_valid])
         x_hatc_all = torch.cat(x_hatc_parts, dim=0)
         x_lnk_all = torch.cat(x_lnk_parts, dim=0)
         y_all = torch.cat(y_parts, dim=0)
-        return TensorDataset(x_hatc_all.detach(), x_lnk_all.detach(), y_all.detach())
+        path_all = torch.cat(path_parts, dim=0)
+        return FC2SupervisedBundle(
+            x_hatc=x_hatc_all.detach(),
+            x_lnk=x_lnk_all.detach(),
+            y=y_all.detach(),
+            path_ids=path_all.detach(),
+        )
 
-    def _build_fc2_supervised_dataset(self) -> Optional[TensorDataset]:
+    def _build_fc2_supervised_dataset_from_tables(
+        self,
+        firm_table: Optional[TensorTable],
+        macro_table: Optional[TensorTable],
+    ) -> Optional[TensorDataset]:
+        bundle = self._build_fc2_supervised_bundle_from_tables(firm_table, macro_table)
+        if bundle is None:
+            return None
+        return self._fc2_bundle_to_dataset(bundle)
+
+    def _build_fc2_supervised_bundle(self) -> Optional[FC2SupervisedBundle]:
         if not self._use_tensor_pipeline() or self.tensor_firm is None or self.tensor_macro is None:
             return None
-        return self._build_fc2_supervised_dataset_from_tables(self.tensor_firm, self.tensor_macro)
+        return self._build_fc2_supervised_bundle_from_tables(self.tensor_firm, self.tensor_macro)
+
+    def _build_fc2_supervised_dataset(self) -> Optional[TensorDataset]:
+        bundle = self._build_fc2_supervised_bundle()
+        if bundle is None:
+            return None
+        return self._fc2_bundle_to_dataset(bundle)
 
     def _evaluate_fc2_dataset_fit(
         self,
@@ -3211,6 +3321,173 @@ class Episode:
             prefix='fc2_fit_after_train',
             store_attr='_latest_fc2_fit_df',
         )
+
+    def _run_fc2_supervised_pretrain_probe_lite(
+        self,
+        sup_bundle: FC2SupervisedBundle,
+        n_epochs: int,
+        log_interval: int,
+    ) -> Tuple[List[Dict[str, float]], Dict[str, float]]:
+        hatc_model, lnk_model = self._get_fc2_models()
+        if hatc_model is None or lnk_model is None or sup_bundle.y.shape[0] == 0:
+            return [], {}
+
+        train_bundle, val_bundle = self._split_fc2_supervised_bundle(sup_bundle)
+        hatc_baseline_diag = self._fit_fc2_hatc_x_baseline(train_bundle)
+        train_loader = DataLoader(
+            self._fc2_bundle_to_dataset(train_bundle),
+            batch_size=max(int(getattr(self.hyperparams, 'fc2_pretrain_batch_size', 4096)), 1),
+            shuffle=True,
+        )
+        x_hatc_val = val_bundle.x_hatc
+        x_lnk_val = val_bundle.x_lnk
+        y_val = val_bundle.y
+        hatc_w = float(getattr(self.hyperparams, 'fc2_supervised_hatc_weight', 1.0))
+        lnk_w = float(getattr(self.hyperparams, 'fc2_supervised_lnk_weight', 1.0))
+        patience = max(int(getattr(self.hyperparams, 'fc2_pretrain_patience', 30)), 1)
+        lr = float(getattr(self.hyperparams, 'fc2_pretrain_lr', 1e-3))
+        weight_decay = float(getattr(self.hyperparams, 'fc2_pretrain_weight_decay', self.hyperparams.fc2_weight_decay))
+        disable_dropout = bool(getattr(self.hyperparams, 'fc2_pretrain_disable_dropout', True))
+
+        hatc_optimizer = torch.optim.AdamW(hatc_model.parameters(), lr=lr, weight_decay=weight_decay)
+        lnk_optimizer = torch.optim.AdamW(lnk_model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        prev_hatc_mode = hatc_model.training
+        prev_lnk_mode = lnk_model.training
+        best_val = float('inf')
+        best_epoch = -1
+        best_states: Optional[Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]] = None
+        pretrain_epoch_losses: List[Dict[str, float]] = []
+
+        try:
+            for _ in tqdm(range(n_epochs), desc='FC2 Supervised Pretrain'):
+                if disable_dropout:
+                    hatc_model.eval()
+                    lnk_model.eval()
+                else:
+                    hatc_model.train()
+                    lnk_model.train()
+
+                batch_losses = []
+                for x_hatc_batch, x_lnk_batch, y_batch in train_loader:
+                    hatc_optimizer.zero_grad(set_to_none=True)
+                    lnk_optimizer.zero_grad(set_to_none=True)
+                    hatc_pred = hatc_model(x_hatc_batch)
+                    lnk_pred = lnk_model(x_lnk_batch)
+                    lnk_target = y_batch[:, 0:1]
+                    hatc_target = y_batch[:, 1:2]
+                    hatc_loss = nn.functional.mse_loss(hatc_pred, hatc_target)
+                    lnk_loss = nn.functional.mse_loss(lnk_pred, lnk_target)
+                    sup_loss = hatc_w * hatc_loss + lnk_w * lnk_loss
+                    sup_loss.backward()
+
+                    hatc_grad_norm, hatc_had_nan = gradient_protection(
+                        hatc_model.parameters(),
+                        max_norm=getattr(self.hyperparams, 'fc2_max_grad_norm', self.hyperparams.max_grad_norm)
+                    )
+                    lnk_grad_norm, lnk_had_nan = gradient_protection(
+                        lnk_model.parameters(),
+                        max_norm=getattr(self.hyperparams, 'fc2_max_grad_norm', self.hyperparams.max_grad_norm)
+                    )
+                    if hatc_had_nan:
+                        logger.warning("NaN gradient detected in fc2_hatc supervised pretrain")
+                    if lnk_had_nan:
+                        logger.warning("NaN gradient detected in fc2_lnk supervised pretrain")
+
+                    hatc_optimizer.step()
+                    lnk_optimizer.step()
+
+                    batch_log = {
+                        'fc2_pretrain_loss': float(sup_loss.item()),
+                        'fc2_pretrain_hatc_loss': float(hatc_loss.item()),
+                        'fc2_pretrain_lnk_loss': float(lnk_loss.item()),
+                    }
+                    with torch.no_grad():
+                        for prefix, y_true, y_pred in (
+                            ('fc2_pretrain_hatc', hatc_target, hatc_pred),
+                            ('fc2_pretrain_lnk', lnk_target, lnk_pred),
+                        ):
+                            stats = compute_fit_stats_t(y_true, y_pred)
+                            for k, v in stats.items():
+                                try:
+                                    batch_log[f'{prefix}_{k}'] = float(v)
+                                except (TypeError, ValueError):
+                                    continue
+                    batch_log['fc2_hatc_grad_norm'] = hatc_grad_norm
+                    batch_log['fc2_lnk_grad_norm'] = lnk_grad_norm
+                    batch_log['fc2_grad_norm'] = float(max(hatc_grad_norm, lnk_grad_norm))
+                    batch_log['total'] = float(sup_loss.item())
+                    batch_log.update(hatc_baseline_diag)
+                    self._latest_fc2_diag = batch_log
+                    self._record_manual_losses(batch_log)
+                    batch_losses.append(batch_log)
+
+                hatc_model.eval()
+                lnk_model.eval()
+                with torch.no_grad():
+                    hatc_pred_val = hatc_model(x_hatc_val)
+                    lnk_pred_val = lnk_model(x_lnk_val)
+                    lnk_target_val = y_val[:, 0:1]
+                    hatc_target_val = y_val[:, 1:2]
+                    hatc_val_loss = nn.functional.mse_loss(hatc_pred_val, hatc_target_val)
+                    lnk_val_loss = nn.functional.mse_loss(lnk_pred_val, lnk_target_val)
+                    val_total = hatc_w * hatc_val_loss + lnk_w * lnk_val_loss
+
+                epoch_loss = {
+                    k: float(np.mean([l[k] for l in batch_losses if k in l]))
+                    for k in batch_losses[0].keys()
+                }
+                epoch_loss['fc2_pretrain_val_loss'] = float(val_total.item())
+                epoch_loss['fc2_pretrain_val_hatc_loss'] = float(hatc_val_loss.item())
+                epoch_loss['fc2_pretrain_val_lnk_loss'] = float(lnk_val_loss.item())
+                with torch.no_grad():
+                    for prefix, y_true, y_pred in (
+                        ('fc2_pretrain_val_hatc', hatc_target_val, hatc_pred_val),
+                        ('fc2_pretrain_val_lnk', lnk_target_val, lnk_pred_val),
+                    ):
+                        stats = compute_fit_stats_t(y_true, y_pred)
+                        for k, v in stats.items():
+                            try:
+                                epoch_loss[f'{prefix}_{k}'] = float(v)
+                            except (TypeError, ValueError):
+                                continue
+                pretrain_epoch_losses.append(epoch_loss)
+
+                if val_total.item() < best_val:
+                    best_val = float(val_total.item())
+                    best_epoch = len(pretrain_epoch_losses) - 1
+                    best_states = (
+                        {k: v.detach().cpu().clone() for k, v in hatc_model.state_dict().items()},
+                        {k: v.detach().cpu().clone() for k, v in lnk_model.state_dict().items()},
+                    )
+                elif (len(pretrain_epoch_losses) - 1) - best_epoch >= patience:
+                    break
+
+                if self.step_count % log_interval == 0:
+                    avg_loss = np.mean([l['total'] for l in pretrain_epoch_losses[-log_interval:]])
+                    logger.info(
+                        "FC2 Supervised Pretrain Step %d: train_loss=%.6f, val_loss=%.6f, lr=%.2e",
+                        self.step_count,
+                        avg_loss,
+                        float(val_total.item()),
+                        lr,
+                    )
+        finally:
+            hatc_model.train(prev_hatc_mode)
+            lnk_model.train(prev_lnk_mode)
+
+        if best_states is not None:
+            hatc_model.load_state_dict(best_states[0])
+            lnk_model.load_state_dict(best_states[1])
+            hatc_model.train(prev_hatc_mode)
+            lnk_model.train(prev_lnk_mode)
+
+        if pretrain_epoch_losses:
+            hatc_baseline_diag['fc2_pretrain_best_val_loss'] = float(best_val)
+            hatc_baseline_diag['fc2_pretrain_best_epoch'] = float(best_epoch)
+            hatc_baseline_diag['fc2_pretrain_train_paths'] = float(train_bundle.path_ids.unique().numel())
+            hatc_baseline_diag['fc2_pretrain_val_paths'] = float(val_bundle.path_ids.unique().numel())
+        return pretrain_epoch_losses, hatc_baseline_diag
 
     def _compute_fc2_outer_after_resim(
         self,
@@ -4289,9 +4566,11 @@ class Episode:
         fc2_path_batch_size = int(getattr(self.hyperparams, 'fc2_path_batch_size', 256))
         pretrain_epochs = int(getattr(self.hyperparams, 'fc2_supervised_pretrain_epochs', 0))
         pretrain_only = bool(getattr(self.hyperparams, 'fc2_supervised_pretrain_only', False))
+        probe_lite_pretrain = bool(getattr(self.hyperparams, 'fc2_probe_lite_pretrain', True))
         hatc_model, lnk_model = self._get_fc2_models()
         fc2_optimizer_keys = self._get_fc2_optimizer_keys()
         sup_dataset: Optional[TensorDataset] = None
+        sup_bundle: Optional[FC2SupervisedBundle] = None
         hatc_baseline_diag: Dict[str, float] = {}
 
         if (
@@ -4300,9 +4579,17 @@ class Episode:
             and self._use_tensor_pipeline()
             and self.tensor_firm is not None
         ):
-            sup_dataset = self._build_fc2_supervised_dataset()
+            sup_bundle = self._build_fc2_supervised_bundle()
+            if sup_bundle is not None:
+                sup_dataset = self._fc2_bundle_to_dataset(sup_bundle)
             if sup_dataset is None or len(sup_dataset) == 0:
                 pretrain_epochs = 0
+            elif probe_lite_pretrain and sup_bundle is not None:
+                pretrain_epoch_losses, hatc_baseline_diag = self._run_fc2_supervised_pretrain_probe_lite(
+                    sup_bundle=sup_bundle,
+                    n_epochs=pretrain_epochs,
+                    log_interval=log_interval,
+                )
             else:
                 hatc_baseline_diag = self._fit_fc2_hatc_x_baseline(sup_dataset)
                 sup_loader = DataLoader(
@@ -4310,78 +4597,78 @@ class Episode:
                     batch_size=max(int(getattr(self.hyperparams, 'batch_size', 4096)), 1),
                     shuffle=True,
                 )
-            for _ in tqdm(range(pretrain_epochs), desc='FC2 Supervised Pretrain'):
-                batch_losses = []
-                for x_hatc_batch, x_lnk_batch, y_batch in sup_loader:
-                    for opt_key in fc2_optimizer_keys:
-                        self.optimizers[opt_key].zero_grad(set_to_none=True)
-                    hatc_pred = hatc_model(x_hatc_batch)
-                    lnk_pred = lnk_model(x_lnk_batch)
-                    lnk_target = y_batch[:, 0:1]
-                    hatc_target = y_batch[:, 1:2]
-                    hatc_loss = nn.functional.mse_loss(hatc_pred, hatc_target)
-                    lnk_loss = nn.functional.mse_loss(lnk_pred, lnk_target)
-                    hatc_w = float(getattr(self.hyperparams, 'fc2_supervised_hatc_weight', 1.0))
-                    lnk_w = float(getattr(self.hyperparams, 'fc2_supervised_lnk_weight', 1.0))
-                    sup_loss = hatc_w * hatc_loss + lnk_w * lnk_loss
-                    sup_loss.backward()
-                    hatc_grad_norm, hatc_had_nan = gradient_protection(
-                        hatc_model.parameters(),
-                        max_norm=getattr(self.hyperparams, 'fc2_max_grad_norm', self.hyperparams.max_grad_norm)
-                    )
-                    lnk_grad_norm, lnk_had_nan = gradient_protection(
-                        lnk_model.parameters(),
-                        max_norm=getattr(self.hyperparams, 'fc2_max_grad_norm', self.hyperparams.max_grad_norm)
-                    )
-                    if hatc_had_nan:
-                        logger.warning("NaN gradient detected in fc2_hatc supervised pretrain")
-                    if lnk_had_nan:
-                        logger.warning("NaN gradient detected in fc2_lnk supervised pretrain")
-                    for opt_key in fc2_optimizer_keys:
-                        self.optimizers[opt_key].step()
-                    for sched_key in self._get_fc2_scheduler_keys():
-                        scheduler = self.lr_schedulers.get(sched_key)
-                        if scheduler is not None:
-                            scheduler.step()
-                    batch_log = {
-                        'fc2_pretrain_loss': float(sup_loss.item()),
-                        'fc2_pretrain_hatc_loss': float(hatc_loss.item()),
-                        'fc2_pretrain_lnk_loss': float(lnk_loss.item()),
-                    }
-                    with torch.no_grad():
-                        for prefix, y_true, y_pred in (
-                            ('fc2_pretrain_hatc', hatc_target, hatc_pred),
-                            ('fc2_pretrain_lnk', lnk_target, lnk_pred),
-                        ):
-                            stats = compute_fit_stats_t(y_true, y_pred)
-                            for k, v in stats.items():
-                                try:
-                                    batch_log[f'{prefix}_{k}'] = float(v)
-                                except (TypeError, ValueError):
-                                    continue
-                    batch_log['fc2_hatc_grad_norm'] = hatc_grad_norm
-                    batch_log['fc2_lnk_grad_norm'] = lnk_grad_norm
-                    batch_log['fc2_grad_norm'] = float(max(hatc_grad_norm, lnk_grad_norm))
-                    batch_log['total'] = float(sup_loss.item())
-                    batch_log.update(hatc_baseline_diag)
-                    self._latest_fc2_diag = batch_log
-                    self._record_manual_losses(batch_log)
-                    batch_losses.append(batch_log)
+                for _ in tqdm(range(pretrain_epochs), desc='FC2 Supervised Pretrain'):
+                    batch_losses = []
+                    for x_hatc_batch, x_lnk_batch, y_batch in sup_loader:
+                        for opt_key in fc2_optimizer_keys:
+                            self.optimizers[opt_key].zero_grad(set_to_none=True)
+                        hatc_pred = hatc_model(x_hatc_batch)
+                        lnk_pred = lnk_model(x_lnk_batch)
+                        lnk_target = y_batch[:, 0:1]
+                        hatc_target = y_batch[:, 1:2]
+                        hatc_loss = nn.functional.mse_loss(hatc_pred, hatc_target)
+                        lnk_loss = nn.functional.mse_loss(lnk_pred, lnk_target)
+                        hatc_w = float(getattr(self.hyperparams, 'fc2_supervised_hatc_weight', 1.0))
+                        lnk_w = float(getattr(self.hyperparams, 'fc2_supervised_lnk_weight', 1.0))
+                        sup_loss = hatc_w * hatc_loss + lnk_w * lnk_loss
+                        sup_loss.backward()
+                        hatc_grad_norm, hatc_had_nan = gradient_protection(
+                            hatc_model.parameters(),
+                            max_norm=getattr(self.hyperparams, 'fc2_max_grad_norm', self.hyperparams.max_grad_norm)
+                        )
+                        lnk_grad_norm, lnk_had_nan = gradient_protection(
+                            lnk_model.parameters(),
+                            max_norm=getattr(self.hyperparams, 'fc2_max_grad_norm', self.hyperparams.max_grad_norm)
+                        )
+                        if hatc_had_nan:
+                            logger.warning("NaN gradient detected in fc2_hatc supervised pretrain")
+                        if lnk_had_nan:
+                            logger.warning("NaN gradient detected in fc2_lnk supervised pretrain")
+                        for opt_key in fc2_optimizer_keys:
+                            self.optimizers[opt_key].step()
+                        for sched_key in self._get_fc2_scheduler_keys():
+                            scheduler = self.lr_schedulers.get(sched_key)
+                            if scheduler is not None:
+                                scheduler.step()
+                        batch_log = {
+                            'fc2_pretrain_loss': float(sup_loss.item()),
+                            'fc2_pretrain_hatc_loss': float(hatc_loss.item()),
+                            'fc2_pretrain_lnk_loss': float(lnk_loss.item()),
+                        }
+                        with torch.no_grad():
+                            for prefix, y_true, y_pred in (
+                                ('fc2_pretrain_hatc', hatc_target, hatc_pred),
+                                ('fc2_pretrain_lnk', lnk_target, lnk_pred),
+                            ):
+                                stats = compute_fit_stats_t(y_true, y_pred)
+                                for k, v in stats.items():
+                                    try:
+                                        batch_log[f'{prefix}_{k}'] = float(v)
+                                    except (TypeError, ValueError):
+                                        continue
+                        batch_log['fc2_hatc_grad_norm'] = hatc_grad_norm
+                        batch_log['fc2_lnk_grad_norm'] = lnk_grad_norm
+                        batch_log['fc2_grad_norm'] = float(max(hatc_grad_norm, lnk_grad_norm))
+                        batch_log['total'] = float(sup_loss.item())
+                        batch_log.update(hatc_baseline_diag)
+                        self._latest_fc2_diag = batch_log
+                        self._record_manual_losses(batch_log)
+                        batch_losses.append(batch_log)
 
-                epoch_loss = {
-                    k: float(np.mean([l[k] for l in batch_losses if k in l]))
-                    for k in batch_losses[0].keys()
-                }
-                pretrain_epoch_losses.append(epoch_loss)
-                if self.step_count % log_interval == 0:
-                    avg_loss = np.mean([l['total'] for l in pretrain_epoch_losses[-log_interval:]])
-                    current_lr = self._get_fc2_lr()
-                    logger.info(
-                        "FC2 Supervised Pretrain Step %d: loss=%.6f, lr=%.2e",
-                        self.step_count,
-                        avg_loss,
-                        current_lr
-                    )
+                    epoch_loss = {
+                        k: float(np.mean([l[k] for l in batch_losses if k in l]))
+                        for k in batch_losses[0].keys()
+                    }
+                    pretrain_epoch_losses.append(epoch_loss)
+                    if self.step_count % log_interval == 0:
+                        avg_loss = np.mean([l['total'] for l in pretrain_epoch_losses[-log_interval:]])
+                        current_lr = self._get_fc2_lr()
+                        logger.info(
+                            "FC2 Supervised Pretrain Step %d: loss=%.6f, lr=%.2e",
+                            self.step_count,
+                            avg_loss,
+                            current_lr
+                        )
         if pretrain_only:
             if not pretrain_epoch_losses:
                 logger.warning("fc2_supervised_pretrain_only enabled but no supervised pretrain epochs were run")

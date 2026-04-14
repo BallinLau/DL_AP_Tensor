@@ -48,6 +48,14 @@ class HyperParams:
     fc2_supervised_pretrain_only: bool = False
     fc2_supervised_hatc_weight: float = 1.0
     fc2_supervised_lnk_weight: float = 2.0
+    fc2_probe_lite_pretrain: bool = True
+    fc2_pretrain_lr: float = 1e-3
+    fc2_pretrain_weight_decay: float = 1e-4
+    fc2_pretrain_batch_size: int = 4096
+    fc2_pretrain_patience: int = 30
+    fc2_pretrain_val_frac: float = 0.2
+    fc2_pretrain_split_seed: int = 42
+    fc2_pretrain_disable_dropout: bool = True
     
     # ========== 学习率调度 ==========
     lr_scheduler_factor: float = 0.5

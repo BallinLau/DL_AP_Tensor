@@ -335,4 +335,20 @@
     - `slurm/run_fc2_trainer_compare_80g.slurm`
   - 新增说明文档：
     - `reports/fc2_probe_vs_episode_trainer_compare_20260414.md`
+- 已完成第十八刀：
+  - `Episode._run_fc2_epochs()` 的 supervised pretrain 改为 `probe-lite` 协议：
+    - 使用 path-based train/val split，而不是全样本直接训练；
+    - `hatc x-only baseline` 只在 train split 上拟合；
+    - 使用独立的 pretrain optimizer，不再复用主流程里较弱的 FC2 optimizer/scheduler 组合；
+    - 新增 early stopping，按 validation loss 选择 best epoch；
+    - supervised pretrain 期间默认关闭 dropout，但保持物理尺度训练，不引入 `x/y` 标准化；
+  - 新增相关超参数：
+    - `fc2_probe_lite_pretrain`
+    - `fc2_pretrain_lr`
+    - `fc2_pretrain_weight_decay`
+    - `fc2_pretrain_batch_size`
+    - `fc2_pretrain_patience`
+    - `fc2_pretrain_val_frac`
+    - `fc2_pretrain_split_seed`
+    - `fc2_pretrain_disable_dropout`
 - 当前状态：Phase A 的核心改造已经完成，后续可以进入真实训练验证或开始 Phase B。
