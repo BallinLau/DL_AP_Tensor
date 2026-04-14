@@ -323,4 +323,16 @@
   - 使用合成 `TensorTable` + dummy `FC2` / `policy_value`，`FC2LossPipe.loss(...)` 可直接跑通；
   - `parent / children` diagnostics 可正常生成；
   - `Episode._compute_fc2_loss(...)` 可正常写出 `_latest_fc2_diag`，包含 `fc2_children_hatc_*` 等结构化日志字段。
+- 已完成第十七刀：
+  - 新增独立脚本 `experiments/run_fc2_trainer_compare.py`；
+  - 在完全相同的 simulated episode dataset 与相同 path split 上，对比：
+    - `probe trainer`
+    - `episode-style trainer`
+  - 输出统一的 test metrics、prediction csv 与 scatter 图，用于判断 `hatc` 差异究竟来自：
+    - 数据/目标定义
+    - 还是训练协议本身；
+  - 新增对应 slurm：
+    - `slurm/run_fc2_trainer_compare_80g.slurm`
+  - 新增说明文档：
+    - `reports/fc2_probe_vs_episode_trainer_compare_20260414.md`
 - 当前状态：Phase A 的核心改造已经完成，后续可以进入真实训练验证或开始 Phase B。
