@@ -29,10 +29,11 @@ PROBE_EPOCHS="${PROBE_EPOCHS:-200}"
 PROBE_BATCH_SIZE="${PROBE_BATCH_SIZE:-4096}"
 PROBE_LR="${PROBE_LR:-1e-3}"
 PROBE_PATIENCE="${PROBE_PATIENCE:-30}"
-EPISODE_EPOCHS="${EPISODE_EPOCHS:-40}"
-EPISODE_BATCH_SIZE="${EPISODE_BATCH_SIZE:-8192}"
-EPISODE_LR="${EPISODE_LR:-1e-4}"
-EPISODE_WEIGHT_DECAY="${EPISODE_WEIGHT_DECAY:-1e-4}"
+PROBE_LITE_EPOCHS="${PROBE_LITE_EPOCHS:-40}"
+PROBE_LITE_BATCH_SIZE="${PROBE_LITE_BATCH_SIZE:-4096}"
+PROBE_LITE_LR="${PROBE_LITE_LR:-1e-3}"
+PROBE_LITE_WEIGHT_DECAY="${PROBE_LITE_WEIGHT_DECAY:-1e-4}"
+PROBE_LITE_PATIENCE="${PROBE_LITE_PATIENCE:-30}"
 
 mkdir -p "$LOG_DIR" "$OUT_DIR" "$WORK_ROOT/cachedir" "$WORK_ROOT/.mplcache"
 cd "$REPO_DIR"
@@ -65,9 +66,10 @@ python3 -u experiments/run_fc2_trainer_compare.py \
   --probe-batch-size "$PROBE_BATCH_SIZE" \
   --probe-lr "$PROBE_LR" \
   --probe-patience "$PROBE_PATIENCE" \
-  --episode-epochs "$EPISODE_EPOCHS" \
-  --episode-batch-size "$EPISODE_BATCH_SIZE" \
-  --episode-lr "$EPISODE_LR" \
-  --episode-weight-decay "$EPISODE_WEIGHT_DECAY"
+  --probe-lite-epochs "$PROBE_LITE_EPOCHS" \
+  --probe-lite-batch-size "$PROBE_LITE_BATCH_SIZE" \
+  --probe-lite-lr "$PROBE_LITE_LR" \
+  --probe-lite-weight-decay "$PROBE_LITE_WEIGHT_DECAY" \
+  --probe-lite-patience "$PROBE_LITE_PATIENCE"
 
 echo "Job finished on $(date)"

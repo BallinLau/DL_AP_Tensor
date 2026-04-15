@@ -2,10 +2,11 @@
 
 ## Purpose
 
-This experiment fixes the simulated FC2 supervised dataset and compares two training protocols on exactly the same path split:
+This experiment fixes the simulated FC2 supervised dataset and compares three training protocols on exactly the same path split:
 
-1. `probe trainer`
-2. `episode-style trainer`
+1. `probe_full`
+2. `probe_lite_raw`
+3. `probe_lite_hatc_y_norm`
 
 The goal is to isolate whether the `hatc` gap comes from:
 
@@ -20,7 +21,7 @@ This avoids mixing in:
 
 ## Compared Trainers
 
-### Probe Trainer
+### Probe Full
 
 Matches `experiments/run_fc2_supervised_probe.py`:
 
@@ -31,20 +32,27 @@ Matches `experiments/run_fc2_supervised_probe.py`:
 - validation early stopping
 - MLP probe trainer
 
-### Episode-Style Trainer
+### Probe-Lite Raw
 
-Matches the mainline FC2 supervised pretrain more closely:
+Matches the current mainline FC2 supervised pretrain more closely:
 
 - same path-based train/val/test split
 - raw feature scale
 - raw target scale
 - `FC2HatcModel` / `FC2LnkModel`
 - `hatc` x-baseline fitted via `FC2HatcModel.fit_x_baseline`
-- fixed epochs
+- early stopping
 - AdamW
 - grad clipping
-- optional cosine scheduler
-- default dropout kept on unless overridden by CLI
+- dropout off by default
+
+### Probe-Lite Hatc Y-Norm
+
+Same as `probe_lite_raw`, except:
+
+- `hatc` still outputs in physical scale
+- but the training loss standardizes the `hatc` residual on the train split
+- this isolates the marginal value of `y` normalization without changing the FC2 law interface
 
 ## Entry Points
 
@@ -60,21 +68,22 @@ The comparison run writes:
 - `comparison_summary.json`
 - `comparison_dataset.pkl`
 - `comparison_test_predictions.csv`
-- `compare_probe_hatc_scatter.png`
-- `compare_episode_hatc_scatter.png`
-- `compare_probe_lnk_scatter.png`
-- `compare_episode_lnk_scatter.png`
-- `compare_episode_style_loss_curves.png`
+- `compare_probe_full_hatc_scatter.png`
+- `compare_probe_lite_raw_hatc_scatter.png`
+- `compare_probe_lite_hatc_y_norm_scatter.png`
+- `compare_probe_full_lnk_scatter.png`
+- `compare_probe_lite_raw_lnk_scatter.png`
+- `compare_probe_lite_loss_curves.png`
 
 ## Interpretation Rule
 
-### If probe is clearly better than episode-style on the same test split
+### If probe-lite hatc y-norm is clearly better than probe-lite raw
 
-Then the current `hatc` gap is primarily a training-protocol problem.
+Then the remaining `hatc` gap is likely dominated by target-scale optimization geometry.
 
-### If both are similarly bad
+### If probe-lite raw and probe-lite hatc y-norm are similarly bad
 
-Then the problem is not mainly the trainer; it is more likely:
+Then the remaining `hatc` gap is not mainly a missing `y` normalization issue; it is more likely:
 
 - target difficulty
 - summary sufficiency

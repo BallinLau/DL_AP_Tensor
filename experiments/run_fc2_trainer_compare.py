@@ -44,7 +44,7 @@ from experiments.run_fc2_supervised_probe import (  # noqa: E402
 
 
 @dataclass
-class EpisodeStyleResult:
+class TrainerResult:
     name: str
     pred_test: np.ndarray
     y_test: np.ndarray
@@ -53,7 +53,7 @@ class EpisodeStyleResult:
     best_val_loss: float
 
 
-def _plot_episode_style_losses(results: Sequence[EpisodeStyleResult], path: Path) -> None:
+def _plot_loss_curves(results: Sequence[TrainerResult], path: Path) -> None:
     import matplotlib.pyplot as plt
 
     plt.figure(figsize=(6.4, 4.2))
@@ -62,7 +62,7 @@ def _plot_episode_style_losses(results: Sequence[EpisodeStyleResult], path: Path
         plt.plot(result.val_history, linestyle="--", label=f"{result.name} val")
     plt.xlabel("epoch")
     plt.ylabel("mse")
-    plt.title("FC2 episode-style trainer loss curves")
+    plt.title("FC2 trainer loss curves")
     plt.legend()
     plt.tight_layout()
     plt.savefig(path, dpi=150)
@@ -77,7 +77,7 @@ def _tensor_loader(x: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
 
-def train_episode_style_scalar(
+def train_probe_lite_scalar(
     name: str,
     model: nn.Module,
     x_train: np.ndarray,
@@ -92,35 +92,45 @@ def train_episode_style_scalar(
     lr: float,
     weight_decay: float,
     max_grad_norm: float,
-    use_scheduler: bool,
-    warmup_steps: int,
-    total_steps: int,
-    min_lr: float,
-) -> EpisodeStyleResult:
+    patience: int,
+    normalize_y_loss: bool,
+    fit_hatc_baseline: bool,
+) -> TrainerResult:
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = None
-    if use_scheduler:
-        scheduler = LearningRateScheduler(
-            optimizer,
-            base_lr=lr,
-            warmup_steps=warmup_steps,
-            decay_type="cosine",
-            total_steps=max(total_steps, 1),
-            min_lr=min_lr,
-        )
     loss_fn = nn.MSELoss()
     train_loader = _tensor_loader(x_train, y_train, batch_size=batch_size, shuffle=True)
+
+    x_train_t = torch.from_numpy(x_train).to(device=device, dtype=torch.float32)
     x_val_t = torch.from_numpy(x_val).to(device=device, dtype=torch.float32)
     y_val_t = torch.from_numpy(y_val).to(device=device, dtype=torch.float32)
     x_test_t = torch.from_numpy(x_test).to(device=device, dtype=torch.float32)
 
+    if fit_hatc_baseline and hasattr(model, "fit_x_baseline"):
+        model.fit_x_baseline(x_train_t.detach().cpu(), torch.from_numpy(y_train).to(torch.float32))
+
+    def _baseline(phi: torch.Tensor) -> torch.Tensor:
+        if fit_hatc_baseline and hasattr(model, "x_baseline"):
+            return model.x_baseline(phi)
+        return torch.zeros((phi.shape[0], 1), device=phi.device, dtype=phi.dtype)
+
+    with torch.no_grad():
+        if normalize_y_loss:
+            train_target = torch.from_numpy(y_train).to(device=device, dtype=torch.float32)
+            train_resid = train_target - _baseline(x_train_t)
+            y_mean_t = train_resid.mean(dim=0, keepdim=True)
+            y_std_t = train_resid.std(dim=0, keepdim=True).clamp(min=1e-6)
+        else:
+            y_mean_t = torch.zeros((1, y_train.shape[1]), device=device, dtype=torch.float32)
+            y_std_t = torch.ones((1, y_train.shape[1]), device=device, dtype=torch.float32)
+
     train_hist: List[float] = []
     val_hist: List[float] = []
     best_val = float("inf")
+    best_epoch = -1
     best_state = None
 
-    for _ in range(epochs):
+    for epoch in range(epochs):
         model.train()
         running = 0.0
         total = 0
@@ -129,17 +139,20 @@ def train_episode_style_scalar(
             yb = yb.to(device)
             optimizer.zero_grad(set_to_none=True)
             pred = model(xb)
-            loss = loss_fn(pred, yb)
+            if normalize_y_loss:
+                pred_loss = (pred - _baseline(xb) - y_mean_t) / y_std_t
+                y_loss = (yb - _baseline(xb) - y_mean_t) / y_std_t
+                loss = loss_fn(pred_loss, y_loss)
+            else:
+                loss = loss_fn(pred, yb)
             loss.backward()
             grad_norm, had_nan = gradient_protection(
                 model.parameters(),
                 max_norm=max_grad_norm,
             )
             if had_nan:
-                raise RuntimeError(f"NaN gradient detected in episode-style trainer: {name}")
+                raise RuntimeError(f"NaN gradient detected in trainer: {name}")
             optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
             running += float(loss.item()) * xb.shape[0]
             total += xb.shape[0]
         train_loss = running / max(1, total)
@@ -147,11 +160,20 @@ def train_episode_style_scalar(
 
         model.eval()
         with torch.no_grad():
-            val_loss = float(loss_fn(model(x_val_t), y_val_t).item())
+            pred_val = model(x_val_t)
+            if normalize_y_loss:
+                pred_val_loss = (pred_val - _baseline(x_val_t) - y_mean_t) / y_std_t
+                y_val_loss = (y_val_t - _baseline(x_val_t) - y_mean_t) / y_std_t
+                val_loss = float(loss_fn(pred_val_loss, y_val_loss).item())
+            else:
+                val_loss = float(loss_fn(pred_val, y_val_t).item())
         val_hist.append(val_loss)
         if val_loss < best_val:
             best_val = val_loss
+            best_epoch = epoch
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        elif epoch - best_epoch >= patience:
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -160,7 +182,7 @@ def train_episode_style_scalar(
     with torch.no_grad():
         pred_test = model(x_test_t).cpu().numpy()
 
-    return EpisodeStyleResult(
+    return TrainerResult(
         name=name,
         pred_test=pred_test,
         y_test=y_test,
@@ -190,8 +212,8 @@ def _episode_style_models(
     return hatc_model, lnk_model
 
 
-def _episode_style_summary(
-    result: EpisodeStyleResult,
+def _trainer_summary(
+    result: TrainerResult,
     target_name: str,
 ) -> Dict[str, float]:
     summary = {"best_val_loss_raw": float(result.best_val_loss)}
@@ -215,14 +237,14 @@ def main() -> None:
     parser.add_argument("--probe-lr", type=float, default=1e-3)
     parser.add_argument("--probe-weight-decay", type=float, default=1e-4)
     parser.add_argument("--probe-patience", type=int, default=30)
-    parser.add_argument("--episode-epochs", type=int, default=40)
-    parser.add_argument("--episode-batch-size", type=int, default=8192)
-    parser.add_argument("--episode-lr", type=float, default=HyperParams().fc2_lr)
-    parser.add_argument("--episode-weight-decay", type=float, default=HyperParams().fc2_weight_decay)
+    parser.add_argument("--probe-lite-epochs", type=int, default=HyperParams().fc2_supervised_pretrain_epochs)
+    parser.add_argument("--probe-lite-batch-size", type=int, default=HyperParams().fc2_pretrain_batch_size)
+    parser.add_argument("--probe-lite-lr", type=float, default=HyperParams().fc2_pretrain_lr)
+    parser.add_argument("--probe-lite-weight-decay", type=float, default=HyperParams().fc2_pretrain_weight_decay)
+    parser.add_argument("--probe-lite-patience", type=int, default=HyperParams().fc2_pretrain_patience)
     parser.add_argument("--episode-max-grad-norm", type=float, default=HyperParams().fc2_max_grad_norm)
-    parser.add_argument("--episode-hatc-dropout", type=float, default=0.1)
-    parser.add_argument("--episode-lnk-dropout", type=float, default=0.1)
-    parser.add_argument("--episode-use-scheduler", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--probe-lite-hatc-dropout", type=float, default=0.0)
+    parser.add_argument("--probe-lite-lnk-dropout", type=float, default=0.0)
     parser.add_argument("--val-frac", type=float, default=0.2)
     parser.add_argument("--test-frac", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
@@ -328,7 +350,7 @@ def main() -> None:
         task_summary.update(_prefixed_stats(task_name, true_phys[:, 0], pred_phys[:, 0]))
         probe_results_summary[task_name] = task_summary
 
-    # Episode-style trainer: same dataset, mainline-like model/optimizer protocol
+    # Probe-lite trainer: matches current mainline supervised pretrain more closely.
     x_hatc_train = train_df[hatc_feature_cols].to_numpy(dtype=np.float32)
     x_hatc_val = val_df[hatc_feature_cols].to_numpy(dtype=np.float32)
     x_hatc_test = test_df[hatc_feature_cols].to_numpy(dtype=np.float32)
@@ -343,22 +365,20 @@ def main() -> None:
     y_lnk_val = val_df[["lnk"]].to_numpy(dtype=np.float32)
     y_lnk_test = test_df[["lnk"]].to_numpy(dtype=np.float32)
 
-    hatc_model, lnk_model = _episode_style_models(
+    probe_lite_hatc_raw, probe_lite_lnk_raw = _episode_style_models(
         hidden_dims=hidden_dims,
-        hatc_dropout=args.episode_hatc_dropout,
-        lnk_dropout=args.episode_lnk_dropout,
+        hatc_dropout=args.probe_lite_hatc_dropout,
+        lnk_dropout=args.probe_lite_lnk_dropout,
     )
-    hatc_model.fit_x_baseline(
-        torch.from_numpy(x_hatc_train).to(torch.float32),
-        torch.from_numpy(y_hatc_train).to(torch.float32),
+    probe_lite_hatc_ynorm, probe_lite_lnk_ynorm = _episode_style_models(
+        hidden_dims=hidden_dims,
+        hatc_dropout=args.probe_lite_hatc_dropout,
+        lnk_dropout=args.probe_lite_lnk_dropout,
     )
-    total_steps = max(
-        1,
-        int(np.ceil(x_hatc_train.shape[0] / max(args.episode_batch_size, 1))) * max(args.episode_epochs, 1),
-    )
-    episode_hatc = train_episode_style_scalar(
-        name="episode_hatc",
-        model=hatc_model,
+
+    probe_lite_hatc_raw_res = train_probe_lite_scalar(
+        name="probe_lite_hatc_raw",
+        model=probe_lite_hatc_raw,
         x_train=x_hatc_train,
         y_train=y_hatc_train,
         x_val=x_hatc_val,
@@ -366,19 +386,37 @@ def main() -> None:
         x_test=x_hatc_test,
         y_test=y_hatc_test,
         device=device,
-        epochs=args.episode_epochs,
-        batch_size=args.episode_batch_size,
-        lr=args.episode_lr,
-        weight_decay=args.episode_weight_decay,
+        epochs=args.probe_lite_epochs,
+        batch_size=args.probe_lite_batch_size,
+        lr=args.probe_lite_lr,
+        weight_decay=args.probe_lite_weight_decay,
         max_grad_norm=args.episode_max_grad_norm,
-        use_scheduler=bool(args.episode_use_scheduler),
-        warmup_steps=0,
-        total_steps=total_steps,
-        min_lr=HyperParams().min_lr,
+        patience=args.probe_lite_patience,
+        normalize_y_loss=False,
+        fit_hatc_baseline=True,
     )
-    episode_lnk = train_episode_style_scalar(
-        name="episode_lnk",
-        model=lnk_model,
+    probe_lite_hatc_ynorm_res = train_probe_lite_scalar(
+        name="probe_lite_hatc_y_norm",
+        model=probe_lite_hatc_ynorm,
+        x_train=x_hatc_train,
+        y_train=y_hatc_train,
+        x_val=x_hatc_val,
+        y_val=y_hatc_val,
+        x_test=x_hatc_test,
+        y_test=y_hatc_test,
+        device=device,
+        epochs=args.probe_lite_epochs,
+        batch_size=args.probe_lite_batch_size,
+        lr=args.probe_lite_lr,
+        weight_decay=args.probe_lite_weight_decay,
+        max_grad_norm=args.episode_max_grad_norm,
+        patience=args.probe_lite_patience,
+        normalize_y_loss=True,
+        fit_hatc_baseline=True,
+    )
+    probe_lite_lnk_raw_res = train_probe_lite_scalar(
+        name="probe_lite_lnk_raw",
+        model=probe_lite_lnk_raw,
         x_train=x_lnk_train,
         y_train=y_lnk_train,
         x_val=x_lnk_val,
@@ -386,15 +424,14 @@ def main() -> None:
         x_test=x_lnk_test,
         y_test=y_lnk_test,
         device=device,
-        epochs=args.episode_epochs,
-        batch_size=args.episode_batch_size,
-        lr=args.episode_lr,
-        weight_decay=args.episode_weight_decay,
+        epochs=args.probe_lite_epochs,
+        batch_size=args.probe_lite_batch_size,
+        lr=args.probe_lite_lr,
+        weight_decay=args.probe_lite_weight_decay,
         max_grad_norm=args.episode_max_grad_norm,
-        use_scheduler=bool(args.episode_use_scheduler),
-        warmup_steps=0,
-        total_steps=total_steps,
-        min_lr=HyperParams().min_lr,
+        patience=args.probe_lite_patience,
+        normalize_y_loss=False,
+        fit_hatc_baseline=False,
     )
 
     summary = {
@@ -411,20 +448,25 @@ def main() -> None:
         "n_paths_train": int(split["train"].shape[0]),
         "n_paths_val": int(split["val"].shape[0]),
         "n_paths_test": int(split["test"].shape[0]),
-        "probe_trainer": probe_results_summary,
-        "episode_style_trainer": {
-            "hatc": _episode_style_summary(episode_hatc, "hatc"),
-            "lnk": _episode_style_summary(episode_lnk, "lnk"),
+        "probe_full_trainer": probe_results_summary,
+        "probe_lite_raw_trainer": {
+            "hatc": _trainer_summary(probe_lite_hatc_raw_res, "hatc"),
+            "lnk": _trainer_summary(probe_lite_lnk_raw_res, "lnk"),
         },
-        "episode_style_config": {
-            "epochs": int(args.episode_epochs),
-            "batch_size": int(args.episode_batch_size),
-            "lr": float(args.episode_lr),
-            "weight_decay": float(args.episode_weight_decay),
+        "probe_lite_hatc_y_norm_trainer": {
+            "hatc": _trainer_summary(probe_lite_hatc_ynorm_res, "hatc"),
+            "lnk": _trainer_summary(probe_lite_lnk_raw_res, "lnk"),
+        },
+        "probe_lite_config": {
+            "epochs": int(args.probe_lite_epochs),
+            "batch_size": int(args.probe_lite_batch_size),
+            "lr": float(args.probe_lite_lr),
+            "weight_decay": float(args.probe_lite_weight_decay),
+            "patience": int(args.probe_lite_patience),
             "max_grad_norm": float(args.episode_max_grad_norm),
-            "hatc_dropout": float(args.episode_hatc_dropout),
-            "lnk_dropout": float(args.episode_lnk_dropout),
-            "use_scheduler": bool(args.episode_use_scheduler),
+            "hatc_dropout": float(args.probe_lite_hatc_dropout),
+            "lnk_dropout": float(args.probe_lite_lnk_dropout),
+            "hatc_y_norm_loss": True,
         },
         "probe_config": {
             "epochs": int(args.probe_epochs),
@@ -445,41 +487,48 @@ def main() -> None:
             "branch": test_df["branch"].to_numpy(dtype=int),
             "hatc_true": test_df["hatc"].to_numpy(dtype=float),
             "lnk_true": test_df["lnk"].to_numpy(dtype=float),
-            "hatc_pred_probe": probe_predictions["hatc"][:, 0],
-            "lnk_pred_probe": probe_predictions["lnk"][:, 0],
-            "hatc_pred_episode": episode_hatc.pred_test[:, 0],
-            "lnk_pred_episode": episode_lnk.pred_test[:, 0],
+            "hatc_pred_probe_full": probe_predictions["hatc"][:, 0],
+            "lnk_pred_probe_full": probe_predictions["lnk"][:, 0],
+            "hatc_pred_probe_lite_raw": probe_lite_hatc_raw_res.pred_test[:, 0],
+            "hatc_pred_probe_lite_hatc_y_norm": probe_lite_hatc_ynorm_res.pred_test[:, 0],
+            "lnk_pred_probe_lite_raw": probe_lite_lnk_raw_res.pred_test[:, 0],
         }
     )
     pred_frame.to_csv(args.output_dir / "comparison_test_predictions.csv", index=False)
 
     _plot_scatter(
         pred_frame["hatc_true"].to_numpy(dtype=float),
-        pred_frame["hatc_pred_probe"].to_numpy(dtype=float),
-        "FC2 compare: probe trainer hatc",
-        args.output_dir / "compare_probe_hatc_scatter.png",
+        pred_frame["hatc_pred_probe_full"].to_numpy(dtype=float),
+        "FC2 compare: probe full trainer hatc",
+        args.output_dir / "compare_probe_full_hatc_scatter.png",
     )
     _plot_scatter(
         pred_frame["hatc_true"].to_numpy(dtype=float),
-        pred_frame["hatc_pred_episode"].to_numpy(dtype=float),
-        "FC2 compare: episode-style trainer hatc",
-        args.output_dir / "compare_episode_hatc_scatter.png",
+        pred_frame["hatc_pred_probe_lite_raw"].to_numpy(dtype=float),
+        "FC2 compare: probe-lite raw hatc",
+        args.output_dir / "compare_probe_lite_raw_hatc_scatter.png",
+    )
+    _plot_scatter(
+        pred_frame["hatc_true"].to_numpy(dtype=float),
+        pred_frame["hatc_pred_probe_lite_hatc_y_norm"].to_numpy(dtype=float),
+        "FC2 compare: probe-lite hatc y-norm",
+        args.output_dir / "compare_probe_lite_hatc_y_norm_scatter.png",
     )
     _plot_scatter(
         pred_frame["lnk_true"].to_numpy(dtype=float),
-        pred_frame["lnk_pred_probe"].to_numpy(dtype=float),
-        "FC2 compare: probe trainer lnk",
-        args.output_dir / "compare_probe_lnk_scatter.png",
+        pred_frame["lnk_pred_probe_full"].to_numpy(dtype=float),
+        "FC2 compare: probe full trainer lnk",
+        args.output_dir / "compare_probe_full_lnk_scatter.png",
     )
     _plot_scatter(
         pred_frame["lnk_true"].to_numpy(dtype=float),
-        pred_frame["lnk_pred_episode"].to_numpy(dtype=float),
-        "FC2 compare: episode-style trainer lnk",
-        args.output_dir / "compare_episode_lnk_scatter.png",
+        pred_frame["lnk_pred_probe_lite_raw"].to_numpy(dtype=float),
+        "FC2 compare: probe-lite raw lnk",
+        args.output_dir / "compare_probe_lite_raw_lnk_scatter.png",
     )
-    _plot_episode_style_losses(
-        [episode_hatc, episode_lnk],
-        args.output_dir / "compare_episode_style_loss_curves.png",
+    _plot_loss_curves(
+        [probe_lite_hatc_raw_res, probe_lite_hatc_ynorm_res, probe_lite_lnk_raw_res],
+        args.output_dir / "compare_probe_lite_loss_curves.png",
     )
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
