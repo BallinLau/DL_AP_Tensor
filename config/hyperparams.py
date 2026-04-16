@@ -56,6 +56,8 @@ class HyperParams:
     fc2_pretrain_val_frac: float = 0.2
     fc2_pretrain_split_seed: int = 42
     fc2_pretrain_disable_dropout: bool = True
+    fc2_pretrain_hatc_residual_y_norm_loss: bool = True
+    fc2_pretrain_hatc_residual_y_norm_min_std: float = 1e-6
     
     # ========== 学习率调度 ==========
     lr_scheduler_factor: float = 0.5

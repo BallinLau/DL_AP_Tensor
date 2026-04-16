@@ -264,6 +264,39 @@ class Episode:
             diag["fc2_hatc_x_baseline_fitted"] = float(bool(fitted.item()))
         return diag
 
+    def _fit_fc2_hatc_residual_y_norm(
+        self,
+        sup_source: Optional[Any],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
+        hatc_model, _ = self._get_fc2_models()
+        if hatc_model is None or sup_source is None:
+            return None, None, {}
+        if not bool(getattr(self.hyperparams, 'fc2_pretrain_hatc_residual_y_norm_loss', True)):
+            return None, None, {'fc2_hatc_residual_y_norm_enabled': 0.0}
+        if not hasattr(hatc_model, "x_baseline"):
+            return None, None, {'fc2_hatc_residual_y_norm_enabled': 0.0}
+        tensors = self._extract_fc2_supervised_tensors(sup_source)
+        if tensors is None:
+            return None, None, {'fc2_hatc_residual_y_norm_enabled': 0.0}
+        x_hatc_all, _, y_all = tensors
+        if x_hatc_all.shape[0] == 0:
+            return None, None, {'fc2_hatc_residual_y_norm_enabled': 0.0}
+
+        hatc_target = y_all[:, 1:2]
+        min_std = float(getattr(self.hyperparams, 'fc2_pretrain_hatc_residual_y_norm_min_std', 1e-6))
+        with torch.no_grad():
+            baseline = hatc_model.x_baseline(x_hatc_all)
+            residual = hatc_target - baseline
+            resid_mean = residual.mean(dim=0, keepdim=True).detach()
+            resid_std = residual.std(dim=0, keepdim=True).clamp(min=min_std).detach()
+
+        diag = {
+            'fc2_hatc_residual_y_norm_enabled': 1.0,
+            'fc2_hatc_residual_y_norm_mean': float(resid_mean.detach().cpu().reshape(-1)[0].item()),
+            'fc2_hatc_residual_y_norm_std': float(resid_std.detach().cpu().reshape(-1)[0].item()),
+        }
+        return resid_mean, resid_std, diag
+
     def _extract_fc2_supervised_tensors(
         self,
         sup_source: Optional[Any],
@@ -3334,6 +3367,8 @@ class Episode:
 
         train_bundle, val_bundle = self._split_fc2_supervised_bundle(sup_bundle)
         hatc_baseline_diag = self._fit_fc2_hatc_x_baseline(train_bundle)
+        hatc_resid_mean, hatc_resid_std, hatc_resid_diag = self._fit_fc2_hatc_residual_y_norm(train_bundle)
+        hatc_baseline_diag.update(hatc_resid_diag)
         train_loader = DataLoader(
             self._fc2_bundle_to_dataset(train_bundle),
             batch_size=max(int(getattr(self.hyperparams, 'fc2_pretrain_batch_size', 4096)), 1),
@@ -3348,6 +3383,11 @@ class Episode:
         lr = float(getattr(self.hyperparams, 'fc2_pretrain_lr', 1e-3))
         weight_decay = float(getattr(self.hyperparams, 'fc2_pretrain_weight_decay', self.hyperparams.fc2_weight_decay))
         disable_dropout = bool(getattr(self.hyperparams, 'fc2_pretrain_disable_dropout', True))
+        use_hatc_resid_y_norm = bool(
+            getattr(self.hyperparams, 'fc2_pretrain_hatc_residual_y_norm_loss', True)
+            and hatc_resid_mean is not None
+            and hatc_resid_std is not None
+        )
 
         hatc_optimizer = torch.optim.AdamW(hatc_model.parameters(), lr=lr, weight_decay=weight_decay)
         lnk_optimizer = torch.optim.AdamW(lnk_model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -3376,9 +3416,17 @@ class Episode:
                     lnk_pred = lnk_model(x_lnk_batch)
                     lnk_target = y_batch[:, 0:1]
                     hatc_target = y_batch[:, 1:2]
+                    if use_hatc_resid_y_norm:
+                        with torch.no_grad():
+                            hatc_baseline_batch = hatc_model.x_baseline(x_hatc_batch)
+                        hatc_pred_loss = (hatc_pred - hatc_baseline_batch - hatc_resid_mean) / hatc_resid_std
+                        hatc_target_loss = (hatc_target - hatc_baseline_batch - hatc_resid_mean) / hatc_resid_std
+                        hatc_loss_objective = nn.functional.mse_loss(hatc_pred_loss, hatc_target_loss)
+                    else:
+                        hatc_loss_objective = nn.functional.mse_loss(hatc_pred, hatc_target)
                     hatc_loss = nn.functional.mse_loss(hatc_pred, hatc_target)
                     lnk_loss = nn.functional.mse_loss(lnk_pred, lnk_target)
-                    sup_loss = hatc_w * hatc_loss + lnk_w * lnk_loss
+                    sup_loss = hatc_w * hatc_loss_objective + lnk_w * lnk_loss
                     sup_loss.backward()
 
                     hatc_grad_norm, hatc_had_nan = gradient_protection(
@@ -3400,6 +3448,7 @@ class Episode:
                     batch_log = {
                         'fc2_pretrain_loss': float(sup_loss.item()),
                         'fc2_pretrain_hatc_loss': float(hatc_loss.item()),
+                        'fc2_pretrain_hatc_loss_objective': float(hatc_loss_objective.item()),
                         'fc2_pretrain_lnk_loss': float(lnk_loss.item()),
                     }
                     with torch.no_grad():
@@ -3429,9 +3478,16 @@ class Episode:
                     lnk_pred_val = lnk_model(x_lnk_val)
                     lnk_target_val = y_val[:, 0:1]
                     hatc_target_val = y_val[:, 1:2]
+                    if use_hatc_resid_y_norm:
+                        hatc_baseline_val = hatc_model.x_baseline(x_hatc_val)
+                        hatc_pred_val_loss = (hatc_pred_val - hatc_baseline_val - hatc_resid_mean) / hatc_resid_std
+                        hatc_target_val_loss = (hatc_target_val - hatc_baseline_val - hatc_resid_mean) / hatc_resid_std
+                        hatc_val_loss_objective = nn.functional.mse_loss(hatc_pred_val_loss, hatc_target_val_loss)
+                    else:
+                        hatc_val_loss_objective = nn.functional.mse_loss(hatc_pred_val, hatc_target_val)
                     hatc_val_loss = nn.functional.mse_loss(hatc_pred_val, hatc_target_val)
                     lnk_val_loss = nn.functional.mse_loss(lnk_pred_val, lnk_target_val)
-                    val_total = hatc_w * hatc_val_loss + lnk_w * lnk_val_loss
+                    val_total = hatc_w * hatc_val_loss_objective + lnk_w * lnk_val_loss
 
                 epoch_loss = {
                     k: float(np.mean([l[k] for l in batch_losses if k in l]))
@@ -3439,6 +3495,7 @@ class Episode:
                 }
                 epoch_loss['fc2_pretrain_val_loss'] = float(val_total.item())
                 epoch_loss['fc2_pretrain_val_hatc_loss'] = float(hatc_val_loss.item())
+                epoch_loss['fc2_pretrain_val_hatc_loss_objective'] = float(hatc_val_loss_objective.item())
                 epoch_loss['fc2_pretrain_val_lnk_loss'] = float(lnk_val_loss.item())
                 with torch.no_grad():
                     for prefix, y_true, y_pred in (

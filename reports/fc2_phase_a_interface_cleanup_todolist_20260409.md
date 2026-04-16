@@ -219,6 +219,11 @@
   - 之前的写法先取 `eta_j = child_state[:, j, 2]` 这个 view，再对同一 `child_state[:, j, 0]` 原地赋值，会触发 backward 的 version mismatch；
   - 现已改为一次性函数式构造 `new_b` 和新的 `updated_child_state`，避免 inplace autograd 冲突。
 - 已完成第九刀：
+  - 主流程 `FC2 supervised pretrain` 现已支持对 `hatc residual = hatc - x_baseline(x)` 仅在 loss 内部做标准化；
+  - 标准化参数只用 train split 拟合，不暴露到外部 law 接口；
+  - 模型输出和 `fit_after_train / outer_after_resim` 评估仍保持原始物理尺度；
+  - 新增 `fc2_pretrain_hatc_residual_y_norm_loss` 与 `fc2_pretrain_hatc_residual_y_norm_min_std` 超参数。
+- 已完成第九刀：
   - 在 `simulate_ts.py / simulate_ts_parallel.py` 中补入 `C_raw / C_firmclip / C_aggclip / Hatc_firmclip / Hatc_aggclip` 这组资源诊断列；
   - `Episode` 现在会在 `FC2` 训练前记录当前 macro panel 的 `sum C` 诊断，并在 `outer_after_resim` 中再记录一遍；
   - runner 新增两张逐 episode 图：
