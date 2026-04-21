@@ -293,7 +293,12 @@ class SimulateTS:
             macro_row = torch.tensor(
                 [[
                     float(path_idx), float(t), float(branch_k),
-                    0.0, 0.0, -10.0, -10.0, 0.0,
+                    0.0, 0.0, -10.0, -10.0,
+                    0.0, 0.0, 0.0,
+                    -10.0, -10.0,
+                    0.0, 0.0, 0.0,
+                    0.0, 0.0,
+                    0.0,
                     float(m_val.detach().item()),
                     float(x.detach().item()),
                     float(hatcf.detach().item()),
@@ -302,6 +307,8 @@ class SimulateTS:
                 device=device,
                 dtype=torch.float32
             )
+            state['hatc_curr'] = -10.0
+            state['lnk_curr'] = -10.0
             firm_empty = torch.empty((0, len(self.FIRM_COLUMNS)), device=device, dtype=torch.float32)
             return firm_empty, macro_row
 
