@@ -33,6 +33,7 @@ N_EPOCHS="${N_EPOCHS:-220}"
 Q_STAGE_EPOCHS="${Q_STAGE_EPOCHS:-100}"
 PVBP_STAGE_EPOCHS="${PVBP_STAGE_EPOCHS:-100}"
 Q_REFRESH_STAGE_EPOCHS="${Q_REFRESH_STAGE_EPOCHS:-20}"
+BEFORE_EVAL_TOL="${BEFORE_EVAL_TOL:-1e-8}"
 LOG_INTERVAL="${LOG_INTERVAL:-20}"
 SEED="${SEED:-42}"
 
@@ -71,6 +72,7 @@ python3 -u experiments/run_policy_datagen_compare.py \
   --q-stage-epochs "$Q_STAGE_EPOCHS" \
   --pvbp-stage-epochs "$PVBP_STAGE_EPOCHS" \
   --q-refresh-stage-epochs "$Q_REFRESH_STAGE_EPOCHS" \
+  --before-eval-tol "$BEFORE_EVAL_TOL" \
   --log-interval "$LOG_INTERVAL" \
   --seed "$SEED"
 

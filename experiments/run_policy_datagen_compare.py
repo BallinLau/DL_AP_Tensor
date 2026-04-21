@@ -52,12 +52,151 @@ class DatagenRunResult:
     generation_summary: Dict[str, Any]
 
 
+@dataclass
+class ArmRunContext:
+    name: str
+    datagen_result: DatagenRunResult
+    episode: Episode
+    batches: List[Dict[str, torch.Tensor]]
+    conv_before: Dict[str, Any]
+    common_before: Dict[str, Dict[str, Any]]
+
+
 def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _make_policy_hyperparams(
+    n_epochs: int,
+    q_stage_epochs: int,
+    pvbp_stage_epochs: int,
+    q_refresh_stage_epochs: int,
+) -> Any:
+    hp = build_hyperparams()
+    hp.q_stage_epochs = int(q_stage_epochs)
+    hp.pvbp_stage_epochs = int(pvbp_stage_epochs)
+    hp.q_refresh_stage_epochs = int(q_refresh_stage_epochs)
+    hp.q_pretrain_epochs = int(q_stage_epochs)
+    hp.q_warmstart_epochs = int(q_stage_epochs)
+    hp.epochs = int(max(n_epochs, q_stage_epochs + pvbp_stage_epochs + q_refresh_stage_epochs))
+    return hp
+
+
+def _snapshot_model_states(models: Dict[str, torch.nn.Module]) -> Dict[str, Dict[str, torch.Tensor]]:
+    return {
+        name: {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        for name, model in models.items()
+    }
+
+
+def _load_model_states(
+    models: Dict[str, torch.nn.Module],
+    states: Dict[str, Dict[str, torch.Tensor]],
+    device: torch.device,
+) -> None:
+    for name, state in states.items():
+        if name not in models:
+            raise KeyError(f"Initial state contains unknown model: {name}")
+        state_on_device = {k: v.to(device=device) for k, v in state.items()}
+        models[name].load_state_dict(state_on_device, strict=True)
+
+
+def _model_state_stats(states: Dict[str, Dict[str, torch.Tensor]]) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for model_name, state in states.items():
+        n_params = 0
+        abs_sum = 0.0
+        sq_sum = 0.0
+        max_abs = 0.0
+        for tensor in state.values():
+            vals = tensor.detach().to(dtype=torch.float64).reshape(-1)
+            n_params += int(vals.numel())
+            if vals.numel() == 0:
+                continue
+            abs_vals = vals.abs()
+            abs_sum += float(abs_vals.sum().item())
+            sq_sum += float((vals * vals).sum().item())
+            max_abs = max(max_abs, float(abs_vals.max().item()))
+        out[model_name] = {
+            "n_params": float(n_params),
+            "abs_sum": abs_sum,
+            "l2": float(sq_sum ** 0.5),
+            "max_abs": max_abs,
+        }
+    return out
+
+
+def _policy_checkpoint_status(ckpt_dir: Path | None, ckpt_prefix: str | None) -> Dict[str, Any]:
+    status: Dict[str, Any] = {
+        "ckpt_dir": str(ckpt_dir) if ckpt_dir is not None else None,
+        "ckpt_prefix": ckpt_prefix,
+        "policy_value_loaded": False,
+        "policy_value_source": None,
+        "reason": None,
+    }
+    if ckpt_dir is None:
+        status["reason"] = "no_ckpt_dir"
+        return status
+
+    ckpt_dir = Path(ckpt_dir)
+    prefix = f"{ckpt_prefix}_" if ckpt_prefix else ""
+    split_q = ckpt_dir / f"{prefix}policy_value_q.pt"
+    split_pvbp = ckpt_dir / f"{prefix}policy_value_pvbp.pt"
+    merged = ckpt_dir / f"{prefix}policy_value.pt"
+    status.update(
+        {
+            "split_q_exists": split_q.exists(),
+            "split_pvbp_exists": split_pvbp.exists(),
+            "merged_exists": merged.exists(),
+        }
+    )
+    if split_q.exists() and split_pvbp.exists():
+        status["policy_value_loaded"] = True
+        status["policy_value_source"] = "split_q_pvbp"
+        status["reason"] = "loaded_split_policy_value"
+        return status
+    if merged.exists():
+        try:
+            state = torch.load(merged, map_location="cpu")
+            is_old_joint_ckpt = any(
+                str(k).startswith("shared_model.") or str(k).startswith("combined_model.")
+                for k in state.keys()
+            )
+            status["merged_legacy_joint"] = bool(is_old_joint_ckpt)
+            if is_old_joint_ckpt:
+                status["reason"] = "merged_policy_value_is_incompatible_legacy_joint"
+            else:
+                status["policy_value_loaded"] = True
+                status["policy_value_source"] = "merged_policy_value"
+                status["reason"] = "loaded_merged_policy_value"
+        except Exception as exc:
+            status["reason"] = f"merged_policy_value_inspect_failed: {exc}"
+        return status
+
+    status["reason"] = "missing_policy_value_checkpoint"
+    return status
+
+
+def _build_episode_from_initial_state(
+    initial_model_states: Dict[str, Dict[str, torch.Tensor]],
+    device: torch.device,
+    hp: Any,
+) -> Episode:
+    models = build_models(device=device)
+    _load_model_states(models, initial_model_states, device)
+    optimizers = build_optimizers(models, hp)
+    return Episode(
+        models=models,
+        optimizers=optimizers,
+        config=Config,
+        hyperparams=hp,
+        device=device,
+        episode_id=0,
+    )
 
 
 def _clone_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -331,39 +470,27 @@ def _plot_stage_common_eval(summary_rows: Sequence[Dict[str, Any]], eval_name: s
     plt.close(fig)
 
 
-def run_single_arm(
+def prepare_single_arm(
     name: str,
     datagen_result: DatagenRunResult,
     device: torch.device,
-    ckpt_dir: Path | None,
-    ckpt_prefix: str | None,
     batch_size: int,
     n_epochs: int,
-    log_interval: int,
     seed: int,
     q_stage_epochs: int,
     pvbp_stage_epochs: int,
     q_refresh_stage_epochs: int,
     common_eval_batches: Dict[str, List[Dict[str, torch.Tensor]]],
-) -> Dict[str, Any]:
+    initial_model_states: Dict[str, Dict[str, torch.Tensor]],
+) -> ArmRunContext:
     _set_seed(seed)
-    models = build_models(device=device, ckpt_dir=ckpt_dir, ckpt_prefix=ckpt_prefix)
-    hp = build_hyperparams()
-    hp.q_stage_epochs = int(q_stage_epochs)
-    hp.pvbp_stage_epochs = int(pvbp_stage_epochs)
-    hp.q_refresh_stage_epochs = int(q_refresh_stage_epochs)
-    hp.q_pretrain_epochs = int(q_stage_epochs)
-    hp.q_warmstart_epochs = int(q_stage_epochs)
-    hp.epochs = int(max(n_epochs, q_stage_epochs + pvbp_stage_epochs + q_refresh_stage_epochs))
-    optimizers = build_optimizers(models, hp)
-    episode = Episode(
-        models=models,
-        optimizers=optimizers,
-        config=Config,
-        hyperparams=hp,
-        device=device,
-        episode_id=0,
+    hp = _make_policy_hyperparams(
+        n_epochs=n_epochs,
+        q_stage_epochs=q_stage_epochs,
+        pvbp_stage_epochs=pvbp_stage_epochs,
+        q_refresh_stage_epochs=q_refresh_stage_epochs,
     )
+    episode = _build_episode_from_initial_state(initial_model_states, device, hp)
 
     _set_seed(seed)
     batches = episode._create_firm_batches_from_tensor(
@@ -380,6 +507,89 @@ def run_single_arm(
         eval_name: episode.evaluate_bellman_convergence(eval_batches)
         for eval_name, eval_batches in common_eval_batches.items()
     }
+    return ArmRunContext(
+        name=name,
+        datagen_result=datagen_result,
+        episode=episode,
+        batches=batches,
+        conv_before=conv_before,
+        common_before=common_before,
+    )
+
+
+def _assert_common_before_matches(
+    contexts: Sequence[ArmRunContext],
+    eval_names: Sequence[str],
+    tol: float,
+) -> Dict[str, Any]:
+    if len(contexts) < 2:
+        return {"enabled": False, "reason": "fewer_than_two_arms"}
+
+    ref = contexts[0]
+    comparisons: List[Dict[str, Any]] = []
+    max_abs_diff = 0.0
+    worst: Dict[str, Any] | None = None
+    metric_keys = [
+        "conv_p0_mean",
+        "conv_p0_p90",
+        "conv_pi_mean",
+        "conv_pi_p90",
+        "conv_q_mean",
+        "conv_q_p90",
+    ]
+    for ctx in contexts[1:]:
+        for eval_name in eval_names:
+            ref_values = _extract_conv(ref.common_before.get(eval_name, {}))
+            cur_values = _extract_conv(ctx.common_before.get(eval_name, {}))
+            for key in metric_keys:
+                a = float(ref_values.get(key, float("nan")))
+                b = float(cur_values.get(key, float("nan")))
+                if not (np.isfinite(a) and np.isfinite(b)):
+                    continue
+                diff = abs(a - b)
+                item = {
+                    "reference_arm": ref.name,
+                    "other_arm": ctx.name,
+                    "eval_name": eval_name,
+                    "metric": key,
+                    "reference": a,
+                    "other": b,
+                    "abs_diff": diff,
+                }
+                comparisons.append(item)
+                if diff > max_abs_diff:
+                    max_abs_diff = diff
+                    worst = item
+
+    check = {
+        "enabled": True,
+        "tolerance": float(tol),
+        "max_abs_diff": float(max_abs_diff),
+        "passed": bool(max_abs_diff <= tol),
+        "worst": worst,
+        "comparisons": comparisons,
+    }
+    if max_abs_diff > tol:
+        raise RuntimeError(
+            "Common eval before residuals differ across arms. "
+            f"max_abs_diff={max_abs_diff:.6e}, tol={tol:.6e}, worst={worst}. "
+            "This violates clean A/B initialization; aborting before training."
+        )
+    return check
+
+
+def train_prepared_arm(
+    context: ArmRunContext,
+    n_epochs: int,
+    log_interval: int,
+    common_eval_batches: Dict[str, List[Dict[str, torch.Tensor]]],
+) -> Dict[str, Any]:
+    name = context.name
+    datagen_result = context.datagen_result
+    episode = context.episode
+    batches = context.batches
+    conv_before = context.conv_before
+    common_before = context.common_before
 
     stage_common_eval: Dict[str, Dict[str, float]] = {}
 
@@ -426,7 +636,9 @@ def _make_eval_batches(
     device: torch.device,
     batch_size: int,
     branch_num: int,
+    seed: int,
 ) -> List[Dict[str, torch.Tensor]]:
+    _set_seed(seed)
     models = build_models(device=device)
     hp = build_hyperparams()
     optimizers = build_optimizers(models, hp)
@@ -465,6 +677,7 @@ def main() -> None:
     parser.add_argument("--q-refresh-stage-epochs", type=int, default=20)
     parser.add_argument("--eval-pool-size", type=int, default=None)
     parser.add_argument("--eval-rollout-steps", type=int, default=None)
+    parser.add_argument("--before-eval-tol", type=float, default=1e-8)
     args = parser.parse_args()
 
     if args.output_dir is None:
@@ -474,6 +687,9 @@ def main() -> None:
     device = torch.device(args.device)
     _set_seed(args.seed)
     base_models = build_models(device=device, ckpt_dir=args.ckpt_dir, ckpt_prefix=args.ckpt_prefix)
+    initial_model_states = _snapshot_model_states(base_models)
+    initial_state_stats = _model_state_stats(initial_model_states)
+    policy_ckpt_status = _policy_checkpoint_status(args.ckpt_dir, args.ckpt_prefix)
     sim = SimulateTS(
         models=base_models,
         config=Config,
@@ -539,42 +755,71 @@ def main() -> None:
         },
     )
     common_eval_batches = {
-        "eval_main": _make_eval_batches(eval_main_result.firm_table, device, args.batch_size, args.branch_num),
-        "eval_children": _make_eval_batches(eval_children_result.firm_table, device, args.batch_size, args.branch_num),
-        "eval_mixed": _make_eval_batches(eval_mixed_result.firm_table, device, args.batch_size, args.branch_num),
+        "eval_main": _make_eval_batches(
+            eval_main_result.firm_table,
+            device,
+            args.batch_size,
+            args.branch_num,
+            seed=args.seed + 9101,
+        ),
+        "eval_children": _make_eval_batches(
+            eval_children_result.firm_table,
+            device,
+            args.batch_size,
+            args.branch_num,
+            seed=args.seed + 9102,
+        ),
+        "eval_mixed": _make_eval_batches(
+            eval_mixed_result.firm_table,
+            device,
+            args.batch_size,
+            args.branch_num,
+            seed=args.seed + 9103,
+        ),
     }
 
-    summary_rows = [
-        run_single_arm(
+    arm_contexts = [
+        prepare_single_arm(
             name="main_branch",
             datagen_result=main_result,
             device=device,
-            ckpt_dir=args.ckpt_dir,
-            ckpt_prefix=args.ckpt_prefix,
             batch_size=args.batch_size,
             n_epochs=args.n_epochs,
-            log_interval=args.log_interval,
             seed=args.seed + 100,
             q_stage_epochs=args.q_stage_epochs,
             pvbp_stage_epochs=args.pvbp_stage_epochs,
             q_refresh_stage_epochs=args.q_refresh_stage_epochs,
             common_eval_batches=common_eval_batches,
+            initial_model_states=initial_model_states,
         ),
-        run_single_arm(
+        prepare_single_arm(
             name="children_promote",
             datagen_result=promote_result,
             device=device,
-            ckpt_dir=args.ckpt_dir,
-            ckpt_prefix=args.ckpt_prefix,
             batch_size=args.batch_size,
             n_epochs=args.n_epochs,
-            log_interval=args.log_interval,
             seed=args.seed + 101,
             q_stage_epochs=args.q_stage_epochs,
             pvbp_stage_epochs=args.pvbp_stage_epochs,
             q_refresh_stage_epochs=args.q_refresh_stage_epochs,
             common_eval_batches=common_eval_batches,
+            initial_model_states=initial_model_states,
         ),
+    ]
+    before_eval_check = _assert_common_before_matches(
+        contexts=arm_contexts,
+        eval_names=list(common_eval_batches.keys()),
+        tol=float(args.before_eval_tol),
+    )
+
+    summary_rows = [
+        train_prepared_arm(
+            context=ctx,
+            n_epochs=args.n_epochs,
+            log_interval=args.log_interval,
+            common_eval_batches=common_eval_batches,
+        )
+        for ctx in arm_contexts
     ]
 
     manifest = {
@@ -592,6 +837,13 @@ def main() -> None:
         "q_refresh_stage_epochs": int(args.q_refresh_stage_epochs),
         "eval_pool_size": int(eval_pool_size),
         "eval_rollout_steps": int(eval_rollout_steps),
+        "before_eval_tol": float(args.before_eval_tol),
+        "initialization": {
+            "shared_initial_model_state": True,
+            "policy_checkpoint_status": policy_ckpt_status,
+            "state_stats": initial_state_stats,
+            "before_eval_check": before_eval_check,
+        },
         "eval_supports": {
             "eval_main": eval_main_result.generation_summary,
             "eval_children": eval_children_result.generation_summary,

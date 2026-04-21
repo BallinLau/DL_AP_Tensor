@@ -122,6 +122,36 @@ This directly tests whether children promotion improves Bellman residuals on sha
 For `eval_mixed`, the child-promoted validation table is assigned a disjoint path-id range before concatenation.
 This avoids accidental duplicate `(path,t,branch)` keys when the batching code reconstructs parent-child tuples.
 
+## Clean A/B Initialization Guard
+
+The harness now constructs the initial model once, snapshots every model `state_dict`, and loads that same snapshot into both arms.
+The arms no longer rebuild independently from checkpoint paths.
+
+Before any training starts, the harness evaluates both arms on the same common eval batches and asserts:
+
+```text
+max_abs_diff(common_eval_before_residuals) <= before_eval_tol
+```
+
+Default:
+
+- `before_eval_tol = 1e-8`
+
+If this check fails, the run aborts before training.
+This prevents comparing:
+
+```text
+main_branch      = data A + init A
+children_promote = data B + init B
+```
+
+The summary also records:
+
+- `initialization.shared_initial_model_state`
+- `initialization.policy_checkpoint_status`
+- `initialization.state_stats`
+- `initialization.before_eval_check`
+
 ## Stage-Level Evaluation
 
 The harness also evaluates common-support convergence at:
