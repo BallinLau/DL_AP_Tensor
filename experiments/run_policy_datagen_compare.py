@@ -93,6 +93,7 @@ def _summarize_generation(
         branch_share[f"branch_{branch_k}_share"] = float(cnt / total_branch)
     return {
         "mode": mode,
+        "branch_num": int(len(promoted_branch_counts)),
         "pool_size": int(pool_size),
         "rollout_steps": int(rollout_steps),
         "promoted_total": int(promoted_total),
@@ -208,6 +209,31 @@ def _extract_conv(convergence: Dict[str, Any] | None) -> Dict[str, float]:
     return out
 
 
+def _path_col_idx(table: TensorTable) -> int:
+    return list(table.columns).index("path")
+
+
+def _next_path_offset(*tables: TensorTable) -> int:
+    max_path = -1
+    for table in tables:
+        if len(table) == 0:
+            continue
+        path_idx = _path_col_idx(table)
+        max_path = max(max_path, int(table.data[:, path_idx].max().item()))
+    return max_path + 1
+
+
+def _offset_path_column(table: TensorTable, offset: int) -> TensorTable:
+    data = table.data.clone()
+    if data.numel() > 0 and offset != 0:
+        data[:, _path_col_idx(table)] += float(offset)
+    return TensorTable(data, list(table.columns))
+
+
+def _prefix_dict(prefix: str, values: Dict[str, float]) -> Dict[str, float]:
+    return {f"{prefix}_{k}": v for k, v in values.items()}
+
+
 def _extract_stage_final_losses(summary: Dict[str, Any]) -> Dict[str, float]:
     final_losses = summary.get("final_losses", {})
     out: Dict[str, float] = {}
@@ -222,9 +248,9 @@ def _extract_stage_final_losses(summary: Dict[str, Any]) -> Dict[str, float]:
 def _plot_conv_compare(summary_rows: Sequence[Dict[str, Any]], out_path: Path) -> None:
     labels = [row["name"] for row in summary_rows]
     metrics = [
-        "conv_p0_mean_after",
-        "conv_pi_mean_after",
-        "conv_q_mean_after",
+        "train_support_conv_p0_mean_after",
+        "train_support_conv_pi_mean_after",
+        "train_support_conv_q_mean_after",
     ]
     x = np.arange(len(labels))
     width = 0.22
@@ -261,6 +287,50 @@ def _plot_branch_share(summary_rows: Sequence[Dict[str, Any]], out_path: Path) -
     plt.close()
 
 
+def _plot_common_eval_compare(summary_rows: Sequence[Dict[str, Any]], eval_name: str, out_path: Path) -> None:
+    labels = [row["name"] for row in summary_rows]
+    metrics = [
+        f"{eval_name}_conv_p0_mean_after",
+        f"{eval_name}_conv_pi_mean_after",
+        f"{eval_name}_conv_q_mean_after",
+    ]
+    x = np.arange(len(labels))
+    width = 0.22
+    plt.figure(figsize=(7.2, 4.2))
+    for idx, metric in enumerate(metrics):
+        vals = [row.get(metric, np.nan) for row in summary_rows]
+        plt.bar(x + (idx - 1) * width, vals, width=width, label=metric.replace(f"{eval_name}_", "").replace("_after", ""))
+    plt.xticks(x, labels)
+    plt.ylabel("absolute Bellman residual mean")
+    plt.title(f"Policy datagen compare: {eval_name} common eval")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+
+def _plot_stage_common_eval(summary_rows: Sequence[Dict[str, Any]], eval_name: str, out_path: Path) -> None:
+    phases = ["q_stage_end", "pvbp_stage_end", "q_refresh_end"]
+    equations = ["p0", "pi", "q"]
+    fig, axes = plt.subplots(1, len(equations), figsize=(13.5, 3.8), sharex=True)
+    for ax, eq in zip(axes, equations):
+        for row in summary_rows:
+            vals = [
+                row.get(f"stage_{phase}_{eval_name}_conv_{eq}_mean", np.nan)
+                for phase in phases
+            ]
+            ax.plot(phases, vals, marker="o", label=row["name"])
+        ax.set_title(f"{eq.upper()} mean residual")
+        ax.tick_params(axis="x", rotation=25)
+        ax.grid(alpha=0.25)
+    axes[0].set_ylabel("absolute residual mean")
+    axes[-1].legend()
+    fig.suptitle(f"Stage-level common eval: {eval_name}")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def run_single_arm(
     name: str,
     datagen_result: DatagenRunResult,
@@ -274,6 +344,7 @@ def run_single_arm(
     q_stage_epochs: int,
     pvbp_stage_epochs: int,
     q_refresh_stage_epochs: int,
+    common_eval_batches: Dict[str, List[Dict[str, torch.Tensor]]],
 ) -> Dict[str, Any]:
     _set_seed(seed)
     models = build_models(device=device, ckpt_dir=ckpt_dir, ckpt_prefix=ckpt_prefix)
@@ -305,14 +376,32 @@ def run_single_arm(
         raise RuntimeError(f"No training batches created for arm: {name}")
 
     conv_before = episode.evaluate_bellman_convergence(batches)
+    common_before = {
+        eval_name: episode.evaluate_bellman_convergence(eval_batches)
+        for eval_name, eval_batches in common_eval_batches.items()
+    }
+
+    stage_common_eval: Dict[str, Dict[str, float]] = {}
+
+    def _on_policy_stage(stage_summary: Dict[str, Any]) -> None:
+        phase = str(stage_summary.get("phase", "unknown"))
+        for eval_name, eval_batches in common_eval_batches.items():
+            conv = episode.evaluate_bellman_convergence(eval_batches)
+            stage_common_eval.update(_prefix_dict(f"stage_{phase}_{eval_name}", _extract_conv(conv)))
+
     train_summary = episode._run_batches(
         batches=batches,
         n_epochs=n_epochs,
         log_interval=log_interval,
         train_modules=["policy_value"],
         desc_prefix=f"{name} ",
+        policy_stage_callback=_on_policy_stage,
     )
     conv_after = train_summary.get("convergence", {})
+    common_after = {
+        eval_name: episode.evaluate_bellman_convergence(eval_batches)
+        for eval_name, eval_batches in common_eval_batches.items()
+    }
 
     out = {
         "name": name,
@@ -320,11 +409,41 @@ def run_single_arm(
         "n_macro_rows": int(len(datagen_result.macro_table)),
         "n_batches": int(len(batches)),
         **datagen_result.generation_summary,
-        **{f"{k}_before": v for k, v in _extract_conv(conv_before).items()},
-        **{f"{k}_after": v for k, v in _extract_conv(conv_after).items()},
+        **_prefix_dict("train_support", {f"{k}_before": v for k, v in _extract_conv(conv_before).items()}),
+        **_prefix_dict("train_support", {f"{k}_after": v for k, v in _extract_conv(conv_after).items()}),
         **_extract_stage_final_losses(train_summary),
     }
+    for eval_name, conv in common_before.items():
+        out.update(_prefix_dict(f"{eval_name}", {f"{k}_before": v for k, v in _extract_conv(conv).items()}))
+    for eval_name, conv in common_after.items():
+        out.update(_prefix_dict(f"{eval_name}", {f"{k}_after": v for k, v in _extract_conv(conv).items()}))
+    out.update(stage_common_eval)
     return out
+
+
+def _make_eval_batches(
+    table: TensorTable,
+    device: torch.device,
+    batch_size: int,
+    branch_num: int,
+) -> List[Dict[str, torch.Tensor]]:
+    models = build_models(device=device)
+    hp = build_hyperparams()
+    optimizers = build_optimizers(models, hp)
+    episode = Episode(
+        models=models,
+        optimizers=optimizers,
+        config=Config,
+        hyperparams=hp,
+        device=device,
+        episode_id=0,
+    )
+    return episode._create_firm_batches_from_tensor(
+        table,
+        batch_size=batch_size,
+        n_branches=branch_num,
+        eta_resample=True,
+    )
 
 
 def main() -> None:
@@ -344,6 +463,8 @@ def main() -> None:
     parser.add_argument("--q-stage-epochs", type=int, default=100)
     parser.add_argument("--pvbp-stage-epochs", type=int, default=100)
     parser.add_argument("--q-refresh-stage-epochs", type=int, default=20)
+    parser.add_argument("--eval-pool-size", type=int, default=None)
+    parser.add_argument("--eval-rollout-steps", type=int, default=None)
     args = parser.parse_args()
 
     if args.output_dir is None:
@@ -382,6 +503,46 @@ def main() -> None:
         mode="children_promote",
         seed=args.seed + 1,
     )
+    eval_pool_size = int(args.pool_size if args.eval_pool_size is None else args.eval_pool_size)
+    eval_rollout_steps = int(args.rollout_steps if args.eval_rollout_steps is None else args.eval_rollout_steps)
+    eval_parent_pool = _init_parent_pool(sim, pool_size=eval_pool_size, seed=args.seed + 9000)
+    eval_main_result = generate_policy_tuple_tables(
+        sim=sim,
+        initial_parent_pool=eval_parent_pool,
+        rollout_steps=eval_rollout_steps,
+        mode="main_branch",
+        seed=args.seed + 9001,
+    )
+    eval_children_result = generate_policy_tuple_tables(
+        sim=sim,
+        initial_parent_pool=eval_parent_pool,
+        rollout_steps=eval_rollout_steps,
+        mode="children_promote",
+        seed=args.seed + 9002,
+    )
+    eval_children_path_offset = _next_path_offset(eval_main_result.firm_table, eval_main_result.macro_table)
+    eval_children_firm_offset = _offset_path_column(eval_children_result.firm_table, eval_children_path_offset)
+    eval_children_macro_offset = _offset_path_column(eval_children_result.macro_table, eval_children_path_offset)
+    eval_mixed_tensor = torch.cat([eval_main_result.firm_table.data, eval_children_firm_offset.data], dim=0)
+    eval_mixed_result = DatagenRunResult(
+        name="eval_mixed",
+        firm_table=TensorTable(eval_mixed_tensor, sim.FIRM_COLUMNS),
+        macro_table=TensorTable(
+            torch.cat([eval_main_result.macro_table.data, eval_children_macro_offset.data], dim=0),
+            sim.MACRO_COLUMNS,
+        ),
+        generation_summary={
+            "mode": "eval_mixed",
+            "branch_num": int(args.branch_num),
+            "eval_children_path_offset": int(eval_children_path_offset),
+            "source_supports": ["eval_main", "eval_children"],
+        },
+    )
+    common_eval_batches = {
+        "eval_main": _make_eval_batches(eval_main_result.firm_table, device, args.batch_size, args.branch_num),
+        "eval_children": _make_eval_batches(eval_children_result.firm_table, device, args.batch_size, args.branch_num),
+        "eval_mixed": _make_eval_batches(eval_mixed_result.firm_table, device, args.batch_size, args.branch_num),
+    }
 
     summary_rows = [
         run_single_arm(
@@ -397,6 +558,7 @@ def main() -> None:
             q_stage_epochs=args.q_stage_epochs,
             pvbp_stage_epochs=args.pvbp_stage_epochs,
             q_refresh_stage_epochs=args.q_refresh_stage_epochs,
+            common_eval_batches=common_eval_batches,
         ),
         run_single_arm(
             name="children_promote",
@@ -411,6 +573,7 @@ def main() -> None:
             q_stage_epochs=args.q_stage_epochs,
             pvbp_stage_epochs=args.pvbp_stage_epochs,
             q_refresh_stage_epochs=args.q_refresh_stage_epochs,
+            common_eval_batches=common_eval_batches,
         ),
     ]
 
@@ -427,6 +590,13 @@ def main() -> None:
         "q_stage_epochs": int(args.q_stage_epochs),
         "pvbp_stage_epochs": int(args.pvbp_stage_epochs),
         "q_refresh_stage_epochs": int(args.q_refresh_stage_epochs),
+        "eval_pool_size": int(eval_pool_size),
+        "eval_rollout_steps": int(eval_rollout_steps),
+        "eval_supports": {
+            "eval_main": eval_main_result.generation_summary,
+            "eval_children": eval_children_result.generation_summary,
+            "eval_mixed": eval_mixed_result.generation_summary,
+        },
         "results": summary_rows,
     }
     with open(args.output_dir / "comparison_summary.json", "w", encoding="utf-8") as f:
@@ -434,6 +604,9 @@ def main() -> None:
 
     _plot_conv_compare(summary_rows, args.output_dir / "compare_conv_means.png")
     _plot_branch_share(summary_rows, args.output_dir / "compare_promoted_branch_share.png")
+    for eval_name in common_eval_batches:
+        _plot_common_eval_compare(summary_rows, eval_name, args.output_dir / f"compare_{eval_name}_conv_means.png")
+        _plot_stage_common_eval(summary_rows, eval_name, args.output_dir / f"compare_{eval_name}_stage_conv_means.png")
 
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 

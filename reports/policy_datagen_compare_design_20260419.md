@@ -87,6 +87,51 @@ These are evaluated:
 1. before training
 2. after training
 
+The updated harness reports metrics at two levels:
+
+1. `train_support_*`
+   - residuals on each arm's own training support
+2. common evaluation supports
+   - `eval_main_*`
+   - `eval_children_*`
+   - `eval_mixed_*`
+
+The common evaluation metrics are the main decision metrics.
+The train-support metrics are diagnostic only, because each arm trains on a different state distribution.
+
+## Common-Support Evaluation
+
+The first harness version evaluated each arm on its own support:
+
+```text
+train main_branch      -> eval main_branch support
+train children_promote -> eval children_promote support
+```
+
+That is not a clean A/B because `children_promote` may generate harder states.
+
+The updated harness evaluates both trained models on the same fixed supports:
+
+```text
+                 eval_main    eval_children    eval_mixed
+train_main
+train_children
+```
+
+This directly tests whether children promotion improves Bellman residuals on shared validation supports.
+For `eval_mixed`, the child-promoted validation table is assigned a disjoint path-id range before concatenation.
+This avoids accidental duplicate `(path,t,branch)` keys when the batching code reconstructs parent-child tuples.
+
+## Stage-Level Evaluation
+
+The harness also evaluates common-support convergence at:
+
+- `q_stage_end`
+- `pvbp_stage_end`
+- `q_refresh_end`
+
+This is necessary because the final stage may be `q_refresh`; final loss summaries alone can omit fresh `p0/pi` training terms.
+
 ## Decision Rule
 
 ### If `children_promote` beats `main_branch`
@@ -105,6 +150,22 @@ Then this mechanism is not the main blocker, and effort should move away from su
 - objective structure
 - staged optimization
 - regime-specific hardness
+
+## Main Outputs
+
+The run writes:
+
+- `comparison_summary.json`
+- `compare_conv_means.png`
+- `compare_promoted_branch_share.png`
+- `compare_eval_main_conv_means.png`
+- `compare_eval_children_conv_means.png`
+- `compare_eval_mixed_conv_means.png`
+- `compare_eval_main_stage_conv_means.png`
+- `compare_eval_children_stage_conv_means.png`
+- `compare_eval_mixed_stage_conv_means.png`
+
+The `eval_*` outputs are the primary outputs for interpretation.
 
 ## Entry Points
 

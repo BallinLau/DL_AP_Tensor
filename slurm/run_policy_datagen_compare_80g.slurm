@@ -25,6 +25,8 @@ OUT_DIR="${OUT_DIR:-$WORK_ROOT/cachedir/policy_datagen_compare_${STAMP}}"
 POOL_SIZE="${POOL_SIZE:-256}"
 GROUP_SIZE="${GROUP_SIZE:-64}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-6}"
+EVAL_POOL_SIZE="${EVAL_POOL_SIZE:-$POOL_SIZE}"
+EVAL_ROLLOUT_STEPS="${EVAL_ROLLOUT_STEPS:-$ROLLOUT_STEPS}"
 BRANCH_NUM="${BRANCH_NUM:-2}"
 BATCH_SIZE="${BATCH_SIZE:-2048}"
 N_EPOCHS="${N_EPOCHS:-220}"
@@ -61,6 +63,8 @@ python3 -u experiments/run_policy_datagen_compare.py \
   --pool-size "$POOL_SIZE" \
   --group-size "$GROUP_SIZE" \
   --rollout-steps "$ROLLOUT_STEPS" \
+  --eval-pool-size "$EVAL_POOL_SIZE" \
+  --eval-rollout-steps "$EVAL_ROLLOUT_STEPS" \
   --branch-num "$BRANCH_NUM" \
   --batch-size "$BATCH_SIZE" \
   --n-epochs "$N_EPOCHS" \
