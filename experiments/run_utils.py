@@ -19,6 +19,19 @@ def resolve_base_dir(run_root: Optional[Path], project_root: Path) -> Path:
     return run_root if run_root is not None else project_root
 
 
+def _load_state_dict(ckpt_path: Path, device: torch.device):
+    """
+    Load a plain tensor state dict without opt-in pickle execution.
+
+    `weights_only=True` is the forward-compatible PyTorch setting for model
+    checkpoints. Fall back for older torch versions that do not expose it.
+    """
+    try:
+        return torch.load(ckpt_path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(ckpt_path, map_location=device)
+
+
 def _artifact_suffix(tag: Optional[str]) -> str:
     return f"_{tag}" if tag else ""
 
@@ -68,14 +81,14 @@ def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ck
                 split_pvbp = ckpt_dir / f"{prefix}{stem}_pvbp.pt"
                 merged = ckpt_dir / f"{prefix}{stem}.pt"
                 if split_q.exists() and split_pvbp.exists():
-                    q_state = torch.load(split_q, map_location=device)
-                    pvbp_state = torch.load(split_pvbp, map_location=device)
+                    q_state = _load_state_dict(split_q, device)
+                    pvbp_state = _load_state_dict(split_pvbp, device)
                     models[key].q_model.load_state_dict(q_state, strict=strict)
                     models[key].pvbp_model.load_state_dict(pvbp_state, strict=strict)
                     print(f"[build_models] loaded {split_q}")
                     print(f"[build_models] loaded {split_pvbp}")
                 elif merged.exists():
-                    state = torch.load(merged, map_location=device)
+                    state = _load_state_dict(merged, device)
                     is_old_joint_ckpt = any(
                         str(k).startswith("shared_model.") or str(k).startswith("combined_model.")
                         for k in state.keys()
@@ -91,14 +104,14 @@ def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ck
                 ckpt_path = ckpt_dir / f"{prefix}{stem}.pt"
                 legacy_path = ckpt_dir / f"{prefix}fc2.pt"
                 if ckpt_path.exists():
-                    state = torch.load(ckpt_path, map_location=device)
+                    state = _load_state_dict(ckpt_path, device)
                     try:
                         models[key].load_state_dict(state, strict=strict)
                         print(f"[build_models] loaded {ckpt_path}")
                     except RuntimeError as exc:
                         print(f"[build_models] skip incompatible ckpt: {ckpt_path} ({exc})")
                 elif legacy_path.exists():
-                    state = torch.load(legacy_path, map_location=device)
+                    state = _load_state_dict(legacy_path, device)
                     if key == "fc2_hatc":
                         trunk_prefix = "hatc_model.trunk."
                         head_prefix = "hatc_model.head."
@@ -132,7 +145,7 @@ def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ck
             else:
                 ckpt_path = ckpt_dir / f"{prefix}{stem}.pt"
                 if ckpt_path.exists():
-                    state = torch.load(ckpt_path, map_location=device)
+                    state = _load_state_dict(ckpt_path, device)
                     try:
                         models[key].load_state_dict(state, strict=strict)
                         print(f"[build_models] loaded {ckpt_path}")
@@ -268,8 +281,10 @@ def build_hyperparams():
     hp.bp_value_sample_cap = 256
     hp.bp_value_survival_only = True
     hp.bp_value_barz_threshold = 0.5
-    # P0/PI 对上游 M 的鲁棒化（避免 M 偏高直接抬高 P）
-    hp.pv_use_clipped_m = True
+    # P0/PI 默认与 raw-M Bellman operator 对齐；如需旧口径，可切回 clip/anneal。
+    hp.pv_m_mode = "raw"
+    hp.pv_m_clip_anneal_epochs = 0
+    hp.pv_use_clipped_m = False
     hp.pv_m_clamp_min = 0.7
     hp.pv_m_clamp_max = 1.3
     return hp

@@ -1689,6 +1689,60 @@ class Episode:
             return
         pvbp_model.chi_warmup_factor = self._compute_pvbp_anti_collapse_warmup_factor(q_stage_epochs)
 
+    def _resolve_pv_m_mode(self) -> str:
+        mode = str(getattr(self.hyperparams, "pv_m_mode", "") or "").strip().lower()
+        if not mode:
+            return "clip" if bool(getattr(self.hyperparams, "pv_use_clipped_m", False)) else "raw"
+        aliases = {
+            "raw": "raw",
+            "none": "raw",
+            "off": "raw",
+            "clip": "clip",
+            "clipped": "clip",
+            "anneal": "anneal",
+            "annealed": "anneal",
+        }
+        if mode in aliases:
+            return aliases[mode]
+        logger.warning("Unknown pv_m_mode=%s. Fallback to raw.", mode)
+        return "raw"
+
+    def _compute_pv_m_clip_weight(self) -> float:
+        mode = self._resolve_pv_m_mode()
+        if mode == "clip":
+            return 1.0
+        if mode == "raw":
+            return 0.0
+
+        anneal_epochs = max(0, int(getattr(self.hyperparams, "pv_m_clip_anneal_epochs", 0)))
+        if anneal_epochs <= 0:
+            return 0.0
+        q_stage_epochs = max(0, int(getattr(self.hyperparams, "q_stage_epochs", 0)))
+        local_epoch = max(0, int(getattr(self, "_current_epoch_idx", 0)) - q_stage_epochs)
+        clip_weight = 1.0 - float(local_epoch) / float(max(1, anneal_epochs))
+        return float(min(max(clip_weight, 0.0), 1.0))
+
+    def _get_pv_m_list(self, raw_M_list: List[torch.Tensor]) -> List[torch.Tensor]:
+        mode = self._resolve_pv_m_mode()
+        if mode == "raw":
+            return raw_M_list
+
+        m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
+        m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
+        clipped_M_list = [m.clamp(m_lo, m_hi) for m in raw_M_list]
+        if mode == "clip":
+            return clipped_M_list
+
+        clip_weight = self._compute_pv_m_clip_weight()
+        if clip_weight <= 0.0:
+            return raw_M_list
+        if clip_weight >= 1.0:
+            return clipped_M_list
+        return [
+            clip_weight * clipped_m + (1.0 - clip_weight) * raw_m
+            for raw_m, clipped_m in zip(raw_M_list, clipped_M_list)
+        ]
+
     def _compute_value_gate_monotonicity_penalty(
         self,
         parent_state: torch.Tensor,
@@ -2426,12 +2480,7 @@ class Episode:
             raw_M_list = [child[:, 7:8] for child in children]
         else:
             raw_M_list = [torch.ones(parent.shape[0], 1, device=self.device) for _ in children]
-        if bool(getattr(self.hyperparams, "pv_use_clipped_m", True)):
-            m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
-            m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-            M_list = [m.clamp(m_lo, m_hi) for m in raw_M_list]
-        else:
-            M_list = raw_M_list
+        M_list = self._get_pv_m_list(raw_M_list)
         
         # 前向传播
         parent_state = strip_extra(parent).clone().detach().requires_grad_(True)
@@ -2575,6 +2624,8 @@ class Episode:
         with torch.no_grad():
             raw_m = torch.cat([m.reshape(-1) for m in raw_M_list], dim=0)
             use_m = torch.cat([m.reshape(-1) for m in M_list], dim=0)
+            pv_m_mode = self._resolve_pv_m_mode()
+            pv_m_clip_weight = self._compute_pv_m_clip_weight()
             self._latest_p0_terms = {
                 'p0_main': float(main_loss.item()),
                 'p0_foc': float(loss_foc.item()),
@@ -2604,6 +2655,10 @@ class Episode:
                 'p0_log_mean_M_used': float(torch.log(use_m.mean().clamp_min(1e-8)).item()),
                 'p0_M_raw_p90': float(torch.quantile(raw_m, 0.90).item()),
                 'p0_M_used_p90': float(torch.quantile(use_m, 0.90).item()),
+                'p0_pv_m_mode_raw': float(1.0 if pv_m_mode == 'raw' else 0.0),
+                'p0_pv_m_mode_clip': float(1.0 if pv_m_mode == 'clip' else 0.0),
+                'p0_pv_m_mode_anneal': float(1.0 if pv_m_mode == 'anneal' else 0.0),
+                'p0_pv_m_clip_weight': float(pv_m_clip_weight),
                 'p0_bp_foc_use_phat': float(1.0 if use_phat_for_bp_foc else 0.0),
                 'p0_bar_i_cond_mean': float(bar_i_cond_t.mean().item()),
                 'p0_bar_i_eff_mean': float(bar_i_t.mean().item()),
@@ -2641,12 +2696,7 @@ class Episode:
             raw_M_list = [child[:, 7:8] for child in children]
         else:
             raw_M_list = [torch.ones(parent.shape[0], 1, device=self.device) for _ in children]
-        if bool(getattr(self.hyperparams, "pv_use_clipped_m", True)):
-            m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
-            m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-            M_list = [m.clamp(m_lo, m_hi) for m in raw_M_list]
-        else:
-            M_list = raw_M_list
+        M_list = self._get_pv_m_list(raw_M_list)
         
         # 前向传播
         parent_state = strip_extra(parent).clone().detach().requires_grad_(True)
@@ -2797,6 +2847,8 @@ class Episode:
         with torch.no_grad():
             raw_m = torch.cat([m.reshape(-1) for m in raw_M_list], dim=0)
             use_m = torch.cat([m.reshape(-1) for m in M_list], dim=0)
+            pv_m_mode = self._resolve_pv_m_mode()
+            pv_m_clip_weight = self._compute_pv_m_clip_weight()
             self._latest_pi_terms = {
                 'pi_main': float(main_loss.item()),
                 'pi_foc': float(loss_foc.item()),
@@ -2827,6 +2879,10 @@ class Episode:
                 'pi_log_mean_M_used': float(torch.log(use_m.mean().clamp_min(1e-8)).item()),
                 'pi_M_raw_p90': float(torch.quantile(raw_m, 0.90).item()),
                 'pi_M_used_p90': float(torch.quantile(use_m, 0.90).item()),
+                'pi_pv_m_mode_raw': float(1.0 if pv_m_mode == 'raw' else 0.0),
+                'pi_pv_m_mode_clip': float(1.0 if pv_m_mode == 'clip' else 0.0),
+                'pi_pv_m_mode_anneal': float(1.0 if pv_m_mode == 'anneal' else 0.0),
+                'pi_pv_m_clip_weight': float(pv_m_clip_weight),
                 'pi_bp_foc_use_phat': float(1.0 if use_phat_for_bp_foc else 0.0),
                 'pi_bar_i_cond_mean': float(bar_i_cond_t.mean().item()),
                 'pi_bar_i_eff_mean': float(bar_i_t.mean().item()),

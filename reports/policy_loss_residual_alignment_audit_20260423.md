@@ -17,7 +17,7 @@ However, lower training losses do not automatically imply lower final Bellman re
 
 - training P0/PI use AIO-transformed residuals
 - convergence P0/PI reports raw absolute residuals
-- training P0/PI may use clipped `M`
+- training P0/PI may use raw / clipped / annealed `M`
 - convergence P0/PI currently reports raw-`M` residuals
 - training Q total includes boundary, shape, and possible warm-start terms
 - convergence Q reports only raw Bellman equation residuals under the configured Q `M` clamp
@@ -87,6 +87,14 @@ If train-`M` residual falls while raw-`M` residual does not fall:
 ```text
 M clipping changes the target being optimized
 ```
+
+If `pv_m_mode = raw`, then P0/PI training operator is aligned with raw-`M` Bellman residuals by construction.
+If `pv_m_mode = anneal`, the audit manifest records both:
+
+- `pv_m_mode`
+- `pv_m_clip_anneal_epochs`
+
+so the run can be interpreted against the exact transition schedule.
 
 If Q total loss falls but Q raw Bellman residual does not fall:
 

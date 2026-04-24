@@ -42,6 +42,10 @@ from losses.utils import compute_aio_residual  # noqa: E402
 from training.episode import Episode  # noqa: E402
 
 
+def _progress_disabled() -> bool:
+    return not sys.stderr.isatty()
+
+
 def _to_float(value: Any) -> float:
     if torch.is_tensor(value):
         if value.numel() == 0:
@@ -108,11 +112,7 @@ def _get_m_lists(
 
     hp = episode.hyperparams
     if kind in {"p0", "pi"}:
-        if bool(getattr(hp, "pv_use_clipped_m", True)):
-            lo = float(getattr(hp, "pv_m_clamp_min", 0.7))
-            hi = float(getattr(hp, "pv_m_clamp_max", 1.3))
-            return [m.clamp(lo, hi) for m in raw_m]
-        return raw_m
+        return episode._get_pv_m_list(raw_m)
 
     if kind == "q":
         if bool(getattr(hp, "q_use_detached_m", True)):
@@ -417,7 +417,7 @@ def _run_epoch_pass(
     episode._value_only_stage = value_only
     episode._bp_only_stage = bp_only
     try:
-        for batch in tqdm(batches, desc=f"{phase}", leave=False):
+        for batch in tqdm(batches, desc=f"{phase}", leave=False, disable=_progress_disabled()):
             rows.append(
                 episode.train_step(
                     batch,
@@ -641,6 +641,15 @@ def main() -> None:
                 recent_losses=recent_losses,
             )
             recent_losses = []
+            latest = history[-1]
+            print(
+                "[alignment_audit] "
+                f"epoch={epoch + 1}/{total_epochs} "
+                f"phase={phase} "
+                f"conv_p0={latest.get('conv_p0_mean', float('nan')):.6f} "
+                f"conv_pi={latest.get('conv_pi_mean', float('nan')):.6f} "
+                f"conv_q={latest.get('conv_q_mean', float('nan')):.6f}"
+            )
 
     episode._q_only_stage = False
     episode._q_refresh_stage = False
@@ -670,6 +679,9 @@ def main() -> None:
         "q_stage_epochs": int(args.q_stage_epochs),
         "pvbp_stage_epochs": int(args.pvbp_stage_epochs),
         "q_refresh_stage_epochs": int(args.q_refresh_stage_epochs),
+        "pv_m_mode": str(getattr(hp, "pv_m_mode", "")),
+        "pv_use_clipped_m": bool(getattr(hp, "pv_use_clipped_m", False)),
+        "pv_m_clip_anneal_epochs": int(getattr(hp, "pv_m_clip_anneal_epochs", 0)),
         "eval_every": int(args.eval_every),
         "train_generation": train_result.generation_summary,
         "eval_generation": eval_result.generation_summary,

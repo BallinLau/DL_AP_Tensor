@@ -215,8 +215,14 @@ class HyperParams:
     q_use_detached_m: bool = True
     q_m_clamp_min: float = 0.5
     q_m_clamp_max: float = 1.5
-    # P0/PI Bellman 中 M 的稳定化（防止上游 SDF 短期失稳把 P 残差推偏）
-    pv_use_clipped_m: bool = True
+    # P0/PI Bellman 中 M 的处理方式：
+    # - 'raw': 直接使用原始 M（与 raw-M Bellman operator 对齐）
+    # - 'clip': 使用截断后的 M（旧口径）
+    # - 'anneal': 从 clipped-M 逐步退火到 raw-M
+    pv_m_mode: str = "raw"
+    pv_m_clip_anneal_epochs: int = 0
+    # 兼容旧配置：未显式设置 pv_m_mode 时，仍可用该字段回退到旧逻辑
+    pv_use_clipped_m: bool = False
     pv_m_clamp_min: float = 0.7
     pv_m_clamp_max: float = 1.3
     # Q 形状正则改为约束单位债价格 q_unit：
