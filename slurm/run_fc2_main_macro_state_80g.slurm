@@ -27,12 +27,17 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 export PYTHONUNBUFFERED=1
 
+Q_STAGE_EPOCHS="${Q_STAGE_EPOCHS:-40}"
+PVBP_STAGE_EPOCHS="${PVBP_STAGE_EPOCHS:-60}"
+Q_REFRESH_STAGE_EPOCHS="${Q_REFRESH_STAGE_EPOCHS:-10}"
+
 echo "Job started on $(date)"
 echo "Host: $(hostname)"
 echo "Repo: $REPO_DIR"
 echo "Branch: $(git branch --show-current)"
 echo "Commit: $(git rev-parse --short HEAD)"
 echo "Run root: $RUN_ROOT"
+echo "Policy schedule: q=$Q_STAGE_EPOCHS pvbp=$PVBP_STAGE_EPOCHS q_refresh=$Q_REFRESH_STAGE_EPOCHS"
 echo "Python: $(which python3)"
 echo "Torch check: $(python3 -c 'import torch; print(torch.__version__)')"
 
@@ -46,6 +51,9 @@ python3 -u experiments/run_multi_episode_job.py \
   --simulate-group-size 200 \
   --simulate-horizon 10 \
   --batch-size 8192 \
+  --q-stage-epochs "$Q_STAGE_EPOCHS" \
+  --pvbp-stage-epochs "$PVBP_STAGE_EPOCHS" \
+  --q-refresh-stage-epochs "$Q_REFRESH_STAGE_EPOCHS" \
   --enable-fc2 \
   --fc2-as-main-macro-state \
   --no-final-sim

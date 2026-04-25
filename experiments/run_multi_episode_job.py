@@ -132,6 +132,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override PV/BP-stage epochs for staged policy_value training.",
     )
+    parser.add_argument(
+        "--q-refresh-stage-epochs",
+        dest="q_refresh_stage_epochs",
+        type=int,
+        default=None,
+        help="Override Q-refresh epochs for staged policy_value training.",
+    )
     return parser.parse_args()
 
 
@@ -159,25 +166,41 @@ def configure_hyperparams(args: argparse.Namespace):
     if args.fc2_supervised_pretrain_only is not None:
         hyperparams.fc2_supervised_pretrain_only = bool(args.fc2_supervised_pretrain_only)
     if args.q_only_ablation:
-        q_only_epochs = max(100, int(hyperparams.epochs))
+        q_only_epochs = max(0, int(hyperparams.epochs))
         hyperparams.q_stage_epochs = q_only_epochs
         hyperparams.pvbp_stage_epochs = 0
+        hyperparams.q_refresh_stage_epochs = 0
         hyperparams.q_pretrain_epochs = q_only_epochs
         hyperparams.q_warmstart_epochs = q_only_epochs
         hyperparams.bp_diag_enabled = True
         hyperparams.bp_diag_every_n_episodes = 1
         hyperparams.bp_diag_states = "safe"
-    if args.q_joint_continuation_ablation:
+    policy_stage_override = any(
+        value is not None
+        for value in (args.q_stage_epochs, args.pvbp_stage_epochs, args.q_refresh_stage_epochs)
+    )
+    if args.q_joint_continuation_ablation or policy_stage_override:
         q_stage_epochs = int(args.q_stage_epochs if args.q_stage_epochs is not None else hyperparams.q_stage_epochs)
         pvbp_stage_epochs = int(args.pvbp_stage_epochs if args.pvbp_stage_epochs is not None else hyperparams.pvbp_stage_epochs)
-        hyperparams.q_stage_epochs = max(100, q_stage_epochs)
-        hyperparams.pvbp_stage_epochs = max(100, pvbp_stage_epochs)
+        q_refresh_stage_epochs = int(
+            args.q_refresh_stage_epochs
+            if args.q_refresh_stage_epochs is not None
+            else getattr(hyperparams, "q_refresh_stage_epochs", 0)
+        )
+        hyperparams.q_stage_epochs = max(0, q_stage_epochs)
+        hyperparams.pvbp_stage_epochs = max(0, pvbp_stage_epochs)
+        hyperparams.q_refresh_stage_epochs = max(0, q_refresh_stage_epochs)
         hyperparams.q_pretrain_epochs = hyperparams.q_stage_epochs
         hyperparams.q_warmstart_epochs = hyperparams.q_stage_epochs
-        hyperparams.epochs = hyperparams.q_stage_epochs + hyperparams.pvbp_stage_epochs
-        hyperparams.bp_diag_enabled = True
-        hyperparams.bp_diag_every_n_episodes = 1
-        hyperparams.bp_diag_states = "safe"
+        hyperparams.epochs = (
+            hyperparams.q_stage_epochs +
+            hyperparams.pvbp_stage_epochs +
+            hyperparams.q_refresh_stage_epochs
+        )
+        if args.q_joint_continuation_ablation:
+            hyperparams.bp_diag_enabled = True
+            hyperparams.bp_diag_every_n_episodes = 1
+            hyperparams.bp_diag_states = "safe"
     return hyperparams
 
 

@@ -4333,14 +4333,14 @@ class Episode:
         )
         if policy_staged_training:
             q_stage_cfg = max(
-                int(getattr(self.hyperparams, "q_stage_epochs", 100)),
+                int(getattr(self.hyperparams, "q_stage_epochs", 40)),
                 int(getattr(self.hyperparams, "q_pretrain_epochs", 0)),
                 int(getattr(self.hyperparams, "q_warmstart_epochs", 0)),
             )
-            pvbp_stage_cfg = int(getattr(self.hyperparams, "pvbp_stage_epochs", 100))
+            pvbp_stage_cfg = int(getattr(self.hyperparams, "pvbp_stage_epochs", 60))
             q_refresh_cfg = int(getattr(self.hyperparams, "q_refresh_stage_epochs", 0))
-            q_stage_epochs = 0 if q_stage_cfg <= 0 else max(100, q_stage_cfg)
-            pvbp_stage_epochs = 0 if pvbp_stage_cfg <= 0 else max(100, pvbp_stage_cfg)
+            q_stage_epochs = 0 if q_stage_cfg <= 0 else q_stage_cfg
+            pvbp_stage_epochs = 0 if pvbp_stage_cfg <= 0 else pvbp_stage_cfg
             q_refresh_stage_epochs = 0 if q_refresh_cfg <= 0 else q_refresh_cfg
             total_epochs = max(n_epochs, q_stage_epochs + pvbp_stage_epochs + q_refresh_stage_epochs)
         else:

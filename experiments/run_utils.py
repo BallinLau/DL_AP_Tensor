@@ -249,11 +249,12 @@ def build_hyperparams():
     hp.sdf_log_mean_anchor_weight_stage1 = 1.0
     hp.sdf_log_mean_anchor_weight_stage2 = 5.0
     # 显式覆盖 Q 训练入口，避免 HyperParams 默认值和运行入口脱节。
-    hp.q_pretrain_epochs = 10
-    hp.q_stage_epochs = 100
-    hp.pvbp_stage_epochs = 100
+    hp.q_pretrain_epochs = 40
+    hp.q_stage_epochs = 40
+    hp.pvbp_stage_epochs = 60
     hp.policy_separate_q_pvbp_training = True
-    hp.q_warmstart_epochs = 10
+    hp.q_refresh_stage_epochs = 10
+    hp.q_warmstart_epochs = 40
     hp.q_lr = hp.policy_lr
     hp.q_weight_decay = hp.policy_weight_decay
     hp.pvbp_lr = hp.policy_lr

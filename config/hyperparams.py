@@ -191,14 +191,14 @@ class HyperParams:
 
     # ========== Policy/Value: Q 优先训练与形状约束 ==========
     # 在 policy/value 联合训练前先进行 q-only 预训练轮数
-    q_pretrain_epochs: int = 10
+    q_pretrain_epochs: int = 40
     policy_separate_q_pvbp_training: bool = True
     # 重构后默认采用两阶段训练：
     # Stage A: Q-only
     # Stage B: PV/BP-only
-    q_stage_epochs: int = 100
-    pvbp_stage_epochs: int = 100
-    q_refresh_stage_epochs: int = 20
+    q_stage_epochs: int = 40
+    pvbp_stage_epochs: int = 60
+    q_refresh_stage_epochs: int = 10
     pvbp_alternating_enabled: bool = True
     pvbp_value_steps_per_epoch: int = 1
     pvbp_policy_steps_per_epoch: int = 1
@@ -241,7 +241,7 @@ class HyperParams:
     # 兼容旧配置（不再推荐）：Q-only 阶段路径解耦开关
     q_decouple_policy_in_pretrain: bool = False
     # 论文式结构化 warm-start（Q 监督预训练）
-    q_warmstart_epochs: int = 10
+    q_warmstart_epochs: int = 40
     q_warmstart_weight: float = 1.0
     q_warm_A: float = 1.0
     q_warm_b_star: float = 0.05
