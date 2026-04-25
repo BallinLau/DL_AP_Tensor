@@ -30,6 +30,13 @@ export PYTHONUNBUFFERED=1
 Q_STAGE_EPOCHS="${Q_STAGE_EPOCHS:-40}"
 PVBP_STAGE_EPOCHS="${PVBP_STAGE_EPOCHS:-60}"
 Q_REFRESH_STAGE_EPOCHS="${Q_REFRESH_STAGE_EPOCHS:-10}"
+FC2_SUPERVISED_PRETRAIN_ONLY="${FC2_SUPERVISED_PRETRAIN_ONLY:-1}"
+
+if [[ "$FC2_SUPERVISED_PRETRAIN_ONLY" == "1" ]]; then
+  FC2_PRETRAIN_ONLY_FLAG="--fc2-supervised-pretrain-only"
+else
+  FC2_PRETRAIN_ONLY_FLAG="--no-fc2-supervised-pretrain-only"
+fi
 
 echo "Job started on $(date)"
 echo "Host: $(hostname)"
@@ -38,6 +45,7 @@ echo "Branch: $(git branch --show-current)"
 echo "Commit: $(git rev-parse --short HEAD)"
 echo "Run root: $RUN_ROOT"
 echo "Policy schedule: q=$Q_STAGE_EPOCHS pvbp=$PVBP_STAGE_EPOCHS q_refresh=$Q_REFRESH_STAGE_EPOCHS"
+echo "FC2 supervised pretrain only: $FC2_SUPERVISED_PRETRAIN_ONLY"
 echo "Python: $(which python3)"
 echo "Torch check: $(python3 -c 'import torch; print(torch.__version__)')"
 
@@ -54,6 +62,7 @@ python3 -u experiments/run_multi_episode_job.py \
   --q-stage-epochs "$Q_STAGE_EPOCHS" \
   --pvbp-stage-epochs "$PVBP_STAGE_EPOCHS" \
   --q-refresh-stage-epochs "$Q_REFRESH_STAGE_EPOCHS" \
+  "$FC2_PRETRAIN_ONLY_FLAG" \
   --enable-fc2 \
   --fc2-as-main-macro-state \
   --no-final-sim
