@@ -118,7 +118,7 @@ class PILoss(nn.Module):
         """
         计算投资 Bellman 残差（支持任意分支数）
         
-        loss^{(j)} = PI - CFip - g * M^{(j)} * P'^{(j)} * (1 - bar_z'^{(j)})
+        loss^{(j)} = PI - CFip - g * M^{(j)} * P'^{(j)}
         """
         n_branches = len(P_children)
         if isinstance(CFip, (list, tuple)):
@@ -132,8 +132,8 @@ class PILoss(nn.Module):
             raise ValueError(f"CFip branches mismatch: expected {n_branches}, got {len(cf_list)}")
 
         residuals = []
-        for cf_j, M, P_child, bar_z in zip(cf_list, M_list, P_children, bar_z_children):
-            residual = PI - cf_j - self.g * M * P_child * (1 - bar_z)
+        for cf_j, M, P_child, _bar_z in zip(cf_list, M_list, P_children, bar_z_children):
+            residual = PI - cf_j - self.g * M * P_child
             residuals.append(residual)
         return residuals
     

@@ -7,8 +7,9 @@ Policy & Value 统一接口
 
 import torch
 import torch.nn as nn
-from typing import Dict, Tuple, Optional, NamedTuple
-from .share_layer import ShareLayer, SharedModel, CombinedModel, BarzModel, BariModel
+from typing import Tuple, Optional, NamedTuple
+from .firm_derived import FirmDerivedObjects
+from .share_layer import ShareLayer, QHead, BpHead, PHead, CombinedModel, BarzModel, BariModel
 
 import sys
 sys.path.append('..')
@@ -20,13 +21,19 @@ class PolicyValueOutput(NamedTuple):
     Q: torch.Tensor          # 债券价值
     bp0: torch.Tensor        # 不投资时杠杆候选
     bpI: torch.Tensor        # 投资时杠杆候选
-    P0: torch.Tensor         # 不投资时股票价值
-    PI: torch.Tensor         # 投资时股票价值
-    bar_i: torch.Tensor      # 投资门槛
+    P0: torch.Tensor         # 兼容别名：V0
+    PI: torch.Tensor         # 兼容别名：VI
+    bar_i: torch.Tensor      # 兼容别名：bar_i_eff
     bar_z: torch.Tensor      # 破产门槛
     P: torch.Tensor          # 综合股票价值
     Phat: torch.Tensor       # P hat (中间值)
     bp: torch.Tensor         # 综合杠杆候选
+    V0: torch.Tensor         # 不投资 branch value
+    VI: torch.Tensor         # 投资 branch value
+    bar_i_cond: torch.Tensor # 存活条件下投资概率
+    bar_i_eff: torch.Tensor  # 考虑当前违约后的有效投资概率
+    survival_prob: torch.Tensor
+    bp_cond: torch.Tensor    # 存活条件下混合杠杆候选
 
 
 class PolicyValueModel(nn.Module):
@@ -51,29 +58,30 @@ class PolicyValueModel(nn.Module):
     ):
         super().__init__()
         
-        share_layer = ShareLayer(
+        self.q_encoder = ShareLayer(
             input_dim=base_state_dim,
             hidden_dims=share_hidden_dims,
             output_dim=share_output_dim,
             dropout=dropout
         )
-        
-        # 主要模型
-        self.shared_model = SharedModel(
-            base_state_dim=base_state_dim,
-            share_hidden_dims=share_hidden_dims,
-            share_output_dim=share_output_dim,
-            dropout=dropout,
-            share_layer=share_layer
+        self.value_encoder = ShareLayer(
+            input_dim=base_state_dim,
+            hidden_dims=share_hidden_dims,
+            output_dim=share_output_dim,
+            dropout=dropout
         )
-        
-        self.combined_model = CombinedModel(
-            base_state_dim=base_state_dim,
-            share_hidden_dims=share_hidden_dims,
-            share_output_dim=share_output_dim,
-            dropout=dropout,
-            share_layer=share_layer
+        self.policy_encoder = ShareLayer(
+            input_dim=base_state_dim,
+            hidden_dims=share_hidden_dims,
+            output_dim=share_output_dim,
+            dropout=dropout
         )
+
+        self.q_head = QHead(input_dim=share_output_dim)
+        self.v0_head = PHead(input_dim=share_output_dim, requires_i=False)
+        self.vi_head = PHead(input_dim=share_output_dim, requires_i=True)
+        self.bp0_head = BpHead(input_dim=share_output_dim, requires_i=False)
+        self.bpi_head = BpHead(input_dim=share_output_dim, requires_i=True)
         
         # 辅助模型
         self.barz_model = BarzModel(
@@ -85,11 +93,41 @@ class PolicyValueModel(nn.Module):
             input_dim=base_state_dim,
             dropout=dropout
         )
+
+        tau_i = float(getattr(Config, "PV_TAU_I", getattr(Config, "BARI_TAU", 0.1)))
+        tau_z = float(getattr(Config, "PV_TAU_Z", 1.0 / max(float(getattr(Config, "BARZ_LOGIT_TEMP", 10.0)), 1e-8)))
+        self.derived = FirmDerivedObjects(tau_i=tau_i, tau_z=tau_z)
         
         # 经济参数
         self.register_buffer('delta', torch.tensor(Config.DELTA))
         self.register_buffer('phi', torch.tensor(Config.PHI))
         self.register_buffer('g', torch.tensor(Config.G))
+
+    def _split_state(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        base_state = self.extract_base_state(firm_state)
+        i = firm_state[:, SIMMODEL.I:SIMMODEL.I + 1]
+        b = firm_state[:, SIMMODEL.B:SIMMODEL.B + 1]
+        return base_state, i, b
+
+    def _value_outputs(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        base_state, i, _ = self._split_state(firm_state)
+        h_v = self.value_encoder(base_state)
+        V0 = self.v0_head(h_v)
+        VI = self.vi_head(h_v, i)
+        return V0, VI
+
+    def _q_output(self, firm_state: torch.Tensor) -> torch.Tensor:
+        base_state, _, b = self._split_state(firm_state)
+        h_q = self.q_encoder(base_state)
+        q_unit = self.q_head(h_q)
+        return torch.clamp(b, min=0.0) * q_unit
+
+    def _policy_outputs(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        base_state, i, _ = self._split_state(firm_state)
+        h_pi = self.policy_encoder(base_state)
+        bp0 = self.bp0_head(h_pi)
+        bpI = self.bpi_head(h_pi, i)
+        return bp0, bpI
     
     def extract_base_state(self, firm_state: torch.Tensor) -> torch.Tensor:
         """提取 base state（不含 i）"""
@@ -113,36 +151,40 @@ class PolicyValueModel(nn.Module):
         Returns:
             PolicyValueOutput: 包含所有输出的命名元组
         """
-        # SharedModel 输出
-        Q, bp0, bpI = self.shared_model(firm_state)
-        
-        # CombinedModel 输出
-        P0, PI, bar_i = self.combined_model(firm_state)
+        Q = self._q_output(firm_state)
+        bp0, bpI = self._policy_outputs(firm_state)
+        V0, VI = self._value_outputs(firm_state)
 
-        # 计算 Phat/P，同时基于积分结果得到 bar_z（P>0 则 bar_z=0，否则=1）
-        Phat, P, bar_z = self.cal_phats(firm_state, P0, PI)
-        bp = self.cal_bp(bp0, bpI, bar_i)
+        Phat, P, bar_z, survival_prob = self.cal_phats(firm_state)
+        bar_i_cond = self.derived.investment_conditional(V0, VI)
+        bar_i_eff = survival_prob * bar_i_cond
+        bp_cond = self.cal_bp(bp0, bpI, bar_i_cond)
+        bp = survival_prob * bp_cond + (1.0 - survival_prob) * bp0
         
         return PolicyValueOutput(
             Q=Q,
             bp0=bp0,
             bpI=bpI,
-            P0=P0,
-            PI=PI,
-            bar_i=bar_i,
+            P0=V0,
+            PI=VI,
+            bar_i=bar_i_eff,
             bar_z=bar_z,
             P=P,
             Phat=Phat,
-            bp=bp
+            bp=bp,
+            V0=V0,
+            VI=VI,
+            bar_i_cond=bar_i_cond,
+            bar_i_eff=bar_i_eff,
+            survival_prob=survival_prob,
+            bp_cond=bp_cond,
         )
     
     def cal_phats(
         self,
         firm_state: torch.Tensor,
-        P0: torch.Tensor,
-        PI: torch.Tensor,
         simulated_i: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         计算 Phat、P、bar_z
 
@@ -153,30 +195,33 @@ class PolicyValueModel(nn.Module):
         batch_size = firm_state.size(0)
 
         if simulated_i is None:
-            # 使用少量均匀点近似积分
-            simulated_i = torch.linspace(0.0, Config.I_THRESHOLD, steps=5, device=device).unsqueeze(-1)
+            grid_size = int(getattr(Config, "PV_I_GRID_SIZE", 11))
+            simulated_i = torch.linspace(
+                0.0,
+                Config.I_THRESHOLD,
+                steps=max(grid_size, 2),
+                device=device
+            ).unsqueeze(-1)
 
-        P0_list = []
-        PI_list = []
+        V0_list = []
+        VI_list = []
         for i_val in simulated_i:
             modified = firm_state.clone()
             modified[:, SIMMODEL.I] = i_val.expand(batch_size)
-            P0_i, PI_i, _ = self.combined_model(modified)
-            P0_list.append(P0_i)
-            PI_list.append(PI_i)
+            V0_i, VI_i = self._value_outputs(modified)
+            V0_list.append(V0_i)
+            VI_list.append(VI_i)
 
-        P0_stack = torch.stack(P0_list, dim=0)  # (n_i, batch, 1)
-        PI_stack = torch.stack(PI_list, dim=0)  # (n_i, batch, 1)
-        max_vals = torch.max(P0_stack, PI_stack)
+        V0_stack = torch.stack(V0_list, dim=0)  # (n_i, batch, 1)
+        VI_stack = torch.stack(VI_list, dim=0)  # (n_i, batch, 1)
+        max_vals = torch.max(V0_stack, VI_stack)
         Phat = max_vals.mean(dim=0)  # (batch, 1)
 
-        barz_temp = float(getattr(Config, "BARZ_LOGIT_TEMP", 10.0))
-        # 论文口径：P = max(0, Phat)，需要允许出现明确的 P=0 违约区域。
-        P = torch.clamp_min(Phat, 0.0)
-        # 使用 Phat 生成平滑违约概率代理，保留负值区域梯度
-        bar_z = torch.sigmoid(-barz_temp * Phat)
+        P = self.derived.total_equity(Phat, hard=True)
+        survival_prob = self.derived.survival(Phat)
+        bar_z = 1.0 - survival_prob
 
-        return Phat, P, bar_z
+        return Phat, P, bar_z, survival_prob
     
     def cal_bp(
         self,
@@ -236,24 +281,27 @@ class PolicyValueModel(nn.Module):
         firm_state: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """只获取 SharedModel 输出"""
-        return self.shared_model(firm_state)
+        Q = self._q_output(firm_state)
+        bp0, bpI = self._policy_outputs(firm_state)
+        return Q, bp0, bpI
     
     def get_combined_output(
         self, 
         firm_state: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """只获取 CombinedModel 输出"""
-        return self.combined_model(firm_state)
+        V0, VI = self._value_outputs(firm_state)
+        bar_i_cond = self.derived.investment_conditional(V0, VI)
+        return V0, VI, bar_i_cond
     
     def get_bar_z(self, firm_state: torch.Tensor) -> torch.Tensor:
         """只获取 bar_z"""
-        base_state = self.extract_base_state(firm_state)
-        return self.barz_model(base_state)
+        return self.cal_phats(firm_state)[2]
     
     def get_bar_i_value(self, firm_state: torch.Tensor) -> torch.Tensor:
         """获取 bar_i 的 value version"""
-        base_state = self.extract_base_state(firm_state)
-        return self.bari_model(base_state)
+        V0, VI = self._value_outputs(firm_state)
+        return self.derived.investment_conditional(V0, VI)
     
     def freeze(self):
         """冻结所有参数"""
@@ -272,11 +320,14 @@ class PolicyValueModel(nn.Module):
         获取指定模块的参数
         
         Args:
-            module_name: 'shared', 'combined', 'barz', 'bari'
+            module_name: 'q', 'value', 'policy', legacy names also accepted
         """
         modules = {
-            'shared': self.shared_model,
-            'combined': self.combined_model,
+            'q': nn.ModuleList([self.q_encoder, self.q_head]),
+            'value': nn.ModuleList([self.value_encoder, self.v0_head, self.vi_head]),
+            'policy': nn.ModuleList([self.policy_encoder, self.bp0_head, self.bpi_head]),
+            'shared': nn.ModuleList([self.q_encoder, self.q_head, self.policy_encoder, self.bp0_head, self.bpi_head]),
+            'combined': nn.ModuleList([self.value_encoder, self.v0_head, self.vi_head]),
             'barz': self.barz_model,
             'bari': self.bari_model
         }

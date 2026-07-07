@@ -938,14 +938,14 @@ class Episode:
             for p in model.parameters():
                 p.requires_grad = False
             # Q 头始终可训练
-            for p in model.shared_model.q_head.parameters():
+            for p in model.q_head.parameters():
                 p.requires_grad = True
             scope = str(getattr(self.hyperparams, "q_pretrain_trainable_scope", "q_path")).lower()
             if scope not in {"q_head_only", "q_path"}:
                 scope = "q_path"
             # q_path: 允许共享表征与 Q 头联合适配
             if scope == "q_path":
-                for p in model.shared_model.share_layer.parameters():
+                for p in model.q_encoder.parameters():
                     p.requires_grad = True
             self._policy_q_freeze_active = True
         else:
@@ -973,9 +973,11 @@ class Episode:
             }
             for p in model.parameters():
                 p.requires_grad = False
-            for p in model.shared_model.bp0_head.parameters():
+            for p in model.policy_encoder.parameters():
                 p.requires_grad = True
-            for p in model.shared_model.bpI_head.parameters():
+            for p in model.bp0_head.parameters():
+                p.requires_grad = True
+            for p in model.bpi_head.parameters():
                 p.requires_grad = True
             self._policy_bp_freeze_active = True
         else:

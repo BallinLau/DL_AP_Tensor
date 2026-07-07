@@ -110,14 +110,14 @@ class P0Loss(nn.Module):
         """
         计算 Bellman 残差（支持任意分支数）
         
-        loss^{(j)} = P0 - CF0p - M^{(j)} * P'^{(j)} * (1 - bar_z'^{(j)})
+        loss^{(j)} = P0 - CF0p - M^{(j)} * P'^{(j)}
         
         Args:
             P0: 当期股价
             CF0p: 当期现金流
             M_list: List[torch.Tensor] - 各路径的 SDF
             P_children: List[torch.Tensor] - 各路径的未来股价
-            bar_z_children: List[torch.Tensor] - 各路径的违约阈值
+            bar_z_children: List[torch.Tensor] - 兼容旧接口；equity continuation 不再重复使用该 gate
         
         Returns:
             residuals: List[torch.Tensor] - 各路径的残差
@@ -134,8 +134,8 @@ class P0Loss(nn.Module):
             raise ValueError(f"CF0p branches mismatch: expected {n_branches}, got {len(cf_list)}")
 
         residuals = []
-        for cf_j, M, P_child, bar_z in zip(cf_list, M_list, P_children, bar_z_children):
-            residual = P0 - cf_j - M * P_child * (1 - bar_z)
+        for cf_j, M, P_child, _bar_z in zip(cf_list, M_list, P_children, bar_z_children):
+            residual = P0 - cf_j - M * P_child
             residuals.append(residual)
         
         return residuals

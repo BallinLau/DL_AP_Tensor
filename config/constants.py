@@ -71,6 +71,10 @@ class Config:
     # P/bar_z 平滑温度（避免硬阈值导致梯度死区）
     P_SOFTPLUS_BETA = 8.0
     BARZ_LOGIT_TEMP = 10.0
+    # Policy/value derived-object controls
+    PV_TAU_I = 0.1
+    PV_TAU_Z = 0.1
+    PV_I_GRID_SIZE = 11
     
     # ========== 模型架构参数 ==========
     # 共享层维度 (INCREASED for higher memory usage)
