@@ -28,6 +28,9 @@ class HyperParams:
     fc1_weight_decay: float = 1e-4
     # 通用学习率（调度器基准值，缺省时沿用 sdf_lr）
     lr: float = 5e-4
+    weight_decay: float = 1e-4
+    beta1: float = 0.9
+    beta2: float = 0.999
     
     # Policy & Value
     policy_lr: float = 1e-3
@@ -218,6 +221,12 @@ class HyperParams:
     # FOC/KKT 的 ∂P'/∂bp 是否使用 Phat'（避免 P=max(Phat,0) 在违约区梯度为0）
     # 注意：仅影响梯度通道；Bellman 主方程仍使用 P（含显式 P=0 违约语义）
     bp_foc_use_phat_children: bool = True
+
+    # ========== Firm target network ==========
+    # policy_value 的 target network 不进入 optimizer；Bellman RHS 使用 target no-grad 输出。
+    # soft: 每个 policy_value optimizer step 后做 Polyak update；hard: 每步硬同步；none: 只保留初始化 target。
+    firm_target_update: str = 'soft'
+    firm_target_tau: float = 0.005
 
     # ========== Episode 收敛判定（非 AIO Bellman 残差） ==========
     # 判定条件：Q/P0/PI 各自主残差的 mean(abs) 与 p90(abs) 同时过阈值

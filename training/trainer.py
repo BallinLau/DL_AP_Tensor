@@ -14,6 +14,7 @@ import logging
 import json
 from datetime import datetime
 from tqdm import tqdm
+from copy import deepcopy
 
 import sys
 sys.path.append('..')
@@ -21,6 +22,7 @@ from config import Config, HyperParams
 
 from .episode import Episode
 from .scheduler import EpisodeScheduler
+from .target_utils import hard_update
 
 
 logger = logging.getLogger(__name__)
@@ -68,6 +70,7 @@ class Trainer:
         
         # 优化器
         self.optimizers = self._init_optimizers()
+        self.firm_target = self._init_firm_target()
         
         # 训练状态
         self.current_episode = 0
@@ -77,6 +80,19 @@ class Trainer:
         
         # 设置日志
         self._setup_logging()
+
+    def _init_firm_target(self) -> Optional[nn.Module]:
+        """
+        Create a frozen policy/value target network that is not added to optimizers.
+        """
+        online = self.models.get('policy_value')
+        if online is None:
+            return None
+        target = deepcopy(online).to(self.device)
+        hard_update(target, online)
+        target.eval()
+        target.requires_grad_(False)
+        return target
     
     def _init_optimizers(self) -> Dict[str, torch.optim.Optimizer]:
         """
@@ -161,7 +177,8 @@ class Trainer:
                 config=self.config,
                 hyperparams=self.hyperparams,
                 device=self.device,
-                episode_id=ep
+                episode_id=ep,
+                firm_target=self.firm_target
             )
             
             # 生成数据
@@ -310,6 +327,8 @@ class Trainer:
         for model_name, model in self.models.items():
             if model is not None:
                 checkpoint['models'][model_name] = model.state_dict()
+        if self.firm_target is not None:
+            checkpoint['models']['firm_target'] = self.firm_target.state_dict()
         
         for opt_name, opt in self.optimizers.items():
             checkpoint['optimizers'][opt_name] = opt.state_dict()
@@ -332,6 +351,11 @@ class Trainer:
         for model_name, state_dict in checkpoint['models'].items():
             if model_name in self.models and self.models[model_name] is not None:
                 self.models[model_name].load_state_dict(state_dict)
+            elif model_name == 'firm_target' and self.firm_target is not None:
+                self.firm_target.load_state_dict(state_dict)
+
+        if self.firm_target is not None and 'firm_target' not in checkpoint.get('models', {}):
+            hard_update(self.firm_target, self.models['policy_value'])
         
         for opt_name, state_dict in checkpoint['optimizers'].items():
             if opt_name in self.optimizers:

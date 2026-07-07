@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 import logging
@@ -28,6 +29,7 @@ from losses.sdf_loss import moment_penalty
 from data.data_utils import build_sdf_pairs_from_macro_ts
 from .gradient_utils import gradient_protection, compute_gradient_norm
 from .scheduler import LossWeightScheduler, LearningRateScheduler
+from .target_utils import hard_update, soft_update
 from utils.gpu_monitor import GPUMonitor, print_memory_summary
 
 
@@ -94,7 +96,8 @@ class Episode:
         hyperparams: HyperParams = None,
         device: torch.device = None,
         episode_id: int = 0,
-        gpu_monitor = None
+        gpu_monitor = None,
+        firm_target: Optional[nn.Module] = None
     ):
         """
         Args:
@@ -108,6 +111,7 @@ class Episode:
             device: 设备
             episode_id: Episode 编号
             gpu_monitor: GPU 监控器（可选，用于共享监控数据）
+            firm_target: 冻结的 policy_value target network（可选）
         """
         self.models = models
         self.optimizers = optimizers
@@ -115,6 +119,7 @@ class Episode:
         self.hyperparams = hyperparams or HyperParams()
         self.device = device or config.DEVICE
         self.episode_id = episode_id
+        self.firm_target = self._init_firm_target(firm_target)
         
         # GPU 监控器（使用外部传入的或创建新的）
         self.gpu_monitor = gpu_monitor if gpu_monitor is not None else GPUMonitor(self.device, log_interval=10)
@@ -158,6 +163,56 @@ class Episode:
         self._policy_bp_grad_backup = {}
         self._sdf_fc1_teacher_freeze_active = False
         self._sdf_fc1_grad_backup = {}
+
+    def _init_firm_target(self, firm_target: Optional[nn.Module] = None) -> Optional[nn.Module]:
+        """
+        Initialize or attach a frozen policy/value target network.
+        """
+        online = self.models.get('policy_value')
+        if online is None:
+            return None
+        target = firm_target if firm_target is not None else deepcopy(online)
+        target.to(self.device)
+        target.eval()
+        target.requires_grad_(False)
+        if firm_target is None:
+            hard_update(target, online)
+        return target
+
+    def refresh_firm_target(self) -> None:
+        """Hard-copy the online policy/value model into the target model."""
+        if self.firm_target is not None and self.models.get('policy_value') is not None:
+            hard_update(self.firm_target, self.models['policy_value'])
+            self.firm_target.eval()
+            self.firm_target.requires_grad_(False)
+
+    def _maybe_update_firm_target(self, train_modules: List[str]) -> None:
+        """
+        Update firm target after online optimizer steps.
+        """
+        if 'policy_value' not in train_modules:
+            return
+        if self.firm_target is None or self.models.get('policy_value') is None:
+            return
+        mode = str(getattr(self.hyperparams, "firm_target_update", "soft")).lower()
+        if mode in {"none", "off", "disabled"}:
+            return
+        if mode == "hard":
+            hard_update(self.firm_target, self.models['policy_value'])
+        elif mode == "soft":
+            tau = float(getattr(self.hyperparams, "firm_target_tau", 0.005))
+            soft_update(self.firm_target, self.models['policy_value'], tau=tau)
+        else:
+            raise ValueError(f"Unknown firm_target_update mode: {mode}")
+        self.firm_target.eval()
+        self.firm_target.requires_grad_(False)
+
+    def _target_policy_value(self) -> nn.Module:
+        target = self.firm_target
+        if target is None:
+            target = self.models['policy_value']
+        target.eval()
+        return target
     
     def _init_loss_functions(self) -> Dict:
         """
@@ -1224,6 +1279,7 @@ class Episode:
                 for name in train_modules:
                     if name in self.optimizers:
                         self.optimizers[name].step()
+                self._maybe_update_firm_target(train_modules)
         finally:
             self._set_policy_q_only_freeze(False)
             self._set_policy_bp_only_freeze(False)
@@ -1620,6 +1676,7 @@ class Episode:
         
         # 前向传播
         parent_state = strip_extra(parent)
+        target_model = self._target_policy_value()
         output_t = model(parent_state)
 
         def _get_out(out, name: str, idx: int) -> torch.Tensor:
@@ -1640,6 +1697,7 @@ class Episode:
         b_parent = parent_state[:, 0:1]
 
         output_children = []
+        output_children_target = []
         eta_children = []
 
         for child in children:
@@ -1648,26 +1706,32 @@ class Episode:
             child_state = child_state_raw.clone()
             child_state[:, 0:1] = eta_child * bp_for_p0 + (1 - eta_child) * b_parent
             output_children.append(model(child_state))
+            with torch.no_grad():
+                output_children_target.append(target_model(child_state.detach()))
             eta_children.append(eta_child)
             
         childp0_state = parent_state.clone()
         childp0_state[:, 0:1] = bp_for_p0
         outputp0_children = model(childp0_state)
+        with torch.no_grad():
+            outputp0_children_target = target_model(childp0_state.detach())
         
         # 提取 P0 和所需变量
         P0 = _get_out(output_t, 'P0', 3)
-        P_children = [_get_out(out, 'P', 7) for out in output_children]
+        P_children = [_get_out(out, 'P', 7).detach() for out in output_children_target]
         # FOC/KKT 梯度通道可选用 Phat，避免 P=max(Phat,0) 在违约区产生大面积零梯度
         use_phat_for_bp_foc = bool(getattr(self.hyperparams, "bp_foc_use_phat_children", True))
         P_children_for_foc = [
             _get_out(out, 'Phat', 8) if use_phat_for_bp_foc else _get_out(out, 'P', 7)
             for out in output_children
         ]
-        bar_z_children = [_get_out(out, 'bar_z', 6) for out in output_children]
+        bar_z_children = [_get_out(out, 'bar_z', 6).detach() for out in output_children_target]
+        bar_z_children_for_foc = [_get_out(out, 'bar_z', 6) for out in output_children]
         
         # Q 值
         Q = _get_out(output_t, 'Q', 0)
-        Qp = _get_out(outputp0_children, 'Q', 0)
+        Qp = _get_out(outputp0_children_target, 'Q', 0).detach()
+        Qp_for_foc = _get_out(outputp0_children, 'Q', 0)
 
         
         # 计算现金流与残差（逐 parent × child 对齐）
@@ -1677,6 +1741,16 @@ class Episode:
                 parent_state[:, 1:2],  # z
                 parent_state[:, 0:1],  # b
                 Q, Qp,
+                eta_j
+            )
+            for eta_j in eta_children
+        ]
+        CF0p_for_foc = [
+            loss_fn.compute_cashflow_p0(
+                parent_state[:, 4:5],  # x
+                parent_state[:, 1:2],  # z
+                parent_state[:, 0:1],  # b
+                Q, Qp_for_foc,
                 eta_j
             )
             for eta_j in eta_children
@@ -1693,10 +1767,10 @@ class Episode:
         )
 
         foc_residuals = loss_fn.compute_foc_residual_from_bp(
-            CF0p=CF0p,
+            CF0p=CF0p_for_foc,
             M_list=M_list,
             P_children=P_children_for_foc,
-            bar_z_children=bar_z_children,
+            bar_z_children=bar_z_children_for_foc,
             bp=bp_for_p0,
             eta=eta_children
         )
@@ -1788,6 +1862,7 @@ class Episode:
         
         # 前向传播
         parent_state = strip_extra(parent)
+        target_model = self._target_policy_value()
         output_t = model(parent_state)
 
         def _get_out(out, name: str, idx: int) -> torch.Tensor:
@@ -1809,6 +1884,7 @@ class Episode:
         b_parent = parent_state[:, 0:1]
 
         output_children = []
+        output_children_target = []
         eta_children = []
 
         for child in children:
@@ -1817,24 +1893,30 @@ class Episode:
             child_state = child_state_raw.clone()
             child_state[:, 0:1] = eta_child * bp_for_pi + (1 - eta_child) * b_parent
             output_children.append(model(child_state))
+            with torch.no_grad():
+                output_children_target.append(target_model(child_state.detach()))
             eta_children.append(eta_child)
             
         childpI_state = parent_state.clone()
         childpI_state[:, 0:1] = bp_for_pi
         outputpI_children = model(childpI_state)
+        with torch.no_grad():
+            outputpI_children_target = target_model(childpI_state.detach())
         
         # 提取 PI 和所需变量
         Q = _get_out(output_t, 'Q', 0)
         PI = _get_out(output_t, 'PI', 4)
-        P_children = [_get_out(out, 'P', 7) for out in output_children]
+        P_children = [_get_out(out, 'P', 7).detach() for out in output_children_target]
         # FOC/KKT 梯度通道可选用 Phat，避免 P=max(Phat,0) 在违约区产生大面积零梯度
         use_phat_for_bp_foc = bool(getattr(self.hyperparams, "bp_foc_use_phat_children", True))
         P_children_for_foc = [
             _get_out(out, 'Phat', 8) if use_phat_for_bp_foc else _get_out(out, 'P', 7)
             for out in output_children
         ]
-        bar_z_children = [_get_out(out, 'bar_z', 6) for out in output_children]
-        QpI = _get_out(outputpI_children, 'Q', 0)
+        bar_z_children = [_get_out(out, 'bar_z', 6).detach() for out in output_children_target]
+        bar_z_children_for_foc = [_get_out(out, 'bar_z', 6) for out in output_children]
+        QpI = _get_out(outputpI_children_target, 'Q', 0).detach()
+        QpI_for_foc = _get_out(outputpI_children, 'Q', 0)
         
         # 提取 z 和 b
         z = parent[:, 1:2]
@@ -1855,6 +1937,17 @@ class Episode:
             )
             for eta_j in eta_children
         ]
+        CFip_for_foc = [
+            loss_fn.compute_cashflow_pi(
+                parent_state[:, 4:5],  # x
+                parent_state[:, 1:2],  # z
+                parent_state[:, 0:1],  # b
+                parent_state[:, 3:4],  # i
+                Q, QpI_for_foc,
+                eta_j
+            )
+            for eta_j in eta_children
+        ]
         residuals = loss_fn.compute_bellman_residual(
             PI, CFip, M_list, P_children, bar_z_children
         )  # List[(batch,1)]
@@ -1868,10 +1961,10 @@ class Episode:
         penalty_b = loss_fn.b_penalty_weight * loss_fn.compute_b_penalty(PI, parent_state[:, 0:1]).mean()
 
         foc_residuals = loss_fn.compute_foc_residual_from_bp(
-            CFip=CFip,
+            CFip=CFip_for_foc,
             M_list=M_list,
             P_children=P_children_for_foc,
-            bar_z_children=bar_z_children,
+            bar_z_children=bar_z_children_for_foc,
             bp=bp_for_pi,
             eta=eta_children
         )
@@ -1973,7 +2066,10 @@ class Episode:
 
         # 前向传播（Q 形状正则需要对输入求梯度）
         parent_state = strip_extra(parent).clone().detach().requires_grad_(True)
+        target_model = self._target_policy_value()
         output_t = model(parent_state)
+        with torch.no_grad():
+            output_t_target = target_model(parent_state.detach())
 
         def _get_out(out, name: str, idx: int) -> torch.Tensor:
             if isinstance(out, dict):
@@ -1982,14 +2078,14 @@ class Episode:
                 return getattr(out, name)
             return out[:, idx:idx + 1]
 
-        bp0_t = _get_out(output_t, 'bp0', 1)
-        bpI_t = _get_out(output_t, 'bpI', 2)
-        bar_i_t = _get_out(output_t, 'bar_i', 5)
-        bp_t = _get_out(output_t, 'bp', -1)
+        bp0_t = _get_out(output_t_target, 'bp0', 1).detach()
+        bpI_t = _get_out(output_t_target, 'bpI', 2).detach()
+        bar_i_t = _get_out(output_t_target, 'bar_i', 5).detach()
+        bp_t = _get_out(output_t_target, 'bp', -1).detach()
         if bp_t.shape != bp0_t.shape:
             bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
         b_parent = parent_state[:, 0:1]
-        bar_z_t = _get_out(output_t, 'bar_z', 6)
+        bar_z_t = _get_out(output_t_target, 'bar_z', 6).detach()
         bar_i_use = bar_i_t
         bp_use = bp_t
         bar_z_use = bar_z_t
@@ -1998,23 +2094,18 @@ class Episode:
         multiplier = bar_i_use * (g_val - 1.0) + 1.0
         b_sp = b_parent / multiplier.clamp_min(1e-6)
 
-        output_children = []
         outputsp_children = []
         for child in children:
             child_state_raw = strip_extra(child)
-            eta_child = child[:, 2:3]
-            child_state = child_state_raw.clone()
-            child_state[:, 0:1] = eta_child * bp_use + (1 - eta_child) * b_parent
-            output_children.append(model(child_state))
-
             childsp_state = child_state_raw.clone()
             childsp_state[:, 0:1] = b_sp
-            outputsp_children.append(model(childsp_state))
+            with torch.no_grad():
+                outputsp_children.append(target_model(childsp_state.detach()))
 
         # 提取 Q 和所需变量
         Q = _get_out(output_t, 'Q', 0)
-        Qsp_children = [_get_out(out, 'Q', 0) for out in outputsp_children]
-        bar_zsp_children = [_get_out(out, 'bar_z', 6) for out in outputsp_children]
+        Qsp_children = [_get_out(out, 'Q', 0).detach() for out in outputsp_children]
+        bar_zsp_children = [_get_out(out, 'bar_z', 6).detach() for out in outputsp_children]
         x_children = [child[:, 4:5] for child in children]
         z_children = [child[:, 1:2] for child in children]
 
