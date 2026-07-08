@@ -3697,19 +3697,28 @@ class Episode:
                         )
 
                 if use_sdf_fc1:
-                    self.add_FC1loss = False
-                    if tensor_pipeline and self.tensor_firm is not None:
-                        sdf_batches = self._create_firm_batches_from_tensor(
-                            self.tensor_firm, batch_size=batch_size, n_branches=n_branches, eta_resample=False
+                    if self.episode_id > 0:
+                        self._run_sdf_recon_from_macro(
+                            module_summaries=module_summaries,
+                            n_epochs=n_epochs,
+                            batch_size=batch_size,
+                            log_interval=log_interval,
+                            n_branches=n_branches
                         )
                     else:
-                        sdf_batches = self._create_firm_batches_from_df(
-                            self.df, batch_size=batch_size, n_branches=n_branches, eta_resample=False
-                        )
-                    if sdf_batches:
-                        module_summaries['sdf_fc1'] = self._run_batches(
-                            sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1 '
-                        )
+                        self.add_FC1loss = False
+                        if tensor_pipeline and self.tensor_firm is not None:
+                            sdf_batches = self._create_firm_batches_from_tensor(
+                                self.tensor_firm, batch_size=batch_size, n_branches=n_branches, eta_resample=False
+                            )
+                        else:
+                            sdf_batches = self._create_firm_batches_from_df(
+                                self.df, batch_size=batch_size, n_branches=n_branches, eta_resample=False
+                            )
+                        if sdf_batches:
+                            module_summaries['sdf_fc1'] = self._run_batches(
+                                sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1 '
+                            )
 
                 if use_fc2:
                     fc2_summary = self._run_fc2_epochs(n_epochs=n_epochs, log_interval=log_interval)
