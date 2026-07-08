@@ -36,6 +36,10 @@ from utils.gpu_monitor import GPUMonitor, print_memory_summary
 logger = logging.getLogger(__name__)
 
 
+class NumericalStageFailure(RuntimeError):
+    """Raised when a training stage repeatedly produces non-finite gradients."""
+
+
 def convert_tree_fast(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -163,6 +167,9 @@ class Episode:
         self._policy_bp_grad_backup = {}
         self._sdf_fc1_teacher_freeze_active = False
         self._sdf_fc1_grad_backup = {}
+        self._nonfinite_grad_streak = 0
+        self._nonfinite_grad_total = 0
+        self._last_nonfinite_grad_params: Dict[str, List[str]] = {}
 
     def _init_firm_target(self, firm_target: Optional[nn.Module] = None) -> Optional[nn.Module]:
         """
@@ -213,6 +220,21 @@ class Episode:
             target = self.models['policy_value']
         target.eval()
         return target
+
+    @staticmethod
+    def _nonfinite_gradient_params(model: nn.Module, limit: int = 20) -> List[str]:
+        """
+        Return names of parameters whose gradients contain NaN or Inf.
+        """
+        bad: List[str] = []
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                continue
+            if not torch.isfinite(param.grad).all():
+                bad.append(name)
+                if len(bad) >= limit:
+                    break
+        return bad
     
     def _init_loss_functions(self) -> Dict:
         """
@@ -418,7 +440,6 @@ class Episode:
         if n_units == 0:
             return []
 
-        n_batches = (n_units + batch_size - 1) // batch_size
         indices = torch.arange(n_units, device=parent.device)
 
         # eta 稀疏时，对 Policy/Value 批次进行条件重采样，增强 eta=1 信号。
@@ -445,10 +466,20 @@ class Episode:
         else:
             indices = indices[torch.randperm(n_units, device=indices.device)]
 
+        max_units = int(getattr(self.hyperparams, "max_firm_train_units", 0))
+        if max_units > 0 and indices.numel() > max_units:
+            logger.warning(
+                "Capping firm training units from %d to %d before batching",
+                indices.numel(),
+                max_units
+            )
+            indices = indices[:max_units]
+
+        n_batches = (indices.numel() + batch_size - 1) // batch_size
         batches = []
         for i in range(n_batches):
             start = i * batch_size
-            end = min((i + 1) * batch_size, n_units)
+            end = min((i + 1) * batch_size, indices.numel())
             idx = indices[start:end]
             batch = {
                 'parent': parent[idx],
@@ -1262,24 +1293,73 @@ class Episode:
             # 反向传播
             if total_loss.requires_grad:
                 total_loss.backward()
-                
-                # 梯度保护
+
+                bad_grad_params: Dict[str, List[str]] = {}
                 for name in train_modules:
                     if name in self.models:
-                        grad_norm, had_nan = gradient_protection(
-                            self.models[name].parameters(),
-                            max_norm=self.hyperparams.max_grad_norm
+                        bad = self._nonfinite_gradient_params(self.models[name])
+                        if bad:
+                            bad_grad_params[name] = bad
+
+                if bad_grad_params:
+                    self._nonfinite_grad_streak += 1
+                    self._nonfinite_grad_total += 1
+                    self._last_nonfinite_grad_params = bad_grad_params
+                    losses['nonfinite_grad'] = 1.0
+                    losses['nonfinite_grad_streak'] = float(self._nonfinite_grad_streak)
+                    logger.warning(
+                        "Non-finite gradient detected at episode=%s step=%s streak=%d modules=%s",
+                        self.episode_id,
+                        self.step_count,
+                        self._nonfinite_grad_streak,
+                        {k: v[:5] for k, v in bad_grad_params.items()}
+                    )
+                    fail_after = int(getattr(self.hyperparams, "nonfinite_grad_fail_after", 3))
+                    if fail_after > 0 and self._nonfinite_grad_streak >= fail_after:
+                        raise NumericalStageFailure(
+                            f"Repeated non-finite gradients for {self._nonfinite_grad_streak} "
+                            f"consecutive steps at episode={self.episode_id}; "
+                            f"bad params={bad_grad_params}"
                         )
-                        losses[f'{name}_grad_norm'] = grad_norm
-                        
-                        if had_nan:
-                            logger.warning(f"NaN gradient detected in {name}")
-                
-                # 优化器步骤
-                for name in train_modules:
-                    if name in self.optimizers:
-                        self.optimizers[name].step()
-                self._maybe_update_firm_target(train_modules)
+                    skip_step = bool(getattr(self.hyperparams, "nonfinite_grad_skip_step", True))
+                    if skip_step:
+                        for name in train_modules:
+                            if name in self.optimizers:
+                                self.optimizers[name].zero_grad(set_to_none=True)
+                    else:
+                        for name in train_modules:
+                            if name in self.models:
+                                gradient_protection(
+                                    self.models[name].parameters(),
+                                    max_norm=self.hyperparams.max_grad_norm,
+                                    nan_to_num=True
+                                )
+                        for name in train_modules:
+                            if name in self.optimizers:
+                                self.optimizers[name].step()
+                        self._maybe_update_firm_target(train_modules)
+                else:
+                    self._nonfinite_grad_streak = 0
+                    losses['nonfinite_grad'] = 0.0
+
+                    # 梯度保护
+                    for name in train_modules:
+                        if name in self.models:
+                            grad_norm, had_nan = gradient_protection(
+                                self.models[name].parameters(),
+                                max_norm=self.hyperparams.max_grad_norm,
+                                nan_to_num=False
+                            )
+                            losses[f'{name}_grad_norm'] = grad_norm
+
+                            if had_nan:
+                                logger.warning(f"NaN gradient detected in {name}")
+
+                    # 优化器步骤
+                    for name in train_modules:
+                        if name in self.optimizers:
+                            self.optimizers[name].step()
+                    self._maybe_update_firm_target(train_modules)
         finally:
             self._set_policy_q_only_freeze(False)
             self._set_policy_bp_only_freeze(False)
@@ -2424,7 +2504,6 @@ class Episode:
         ]
         
         n_units = len(parent)
-        n_batches = (n_units + batch_size - 1) // batch_size
         indices = torch.arange(n_units, device=parent.device)
 
         # eta 稀疏时，对 Policy/Value 批次进行条件重采样，增强 eta=1 信号。
@@ -2450,10 +2529,20 @@ class Episode:
             else:
                 indices = indices[torch.randperm(n_units, device=indices.device)]
 
+        max_units = int(getattr(self.hyperparams, "max_firm_train_units", 0))
+        if max_units > 0 and indices.numel() > max_units:
+            logger.warning(
+                "Capping firm training units from %d to %d before batching",
+                indices.numel(),
+                max_units
+            )
+            indices = indices[:max_units]
+
+        n_batches = (indices.numel() + batch_size - 1) // batch_size
         batches = []
         for i in range(n_batches):
             start = i * batch_size
-            end = min((i + 1) * batch_size, n_units)
+            end = min((i + 1) * batch_size, indices.numel())
             idx = indices[start:end]
             batch = {
                 'parent': parent[idx],
@@ -2744,9 +2833,85 @@ class Episode:
         was_training = model.training
         model.eval()
 
-        p0_chunks: List[torch.Tensor] = []
-        pi_chunks: List[torch.Tensor] = []
-        q_chunks: List[torch.Tensor] = []
+        max_q_samples = int(getattr(self.hyperparams, "bellman_conv_max_samples", 1_000_000))
+        max_q_samples = max(1, max_q_samples)
+
+        class _ResidualAccumulator:
+            def __init__(self, max_samples: int):
+                self.max_samples = max_samples
+                self.n_total = 0
+                self.n_finite = 0
+                self.abs_sum = 0.0
+                self.samples: List[torch.Tensor] = []
+                self.n_sampled = 0
+
+            def update(self, values: torch.Tensor) -> None:
+                vals = values.detach().reshape(-1)
+                self.n_total += int(vals.numel())
+                if vals.numel() == 0:
+                    return
+                vals = vals[torch.isfinite(vals)]
+                self.n_finite += int(vals.numel())
+                if vals.numel() == 0:
+                    return
+                vals = vals.abs().to(torch.float32)
+                self.abs_sum += float(vals.sum().item())
+                remaining = self.max_samples - self.n_sampled
+                if remaining <= 0:
+                    return
+                if vals.numel() > remaining:
+                    idx = torch.randperm(vals.numel(), device=vals.device)[:remaining]
+                    vals = vals[idx]
+                self.samples.append(vals.cpu())
+                self.n_sampled += int(vals.numel())
+
+            def summarize(self, name: str, mean_thr: float, p90_thr: float) -> Dict:
+                if self.n_finite == 0:
+                    return {
+                        'enabled': False,
+                        'n': 0,
+                        'n_total': self.n_total,
+                        'n_finite': 0,
+                        'n_used_for_p90': 0,
+                        'nonfinite_ratio': 1.0 if self.n_total > 0 else 0.0,
+                        'mean': float('nan'),
+                        'p90': float('nan'),
+                        'passed': False
+                    }
+                mean_v = self.abs_sum / max(self.n_finite, 1)
+                if self.samples:
+                    sample = torch.cat(self.samples, dim=0)
+                    p90_v = float(torch.quantile(sample, 0.9).item())
+                else:
+                    p90_v = float('nan')
+                nonfinite_ratio = 1.0 - (self.n_finite / max(self.n_total, 1))
+                passed = bool(mean_v < mean_thr and p90_v < p90_thr and nonfinite_ratio == 0.0)
+                logger.info(
+                    "Bellman convergence [%s] | mean(abs)=%.6e, p90(abs)=%.6e, "
+                    "n_total=%d, n_used=%d, nonfinite=%.3e, pass=%s",
+                    name,
+                    mean_v,
+                    p90_v,
+                    self.n_total,
+                    self.n_sampled,
+                    nonfinite_ratio,
+                    str(passed)
+                )
+                return {
+                    'enabled': True,
+                    'n': self.n_finite,
+                    'n_total': self.n_total,
+                    'n_finite': self.n_finite,
+                    'n_used_for_p90': self.n_sampled,
+                    'nonfinite_ratio': nonfinite_ratio,
+                    'mean': mean_v,
+                    'p90': p90_v,
+                    'passed': passed
+                }
+
+        p0_acc = _ResidualAccumulator(max_q_samples)
+        pi_acc = _ResidualAccumulator(max_q_samples)
+        q_acc = _ResidualAccumulator(max_q_samples)
 
         with torch.no_grad():
             for idx, batch in enumerate(batches):
@@ -2758,57 +2923,19 @@ class Episode:
                     logger.warning("Bellman convergence eval skip batch %d due to error: %s", idx, exc)
                     continue
                 if p0_abs.numel() > 0:
-                    p0_chunks.append(p0_abs.detach())
+                    p0_acc.update(p0_abs)
                 if pi_abs.numel() > 0:
-                    pi_chunks.append(pi_abs.detach())
+                    pi_acc.update(pi_abs)
                 if q_abs.numel() > 0:
-                    q_chunks.append(q_abs.detach())
+                    q_acc.update(q_abs)
 
         if was_training:
             model.train()
 
-        def _summarize(name: str, chunks: List[torch.Tensor]) -> Dict:
-            if not chunks:
-                return {
-                    'enabled': False,
-                    'n': 0,
-                    'mean': float('nan'),
-                    'p90': float('nan'),
-                    'passed': False
-                }
-            vals = torch.cat(chunks, dim=0).reshape(-1).to(torch.float32)
-            finite_mask = torch.isfinite(vals)
-            vals = vals[finite_mask]
-            if vals.numel() == 0:
-                return {
-                    'enabled': False,
-                    'n': 0,
-                    'mean': float('nan'),
-                    'p90': float('nan'),
-                    'passed': False
-                }
-            mean_v = float(vals.mean().item())
-            p90_v = float(torch.quantile(vals, 0.9).item())
-            passed = bool(mean_v < mean_thr and p90_v < p90_thr)
-            logger.info(
-                "Bellman convergence [%s] | mean(abs)=%.6e, p90(abs)=%.6e, pass=%s",
-                name,
-                mean_v,
-                p90_v,
-                str(passed)
-            )
-            return {
-                'enabled': True,
-                'n': int(vals.numel()),
-                'mean': mean_v,
-                'p90': p90_v,
-                'passed': passed
-            }
-
         equations = {
-            'p0': _summarize('p0', p0_chunks),
-            'pi': _summarize('pi', pi_chunks),
-            'q': _summarize('q', q_chunks)
+            'p0': p0_acc.summarize('p0', mean_thr, p90_thr),
+            'pi': pi_acc.summarize('pi', mean_thr, p90_thr),
+            'q': q_acc.summarize('q', mean_thr, p90_thr)
         }
 
         enabled_eq = [m for m in equations.values() if m.get('enabled', False)]
@@ -2816,6 +2943,7 @@ class Episode:
         summary = {
             'enabled': True,
             'thresholds': {'mean': mean_thr, 'p90': p90_thr},
+            'max_quantile_samples': max_q_samples,
             'equations': equations,
             'passed': all_passed
         }
@@ -2928,6 +3056,20 @@ class Episode:
                 k: np.mean([l[k] for l in epoch_losses if k in l])
                 for k in epoch_losses[0].keys()
             }
+            if (
+                'policy_value' in train_modules
+                and bool(getattr(self.hyperparams, "stage_fail_on_policy_value_explosion", True))
+            ):
+                total_v = float(avg_losses.get('total', 0.0))
+                grad_v = float(avg_losses.get('policy_value_grad_norm', 0.0))
+                loss_thr = float(getattr(self.hyperparams, "policy_value_loss_fail_threshold", 1000.0))
+                grad_thr = float(getattr(self.hyperparams, "policy_value_grad_fail_threshold", 1000.0))
+                if (not np.isfinite(total_v)) or (not np.isfinite(grad_v)) or total_v > loss_thr or grad_v > grad_thr:
+                    raise NumericalStageFailure(
+                        f"Policy/value stage failed at episode={self.episode_id}, epoch={epoch + 1}: "
+                        f"total={total_v:.6g} (thr={loss_thr:.6g}), "
+                        f"grad_norm={grad_v:.6g} (thr={grad_thr:.6g})"
+                    )
             logger.info(f"{desc_prefix}Epoch {epoch+1} finished: {avg_losses}")
             if 'sdf_log_mean_M' in avg_losses:
                 logger.info(

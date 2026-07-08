@@ -98,9 +98,15 @@ class HyperParams:
     # ========== 稳定性保障 ==========
     # 损失爆炸防护
     loss_explosion_threshold: float = 100.0
+    stage_fail_on_policy_value_explosion: bool = True
+    policy_value_loss_fail_threshold: float = 1000.0
+    policy_value_grad_fail_threshold: float = 1000.0
     
     # NaN/Inf 检测
     nan_recovery: bool = True
+    # 连续出现非有限梯度时 fail-fast，避免整轮 stage 空跑。
+    nonfinite_grad_fail_after: int = 3
+    nonfinite_grad_skip_step: bool = True
     
     # 早停
     early_stop_threshold: float = 0.1
@@ -113,6 +119,8 @@ class HyperParams:
     simulate_horizon: int = 200
     # 训练数据批次是否优先走 tensor 管线（避免训练前 pandas 拼装）
     use_tensor_pipeline: bool = True
+    # firm-level 训练每个 stage 最多使用多少 parent transitions；<=0 表示不截断。
+    max_firm_train_units: int = 1_000_000
 
     # Stage2 true-state 重建损失权重：
     # (Hatc_t, LnK_t) -> (Hatc_{t+1}, LnK_{t+1})
@@ -232,6 +240,8 @@ class HyperParams:
     # 判定条件：Q/P0/PI 各自主残差的 mean(abs) 与 p90(abs) 同时过阈值
     bellman_conv_mean_thresh: float = 1e-3
     bellman_conv_p90_thresh: float = 5e-3
+    # Bellman convergence 的 p90 只使用有界样本估计，避免超大 tensor 上 torch.quantile 崩溃。
+    bellman_conv_max_samples: int = 1_000_000
     # True 时在 Trainer.train 中达到收敛后提前结束 episode 循环
     episode_stop_on_bellman_convergence: bool = True
     
