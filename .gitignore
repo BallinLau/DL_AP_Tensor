@@ -17,12 +17,7 @@ env/
 
 # Training artifacts
 checkpoints/
-logs/
-cachedir/
 data/outputs/
-*.pt
-*.pth
-*.pkl
 
 # Coverage / local reports
 .coverage
