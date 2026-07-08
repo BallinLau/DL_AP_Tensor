@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 print(f"Added {ROOT} to sys.path for imports")
 from config import Config  # noqa: E402
-from training.episode import Episode  # noqa: E402
+from training.episode import Episode, NumericalStageFailure  # noqa: E402
 from data.simulate_ts import SimulateTS  # noqa: E402
 from experiments.run_utils import (  # noqa: E402
     resolve_base_dir,
@@ -70,6 +70,20 @@ def parse_args() -> argparse.Namespace:
         choices=["modea", "modeb"],
         help="When --post0-mode=alternate, choose which mode starts at episode 1",
     )
+    parser.add_argument(
+        "--ablation-mode",
+        type=str.lower,
+        default="baseline",
+        choices=["baseline", "bellman_only", "fixed_sdf", "fixed_policy"],
+        help="Policy/value ablation mode for Episode 2 instability diagnosis",
+    )
+    parser.add_argument("--max-firm-train-units", type=int, default=None, help="Cap firm parent transitions per stage")
+    parser.add_argument("--pv-fixed-sdf-value", type=float, default=None, help="Fixed SDF value for fixed_sdf ablation")
+    parser.add_argument("--pv-fixed-policy-mode", type=str.lower, default=None, choices=["parent_b", "zero", "one"], help="Fixed policy rule")
+    parser.add_argument("--policy-grad-threshold", type=float, default=None, help="Absolute policy/value grad gate")
+    parser.add_argument("--policy-rolling-grad-threshold", type=float, default=None, help="Rolling policy/value grad gate floor")
+    parser.add_argument("--policy-loss-threshold", type=float, default=None, help="Absolute policy/value loss gate")
+    parser.add_argument("--pv-sdf-clip-ratio-gate", type=float, default=None, help="Reject stage if raw SDF clip ratio exceeds this value")
     return parser.parse_args()
 
 
@@ -88,6 +102,24 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.epochs = args.epochs
     if args.simulate_horizon is not None:
         hyperparams.simulate_horizon = args.simulate_horizon
+    hyperparams.ablation_mode = args.ablation_mode
+    hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"
+    hyperparams.pv_fixed_sdf = args.ablation_mode == "fixed_sdf"
+    hyperparams.pv_fixed_policy = args.ablation_mode == "fixed_policy"
+    if args.max_firm_train_units is not None:
+        hyperparams.max_firm_train_units = args.max_firm_train_units
+    if args.pv_fixed_sdf_value is not None:
+        hyperparams.pv_fixed_sdf_value = args.pv_fixed_sdf_value
+    if args.pv_fixed_policy_mode is not None:
+        hyperparams.pv_fixed_policy_mode = args.pv_fixed_policy_mode
+    if args.policy_grad_threshold is not None:
+        hyperparams.policy_value_grad_fail_threshold = args.policy_grad_threshold
+    if args.policy_rolling_grad_threshold is not None:
+        hyperparams.policy_value_rolling_grad_fail_threshold = args.policy_rolling_grad_threshold
+    if args.policy_loss_threshold is not None:
+        hyperparams.policy_value_loss_fail_threshold = args.policy_loss_threshold
+    if args.pv_sdf_clip_ratio_gate is not None:
+        hyperparams.pv_sdf_clip_ratio_gate = args.pv_sdf_clip_ratio_gate
     return hyperparams
 
 
@@ -137,6 +169,7 @@ def main():
     print(f"GPU Monitor initialized: {device}")
 
     summaries = []
+    failure_report = None
     episode = Episode(
             models=models,
             optimizers=optimizers,
@@ -177,15 +210,43 @@ def main():
             "horizon_mode1": 1,
             "horizon": hyperparams.simulate_horizon,
         }
-        summary = episode.run_episode(
-            n_epochs=hyperparams.epochs,
-            batch_size=hyperparams.batch_size,
-            log_interval=50,
-            train_modules=train_modules,
-            simulate_kwargs=simulate_kwargs,
-            episode_mode=episode_mode,
-            **data_kwargs,
-        )
+        try:
+            summary = episode.run_episode(
+                n_epochs=hyperparams.epochs,
+                batch_size=hyperparams.batch_size,
+                log_interval=50,
+                train_modules=train_modules,
+                simulate_kwargs=simulate_kwargs,
+                episode_mode=episode_mode,
+                **data_kwargs,
+            )
+        except NumericalStageFailure as exc:
+            failure_report = {
+                "failed_episode": ep,
+                "episode_mode": episode_mode,
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+                "ablation_mode": args.ablation_mode,
+                "gate_context": getattr(episode, "_last_policy_value_gate_context", {}),
+                "last_policy_value_stage_summary": getattr(episode, "_last_policy_value_stage_summary", {}),
+                "completed_summaries": summaries,
+                "run_parameters": {
+                    "n_episodes": args.n_episodes,
+                    "epochs": hyperparams.epochs,
+                    "n_paths": data_kwargs["n_paths"],
+                    "batch_size": hyperparams.batch_size,
+                    "simulate_group_size": simulate_group_size,
+                    "simulate_horizon": hyperparams.simulate_horizon,
+                    "post0_mode": args.post0_mode,
+                    "max_firm_train_units": hyperparams.max_firm_train_units,
+                },
+            }
+            failure_path = resolve_base_dir(run_root, ROOT) / "failure_report.json"
+            failure_path.parent.mkdir(parents=True, exist_ok=True)
+            failure_path.write_text(json.dumps(failure_report, indent=2, default=str))
+            print(f"Numerical stage failure saved to: {failure_path}")
+            print(json.dumps(failure_report, indent=2, default=str))
+            break
         ep_summary = summary.get("module_summaries", summary)
         save_stage_df(ep, episode_mode, resolve_base_dir(run_root, ROOT), episode.df, episode.df_macro, episode.df_sdf)
 
@@ -232,7 +293,10 @@ def main():
         log_gpu_stats(f"[Episode {ep}]", device)
         print(f"Episode {ep} ({episode_mode}) done: {ep_summary}")
 
-    print("All episodes done.")
+    if failure_report is None:
+        print("All episodes done.")
+    else:
+        print("Training stopped safely after numerical stage failure.")
     print(summaries)
 
     # Save GPU memory monitoring results to JSON
@@ -242,6 +306,9 @@ def main():
         gpu_monitor.save_to_json(gpu_json_path)
         print(f"GPU memory monitoring saved to: {gpu_json_path}")
         reset_monitor()
+
+    if failure_report is not None:
+        return
 
     final_sim = SimulateTS(
         models=models,

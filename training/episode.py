@@ -170,6 +170,8 @@ class Episode:
         self._nonfinite_grad_streak = 0
         self._nonfinite_grad_total = 0
         self._last_nonfinite_grad_params: Dict[str, List[str]] = {}
+        self._last_policy_value_stage_summary: Optional[Dict[str, float]] = None
+        self._last_policy_value_gate_context: Dict[str, float] = {}
 
     def _init_firm_target(self, firm_target: Optional[nn.Module] = None) -> Optional[nn.Module]:
         """
@@ -220,6 +222,185 @@ class Episode:
             target = self.models['policy_value']
         target.eval()
         return target
+
+    def _ablation_mode(self) -> str:
+        return str(getattr(self.hyperparams, "ablation_mode", "baseline")).lower()
+
+    def _policy_value_bellman_only(self) -> bool:
+        return bool(getattr(self.hyperparams, "policy_value_bellman_only", False)) or self._ablation_mode() == "bellman_only"
+
+    def _pv_use_fixed_sdf(self) -> bool:
+        return bool(getattr(self.hyperparams, "pv_fixed_sdf", False)) or self._ablation_mode() == "fixed_sdf"
+
+    def _pv_use_fixed_policy(self) -> bool:
+        return bool(getattr(self.hyperparams, "pv_fixed_policy", False)) or self._ablation_mode() == "fixed_policy"
+
+    def _apply_policy_ablation(self, bp: torch.Tensor, parent_b: torch.Tensor) -> torch.Tensor:
+        if not self._pv_use_fixed_policy():
+            return bp
+        mode = str(getattr(self.hyperparams, "pv_fixed_policy_mode", "parent_b")).lower()
+        if mode == "zero":
+            fixed = torch.zeros_like(parent_b)
+        elif mode == "one":
+            fixed = torch.ones_like(parent_b)
+        else:
+            fixed = parent_b.clamp(0.0, 1.0)
+        return fixed.detach().clone().requires_grad_(bp.requires_grad)
+
+    def _build_policy_m_lists(self, parent: torch.Tensor, children: List[torch.Tensor], clamp_min: float, clamp_max: float) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        if parent.shape[1] > 7:
+            raw_M_list = [child[:, 7:8] for child in children]
+        else:
+            raw_M_list = [torch.ones(parent.shape[0], 1, device=self.device) for _ in children]
+        if self._pv_use_fixed_sdf():
+            fixed = float(getattr(self.hyperparams, "pv_fixed_sdf_value", 0.98))
+            M_list = [torch.full_like(m, fixed) for m in raw_M_list]
+        elif bool(getattr(self.hyperparams, "pv_use_clipped_m", True)):
+            M_list = [m.clamp(clamp_min, clamp_max) for m in raw_M_list]
+        else:
+            M_list = raw_M_list
+        return raw_M_list, M_list
+
+    @staticmethod
+    def _safe_quantile(v: torch.Tensor, q: float) -> float:
+        vv = v.detach().reshape(-1)
+        vv = vv[torch.isfinite(vv)]
+        if vv.numel() == 0:
+            return float('nan')
+        return float(torch.quantile(vv.to(torch.float32), q).item())
+
+    def _m_diagnostics(self, prefix: str, raw_m: torch.Tensor, use_m: torch.Tensor, lo: float, hi: float) -> Dict[str, float]:
+        raw = raw_m.detach().reshape(-1)
+        used = use_m.detach().reshape(-1)
+        raw_finite = raw[torch.isfinite(raw)]
+        used_finite = used[torch.isfinite(used)]
+        if raw_finite.numel() == 0 or used_finite.numel() == 0:
+            return {
+                f'{prefix}_M_raw_finite_ratio': 0.0,
+                f'{prefix}_M_clip_low_ratio': float('nan'),
+                f'{prefix}_M_clip_high_ratio': float('nan'),
+            }
+        return {
+            f'{prefix}_log_mean_M_raw': float(torch.log(raw_finite.mean().clamp_min(1e-8)).item()),
+            f'{prefix}_log_mean_M_used': float(torch.log(used_finite.mean().clamp_min(1e-8)).item()),
+            f'{prefix}_M_raw_p50': self._safe_quantile(raw_finite, 0.50),
+            f'{prefix}_M_raw_p90': self._safe_quantile(raw_finite, 0.90),
+            f'{prefix}_M_raw_p99': self._safe_quantile(raw_finite, 0.99),
+            f'{prefix}_M_raw_max': float(raw_finite.max().item()),
+            f'{prefix}_M_used_p50': self._safe_quantile(used_finite, 0.50),
+            f'{prefix}_M_used_p90': self._safe_quantile(used_finite, 0.90),
+            f'{prefix}_M_used_p99': self._safe_quantile(used_finite, 0.99),
+            f'{prefix}_M_used_max': float(used_finite.max().item()),
+            f'{prefix}_M_raw_finite_ratio': float(raw_finite.numel() / max(raw.numel(), 1)),
+            f'{prefix}_M_clip_low_ratio': float((raw_finite < lo).float().mean().item()),
+            f'{prefix}_M_clip_high_ratio': float((raw_finite > hi).float().mean().item()),
+        }
+
+    def _tensor_tail_diagnostics(self, prefix: str, value: torch.Tensor) -> Dict[str, float]:
+        flat = value.detach().reshape(-1)
+        finite = flat[torch.isfinite(flat)]
+        if finite.numel() == 0:
+            return {
+                f'{prefix}_finite_ratio': 0.0,
+                f'{prefix}_mean': float('nan'),
+                f'{prefix}_abs_p50': float('nan'),
+                f'{prefix}_abs_p90': float('nan'),
+                f'{prefix}_abs_p99': float('nan'),
+                f'{prefix}_abs_p999': float('nan'),
+                f'{prefix}_abs_max': float('nan'),
+            }
+        abs_finite = finite.abs()
+        return {
+            f'{prefix}_finite_ratio': float(finite.numel() / max(flat.numel(), 1)),
+            f'{prefix}_mean': float(finite.mean().item()),
+            f'{prefix}_abs_p50': self._safe_quantile(abs_finite, 0.50),
+            f'{prefix}_abs_p90': self._safe_quantile(abs_finite, 0.90),
+            f'{prefix}_abs_p99': self._safe_quantile(abs_finite, 0.99),
+            f'{prefix}_abs_p999': self._safe_quantile(abs_finite, 0.999),
+            f'{prefix}_abs_max': float(abs_finite.max().item()),
+        }
+
+    @staticmethod
+    def _module_grad_norm(module: nn.Module) -> float:
+        vals = []
+        for p in module.parameters():
+            if p.grad is not None:
+                vals.append(float(p.grad.detach().norm(2).item()) ** 2)
+        return float(sum(vals) ** 0.5) if vals else 0.0
+
+    def _policy_value_grad_group_norms(self) -> Dict[str, float]:
+        model = self.models.get('policy_value')
+        if model is None:
+            return {}
+        names = [
+            'value_encoder', 'v0_head', 'vi_head',
+            'q_encoder', 'q_head',
+            'policy_encoder', 'bp0_head', 'bpi_head',
+        ]
+        out = {}
+        for name in names:
+            module = getattr(model, name, None)
+            if module is not None:
+                out[f'{name}_grad_norm'] = self._module_grad_norm(module)
+        return out
+
+    def _policy_value_gate_limits(self) -> Tuple[float, float]:
+        loss_abs = float(getattr(self.hyperparams, "policy_value_loss_fail_threshold", 1000.0))
+        grad_abs = float(getattr(self.hyperparams, "policy_value_grad_fail_threshold", 1000.0))
+        prev = self._last_policy_value_stage_summary or {}
+        prev_loss = prev.get('total')
+        prev_grad = prev.get('policy_value_grad_norm')
+        if prev_loss is not None and np.isfinite(prev_loss):
+            mult = float(getattr(self.hyperparams, "policy_value_loss_relative_fail_multiplier", 10.0))
+            loss_abs = max(loss_abs, float(prev_loss) * mult)
+        if prev_grad is not None and np.isfinite(prev_grad):
+            mult = float(getattr(self.hyperparams, "policy_value_grad_relative_fail_multiplier", 10.0))
+            rolling_abs = float(getattr(self.hyperparams, "policy_value_rolling_grad_fail_threshold", 100.0))
+            grad_abs = min(grad_abs, max(rolling_abs, float(prev_grad) * mult))
+        return loss_abs, grad_abs
+
+    def _check_policy_value_gate(self, losses: Dict[str, float], context: str) -> None:
+        if not bool(getattr(self.hyperparams, "stage_fail_on_policy_value_explosion", True)):
+            return
+        total_v = float(losses.get('total', 0.0))
+        grad_v = float(losses.get('policy_value_grad_norm', 0.0))
+        loss_thr, grad_thr = self._policy_value_gate_limits()
+        clip_gate = float(getattr(self.hyperparams, "pv_sdf_clip_ratio_gate", 0.05))
+        clip_high = max(
+            float(losses.get('p0_M_clip_high_ratio', 0.0)),
+            float(losses.get('pi_M_clip_high_ratio', 0.0)),
+        )
+        clip_low = max(
+            float(losses.get('p0_M_clip_low_ratio', 0.0)),
+            float(losses.get('pi_M_clip_low_ratio', 0.0)),
+        )
+        failed = (
+            (not np.isfinite(total_v))
+            or (not np.isfinite(grad_v))
+            or total_v > loss_thr
+            or grad_v > grad_thr
+            or clip_high > clip_gate
+            or clip_low > clip_gate
+        )
+        if failed:
+            self._last_policy_value_gate_context = {
+                'total': total_v,
+                'policy_value_grad_norm': grad_v,
+                'loss_threshold': loss_thr,
+                'grad_threshold': grad_thr,
+                'clip_high_ratio': clip_high,
+                'clip_low_ratio': clip_low,
+                'clip_ratio_gate': clip_gate,
+                'context': context,
+                'losses': dict(losses),
+            }
+            raise NumericalStageFailure(
+                f"Policy/value stage failed at {context}: "
+                f"total={total_v:.6g} (thr={loss_thr:.6g}), "
+                f"grad_norm={grad_v:.6g} (thr={grad_thr:.6g}), "
+                f"clip_high={clip_high:.6g} (thr={clip_gate:.6g}), "
+                f"clip_low={clip_low:.6g} (thr={clip_gate:.6g})"
+            )
 
     @staticmethod
     def _nonfinite_gradient_params(model: nn.Module, limit: int = 20) -> List[str]:
@@ -1354,6 +1535,8 @@ class Episode:
 
                             if had_nan:
                                 logger.warning(f"NaN gradient detected in {name}")
+                    if 'policy_value' in train_modules and 'policy_value' in self.models:
+                        losses.update(self._policy_value_grad_group_norms())
 
                     # 优化器步骤
                     for name in train_modules:
@@ -1742,17 +1925,9 @@ class Episode:
         if not children:
             raise ValueError("No children data in batch")
         
-        # 获取 SDF（优先用 batch 内的 M，避免重复计算）
-        if parent.shape[1] > 7:
-            raw_M_list = [child[:, 7:8] for child in children]
-        else:
-            raw_M_list = [torch.ones(parent.shape[0], 1, device=self.device) for _ in children]
-        if bool(getattr(self.hyperparams, "pv_use_clipped_m", True)):
-            m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
-            m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-            M_list = [m.clamp(m_lo, m_hi) for m in raw_M_list]
-        else:
-            M_list = raw_M_list
+        m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
+        m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
+        raw_M_list, M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
         
         # 前向传播
         parent_state = strip_extra(parent)
@@ -1773,8 +1948,8 @@ class Episode:
         if bp_t.shape != bp0_t.shape:
             bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
         # P0 分支使用不投资场景的杠杆候选 bp0
-        bp_for_p0 = bp0_t
         b_parent = parent_state[:, 0:1]
+        bp_for_p0 = self._apply_policy_ablation(bp0_t, b_parent)
 
         output_children = []
         output_children_target = []
@@ -1845,38 +2020,55 @@ class Episode:
             bellman_residual, parent_state[:, 1:2],
             loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
         )
-
-        foc_residuals = loss_fn.compute_foc_residual_from_bp(
-            CF0p=CF0p_for_foc,
-            M_list=M_list,
-            P_children=P_children_for_foc,
-            bar_z_children=bar_z_children_for_foc,
-            bp=bp_for_p0,
-            eta=eta_children
-        )
-        loss_foc, penalty_z_foc, foc_diag = self._compute_conditional_signed_foc_terms(
-            foc_residuals=foc_residuals,
-            eta_children=eta_children,
-            z_parent=parent_state[:, 1:2],
-            alpha_z=loss_fn.alpha_z,
-            beta_z=loss_fn.beta_z,
-            z0=loss_fn.z0
-        )
-        kkt_penalty_base, kkt_diag = self._compute_bp_kkt_penalty(
-            bp_for_p0, foc_residuals, eta_children=eta_children
-        )
-        p0_kkt_w = float(getattr(self.hyperparams, "p0_kkt_weight", 1.0))
-        kkt_penalty = p0_kkt_w * kkt_penalty_base
-        eta_active_boost = self._compute_eta_active_boost(foc_diag.get('foc_active_ratio', 0.0))
-        bp_terms_base = loss_foc + penalty_z_foc + kkt_penalty
-        bp_terms_after_eta = eta_active_boost * bp_terms_base
-        bp_adapt_scale = self._compute_bp_adaptive_scale(main_loss, bp_terms_after_eta)
-        bp_terms = bp_adapt_scale * bp_terms_after_eta
-
-        total_loss = main_loss + penalty_z + bp_terms
+        bellman_only = self._policy_value_bellman_only()
+        if bellman_only:
+            zero = torch.tensor(0.0, device=self.device)
+            loss_foc = zero
+            penalty_z_foc = zero
+            kkt_penalty = zero
+            bp_terms_base = zero
+            bp_terms_after_eta = zero
+            bp_terms = zero
+            eta_active_boost = 1.0
+            bp_adapt_scale = 1.0
+            foc_diag = {'foc_active_ratio': 0.0, 'foc_signed_moment': 0.0, 'foc_cond_abs_mean': 0.0, 'foc_active_n': 0.0}
+            kkt_diag = {'kkt_inner': 0.0, 'kkt_low': 0.0, 'kkt_high': 0.0, 'kkt_foc_abs_mean': 0.0, 'kkt_active_ratio': 0.0, 'kkt_high_weight': 0.0}
+            total_loss = main_loss
+        else:
+            foc_residuals = loss_fn.compute_foc_residual_from_bp(
+                CF0p=CF0p_for_foc,
+                M_list=M_list,
+                P_children=P_children_for_foc,
+                bar_z_children=bar_z_children_for_foc,
+                bp=bp_for_p0,
+                eta=eta_children
+            )
+            loss_foc, penalty_z_foc, foc_diag = self._compute_conditional_signed_foc_terms(
+                foc_residuals=foc_residuals,
+                eta_children=eta_children,
+                z_parent=parent_state[:, 1:2],
+                alpha_z=loss_fn.alpha_z,
+                beta_z=loss_fn.beta_z,
+                z0=loss_fn.z0
+            )
+            kkt_penalty_base, kkt_diag = self._compute_bp_kkt_penalty(
+                bp_for_p0, foc_residuals, eta_children=eta_children
+            )
+            p0_kkt_w = float(getattr(self.hyperparams, "p0_kkt_weight", 1.0))
+            kkt_penalty = p0_kkt_w * kkt_penalty_base
+            eta_active_boost = self._compute_eta_active_boost(foc_diag.get('foc_active_ratio', 0.0))
+            bp_terms_base = loss_foc + penalty_z_foc + kkt_penalty
+            bp_terms_after_eta = eta_active_boost * bp_terms_base
+            bp_adapt_scale = self._compute_bp_adaptive_scale(main_loss, bp_terms_after_eta)
+            bp_terms = bp_adapt_scale * bp_terms_after_eta
+            total_loss = main_loss + penalty_z + bp_terms
         with torch.no_grad():
             raw_m = torch.cat([m.reshape(-1) for m in raw_M_list], dim=0)
             use_m = torch.cat([m.reshape(-1) for m in M_list], dim=0)
+            target_y = torch.cat(
+                [(cf + m * p).reshape(-1) for cf, m, p in zip(CF0p, M_list, P_children)],
+                dim=0,
+            )
             self._latest_p0_terms = {
                 'p0_main': float(main_loss.item()),
                 'p0_foc': float(loss_foc.item()),
@@ -1898,12 +2090,13 @@ class Episode:
                 'p0_foc_signed_moment': float(foc_diag['foc_signed_moment']),
                 'p0_foc_cond_abs_mean': float(foc_diag['foc_cond_abs_mean']),
                 'p0_foc_active_n': float(foc_diag.get('foc_active_n', 0.0)),
-                'p0_log_mean_M_raw': float(torch.log(raw_m.mean().clamp_min(1e-8)).item()),
-                'p0_log_mean_M_used': float(torch.log(use_m.mean().clamp_min(1e-8)).item()),
-                'p0_M_raw_p90': float(torch.quantile(raw_m, 0.90).item()),
-                'p0_M_used_p90': float(torch.quantile(use_m, 0.90).item()),
                 'p0_bp_foc_use_phat': float(1.0 if use_phat_for_bp_foc else 0.0),
+                'p0_bellman_only': float(1.0 if bellman_only else 0.0),
+                'p0_fixed_sdf': float(1.0 if self._pv_use_fixed_sdf() else 0.0),
+                'p0_fixed_policy': float(1.0 if self._pv_use_fixed_policy() else 0.0),
             }
+            self._latest_p0_terms.update(self._m_diagnostics('p0', raw_m, use_m, m_lo, m_hi))
+            self._latest_p0_terms.update(self._tensor_tail_diagnostics('p0_target_y', target_y))
             self._latest_p0_terms.update(getattr(loss_fn, 'latest_foc_diag', {}))
         return total_loss
     
@@ -1928,17 +2121,9 @@ class Episode:
         if not children:
             raise ValueError("No children data in batch")
         
-        # 获取 SDF（优先用 batch 内的 M，避免重复计算）
-        if parent.shape[1] > 7:
-            raw_M_list = [child[:, 7:8] for child in children]
-        else:
-            raw_M_list = [torch.ones(parent.shape[0], 1, device=self.device) for _ in children]
-        if bool(getattr(self.hyperparams, "pv_use_clipped_m", True)):
-            m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
-            m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-            M_list = [m.clamp(m_lo, m_hi) for m in raw_M_list]
-        else:
-            M_list = raw_M_list
+        m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
+        m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
+        raw_M_list, M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
         
         # 前向传播
         parent_state = strip_extra(parent)
@@ -1960,8 +2145,8 @@ class Episode:
         if bp_t.shape != bp0_t.shape:
             bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
         # PI 分支使用投资场景的杠杆候选 bpI
-        bp_for_pi = bpI_t
         b_parent = parent_state[:, 0:1]
+        bp_for_pi = self._apply_policy_ablation(bpI_t, b_parent)
 
         output_children = []
         output_children_target = []
@@ -2039,38 +2224,55 @@ class Episode:
             loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
         )
         penalty_b = loss_fn.b_penalty_weight * loss_fn.compute_b_penalty(PI, parent_state[:, 0:1]).mean()
-
-        foc_residuals = loss_fn.compute_foc_residual_from_bp(
-            CFip=CFip_for_foc,
-            M_list=M_list,
-            P_children=P_children_for_foc,
-            bar_z_children=bar_z_children_for_foc,
-            bp=bp_for_pi,
-            eta=eta_children
-        )
-        loss_foc, penalty_z_foc, foc_diag = self._compute_conditional_signed_foc_terms(
-            foc_residuals=foc_residuals,
-            eta_children=eta_children,
-            z_parent=parent_state[:, 1:2],
-            alpha_z=loss_fn.alpha_z,
-            beta_z=loss_fn.beta_z,
-            z0=loss_fn.z0
-        )
-        kkt_penalty_base, kkt_diag = self._compute_bp_kkt_penalty(
-            bp_for_pi, foc_residuals, eta_children=eta_children
-        )
-        pi_kkt_w = float(getattr(self.hyperparams, "pi_kkt_weight", 1.0))
-        kkt_penalty = pi_kkt_w * kkt_penalty_base
-        eta_active_boost = self._compute_eta_active_boost(foc_diag.get('foc_active_ratio', 0.0))
-        bp_terms_base = loss_foc + penalty_z_foc + kkt_penalty
-        bp_terms_after_eta = eta_active_boost * bp_terms_base
-        bp_adapt_scale = self._compute_bp_adaptive_scale(main_loss, bp_terms_after_eta)
-        bp_terms = bp_adapt_scale * bp_terms_after_eta
-
-        total_loss = main_loss + penalty_z + penalty_b + bp_terms
+        bellman_only = self._policy_value_bellman_only()
+        if bellman_only:
+            zero = torch.tensor(0.0, device=self.device)
+            loss_foc = zero
+            penalty_z_foc = zero
+            kkt_penalty = zero
+            bp_terms_base = zero
+            bp_terms_after_eta = zero
+            bp_terms = zero
+            eta_active_boost = 1.0
+            bp_adapt_scale = 1.0
+            foc_diag = {'foc_active_ratio': 0.0, 'foc_signed_moment': 0.0, 'foc_cond_abs_mean': 0.0, 'foc_active_n': 0.0}
+            kkt_diag = {'kkt_inner': 0.0, 'kkt_low': 0.0, 'kkt_high': 0.0, 'kkt_foc_abs_mean': 0.0, 'kkt_active_ratio': 0.0, 'kkt_high_weight': 0.0}
+            total_loss = main_loss
+        else:
+            foc_residuals = loss_fn.compute_foc_residual_from_bp(
+                CFip=CFip_for_foc,
+                M_list=M_list,
+                P_children=P_children_for_foc,
+                bar_z_children=bar_z_children_for_foc,
+                bp=bp_for_pi,
+                eta=eta_children
+            )
+            loss_foc, penalty_z_foc, foc_diag = self._compute_conditional_signed_foc_terms(
+                foc_residuals=foc_residuals,
+                eta_children=eta_children,
+                z_parent=parent_state[:, 1:2],
+                alpha_z=loss_fn.alpha_z,
+                beta_z=loss_fn.beta_z,
+                z0=loss_fn.z0
+            )
+            kkt_penalty_base, kkt_diag = self._compute_bp_kkt_penalty(
+                bp_for_pi, foc_residuals, eta_children=eta_children
+            )
+            pi_kkt_w = float(getattr(self.hyperparams, "pi_kkt_weight", 1.0))
+            kkt_penalty = pi_kkt_w * kkt_penalty_base
+            eta_active_boost = self._compute_eta_active_boost(foc_diag.get('foc_active_ratio', 0.0))
+            bp_terms_base = loss_foc + penalty_z_foc + kkt_penalty
+            bp_terms_after_eta = eta_active_boost * bp_terms_base
+            bp_adapt_scale = self._compute_bp_adaptive_scale(main_loss, bp_terms_after_eta)
+            bp_terms = bp_adapt_scale * bp_terms_after_eta
+            total_loss = main_loss + penalty_z + penalty_b + bp_terms
         with torch.no_grad():
             raw_m = torch.cat([m.reshape(-1) for m in raw_M_list], dim=0)
             use_m = torch.cat([m.reshape(-1) for m in M_list], dim=0)
+            target_y = torch.cat(
+                [(cf + m * p).reshape(-1) for cf, m, p in zip(CFip, M_list, P_children)],
+                dim=0,
+            )
             self._latest_pi_terms = {
                 'pi_main': float(main_loss.item()),
                 'pi_foc': float(loss_foc.item()),
@@ -2093,12 +2295,13 @@ class Episode:
                 'pi_foc_signed_moment': float(foc_diag['foc_signed_moment']),
                 'pi_foc_cond_abs_mean': float(foc_diag['foc_cond_abs_mean']),
                 'pi_foc_active_n': float(foc_diag.get('foc_active_n', 0.0)),
-                'pi_log_mean_M_raw': float(torch.log(raw_m.mean().clamp_min(1e-8)).item()),
-                'pi_log_mean_M_used': float(torch.log(use_m.mean().clamp_min(1e-8)).item()),
-                'pi_M_raw_p90': float(torch.quantile(raw_m, 0.90).item()),
-                'pi_M_used_p90': float(torch.quantile(use_m, 0.90).item()),
                 'pi_bp_foc_use_phat': float(1.0 if use_phat_for_bp_foc else 0.0),
+                'pi_bellman_only': float(1.0 if bellman_only else 0.0),
+                'pi_fixed_sdf': float(1.0 if self._pv_use_fixed_sdf() else 0.0),
+                'pi_fixed_policy': float(1.0 if self._pv_use_fixed_policy() else 0.0),
             }
+            self._latest_pi_terms.update(self._m_diagnostics('pi', raw_m, use_m, m_lo, m_hi))
+            self._latest_pi_terms.update(self._tensor_tail_diagnostics('pi_target_y', target_y))
             self._latest_pi_terms.update(getattr(loss_fn, 'latest_foc_diag', {}))
         return total_loss
     
@@ -2137,7 +2340,10 @@ class Episode:
             raw_M_list = [child[:, 7:8] for child in children]
         else:
             raw_M_list = [torch.ones(parent.shape[0], 1, device=self.device) for _ in children]
-        if getattr(self.hyperparams, "q_use_detached_m", True):
+        if self._pv_use_fixed_sdf():
+            fixed = float(getattr(self.hyperparams, "pv_fixed_sdf_value", 0.98))
+            M_list = [torch.full_like(m, fixed).detach() for m in raw_M_list]
+        elif getattr(self.hyperparams, "q_use_detached_m", True):
             m_lo = float(getattr(self.hyperparams, "q_m_clamp_min", 0.5))
             m_hi = float(getattr(self.hyperparams, "q_m_clamp_max", 1.5))
             M_list = [m.clamp(m_lo, m_hi).detach() for m in raw_M_list]
@@ -2167,6 +2373,8 @@ class Episode:
         b_parent = parent_state[:, 0:1]
         bar_z_t = _get_out(output_t_target, 'bar_z', 6).detach()
         bar_i_use = bar_i_t
+        if self._pv_use_fixed_policy():
+            bar_i_use = torch.zeros_like(bar_i_t)
         bp_use = bp_t
         bar_z_use = bar_z_t
         # 与 q_loss 主方程保持一致：Qsp 输入使用 b' = b / (bar_i*(G-1)+1)
@@ -2994,6 +3202,11 @@ class Episode:
                     policy_loss_terms=policy_loss_terms
                 )
                 epoch_losses.append(losses)
+                if 'policy_value' in train_modules and 'policy_value' in self.models:
+                    self._check_policy_value_gate(
+                        losses,
+                        context=f"episode={self.episode_id}, epoch={epoch + 1}, batch={len(epoch_losses)}"
+                    )
                 
                 if self.step_count % log_interval == 0:
                     avg_loss = np.mean([l['total'] for l in epoch_losses[-log_interval:]])
@@ -3056,20 +3269,11 @@ class Episode:
                 k: np.mean([l[k] for l in epoch_losses if k in l])
                 for k in epoch_losses[0].keys()
             }
-            if (
-                'policy_value' in train_modules
-                and bool(getattr(self.hyperparams, "stage_fail_on_policy_value_explosion", True))
-            ):
-                total_v = float(avg_losses.get('total', 0.0))
-                grad_v = float(avg_losses.get('policy_value_grad_norm', 0.0))
-                loss_thr = float(getattr(self.hyperparams, "policy_value_loss_fail_threshold", 1000.0))
-                grad_thr = float(getattr(self.hyperparams, "policy_value_grad_fail_threshold", 1000.0))
-                if (not np.isfinite(total_v)) or (not np.isfinite(grad_v)) or total_v > loss_thr or grad_v > grad_thr:
-                    raise NumericalStageFailure(
-                        f"Policy/value stage failed at episode={self.episode_id}, epoch={epoch + 1}: "
-                        f"total={total_v:.6g} (thr={loss_thr:.6g}), "
-                        f"grad_norm={grad_v:.6g} (thr={grad_thr:.6g})"
-                    )
+            if 'policy_value' in train_modules and 'policy_value' in self.models:
+                self._check_policy_value_gate(
+                    avg_losses,
+                    context=f"episode={self.episode_id}, epoch={epoch + 1}"
+                )
             logger.info(f"{desc_prefix}Epoch {epoch+1} finished: {avg_losses}")
             if 'sdf_log_mean_M' in avg_losses:
                 logger.info(
@@ -3092,6 +3296,8 @@ class Episode:
         }
         if convergence is not None:
             result['convergence'] = convergence
+        if 'policy_value' in train_modules:
+            self._last_policy_value_stage_summary = dict(avg_losses)
         return result
 
     def _simulate_df(

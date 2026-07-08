@@ -35,6 +35,13 @@ class HyperParams:
     # Policy & Value
     policy_lr: float = 1e-3
     policy_weight_decay: float = 1e-6
+    # Policy/Value 消融实验：baseline, bellman_only, fixed_sdf, fixed_policy
+    ablation_mode: str = 'baseline'
+    policy_value_bellman_only: bool = False
+    pv_fixed_sdf: bool = False
+    pv_fixed_sdf_value: float = 0.98
+    pv_fixed_policy: bool = False
+    pv_fixed_policy_mode: str = 'parent_b'
     
     # FC2
     fc2_lr: float = 1e-4
@@ -101,6 +108,9 @@ class HyperParams:
     stage_fail_on_policy_value_explosion: bool = True
     policy_value_loss_fail_threshold: float = 1000.0
     policy_value_grad_fail_threshold: float = 1000.0
+    policy_value_loss_relative_fail_multiplier: float = 10.0
+    policy_value_grad_relative_fail_multiplier: float = 10.0
+    policy_value_rolling_grad_fail_threshold: float = 100.0
     
     # NaN/Inf 检测
     nan_recovery: bool = True
@@ -173,6 +183,7 @@ class HyperParams:
     pv_use_clipped_m: bool = True
     pv_m_clamp_min: float = 0.7
     pv_m_clamp_max: float = 1.3
+    pv_sdf_clip_ratio_gate: float = 1.0
     # Q 对 b/z 的形状正则权重与区间
     q_shape_weight_z: float = 1.0
     q_shape_weight_b_low: float = 1.0
