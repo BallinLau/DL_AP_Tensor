@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
 from data import TensorTable  # noqa: E402
+from experiments.run_utils import build_hyperparams  # noqa: E402
 from training.episode import Episode  # noqa: E402
 
 
@@ -140,7 +141,7 @@ class TreatmentBFlowTest(unittest.TestCase):
     def test_fixed_batch_eval_reports_stage2_object_layers(self):
         episode = Episode.__new__(Episode)
         episode.models = {"sdf_fc1": _FakeSdfModel()}
-        episode.hyperparams = SimpleNamespace(fc1_use_true_macro_state_in_stage2=True)
+        episode.hyperparams = SimpleNamespace(fc1_use_true_macro_state_in_stage2=False)
 
         parent = torch.tensor(
             [[0.0, 0.0, 0.0, 0.0, 1.0, -2.0, 4.0, -1.5, 4.2]],
@@ -158,7 +159,20 @@ class TreatmentBFlowTest(unittest.TestCase):
         self.assertIn("check_current_belief_hatc_vs_realized_rmse", out)
         self.assertIn("check_current_belief_lnk_vs_realized_rmse", out)
         self.assertIn("check_recursive_forecast_state_hatc_next_rmse", out)
+        self.assertIn("check_recursive_forecast_state_lnk_next_rmse", out)
         self.assertIn("check_recursive_forecast_state_dlnk_next_rmse", out)
+        self.assertIn("check_primary_true_state_M_p99", out)
+        self.assertIn("check_recursive_forecast_state_M_p99", out)
+
+        self.assertAlmostEqual(out["check_primary_true_state_dlnk_next_rmse"], 0.0, places=6)
+        self.assertAlmostEqual(out["check_recursive_forecast_state_dlnk_next_rmse"], 0.0, places=6)
+        self.assertAlmostEqual(out["check_current_belief_lnk_vs_realized_rmse"], 0.2, places=6)
+
+    def test_formal_hyperparams_use_true_state_primary_stage2(self):
+        hp = build_hyperparams()
+        self.assertTrue(hp.fc1_use_true_macro_state_in_stage2)
+        self.assertGreater(hp.fc1_recon_weight, 0.0)
+        self.assertLess(hp.fc1_forecast_recon_weight, hp.fc1_recon_weight)
 
 
 if __name__ == "__main__":

@@ -3621,9 +3621,12 @@ class Episode:
         current_lnk_true_parts: List[torch.Tensor] = []
         recursive_hatc_true_parts: List[torch.Tensor] = []
         recursive_hatc_pred_parts: List[torch.Tensor] = []
+        recursive_lnk_true_parts: List[torch.Tensor] = []
+        recursive_lnk_pred_parts: List[torch.Tensor] = []
         recursive_dlnk_true_parts: List[torch.Tensor] = []
         recursive_dlnk_pred_parts: List[torch.Tensor] = []
-        m_parts: List[torch.Tensor] = []
+        primary_m_parts: List[torch.Tensor] = []
+        recursive_m_parts: List[torch.Tensor] = []
 
         try:
             with torch.no_grad():
@@ -3638,22 +3641,23 @@ class Episode:
                     if not children or len(children) < 2:
                         continue
                     children_t = torch.stack(children[:2], dim=1)
-                    use_true_prev_macro = bool(
-                        parent.shape[1] >= 9
-                        and getattr(self.hyperparams, "fc1_use_true_macro_state_in_stage2", True)
-                    )
                     has_true_prev_macro = parent.shape[1] >= 9
                     c_prev_true = parent[:, 7:8] if has_true_prev_macro else parent[:, 5:6]
                     k_prev_true = parent[:, 8:9] if has_true_prev_macro else parent[:, 6:7]
                     c_prev_forecast = parent[:, 5:6]
                     k_prev_forecast = parent[:, 6:7]
-                    c_prev_input = c_prev_true if use_true_prev_macro else c_prev_forecast
-                    k_prev_input = k_prev_true if use_true_prev_macro else k_prev_forecast
-                    _, _, M, c_children, k_children = model.forward_step(
+                    _, _, M_primary, c_children_primary, k_children_primary = model.forward_step(
                         x_prev=parent[:, 4:5],
                         x_curr=children_t[:, :, 4:5],
-                        hatcf_prev=c_prev_input,
-                        lnkf_prev=k_prev_input,
+                        hatcf_prev=c_prev_true,
+                        lnkf_prev=k_prev_true,
+                        return_physical=True
+                    )
+                    _, _, M_recursive, c_children_recursive, k_children_recursive = model.forward_step(
+                        x_prev=parent[:, 4:5],
+                        x_curr=children_t[:, :, 4:5],
+                        hatcf_prev=c_prev_forecast,
+                        lnkf_prev=k_prev_forecast,
                         return_physical=True
                     )
                     if children_t.shape[-1] >= 10:
@@ -3667,32 +3671,28 @@ class Episode:
                         lnkf_true = None
                     if hatcf_true is not None and lnkf_true is not None:
                         hatc_true_parts.append(hatcf_true.detach().reshape(-1).cpu())
-                        hatc_pred_parts.append(c_children.detach().reshape(-1).cpu())
+                        hatc_pred_parts.append(c_children_primary.detach().reshape(-1).cpu())
                         lnk_true_parts.append(lnkf_true.detach().reshape(-1).cpu())
-                        lnk_pred_parts.append(k_children.detach().reshape(-1).cpu())
+                        lnk_pred_parts.append(k_children_primary.detach().reshape(-1).cpu())
                         dlnk_true_parts.append((lnkf_true - k_prev_true.unsqueeze(1)).detach().reshape(-1).cpu())
-                        dlnk_pred_parts.append((k_children - k_prev_true.unsqueeze(1)).detach().reshape(-1).cpu())
+                        dlnk_pred_parts.append((k_children_primary - k_prev_true.unsqueeze(1)).detach().reshape(-1).cpu())
                         if has_true_prev_macro:
                             current_hatc_forecast_parts.append(c_prev_forecast.detach().reshape(-1).cpu())
                             current_hatc_true_parts.append(c_prev_true.detach().reshape(-1).cpu())
                             current_lnk_forecast_parts.append(k_prev_forecast.detach().reshape(-1).cpu())
                             current_lnk_true_parts.append(k_prev_true.detach().reshape(-1).cpu())
-                            _, _, _, c_children_recursive, k_children_recursive = model.forward_step(
-                                x_prev=parent[:, 4:5],
-                                x_curr=children_t[:, :, 4:5],
-                                hatcf_prev=c_prev_forecast,
-                                lnkf_prev=k_prev_forecast,
-                                return_physical=True
-                            )
                             recursive_hatc_true_parts.append(hatcf_true.detach().reshape(-1).cpu())
                             recursive_hatc_pred_parts.append(c_children_recursive.detach().reshape(-1).cpu())
+                            recursive_lnk_true_parts.append(lnkf_true.detach().reshape(-1).cpu())
+                            recursive_lnk_pred_parts.append(k_children_recursive.detach().reshape(-1).cpu())
                             recursive_dlnk_true_parts.append(
-                                (lnkf_true - k_prev_forecast.unsqueeze(1)).detach().reshape(-1).cpu()
+                                (lnkf_true - k_prev_true.unsqueeze(1)).detach().reshape(-1).cpu()
                             )
                             recursive_dlnk_pred_parts.append(
                                 (k_children_recursive - k_prev_forecast.unsqueeze(1)).detach().reshape(-1).cpu()
                             )
-                    m_parts.append(M.detach().reshape(-1).cpu())
+                    primary_m_parts.append(M_primary.detach().reshape(-1).cpu())
+                    recursive_m_parts.append(M_recursive.detach().reshape(-1).cpu())
         finally:
             if was_training:
                 model.train()
@@ -3723,6 +3723,7 @@ class Episode:
         _safe_metric_pair('primary_true_state_lnk_next', lnk_true_parts, lnk_pred_parts)
         _safe_metric_pair('primary_true_state_dlnk_next', dlnk_true_parts, dlnk_pred_parts)
         _safe_metric_pair('recursive_forecast_state_hatc_next', recursive_hatc_true_parts, recursive_hatc_pred_parts)
+        _safe_metric_pair('recursive_forecast_state_lnk_next', recursive_lnk_true_parts, recursive_lnk_pred_parts)
         _safe_metric_pair('recursive_forecast_state_dlnk_next', recursive_dlnk_true_parts, recursive_dlnk_pred_parts)
 
         def _safe_gap_metrics(name: str, true_parts: List[torch.Tensor], pred_parts: List[torch.Tensor]) -> None:
@@ -3744,17 +3745,22 @@ class Episode:
         _safe_gap_metrics('current_belief_hatc_vs_realized', current_hatc_true_parts, current_hatc_forecast_parts)
         _safe_gap_metrics('current_belief_lnk_vs_realized', current_lnk_true_parts, current_lnk_forecast_parts)
 
-        if m_parts:
-            m = torch.cat(m_parts).to(torch.float32)
+        def _safe_m_metrics(name: str, parts: List[torch.Tensor]) -> None:
+            if not parts:
+                return
+            m = torch.cat(parts).to(torch.float32)
             m = m[torch.isfinite(m)]
-            out[f'{prefix}_M_n'] = float(m.numel())
+            out[f'{prefix}_{name}_n'] = float(m.numel())
             if m.numel() > 0:
-                out[f'{prefix}_M_p50'] = float(torch.quantile(m, 0.50).item())
-                out[f'{prefix}_M_p90'] = float(torch.quantile(m, 0.90).item())
-                out[f'{prefix}_M_p99'] = float(torch.quantile(m, 0.99).item())
-                out[f'{prefix}_M_max'] = float(m.max().item())
-                out[f'{prefix}_M_lt_0p7_rate'] = float((m < 0.7).to(torch.float32).mean().item())
-                out[f'{prefix}_M_gt_1p3_rate'] = float((m > 1.3).to(torch.float32).mean().item())
+                out[f'{prefix}_{name}_p50'] = float(torch.quantile(m, 0.50).item())
+                out[f'{prefix}_{name}_p90'] = float(torch.quantile(m, 0.90).item())
+                out[f'{prefix}_{name}_p99'] = float(torch.quantile(m, 0.99).item())
+                out[f'{prefix}_{name}_max'] = float(m.max().item())
+                out[f'{prefix}_{name}_lt_0p7_rate'] = float((m < 0.7).to(torch.float32).mean().item())
+                out[f'{prefix}_{name}_gt_1p3_rate'] = float((m > 1.3).to(torch.float32).mean().item())
+
+        _safe_m_metrics('primary_true_state_M', primary_m_parts)
+        _safe_m_metrics('recursive_forecast_state_M', recursive_m_parts)
         return out
 
     def _run_sdf_recon_from_macro(

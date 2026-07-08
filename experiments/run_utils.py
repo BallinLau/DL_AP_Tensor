@@ -120,16 +120,16 @@ def build_hyperparams():
     hp.w_pi = 1.0
     hp.w_q = 1.0
     hp.w_fc2 = 1.0
-    # SDF 两阶段稳定配置（与 notebook 口径对齐）
-    hp.fc1_recon_weight = 0.0
-    hp.fc1_forecast_recon_weight = 1.0
+    # SDF 两阶段稳定配置：true-state one-step 是主监督，forecast-state 只做辅助递推稳定项。
+    hp.fc1_recon_weight = 1.0
+    hp.fc1_forecast_recon_weight = 0.1
     hp.fc1_hatc_recon_weight = 1.0
     hp.fc1_lnk_recon_weight = 0.25
     hp.fc1_delta_penalty_weight = 10.0
     hp.fc1_delta_hatc_abs_max = 0.50
     hp.fc1_delta_lnk_abs_max = 0.30
     hp.fc1_jacobian_penalty_weight = 1.0
-    hp.fc1_use_true_macro_state_in_stage2 = False
+    hp.fc1_use_true_macro_state_in_stage2 = True
     hp.sdf_stage1_lr = 1e-4
     hp.sdf_stage2_lr = 2e-4
     hp.sdf_stage1_moment_weight = 5.0
