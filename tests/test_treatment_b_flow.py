@@ -20,6 +20,27 @@ class _DummyMonitor:
         return {"enabled": False}
 
 
+class _FakeSdfModel:
+    training = True
+
+    def eval(self):
+        self.training = False
+
+    def train(self):
+        self.training = True
+
+    def forward_step(self, x_prev, x_curr, hatcf_prev, lnkf_prev, return_physical=True):
+        del x_prev, return_physical
+        hatcf_curr = hatcf_prev.unsqueeze(1) + 0.5 * x_curr
+        lnkf_curr = lnkf_prev.unsqueeze(1) + 0.25 * x_curr
+        batch = x_curr.shape[0]
+        n_children = x_curr.shape[1]
+        w_prev = torch.ones(batch, 1)
+        w_curr = torch.ones(batch, n_children, 1)
+        m = torch.ones(batch, n_children, 1)
+        return w_prev, w_curr, m, hatcf_curr, lnkf_curr
+
+
 class TreatmentBFlowTest(unittest.TestCase):
     def _make_episode(self, resimulate_after_pv):
         episode = Episode.__new__(Episode)
@@ -115,6 +136,29 @@ class TreatmentBFlowTest(unittest.TestCase):
         self.assertTrue(diag["rng_state_replayed"])
         self.assertIn("macro_old_to_new_common_rows", diag)
         self.assertIn("firm_old_to_new_keys_common_rows", diag)
+
+    def test_fixed_batch_eval_reports_stage2_object_layers(self):
+        episode = Episode.__new__(Episode)
+        episode.models = {"sdf_fc1": _FakeSdfModel()}
+        episode.hyperparams = SimpleNamespace(fc1_use_true_macro_state_in_stage2=True)
+
+        parent = torch.tensor(
+            [[0.0, 0.0, 0.0, 0.0, 1.0, -2.0, 4.0, -1.5, 4.2]],
+            dtype=torch.float32,
+        )
+        child0 = torch.tensor([[0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, -0.5, 4.7]], dtype=torch.float32)
+        child1 = torch.tensor([[0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.5, 5.2]], dtype=torch.float32)
+        out = episode._evaluate_sdf_fc1_batches(
+            [{"parent": parent, "children": [child0, child1]}],
+            prefix="check",
+        )
+
+        self.assertIn("check_primary_true_state_hatc_next_rmse", out)
+        self.assertIn("check_primary_true_state_dlnk_next_rmse", out)
+        self.assertIn("check_current_belief_hatc_vs_realized_rmse", out)
+        self.assertIn("check_current_belief_lnk_vs_realized_rmse", out)
+        self.assertIn("check_recursive_forecast_state_hatc_next_rmse", out)
+        self.assertIn("check_recursive_forecast_state_dlnk_next_rmse", out)
 
 
 if __name__ == "__main__":

@@ -1868,8 +1868,10 @@ class Episode:
         recon_loss_forecast = torch.tensor(0.0, device=self.device)
         recon_loss_hatc = torch.tensor(0.0, device=self.device)
         recon_loss_lnk = torch.tensor(0.0, device=self.device)
+        recon_loss_dlnk = torch.tensor(0.0, device=self.device)
         recon_loss_forecast_hatc = torch.tensor(0.0, device=self.device)
         recon_loss_forecast_lnk = torch.tensor(0.0, device=self.device)
+        recon_loss_forecast_dlnk = torch.tensor(0.0, device=self.device)
         delta_penalty = torch.tensor(0.0, device=self.device)
         delta_penalty_hatc = torch.tensor(0.0, device=self.device)
         delta_penalty_lnk = torch.tensor(0.0, device=self.device)
@@ -1903,6 +1905,9 @@ class Episode:
             if hatcf_true is not None and lnkf_true is not None:
                 recon_loss_hatc = (hatcf_pred - hatcf_true).pow(2).mean()
                 recon_loss_lnk = (lnkf_pred - lnkf_true).pow(2).mean()
+                dlnkf_pred = lnkf_pred - k_prev_input.unsqueeze(1)
+                dlnkf_true = lnkf_true - k_prev_input.unsqueeze(1)
+                recon_loss_dlnk = (dlnkf_pred - dlnkf_true).pow(2).mean()
                 recon_loss = (
                     hatc_recon_inner_weight * recon_loss_hatc
                     + lnk_recon_inner_weight * recon_loss_lnk
@@ -1927,6 +1932,9 @@ class Episode:
                 )
                 recon_loss_forecast_hatc = (c_children_forecast - hatcf_true).pow(2).mean()
                 recon_loss_forecast_lnk = (k_children_forecast - lnkf_true).pow(2).mean()
+                dlnkf_forecast_pred = k_children_forecast - lnkf_prev_forecast.unsqueeze(1)
+                dlnkf_forecast_true = lnkf_true - lnkf_prev_forecast.unsqueeze(1)
+                recon_loss_forecast_dlnk = (dlnkf_forecast_pred - dlnkf_forecast_true).pow(2).mean()
                 recon_loss_forecast = (
                     hatc_recon_inner_weight * recon_loss_forecast_hatc
                     + lnk_recon_inner_weight * recon_loss_forecast_lnk
@@ -1991,10 +1999,14 @@ class Episode:
             recon_loss_hatc = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(recon_loss_lnk):
             recon_loss_lnk = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(recon_loss_dlnk):
+            recon_loss_dlnk = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(recon_loss_forecast_hatc):
             recon_loss_forecast_hatc = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(recon_loss_forecast_lnk):
             recon_loss_forecast_lnk = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(recon_loss_forecast_dlnk):
+            recon_loss_forecast_dlnk = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(delta_penalty):
             delta_penalty = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(delta_penalty_hatc):
@@ -2052,9 +2064,11 @@ class Episode:
                 'sdf_recon_loss': float(recon_loss.detach().item()),
                 'sdf_recon_loss_hatc': float(recon_loss_hatc.detach().item()),
                 'sdf_recon_loss_lnk': float(recon_loss_lnk.detach().item()),
+                'sdf_recon_loss_dlnk': float(recon_loss_dlnk.detach().item()),
                 'sdf_recon_loss_forecast': float(recon_loss_forecast.detach().item()),
                 'sdf_recon_loss_forecast_hatc': float(recon_loss_forecast_hatc.detach().item()),
                 'sdf_recon_loss_forecast_lnk': float(recon_loss_forecast_lnk.detach().item()),
+                'sdf_recon_loss_forecast_dlnk': float(recon_loss_forecast_dlnk.detach().item()),
                 'sdf_delta_penalty': float(delta_penalty.detach().item()),
                 'sdf_delta_penalty_hatc': float(delta_penalty_hatc.detach().item()),
                 'sdf_delta_penalty_lnk': float(delta_penalty_lnk.detach().item()),
@@ -3599,6 +3613,16 @@ class Episode:
         hatc_pred_parts: List[torch.Tensor] = []
         lnk_true_parts: List[torch.Tensor] = []
         lnk_pred_parts: List[torch.Tensor] = []
+        dlnk_true_parts: List[torch.Tensor] = []
+        dlnk_pred_parts: List[torch.Tensor] = []
+        current_hatc_forecast_parts: List[torch.Tensor] = []
+        current_hatc_true_parts: List[torch.Tensor] = []
+        current_lnk_forecast_parts: List[torch.Tensor] = []
+        current_lnk_true_parts: List[torch.Tensor] = []
+        recursive_hatc_true_parts: List[torch.Tensor] = []
+        recursive_hatc_pred_parts: List[torch.Tensor] = []
+        recursive_dlnk_true_parts: List[torch.Tensor] = []
+        recursive_dlnk_pred_parts: List[torch.Tensor] = []
         m_parts: List[torch.Tensor] = []
 
         try:
@@ -3618,8 +3642,13 @@ class Episode:
                         parent.shape[1] >= 9
                         and getattr(self.hyperparams, "fc1_use_true_macro_state_in_stage2", True)
                     )
-                    c_prev_input = parent[:, 7:8] if use_true_prev_macro else parent[:, 5:6]
-                    k_prev_input = parent[:, 8:9] if use_true_prev_macro else parent[:, 6:7]
+                    has_true_prev_macro = parent.shape[1] >= 9
+                    c_prev_true = parent[:, 7:8] if has_true_prev_macro else parent[:, 5:6]
+                    k_prev_true = parent[:, 8:9] if has_true_prev_macro else parent[:, 6:7]
+                    c_prev_forecast = parent[:, 5:6]
+                    k_prev_forecast = parent[:, 6:7]
+                    c_prev_input = c_prev_true if use_true_prev_macro else c_prev_forecast
+                    k_prev_input = k_prev_true if use_true_prev_macro else k_prev_forecast
                     _, _, M, c_children, k_children = model.forward_step(
                         x_prev=parent[:, 4:5],
                         x_curr=children_t[:, :, 4:5],
@@ -3641,6 +3670,28 @@ class Episode:
                         hatc_pred_parts.append(c_children.detach().reshape(-1).cpu())
                         lnk_true_parts.append(lnkf_true.detach().reshape(-1).cpu())
                         lnk_pred_parts.append(k_children.detach().reshape(-1).cpu())
+                        dlnk_true_parts.append((lnkf_true - k_prev_true.unsqueeze(1)).detach().reshape(-1).cpu())
+                        dlnk_pred_parts.append((k_children - k_prev_true.unsqueeze(1)).detach().reshape(-1).cpu())
+                        if has_true_prev_macro:
+                            current_hatc_forecast_parts.append(c_prev_forecast.detach().reshape(-1).cpu())
+                            current_hatc_true_parts.append(c_prev_true.detach().reshape(-1).cpu())
+                            current_lnk_forecast_parts.append(k_prev_forecast.detach().reshape(-1).cpu())
+                            current_lnk_true_parts.append(k_prev_true.detach().reshape(-1).cpu())
+                            _, _, _, c_children_recursive, k_children_recursive = model.forward_step(
+                                x_prev=parent[:, 4:5],
+                                x_curr=children_t[:, :, 4:5],
+                                hatcf_prev=c_prev_forecast,
+                                lnkf_prev=k_prev_forecast,
+                                return_physical=True
+                            )
+                            recursive_hatc_true_parts.append(hatcf_true.detach().reshape(-1).cpu())
+                            recursive_hatc_pred_parts.append(c_children_recursive.detach().reshape(-1).cpu())
+                            recursive_dlnk_true_parts.append(
+                                (lnkf_true - k_prev_forecast.unsqueeze(1)).detach().reshape(-1).cpu()
+                            )
+                            recursive_dlnk_pred_parts.append(
+                                (k_children_recursive - k_prev_forecast.unsqueeze(1)).detach().reshape(-1).cpu()
+                            )
                     m_parts.append(M.detach().reshape(-1).cpu())
         finally:
             if was_training:
@@ -3668,6 +3719,30 @@ class Episode:
 
         _safe_metric_pair('hatc', hatc_true_parts, hatc_pred_parts)
         _safe_metric_pair('lnk', lnk_true_parts, lnk_pred_parts)
+        _safe_metric_pair('primary_true_state_hatc_next', hatc_true_parts, hatc_pred_parts)
+        _safe_metric_pair('primary_true_state_lnk_next', lnk_true_parts, lnk_pred_parts)
+        _safe_metric_pair('primary_true_state_dlnk_next', dlnk_true_parts, dlnk_pred_parts)
+        _safe_metric_pair('recursive_forecast_state_hatc_next', recursive_hatc_true_parts, recursive_hatc_pred_parts)
+        _safe_metric_pair('recursive_forecast_state_dlnk_next', recursive_dlnk_true_parts, recursive_dlnk_pred_parts)
+
+        def _safe_gap_metrics(name: str, true_parts: List[torch.Tensor], pred_parts: List[torch.Tensor]) -> None:
+            if not true_parts or not pred_parts:
+                return
+            y = torch.cat(true_parts).to(torch.float32)
+            p = torch.cat(pred_parts).to(torch.float32)
+            mask = torch.isfinite(y) & torch.isfinite(p)
+            out[f'{prefix}_{name}_n'] = float(mask.sum().item())
+            if int(mask.sum().item()) == 0:
+                return
+            d = p[mask] - y[mask]
+            out[f'{prefix}_{name}_mean_error'] = float(d.mean().item())
+            out[f'{prefix}_{name}_mae'] = float(d.abs().mean().item())
+            out[f'{prefix}_{name}_rmse'] = float(torch.sqrt(d.pow(2).mean()).item())
+            out[f'{prefix}_{name}_p50_abs'] = float(torch.quantile(d.abs(), 0.50).item())
+            out[f'{prefix}_{name}_p90_abs'] = float(torch.quantile(d.abs(), 0.90).item())
+
+        _safe_gap_metrics('current_belief_hatc_vs_realized', current_hatc_true_parts, current_hatc_forecast_parts)
+        _safe_gap_metrics('current_belief_lnk_vs_realized', current_lnk_true_parts, current_lnk_forecast_parts)
 
         if m_parts:
             m = torch.cat(m_parts).to(torch.float32)
