@@ -587,53 +587,173 @@ class Episode:
             torch.cuda.set_rng_state_all(state['cuda'])
 
     @staticmethod
-    def _table_selected_snapshot(table: Optional[TensorTable], columns: List[str]) -> Dict[str, torch.Tensor]:
-        if table is None or table.data.numel() == 0:
-            return {}
-        col = {name: i for i, name in enumerate(table.columns)}
-        out: Dict[str, torch.Tensor] = {}
+    def _selected_frame_snapshot(
+        table: Optional[TensorTable],
+        dataframe: Optional[pd.DataFrame],
+        columns: List[str],
+        key_columns: Optional[List[str]] = None
+    ) -> pd.DataFrame:
+        """
+        Materialize only selected diagnostic columns, preferring tensor data.
+        This avoids copying the full firm table while still supporting df mode.
+        """
+        key_columns = key_columns or []
+        wanted: List[str] = []
+        for name in key_columns + columns:
+            if name not in wanted:
+                wanted.append(name)
+        if table is not None and table.data.numel() > 0:
+            col = {name: i for i, name in enumerate(table.columns)}
+            have = [name for name in wanted if name in col]
+            if not have:
+                return pd.DataFrame()
+            idx = [col[name] for name in have]
+            arr = table.data[:, idx].detach().cpu().numpy()
+            out = pd.DataFrame(arr, columns=have)
+        elif dataframe is not None and not dataframe.empty:
+            have = [name for name in wanted if name in dataframe.columns]
+            if not have:
+                return pd.DataFrame()
+            out = dataframe.loc[:, have].copy()
+        else:
+            return pd.DataFrame()
+
+        for name in key_columns:
+            if name in out.columns:
+                if name == 'ID':
+                    out[name] = out[name].astype(str)
+                else:
+                    out[name] = np.rint(pd.to_numeric(out[name], errors='coerce')).astype('Int64')
+        return out
+
+    @staticmethod
+    def _snapshot_stats(prefix: str, frame: pd.DataFrame, columns: Optional[List[str]] = None) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        if frame is None or frame.empty:
+            return out
+        columns = columns or list(frame.columns)
         for name in columns:
-            if name in col:
-                out[name] = table.data[:, col[name]].detach().cpu().clone()
+            if name not in frame.columns:
+                continue
+            v = pd.to_numeric(frame[name], errors='coerce').to_numpy(dtype=np.float64)
+            finite = v[np.isfinite(v)]
+            key = f'{prefix}_{name}'
+            out[f'{key}_n'] = float(finite.size)
+            if finite.size == 0:
+                continue
+            out[f'{key}_mean'] = float(np.mean(finite))
+            out[f'{key}_std'] = float(np.std(finite))
+            out[f'{key}_p50'] = float(np.quantile(finite, 0.50))
+            out[f'{key}_p90'] = float(np.quantile(finite, 0.90))
+            out[f'{key}_p99'] = float(np.quantile(finite, 0.99))
         return out
 
     @staticmethod
-    def _snapshot_stats(prefix: str, snapshot: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    def _keyed_snapshot_gap(
+        prefix: str,
+        old: pd.DataFrame,
+        new: pd.DataFrame,
+        key_columns: List[str],
+        value_columns: List[str]
+    ) -> Dict[str, float]:
         out: Dict[str, float] = {}
-        for name, value in snapshot.items():
-            v = value.reshape(-1).to(torch.float32)
-            finite = v[torch.isfinite(v)]
-            key = f'{prefix}_{name}'
-            out[f'{key}_n'] = float(finite.numel())
-            if finite.numel() == 0:
-                continue
-            out[f'{key}_mean'] = float(finite.mean().item())
-            out[f'{key}_std'] = float(finite.std(unbiased=False).item()) if finite.numel() > 1 else 0.0
-            out[f'{key}_p50'] = float(torch.quantile(finite, 0.50).item())
-            out[f'{key}_p90'] = float(torch.quantile(finite, 0.90).item())
-            out[f'{key}_p99'] = float(torch.quantile(finite, 0.99).item())
-        return out
+        if not key_columns:
+            out[f'{prefix}_keyed'] = 0.0
+            out[f'{prefix}_common_rows'] = 0.0
+            return out
+        if old is None or new is None or old.empty or new.empty:
+            out[f'{prefix}_old_rows'] = float(0 if old is None else len(old))
+            out[f'{prefix}_new_rows'] = float(0 if new is None else len(new))
+            out[f'{prefix}_common_rows'] = 0.0
+            return out
+        if any(k not in old.columns or k not in new.columns for k in key_columns):
+            out[f'{prefix}_keyed'] = 0.0
+            return out
 
-    @staticmethod
-    def _snapshot_gap(prefix: str, old: Dict[str, torch.Tensor], new: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        out: Dict[str, float] = {}
-        for name in sorted(set(old).intersection(new)):
-            a = old[name].reshape(-1).to(torch.float32)
-            b = new[name].reshape(-1).to(torch.float32)
-            n = min(a.numel(), b.numel())
-            if n == 0:
-                continue
-            a = a[:n]
-            b = b[:n]
-            mask = torch.isfinite(a) & torch.isfinite(b)
+        old_keyed = old.dropna(subset=key_columns).drop_duplicates(subset=key_columns)
+        new_keyed = new.dropna(subset=key_columns).drop_duplicates(subset=key_columns)
+        old_keys = old_keyed.loc[:, key_columns]
+        new_keys = new_keyed.loc[:, key_columns]
+        common_keys = old_keys.merge(new_keys, on=key_columns, how='inner')
+        out[f'{prefix}_keyed'] = 1.0
+        out[f'{prefix}_old_rows'] = float(len(old_keyed))
+        out[f'{prefix}_new_rows'] = float(len(new_keyed))
+        out[f'{prefix}_common_rows'] = float(len(common_keys))
+        out[f'{prefix}_old_only_rows'] = float(max(len(old_keyed) - len(common_keys), 0))
+        out[f'{prefix}_new_only_rows'] = float(max(len(new_keyed) - len(common_keys), 0))
+
+        have_values = [
+            name for name in value_columns
+            if name in old_keyed.columns and name in new_keyed.columns
+        ]
+        if not have_values or common_keys.empty:
+            return out
+        merged = old_keyed.loc[:, key_columns + have_values].merge(
+            new_keyed.loc[:, key_columns + have_values],
+            on=key_columns,
+            how='inner',
+            suffixes=('_old', '_new')
+        )
+        for name in have_values:
+            a = pd.to_numeric(merged[f'{name}_old'], errors='coerce').to_numpy(dtype=np.float64)
+            b = pd.to_numeric(merged[f'{name}_new'], errors='coerce').to_numpy(dtype=np.float64)
+            mask = np.isfinite(a) & np.isfinite(b)
             key = f'{prefix}_{name}'
-            out[f'{key}_n_common'] = float(mask.sum().item())
-            if int(mask.sum().item()) == 0:
+            out[f'{key}_n_common'] = float(mask.sum())
+            if not mask.any():
                 continue
             d = b[mask] - a[mask]
-            out[f'{key}_mae'] = float(d.abs().mean().item())
-            out[f'{key}_mean_delta'] = float(d.mean().item())
-            out[f'{key}_rmse'] = float(torch.sqrt(d.pow(2).mean()).item())
+            out[f'{key}_mae'] = float(np.mean(np.abs(d)))
+            out[f'{key}_mean_delta'] = float(np.mean(d))
+            out[f'{key}_rmse'] = float(np.sqrt(np.mean(d ** 2)))
+        return out
+
+    @staticmethod
+    def _firm_economic_moments(prefix: str, frame: pd.DataFrame) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        if frame is None or frame.empty:
+            out[f'{prefix}_n_rows'] = 0.0
+            return out
+        out[f'{prefix}_n_rows'] = float(len(frame))
+        key_cols = [k for k in ['path', 't', 'branch', 'ID'] if k in frame.columns]
+        if key_cols:
+            out[f'{prefix}_n_keys'] = float(len(frame.dropna(subset=key_cols).drop_duplicates(subset=key_cols)))
+        if 'entry' in frame.columns:
+            entry = pd.to_numeric(frame['entry'], errors='coerce').to_numpy(dtype=np.float64)
+            entry = entry[np.isfinite(entry)]
+            out[f'{prefix}_entry_rate'] = float(np.mean(entry > 0.5)) if entry.size else float('nan')
+        if 'Bar_z' in frame.columns:
+            bar_z = pd.to_numeric(frame['Bar_z'], errors='coerce').to_numpy(dtype=np.float64)
+            bar_z = bar_z[np.isfinite(bar_z)]
+            out[f'{prefix}_exit_rule_rate_bar_z_ge_0p5'] = float(np.mean(bar_z >= 0.5)) if bar_z.size else float('nan')
+        if 'Bar_i' in frame.columns:
+            bar_i = pd.to_numeric(frame['Bar_i'], errors='coerce').to_numpy(dtype=np.float64)
+            bar_i = bar_i[np.isfinite(bar_i)]
+            out[f'{prefix}_investment_rule_rate_bar_i_ge_0p5'] = float(np.mean(bar_i >= 0.5)) if bar_i.size else float('nan')
+        if 'b' in frame.columns:
+            b = pd.to_numeric(frame['b'], errors='coerce').to_numpy(dtype=np.float64)
+            b = b[np.isfinite(b)]
+            out[f'{prefix}_mean_leverage_b'] = float(np.mean(b)) if b.size else float('nan')
+        for name in ['P', 'Q']:
+            if name in frame.columns:
+                v = pd.to_numeric(frame[name], errors='coerce').to_numpy(dtype=np.float64)
+                v = v[np.isfinite(v)]
+                out[f'{prefix}_mean_{name}'] = float(np.mean(v)) if v.size else float('nan')
+        return out
+
+    @staticmethod
+    def _prefixed_delta(prefix: str, old_stats: Dict[str, float], new_stats: Dict[str, float], old_prefix: str, new_prefix: str) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for old_key, old_value in old_stats.items():
+            if not old_key.startswith(old_prefix):
+                continue
+            suffix = old_key[len(old_prefix):]
+            new_key = f'{new_prefix}{suffix}'
+            new_value = new_stats.get(new_key)
+            if new_value is None:
+                continue
+            if np.isfinite(old_value) and np.isfinite(new_value):
+                out[f'{prefix}{suffix}_delta'] = float(new_value - old_value)
         return out
 
     @staticmethod
@@ -3462,6 +3582,106 @@ class Episode:
         logger.info("FC2 Epochs finished: %s", avg_losses)
         return {'final_losses': avg_losses}
 
+    def _evaluate_sdf_fc1_batches(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+        prefix: str,
+        max_batches: Optional[int] = None
+    ) -> Dict[str, float]:
+        if not batches or 'sdf_fc1' not in self.models:
+            return {}
+        model = self.models['sdf_fc1']
+        was_training = bool(getattr(model, 'training', False))
+        model.eval()
+        max_batches = len(batches) if max_batches is None else min(max_batches, len(batches))
+
+        hatc_true_parts: List[torch.Tensor] = []
+        hatc_pred_parts: List[torch.Tensor] = []
+        lnk_true_parts: List[torch.Tensor] = []
+        lnk_pred_parts: List[torch.Tensor] = []
+        m_parts: List[torch.Tensor] = []
+
+        try:
+            with torch.no_grad():
+                for batch in batches[:max_batches]:
+                    parent = batch['parent']
+                    children = batch.get('children', [])
+                    if not children:
+                        child0 = batch.get('child0')
+                        child1 = batch.get('child1')
+                        if child0 is not None and child1 is not None:
+                            children = [child0, child1]
+                    if not children or len(children) < 2:
+                        continue
+                    children_t = torch.stack(children[:2], dim=1)
+                    use_true_prev_macro = bool(
+                        parent.shape[1] >= 9
+                        and getattr(self.hyperparams, "fc1_use_true_macro_state_in_stage2", True)
+                    )
+                    c_prev_input = parent[:, 7:8] if use_true_prev_macro else parent[:, 5:6]
+                    k_prev_input = parent[:, 8:9] if use_true_prev_macro else parent[:, 6:7]
+                    _, _, M, c_children, k_children = model.forward_step(
+                        x_prev=parent[:, 4:5],
+                        x_curr=children_t[:, :, 4:5],
+                        hatcf_prev=c_prev_input,
+                        lnkf_prev=k_prev_input,
+                        return_physical=True
+                    )
+                    if children_t.shape[-1] >= 10:
+                        hatcf_true = children_t[:, :, 8:9]
+                        lnkf_true = children_t[:, :, 9:10]
+                    elif children_t.shape[-1] >= 9:
+                        hatcf_true = children_t[:, :, 7:8]
+                        lnkf_true = children_t[:, :, 8:9]
+                    else:
+                        hatcf_true = None
+                        lnkf_true = None
+                    if hatcf_true is not None and lnkf_true is not None:
+                        hatc_true_parts.append(hatcf_true.detach().reshape(-1).cpu())
+                        hatc_pred_parts.append(c_children.detach().reshape(-1).cpu())
+                        lnk_true_parts.append(lnkf_true.detach().reshape(-1).cpu())
+                        lnk_pred_parts.append(k_children.detach().reshape(-1).cpu())
+                    m_parts.append(M.detach().reshape(-1).cpu())
+        finally:
+            if was_training:
+                model.train()
+
+        out: Dict[str, float] = {}
+
+        def _safe_metric_pair(name: str, true_parts: List[torch.Tensor], pred_parts: List[torch.Tensor]) -> None:
+            if not true_parts or not pred_parts:
+                return
+            y = torch.cat(true_parts).to(torch.float32)
+            p = torch.cat(pred_parts).to(torch.float32)
+            mask = torch.isfinite(y) & torch.isfinite(p)
+            out[f'{prefix}_{name}_n'] = float(mask.sum().item())
+            if int(mask.sum().item()) < 2:
+                out[f'{prefix}_{name}_r2'] = float('nan')
+                out[f'{prefix}_{name}_rmse'] = float('nan')
+                return
+            y = y[mask]
+            p = p[mask]
+            sst = (y - y.mean()).pow(2).sum()
+            sse = (y - p).pow(2).sum()
+            out[f'{prefix}_{name}_r2'] = float((1.0 - sse / sst).item()) if float(sst.item()) > 1e-12 else float('nan')
+            out[f'{prefix}_{name}_rmse'] = float(torch.sqrt((y - p).pow(2).mean()).item())
+
+        _safe_metric_pair('hatc', hatc_true_parts, hatc_pred_parts)
+        _safe_metric_pair('lnk', lnk_true_parts, lnk_pred_parts)
+
+        if m_parts:
+            m = torch.cat(m_parts).to(torch.float32)
+            m = m[torch.isfinite(m)]
+            out[f'{prefix}_M_n'] = float(m.numel())
+            if m.numel() > 0:
+                out[f'{prefix}_M_p50'] = float(torch.quantile(m, 0.50).item())
+                out[f'{prefix}_M_p90'] = float(torch.quantile(m, 0.90).item())
+                out[f'{prefix}_M_p99'] = float(torch.quantile(m, 0.99).item())
+                out[f'{prefix}_M_max'] = float(m.max().item())
+                out[f'{prefix}_M_lt_0p7_rate'] = float((m < 0.7).to(torch.float32).mean().item())
+                out[f'{prefix}_M_gt_1p3_rate'] = float((m > 1.3).to(torch.float32).mean().item())
+        return out
+
     def _run_sdf_recon_from_macro(
         self,
         module_summaries: Dict,
@@ -3510,6 +3730,15 @@ class Episode:
                 sdf_table, batch_size=batch_size, n_branches=n_branches
             )
             if sdf_batches:
+                eval_batches = int(getattr(self.hyperparams, "sdf_fc1_eval_max_batches", 0))
+                eval_batches_arg = eval_batches if eval_batches > 0 else None
+                before_eval = self._evaluate_sdf_fc1_batches(
+                    sdf_batches,
+                    prefix='before',
+                    max_batches=eval_batches_arg
+                )
+                if before_eval:
+                    module_summaries['sdf_fc1_fixed_batch_eval_before'] = before_eval
                 tf_epochs = max(0, int(getattr(self.hyperparams, "fc1_teacher_forcing_epochs", 0)))
                 if tf_epochs > 0:
                     self._fc1_teacher_forcing_stage = True
@@ -3522,6 +3751,13 @@ class Episode:
                 )
                 # keep backward compatibility for consumers expecting a single sdf_fc1 key
                 module_summaries['sdf_fc1'] = module_summaries['sdf_fc1_stage2']
+                after_eval = self._evaluate_sdf_fc1_batches(
+                    sdf_batches,
+                    prefix='after',
+                    max_batches=eval_batches_arg
+                )
+                if after_eval:
+                    module_summaries['sdf_fc1_fixed_batch_eval_after'] = after_eval
         finally:
             self.add_FC1loss = prev_flag
             self._fc1_teacher_forcing_stage = prev_teacher_flag
@@ -3753,14 +3989,29 @@ class Episode:
                         simulate_kwargs=simulate_kwargs
                     )
 
-                old_macro_snapshot = self._table_selected_snapshot(
+                macro_key_columns = ['path', 't', 'branch']
+                macro_diag_columns = ['Hatc', 'LnK', 'hatcf', 'lnkf', 'M', 'n_firms', 'K', 'C']
+                firm_key_columns = ['path', 't', 'branch', 'ID']
+                firm_diag_columns = ['bp', 'Bar_i', 'Bar_z', 'entry', 'b', 'z', 'K', 'P', 'Q']
+                old_macro_snapshot = self._selected_frame_snapshot(
                     self.tensor_macro,
-                    ['Hatc', 'LnK', 'hatcf', 'lnkf', 'M', 'n_firms', 'K', 'C']
+                    self.df_macro,
+                    macro_diag_columns,
+                    key_columns=macro_key_columns
                 )
-                old_firm_snapshot = self._table_selected_snapshot(
+                old_firm_snapshot = self._selected_frame_snapshot(
                     self.tensor_firm,
-                    ['bp', 'Bar_i', 'Bar_z', 'entry', 'b', 'z', 'K', 'M', 'P', 'Q']
+                    self.df,
+                    firm_diag_columns,
+                    key_columns=firm_key_columns
                 )
+                old_firm_stats = self._snapshot_stats('old_firm', old_firm_snapshot, firm_diag_columns)
+                old_firm_stats.update(self._firm_economic_moments('old_firm', old_firm_snapshot))
+                old_firm_keys = old_firm_snapshot.loc[
+                    :,
+                    [k for k in firm_key_columns if k in old_firm_snapshot.columns]
+                ].copy() if not old_firm_snapshot.empty else pd.DataFrame()
+                del old_firm_snapshot
                 modeb_old_diag: Dict[str, Any] = {
                     'resimulate_after_pv': bool(modeb_resimulate_after_pv),
                     'macro_r2': (
@@ -3769,8 +4020,8 @@ class Episode:
                         else self._macro_forecast_r2(self.df_macro)
                     ),
                 }
-                modeb_old_diag.update(self._snapshot_stats('old_macro', old_macro_snapshot))
-                modeb_old_diag.update(self._snapshot_stats('old_firm', old_firm_snapshot))
+                modeb_old_diag.update(self._snapshot_stats('old_macro', old_macro_snapshot, macro_diag_columns))
+                modeb_old_diag.update(old_firm_stats)
                 module_summaries['modeb_pre_pv_simulation_diag'] = modeb_old_diag
 
                 if use_policy_value:
@@ -3808,32 +4059,67 @@ class Episode:
                             simulate_kwargs=simulate_kwargs
                         )
                     self._restore_rng_state(rng_after_pv_training)
-                    new_macro_snapshot = self._table_selected_snapshot(
+                    new_macro_snapshot = self._selected_frame_snapshot(
                         self.tensor_macro,
-                        ['Hatc', 'LnK', 'hatcf', 'lnkf', 'M', 'n_firms', 'K', 'C']
+                        self.df_macro,
+                        macro_diag_columns,
+                        key_columns=macro_key_columns
                     )
-                    new_firm_snapshot = self._table_selected_snapshot(
+                    new_firm_snapshot = self._selected_frame_snapshot(
                         self.tensor_firm,
-                        ['bp', 'Bar_i', 'Bar_z', 'entry', 'b', 'z', 'K', 'M', 'P', 'Q']
+                        self.df,
+                        firm_diag_columns,
+                        key_columns=firm_key_columns
                     )
+                    new_firm_stats = self._snapshot_stats('new_firm', new_firm_snapshot, firm_diag_columns)
+                    new_firm_stats.update(self._firm_economic_moments('new_firm', new_firm_snapshot))
+                    new_firm_keys = new_firm_snapshot.loc[
+                        :,
+                        [k for k in firm_key_columns if k in new_firm_snapshot.columns]
+                    ].copy() if not new_firm_snapshot.empty else pd.DataFrame()
                     modeb_refresh_diag: Dict[str, Any] = {
                         'resimulated_after_pv': True,
-                        'common_random_numbers': True,
+                        'rng_state_replayed': True,
                         'macro_r2': (
                             self._macro_forecast_r2_tensor(self.tensor_macro)
                             if tensor_pipeline and self.tensor_macro is not None
                             else self._macro_forecast_r2(self.df_macro)
                         ),
                     }
-                    modeb_refresh_diag.update(self._snapshot_stats('new_macro', new_macro_snapshot))
-                    modeb_refresh_diag.update(self._snapshot_stats('new_firm', new_firm_snapshot))
-                    modeb_refresh_diag.update(self._snapshot_gap('macro_old_to_new', old_macro_snapshot, new_macro_snapshot))
-                    modeb_refresh_diag.update(self._snapshot_gap('firm_old_to_new', old_firm_snapshot, new_firm_snapshot))
+                    modeb_refresh_diag.update(self._snapshot_stats('new_macro', new_macro_snapshot, macro_diag_columns))
+                    modeb_refresh_diag.update(new_firm_stats)
+                    modeb_refresh_diag.update(
+                        self._keyed_snapshot_gap(
+                            'macro_old_to_new',
+                            old_macro_snapshot,
+                            new_macro_snapshot,
+                            key_columns=macro_key_columns,
+                            value_columns=macro_diag_columns
+                        )
+                    )
+                    modeb_refresh_diag.update(
+                        self._keyed_snapshot_gap(
+                            'firm_old_to_new_keys',
+                            old_firm_keys,
+                            new_firm_keys,
+                            key_columns=[k for k in firm_key_columns if k in old_firm_keys.columns and k in new_firm_keys.columns],
+                            value_columns=[]
+                        )
+                    )
+                    modeb_refresh_diag.update(
+                        self._prefixed_delta(
+                            'firm_new_minus_old',
+                            old_firm_stats,
+                            new_firm_stats,
+                            old_prefix='old_firm',
+                            new_prefix='new_firm'
+                        )
+                    )
                     module_summaries['modeb_post_pv_resimulation_diag'] = modeb_refresh_diag
                 else:
                     module_summaries['modeb_post_pv_resimulation_diag'] = {
                         'resimulated_after_pv': False,
-                        'common_random_numbers': False,
+                        'rng_state_replayed': False,
                     }
 
                 if use_sdf_fc1:
