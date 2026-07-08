@@ -31,6 +31,7 @@ POST0_MODE="${POST0_MODE:-modeb}"
 ALTERNATE_START="${ALTERNATE_START:-modea}"
 ENABLE_FC2="${ENABLE_FC2:-0}"
 QUICK_TEST="${QUICK_TEST:-0}"
+MODEB_RESIMULATE_AFTER_PV="${MODEB_RESIMULATE_AFTER_PV:-0}"
 
 mkdir -p "$LOG_DIR" "$RUN_ROOT" "$WORK_ROOT/cachedir" "$WORK_ROOT/.mplcache"
 cd "$REPO_DIR"
@@ -72,6 +73,11 @@ fi
 if [[ "$QUICK_TEST" == "1" ]]; then
   EXTRA_ARGS+=(--quick-test)
 fi
+if [[ "$MODEB_RESIMULATE_AFTER_PV" == "1" ]]; then
+  EXTRA_ARGS+=(--modeb-resimulate-after-pv)
+else
+  EXTRA_ARGS+=(--no-modeb-resimulate-after-pv)
+fi
 
 echo "Run parameters:"
 echo "  N_EPISODES=$N_EPISODES"
@@ -85,6 +91,7 @@ echo "  POST0_MODE=$POST0_MODE"
 echo "  ALTERNATE_START=$ALTERNATE_START"
 echo "  ENABLE_FC2=$ENABLE_FC2"
 echo "  QUICK_TEST=$QUICK_TEST"
+echo "  MODEB_RESIMULATE_AFTER_PV=$MODEB_RESIMULATE_AFTER_PV"
 
 python3 -u experiments/run_multi_episode_job.py \
   --run-root "$RUN_ROOT" \

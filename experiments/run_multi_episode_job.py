@@ -84,6 +84,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-rolling-grad-threshold", type=float, default=None, help="Rolling policy/value grad gate floor")
     parser.add_argument("--policy-loss-threshold", type=float, default=None, help="Absolute policy/value loss gate")
     parser.add_argument("--pv-sdf-clip-ratio-gate", type=float, default=None, help="Reject stage if raw SDF clip ratio exceeds this value")
+    parser.add_argument(
+        "--modeb-resimulate-after-pv",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Treatment B: resimulate Mode B data after Policy/Value training and before SDF/FC1 Stage 2",
+    )
     return parser.parse_args()
 
 
@@ -209,6 +215,7 @@ def main():
         simulate_kwargs = {
             "horizon_mode1": 1,
             "horizon": hyperparams.simulate_horizon,
+            "modeb_resimulate_after_pv": args.modeb_resimulate_after_pv,
         }
         try:
             summary = episode.run_episode(
@@ -238,6 +245,7 @@ def main():
                     "simulate_group_size": simulate_group_size,
                     "simulate_horizon": hyperparams.simulate_horizon,
                     "post0_mode": args.post0_mode,
+                    "modeb_resimulate_after_pv": args.modeb_resimulate_after_pv,
                     "max_firm_train_units": hyperparams.max_firm_train_units,
                 },
             }

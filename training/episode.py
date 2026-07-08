@@ -567,6 +567,75 @@ class Episode:
             df['ID'] = df['ID'].astype(str)
         return df
 
+    def _capture_rng_state(self) -> Dict[str, Any]:
+        state: Dict[str, Any] = {
+            'torch': torch.get_rng_state(),
+            'numpy': np.random.get_state(),
+        }
+        if torch.cuda.is_available():
+            state['cuda'] = torch.cuda.get_rng_state_all()
+        return state
+
+    def _restore_rng_state(self, state: Optional[Dict[str, Any]]) -> None:
+        if not state:
+            return
+        if 'torch' in state:
+            torch.set_rng_state(state['torch'])
+        if 'numpy' in state:
+            np.random.set_state(state['numpy'])
+        if 'cuda' in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state['cuda'])
+
+    @staticmethod
+    def _table_selected_snapshot(table: Optional[TensorTable], columns: List[str]) -> Dict[str, torch.Tensor]:
+        if table is None or table.data.numel() == 0:
+            return {}
+        col = {name: i for i, name in enumerate(table.columns)}
+        out: Dict[str, torch.Tensor] = {}
+        for name in columns:
+            if name in col:
+                out[name] = table.data[:, col[name]].detach().cpu().clone()
+        return out
+
+    @staticmethod
+    def _snapshot_stats(prefix: str, snapshot: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for name, value in snapshot.items():
+            v = value.reshape(-1).to(torch.float32)
+            finite = v[torch.isfinite(v)]
+            key = f'{prefix}_{name}'
+            out[f'{key}_n'] = float(finite.numel())
+            if finite.numel() == 0:
+                continue
+            out[f'{key}_mean'] = float(finite.mean().item())
+            out[f'{key}_std'] = float(finite.std(unbiased=False).item()) if finite.numel() > 1 else 0.0
+            out[f'{key}_p50'] = float(torch.quantile(finite, 0.50).item())
+            out[f'{key}_p90'] = float(torch.quantile(finite, 0.90).item())
+            out[f'{key}_p99'] = float(torch.quantile(finite, 0.99).item())
+        return out
+
+    @staticmethod
+    def _snapshot_gap(prefix: str, old: Dict[str, torch.Tensor], new: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for name in sorted(set(old).intersection(new)):
+            a = old[name].reshape(-1).to(torch.float32)
+            b = new[name].reshape(-1).to(torch.float32)
+            n = min(a.numel(), b.numel())
+            if n == 0:
+                continue
+            a = a[:n]
+            b = b[:n]
+            mask = torch.isfinite(a) & torch.isfinite(b)
+            key = f'{prefix}_{name}'
+            out[f'{key}_n_common'] = float(mask.sum().item())
+            if int(mask.sum().item()) == 0:
+                continue
+            d = b[mask] - a[mask]
+            out[f'{key}_mae'] = float(d.abs().mean().item())
+            out[f'{key}_mean_delta'] = float(d.mean().item())
+            out[f'{key}_rmse'] = float(torch.sqrt(d.pow(2).mean()).item())
+        return out
+
     @staticmethod
     def _encode_int_keys(
         path: torch.Tensor,
@@ -3504,6 +3573,7 @@ class Episode:
 
         horizon_mode1 = int(simulate_kwargs.pop('horizon_mode1', 1))
         horizon_modeb = int(simulate_kwargs.pop('horizon', getattr(self.hyperparams, 'simulate_horizon', 20)))
+        modeb_resimulate_after_pv = bool(simulate_kwargs.pop('modeb_resimulate_after_pv', False))
         mode = self._resolve_episode_mode(episode_mode)
         tensor_pipeline = self._use_tensor_pipeline()
 
@@ -3664,6 +3734,7 @@ class Episode:
                     )
 
             elif mode == 'modeb':
+                modeb_rng_before_first_sim = self._capture_rng_state()
                 if tensor_pipeline:
                     self._simulate_tensor(
                         n_paths=n_paths,
@@ -3682,6 +3753,26 @@ class Episode:
                         simulate_kwargs=simulate_kwargs
                     )
 
+                old_macro_snapshot = self._table_selected_snapshot(
+                    self.tensor_macro,
+                    ['Hatc', 'LnK', 'hatcf', 'lnkf', 'M', 'n_firms', 'K', 'C']
+                )
+                old_firm_snapshot = self._table_selected_snapshot(
+                    self.tensor_firm,
+                    ['bp', 'Bar_i', 'Bar_z', 'entry', 'b', 'z', 'K', 'M', 'P', 'Q']
+                )
+                modeb_old_diag: Dict[str, Any] = {
+                    'resimulate_after_pv': bool(modeb_resimulate_after_pv),
+                    'macro_r2': (
+                        self._macro_forecast_r2_tensor(self.tensor_macro)
+                        if tensor_pipeline and self.tensor_macro is not None
+                        else self._macro_forecast_r2(self.df_macro)
+                    ),
+                }
+                modeb_old_diag.update(self._snapshot_stats('old_macro', old_macro_snapshot))
+                modeb_old_diag.update(self._snapshot_stats('old_firm', old_firm_snapshot))
+                module_summaries['modeb_pre_pv_simulation_diag'] = modeb_old_diag
+
                 if use_policy_value:
                     if tensor_pipeline and self.tensor_firm is not None:
                         pv_batches = self._create_firm_batches_from_tensor(
@@ -3695,6 +3786,55 @@ class Episode:
                         module_summaries['policy_value'] = self._run_batches(
                             pv_batches, n_epochs, log_interval, ['policy_value'], desc_prefix='Policy/Value '
                         )
+
+                if modeb_resimulate_after_pv and use_policy_value:
+                    rng_after_pv_training = self._capture_rng_state()
+                    self._restore_rng_state(modeb_rng_before_first_sim)
+                    if tensor_pipeline:
+                        self._simulate_tensor(
+                            n_paths=n_paths,
+                            group_size=group_size,
+                            n_branches=n_branches,
+                            horizon=horizon_modeb,
+                            simulate_kwargs=simulate_kwargs,
+                            export_df=use_fc2
+                        )
+                    else:
+                        self._simulate_df(
+                            n_paths=n_paths,
+                            group_size=group_size,
+                            n_branches=n_branches,
+                            horizon=horizon_modeb,
+                            simulate_kwargs=simulate_kwargs
+                        )
+                    self._restore_rng_state(rng_after_pv_training)
+                    new_macro_snapshot = self._table_selected_snapshot(
+                        self.tensor_macro,
+                        ['Hatc', 'LnK', 'hatcf', 'lnkf', 'M', 'n_firms', 'K', 'C']
+                    )
+                    new_firm_snapshot = self._table_selected_snapshot(
+                        self.tensor_firm,
+                        ['bp', 'Bar_i', 'Bar_z', 'entry', 'b', 'z', 'K', 'M', 'P', 'Q']
+                    )
+                    modeb_refresh_diag: Dict[str, Any] = {
+                        'resimulated_after_pv': True,
+                        'common_random_numbers': True,
+                        'macro_r2': (
+                            self._macro_forecast_r2_tensor(self.tensor_macro)
+                            if tensor_pipeline and self.tensor_macro is not None
+                            else self._macro_forecast_r2(self.df_macro)
+                        ),
+                    }
+                    modeb_refresh_diag.update(self._snapshot_stats('new_macro', new_macro_snapshot))
+                    modeb_refresh_diag.update(self._snapshot_stats('new_firm', new_firm_snapshot))
+                    modeb_refresh_diag.update(self._snapshot_gap('macro_old_to_new', old_macro_snapshot, new_macro_snapshot))
+                    modeb_refresh_diag.update(self._snapshot_gap('firm_old_to_new', old_firm_snapshot, new_firm_snapshot))
+                    module_summaries['modeb_post_pv_resimulation_diag'] = modeb_refresh_diag
+                else:
+                    module_summaries['modeb_post_pv_resimulation_diag'] = {
+                        'resimulated_after_pv': False,
+                        'common_random_numbers': False,
+                    }
 
                 if use_sdf_fc1:
                     if self.episode_id > 0:
