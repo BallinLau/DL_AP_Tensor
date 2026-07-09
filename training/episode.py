@@ -157,6 +157,7 @@ class Episode:
         
         # 训练状态
         self.step_count = 0
+        self.sdf_fc1_step_count = 0
         self.loss_history = {}
         self.add_FC1loss = False
         self.train_mode = '2time'
@@ -1842,6 +1843,7 @@ class Episode:
             if name in self.optimizers:
                 self.optimizers[name].zero_grad()
         
+        stepped_modules = set()
         try:
             # 计算损失
             total_loss = torch.tensor(0.0, device=self.device)
@@ -1936,6 +1938,7 @@ class Episode:
                         for name in train_modules:
                             if name in self.optimizers:
                                 self.optimizers[name].step()
+                                stepped_modules.add(name)
                         self._maybe_update_firm_target(train_modules)
                 else:
                     self._nonfinite_grad_streak = 0
@@ -1960,6 +1963,7 @@ class Episode:
                     for name in train_modules:
                         if name in self.optimizers:
                             self.optimizers[name].step()
+                            stepped_modules.add(name)
                     self._maybe_update_firm_target(train_modules)
         finally:
             self._set_policy_q_only_freeze(False)
@@ -1970,7 +1974,11 @@ class Episode:
         self.weight_scheduler.step(losses)
         for scheduler in self.lr_schedulers.values():
             scheduler.step()
-        
+
+        if 'sdf_fc1' in stepped_modules:
+            self.sdf_fc1_step_count = int(getattr(self, "sdf_fc1_step_count", 0)) + 1
+            losses['sdf_fc1_step_count'] = float(self.sdf_fc1_step_count)
+
         self.step_count += 1
         
         # 记录历史
@@ -2123,10 +2131,11 @@ class Episode:
         jacobian_penalty_interval = int(
             getattr(self.hyperparams, "fc1_jacobian_penalty_interval", 10)
         )
+        sdf_fc1_step_count = int(getattr(self, "sdf_fc1_step_count", 0))
         compute_jacobian_penalty = (
             jacobian_penalty_weight > 0.0
             and jacobian_penalty_interval > 0
-            and self.step_count % jacobian_penalty_interval == 0
+            and sdf_fc1_step_count % jacobian_penalty_interval == 0
         )
         jacobian_penalty_active = False
         delta_hatc_abs_max = float(
@@ -2380,6 +2389,7 @@ class Episode:
                 'sdf_jacobian_penalty_weight': float(jacobian_penalty_weight),
                 'sdf_jacobian_penalty_interval': float(jacobian_penalty_interval),
                 'sdf_jacobian_penalty_active': float(1.0 if jacobian_penalty_active else 0.0),
+                'sdf_fc1_step_count': float(sdf_fc1_step_count),
                 'sdf_hj_warmup_factor': float(hj_warmup_factor),
                 'sdf_teacher_forcing_stage': float(1.0 if self._fc1_teacher_forcing_stage else 0.0),
                 'sdf_use_true_prev_macro': float(1.0 if use_true_prev_macro else 0.0),

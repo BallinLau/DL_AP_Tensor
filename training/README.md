@@ -36,11 +36,12 @@ Training orchestration for episodes and modules.
 - `fc1_jacobian_penalty_weight` enables the forecast-state local Jacobian penalty for FC1.
 - The penalty uses higher-order autograd, so it is not evaluated on every batch by default.
 - `fc1_jacobian_penalty_interval` controls the schedule:
-  - `10` by default: compute the Jacobian penalty every 10 optimizer steps.
+  - `10` by default: compute the Jacobian penalty every 10 SDF/FC1 optimizer steps.
   - `1`: compute it on every step, matching the original expensive behavior.
   - `<=0`: skip the Jacobian penalty even if its weight is positive.
 - Non-Jacobian batches still compute the ordinary true-state reconstruction, forecast-state reconstruction, and delta penalties; they skip only the four `torch.autograd.grad(..., create_graph=True)` calls.
-- Diagnostics include `sdf_jacobian_penalty_interval` and `sdf_jacobian_penalty_active`.
+- The schedule uses `sdf_fc1_step_count`, not the global training step, so Policy/Value and FC2 steps cannot starve the Jacobian penalty.
+- Diagnostics include `sdf_jacobian_penalty_interval`, `sdf_jacobian_penalty_active`, and `sdf_fc1_step_count`.
 - Slurm jobs expose the same control as `FC1_JACOBIAN_PENALTY_INTERVAL`.
 
 ### Policy/Value: Q-first training hooks

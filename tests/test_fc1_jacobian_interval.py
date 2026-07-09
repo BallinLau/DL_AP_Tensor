@@ -50,6 +50,7 @@ def _episode_with_interval(interval: int) -> Episode:
     ep._fc1_teacher_forcing_stage = False
     ep._current_epoch_idx = 0
     ep.step_count = 0
+    ep.sdf_fc1_step_count = 0
     ep._latest_sdf_terms = {}
     ep._latest_sdf_diag = {}
     return ep
@@ -84,16 +85,64 @@ def test_fc1_jacobian_penalty_uses_interval_gate():
     ep = _episode_with_interval(interval=2)
     batch = _batch()
 
-    ep.step_count = 0
+    ep.sdf_fc1_step_count = 0
     ep._compute_sdf_loss(batch)
     assert ep._latest_sdf_terms["sdf_jacobian_penalty_active"] == 1.0
     assert ep._latest_sdf_terms["sdf_jacobian_penalty"] > 0.0
 
-    ep.step_count = 1
+    ep.sdf_fc1_step_count = 1
     ep._compute_sdf_loss(batch)
     assert ep._latest_sdf_terms["sdf_jacobian_penalty_active"] == 0.0
     assert ep._latest_sdf_terms["sdf_jacobian_penalty"] == 0.0
 
 
+def test_fc1_jacobian_penalty_uses_sdf_counter_not_global_counter():
+    ep = _episode_with_interval(interval=2)
+    ep.step_count = 999
+    ep.sdf_fc1_step_count = 0
+
+    ep._compute_sdf_loss(_batch())
+
+    assert ep._latest_sdf_terms["sdf_jacobian_penalty_active"] == 1.0
+    assert ep._latest_sdf_terms["sdf_fc1_step_count"] == 0.0
+
+
+def test_fc1_jacobian_interval_zero_disables_penalty():
+    ep = _episode_with_interval(interval=0)
+    ep.sdf_fc1_step_count = 0
+
+    ep._compute_sdf_loss(_batch())
+
+    assert ep._latest_sdf_terms["sdf_jacobian_penalty_active"] == 0.0
+    assert ep._latest_sdf_terms["sdf_jacobian_penalty"] == 0.0
+
+
+def test_fc1_jacobian_interval_one_computes_every_sdf_step():
+    ep = _episode_with_interval(interval=1)
+    batch = _batch()
+
+    for sdf_step in (0, 1, 2):
+        ep.sdf_fc1_step_count = sdf_step
+        ep._compute_sdf_loss(batch)
+        assert ep._latest_sdf_terms["sdf_jacobian_penalty_active"] == 1.0
+        assert ep._latest_sdf_terms["sdf_jacobian_penalty"] > 0.0
+
+
+def test_fc1_jacobian_active_batch_backward_has_finite_grads():
+    ep = _episode_with_interval(interval=1)
+    loss = ep._compute_sdf_loss(_batch())
+
+    loss.backward()
+
+    grads = [p.grad for p in ep.models["sdf_fc1"].parameters() if p.grad is not None]
+    assert grads
+    for grad in grads:
+        assert torch.isfinite(grad).all()
+
+
 if __name__ == "__main__":
     test_fc1_jacobian_penalty_uses_interval_gate()
+    test_fc1_jacobian_penalty_uses_sdf_counter_not_global_counter()
+    test_fc1_jacobian_interval_zero_disables_penalty()
+    test_fc1_jacobian_interval_one_computes_every_sdf_step()
+    test_fc1_jacobian_active_batch_backward_has_finite_grads()
