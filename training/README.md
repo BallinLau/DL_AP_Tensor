@@ -32,6 +32,17 @@ Training orchestration for episodes and modules.
 - Diagnostics include `sdf_pair_collision_rate`, `sdf_pair_unique_ratio` (index-pair uniqueness), `sdf_index_pair_coverage_ratio`, `sdf_parent_pair_unique_ratio`, `sdf_j1_hist_entropy`, `sdf_j2_hist_entropy`, `sdf_eps_cross_corr`, `sdf_eps1_std`, `sdf_eps2_std`, `sdf_bank_size`, and `sdf_bank_refresh_id`.
 - Signed AiO also logs finite-sample diagnostics such as `sdf_signed_aio_se` and `sdf_signed_aio_negative_share`. These do not change the objective; they only make noisy negative sample estimates visible.
 
+### SDF/FC1: forecast Jacobian penalty schedule
+- `fc1_jacobian_penalty_weight` enables the forecast-state local Jacobian penalty for FC1.
+- The penalty uses higher-order autograd, so it is not evaluated on every batch by default.
+- `fc1_jacobian_penalty_interval` controls the schedule:
+  - `10` by default: compute the Jacobian penalty every 10 optimizer steps.
+  - `1`: compute it on every step, matching the original expensive behavior.
+  - `<=0`: skip the Jacobian penalty even if its weight is positive.
+- Non-Jacobian batches still compute the ordinary true-state reconstruction, forecast-state reconstruction, and delta penalties; they skip only the four `torch.autograd.grad(..., create_graph=True)` calls.
+- Diagnostics include `sdf_jacobian_penalty_interval` and `sdf_jacobian_penalty_active`.
+- Slurm jobs expose the same control as `FC1_JACOBIAN_PENALTY_INTERVAL`.
+
 ### Policy/Value: Q-first training hooks
 - `train_step(..., policy_loss_terms=...)` now supports selective optimization among `['q', 'p0', 'pi']`.
 - `_run_batches(...)` supports Q pretraining via `HyperParams.q_pretrain_epochs` and `HyperParams.q_warmstart_epochs`:

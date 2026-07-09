@@ -121,6 +121,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sdf-child-bank-seed", type=int, default=12345, help="Base seed for SDF shock bank")
     parser.add_argument(
+        "--fc1-jacobian-penalty-interval",
+        type=int,
+        default=None,
+        help="Compute FC1 Jacobian penalty every N optimizer steps; <=0 disables it",
+    )
+    parser.add_argument(
         "--pv-bp-training-mode",
         type=str.lower,
         default=None,
@@ -185,6 +191,8 @@ def configure_hyperparams(args: argparse.Namespace):
     hyperparams.sdf_child_bank_size = args.sdf_child_bank_size
     hyperparams.sdf_child_bank_refresh_epochs = args.sdf_child_bank_refresh_epochs
     hyperparams.sdf_child_bank_seed = args.sdf_child_bank_seed
+    if args.fc1_jacobian_penalty_interval is not None:
+        hyperparams.fc1_jacobian_penalty_interval = args.fc1_jacobian_penalty_interval
     if args.pv_bp_training_mode is not None:
         hyperparams.pv_bp_training_mode = args.pv_bp_training_mode
     if args.bp_grid_coarse_size is not None:

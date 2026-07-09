@@ -169,6 +169,12 @@ def main():
         help="Refresh the SDF shock bank every N epochs",
     )
     parser.add_argument("--sdf-child-bank-seed", type=int, default=12345, help="Base seed for SDF shock bank")
+    parser.add_argument(
+        "--fc1-jacobian-penalty-interval",
+        type=int,
+        default=None,
+        help="Compute FC1 Jacobian penalty every N optimizer steps; <=0 disables it",
+    )
     args = parser.parse_args()
 
     global RUN_ROOT
@@ -184,6 +190,8 @@ def main():
     hyperparams.sdf_child_bank_size = args.sdf_child_bank_size
     hyperparams.sdf_child_bank_refresh_epochs = args.sdf_child_bank_refresh_epochs
     hyperparams.sdf_child_bank_seed = args.sdf_child_bank_seed
+    if args.fc1_jacobian_penalty_interval is not None:
+        hyperparams.fc1_jacobian_penalty_interval = args.fc1_jacobian_penalty_interval
     validate_sdf_fresh_pair_config(hyperparams)
     models = build_models(device)
     optimizers = build_optimizers(models, hyperparams)

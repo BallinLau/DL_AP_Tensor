@@ -2120,6 +2120,15 @@ class Episode:
         jacobian_penalty_weight = float(
             getattr(self.hyperparams, "fc1_jacobian_penalty_weight", 0.0)
         )
+        jacobian_penalty_interval = int(
+            getattr(self.hyperparams, "fc1_jacobian_penalty_interval", 10)
+        )
+        compute_jacobian_penalty = (
+            jacobian_penalty_weight > 0.0
+            and jacobian_penalty_interval > 0
+            and self.step_count % jacobian_penalty_interval == 0
+        )
+        jacobian_penalty_active = False
         delta_hatc_abs_max = float(
             getattr(self.hyperparams, "fc1_delta_hatc_abs_max", float("inf"))
         )
@@ -2183,8 +2192,11 @@ class Episode:
                 and parent.shape[1] >= 7
                 and children_t.shape[-1] >= 9
             ):
-                hatcf_prev_forecast = parent[:, 5:6].detach().clone().requires_grad_(True)
-                lnkf_prev_forecast = parent[:, 6:7].detach().clone().requires_grad_(True)
+                hatcf_prev_forecast = parent[:, 5:6].detach().clone()
+                lnkf_prev_forecast = parent[:, 6:7].detach().clone()
+                if compute_jacobian_penalty:
+                    hatcf_prev_forecast.requires_grad_(True)
+                    lnkf_prev_forecast.requires_grad_(True)
                 _, _, _, c_children_forecast, k_children_forecast = model.forward_step(
                     x_prev=parent[:, 4:5],
                     x_curr=children_t[:, :, 4:5],
@@ -2214,7 +2226,8 @@ class Episode:
                     + lnk_recon_inner_weight * delta_penalty_lnk
                 )
 
-                if jacobian_penalty_weight > 0.0:
+                if compute_jacobian_penalty:
+                    jacobian_penalty_active = True
                     grad_hat_wrt_hat = torch.autograd.grad(
                         c_children_forecast.sum(),
                         hatcf_prev_forecast,
@@ -2365,6 +2378,8 @@ class Episode:
                 'sdf_delta_hatc_abs_max': float(delta_hatc_abs_max),
                 'sdf_delta_lnk_abs_max': float(delta_lnk_abs_max),
                 'sdf_jacobian_penalty_weight': float(jacobian_penalty_weight),
+                'sdf_jacobian_penalty_interval': float(jacobian_penalty_interval),
+                'sdf_jacobian_penalty_active': float(1.0 if jacobian_penalty_active else 0.0),
                 'sdf_hj_warmup_factor': float(hj_warmup_factor),
                 'sdf_teacher_forcing_stage': float(1.0 if self._fc1_teacher_forcing_stage else 0.0),
                 'sdf_use_true_prev_macro': float(1.0 if use_true_prev_macro else 0.0),
