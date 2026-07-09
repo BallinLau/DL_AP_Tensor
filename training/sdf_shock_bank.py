@@ -117,6 +117,7 @@ def shock_pair_diagnostics(
     j1: torch.Tensor,
     j2: torch.Tensor,
     bank_size: int,
+    parent_index: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     e1 = eps1.detach().reshape(-1).to(torch.float32)
     e2 = eps2.detach().reshape(-1).to(torch.float32)
@@ -124,6 +125,10 @@ def shock_pair_diagnostics(
         return {
             "sdf_pair_collision_rate": 0.0,
             "sdf_pair_unique_ratio": 0.0,
+            "sdf_index_pair_coverage_ratio": 0.0,
+            "sdf_parent_pair_unique_ratio": 0.0,
+            "sdf_j1_hist_entropy": 0.0,
+            "sdf_j2_hist_entropy": 0.0,
             "sdf_eps1_mean": 0.0,
             "sdf_eps1_std": 0.0,
             "sdf_eps2_mean": 0.0,
@@ -139,9 +144,29 @@ def shock_pair_diagnostics(
         / (e1_centered.std(unbiased=False) * e2_centered.std(unbiased=False) + 1e-8)
     )
     pair_code = j1.to(torch.long) * int(bank_size) + j2.to(torch.long)
+    index_pair_coverage = float(torch.unique(pair_code).numel() / max(1, min(pair_code.numel(), int(bank_size) * int(bank_size))))
+    parent_pair_unique = float(torch.unique(pair_code).numel() / max(1, pair_code.numel()))
+    if parent_index is not None:
+        parent_code = parent_index.to(device=pair_code.device, dtype=torch.long).reshape(-1)
+        parent_pair_code = parent_code * int(bank_size) * int(bank_size) + pair_code
+        parent_pair_unique = float(torch.unique(parent_pair_code).numel() / max(1, parent_pair_code.numel()))
+
+    def _entropy(idx: torch.Tensor) -> float:
+        counts = torch.bincount(idx.to(torch.long).reshape(-1), minlength=int(bank_size)).to(torch.float32)
+        probs = counts / counts.sum().clamp_min(1.0)
+        probs = probs[probs > 0]
+        if probs.numel() == 0:
+            return 0.0
+        entropy = -(probs * torch.log(probs)).sum() / torch.log(torch.tensor(float(bank_size), device=probs.device))
+        return float(entropy.item())
+
     return {
         "sdf_pair_collision_rate": float((j1 == j2).float().mean().item()),
         "sdf_pair_unique_ratio": float(torch.unique(pair_code).numel() / max(1, pair_code.numel())),
+        "sdf_index_pair_coverage_ratio": index_pair_coverage,
+        "sdf_parent_pair_unique_ratio": parent_pair_unique,
+        "sdf_j1_hist_entropy": _entropy(j1),
+        "sdf_j2_hist_entropy": _entropy(j2),
         "sdf_eps1_mean": float(e1.mean().item()),
         "sdf_eps1_std": float(e1.std(unbiased=False).item()),
         "sdf_eps2_mean": float(e2.mean().item()),

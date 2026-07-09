@@ -185,6 +185,12 @@ class SDFLoss(nn.Module):
         if n_branches == 2:
             signed_product = r[:, 0] * r[:, 1]
             details["signed_aio"] = signed_product.mean()
+            details["signed_aio_std"] = signed_product.std(unbiased=False)
+            details["signed_aio_se"] = (
+                signed_product.std(unbiased=False)
+                / torch.sqrt(torch.tensor(float(max(1, signed_product.numel())), device=r.device, dtype=r.dtype))
+            )
+            details["signed_aio_negative_share"] = (signed_product < 0).float().mean()
 
         if self.wealth_loss_mode == "legacy_abs_log1p":
             return legacy_loss, details

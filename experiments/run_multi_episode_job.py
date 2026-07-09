@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 import sys
 import json
+import warnings
 
 import torch
 
@@ -36,6 +37,20 @@ from experiments.run_utils import (  # noqa: E402
     plot_firm_b_window_distribution,
 )
 from utils.gpu_monitor import get_monitor, reset_monitor
+
+
+def validate_sdf_fresh_pair_config(hyperparams):
+    mode = str(getattr(hyperparams, "sdf_wealth_loss_mode", "legacy_abs_log1p")).lower()
+    fresh = bool(getattr(hyperparams, "sdf_fresh_pair_enabled", False))
+    if mode == "signed_aio" and not fresh:
+        raise ValueError("signed_aio requires --sdf-fresh-pair-enabled for valid double sampling.")
+    if mode != "signed_aio" and fresh:
+        warnings.warn(
+            "--sdf-fresh-pair-enabled with legacy SDF wealth loss is allowed, "
+            "but the fresh pair bank is primarily designed for signed_aio.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -213,6 +228,7 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.policy_value_loss_fail_threshold = args.policy_loss_threshold
     if args.pv_sdf_clip_ratio_gate is not None:
         hyperparams.pv_sdf_clip_ratio_gate = args.pv_sdf_clip_ratio_gate
+    validate_sdf_fresh_pair_config(hyperparams)
     return hyperparams
 
 

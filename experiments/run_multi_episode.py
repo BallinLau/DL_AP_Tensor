@@ -16,6 +16,7 @@ Each episode saves:
 
 import sys
 import argparse
+import warnings
 from pathlib import Path
 from datetime import datetime
 import torch
@@ -42,6 +43,21 @@ from experiments.run_utils import (  # noqa: E402
     plot_macro_series,
     plot_firm_b_window_distribution,
 )
+
+
+def validate_sdf_fresh_pair_config(hyperparams):
+    mode = str(getattr(hyperparams, "sdf_wealth_loss_mode", "legacy_abs_log1p")).lower()
+    fresh = bool(getattr(hyperparams, "sdf_fresh_pair_enabled", False))
+    if mode == "signed_aio" and not fresh:
+        raise ValueError("signed_aio requires --sdf-fresh-pair-enabled for valid double sampling.")
+    if mode != "signed_aio" and fresh:
+        warnings.warn(
+            "--sdf-fresh-pair-enabled with legacy SDF wealth loss is allowed, "
+            "but the fresh pair bank is primarily designed for signed_aio.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
 
 # Per-run cache directory (set in main). Lives outside code tree at ROOT.parent / cachedir.
 RUN_ROOT: Path | None = None
@@ -168,6 +184,7 @@ def main():
     hyperparams.sdf_child_bank_size = args.sdf_child_bank_size
     hyperparams.sdf_child_bank_refresh_epochs = args.sdf_child_bank_refresh_epochs
     hyperparams.sdf_child_bank_seed = args.sdf_child_bank_seed
+    validate_sdf_fresh_pair_config(hyperparams)
     models = build_models(device)
     optimizers = build_optimizers(models, hyperparams)
 

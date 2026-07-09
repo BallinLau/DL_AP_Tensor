@@ -51,6 +51,20 @@ class SDFShockBankTest(unittest.TestCase):
         self.assertEqual(diag["sdf_pair_collision_rate"], 0.0)
         self.assertLess(abs(diag["sdf_eps_cross_corr"]), 0.02)
 
+    def test_parent_aware_pair_diagnostics_do_not_penalize_cross_parent_reuse(self):
+        eps1 = torch.randn(4, 1)
+        eps2 = torch.randn(4, 1)
+        j1 = torch.tensor([0, 0, 0, 0])
+        j2 = torch.tensor([1, 1, 1, 1])
+        parent_index = torch.arange(4)
+
+        diag = shock_pair_diagnostics(eps1, eps2, j1, j2, bank_size=4, parent_index=parent_index)
+
+        self.assertLess(diag["sdf_pair_unique_ratio"], 1.0)
+        self.assertEqual(diag["sdf_parent_pair_unique_ratio"], 1.0)
+        self.assertIn("sdf_index_pair_coverage_ratio", diag)
+        self.assertIn("sdf_j1_hist_entropy", diag)
+
     def test_refresh_changes_bank_and_is_reproducible_for_same_seed(self):
         bank_a = SDFShockBank.create(
             n_parents=32,

@@ -18,6 +18,7 @@ from tqdm import tqdm
 import logging
 
 import sys
+import warnings
 sys.path.append('..')
 from config import Config, HyperParams, SIMMODEL
 from data import Sample, SimulateTS, TensorTable, TensorSimulationOutput
@@ -128,6 +129,7 @@ class Episode:
         self.optimizers = optimizers
         self.config = config
         self.hyperparams = hyperparams or HyperParams()
+        self._validate_sdf_fresh_pair_config()
         self.device = device or config.DEVICE
         self.episode_id = episode_id
         self.firm_target = self._init_firm_target(firm_target)
@@ -182,7 +184,31 @@ class Episode:
         self._sdf_shock_bank: Optional[SDFShockBank] = None
         self._sdf_shock_bank_n_parents: int = 0
         self._sdf_shock_bank_epoch: Optional[int] = None
+        self._sdf_shock_bank_episode_id: Optional[int] = None
+        self._sdf_shock_bank_key: Optional[Tuple[Any, ...]] = None
         self._sdf_pair_generator: Optional[torch.Generator] = None
+
+    def reset_sdf_shock_bank(self) -> None:
+        """Drop cached fresh-pair shock bank when episode/data stage changes."""
+        self._sdf_shock_bank = None
+        self._sdf_shock_bank_n_parents = 0
+        self._sdf_shock_bank_epoch = None
+        self._sdf_shock_bank_episode_id = int(self.episode_id)
+        self._sdf_shock_bank_key = None
+        self._sdf_pair_generator = None
+
+    def _validate_sdf_fresh_pair_config(self) -> None:
+        mode = str(getattr(self.hyperparams, "sdf_wealth_loss_mode", "legacy_abs_log1p")).lower()
+        fresh = bool(getattr(self.hyperparams, "sdf_fresh_pair_enabled", False))
+        if mode == "signed_aio" and not fresh:
+            raise ValueError("signed_aio requires sdf_fresh_pair_enabled=True for valid double sampling.")
+        if mode != "signed_aio" and fresh:
+            warnings.warn(
+                "sdf_fresh_pair_enabled=True with legacy SDF wealth loss is allowed, "
+                "but fresh pair bank is primarily designed for signed_aio.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def _init_firm_target(self, firm_target: Optional[nn.Module] = None) -> Optional[nn.Module]:
         """
@@ -883,18 +909,21 @@ class Episode:
             )
             indices = indices[:max_units]
 
+        selected_indices = indices
+        compact_indices = torch.arange(selected_indices.numel(), device=selected_indices.device)
         n_batches = (indices.numel() + batch_size - 1) // batch_size
         batches = []
         for i in range(n_batches):
             start = i * batch_size
             end = min((i + 1) * batch_size, indices.numel())
-            idx = indices[start:end]
+            idx = selected_indices[start:end]
             batch = {
                 'parent': parent[idx],
                 'children': [c[idx] for c in children],
                 'child0': children[0][idx] if len(children) > 0 else None,
                 'child1': children[1][idx] if len(children) > 1 else None,
-                'parent_index': idx,
+                'parent_index': compact_indices[start:end],
+                'parent_source_index': idx,
             }
             batches.append(batch)
         return batches
@@ -1535,6 +1564,70 @@ class Episode:
         base_seed = int(getattr(self.hyperparams, "sdf_child_bank_seed", 12345))
         return int(base_seed + 10000 * int(self.episode_id) + int(epoch))
 
+    def _ensure_sdf_bank_capacity(
+        self,
+        parent_index: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        epoch: Optional[int] = None,
+    ) -> None:
+        if parent_index.numel() == 0:
+            return
+        bank_size = int(getattr(self.hyperparams, "sdf_child_bank_size", 16))
+        if bank_size < 2:
+            raise ValueError("sdf_child_bank_size must be >= 2 when fresh pairs are enabled.")
+        n_children = int(getattr(self.hyperparams, "sdf_signed_aio_n_children", 2))
+        if n_children != 2:
+            raise ValueError("Only sdf_signed_aio_n_children=2 is currently supported.")
+
+        epoch_i = int(self._current_epoch_idx if epoch is None else epoch)
+        device = self.device
+        parent_index = parent_index.to(device=device, dtype=torch.long).reshape(-1)
+        required = int(parent_index.max().item()) + 1
+        seed = self._sdf_child_bank_seed(epoch_i)
+        prior_key = self._sdf_shock_bank_key
+        needs_create = (
+            self._sdf_shock_bank is None
+            or self._sdf_shock_bank.eps.shape[0] < required
+            or self._sdf_shock_bank.bank_size != bank_size
+            or self._sdf_shock_bank.eps.device != device
+            or self._sdf_shock_bank.eps.dtype != dtype
+            or self._sdf_shock_bank_episode_id != int(self.episode_id)
+        )
+        key_capacity = required if needs_create else int(self._sdf_shock_bank.eps.shape[0])
+        key = (
+            int(self.episode_id),
+            epoch_i,
+            key_capacity,
+            bank_size,
+            str(device),
+            str(dtype),
+        )
+        if needs_create:
+            self._sdf_shock_bank = SDFShockBank.create(
+                n_parents=required,
+                bank_size=bank_size,
+                device=device,
+                base_seed=seed,
+                dtype=dtype,
+            )
+            self._sdf_shock_bank_n_parents = required
+            self._sdf_shock_bank_epoch = epoch_i
+            self._sdf_shock_bank_episode_id = int(self.episode_id)
+            self._sdf_shock_bank_key = key
+        else:
+            refresh_epochs = max(1, int(getattr(self.hyperparams, "sdf_child_bank_refresh_epochs", 1)))
+            if epoch_i % refresh_epochs == 0 and self._sdf_shock_bank_key != key:
+                self._sdf_shock_bank.refresh_(seed=seed)
+                self._sdf_shock_bank_epoch = epoch_i
+                self._sdf_shock_bank_key = key
+
+        if self._sdf_pair_generator is None or prior_key != key:
+            pair_seed = seed + 7919
+            self._sdf_pair_generator = _make_generator(device)
+            self._sdf_pair_generator.manual_seed(pair_seed)
+        self._sdf_shock_bank_key = key
+
     def _prepare_sdf_shock_bank_for_epoch(
         self,
         batches: List[Dict[str, torch.Tensor]],
@@ -1545,13 +1638,6 @@ class Episode:
             return
         if not batches:
             return
-
-        bank_size = int(getattr(self.hyperparams, "sdf_child_bank_size", 16))
-        if bank_size < 2:
-            raise ValueError("sdf_child_bank_size must be >= 2 when fresh pairs are enabled.")
-        n_children = int(getattr(self.hyperparams, "sdf_signed_aio_n_children", 2))
-        if n_children != 2:
-            raise ValueError("Only sdf_signed_aio_n_children=2 is currently supported.")
 
         max_parent_index = -1
         first_parent = None
@@ -1566,44 +1652,17 @@ class Episode:
         if max_parent_index < 0 or first_parent is None:
             return
 
-        n_parents = max_parent_index + 1
         dtype = first_parent.dtype
-        device = self.device
-        seed = self._sdf_child_bank_seed(epoch)
-        needs_create = (
-            self._sdf_shock_bank is None
-            or self._sdf_shock_bank.eps.shape[0] < n_parents
-            or self._sdf_shock_bank.bank_size != bank_size
-            or self._sdf_shock_bank.eps.device != device
-            or self._sdf_shock_bank.eps.dtype != dtype
-        )
-        if needs_create:
-            self._sdf_shock_bank = SDFShockBank.create(
-                n_parents=n_parents,
-                bank_size=bank_size,
-                device=device,
-                base_seed=seed,
-                dtype=dtype,
-            )
-            self._sdf_shock_bank_n_parents = n_parents
-            self._sdf_shock_bank_epoch = epoch
-        else:
-            refresh_epochs = max(1, int(getattr(self.hyperparams, "sdf_child_bank_refresh_epochs", 1)))
-            if epoch % refresh_epochs == 0 and self._sdf_shock_bank_epoch != epoch:
-                self._sdf_shock_bank.refresh_(seed=seed)
-                self._sdf_shock_bank_epoch = epoch
-
-        pair_seed = seed + 7919
-        self._sdf_pair_generator = _make_generator(device)
-        self._sdf_pair_generator.manual_seed(pair_seed)
+        all_parent_index = torch.cat([batch['parent_index'].reshape(-1) for batch in batches], dim=0)
+        self._ensure_sdf_bank_capacity(all_parent_index, dtype=dtype, epoch=epoch)
         logger.info(
             "SDF shock bank ready | episode=%s epoch=%s n_parents=%s bank_size=%s refresh_id=%s seed=%s",
             self.episode_id,
             epoch,
-            n_parents,
-            bank_size,
+            self._sdf_shock_bank.eps.shape[0] if self._sdf_shock_bank is not None else 0,
+            self._sdf_shock_bank.bank_size if self._sdf_shock_bank is not None else -1,
             self._sdf_shock_bank.refresh_id if self._sdf_shock_bank is not None else -1,
-            seed,
+            self._sdf_child_bank_seed(epoch),
         )
 
     def _sample_sdf_fresh_x_children(
@@ -1626,18 +1685,7 @@ class Episode:
         parent_index = batch.get('parent_index')
         if parent_index is None:
             raise ValueError("SDF fresh pair sampling requires batch['parent_index'].")
-        if self._sdf_shock_bank is None:
-            seed = self._sdf_child_bank_seed(self._current_epoch_idx)
-            n_parents = int(parent_index.max().item()) + 1
-            self._sdf_shock_bank = SDFShockBank.create(
-                n_parents=n_parents,
-                bank_size=int(getattr(self.hyperparams, "sdf_child_bank_size", 16)),
-                device=self.device,
-                base_seed=seed,
-                dtype=parent.dtype,
-            )
-            self._sdf_pair_generator = _make_generator(self.device)
-            self._sdf_pair_generator.manual_seed(seed + 7919)
+        self._ensure_sdf_bank_capacity(parent_index, dtype=parent.dtype, epoch=self._current_epoch_idx)
 
         eps1, eps2, j1, j2 = self._sdf_shock_bank.sample_pair(
             parent_index.to(self.device),
@@ -1651,12 +1699,22 @@ class Episode:
             sigma_x=self.config.SIGMA_X,
             xbar=self.config.XBAR,
         )
-        diag = shock_pair_diagnostics(eps1, eps2, j1, j2, self._sdf_shock_bank.bank_size)
+        diag = shock_pair_diagnostics(
+            eps1,
+            eps2,
+            j1,
+            j2,
+            self._sdf_shock_bank.bank_size,
+            parent_index=parent_index,
+        )
         diag.update({
             'sdf_fresh_pair_enabled': 1.0,
+            'sdf_fresh_pair_requested': 1.0,
+            'sdf_fresh_pair_used': 1.0,
             'sdf_bank_size': float(self._sdf_shock_bank.bank_size),
             'sdf_bank_refresh_id': float(self._sdf_shock_bank.refresh_id),
             'sdf_bank_wealth_only': float(1.0 if wealth_only else 0.0),
+            'sdf_bank_n_parents': float(self._sdf_shock_bank.eps.shape[0]),
         })
         return x_children, diag
     
@@ -1961,10 +2019,19 @@ class Episode:
         k_prev_input = parent[:, 8:9] if use_true_prev_macro else parent[:, 6:7]
 
         fixed_children_x = children_t[:, :, 4:5]
-        x_children_fresh, fresh_pair_diag = self._sample_sdf_fresh_x_children(parent, batch)
-        use_fresh_wealth = x_children_fresh is not None and not bool(
+        fresh_pair_requested = self._sdf_fresh_pair_enabled()
+        use_fresh_wealth = fresh_pair_requested and not bool(
             getattr(self, "_fc1_teacher_forcing_stage", False)
         )
+        if use_fresh_wealth:
+            x_children_fresh, fresh_pair_diag = self._sample_sdf_fresh_x_children(parent, batch)
+        else:
+            x_children_fresh = None
+            fresh_pair_diag = {
+                'sdf_fresh_pair_requested': float(1.0 if fresh_pair_requested else 0.0),
+                'sdf_fresh_pair_used': 0.0,
+                'sdf_fresh_pair_enabled': float(1.0 if fresh_pair_requested else 0.0),
+            }
         if use_fresh_wealth:
             if self.add_FC1loss:
                 x_children_all = torch.cat([x_children_fresh, fixed_children_x], dim=1)
@@ -1978,7 +2045,6 @@ class Episode:
             x_children_all = fixed_children_x
             wealth_slice = slice(0, 2)
             recon_slice = slice(0, 2)
-            fresh_pair_diag = {'sdf_fresh_pair_enabled': float(1.0 if x_children_fresh is not None else 0.0)}
 
         # 前向传播：fresh wealth pair 与固定 recon pair 共享 parent forward
         w_parent, w_children_all, M_all, c_children_all, k_children_all = model.forward_step(
@@ -3396,18 +3462,21 @@ class Episode:
         n_units = len(parent)
         n_batches = (n_units + batch_size - 1) // batch_size
         indices = torch.randperm(n_units)
+        selected_indices = indices
+        compact_indices = torch.arange(selected_indices.numel(), device=selected_indices.device)
         batches = []
         
         for i in range(n_batches):
             start = i * batch_size
             end = min((i + 1) * batch_size, n_units)
-            idx = indices[start:end]
+            idx = selected_indices[start:end]
             batch = {
                 'parent': parent[idx],
                 'children': [c[idx] for c in children],
                 'child0': children[0][idx] if len(children) > 0 else None,
                 'child1': children[1][idx] if len(children) > 1 else None,
-                'parent_index': idx,
+                'parent_index': compact_indices[start:end],
+                'parent_source_index': idx,
             }
             batches.append(batch)
         
@@ -3526,18 +3595,21 @@ class Episode:
             )
             indices = indices[:max_units]
 
+        selected_indices = indices
+        compact_indices = torch.arange(selected_indices.numel(), device=selected_indices.device)
         n_batches = (indices.numel() + batch_size - 1) // batch_size
         batches = []
         for i in range(n_batches):
             start = i * batch_size
             end = min((i + 1) * batch_size, indices.numel())
-            idx = indices[start:end]
+            idx = selected_indices[start:end]
             batch = {
                 'parent': parent[idx],
                 'children': [c[idx] for c in children],
                 'child0': children[0][idx] if len(children) > 0 else None,
                 'child1': children[1][idx] if len(children) > 1 else None,
-                'parent_index': idx,
+                'parent_index': compact_indices[start:end],
+                'parent_source_index': idx,
             }
             batches.append(batch)
         
@@ -3800,17 +3872,26 @@ class Episode:
         regret_thr = float(getattr(self.hyperparams, "bp_grid_conv_regret_p90_thresh", 1e-2))
         max_batches = int(getattr(self.hyperparams, "bp_grid_conv_max_batches", 4))
         max_batches = max(1, max_batches)
+        survival_eps = float(getattr(self.hyperparams, "bp_grid_conv_survival_eps", 0.05))
 
         class _PolicyAccumulator:
             def __init__(self):
                 self.errs: List[torch.Tensor] = []
                 self.regrets: List[torch.Tensor] = []
+                self.active_weights: List[torch.Tensor] = []
 
-            def update(self, pred: torch.Tensor, grid: Dict[str, torch.Tensor]) -> None:
+            def update(
+                self,
+                pred: torch.Tensor,
+                grid: Dict[str, torch.Tensor],
+                active_weight: Optional[torch.Tensor] = None,
+            ) -> None:
                 err = (pred.detach() - grid["bp_star"]).abs().reshape(-1)
                 regret = grid["regret"].detach().reshape(-1)
                 self.errs.append(err.cpu())
                 self.regrets.append(regret.cpu())
+                if active_weight is not None:
+                    self.active_weights.append(active_weight.detach().reshape(-1).cpu().to(torch.float32))
 
             def summarize(self) -> Dict:
                 if not self.errs:
@@ -3821,6 +3902,9 @@ class Episode:
                         'mae_p90': float('nan'),
                         'regret_mean': float('nan'),
                         'regret_p90': float('nan'),
+                        'mae_all': float('nan'),
+                        'regret_p90_all': float('nan'),
+                        'survival_active_share': float('nan'),
                         'passed': False,
                     }
                 err = torch.cat(self.errs).to(torch.float32)
@@ -3834,21 +3918,51 @@ class Episode:
                         'mae_p90': float('nan'),
                         'regret_mean': float('nan'),
                         'regret_p90': float('nan'),
+                        'mae_all': float('nan'),
+                        'regret_p90_all': float('nan'),
+                        'survival_active_share': float('nan'),
                         'passed': False,
                     }
+                weight = None
+                if self.active_weights:
+                    weight = torch.cat(self.active_weights).to(torch.float32)
+                    weight = weight[finite]
                 err = err[finite]
                 regret = regret[finite]
-                mae = float(err.mean().item())
-                mae_p90 = float(torch.quantile(err, 0.9).item())
-                regret_mean = float(regret.mean().item())
-                regret_p90 = float(torch.quantile(regret, 0.9).item())
+                mae_all = float(err.mean().item())
+                mae_p90_all = float(torch.quantile(err, 0.9).item())
+                regret_mean_all = float(regret.mean().item())
+                regret_p90_all = float(torch.quantile(regret, 0.9).item())
+                active_share = float('nan')
+                if weight is not None:
+                    active = torch.isfinite(weight) & (weight > survival_eps)
+                    active_share = float(active.to(torch.float32).mean().item()) if active.numel() else 0.0
+                    if bool(active.any()):
+                        err_eval = err[active]
+                        regret_eval = regret[active]
+                    else:
+                        err_eval = err
+                        regret_eval = regret
+                else:
+                    err_eval = err
+                    regret_eval = regret
+                mae = float(err_eval.mean().item())
+                mae_p90 = float(torch.quantile(err_eval, 0.9).item())
+                regret_mean = float(regret_eval.mean().item())
+                regret_p90 = float(torch.quantile(regret_eval, 0.9).item())
                 return {
                     'enabled': True,
                     'n': int(err.numel()),
+                    'n_active': int(err_eval.numel()),
                     'mae': mae,
                     'mae_p90': mae_p90,
                     'regret_mean': regret_mean,
                     'regret_p90': regret_p90,
+                    'mae_all': mae_all,
+                    'mae_p90_all': mae_p90_all,
+                    'regret_mean_all': regret_mean_all,
+                    'regret_p90_all': regret_p90_all,
+                    'survival_active_share': active_share,
                     'passed': bool(mae < mae_thr and regret_p90 < regret_thr),
                 }
 
@@ -3891,6 +4005,15 @@ class Episode:
                     parent_state,
                     fallback=bar_i_cond_online,
                 )
+                if isinstance(output_t, dict):
+                    survival_online = output_t.get('survival_prob', torch.ones_like(bar_i_t))
+                else:
+                    survival_online = getattr(output_t, 'survival_prob', torch.ones_like(bar_i_t))
+                mix_survival_target = self._target_survival_probability(
+                    target_model,
+                    parent_state,
+                    fallback=survival_online,
+                )
                 bp_mix_cond = self._mixed_policy_conditional_bp(
                     output_t,
                     bp0_t,
@@ -3911,7 +4034,7 @@ class Episode:
                 )
                 p0_acc.update(bp0_t, p0_grid)
                 pi_acc.update(bpI_t, pi_grid)
-                mix_acc.update(bp_mix_cond, mix_grid)
+                mix_acc.update(bp_mix_cond, mix_grid, active_weight=mix_survival_target)
 
         policies = {
             'bp0': p0_acc.summarize(),
@@ -3928,7 +4051,7 @@ class Episode:
         )
         return {
             'enabled': True,
-            'thresholds': {'mae': mae_thr, 'regret_p90': regret_thr},
+            'thresholds': {'mae': mae_thr, 'regret_p90': regret_thr, 'survival_eps': survival_eps},
             'max_batches': max_batches,
             'policies': policies,
             'passed': passed,
@@ -4132,7 +4255,7 @@ class Episode:
             q_warmstart_epochs = 0
             q_only_epochs = 0
 
-        train_batches = batches
+        pv_train_batches = batches
         validation_batches: List[Dict[str, torch.Tensor]] = []
         if 'policy_value' in train_modules and self._pv_use_target_grid_bp() and len(batches) > 1:
             val_fraction = float(getattr(self.hyperparams, "pv_target_grid_val_fraction", 0.10))
@@ -4142,18 +4265,23 @@ class Episode:
                 n_val = max(1, n_val)
             n_val = min(n_val, len(batches) - 1)
             if n_val > 0:
-                train_batches = batches[:-n_val]
+                pv_train_batches = batches[:-n_val]
                 validation_batches = batches[-n_val:]
                 logger.info(
                     "%sTarget-grid PV validation split: train_batches=%d, val_batches=%d",
                     desc_prefix,
-                    len(train_batches),
+                    len(pv_train_batches),
                     len(validation_batches),
                 )
+        joint_module_split = (
+            bool(validation_batches)
+            and 'policy_value' in train_modules
+            and any(m != 'policy_value' for m in train_modules)
+        )
 
         for epoch in range(n_epochs):
             self._current_epoch_idx = epoch
-            self._prepare_sdf_shock_bank_for_epoch(train_batches, epoch, train_modules)
+            self._prepare_sdf_shock_bank_for_epoch(batches, epoch, train_modules)
             self._q_only_stage = bool(
                 'policy_value' in train_modules and q_only_epochs > 0 and epoch < q_only_epochs
             )
@@ -4161,32 +4289,57 @@ class Episode:
             if 'policy_value' in train_modules and q_only_epochs > 0:
                 policy_loss_terms = ['q'] if self._q_only_stage else ['p0', 'pi', 'q']
             epoch_losses = []
-            for batch in tqdm(train_batches, desc=f"{desc_prefix}Epoch {epoch+1}/{n_epochs}"):
-                losses = self.train_step(
-                    batch,
-                    train_modules,
-                    policy_loss_terms=policy_loss_terms
-                )
-                epoch_losses.append(losses)
-                if 'policy_value' in train_modules and 'policy_value' in self.models:
+            if joint_module_split:
+                non_pv_modules = [m for m in train_modules if m != 'policy_value']
+                if non_pv_modules:
+                    for batch in tqdm(batches, desc=f"{desc_prefix}Epoch {epoch+1}/{n_epochs} non-PV"):
+                        losses = self.train_step(batch, non_pv_modules, policy_loss_terms=policy_loss_terms)
+                        epoch_losses.append(losses)
+                        if self.step_count % log_interval == 0:
+                            avg_loss = np.mean([l['total'] for l in epoch_losses[-log_interval:]])
+                            logger.info(f"Step {self.step_count}: loss={avg_loss:.6f}")
+                for batch in tqdm(pv_train_batches, desc=f"{desc_prefix}Epoch {epoch+1}/{n_epochs} PV"):
+                    losses = self.train_step(
+                        batch,
+                        ['policy_value'],
+                        policy_loss_terms=policy_loss_terms
+                    )
+                    epoch_losses.append(losses)
                     self._check_policy_value_gate(
                         losses,
                         context=f"episode={self.episode_id}, epoch={epoch + 1}, batch={len(epoch_losses)}"
                     )
-                
-                if self.step_count % log_interval == 0:
-                    avg_loss = np.mean([l['total'] for l in epoch_losses[-log_interval:]])
-                    lr = None
-                    for name in train_modules:
-                        lr = self.lr_schedulers.get(name)
-                        if lr is not None:
-                            break
-                    current_lr = lr.get_lr() if lr else 0
-                    
-                    logger.info(
-                        f"Step {self.step_count}: "
-                        f"loss={avg_loss:.6f}, lr={current_lr:.2e}"
+                    if self.step_count % log_interval == 0:
+                        avg_loss = np.mean([l['total'] for l in epoch_losses[-log_interval:]])
+                        logger.info(f"Step {self.step_count}: loss={avg_loss:.6f}")
+            else:
+                train_loop_batches = pv_train_batches if 'policy_value' in train_modules else batches
+                for batch in tqdm(train_loop_batches, desc=f"{desc_prefix}Epoch {epoch+1}/{n_epochs}"):
+                    losses = self.train_step(
+                        batch,
+                        train_modules,
+                        policy_loss_terms=policy_loss_terms
                     )
+                    epoch_losses.append(losses)
+                    if 'policy_value' in train_modules and 'policy_value' in self.models:
+                        self._check_policy_value_gate(
+                            losses,
+                            context=f"episode={self.episode_id}, epoch={epoch + 1}, batch={len(epoch_losses)}"
+                        )
+
+                    if self.step_count % log_interval == 0:
+                        avg_loss = np.mean([l['total'] for l in epoch_losses[-log_interval:]])
+                        lr = None
+                        for name in train_modules:
+                            lr = self.lr_schedulers.get(name)
+                            if lr is not None:
+                                break
+                        current_lr = lr.get_lr() if lr else 0
+
+                        logger.info(
+                            f"Step {self.step_count}: "
+                            f"loss={avg_loss:.6f}, lr={current_lr:.2e}"
+                        )
 
             # 每个 epoch 追加 bp-only 精修：只优化 P0/PI 且仅更新 bp 头。
             bp_refine_steps = max(0, int(getattr(self.hyperparams, "bp_refine_steps_per_epoch", 0)))
@@ -4195,12 +4348,12 @@ class Episode:
                 'policy_value' in train_modules and
                 not self._q_only_stage and
                 bp_refine_steps > 0 and
-                len(train_batches) > 0
+                len(pv_train_batches) > 0
             ):
                 if bp_refine_cap > 0:
-                    refine_batches = train_batches[:min(bp_refine_cap, len(train_batches))]
+                    refine_batches = pv_train_batches[:min(bp_refine_cap, len(pv_train_batches))]
                 else:
-                    refine_batches = train_batches
+                    refine_batches = pv_train_batches
                 self._bp_only_stage = True
                 try:
                     for r in range(bp_refine_steps):
@@ -4256,7 +4409,7 @@ class Episode:
         self._bp_only_stage = False
         convergence = None
         if 'policy_value' in train_modules and 'policy_value' in self.models:
-            convergence = self.evaluate_bellman_convergence(train_batches, validation_batches=validation_batches)
+            convergence = self.evaluate_bellman_convergence(pv_train_batches, validation_batches=validation_batches)
 
         result = {
             'final_losses': avg_losses
@@ -4652,6 +4805,7 @@ class Episode:
         train_modules = train_modules or ['sdf_fc1', 'policy_value', 'fc2']
         self.train_mode = train_mode
         self.add_FC1loss = False
+        self.reset_sdf_shock_bank()
 
         horizon_mode1 = int(simulate_kwargs.pop('horizon_mode1', 1))
         horizon_modeb = int(simulate_kwargs.pop('horizon', getattr(self.hyperparams, 'simulate_horizon', 20)))

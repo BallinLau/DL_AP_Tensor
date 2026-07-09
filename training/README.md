@@ -9,6 +9,8 @@ Training orchestration for episodes and modules.
 
 ### SDF/FC1: fresh wealth shock pairs
 - `HyperParams.sdf_fresh_pair_enabled` enables refreshable aggregate shock pairs for the SDF wealth Euler loss.
+- `sdf_wealth_loss_mode='signed_aio'` now requires `sdf_fresh_pair_enabled=True`; `Episode` and the multi-episode CLI entry points raise immediately if signed AiO is requested without fresh double sampling.
+- `sdf_fresh_pair_enabled=True` with legacy wealth loss is still allowed for diagnostics/ablations, but it emits a warning because the bank was designed for signed AiO.
 - The shock tape stores only AR(1) innovations with shape `[n_parent, sdf_child_bank_size, 1]`.
 - At each optimizer step, `_compute_sdf_loss(...)` samples two different children per parent (`j1 != j2`) and converts them into fresh `x_{t+1}` values.
 - Fresh children are used only for:
@@ -19,12 +21,16 @@ Training orchestration for episodes and modules.
   - FC1 true-state reconstruction targets
   - FC1 forecast-state reconstruction targets
   - delta and Jacobian penalties
+- Teacher-forcing phases mark fresh pairs as requested but not used, and do not advance the pair generator, because FC1 teacher targets must stay tied to the fixed Treatment B children.
+- Parent indices are compacted after resampling/capping before they reach the shock bank. The original row id is kept as `parent_source_index`, while `parent_index` is the dense bank index, avoiding huge sparse-bank allocations.
+- The bank lifecycle is keyed by `(episode_id, epoch, capacity, bank_size, device, dtype)` and is reset at each `run_episode(...)` call, so reused `Episode` instances cannot carry stale shock tapes across episodes.
 - Relevant controls:
   - `sdf_child_bank_size` (default `16`)
   - `sdf_child_bank_refresh_epochs` (default `1`)
   - `sdf_child_bank_seed` (default `12345`)
   - CLI flags: `--sdf-fresh-pair-enabled`, `--sdf-child-bank-size`, `--sdf-child-bank-refresh-epochs`, `--sdf-child-bank-seed`
-- Diagnostics include `sdf_pair_collision_rate`, `sdf_eps_cross_corr`, `sdf_eps1_std`, `sdf_eps2_std`, `sdf_bank_size`, and `sdf_bank_refresh_id`.
+- Diagnostics include `sdf_pair_collision_rate`, `sdf_pair_unique_ratio` (index-pair uniqueness), `sdf_index_pair_coverage_ratio`, `sdf_parent_pair_unique_ratio`, `sdf_j1_hist_entropy`, `sdf_j2_hist_entropy`, `sdf_eps_cross_corr`, `sdf_eps1_std`, `sdf_eps2_std`, `sdf_bank_size`, and `sdf_bank_refresh_id`.
+- Signed AiO also logs finite-sample diagnostics such as `sdf_signed_aio_se` and `sdf_signed_aio_negative_share`. These do not change the objective; they only make noisy negative sample estimates visible.
 
 ### Policy/Value: Q-first training hooks
 - `train_step(..., policy_loss_terms=...)` now supports selective optimization among `['q', 'p0', 'pi']`.
@@ -80,14 +86,16 @@ Training orchestration for episodes and modules.
   - `bp_grid_mix_policy_weight`
   - `bp_grid_margin_scale`, `bp_grid_confidence_relative`, `bp_grid_confidence_min`
   - `bp_grid_parent_chunk_size`, `bp_grid_candidate_chunk_size`, `bp_grid_max_expanded_states`
-  - `bp_grid_conv_mae_thresh`, `bp_grid_conv_regret_p90_thresh`, `bp_grid_conv_max_batches`
+  - `bp_grid_conv_mae_thresh`, `bp_grid_conv_regret_p90_thresh`, `bp_grid_conv_max_batches`, `bp_grid_conv_survival_eps`
   - `pv_target_grid_val_fraction`
   - CLI flags: `--pv-bp-training-mode`, `--bp-grid-coarse-size`, `--bp-grid-fine-size`, `--bp-grid-refine-enabled`, `--bp-grid-policy-weight`, `--bp-grid-mix-policy-weight`, `--bp-grid-margin-scale`, `--bp-grid-parent-chunk-size`, `--bp-grid-candidate-chunk-size`, `--bp-grid-max-expanded-states`, `--bp-grid-confidence-relative`, `--no-bp-grid-confidence-relative`, `--pv-target-grid-val-fraction`, `--firm-target-update`
 - Confidence is computed from coarse/global top-two margins by default. In relative mode it uses `(coarse_top2_margin / |V_star|) / bp_grid_margin_scale`; fine-grid margins are logged separately as `*_grid_fine_top2_margin_mean`.
 - Global low/high bp diagnostics come from the coarse grid endpoints. Local fine interval endpoints are logged only as `*_grid_local_value_left_mean` and `*_grid_local_value_right_mean`.
 - `bp_grid_quadratic_refine=True` re-evaluates `value_star`, `q_issue_at_star`, `p_child_at_star`, and `default_at_star` at the refined continuous `bp_star`.
 - `bp_grid_use_survival_gate` has been removed; continuation values use the already clipped/default-adjusted `P` from the target equity evaluator.
-- Target-grid policy convergence is checked in addition to Bellman residual convergence. In `target_grid` mode, `_run_batches(...)` reserves tail batches according to `pv_target_grid_val_fraction`; `evaluate_bellman_convergence(...)` passes only if Bellman residuals and validation teacher policy MAE/regret checks pass.
+- Target-grid policy convergence is checked in addition to Bellman residual convergence. In `target_grid` mode, `_run_batches(...)` reserves tail batches according to `pv_target_grid_val_fraction`; for joint stages, only PV training uses the reduced train split while SDF/FC1 continues to see all batches.
+- Mixed-policy convergence is evaluated on survival-active states using `target survival_prob > bp_grid_conv_survival_eps`; all-state metrics are also reported as `*_all` fields. This prevents near-default fallback states from dominating the convergence gate.
+- `evaluate_bellman_convergence(...)` passes only if Bellman residuals and validation teacher policy MAE/regret checks pass.
 - Diagnostics include:
   - `p0_grid_bp_mae`, `pi_grid_bp_mae`
   - `mix_grid_bp_mae`, `mix_grid_regret_p90`
