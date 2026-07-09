@@ -51,6 +51,35 @@ Training orchestration for episodes and modules.
     - `q_physics`, `q_warmstart`, `q_warm_weight`
     - `q_pretrain_mode`, `q_freeze_mode`
 
+### Policy/Value: target-grid bp teacher
+- `HyperParams.pv_bp_training_mode='target_grid'` enables the new Grid-B policy/value training path.
+- During PV training, `_compute_p0_loss(...)` and `_compute_pi_loss(...)` call `BPGridTeacher`:
+  - build a coarse bp-grid, optionally refine locally;
+  - construct continuation child states with `b_child = eta_child * bp_candidate + (1 - eta_child) * b_parent`;
+  - construct issuance-Q states with debt set directly to `bp_candidate`;
+  - evaluate `Q`, `P`, and `bar_z` using the frozen firm target network;
+  - choose the candidate maximizing economic RHS `cashflow + continuation value`;
+  - train `P0/PI` with Huber loss toward the selected target-grid Bellman backup;
+  - train `bp0/bpI` with Huber distillation loss toward the selected grid argmax.
+- FOC/KKT is no longer the default bp training signal in `target_grid` mode. The old path is still available with `pv_bp_training_mode='legacy_foc_kkt'`.
+- Simulation still calls `PolicyValueModel.forward(...)` and uses network outputs directly; it does not call `BPGridTeacher` or run a bp-grid.
+- `PolicyValueModel.forward_policy(...)` is available for policy-only diagnostics and avoids `Q/P/Phat/bar_z` and the internal `i`-grid.
+- Target-moving controls:
+  - `firm_target_update='epoch_hard'` by default: the target network is fixed inside each epoch and hard-copied from online at epoch end.
+  - `soft`, `hard`, `epoch_soft`, and `none` remain available for ablations.
+- Main target-grid controls:
+  - `bp_grid_coarse_size`, `bp_grid_refine_enabled`, `bp_grid_fine_size`
+  - `bp_grid_value_huber_delta`, `bp_grid_policy_huber_delta`, `bp_grid_policy_weight`
+  - `bp_grid_margin_scale`, `bp_grid_confidence_min`
+  - CLI flags: `--pv-bp-training-mode`, `--bp-grid-coarse-size`, `--bp-grid-fine-size`, `--bp-grid-refine-enabled`, `--bp-grid-policy-weight`, `--bp-grid-margin-scale`, `--firm-target-update`
+- Diagnostics include:
+  - `p0_grid_bp_mae`, `pi_grid_bp_mae`
+  - `p0_grid_regret_mean`, `pi_grid_regret_mean`
+  - `p0_grid_boundary_low_share`, `p0_grid_boundary_high_share`
+  - `p0_grid_top2_margin_mean`, `pi_grid_top2_margin_mean`
+  - `p0_grid_default_at_star_mean`, `pi_grid_default_at_star_mean`
+  - low/high-bp curve endpoints such as `p0_grid_value_low_bp_mean`, `p0_grid_value_high_bp_mean`, and matching default/P/Q endpoint means
+
 ### Episode flow
 - Episode 0:
   1) Sample-based SDF/FC1 training (`build_sdf_fc1_df`)

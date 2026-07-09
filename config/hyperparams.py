@@ -219,6 +219,28 @@ class HyperParams:
     q_warm_alpha_x: float = 0.15
 
     # ========== Policy/Value: bp KKT 约束（P0/PI） ==========
+    # bp 训练模式：
+    # - target_grid: 训练时用 frozen firm target 在 bp-grid 上做经济价值 argmax，
+    #   P0/PI value heads 拟合最优 Bellman backup，bp heads 拟合 grid argmax。
+    # - legacy_foc_kkt: 旧路径，bp heads 直接由 FOC/KKT 训练。
+    pv_bp_training_mode: str = 'target_grid'
+    # Target-grid 控制搜索区间与两阶段 coarse-to-fine 网格。
+    bp_grid_min: float = 0.0
+    bp_grid_max: float = 1.0
+    bp_grid_coarse_size: int = 21
+    bp_grid_refine_enabled: bool = True
+    bp_grid_fine_size: int = 9
+    bp_grid_quadratic_refine: bool = False
+    # Huber losses for target-grid value backup and policy distillation.
+    bp_grid_value_huber_delta: float = 1.0
+    bp_grid_policy_huber_delta: float = 0.05
+    bp_grid_policy_weight: float = 1.0
+    # Downweight policy targets when the top-two grid values are nearly tied.
+    bp_grid_margin_scale: float = 1e-3
+    bp_grid_confidence_min: float = 0.0
+    # P is already hard-clipped at zero. This optional switch additionally gates
+    # continuation by hard survival, mainly for ablation/diagnostics.
+    bp_grid_use_survival_gate: bool = False
     # 对应有界控制 0 <= bp <= 1 的一阶最优条件：
     # - 内点: FOC = 0
     # - 下界: FOC <= 0
@@ -256,9 +278,11 @@ class HyperParams:
 
     # ========== Firm target network ==========
     # policy_value 的 target network 不进入 optimizer；Bellman RHS 使用 target no-grad 输出。
-    # soft: 每个 policy_value optimizer step 后做 Polyak update；hard: 每步硬同步；none: 只保留初始化 target。
-    firm_target_update: str = 'soft'
+    # soft: 每个 policy_value optimizer step 后做 Polyak update；hard: 每步硬同步；
+    # epoch_hard/epoch_soft: epoch 内冻结 target，epoch 末更新；none: 只保留初始化 target。
+    firm_target_update: str = 'epoch_hard'
     firm_target_tau: float = 0.005
+    firm_target_update_interval_steps: int = 1
 
     # ========== Episode 收敛判定（非 AIO Bellman 残差） ==========
     # 判定条件：Q/P0/PI 各自主残差的 mean(abs) 与 p90(abs) 同时过阈值

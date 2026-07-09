@@ -106,6 +106,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sdf-child-bank-seed", type=int, default=12345, help="Base seed for SDF shock bank")
     parser.add_argument(
+        "--pv-bp-training-mode",
+        type=str.lower,
+        default=None,
+        choices=["target_grid", "legacy_foc_kkt"],
+        help="bp training mode: target_grid distillation or legacy FOC/KKT",
+    )
+    parser.add_argument("--bp-grid-coarse-size", type=int, default=None, help="Coarse bp-grid size for target_grid mode")
+    parser.add_argument("--bp-grid-fine-size", type=int, default=None, help="Local fine bp-grid size for target_grid mode")
+    parser.add_argument(
+        "--bp-grid-refine-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable coarse-to-fine local bp-grid refinement",
+    )
+    parser.add_argument("--bp-grid-policy-weight", type=float, default=None, help="Weight on bp policy distillation loss")
+    parser.add_argument("--bp-grid-margin-scale", type=float, default=None, help="Top-two value margin scale for policy target confidence")
+    parser.add_argument(
+        "--firm-target-update",
+        type=str.lower,
+        default=None,
+        choices=["soft", "hard", "epoch_hard", "epoch_soft", "none"],
+        help="Firm target update schedule",
+    )
+    parser.add_argument(
         "--modeb-resimulate-after-pv",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -135,6 +159,20 @@ def configure_hyperparams(args: argparse.Namespace):
     hyperparams.sdf_child_bank_size = args.sdf_child_bank_size
     hyperparams.sdf_child_bank_refresh_epochs = args.sdf_child_bank_refresh_epochs
     hyperparams.sdf_child_bank_seed = args.sdf_child_bank_seed
+    if args.pv_bp_training_mode is not None:
+        hyperparams.pv_bp_training_mode = args.pv_bp_training_mode
+    if args.bp_grid_coarse_size is not None:
+        hyperparams.bp_grid_coarse_size = args.bp_grid_coarse_size
+    if args.bp_grid_fine_size is not None:
+        hyperparams.bp_grid_fine_size = args.bp_grid_fine_size
+    if args.bp_grid_refine_enabled is not None:
+        hyperparams.bp_grid_refine_enabled = bool(args.bp_grid_refine_enabled)
+    if args.bp_grid_policy_weight is not None:
+        hyperparams.bp_grid_policy_weight = args.bp_grid_policy_weight
+    if args.bp_grid_margin_scale is not None:
+        hyperparams.bp_grid_margin_scale = args.bp_grid_margin_scale
+    if args.firm_target_update is not None:
+        hyperparams.firm_target_update = args.firm_target_update
     hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"
     hyperparams.pv_fixed_sdf = args.ablation_mode == "fixed_sdf"
     hyperparams.pv_fixed_policy = args.ablation_mode == "fixed_policy"
@@ -272,6 +310,8 @@ def main():
                     "simulate_horizon": hyperparams.simulate_horizon,
                     "post0_mode": args.post0_mode,
                     "sdf_wealth_loss_mode": hyperparams.sdf_wealth_loss_mode,
+                    "pv_bp_training_mode": hyperparams.pv_bp_training_mode,
+                    "firm_target_update": hyperparams.firm_target_update,
                     "modeb_resimulate_after_pv": args.modeb_resimulate_after_pv,
                     "max_firm_train_units": hyperparams.max_firm_train_units,
                 },
@@ -316,6 +356,8 @@ def main():
         summaries.append({
             "episode_mode": episode_mode,
             "sdf_wealth_loss_mode": hyperparams.sdf_wealth_loss_mode,
+            "pv_bp_training_mode": hyperparams.pv_bp_training_mode,
+            "firm_target_update": hyperparams.firm_target_update,
             "module_summaries": ep_summary,
             "gpu_memory": summary.get("gpu_memory", {})
         })
@@ -325,7 +367,9 @@ def main():
             f"n_paths={data_kwargs['n_paths']} "
             f"group_size={data_kwargs['group_size']} "
             f"horizon={hyperparams.simulate_horizon} "
-            f"sdf_wealth_loss_mode={hyperparams.sdf_wealth_loss_mode}"
+            f"sdf_wealth_loss_mode={hyperparams.sdf_wealth_loss_mode} "
+            f"pv_bp_training_mode={hyperparams.pv_bp_training_mode} "
+            f"firm_target_update={hyperparams.firm_target_update}"
         )
         log_gpu_stats(f"[Episode {ep}]", device)
         print(f"Episode {ep} ({episode_mode}) done: {ep_summary}")

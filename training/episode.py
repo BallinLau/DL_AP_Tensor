@@ -35,6 +35,7 @@ from .sdf_shock_bank import (
     shock_pair_diagnostics,
     shocks_to_x_children,
 )
+from .bp_grid_teacher import BPGridTeacher
 from .target_utils import hard_update, soft_update
 from utils.gpu_monitor import GPUMonitor, print_memory_summary
 
@@ -205,6 +206,20 @@ class Episode:
             self.firm_target.eval()
             self.firm_target.requires_grad_(False)
 
+    def _update_firm_target_now(self, mode: str) -> None:
+        if self.firm_target is None or self.models.get('policy_value') is None:
+            return
+        mode = mode.lower()
+        if mode in {"hard", "epoch_hard"}:
+            hard_update(self.firm_target, self.models['policy_value'])
+        elif mode in {"soft", "epoch_soft"}:
+            tau = float(getattr(self.hyperparams, "firm_target_tau", 0.005))
+            soft_update(self.firm_target, self.models['policy_value'], tau=tau)
+        else:
+            raise ValueError(f"Unknown firm_target_update mode: {mode}")
+        self.firm_target.eval()
+        self.firm_target.requires_grad_(False)
+
     def _maybe_update_firm_target(self, train_modules: List[str]) -> None:
         """
         Update firm target after online optimizer steps.
@@ -216,15 +231,19 @@ class Episode:
         mode = str(getattr(self.hyperparams, "firm_target_update", "soft")).lower()
         if mode in {"none", "off", "disabled"}:
             return
-        if mode == "hard":
-            hard_update(self.firm_target, self.models['policy_value'])
-        elif mode == "soft":
-            tau = float(getattr(self.hyperparams, "firm_target_tau", 0.005))
-            soft_update(self.firm_target, self.models['policy_value'], tau=tau)
-        else:
-            raise ValueError(f"Unknown firm_target_update mode: {mode}")
-        self.firm_target.eval()
-        self.firm_target.requires_grad_(False)
+        if mode in {"epoch_hard", "epoch_soft"}:
+            return
+        interval = max(1, int(getattr(self.hyperparams, "firm_target_update_interval_steps", 1)))
+        if interval > 1 and (self.step_count + 1) % interval != 0:
+            return
+        self._update_firm_target_now(mode)
+
+    def _maybe_update_firm_target_epoch(self, train_modules: List[str]) -> None:
+        if 'policy_value' not in train_modules:
+            return
+        mode = str(getattr(self.hyperparams, "firm_target_update", "soft")).lower()
+        if mode in {"epoch_hard", "epoch_soft"}:
+            self._update_firm_target_now(mode)
 
     def _target_policy_value(self) -> nn.Module:
         target = self.firm_target
@@ -232,6 +251,13 @@ class Episode:
             target = self.models['policy_value']
         target.eval()
         return target
+
+    def _pv_bp_training_mode(self) -> str:
+        return str(getattr(self.hyperparams, "pv_bp_training_mode", "legacy_foc_kkt")).lower()
+
+    def _pv_use_target_grid_bp(self) -> bool:
+        mode = self._pv_bp_training_mode()
+        return mode in {"target_grid", "grid", "grid_b", "full_grid"}
 
     def _ablation_mode(self) -> str:
         return str(getattr(self.hyperparams, "ablation_mode", "baseline")).lower()
@@ -2296,6 +2322,171 @@ class Episode:
 
         return total_sdf_loss
     
+    def _huber_element(self, pred: torch.Tensor, target: torch.Tensor, beta: float) -> torch.Tensor:
+        diff = (pred - target).abs()
+        beta = float(beta)
+        if beta <= 0:
+            return diff
+        return torch.where(diff < beta, 0.5 * diff.pow(2) / beta, diff - 0.5 * beta)
+
+    def _grid_diag_terms(
+        self,
+        prefix: str,
+        grid: Dict[str, torch.Tensor],
+        bp_pred: torch.Tensor,
+        value_pred_online: torch.Tensor,
+        value_loss_elem: torch.Tensor,
+        policy_loss_elem: torch.Tensor,
+        policy_loss: torch.Tensor,
+        policy_weight: float,
+        value_loss: torch.Tensor,
+        penalty_z: torch.Tensor,
+        extra_terms: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        bp_err = (bp_pred.detach() - grid["bp_star"]).abs()
+        terms = {
+            f'{prefix}_main': float(value_loss.item()),
+            f'{prefix}_foc': 0.0,
+            f'{prefix}_penalty_z': float(penalty_z.item()),
+            f'{prefix}_penalty_z_foc': 0.0,
+            f'{prefix}_kkt': 0.0,
+            f'{prefix}_bp_terms_base': float(policy_loss.item()),
+            f'{prefix}_bp_terms_after_eta': float(policy_loss.item()),
+            f'{prefix}_bp_terms': float((policy_weight * policy_loss).item()),
+            f'{prefix}_eta_active_boost': 1.0,
+            f'{prefix}_bp_adapt_scale': 1.0,
+            f'{prefix}_kkt_inner': 0.0,
+            f'{prefix}_kkt_low': 0.0,
+            f'{prefix}_kkt_high': 0.0,
+            f'{prefix}_kkt_foc_abs_mean': 0.0,
+            f'{prefix}_kkt_active_ratio': 0.0,
+            f'{prefix}_kkt_high_weight': 0.0,
+            f'{prefix}_foc_active_ratio': 0.0,
+            f'{prefix}_foc_signed_moment': 0.0,
+            f'{prefix}_foc_cond_abs_mean': 0.0,
+            f'{prefix}_foc_active_n': 0.0,
+            f'{prefix}_bp_foc_use_phat': 0.0,
+            f'{prefix}_bellman_only': 0.0,
+            f'{prefix}_fixed_sdf': float(1.0 if self._pv_use_fixed_sdf() else 0.0),
+            f'{prefix}_fixed_policy': float(1.0 if self._pv_use_fixed_policy() else 0.0),
+            f'{prefix}_target_grid': 1.0,
+            f'{prefix}_grid_value_loss': float(value_loss.item()),
+            f'{prefix}_grid_value_loss_elem_mean': float(value_loss_elem.detach().mean().item()),
+            f'{prefix}_grid_policy_loss': float(policy_loss.item()),
+            f'{prefix}_grid_policy_loss_elem_mean': float(policy_loss_elem.detach().mean().item()),
+            f'{prefix}_grid_policy_weight': float(policy_weight),
+            f'{prefix}_grid_bp_mae': float(bp_err.mean().item()),
+            f'{prefix}_grid_bp_err_p90': self._safe_quantile(bp_err, 0.90),
+            f'{prefix}_grid_regret_mean': float(grid["regret"].mean().item()),
+            f'{prefix}_grid_regret_p90': self._safe_quantile(grid["regret"], 0.90),
+            f'{prefix}_grid_top2_margin_mean': float(grid["top2_margin"].mean().item()),
+            f'{prefix}_grid_top2_margin_p10': self._safe_quantile(grid["top2_margin"], 0.10),
+            f'{prefix}_grid_confidence_mean': float(grid["confidence"].mean().item()),
+            f'{prefix}_grid_boundary_low_share': float(grid["boundary_low"].mean().item()),
+            f'{prefix}_grid_boundary_high_share': float(grid["boundary_high"].mean().item()),
+            f'{prefix}_grid_bp_star_mean': float(grid["bp_star"].mean().item()),
+            f'{prefix}_grid_bp_star_p50': self._safe_quantile(grid["bp_star"], 0.50),
+            f'{prefix}_grid_bp_star_p90': self._safe_quantile(grid["bp_star"], 0.90),
+            f'{prefix}_grid_value_star_mean': float(grid["value_star"].mean().item()),
+            f'{prefix}_grid_value_pred_mean': float(grid["value_pred"].mean().item()),
+            f'{prefix}_grid_value_online_mean': float(value_pred_online.detach().mean().item()),
+            f'{prefix}_grid_default_at_star_mean': float(grid["default_at_star"].mean().item()),
+            f'{prefix}_grid_p_child_at_star_mean': float(grid["p_child_at_star"].mean().item()),
+            f'{prefix}_grid_q_issue_at_star_mean': float(grid["q_issue_at_star"].mean().item()),
+            f'{prefix}_grid_argmax_index_mean': float(grid["argmax_index"].to(torch.float32).mean().item()),
+            f'{prefix}_grid_value_low_bp_mean': float(grid["value_grid"][:, 0:1].mean().item()),
+            f'{prefix}_grid_value_high_bp_mean': float(grid["value_grid"][:, -1:].mean().item()),
+            f'{prefix}_grid_default_low_bp_mean': float(grid["default_grid_mean"][:, 0:1].mean().item()),
+            f'{prefix}_grid_default_high_bp_mean': float(grid["default_grid_mean"][:, -1:].mean().item()),
+            f'{prefix}_grid_p_child_low_bp_mean': float(grid["p_child_grid_mean"][:, 0:1].mean().item()),
+            f'{prefix}_grid_p_child_high_bp_mean': float(grid["p_child_grid_mean"][:, -1:].mean().item()),
+            f'{prefix}_grid_q_issue_low_bp_mean': float(grid["q_issue_grid"][:, 0:1].mean().item()),
+            f'{prefix}_grid_q_issue_high_bp_mean': float(grid["q_issue_grid"][:, -1:].mean().item()),
+        }
+        if extra_terms:
+            terms.update(extra_terms)
+        terms.update(self._tensor_tail_diagnostics(f'{prefix}_grid_value_star', grid["value_star"]))
+        terms.update(self._tensor_tail_diagnostics(f'{prefix}_grid_regret', grid["regret"]))
+        return terms
+
+    def _compute_target_grid_pv_loss(
+        self,
+        *,
+        branch: str,
+        parent: torch.Tensor,
+        children: List[torch.Tensor],
+        parent_state: torch.Tensor,
+        target_model: nn.Module,
+        value_pred: torch.Tensor,
+        bp_pred: torch.Tensor,
+        m_list: List[torch.Tensor],
+        raw_m_list: List[torch.Tensor],
+        m_lo: float,
+        m_hi: float,
+        loss_fn,
+    ) -> torch.Tensor:
+        branch = branch.lower()
+        prefix = 'p0' if branch == 'p0' else 'pi'
+        teacher = BPGridTeacher.from_hyperparams(
+            target_model,
+            self.loss_fns['p0'],
+            self.loss_fns['pi'],
+            self.hyperparams,
+        )
+        grid = teacher.compute(
+            parent_state=parent_state,
+            children=children,
+            m_list=m_list,
+            branch=branch,
+            bp_pred=bp_pred,
+        )
+
+        value_delta = float(getattr(self.hyperparams, "bp_grid_value_huber_delta", 1.0))
+        policy_delta = float(getattr(self.hyperparams, "bp_grid_policy_huber_delta", 0.05))
+        policy_weight = float(getattr(self.hyperparams, "bp_grid_policy_weight", 1.0))
+
+        value_loss_elem = self._huber_element(value_pred, grid["value_star"], value_delta)
+        value_loss = value_loss_elem.mean()
+        penalty_z = compute_z_penalty(
+            value_loss_elem,
+            parent_state[:, 1:2],
+            loss_fn.alpha_z,
+            loss_fn.beta_z,
+            loss_fn.z0,
+        )
+        policy_loss_elem = self._huber_element(bp_pred, grid["bp_star"], policy_delta)
+        policy_loss = (grid["confidence"] * policy_loss_elem).mean()
+        total_loss = value_loss + penalty_z + policy_weight * policy_loss
+
+        extra_terms: Dict[str, float] = {}
+        if branch == 'pi':
+            penalty_b = loss_fn.b_penalty_weight * loss_fn.compute_b_penalty(value_pred, parent_state[:, 0:1]).mean()
+            total_loss = total_loss + penalty_b
+            extra_terms['pi_penalty_b'] = float(penalty_b.item())
+
+        with torch.no_grad():
+            raw_m = torch.cat([m.reshape(-1) for m in raw_m_list], dim=0)
+            use_m = torch.cat([m.reshape(-1) for m in m_list], dim=0)
+            terms = self._grid_diag_terms(
+                prefix,
+                grid,
+                bp_pred,
+                value_pred,
+                value_loss_elem,
+                policy_loss_elem,
+                policy_loss,
+                policy_weight,
+                value_loss,
+                penalty_z,
+                extra_terms=extra_terms,
+            )
+            terms.update(self._m_diagnostics(prefix, raw_m, use_m, m_lo, m_hi))
+            if branch == 'p0':
+                self._latest_p0_terms = terms
+            else:
+                self._latest_pi_terms = terms
+        return total_loss
+
     def _compute_p0_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         计算 P0 损失（支持任意 N 分支）
@@ -2342,6 +2533,22 @@ class Episode:
         # P0 分支使用不投资场景的杠杆候选 bp0
         b_parent = parent_state[:, 0:1]
         bp_for_p0 = self._apply_policy_ablation(bp0_t, b_parent)
+
+        if self._pv_use_target_grid_bp() and not self._policy_value_bellman_only():
+            return self._compute_target_grid_pv_loss(
+                branch='p0',
+                parent=parent,
+                children=children,
+                parent_state=parent_state,
+                target_model=target_model,
+                value_pred=_get_out(output_t, 'P0', 3),
+                bp_pred=bp_for_p0,
+                m_list=M_list,
+                raw_m_list=raw_M_list,
+                m_lo=m_lo,
+                m_hi=m_hi,
+                loss_fn=loss_fn,
+            )
 
         output_children = []
         output_children_target = []
@@ -2539,6 +2746,22 @@ class Episode:
         # PI 分支使用投资场景的杠杆候选 bpI
         b_parent = parent_state[:, 0:1]
         bp_for_pi = self._apply_policy_ablation(bpI_t, b_parent)
+
+        if self._pv_use_target_grid_bp() and not self._policy_value_bellman_only():
+            return self._compute_target_grid_pv_loss(
+                branch='pi',
+                parent=parent,
+                children=children,
+                parent_state=parent_state,
+                target_model=target_model,
+                value_pred=_get_out(output_t, 'PI', 4),
+                bp_pred=bp_for_pi,
+                m_list=M_list,
+                raw_m_list=raw_M_list,
+                m_lo=m_lo,
+                m_hi=m_hi,
+                loss_fn=loss_fn,
+            )
 
         output_children = []
         output_children_target = []
@@ -3680,6 +3903,7 @@ class Episode:
                     f"dLnKF[p10,p50,p90]=({avg_losses['sdf_dlnkf_p10']:.4f}, "
                     f"{avg_losses['sdf_dlnkf_p50']:.4f}, {avg_losses['sdf_dlnkf_p90']:.4f})"
                 )
+            self._maybe_update_firm_target_epoch(train_modules)
         self._q_only_stage = False
         self._bp_only_stage = False
         convergence = None

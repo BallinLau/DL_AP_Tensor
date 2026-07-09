@@ -135,6 +135,15 @@ class PolicyValueModel(nn.Module):
             firm_state[:, :SIMMODEL.I],
             firm_state[:, SIMMODEL.X:]
         ], dim=-1)
+
+    def forward_policy(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Lightweight policy-only forward for simulation or diagnostics.
+
+        This returns bp0/bpI without computing Q, P0/PI, Phat/P/bar_z, or the
+        internal i-grid used by cal_phats().
+        """
+        return self._policy_outputs(firm_state)
     
     def forward(
         self, 
