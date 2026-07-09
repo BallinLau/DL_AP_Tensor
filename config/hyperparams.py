@@ -73,6 +73,15 @@ class HyperParams:
     # "legacy_abs_log1p": E[log(1 + |r1*r2|)]
     # "signed_aio": E[r1*r2]
     sdf_wealth_loss_mode: str = "legacy_abs_log1p"
+    # Signed AiO fresh-pair controls.  When enabled, wealth Euler residuals
+    # use independently sampled AR(1) aggregate shocks; fixed Treatment B
+    # children still supply FC1 reconstruction targets.
+    sdf_fresh_pair_enabled: bool = False
+    sdf_child_bank_size: int = 16
+    sdf_child_bank_refresh_epochs: int = 1
+    sdf_child_bank_seed: int = 12345
+    sdf_child_bank_wealth_only: bool = True
+    sdf_signed_aio_n_children: int = 2
     
     # 损失权重
     w_sdf: float = 1.0

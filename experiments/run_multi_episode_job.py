@@ -92,6 +92,20 @@ def parse_args() -> argparse.Namespace:
         help="SDF wealth-equation objective: legacy_abs_log1p for A, signed_aio for B",
     )
     parser.add_argument(
+        "--sdf-fresh-pair-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use refreshable fresh aggregate shock pairs for SDF wealth loss",
+    )
+    parser.add_argument("--sdf-child-bank-size", type=int, default=16, help="Fresh SDF shock bank size per parent")
+    parser.add_argument(
+        "--sdf-child-bank-refresh-epochs",
+        type=int,
+        default=1,
+        help="Refresh the SDF shock bank every N epochs",
+    )
+    parser.add_argument("--sdf-child-bank-seed", type=int, default=12345, help="Base seed for SDF shock bank")
+    parser.add_argument(
         "--modeb-resimulate-after-pv",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -117,6 +131,10 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.simulate_horizon = args.simulate_horizon
     hyperparams.ablation_mode = args.ablation_mode
     hyperparams.sdf_wealth_loss_mode = args.sdf_wealth_loss_mode
+    hyperparams.sdf_fresh_pair_enabled = bool(args.sdf_fresh_pair_enabled)
+    hyperparams.sdf_child_bank_size = args.sdf_child_bank_size
+    hyperparams.sdf_child_bank_refresh_epochs = args.sdf_child_bank_refresh_epochs
+    hyperparams.sdf_child_bank_seed = args.sdf_child_bank_seed
     hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"
     hyperparams.pv_fixed_sdf = args.ablation_mode == "fixed_sdf"
     hyperparams.pv_fixed_policy = args.ablation_mode == "fixed_policy"

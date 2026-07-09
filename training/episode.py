@@ -29,6 +29,12 @@ from losses.sdf_loss import moment_penalty
 from data.data_utils import build_sdf_pairs_from_macro_ts
 from .gradient_utils import gradient_protection, compute_gradient_norm
 from .scheduler import LossWeightScheduler, LearningRateScheduler
+from .sdf_shock_bank import (
+    SDFShockBank,
+    _make_generator,
+    shock_pair_diagnostics,
+    shocks_to_x_children,
+)
 from .target_utils import hard_update, soft_update
 from utils.gpu_monitor import GPUMonitor, print_memory_summary
 
@@ -172,6 +178,10 @@ class Episode:
         self._last_nonfinite_grad_params: Dict[str, List[str]] = {}
         self._last_policy_value_stage_summary: Optional[Dict[str, float]] = None
         self._last_policy_value_gate_context: Dict[str, float] = {}
+        self._sdf_shock_bank: Optional[SDFShockBank] = None
+        self._sdf_shock_bank_n_parents: int = 0
+        self._sdf_shock_bank_epoch: Optional[int] = None
+        self._sdf_pair_generator: Optional[torch.Generator] = None
 
     def _init_firm_target(self, firm_target: Optional[nn.Module] = None) -> Optional[nn.Module]:
         """
@@ -857,7 +867,8 @@ class Episode:
                 'parent': parent[idx],
                 'children': [c[idx] for c in children],
                 'child0': children[0][idx] if len(children) > 0 else None,
-                'child1': children[1][idx] if len(children) > 1 else None
+                'child1': children[1][idx] if len(children) > 1 else None,
+                'parent_index': idx,
             }
             batches.append(batch)
         return batches
@@ -1490,6 +1501,138 @@ class Episode:
             return 1.0
         progress = float(self._current_epoch_idx + 1) / float(max(1, warmup_epochs))
         return float(start + (1.0 - start) * progress)
+
+    def _sdf_fresh_pair_enabled(self) -> bool:
+        return bool(getattr(self.hyperparams, "sdf_fresh_pair_enabled", False))
+
+    def _sdf_child_bank_seed(self, epoch: int) -> int:
+        base_seed = int(getattr(self.hyperparams, "sdf_child_bank_seed", 12345))
+        return int(base_seed + 10000 * int(self.episode_id) + int(epoch))
+
+    def _prepare_sdf_shock_bank_for_epoch(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+        epoch: int,
+        train_modules: List[str],
+    ) -> None:
+        if 'sdf_fc1' not in train_modules or not self._sdf_fresh_pair_enabled():
+            return
+        if not batches:
+            return
+
+        bank_size = int(getattr(self.hyperparams, "sdf_child_bank_size", 16))
+        if bank_size < 2:
+            raise ValueError("sdf_child_bank_size must be >= 2 when fresh pairs are enabled.")
+        n_children = int(getattr(self.hyperparams, "sdf_signed_aio_n_children", 2))
+        if n_children != 2:
+            raise ValueError("Only sdf_signed_aio_n_children=2 is currently supported.")
+
+        max_parent_index = -1
+        first_parent = None
+        for batch in batches:
+            if first_parent is None and 'parent' in batch:
+                first_parent = batch['parent']
+            parent_index = batch.get('parent_index')
+            if parent_index is None:
+                raise ValueError("SDF fresh pair sampling requires batch['parent_index'].")
+            if parent_index.numel() > 0:
+                max_parent_index = max(max_parent_index, int(parent_index.max().item()))
+        if max_parent_index < 0 or first_parent is None:
+            return
+
+        n_parents = max_parent_index + 1
+        dtype = first_parent.dtype
+        device = self.device
+        seed = self._sdf_child_bank_seed(epoch)
+        needs_create = (
+            self._sdf_shock_bank is None
+            or self._sdf_shock_bank.eps.shape[0] < n_parents
+            or self._sdf_shock_bank.bank_size != bank_size
+            or self._sdf_shock_bank.eps.device != device
+            or self._sdf_shock_bank.eps.dtype != dtype
+        )
+        if needs_create:
+            self._sdf_shock_bank = SDFShockBank.create(
+                n_parents=n_parents,
+                bank_size=bank_size,
+                device=device,
+                base_seed=seed,
+                dtype=dtype,
+            )
+            self._sdf_shock_bank_n_parents = n_parents
+            self._sdf_shock_bank_epoch = epoch
+        else:
+            refresh_epochs = max(1, int(getattr(self.hyperparams, "sdf_child_bank_refresh_epochs", 1)))
+            if epoch % refresh_epochs == 0 and self._sdf_shock_bank_epoch != epoch:
+                self._sdf_shock_bank.refresh_(seed=seed)
+                self._sdf_shock_bank_epoch = epoch
+
+        pair_seed = seed + 7919
+        self._sdf_pair_generator = _make_generator(device)
+        self._sdf_pair_generator.manual_seed(pair_seed)
+        logger.info(
+            "SDF shock bank ready | episode=%s epoch=%s n_parents=%s bank_size=%s refresh_id=%s seed=%s",
+            self.episode_id,
+            epoch,
+            n_parents,
+            bank_size,
+            self._sdf_shock_bank.refresh_id if self._sdf_shock_bank is not None else -1,
+            seed,
+        )
+
+    def _sample_sdf_fresh_x_children(
+        self,
+        parent: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        if not self._sdf_fresh_pair_enabled():
+            return None, {
+                'sdf_fresh_pair_enabled': 0.0,
+            }
+
+        wealth_only = bool(getattr(self.hyperparams, "sdf_child_bank_wealth_only", True))
+        if self.add_FC1loss and not wealth_only:
+            raise ValueError(
+                "sdf_child_bank_wealth_only=False would replace FC1 reconstruction children "
+                "without true targets; keep it True for Treatment B semantics."
+            )
+
+        parent_index = batch.get('parent_index')
+        if parent_index is None:
+            raise ValueError("SDF fresh pair sampling requires batch['parent_index'].")
+        if self._sdf_shock_bank is None:
+            seed = self._sdf_child_bank_seed(self._current_epoch_idx)
+            n_parents = int(parent_index.max().item()) + 1
+            self._sdf_shock_bank = SDFShockBank.create(
+                n_parents=n_parents,
+                bank_size=int(getattr(self.hyperparams, "sdf_child_bank_size", 16)),
+                device=self.device,
+                base_seed=seed,
+                dtype=parent.dtype,
+            )
+            self._sdf_pair_generator = _make_generator(self.device)
+            self._sdf_pair_generator.manual_seed(seed + 7919)
+
+        eps1, eps2, j1, j2 = self._sdf_shock_bank.sample_pair(
+            parent_index.to(self.device),
+            self._sdf_pair_generator,
+        )
+        x_children = shocks_to_x_children(
+            x_parent=parent[:, 4:5],
+            eps1=eps1,
+            eps2=eps2,
+            rho_x=self.config.RHO_X,
+            sigma_x=self.config.SIGMA_X,
+            xbar=self.config.XBAR,
+        )
+        diag = shock_pair_diagnostics(eps1, eps2, j1, j2, self._sdf_shock_bank.bank_size)
+        diag.update({
+            'sdf_fresh_pair_enabled': 1.0,
+            'sdf_bank_size': float(self._sdf_shock_bank.bank_size),
+            'sdf_bank_refresh_id': float(self._sdf_shock_bank.refresh_id),
+            'sdf_bank_wealth_only': float(1.0 if wealth_only else 0.0),
+        })
+        return x_children, diag
     
     def generate_data(
         self,
@@ -1791,14 +1934,40 @@ class Episode:
         c_prev_input = parent[:, 7:8] if use_true_prev_macro else parent[:, 5:6]
         k_prev_input = parent[:, 8:9] if use_true_prev_macro else parent[:, 6:7]
 
-        # 前向传播：一次性处理两条子路径
-        w_parent, w_children, M, c_children, k_children = model.forward_step(
+        fixed_children_x = children_t[:, :, 4:5]
+        x_children_fresh, fresh_pair_diag = self._sample_sdf_fresh_x_children(parent, batch)
+        use_fresh_wealth = x_children_fresh is not None and not bool(
+            getattr(self, "_fc1_teacher_forcing_stage", False)
+        )
+        if use_fresh_wealth:
+            if self.add_FC1loss:
+                x_children_all = torch.cat([x_children_fresh, fixed_children_x], dim=1)
+                wealth_slice = slice(0, 2)
+                recon_slice = slice(2, 4)
+            else:
+                x_children_all = x_children_fresh
+                wealth_slice = slice(0, 2)
+                recon_slice = slice(0, 2)
+        else:
+            x_children_all = fixed_children_x
+            wealth_slice = slice(0, 2)
+            recon_slice = slice(0, 2)
+            fresh_pair_diag = {'sdf_fresh_pair_enabled': float(1.0 if x_children_fresh is not None else 0.0)}
+
+        # 前向传播：fresh wealth pair 与固定 recon pair 共享 parent forward
+        w_parent, w_children_all, M_all, c_children_all, k_children_all = model.forward_step(
             x_prev=parent[:, 4:5],
-            x_curr=children_t[:, :, 4:5],
+            x_curr=x_children_all,
             hatcf_prev=c_prev_input,
             lnkf_prev=k_prev_input,
             return_physical=True
         )
+        w_children_wealth = w_children_all[:, wealth_slice]
+        M_wealth = M_all[:, wealth_slice]
+        c_children_wealth = c_children_all[:, wealth_slice]
+        k_children_wealth = k_children_all[:, wealth_slice]
+        c_children_recon = c_children_all[:, recon_slice]
+        k_children_recon = k_children_all[:, recon_slice]
         
         # 提取父节点状态并计算 w
         c_parent = c_prev_input
@@ -1807,14 +1976,14 @@ class Episode:
         # 计算损失
         # 构造残差并按 parent 聚合
         residuals = loss_fn.compute_euler_residuals(
-            w_parent.squeeze(-1), w_children.squeeze(-1),
-            k_parent.squeeze(-1), k_children.squeeze(-1),
-            c_parent.squeeze(-1), c_children.squeeze(-1)
+            w_parent.squeeze(-1), w_children_wealth.squeeze(-1),
+            k_parent.squeeze(-1), k_children_wealth.squeeze(-1),
+            c_parent.squeeze(-1), c_children_wealth.squeeze(-1)
         )  # (batch, n_children)
         main_loss, wealth_main_details = loss_fn.compute_wealth_main_loss(residuals)
 
         moment_loss = torch.tensor(0.0, device=self.device)
-        M_use = M.squeeze(-1) if M.dim() == 3 else M
+        M_use = M_wealth.squeeze(-1) if M_wealth.dim() == 3 else M_wealth
         if M_use.dim() == 1:
             M_use = M_use.unsqueeze(-1)
         for j in range(M_use.shape[1]):
@@ -1880,8 +2049,8 @@ class Episode:
         jacobian_penalty_hatc = torch.tensor(0.0, device=self.device)
         jacobian_penalty_lnk = torch.tensor(0.0, device=self.device)
         if self.add_FC1loss:
-            hatcf_pred = c_children  # (batch, 2, 1)
-            lnkf_pred = k_children   # (batch, 2, 1)
+            hatcf_pred = c_children_recon  # fixed Treatment B children
+            lnkf_pred = k_children_recon
             # 与当前 SDF macro-batch 布局保持一致：
             # [..., x, Hatcf, LnKF, Hatc_true, LnK_true]
             if children_t.shape[-1] >= 10:
@@ -2053,8 +2222,10 @@ class Episode:
         with torch.no_grad():
             mu = M_use.mean().clamp_min(1e-8)
             var = ((M_use - mu) ** 2).mean().clamp_min(1e-8)
-            d_hatcf = (c_children - c_parent.unsqueeze(1)).reshape(-1)
-            d_lnkf = (k_children - k_parent.unsqueeze(1)).reshape(-1)
+            d_hatcf = (c_children_wealth - c_parent.unsqueeze(1)).reshape(-1)
+            d_lnkf = (k_children_wealth - k_parent.unsqueeze(1)).reshape(-1)
+            d_hatcf_recon = (c_children_recon - c_parent.unsqueeze(1)).reshape(-1)
+            d_lnkf_recon = (k_children_recon - k_parent.unsqueeze(1)).reshape(-1)
 
             def _q(v: torch.Tensor, q: float) -> float:
                 return float(torch.quantile(v, q).item()) if v.numel() > 0 else 0.0
@@ -2107,6 +2278,7 @@ class Episode:
                 'sdf_use_true_prev_macro': float(1.0 if use_true_prev_macro else 0.0),
             }
             self._latest_sdf_terms.update(wealth_diag)
+            self._latest_sdf_terms.update(fresh_pair_diag)
             self._latest_sdf_diag = {
                 'sdf_log_mean_M': float(torch.log(mu).item()),
                 'sdf_log_var_M': float(torch.log(var).item()),
@@ -2118,6 +2290,8 @@ class Episode:
                 'sdf_dlnkf_p10': _q(d_lnkf, 0.10),
                 'sdf_dlnkf_p50': _q(d_lnkf, 0.50),
                 'sdf_dlnkf_p90': _q(d_lnkf, 0.90),
+                'sdf_recon_dhatcf_mean': float(d_hatcf_recon.mean().item()),
+                'sdf_recon_dlnkf_mean': float(d_lnkf_recon.mean().item()),
             }
 
         return total_sdf_loss
@@ -2845,7 +3019,8 @@ class Episode:
                 'parent': parent[idx],
                 'children': [c[idx] for c in children],
                 'child0': children[0][idx] if len(children) > 0 else None,
-                'child1': children[1][idx] if len(children) > 1 else None
+                'child1': children[1][idx] if len(children) > 1 else None,
+                'parent_index': idx,
             }
             batches.append(batch)
         
@@ -2974,7 +3149,8 @@ class Episode:
                 'parent': parent[idx],
                 'children': [c[idx] for c in children],
                 'child0': children[0][idx] if len(children) > 0 else None,
-                'child1': children[1][idx] if len(children) > 1 else None
+                'child1': children[1][idx] if len(children) > 1 else None,
+                'parent_index': idx,
             }
             batches.append(batch)
         
@@ -3406,6 +3582,7 @@ class Episode:
 
         for epoch in range(n_epochs):
             self._current_epoch_idx = epoch
+            self._prepare_sdf_shock_bank_for_epoch(batches, epoch, train_modules)
             self._q_only_stage = bool(
                 'policy_value' in train_modules and q_only_epochs > 0 and epoch < q_only_epochs
             )

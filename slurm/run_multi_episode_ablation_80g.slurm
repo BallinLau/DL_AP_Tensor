@@ -37,6 +37,10 @@ ALTERNATE_START="${ALTERNATE_START:-modea}"
 ENABLE_FC2="${ENABLE_FC2:-0}"
 QUICK_TEST="${QUICK_TEST:-0}"
 SDF_WEALTH_LOSS_MODE="${SDF_WEALTH_LOSS_MODE:-legacy_abs_log1p}"
+SDF_FRESH_PAIR_ENABLED="${SDF_FRESH_PAIR_ENABLED:-0}"
+SDF_CHILD_BANK_SIZE="${SDF_CHILD_BANK_SIZE:-16}"
+SDF_CHILD_BANK_REFRESH_EPOCHS="${SDF_CHILD_BANK_REFRESH_EPOCHS:-1}"
+SDF_CHILD_BANK_SEED="${SDF_CHILD_BANK_SEED:-12345}"
 # Default to Treatment B for formal Mode B runs; set MODEB_RESIMULATE_AFTER_PV=0 for Treatment A.
 MODEB_RESIMULATE_AFTER_PV="${MODEB_RESIMULATE_AFTER_PV:-1}"
 MAX_FIRM_TRAIN_UNITS="${MAX_FIRM_TRAIN_UNITS:-1000000}"
@@ -94,6 +98,11 @@ if [[ "$MODEB_RESIMULATE_AFTER_PV" == "1" ]]; then
 else
   EXTRA_ARGS+=(--no-modeb-resimulate-after-pv)
 fi
+if [[ "$SDF_FRESH_PAIR_ENABLED" == "1" ]]; then
+  EXTRA_ARGS+=(--sdf-fresh-pair-enabled)
+else
+  EXTRA_ARGS+=(--no-sdf-fresh-pair-enabled)
+fi
 
 echo "Run parameters:"
 echo "  ABLATION_MODE=$ABLATION_MODE"
@@ -109,6 +118,10 @@ echo "  ALTERNATE_START=$ALTERNATE_START"
 echo "  ENABLE_FC2=$ENABLE_FC2"
 echo "  QUICK_TEST=$QUICK_TEST"
 echo "  SDF_WEALTH_LOSS_MODE=$SDF_WEALTH_LOSS_MODE"
+echo "  SDF_FRESH_PAIR_ENABLED=$SDF_FRESH_PAIR_ENABLED"
+echo "  SDF_CHILD_BANK_SIZE=$SDF_CHILD_BANK_SIZE"
+echo "  SDF_CHILD_BANK_REFRESH_EPOCHS=$SDF_CHILD_BANK_REFRESH_EPOCHS"
+echo "  SDF_CHILD_BANK_SEED=$SDF_CHILD_BANK_SEED"
 echo "  MODEB_RESIMULATE_AFTER_PV=$MODEB_RESIMULATE_AFTER_PV"
 echo "  MAX_FIRM_TRAIN_UNITS=$MAX_FIRM_TRAIN_UNITS"
 echo "  POLICY_GRAD_THRESHOLD=$POLICY_GRAD_THRESHOLD"
@@ -131,6 +144,9 @@ python3 -u experiments/run_multi_episode_job.py \
   --post0-mode "$POST0_MODE" \
   --alternate-start "$ALTERNATE_START" \
   --sdf-wealth-loss-mode "$SDF_WEALTH_LOSS_MODE" \
+  --sdf-child-bank-size "$SDF_CHILD_BANK_SIZE" \
+  --sdf-child-bank-refresh-epochs "$SDF_CHILD_BANK_REFRESH_EPOCHS" \
+  --sdf-child-bank-seed "$SDF_CHILD_BANK_SEED" \
   --ablation-mode "$ABLATION_MODE" \
   --max-firm-train-units "$MAX_FIRM_TRAIN_UNITS" \
   --policy-grad-threshold "$POLICY_GRAD_THRESHOLD" \

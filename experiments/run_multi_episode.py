@@ -139,6 +139,20 @@ def main():
         choices=["legacy_abs_log1p", "signed_aio"],
         help="SDF wealth-equation objective: legacy_abs_log1p for A, signed_aio for B",
     )
+    parser.add_argument(
+        "--sdf-fresh-pair-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use refreshable fresh aggregate shock pairs for SDF wealth loss",
+    )
+    parser.add_argument("--sdf-child-bank-size", type=int, default=16, help="Fresh SDF shock bank size per parent")
+    parser.add_argument(
+        "--sdf-child-bank-refresh-epochs",
+        type=int,
+        default=1,
+        help="Refresh the SDF shock bank every N epochs",
+    )
+    parser.add_argument("--sdf-child-bank-seed", type=int, default=12345, help="Base seed for SDF shock bank")
     args = parser.parse_args()
 
     global RUN_ROOT
@@ -150,6 +164,10 @@ def main():
     n_episodes = args.n_episodes  # episode 0 + simulate episodes
     hyperparams = build_hyperparams()
     hyperparams.sdf_wealth_loss_mode = args.sdf_wealth_loss_mode
+    hyperparams.sdf_fresh_pair_enabled = bool(args.sdf_fresh_pair_enabled)
+    hyperparams.sdf_child_bank_size = args.sdf_child_bank_size
+    hyperparams.sdf_child_bank_refresh_epochs = args.sdf_child_bank_refresh_epochs
+    hyperparams.sdf_child_bank_seed = args.sdf_child_bank_seed
     models = build_models(device)
     optimizers = build_optimizers(models, hyperparams)
 

@@ -7,6 +7,25 @@ Training orchestration for episodes and modules.
 - `generate_data` (legacy) and `run_episode` (current flow)
 - SDF, Policy/Value, FC2 losses and batch builders
 
+### SDF/FC1: fresh wealth shock pairs
+- `HyperParams.sdf_fresh_pair_enabled` enables refreshable aggregate shock pairs for the SDF wealth Euler loss.
+- The shock tape stores only AR(1) innovations with shape `[n_parent, sdf_child_bank_size, 1]`.
+- At each optimizer step, `_compute_sdf_loss(...)` samples two different children per parent (`j1 != j2`) and converts them into fresh `x_{t+1}` values.
+- Fresh children are used only for:
+  - wealth Euler residuals
+  - `sdf_wealth_loss_mode` (`legacy_abs_log1p` or `signed_aio`)
+  - SDF moment and mean-anchor penalties
+- Fixed Treatment B children remain the source of:
+  - FC1 true-state reconstruction targets
+  - FC1 forecast-state reconstruction targets
+  - delta and Jacobian penalties
+- Relevant controls:
+  - `sdf_child_bank_size` (default `16`)
+  - `sdf_child_bank_refresh_epochs` (default `1`)
+  - `sdf_child_bank_seed` (default `12345`)
+  - CLI flags: `--sdf-fresh-pair-enabled`, `--sdf-child-bank-size`, `--sdf-child-bank-refresh-epochs`, `--sdf-child-bank-seed`
+- Diagnostics include `sdf_pair_collision_rate`, `sdf_eps_cross_corr`, `sdf_eps1_std`, `sdf_eps2_std`, `sdf_bank_size`, and `sdf_bank_refresh_id`.
+
 ### Policy/Value: Q-first training hooks
 - `train_step(..., policy_loss_terms=...)` now supports selective optimization among `['q', 'p0', 'pi']`.
 - `_run_batches(...)` supports Q pretraining via `HyperParams.q_pretrain_epochs` and `HyperParams.q_warmstart_epochs`:
