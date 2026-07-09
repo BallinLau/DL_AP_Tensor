@@ -94,7 +94,8 @@ class SDFLoss(nn.Module):
         beta: float = None,
         mu_lo: float = -0.025,
         mu_hi: float = 0.0,
-        var_hi: float = 0.25
+        var_hi: float = 0.25,
+        wealth_loss_mode: str = "legacy_abs_log1p",
     ):
         super().__init__()
         
@@ -106,9 +107,97 @@ class SDFLoss(nn.Module):
         self.mu_lo = mu_lo
         self.mu_hi = mu_hi
         self.var_hi = var_hi
+        self.wealth_loss_mode = wealth_loss_mode
         
         # 预计算 β^κ
         self.tmp = self.beta ** self.kappa
+
+    @staticmethod
+    def _safe_quantile(v: torch.Tensor, q: float) -> torch.Tensor:
+        flat = v.detach().reshape(-1)
+        flat = flat[torch.isfinite(flat)]
+        if flat.numel() == 0:
+            return torch.tensor(float("nan"), device=v.device, dtype=v.dtype)
+        return torch.quantile(flat.to(torch.float32), q).to(device=v.device, dtype=v.dtype)
+
+    @staticmethod
+    def _stack_residuals(residuals) -> torch.Tensor:
+        """
+        Return Euler residuals as a tensor with shape [batch_size, n_branches].
+        """
+        if isinstance(residuals, (list, tuple)):
+            if len(residuals) == 0:
+                raise ValueError("Euler residual list is empty.")
+            residuals = torch.stack(
+                [
+                    r.squeeze(-1) if r.ndim > 1 else r
+                    for r in residuals
+                ],
+                dim=1,
+            )
+
+        if residuals.ndim == 3 and residuals.shape[-1] == 1:
+            residuals = residuals.squeeze(-1)
+
+        if residuals.ndim != 2:
+            raise ValueError(
+                "Euler residuals must have shape "
+                f"[batch, branches], got {tuple(residuals.shape)}."
+            )
+
+        return residuals
+
+    def compute_wealth_main_loss(self, residuals) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute the SDF wealth-equation main loss.
+
+        Modes:
+        - legacy_abs_log1p: E[log(1 + |prod_j r_j|)]
+        - signed_aio: E[r_1 * r_2]
+        """
+        r = self._stack_residuals(residuals)
+        n_branches = int(r.shape[1])
+
+        legacy_product = r.prod(dim=1)
+        legacy_loss = torch.log1p(legacy_product.abs()).mean()
+        abs_r = r.abs()
+
+        details: Dict[str, torch.Tensor] = {
+            "legacy_abs_log1p": legacy_loss,
+            "product_signed_mean": legacy_product.mean(),
+            "product_abs_mean": legacy_product.abs().mean(),
+            "product_negative_share": (legacy_product < 0).float().mean(),
+            "residual_abs_mean": abs_r.mean(),
+            "residual_rms": r.pow(2).mean().sqrt(),
+            "r_abs_min_branch_mean": abs_r.min(dim=1).values.mean(),
+            "r_abs_max_branch_mean": abs_r.max(dim=1).values.mean(),
+        }
+
+        for j in range(n_branches):
+            rj_abs = abs_r[:, j]
+            idx = j + 1
+            details[f"r{idx}_abs_mean"] = rj_abs.mean()
+            details[f"r{idx}_abs_p50"] = self._safe_quantile(rj_abs, 0.50)
+            details[f"r{idx}_abs_p90"] = self._safe_quantile(rj_abs, 0.90)
+            details[f"r{idx}_abs_p99"] = self._safe_quantile(rj_abs, 0.99)
+            details[f"r{idx}_abs_max"] = rj_abs.max()
+
+        if n_branches == 2:
+            signed_product = r[:, 0] * r[:, 1]
+            details["signed_aio"] = signed_product.mean()
+
+        if self.wealth_loss_mode == "legacy_abs_log1p":
+            return legacy_loss, details
+
+        if self.wealth_loss_mode == "signed_aio":
+            if n_branches != 2:
+                raise ValueError(
+                    "signed_aio requires exactly two independent children, "
+                    f"got {n_branches}."
+                )
+            return details["signed_aio"], details
+
+        raise ValueError(f"Unknown wealth_loss_mode={self.wealth_loss_mode!r}")
     
     def compute_euler_residuals(
         self,
@@ -212,16 +301,9 @@ class SDFLoss(nn.Module):
             c_parent, c_children
         )
         
-        # 2. 主损失：所有路径残差的乘积（要求同时为零）
-        if isinstance(residuals, list):
-            raw_loss = residuals[0]
-            for residual in residuals[1:]:
-                raw_loss = raw_loss * residual
-        else:
-            raw_loss = residuals.prod(dim=-1)
-        
-        # 使用 log1p 平滑
-        main_loss = torch.mean(torch.log1p(raw_loss.abs()))
+        # 2. Wealth-equation main loss. The selected mode is an SDF-only
+        # theoretical objective, separate from the generic aio_weight helper.
+        main_loss, _ = self.compute_wealth_main_loss(residuals)
         
         # 3. 矩约束惩罚（所有路径的 M）
         moment_loss = torch.tensor(0.0, device=w_parent.device)
@@ -298,16 +380,11 @@ class SDFLoss(nn.Module):
         )
         
         # 主损失
-        if isinstance(residuals, list):
-            raw_loss = residuals[0]
-            for residual in residuals[1:]:
-                raw_loss = raw_loss * residual
-        else:
-            raw_loss = residuals.prod(dim=-1)
-        main_loss = torch.mean(torch.log1p(raw_loss.abs()))
+        main_loss, main_details = self.compute_wealth_main_loss(residuals)
         
         # 矩约束惩罚
         loss_dict = {'main_loss': main_loss}
+        loss_dict.update(main_details)
         moment_loss = torch.tensor(0.0, device=w_parent.device)
         
         if isinstance(M_list, torch.Tensor):

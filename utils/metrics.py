@@ -49,6 +49,44 @@ def compute_euler_residual(
     }
 
 
+def conditional_moment_metrics(residuals: torch.Tensor) -> Dict[str, float]:
+    """
+    Held-out conditional moment metrics for residual tensors.
+
+    Args:
+        residuals: Tensor with shape [n_parents, n_eval_children].
+
+    Returns:
+        Scalar metrics computed in float64 without changing residual definition.
+    """
+    if residuals.ndim != 2:
+        raise ValueError(f"Expected [parents, children], got {tuple(residuals.shape)}")
+    if residuals.shape[1] < 2:
+        raise ValueError("At least two eval children are required for the U-statistic.")
+
+    r = residuals.detach().to(torch.float64)
+    n_children = int(r.shape[1])
+
+    mean_r = r.mean(dim=1)
+    cm_mse = mean_r.pow(2).mean()
+
+    sum_r = r.sum(dim=1)
+    sum_r2 = r.pow(2).sum(dim=1)
+    u_per_parent = (sum_r.pow(2) - sum_r2) / (n_children * (n_children - 1))
+    abs_mean_r = mean_r.abs()
+
+    return {
+        "heldout_cm_mse": float(cm_mse.item()),
+        "heldout_u_stat": float(u_per_parent.mean().item()),
+        "heldout_mean_r_abs": float(abs_mean_r.mean().item()),
+        "heldout_mean_r_p90": float(torch.quantile(abs_mean_r, 0.90).item()),
+        "heldout_mean_r_p99": float(torch.quantile(abs_mean_r, 0.99).item()),
+        "heldout_raw_r_rms": float(r.pow(2).mean().sqrt().item()),
+        "heldout_n_parents": float(r.shape[0]),
+        "heldout_n_children": float(n_children),
+    }
+
+
 def compute_resource_balance(
     Y: torch.Tensor,
     C: torch.Tensor,

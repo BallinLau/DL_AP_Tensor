@@ -422,7 +422,9 @@ class Episode:
         初始化损失函数
         """
         return {
-            'sdf': SDFLoss(),
+            'sdf': SDFLoss(
+                wealth_loss_mode=getattr(self.hyperparams, "sdf_wealth_loss_mode", "legacy_abs_log1p")
+            ),
             'p0': P0Loss(),
             'pi': PILoss(),
             'q': QLoss(),
@@ -1809,8 +1811,7 @@ class Episode:
             k_parent.squeeze(-1), k_children.squeeze(-1),
             c_parent.squeeze(-1), c_children.squeeze(-1)
         )  # (batch, n_children)
-        combined = residuals.prod(dim=-1)  # (batch,)
-        main_loss = torch.log1p(combined.abs()).mean()
+        main_loss, wealth_main_details = loss_fn.compute_wealth_main_loss(residuals)
 
         moment_loss = torch.tensor(0.0, device=self.device)
         M_use = M.squeeze(-1) if M.dim() == 3 else M
@@ -2058,14 +2059,27 @@ class Episode:
             def _q(v: torch.Tensor, q: float) -> float:
                 return float(torch.quantile(v, q).item()) if v.numel() > 0 else 0.0
 
+            wealth_diag = {
+                f"sdf_{key if key != 'signed_aio' else 'signed_aio_main'}": float(
+                    value.detach().item()
+                )
+                for key, value in wealth_main_details.items()
+                if torch.is_tensor(value) and value.numel() == 1
+            }
             self._latest_sdf_terms = {
                 'sdf_main_loss': float(main_loss.detach().item()),
+                'sdf_total_loss': float(total_sdf_loss.detach().item()),
+                'sdf_wealth_loss_mode_signed_aio': float(
+                    1.0 if getattr(loss_fn, "wealth_loss_mode", "legacy_abs_log1p") == "signed_aio" else 0.0
+                ),
                 'sdf_moment_loss': float(moment_loss.detach().item()),
                 'sdf_recon_loss': float(recon_loss.detach().item()),
+                'sdf_fc1_true_recon': float(recon_loss.detach().item()),
                 'sdf_recon_loss_hatc': float(recon_loss_hatc.detach().item()),
                 'sdf_recon_loss_lnk': float(recon_loss_lnk.detach().item()),
                 'sdf_recon_loss_dlnk': float(recon_loss_dlnk.detach().item()),
                 'sdf_recon_loss_forecast': float(recon_loss_forecast.detach().item()),
+                'sdf_fc1_forecast_recon': float(recon_loss_forecast.detach().item()),
                 'sdf_recon_loss_forecast_hatc': float(recon_loss_forecast_hatc.detach().item()),
                 'sdf_recon_loss_forecast_lnk': float(recon_loss_forecast_lnk.detach().item()),
                 'sdf_recon_loss_forecast_dlnk': float(recon_loss_forecast_dlnk.detach().item()),
@@ -2092,6 +2106,7 @@ class Episode:
                 'sdf_teacher_forcing_stage': float(1.0 if self._fc1_teacher_forcing_stage else 0.0),
                 'sdf_use_true_prev_macro': float(1.0 if use_true_prev_macro else 0.0),
             }
+            self._latest_sdf_terms.update(wealth_diag)
             self._latest_sdf_diag = {
                 'sdf_log_mean_M': float(torch.log(mu).item()),
                 'sdf_log_var_M': float(torch.log(var).item()),

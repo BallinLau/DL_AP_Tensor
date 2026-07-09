@@ -69,6 +69,10 @@ class HyperParams:
     # AIO 权重（动态残差插值）
     aio_weight: float = 0.5
     aio_warmup_epochs: int = 10
+    # SDF wealth equation objective. Keep this separate from generic aio_weight:
+    # "legacy_abs_log1p": E[log(1 + |r1*r2|)]
+    # "signed_aio": E[r1*r2]
+    sdf_wealth_loss_mode: str = "legacy_abs_log1p"
     
     # 损失权重
     w_sdf: float = 1.0

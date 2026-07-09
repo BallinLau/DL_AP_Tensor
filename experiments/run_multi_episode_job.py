@@ -85,6 +85,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-loss-threshold", type=float, default=None, help="Absolute policy/value loss gate")
     parser.add_argument("--pv-sdf-clip-ratio-gate", type=float, default=None, help="Reject stage if raw SDF clip ratio exceeds this value")
     parser.add_argument(
+        "--sdf-wealth-loss-mode",
+        type=str.lower,
+        default="legacy_abs_log1p",
+        choices=["legacy_abs_log1p", "signed_aio"],
+        help="SDF wealth-equation objective: legacy_abs_log1p for A, signed_aio for B",
+    )
+    parser.add_argument(
         "--modeb-resimulate-after-pv",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -109,6 +116,7 @@ def configure_hyperparams(args: argparse.Namespace):
     if args.simulate_horizon is not None:
         hyperparams.simulate_horizon = args.simulate_horizon
     hyperparams.ablation_mode = args.ablation_mode
+    hyperparams.sdf_wealth_loss_mode = args.sdf_wealth_loss_mode
     hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"
     hyperparams.pv_fixed_sdf = args.ablation_mode == "fixed_sdf"
     hyperparams.pv_fixed_policy = args.ablation_mode == "fixed_policy"
@@ -245,6 +253,7 @@ def main():
                     "simulate_group_size": simulate_group_size,
                     "simulate_horizon": hyperparams.simulate_horizon,
                     "post0_mode": args.post0_mode,
+                    "sdf_wealth_loss_mode": hyperparams.sdf_wealth_loss_mode,
                     "modeb_resimulate_after_pv": args.modeb_resimulate_after_pv,
                     "max_firm_train_units": hyperparams.max_firm_train_units,
                 },
@@ -288,6 +297,7 @@ def main():
 
         summaries.append({
             "episode_mode": episode_mode,
+            "sdf_wealth_loss_mode": hyperparams.sdf_wealth_loss_mode,
             "module_summaries": ep_summary,
             "gpu_memory": summary.get("gpu_memory", {})
         })
@@ -296,7 +306,8 @@ def main():
             f"batch_size={hyperparams.batch_size} "
             f"n_paths={data_kwargs['n_paths']} "
             f"group_size={data_kwargs['group_size']} "
-            f"horizon={hyperparams.simulate_horizon}"
+            f"horizon={hyperparams.simulate_horizon} "
+            f"sdf_wealth_loss_mode={hyperparams.sdf_wealth_loss_mode}"
         )
         log_gpu_stats(f"[Episode {ep}]", device)
         print(f"Episode {ep} ({episode_mode}) done: {ep_summary}")

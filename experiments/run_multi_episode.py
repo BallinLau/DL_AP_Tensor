@@ -132,6 +132,13 @@ def main():
         choices=["modea", "modeb"],
         help="When --post0-mode=alternate, choose which mode starts at episode 1",
     )
+    parser.add_argument(
+        "--sdf-wealth-loss-mode",
+        type=str.lower,
+        default="legacy_abs_log1p",
+        choices=["legacy_abs_log1p", "signed_aio"],
+        help="SDF wealth-equation objective: legacy_abs_log1p for A, signed_aio for B",
+    )
     args = parser.parse_args()
 
     global RUN_ROOT
@@ -142,6 +149,7 @@ def main():
 
     n_episodes = args.n_episodes  # episode 0 + simulate episodes
     hyperparams = build_hyperparams()
+    hyperparams.sdf_wealth_loss_mode = args.sdf_wealth_loss_mode
     models = build_models(device)
     optimizers = build_optimizers(models, hyperparams)
 

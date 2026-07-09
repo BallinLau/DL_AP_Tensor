@@ -31,6 +31,7 @@ POST0_MODE="${POST0_MODE:-modeb}"
 ALTERNATE_START="${ALTERNATE_START:-modea}"
 ENABLE_FC2="${ENABLE_FC2:-0}"
 QUICK_TEST="${QUICK_TEST:-0}"
+SDF_WEALTH_LOSS_MODE="${SDF_WEALTH_LOSS_MODE:-legacy_abs_log1p}"
 # Default to Treatment B for formal Mode B runs; set MODEB_RESIMULATE_AFTER_PV=0 for Treatment A.
 MODEB_RESIMULATE_AFTER_PV="${MODEB_RESIMULATE_AFTER_PV:-1}"
 
@@ -92,6 +93,7 @@ echo "  POST0_MODE=$POST0_MODE"
 echo "  ALTERNATE_START=$ALTERNATE_START"
 echo "  ENABLE_FC2=$ENABLE_FC2"
 echo "  QUICK_TEST=$QUICK_TEST"
+echo "  SDF_WEALTH_LOSS_MODE=$SDF_WEALTH_LOSS_MODE"
 echo "  MODEB_RESIMULATE_AFTER_PV=$MODEB_RESIMULATE_AFTER_PV"
 
 python3 -u experiments/run_multi_episode_job.py \
@@ -106,6 +108,7 @@ python3 -u experiments/run_multi_episode_job.py \
   --simulate-horizon "$SIMULATE_HORIZON" \
   --post0-mode "$POST0_MODE" \
   --alternate-start "$ALTERNATE_START" \
+  --sdf-wealth-loss-mode "$SDF_WEALTH_LOSS_MODE" \
   "${EXTRA_ARGS[@]}"
 
 echo "Job finished on $(date)"
