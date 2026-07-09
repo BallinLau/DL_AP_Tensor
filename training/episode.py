@@ -2380,6 +2380,7 @@ class Episode:
             f'{prefix}_grid_regret_mean': float(grid["regret"].mean().item()),
             f'{prefix}_grid_regret_p90': self._safe_quantile(grid["regret"], 0.90),
             f'{prefix}_grid_top2_margin_mean': float(grid["top2_margin"].mean().item()),
+            f'{prefix}_grid_fine_top2_margin_mean': float(grid["fine_top2_margin"].mean().item()),
             f'{prefix}_grid_top2_margin_p10': self._safe_quantile(grid["top2_margin"], 0.10),
             f'{prefix}_grid_confidence_mean': float(grid["confidence"].mean().item()),
             f'{prefix}_grid_boundary_low_share': float(grid["boundary_low"].mean().item()),
@@ -2394,20 +2395,67 @@ class Episode:
             f'{prefix}_grid_p_child_at_star_mean': float(grid["p_child_at_star"].mean().item()),
             f'{prefix}_grid_q_issue_at_star_mean': float(grid["q_issue_at_star"].mean().item()),
             f'{prefix}_grid_argmax_index_mean': float(grid["argmax_index"].to(torch.float32).mean().item()),
-            f'{prefix}_grid_value_low_bp_mean': float(grid["value_grid"][:, 0:1].mean().item()),
-            f'{prefix}_grid_value_high_bp_mean': float(grid["value_grid"][:, -1:].mean().item()),
-            f'{prefix}_grid_default_low_bp_mean': float(grid["default_grid_mean"][:, 0:1].mean().item()),
-            f'{prefix}_grid_default_high_bp_mean': float(grid["default_grid_mean"][:, -1:].mean().item()),
-            f'{prefix}_grid_p_child_low_bp_mean': float(grid["p_child_grid_mean"][:, 0:1].mean().item()),
-            f'{prefix}_grid_p_child_high_bp_mean': float(grid["p_child_grid_mean"][:, -1:].mean().item()),
-            f'{prefix}_grid_q_issue_low_bp_mean': float(grid["q_issue_grid"][:, 0:1].mean().item()),
-            f'{prefix}_grid_q_issue_high_bp_mean': float(grid["q_issue_grid"][:, -1:].mean().item()),
+            f'{prefix}_grid_value_low_bp_mean': float(grid["coarse_value_grid"][:, 0:1].mean().item()),
+            f'{prefix}_grid_value_high_bp_mean': float(grid["coarse_value_grid"][:, -1:].mean().item()),
+            f'{prefix}_grid_default_low_bp_mean': float(grid["coarse_default_grid_mean"][:, 0:1].mean().item()),
+            f'{prefix}_grid_default_high_bp_mean': float(grid["coarse_default_grid_mean"][:, -1:].mean().item()),
+            f'{prefix}_grid_p_child_low_bp_mean': float(grid["coarse_p_child_grid_mean"][:, 0:1].mean().item()),
+            f'{prefix}_grid_p_child_high_bp_mean': float(grid["coarse_p_child_grid_mean"][:, -1:].mean().item()),
+            f'{prefix}_grid_q_issue_low_bp_mean': float(grid["coarse_q_issue_grid"][:, 0:1].mean().item()),
+            f'{prefix}_grid_q_issue_high_bp_mean': float(grid["coarse_q_issue_grid"][:, -1:].mean().item()),
+            f'{prefix}_grid_local_value_left_mean': float(grid["local_value_left"].mean().item()),
+            f'{prefix}_grid_local_value_right_mean': float(grid["local_value_right"].mean().item()),
         }
         if extra_terms:
             terms.update(extra_terms)
         terms.update(self._tensor_tail_diagnostics(f'{prefix}_grid_value_star', grid["value_star"]))
         terms.update(self._tensor_tail_diagnostics(f'{prefix}_grid_regret', grid["regret"]))
         return terms
+
+    def _grid_policy_only_diag_terms(
+        self,
+        prefix: str,
+        grid: Dict[str, torch.Tensor],
+        bp_pred: torch.Tensor,
+        policy_loss_elem: torch.Tensor,
+        policy_loss: torch.Tensor,
+        policy_weight: float,
+    ) -> Dict[str, float]:
+        bp_err = (bp_pred.detach() - grid["bp_star"]).abs()
+        return {
+            f'{prefix}_grid_policy_loss': float(policy_loss.item()),
+            f'{prefix}_grid_policy_loss_elem_mean': float(policy_loss_elem.detach().mean().item()),
+            f'{prefix}_grid_policy_weight': float(policy_weight),
+            f'{prefix}_grid_bp_mae': float(bp_err.mean().item()),
+            f'{prefix}_grid_bp_err_p90': self._safe_quantile(bp_err, 0.90),
+            f'{prefix}_grid_regret_mean': float(grid["regret"].mean().item()),
+            f'{prefix}_grid_regret_p90': self._safe_quantile(grid["regret"], 0.90),
+            f'{prefix}_grid_top2_margin_mean': float(grid["top2_margin"].mean().item()),
+            f'{prefix}_grid_fine_top2_margin_mean': float(grid["fine_top2_margin"].mean().item()),
+            f'{prefix}_grid_top2_margin_p10': self._safe_quantile(grid["top2_margin"], 0.10),
+            f'{prefix}_grid_confidence_mean': float(grid["confidence"].mean().item()),
+            f'{prefix}_grid_boundary_low_share': float(grid["boundary_low"].mean().item()),
+            f'{prefix}_grid_boundary_high_share': float(grid["boundary_high"].mean().item()),
+            f'{prefix}_grid_bp_star_mean': float(grid["bp_star"].mean().item()),
+            f'{prefix}_grid_bp_star_p50': self._safe_quantile(grid["bp_star"], 0.50),
+            f'{prefix}_grid_bp_star_p90': self._safe_quantile(grid["bp_star"], 0.90),
+            f'{prefix}_grid_value_star_mean': float(grid["value_star"].mean().item()),
+            f'{prefix}_grid_value_pred_mean': float(grid["value_pred"].mean().item()),
+            f'{prefix}_grid_default_at_star_mean': float(grid["default_at_star"].mean().item()),
+            f'{prefix}_grid_p_child_at_star_mean': float(grid["p_child_at_star"].mean().item()),
+            f'{prefix}_grid_q_issue_at_star_mean': float(grid["q_issue_at_star"].mean().item()),
+            f'{prefix}_grid_argmax_index_mean': float(grid["argmax_index"].to(torch.float32).mean().item()),
+            f'{prefix}_grid_value_low_bp_mean': float(grid["coarse_value_grid"][:, 0:1].mean().item()),
+            f'{prefix}_grid_value_high_bp_mean': float(grid["coarse_value_grid"][:, -1:].mean().item()),
+            f'{prefix}_grid_default_low_bp_mean': float(grid["coarse_default_grid_mean"][:, 0:1].mean().item()),
+            f'{prefix}_grid_default_high_bp_mean': float(grid["coarse_default_grid_mean"][:, -1:].mean().item()),
+            f'{prefix}_grid_p_child_low_bp_mean': float(grid["coarse_p_child_grid_mean"][:, 0:1].mean().item()),
+            f'{prefix}_grid_p_child_high_bp_mean': float(grid["coarse_p_child_grid_mean"][:, -1:].mean().item()),
+            f'{prefix}_grid_q_issue_low_bp_mean': float(grid["coarse_q_issue_grid"][:, 0:1].mean().item()),
+            f'{prefix}_grid_q_issue_high_bp_mean': float(grid["coarse_q_issue_grid"][:, -1:].mean().item()),
+            f'{prefix}_grid_local_value_left_mean': float(grid["local_value_left"].mean().item()),
+            f'{prefix}_grid_local_value_right_mean': float(grid["local_value_right"].mean().item()),
+        }
 
     def _compute_target_grid_pv_loss(
         self,
@@ -2424,6 +2472,8 @@ class Episode:
         m_lo: float,
         m_hi: float,
         loss_fn,
+        mix_weight: Optional[torch.Tensor] = None,
+        bp_mix_pred: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         branch = branch.lower()
         prefix = 'p0' if branch == 'p0' else 'pi'
@@ -2464,6 +2514,29 @@ class Episode:
             total_loss = total_loss + penalty_b
             extra_terms['pi_penalty_b'] = float(penalty_b.item())
 
+        mix_terms: Dict[str, float] = {}
+        if branch == 'pi' and mix_weight is not None and bp_mix_pred is not None:
+            mix_grid = teacher.compute(
+                parent_state=parent_state,
+                children=children,
+                m_list=m_list,
+                branch='mix',
+                bp_pred=bp_mix_pred,
+                mix_weight=mix_weight,
+            )
+            mix_policy_weight = float(getattr(self.hyperparams, "bp_grid_mix_policy_weight", 1.0))
+            mix_policy_loss_elem = self._huber_element(bp_mix_pred, mix_grid["bp_star"], policy_delta)
+            mix_policy_loss = (mix_grid["confidence"] * mix_policy_loss_elem).mean()
+            total_loss = total_loss + mix_policy_weight * mix_policy_loss
+            mix_terms = self._grid_policy_only_diag_terms(
+                'mix',
+                mix_grid,
+                bp_mix_pred,
+                mix_policy_loss_elem,
+                mix_policy_loss,
+                mix_policy_weight,
+            )
+
         with torch.no_grad():
             raw_m = torch.cat([m.reshape(-1) for m in raw_m_list], dim=0)
             use_m = torch.cat([m.reshape(-1) for m in m_list], dim=0)
@@ -2484,6 +2557,7 @@ class Episode:
             if branch == 'p0':
                 self._latest_p0_terms = terms
             else:
+                terms.update(mix_terms)
                 self._latest_pi_terms = terms
         return total_loss
 
@@ -2748,6 +2822,10 @@ class Episode:
         bp_for_pi = self._apply_policy_ablation(bpI_t, b_parent)
 
         if self._pv_use_target_grid_bp() and not self._policy_value_bellman_only():
+            if isinstance(output_t, dict):
+                mix_weight = output_t.get('bar_i_cond', bar_i_t)
+            else:
+                mix_weight = getattr(output_t, 'bar_i_cond', bar_i_t)
             return self._compute_target_grid_pv_loss(
                 branch='pi',
                 parent=parent,
@@ -2761,6 +2839,8 @@ class Episode:
                 m_lo=m_lo,
                 m_hi=m_hi,
                 loss_fn=loss_fn,
+                mix_weight=mix_weight.detach(),
+                bp_mix_pred=bp_t,
             )
 
         output_children = []
@@ -3626,6 +3706,138 @@ class Episode:
         )
         return self._flatten_abs_residuals(residuals)
 
+    def evaluate_target_grid_policy_convergence(self, batches: List[Dict[str, torch.Tensor]]) -> Dict:
+        if not self._pv_use_target_grid_bp():
+            return {'enabled': False, 'passed': True, 'policies': {}}
+        if not batches or 'policy_value' not in self.models or self.models['policy_value'] is None:
+            return {'enabled': False, 'passed': False, 'policies': {}}
+
+        mae_thr = float(getattr(self.hyperparams, "bp_grid_conv_mae_thresh", 0.05))
+        regret_thr = float(getattr(self.hyperparams, "bp_grid_conv_regret_p90_thresh", 1e-2))
+        max_batches = int(getattr(self.hyperparams, "bp_grid_conv_max_batches", 4))
+        max_batches = max(1, max_batches)
+
+        class _PolicyAccumulator:
+            def __init__(self):
+                self.errs: List[torch.Tensor] = []
+                self.regrets: List[torch.Tensor] = []
+
+            def update(self, pred: torch.Tensor, grid: Dict[str, torch.Tensor]) -> None:
+                err = (pred.detach() - grid["bp_star"]).abs().reshape(-1)
+                regret = grid["regret"].detach().reshape(-1)
+                self.errs.append(err.cpu())
+                self.regrets.append(regret.cpu())
+
+            def summarize(self) -> Dict:
+                if not self.errs:
+                    return {
+                        'enabled': False,
+                        'n': 0,
+                        'mae': float('nan'),
+                        'mae_p90': float('nan'),
+                        'regret_mean': float('nan'),
+                        'regret_p90': float('nan'),
+                        'passed': False,
+                    }
+                err = torch.cat(self.errs).to(torch.float32)
+                regret = torch.cat(self.regrets).to(torch.float32)
+                finite = torch.isfinite(err) & torch.isfinite(regret)
+                if not bool(finite.any()):
+                    return {
+                        'enabled': True,
+                        'n': 0,
+                        'mae': float('nan'),
+                        'mae_p90': float('nan'),
+                        'regret_mean': float('nan'),
+                        'regret_p90': float('nan'),
+                        'passed': False,
+                    }
+                err = err[finite]
+                regret = regret[finite]
+                mae = float(err.mean().item())
+                mae_p90 = float(torch.quantile(err, 0.9).item())
+                regret_mean = float(regret.mean().item())
+                regret_p90 = float(torch.quantile(regret, 0.9).item())
+                return {
+                    'enabled': True,
+                    'n': int(err.numel()),
+                    'mae': mae,
+                    'mae_p90': mae_p90,
+                    'regret_mean': regret_mean,
+                    'regret_p90': regret_p90,
+                    'passed': bool(mae < mae_thr and regret_p90 < regret_thr),
+                }
+
+        p0_acc = _PolicyAccumulator()
+        pi_acc = _PolicyAccumulator()
+        mix_acc = _PolicyAccumulator()
+        model = self.models['policy_value']
+        target_model = self._target_policy_value()
+        teacher = BPGridTeacher.from_hyperparams(
+            target_model,
+            self.loss_fns['p0'],
+            self.loss_fns['pi'],
+            self.hyperparams,
+        )
+        m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
+        m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
+
+        with torch.no_grad():
+            for batch in batches[:max_batches]:
+                parent = batch['parent']
+                children = self._get_policy_children(batch)
+                if not children:
+                    continue
+                raw_M_list, M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+                del raw_M_list
+                parent_state = self._policy_strip_extra(parent)
+                output_t = model(parent_state)
+                bp0_t = self._policy_get_out(output_t, 'bp0', 1)
+                bpI_t = self._policy_get_out(output_t, 'bpI', 2)
+                bar_i_t = self._policy_get_out(output_t, 'bar_i', 4)
+                bp_t = self._policy_get_out(output_t, 'bp', -1)
+                if bp_t.shape != bp0_t.shape:
+                    bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
+                if isinstance(output_t, dict):
+                    mix_weight = output_t.get('bar_i_cond', bar_i_t)
+                else:
+                    mix_weight = getattr(output_t, 'bar_i_cond', bar_i_t)
+
+                p0_grid = teacher.compute(parent_state, children, M_list, branch='p0', bp_pred=bp0_t)
+                pi_grid = teacher.compute(parent_state, children, M_list, branch='pi', bp_pred=bpI_t)
+                mix_grid = teacher.compute(
+                    parent_state,
+                    children,
+                    M_list,
+                    branch='mix',
+                    bp_pred=bp_t,
+                    mix_weight=mix_weight.detach(),
+                )
+                p0_acc.update(bp0_t, p0_grid)
+                pi_acc.update(bpI_t, pi_grid)
+                mix_acc.update(bp_t, mix_grid)
+
+        policies = {
+            'bp0': p0_acc.summarize(),
+            'bpI': pi_acc.summarize(),
+            'mix': mix_acc.summarize(),
+        }
+        enabled = [v for v in policies.values() if v.get('enabled', False)]
+        passed = bool(enabled) and all(v.get('passed', False) for v in enabled)
+        logger.info(
+            "Target-grid policy convergence | mae<%.3e, regret_p90<%.3e, passed=%s",
+            mae_thr,
+            regret_thr,
+            str(passed),
+        )
+        return {
+            'enabled': True,
+            'thresholds': {'mae': mae_thr, 'regret_p90': regret_thr},
+            'max_batches': max_batches,
+            'policies': policies,
+            'passed': passed,
+        }
+
     def evaluate_bellman_convergence(
         self,
         batches: List[Dict[str, torch.Tensor]],
@@ -3762,20 +3974,32 @@ class Episode:
             'pi': pi_acc.summarize('pi', mean_thr, p90_thr),
             'q': q_acc.summarize('q', mean_thr, p90_thr)
         }
+        policy_convergence = self.evaluate_target_grid_policy_convergence(batches)
 
         enabled_eq = [m for m in equations.values() if m.get('enabled', False)]
-        all_passed = bool(enabled_eq) and all(m.get('passed', False) for m in enabled_eq)
+        bellman_passed = bool(enabled_eq) and all(m.get('passed', False) for m in enabled_eq)
+        policy_passed = (
+            bool(policy_convergence.get('passed', False))
+            if policy_convergence.get('enabled', False)
+            else True
+        )
+        all_passed = bool(bellman_passed and policy_passed)
         summary = {
             'enabled': True,
             'thresholds': {'mean': mean_thr, 'p90': p90_thr},
             'max_quantile_samples': max_q_samples,
             'equations': equations,
+            'policy': policy_convergence,
+            'bellman_passed': bellman_passed,
+            'policy_passed': policy_passed,
             'passed': all_passed
         }
         logger.info(
-            "Bellman convergence summary | mean<%.3e, p90<%.3e, passed=%s",
+            "Bellman convergence summary | mean<%.3e, p90<%.3e, bellman_passed=%s, policy_passed=%s, passed=%s",
             mean_thr,
             p90_thr,
+            str(bellman_passed),
+            str(policy_passed),
             str(all_passed)
         )
         return summary

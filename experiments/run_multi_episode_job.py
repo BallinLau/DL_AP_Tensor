@@ -121,7 +121,17 @@ def parse_args() -> argparse.Namespace:
         help="Enable coarse-to-fine local bp-grid refinement",
     )
     parser.add_argument("--bp-grid-policy-weight", type=float, default=None, help="Weight on bp policy distillation loss")
+    parser.add_argument("--bp-grid-mix-policy-weight", type=float, default=None, help="Weight on simulation-action mixed bp distillation loss")
     parser.add_argument("--bp-grid-margin-scale", type=float, default=None, help="Top-two value margin scale for policy target confidence")
+    parser.add_argument("--bp-grid-parent-chunk-size", type=int, default=None, help="Parent chunk size for bp-grid teacher")
+    parser.add_argument("--bp-grid-candidate-chunk-size", type=int, default=None, help="Candidate bp chunk size for bp-grid teacher")
+    parser.add_argument("--bp-grid-max-expanded-states", type=int, default=None, help="Max B*J states per bp-grid teacher forward chunk")
+    parser.add_argument(
+        "--bp-grid-confidence-relative",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Scale policy confidence by coarse top-two margin relative to |V*|",
+    )
     parser.add_argument(
         "--firm-target-update",
         type=str.lower,
@@ -169,8 +179,18 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.bp_grid_refine_enabled = bool(args.bp_grid_refine_enabled)
     if args.bp_grid_policy_weight is not None:
         hyperparams.bp_grid_policy_weight = args.bp_grid_policy_weight
+    if args.bp_grid_mix_policy_weight is not None:
+        hyperparams.bp_grid_mix_policy_weight = args.bp_grid_mix_policy_weight
     if args.bp_grid_margin_scale is not None:
         hyperparams.bp_grid_margin_scale = args.bp_grid_margin_scale
+    if args.bp_grid_parent_chunk_size is not None:
+        hyperparams.bp_grid_parent_chunk_size = args.bp_grid_parent_chunk_size
+    if args.bp_grid_candidate_chunk_size is not None:
+        hyperparams.bp_grid_candidate_chunk_size = args.bp_grid_candidate_chunk_size
+    if args.bp_grid_max_expanded_states is not None:
+        hyperparams.bp_grid_max_expanded_states = args.bp_grid_max_expanded_states
+    if args.bp_grid_confidence_relative is not None:
+        hyperparams.bp_grid_confidence_relative = bool(args.bp_grid_confidence_relative)
     if args.firm_target_update is not None:
         hyperparams.firm_target_update = args.firm_target_update
     hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"

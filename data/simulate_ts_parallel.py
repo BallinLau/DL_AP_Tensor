@@ -6,6 +6,7 @@ import torch
 from tqdm import tqdm
 
 from .data_utils import sample_ar1, sample_bernoulli, sample_stationary_ar1, sample_uniform
+from .simulation_forward import forward_policy_value_for_simulation
 from .tensor_data import TensorSimulationOutput, TensorTable, cat_rows
 
 
@@ -161,7 +162,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     pv_model = sim.models.get("policy_value")
     if pv_model is not None:
         with torch.no_grad():
-            output = pv_model(firm_state)
+            output = forward_policy_value_for_simulation(pv_model, firm_state)
         q = output.Q.reshape(-1)
         p0 = output.P0.reshape(-1)
         pi = output.PI.reshape(-1)

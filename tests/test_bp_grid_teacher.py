@@ -15,16 +15,48 @@ class ParabolicTarget:
     def _q_output(self, firm_state):
         return torch.zeros(firm_state.shape[0], 1, device=firm_state.device, dtype=firm_state.dtype)
 
-    def __call__(self, firm_state):
+    def forward_equity(self, firm_state):
         b = firm_state[:, 0:1]
         p = 1.0 - (b - 0.32).pow(2)
         p = p.clamp_min(0.0)
+        return {
+            "P": p,
+            "Phat": p,
+            "bar_z": (p <= 0.0).to(p.dtype),
+        }
+
+    def __call__(self, firm_state):
+        equity = self.forward_equity(firm_state)
         return SimpleNamespace(
             Q=self._q_output(firm_state),
-            P=p,
-            Phat=p,
-            bar_z=(p <= 0.0).to(p.dtype),
+            P=equity["P"],
+            Phat=equity["Phat"],
+            bar_z=equity["bar_z"],
         )
+
+
+class RecordingTarget(ParabolicTarget):
+    def __init__(self):
+        self.q_b = []
+        self.equity_b = []
+
+    def _q_output(self, firm_state):
+        self.q_b.append(firm_state[:, 0:1].detach().clone())
+        return firm_state[:, 0:1].clamp_min(0.0)
+
+    def forward_equity(self, firm_state):
+        self.equity_b.append(firm_state[:, 0:1].detach().clone())
+        return super().forward_equity(firm_state)
+
+
+class HighLeverageTarget(ParabolicTarget):
+    def forward_equity(self, firm_state):
+        b = firm_state[:, 0:1].clamp(0.0, 1.0)
+        return {
+            "P": b,
+            "Phat": b,
+            "bar_z": torch.zeros_like(b),
+        }
 
 
 def test_bp_grid_teacher_selects_value_maximizing_bp():
@@ -58,5 +90,117 @@ def test_bp_grid_teacher_selects_value_maximizing_bp():
     assert not out["bp_star"].requires_grad
 
 
+def test_grid_teacher_debt_state_semantics():
+    target = RecordingTarget()
+    teacher = BPGridTeacher(
+        target,
+        P0Loss(),
+        PILoss(),
+        coarse_size=3,
+        refine=False,
+        candidate_chunk_size=3,
+        margin_scale=1e-4,
+    )
+    parent = torch.tensor([[0.2, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
+    child = parent.clone()
+    child[:, 2:3] = 0.25
+
+    out = teacher.compute(parent, [child], [torch.ones(1, 1)], branch="p0")
+
+    assert out["coarse_bp_grid"].shape == (1, 3)
+    issue_b = [x.reshape(-1) for x in target.q_b if x.numel() == 3][0]
+    expected_issue_b = torch.tensor([0.0, 0.5, 1.0])
+    assert torch.allclose(issue_b, expected_issue_b, atol=1e-6)
+
+    child_b = target.equity_b[0].reshape(-1)
+    expected_child_b = 0.25 * expected_issue_b + 0.75 * torch.tensor(0.2)
+    assert torch.allclose(child_b, expected_child_b, atol=1e-6)
+
+
+def test_grid_teacher_mix_branch_and_coarse_confidence():
+    target = ParabolicTarget()
+    teacher = BPGridTeacher(
+        target,
+        P0Loss(),
+        PILoss(),
+        coarse_size=5,
+        fine_size=5,
+        refine=True,
+        candidate_chunk_size=2,
+        margin_scale=1e-4,
+    )
+    parent = torch.tensor(
+        [
+            [0.1, 0.0, 1.0, 0.2, 0.0, 0.0, 0.0],
+            [0.2, 0.0, 1.0, 0.3, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    child0 = parent.clone()
+    child1 = parent.clone()
+    child0[:, 2:3] = 1.0
+    child1[:, 2:3] = 0.0
+    mix_weight = torch.tensor([[0.25], [0.75]], dtype=torch.float32)
+
+    out = teacher.compute(
+        parent,
+        [child0, child1],
+        [torch.ones(2, 1), torch.ones(2, 1)],
+        branch="mix",
+        bp_pred=torch.full((2, 1), 0.9),
+        mix_weight=mix_weight,
+    )
+
+    assert out["bp_star"].shape == (2, 1)
+    assert out["coarse_value_grid"].shape == (2, 5)
+    assert out["value_grid"].shape == (2, 5)
+    assert torch.all(out["coarse_top2_margin"] >= out["fine_top2_margin"] - 1e-6)
+    assert torch.all(out["confidence"] > 0)
+    assert torch.all(out["regret"] >= 0)
+
+
+def test_pi_grid_target_multi_child_boundary_and_refine():
+    target = HighLeverageTarget()
+    teacher = BPGridTeacher(
+        target,
+        P0Loss(),
+        PILoss(),
+        coarse_size=5,
+        fine_size=5,
+        refine=True,
+        candidate_chunk_size=2,
+        margin_scale=1e-4,
+    )
+    parent = torch.tensor(
+        [
+            [0.1, 0.0, 1.0, 0.2, 0.0, 0.0, 0.0],
+            [0.3, 0.0, 1.0, 0.4, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    child_eta1 = parent.clone()
+    child_eta0 = parent.clone()
+    child_eta1[:, 2:3] = 1.0
+    child_eta0[:, 2:3] = 0.0
+
+    out = teacher.compute(
+        parent,
+        [child_eta1, child_eta0],
+        [torch.ones(2, 1), torch.ones(2, 1)],
+        branch="pi",
+        bp_pred=torch.zeros(2, 1),
+    )
+
+    assert torch.allclose(out["bp_star"], torch.ones(2, 1), atol=1e-6)
+    assert torch.all(out["boundary_high"] == 1.0)
+    assert torch.all(out["boundary_low"] == 0.0)
+    assert out["coarse_value_grid"].shape == (2, 5)
+    assert out["value_grid"].shape == (2, 5)
+    assert torch.all(out["regret"] > 0)
+
+
 if __name__ == "__main__":
     test_bp_grid_teacher_selects_value_maximizing_bp()
+    test_grid_teacher_debt_state_semantics()
+    test_grid_teacher_mix_branch_and_coarse_confidence()
+    test_pi_grid_target_multi_child_boundary_and_refine()

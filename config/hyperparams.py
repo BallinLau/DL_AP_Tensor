@@ -231,16 +231,23 @@ class HyperParams:
     bp_grid_refine_enabled: bool = True
     bp_grid_fine_size: int = 9
     bp_grid_quadratic_refine: bool = False
+    bp_grid_parent_chunk_size: int = 2048
+    bp_grid_candidate_chunk_size: int = 4
+    bp_grid_max_expanded_states: int = 65536
     # Huber losses for target-grid value backup and policy distillation.
     bp_grid_value_huber_delta: float = 1.0
     bp_grid_policy_huber_delta: float = 0.05
     bp_grid_policy_weight: float = 1.0
+    bp_grid_mix_policy_weight: float = 1.0
     # Downweight policy targets when the top-two grid values are nearly tied.
     bp_grid_margin_scale: float = 1e-3
+    bp_grid_confidence_relative: bool = True
     bp_grid_confidence_min: float = 0.0
-    # P is already hard-clipped at zero. This optional switch additionally gates
-    # continuation by hard survival, mainly for ablation/diagnostics.
-    bp_grid_use_survival_gate: bool = False
+    # Under target_grid mode, policy convergence is checked in addition to
+    # Bellman residual convergence.
+    bp_grid_conv_mae_thresh: float = 0.05
+    bp_grid_conv_regret_p90_thresh: float = 1e-2
+    bp_grid_conv_max_batches: int = 4
     # 对应有界控制 0 <= bp <= 1 的一阶最优条件：
     # - 内点: FOC = 0
     # - 下界: FOC <= 0

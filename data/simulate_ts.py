@@ -28,6 +28,7 @@ from .data_utils import (
 )
 from .tensor_data import TensorTable, TensorSimulationOutput, cat_rows
 from .simulate_ts_parallel import simulate_tensor_parallel
+from .simulation_forward import forward_policy_value_for_simulation
 
 
 class SimulateTS:
@@ -322,7 +323,7 @@ class SimulateTS:
         pv_model = self.models.get('policy_value')
         if pv_model is not None:
             with torch.no_grad():
-                output = pv_model(firm_state)
+                output = forward_policy_value_for_simulation(pv_model, firm_state)
             q = output.Q.reshape(-1)
             p0 = output.P0.reshape(-1)
             pi = output.PI.reshape(-1)
@@ -511,7 +512,7 @@ class SimulateTS:
         
         # Policy/Value forward
         with torch.no_grad():
-            output = self.models['policy_value'](firm_state)
+            output = forward_policy_value_for_simulation(self.models['policy_value'], firm_state)
         
         # 资源核算
         Y, I, Phi, C = self._resource_accounting(

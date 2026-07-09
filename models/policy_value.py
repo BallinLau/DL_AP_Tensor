@@ -7,7 +7,7 @@ Policy & Value 统一接口
 
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional, NamedTuple
+from typing import Dict, Tuple, Optional, NamedTuple
 from .firm_derived import FirmDerivedObjects
 from .share_layer import ShareLayer, QHead, BpHead, PHead, CombinedModel, BarzModel, BariModel
 
@@ -144,6 +144,33 @@ class PolicyValueModel(nn.Module):
         internal i-grid used by cal_phats().
         """
         return self._policy_outputs(firm_state)
+
+    def forward_equity(self, firm_state: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Equity-only target evaluation used by the bp-grid teacher.
+
+        It avoids Q and policy-head work, but still computes the internal
+        investment-cost grid required for Phat/P/bar_z.
+        """
+        Phat, P, bar_z, survival_prob = self.cal_phats(firm_state)
+        return {
+            "Phat": Phat,
+            "P": P,
+            "bar_z": bar_z,
+            "survival_prob": survival_prob,
+        }
+
+    def forward_simulation(self, firm_state: torch.Tensor) -> PolicyValueOutput:
+        """
+        Rollout-facing forward path.
+
+        Current simulation exports Q/P0/PI/P, default and policy fields on
+        every firm row, and uses bar_i/bar_z/bp for state transitions and
+        resource accounting.  Therefore this path deliberately returns the
+        full PolicyValueOutput while making the simulation/training-teacher
+        boundary explicit.
+        """
+        return self.forward(firm_state)
     
     def forward(
         self, 

@@ -57,23 +57,37 @@ Training orchestration for episodes and modules.
   - build a coarse bp-grid, optionally refine locally;
   - construct continuation child states with `b_child = eta_child * bp_candidate + (1 - eta_child) * b_parent`;
   - construct issuance-Q states with debt set directly to `bp_candidate`;
-  - evaluate `Q`, `P`, and `bar_z` using the frozen firm target network;
+  - evaluate issuance `Q` with the frozen target network and child continuation `(P, bar_z)` through `target_model.forward_equity(...)`;
   - choose the candidate maximizing economic RHS `cashflow + continuation value`;
   - train `P0/PI` with Huber loss toward the selected target-grid Bellman backup;
   - train `bp0/bpI` with Huber distillation loss toward the selected grid argmax.
+- The simulation leverage action is treated as an ex-ante mixed action:
+  - `output.bp = survival_prob * (bar_i_cond * bpI + (1 - bar_i_cond) * bp0) + (1 - survival_prob) * bp0`
+  - PI target-grid training also constructs `V_mix = (1 - bar_i_cond) * V0_grid + bar_i_cond * VI_grid`
+  - `output.bp` is directly supervised against `argmax_b V_mix`, with diagnostics such as `mix_grid_bp_mae` and `mix_grid_regret_p90`.
 - FOC/KKT is no longer the default bp training signal in `target_grid` mode. The old path is still available with `pv_bp_training_mode='legacy_foc_kkt'`.
-- Simulation still calls `PolicyValueModel.forward(...)` and uses network outputs directly; it does not call `BPGridTeacher` or run a bp-grid.
+- Simulation calls `PolicyValueModel.forward_simulation(...)` through `data.simulation_forward.forward_policy_value_for_simulation(...)`; it uses network outputs directly and never calls `BPGridTeacher` or runs a bp-grid.
 - `PolicyValueModel.forward_policy(...)` is available for policy-only diagnostics and avoids `Q/P/Phat/bar_z` and the internal `i`-grid.
+- `PolicyValueModel.forward_equity(...)` is available for target-grid child continuation and avoids Q/policy-head work.
 - Target-moving controls:
   - `firm_target_update='epoch_hard'` by default: the target network is fixed inside each epoch and hard-copied from online at epoch end.
   - `soft`, `hard`, `epoch_soft`, and `none` remain available for ablations.
 - Main target-grid controls:
   - `bp_grid_coarse_size`, `bp_grid_refine_enabled`, `bp_grid_fine_size`
   - `bp_grid_value_huber_delta`, `bp_grid_policy_huber_delta`, `bp_grid_policy_weight`
-  - `bp_grid_margin_scale`, `bp_grid_confidence_min`
-  - CLI flags: `--pv-bp-training-mode`, `--bp-grid-coarse-size`, `--bp-grid-fine-size`, `--bp-grid-refine-enabled`, `--bp-grid-policy-weight`, `--bp-grid-margin-scale`, `--firm-target-update`
+  - `bp_grid_mix_policy_weight`
+  - `bp_grid_margin_scale`, `bp_grid_confidence_relative`, `bp_grid_confidence_min`
+  - `bp_grid_parent_chunk_size`, `bp_grid_candidate_chunk_size`, `bp_grid_max_expanded_states`
+  - `bp_grid_conv_mae_thresh`, `bp_grid_conv_regret_p90_thresh`, `bp_grid_conv_max_batches`
+  - CLI flags: `--pv-bp-training-mode`, `--bp-grid-coarse-size`, `--bp-grid-fine-size`, `--bp-grid-refine-enabled`, `--bp-grid-policy-weight`, `--bp-grid-mix-policy-weight`, `--bp-grid-margin-scale`, `--bp-grid-parent-chunk-size`, `--bp-grid-candidate-chunk-size`, `--bp-grid-max-expanded-states`, `--bp-grid-confidence-relative`, `--no-bp-grid-confidence-relative`, `--firm-target-update`
+- Confidence is computed from coarse/global top-two margins by default; fine-grid margins are logged separately as `*_grid_fine_top2_margin_mean`.
+- Global low/high bp diagnostics come from the coarse grid endpoints. Local fine interval endpoints are logged only as `*_grid_local_value_left_mean` and `*_grid_local_value_right_mean`.
+- `bp_grid_quadratic_refine=True` re-evaluates `value_star`, `q_issue_at_star`, `p_child_at_star`, and `default_at_star` at the refined continuous `bp_star`.
+- `bp_grid_use_survival_gate` has been removed; continuation values use the already clipped/default-adjusted `P` from the target equity evaluator.
+- Target-grid policy convergence is checked in addition to Bellman residual convergence. In `target_grid` mode, `evaluate_bellman_convergence(...)` passes only if both Bellman residuals and held-out teacher policy MAE/regret checks pass.
 - Diagnostics include:
   - `p0_grid_bp_mae`, `pi_grid_bp_mae`
+  - `mix_grid_bp_mae`, `mix_grid_regret_p90`
   - `p0_grid_regret_mean`, `pi_grid_regret_mean`
   - `p0_grid_boundary_low_share`, `p0_grid_boundary_high_share`
   - `p0_grid_top2_margin_mean`, `pi_grid_top2_margin_mean`
