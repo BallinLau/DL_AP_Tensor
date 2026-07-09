@@ -126,6 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bp-grid-parent-chunk-size", type=int, default=None, help="Parent chunk size for bp-grid teacher")
     parser.add_argument("--bp-grid-candidate-chunk-size", type=int, default=None, help="Candidate bp chunk size for bp-grid teacher")
     parser.add_argument("--bp-grid-max-expanded-states", type=int, default=None, help="Max B*J states per bp-grid teacher forward chunk")
+    parser.add_argument("--pv-target-grid-val-fraction", type=float, default=None, help="Tail batch fraction reserved for target-grid policy validation")
     parser.add_argument(
         "--bp-grid-confidence-relative",
         action=argparse.BooleanOptionalAction,
@@ -191,6 +192,8 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.bp_grid_max_expanded_states = args.bp_grid_max_expanded_states
     if args.bp_grid_confidence_relative is not None:
         hyperparams.bp_grid_confidence_relative = bool(args.bp_grid_confidence_relative)
+    if args.pv_target_grid_val_fraction is not None:
+        hyperparams.pv_target_grid_val_fraction = args.pv_target_grid_val_fraction
     if args.firm_target_update is not None:
         hyperparams.firm_target_update = args.firm_target_update
     hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"

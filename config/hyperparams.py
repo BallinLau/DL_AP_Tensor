@@ -248,6 +248,9 @@ class HyperParams:
     bp_grid_conv_mae_thresh: float = 0.05
     bp_grid_conv_regret_p90_thresh: float = 1e-2
     bp_grid_conv_max_batches: int = 4
+    # Hold out tail batches for target-grid policy convergence checks.  This
+    # avoids passing convergence solely on states used by optimizer steps.
+    pv_target_grid_val_fraction: float = 0.10
     # 对应有界控制 0 <= bp <= 1 的一阶最优条件：
     # - 内点: FOC = 0
     # - 下界: FOC <= 0

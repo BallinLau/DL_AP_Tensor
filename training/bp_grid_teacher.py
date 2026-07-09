@@ -274,10 +274,11 @@ class BPGridTeacher:
             fine_top2_margin, _ = _safe_top2_margin(result["value_grid"])
             coarse_value_star = _gather_by_index(coarse["value_grid"], coarse["argmax_index"])
             if self.confidence_relative:
-                denom = torch.maximum(coarse_value_star.abs(), torch.full_like(coarse_value_star, self.margin_scale))
+                value_scale = coarse_value_star.abs().clamp_min(1e-8)
+                relative_margin = coarse_top2_margin / value_scale
+                confidence = (relative_margin / self.margin_scale).clamp(self.confidence_min, 1.0)
             else:
-                denom = torch.full_like(coarse_value_star, self.margin_scale)
-            confidence = (coarse_top2_margin / denom).clamp(self.confidence_min, 1.0)
+                confidence = (coarse_top2_margin / self.margin_scale).clamp(self.confidence_min, 1.0)
 
             result.update(
                 {
@@ -350,11 +351,12 @@ class BPGridTeacher:
         mix_weight: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size, n_grid = bp_grid.shape
+        q_current = _target_q(self.target_model, parent_state)
         dynamic_chunk = max(1, self.max_expanded_states // max(batch_size, 1))
         chunk_size = self.candidate_chunk_size if self.candidate_chunk_size > 0 else n_grid
         chunk_size = max(1, min(chunk_size, dynamic_chunk, n_grid))
         if chunk_size >= n_grid:
-            return self._evaluate_grid_chunk(parent_state, children, m_list, bp_grid, branch=branch, mix_weight=mix_weight)
+            return self._evaluate_grid_chunk(parent_state, children, m_list, bp_grid, branch=branch, mix_weight=mix_weight, q_current=q_current)
 
         chunks = []
         for start in range(0, n_grid, chunk_size):
@@ -367,6 +369,7 @@ class BPGridTeacher:
                     bp_grid[:, start:stop],
                     branch=branch,
                     mix_weight=mix_weight,
+                    q_current=q_current,
                 )
             )
         return {
@@ -387,9 +390,11 @@ class BPGridTeacher:
         *,
         branch: str,
         mix_weight: Optional[torch.Tensor] = None,
+        q_current: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size, n_grid = bp_grid.shape
-        q_current = _target_q(self.target_model, parent_state)
+        if q_current is None:
+            q_current = _target_q(self.target_model, parent_state)
 
         issue_state = _expand_candidates(parent_state, bp_grid)
         issue_state[:, 0:1] = _candidate_flat(bp_grid)

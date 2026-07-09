@@ -2457,6 +2457,61 @@ class Episode:
             f'{prefix}_grid_local_value_right_mean': float(grid["local_value_right"].mean().item()),
         }
 
+    def _target_investment_conditional(
+        self,
+        target_model: nn.Module,
+        parent_state: torch.Tensor,
+        fallback: torch.Tensor,
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            value_fn = getattr(target_model, "_value_outputs", None)
+            derived = getattr(target_model, "derived", None)
+            if callable(value_fn) and derived is not None:
+                v0_t, vi_t = value_fn(parent_state.detach())
+                return derived.investment_conditional(v0_t, vi_t).detach()
+            out = target_model(parent_state.detach())
+            if isinstance(out, dict) and 'bar_i_cond' in out:
+                return out['bar_i_cond'].detach()
+            if hasattr(out, 'bar_i_cond'):
+                return getattr(out, 'bar_i_cond').detach()
+            return fallback.detach()
+
+    def _target_survival_probability(
+        self,
+        target_model: nn.Module,
+        parent_state: torch.Tensor,
+        fallback: torch.Tensor,
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            equity_fn = getattr(target_model, "forward_equity", None)
+            if callable(equity_fn):
+                out = equity_fn(parent_state.detach())
+                if isinstance(out, dict) and 'survival_prob' in out:
+                    return out['survival_prob'].detach()
+            out = target_model(parent_state.detach())
+            if isinstance(out, dict) and 'survival_prob' in out:
+                return out['survival_prob'].detach()
+            if hasattr(out, 'survival_prob'):
+                return getattr(out, 'survival_prob').detach()
+            return fallback.detach()
+
+    def _mixed_policy_conditional_bp(
+        self,
+        output_t,
+        bp0_t: torch.Tensor,
+        bpI_t: torch.Tensor,
+        parent_b: torch.Tensor,
+        fallback_bar_i: torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(output_t, dict):
+            bar_i_cond = output_t.get('bar_i_cond', fallback_bar_i)
+        else:
+            bar_i_cond = getattr(output_t, 'bar_i_cond', fallback_bar_i)
+        bp0_for_mix = self._apply_policy_ablation(bp0_t, parent_b)
+        bpI_for_mix = self._apply_policy_ablation(bpI_t, parent_b)
+        bar_i_policy = bar_i_cond.detach()
+        return bar_i_policy * bpI_for_mix + (1.0 - bar_i_policy) * bp0_for_mix
+
     def _compute_target_grid_pv_loss(
         self,
         *,
@@ -2474,6 +2529,7 @@ class Episode:
         loss_fn,
         mix_weight: Optional[torch.Tensor] = None,
         bp_mix_pred: Optional[torch.Tensor] = None,
+        mix_policy_sample_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         branch = branch.lower()
         prefix = 'p0' if branch == 'p0' else 'pi'
@@ -2526,7 +2582,10 @@ class Episode:
             )
             mix_policy_weight = float(getattr(self.hyperparams, "bp_grid_mix_policy_weight", 1.0))
             mix_policy_loss_elem = self._huber_element(bp_mix_pred, mix_grid["bp_star"], policy_delta)
-            mix_policy_loss = (mix_grid["confidence"] * mix_policy_loss_elem).mean()
+            mix_sample_weight = mix_grid["confidence"]
+            if mix_policy_sample_weight is not None:
+                mix_sample_weight = mix_sample_weight * mix_policy_sample_weight.detach().clamp(0.0, 1.0)
+            mix_policy_loss = (mix_sample_weight * mix_policy_loss_elem).mean()
             total_loss = total_loss + mix_policy_weight * mix_policy_loss
             mix_terms = self._grid_policy_only_diag_terms(
                 'mix',
@@ -2535,6 +2594,11 @@ class Episode:
                 mix_policy_loss_elem,
                 mix_policy_loss,
                 mix_policy_weight,
+            )
+            mix_terms['mix_grid_target_survival_weight_mean'] = float(
+                mix_policy_sample_weight.detach().mean().item()
+                if mix_policy_sample_weight is not None
+                else 1.0
             )
 
         with torch.no_grad():
@@ -2823,9 +2887,28 @@ class Episode:
 
         if self._pv_use_target_grid_bp() and not self._policy_value_bellman_only():
             if isinstance(output_t, dict):
-                mix_weight = output_t.get('bar_i_cond', bar_i_t)
+                bar_i_cond_online = output_t.get('bar_i_cond', bar_i_t)
+                survival_online = output_t.get('survival_prob', torch.ones_like(bar_i_t))
             else:
-                mix_weight = getattr(output_t, 'bar_i_cond', bar_i_t)
+                bar_i_cond_online = getattr(output_t, 'bar_i_cond', bar_i_t)
+                survival_online = getattr(output_t, 'survival_prob', torch.ones_like(bar_i_t))
+            mix_weight_target = self._target_investment_conditional(
+                target_model,
+                parent_state,
+                fallback=bar_i_cond_online,
+            )
+            mix_survival_target = self._target_survival_probability(
+                target_model,
+                parent_state,
+                fallback=survival_online,
+            )
+            bp_mix_cond_pred = self._mixed_policy_conditional_bp(
+                output_t,
+                bp0_t,
+                bpI_t,
+                b_parent,
+                fallback_bar_i=bar_i_cond_online,
+            )
             return self._compute_target_grid_pv_loss(
                 branch='pi',
                 parent=parent,
@@ -2839,8 +2922,9 @@ class Episode:
                 m_lo=m_lo,
                 m_hi=m_hi,
                 loss_fn=loss_fn,
-                mix_weight=mix_weight.detach(),
-                bp_mix_pred=bp_t,
+                mix_weight=mix_weight_target,
+                bp_mix_pred=bp_mix_cond_pred,
+                mix_policy_sample_weight=mix_survival_target,
             )
 
         output_children = []
@@ -3799,9 +3883,21 @@ class Episode:
                 if bp_t.shape != bp0_t.shape:
                     bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
                 if isinstance(output_t, dict):
-                    mix_weight = output_t.get('bar_i_cond', bar_i_t)
+                    bar_i_cond_online = output_t.get('bar_i_cond', bar_i_t)
                 else:
-                    mix_weight = getattr(output_t, 'bar_i_cond', bar_i_t)
+                    bar_i_cond_online = getattr(output_t, 'bar_i_cond', bar_i_t)
+                mix_weight_target = self._target_investment_conditional(
+                    target_model,
+                    parent_state,
+                    fallback=bar_i_cond_online,
+                )
+                bp_mix_cond = self._mixed_policy_conditional_bp(
+                    output_t,
+                    bp0_t,
+                    bpI_t,
+                    parent_state[:, 0:1],
+                    fallback_bar_i=bar_i_cond_online,
+                )
 
                 p0_grid = teacher.compute(parent_state, children, M_list, branch='p0', bp_pred=bp0_t)
                 pi_grid = teacher.compute(parent_state, children, M_list, branch='pi', bp_pred=bpI_t)
@@ -3810,12 +3906,12 @@ class Episode:
                     children,
                     M_list,
                     branch='mix',
-                    bp_pred=bp_t,
-                    mix_weight=mix_weight.detach(),
+                    bp_pred=bp_mix_cond,
+                    mix_weight=mix_weight_target,
                 )
                 p0_acc.update(bp0_t, p0_grid)
                 pi_acc.update(bpI_t, pi_grid)
-                mix_acc.update(bp_t, mix_grid)
+                mix_acc.update(bp_mix_cond, mix_grid)
 
         policies = {
             'bp0': p0_acc.summarize(),
@@ -3841,6 +3937,7 @@ class Episode:
     def evaluate_bellman_convergence(
         self,
         batches: List[Dict[str, torch.Tensor]],
+        validation_batches: Optional[List[Dict[str, torch.Tensor]]] = None,
         mean_threshold: Optional[float] = None,
         p90_threshold: Optional[float] = None
     ) -> Dict:
@@ -3974,7 +4071,13 @@ class Episode:
             'pi': pi_acc.summarize('pi', mean_thr, p90_thr),
             'q': q_acc.summarize('q', mean_thr, p90_thr)
         }
-        policy_convergence = self.evaluate_target_grid_policy_convergence(batches)
+        policy_train = self.evaluate_target_grid_policy_convergence(batches)
+        policy_val = (
+            self.evaluate_target_grid_policy_convergence(validation_batches)
+            if validation_batches
+            else {'enabled': False, 'passed': True, 'policies': {}}
+        )
+        policy_convergence = policy_val if policy_val.get('enabled', False) else policy_train
 
         enabled_eq = [m for m in equations.values() if m.get('enabled', False)]
         bellman_passed = bool(enabled_eq) and all(m.get('passed', False) for m in enabled_eq)
@@ -3990,6 +4093,8 @@ class Episode:
             'max_quantile_samples': max_q_samples,
             'equations': equations,
             'policy': policy_convergence,
+            'policy_train': policy_train,
+            'policy_val': policy_val,
             'bellman_passed': bellman_passed,
             'policy_passed': policy_passed,
             'passed': all_passed
@@ -4027,9 +4132,28 @@ class Episode:
             q_warmstart_epochs = 0
             q_only_epochs = 0
 
+        train_batches = batches
+        validation_batches: List[Dict[str, torch.Tensor]] = []
+        if 'policy_value' in train_modules and self._pv_use_target_grid_bp() and len(batches) > 1:
+            val_fraction = float(getattr(self.hyperparams, "pv_target_grid_val_fraction", 0.10))
+            val_fraction = min(max(val_fraction, 0.0), 0.5)
+            n_val = int(round(len(batches) * val_fraction))
+            if val_fraction > 0.0:
+                n_val = max(1, n_val)
+            n_val = min(n_val, len(batches) - 1)
+            if n_val > 0:
+                train_batches = batches[:-n_val]
+                validation_batches = batches[-n_val:]
+                logger.info(
+                    "%sTarget-grid PV validation split: train_batches=%d, val_batches=%d",
+                    desc_prefix,
+                    len(train_batches),
+                    len(validation_batches),
+                )
+
         for epoch in range(n_epochs):
             self._current_epoch_idx = epoch
-            self._prepare_sdf_shock_bank_for_epoch(batches, epoch, train_modules)
+            self._prepare_sdf_shock_bank_for_epoch(train_batches, epoch, train_modules)
             self._q_only_stage = bool(
                 'policy_value' in train_modules and q_only_epochs > 0 and epoch < q_only_epochs
             )
@@ -4037,7 +4161,7 @@ class Episode:
             if 'policy_value' in train_modules and q_only_epochs > 0:
                 policy_loss_terms = ['q'] if self._q_only_stage else ['p0', 'pi', 'q']
             epoch_losses = []
-            for batch in tqdm(batches, desc=f"{desc_prefix}Epoch {epoch+1}/{n_epochs}"):
+            for batch in tqdm(train_batches, desc=f"{desc_prefix}Epoch {epoch+1}/{n_epochs}"):
                 losses = self.train_step(
                     batch,
                     train_modules,
@@ -4071,12 +4195,12 @@ class Episode:
                 'policy_value' in train_modules and
                 not self._q_only_stage and
                 bp_refine_steps > 0 and
-                len(batches) > 0
+                len(train_batches) > 0
             ):
                 if bp_refine_cap > 0:
-                    refine_batches = batches[:min(bp_refine_cap, len(batches))]
+                    refine_batches = train_batches[:min(bp_refine_cap, len(train_batches))]
                 else:
-                    refine_batches = batches
+                    refine_batches = train_batches
                 self._bp_only_stage = True
                 try:
                     for r in range(bp_refine_steps):
@@ -4132,13 +4256,14 @@ class Episode:
         self._bp_only_stage = False
         convergence = None
         if 'policy_value' in train_modules and 'policy_value' in self.models:
-            convergence = self.evaluate_bellman_convergence(batches)
+            convergence = self.evaluate_bellman_convergence(train_batches, validation_batches=validation_batches)
 
         result = {
             'final_losses': avg_losses
         }
         if convergence is not None:
             result['convergence'] = convergence
+            result['target_grid_validation_batches'] = len(validation_batches)
         if 'policy_value' in train_modules:
             self._last_policy_value_stage_summary = dict(avg_losses)
         return result

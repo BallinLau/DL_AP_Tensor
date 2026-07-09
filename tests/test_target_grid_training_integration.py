@@ -89,6 +89,47 @@ def test_target_grid_loss_logs_mix_regret_and_freezes_target_gradients():
     assert all(p.grad is None for p in episode.firm_target.parameters())
 
 
+def _module_grad_sum(module: torch.nn.Module) -> float:
+    total = 0.0
+    for p in module.parameters():
+        if p.grad is not None:
+            total += float(p.grad.detach().abs().sum().item())
+    return total
+
+
+def test_mixed_policy_conditional_loss_does_not_update_value_heads():
+    device = torch.device("cpu")
+    Config.DEVICE = device
+    online = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8).to(device)
+    episode = Episode(
+        models={"policy_value": online},
+        optimizers={"policy_value": torch.optim.Adam(online.parameters(), lr=1e-3)},
+        config=Config,
+        hyperparams=_small_hyperparams(),
+        device=device,
+    )
+
+    parent_state = _batch(device)["parent"][:, :7]
+    output = online(parent_state)
+    online.zero_grad(set_to_none=True)
+    bp_cond_pred = episode._mixed_policy_conditional_bp(
+        output,
+        output.bp0,
+        output.bpI,
+        parent_state[:, 0:1],
+        fallback_bar_i=output.bar_i_cond,
+    )
+    loss = (bp_cond_pred - torch.full_like(bp_cond_pred, 0.7)).pow(2).mean()
+    loss.backward()
+
+    assert _module_grad_sum(online.policy_encoder) > 0.0
+    assert _module_grad_sum(online.bp0_head) > 0.0
+    assert _module_grad_sum(online.bpi_head) > 0.0
+    assert _module_grad_sum(online.value_encoder) == 0.0
+    assert _module_grad_sum(online.v0_head) == 0.0
+    assert _module_grad_sum(online.vi_head) == 0.0
+
+
 def test_epoch_hard_target_is_fixed_within_epoch_and_updates_at_epoch_end():
     online = torch.nn.Linear(2, 1)
     target = torch.nn.Linear(2, 1)
@@ -118,4 +159,5 @@ def test_epoch_hard_target_is_fixed_within_epoch_and_updates_at_epoch_end():
 
 if __name__ == "__main__":
     test_target_grid_loss_logs_mix_regret_and_freezes_target_gradients()
+    test_mixed_policy_conditional_loss_does_not_update_value_heads()
     test_epoch_hard_target_is_fixed_within_epoch_and_updates_at_epoch_end()

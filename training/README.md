@@ -63,8 +63,10 @@ Training orchestration for episodes and modules.
   - train `bp0/bpI` with Huber distillation loss toward the selected grid argmax.
 - The simulation leverage action is treated as an ex-ante mixed action:
   - `output.bp = survival_prob * (bar_i_cond * bpI + (1 - bar_i_cond) * bp0) + (1 - survival_prob) * bp0`
-  - PI target-grid training also constructs `V_mix = (1 - bar_i_cond) * V0_grid + bar_i_cond * VI_grid`
-  - `output.bp` is directly supervised against `argmax_b V_mix`, with diagnostics such as `mix_grid_bp_mae` and `mix_grid_regret_p90`.
+  - PI target-grid training constructs `V_mix = (1 - bar_i_cond_target) * V0_grid + bar_i_cond_target * VI_grid`, where `bar_i_cond_target` comes from the frozen firm target network.
+  - The mixed distillation loss supervises conditional leverage `bp_cond = bar_i_cond_stopgrad * bpI + (1 - bar_i_cond_stopgrad) * bp0`, not the survival-fallback `output.bp`.
+  - Mixed loss is weighted by target survival probability, so near-default states do not force economically irrelevant leverage targets.
+  - Diagnostics include `mix_grid_bp_mae`, `mix_grid_regret_p90`, and `mix_grid_target_survival_weight_mean`.
 - FOC/KKT is no longer the default bp training signal in `target_grid` mode. The old path is still available with `pv_bp_training_mode='legacy_foc_kkt'`.
 - Simulation calls `PolicyValueModel.forward_simulation(...)` through `data.simulation_forward.forward_policy_value_for_simulation(...)`; it uses network outputs directly and never calls `BPGridTeacher` or runs a bp-grid.
 - `PolicyValueModel.forward_policy(...)` is available for policy-only diagnostics and avoids `Q/P/Phat/bar_z` and the internal `i`-grid.
@@ -79,12 +81,13 @@ Training orchestration for episodes and modules.
   - `bp_grid_margin_scale`, `bp_grid_confidence_relative`, `bp_grid_confidence_min`
   - `bp_grid_parent_chunk_size`, `bp_grid_candidate_chunk_size`, `bp_grid_max_expanded_states`
   - `bp_grid_conv_mae_thresh`, `bp_grid_conv_regret_p90_thresh`, `bp_grid_conv_max_batches`
-  - CLI flags: `--pv-bp-training-mode`, `--bp-grid-coarse-size`, `--bp-grid-fine-size`, `--bp-grid-refine-enabled`, `--bp-grid-policy-weight`, `--bp-grid-mix-policy-weight`, `--bp-grid-margin-scale`, `--bp-grid-parent-chunk-size`, `--bp-grid-candidate-chunk-size`, `--bp-grid-max-expanded-states`, `--bp-grid-confidence-relative`, `--no-bp-grid-confidence-relative`, `--firm-target-update`
-- Confidence is computed from coarse/global top-two margins by default; fine-grid margins are logged separately as `*_grid_fine_top2_margin_mean`.
+  - `pv_target_grid_val_fraction`
+  - CLI flags: `--pv-bp-training-mode`, `--bp-grid-coarse-size`, `--bp-grid-fine-size`, `--bp-grid-refine-enabled`, `--bp-grid-policy-weight`, `--bp-grid-mix-policy-weight`, `--bp-grid-margin-scale`, `--bp-grid-parent-chunk-size`, `--bp-grid-candidate-chunk-size`, `--bp-grid-max-expanded-states`, `--bp-grid-confidence-relative`, `--no-bp-grid-confidence-relative`, `--pv-target-grid-val-fraction`, `--firm-target-update`
+- Confidence is computed from coarse/global top-two margins by default. In relative mode it uses `(coarse_top2_margin / |V_star|) / bp_grid_margin_scale`; fine-grid margins are logged separately as `*_grid_fine_top2_margin_mean`.
 - Global low/high bp diagnostics come from the coarse grid endpoints. Local fine interval endpoints are logged only as `*_grid_local_value_left_mean` and `*_grid_local_value_right_mean`.
 - `bp_grid_quadratic_refine=True` re-evaluates `value_star`, `q_issue_at_star`, `p_child_at_star`, and `default_at_star` at the refined continuous `bp_star`.
 - `bp_grid_use_survival_gate` has been removed; continuation values use the already clipped/default-adjusted `P` from the target equity evaluator.
-- Target-grid policy convergence is checked in addition to Bellman residual convergence. In `target_grid` mode, `evaluate_bellman_convergence(...)` passes only if both Bellman residuals and held-out teacher policy MAE/regret checks pass.
+- Target-grid policy convergence is checked in addition to Bellman residual convergence. In `target_grid` mode, `_run_batches(...)` reserves tail batches according to `pv_target_grid_val_fraction`; `evaluate_bellman_convergence(...)` passes only if Bellman residuals and validation teacher policy MAE/regret checks pass.
 - Diagnostics include:
   - `p0_grid_bp_mae`, `pi_grid_bp_mae`
   - `mix_grid_bp_mae`, `mix_grid_regret_p90`

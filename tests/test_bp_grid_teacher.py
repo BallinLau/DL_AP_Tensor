@@ -59,6 +59,17 @@ class HighLeverageTarget(ParabolicTarget):
         }
 
 
+class LargeScaleLinearTarget(ParabolicTarget):
+    def forward_equity(self, firm_state):
+        b = firm_state[:, 0:1].clamp(0.0, 1.0)
+        p = 100.0 - 0.2 * b
+        return {
+            "P": p,
+            "Phat": p,
+            "bar_z": torch.zeros_like(b),
+        }
+
+
 def test_bp_grid_teacher_selects_value_maximizing_bp():
     target = ParabolicTarget()
     teacher = BPGridTeacher(
@@ -199,8 +210,30 @@ def test_pi_grid_target_multi_child_boundary_and_refine():
     assert torch.all(out["regret"] > 0)
 
 
+def test_relative_confidence_scales_margin_by_config_threshold():
+    target = LargeScaleLinearTarget()
+    teacher = BPGridTeacher(
+        target,
+        P0Loss(),
+        PILoss(),
+        coarse_size=3,
+        refine=False,
+        margin_scale=1e-3,
+        confidence_relative=True,
+    )
+    parent = torch.tensor([[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
+    child = parent.clone()
+    child[:, 2:3] = 1.0
+
+    out = teacher.compute(parent, [child], [torch.ones(1, 1)], branch="p0")
+
+    assert out["coarse_top2_margin"].item() > 0.0
+    assert out["confidence"].item() > 0.9
+
+
 if __name__ == "__main__":
     test_bp_grid_teacher_selects_value_maximizing_bp()
     test_grid_teacher_debt_state_semantics()
     test_grid_teacher_mix_branch_and_coarse_confidence()
     test_pi_grid_target_multi_child_boundary_and_refine()
+    test_relative_confidence_scales_margin_by_config_threshold()
