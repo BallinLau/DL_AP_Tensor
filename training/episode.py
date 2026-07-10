@@ -1251,6 +1251,48 @@ class Episode:
             eta_resample=False,
             extra_tensors=extra_tensors
         )
+
+    def _split_sdf_table_by_path(
+        self,
+        sdf_table: TensorTable,
+    ) -> Tuple[TensorTable, TensorTable, Dict[str, Any]]:
+        col = {name: i for i, name in enumerate(sdf_table.columns)}
+        if sdf_table.data.numel() == 0 or 'path' not in col:
+            return sdf_table, sdf_table, {
+                'sdf_fc1_holdout_active': False,
+                'sdf_fc1_holdout_reason': 'empty_or_missing_path',
+            }
+        val_fraction = float(getattr(self.hyperparams, "sdf_fc1_val_fraction", 0.2))
+        val_fraction = min(max(val_fraction, 0.0), 0.5)
+        path = sdf_table.data[:, col['path']].long()
+        unique_paths = torch.unique(path)
+        if unique_paths.numel() < 2 or val_fraction <= 0.0:
+            return sdf_table, sdf_table, {
+                'sdf_fc1_holdout_active': False,
+                'sdf_fc1_holdout_reason': 'insufficient_paths_or_disabled',
+                'sdf_fc1_holdout_n_paths': int(unique_paths.numel()),
+            }
+        seed = int(getattr(self.hyperparams, "sdf_fc1_val_seed", 12345))
+        generator = torch.Generator(device=unique_paths.device)
+        generator.manual_seed(seed)
+        order = torch.randperm(unique_paths.numel(), generator=generator, device=unique_paths.device)
+        n_val = int(round(unique_paths.numel() * val_fraction))
+        n_val = min(max(1, n_val), unique_paths.numel() - 1)
+        val_paths = unique_paths[order[:n_val]]
+        train_paths = unique_paths[order[n_val:]]
+        val_mask = torch.isin(path, val_paths)
+        train_mask = torch.isin(path, train_paths)
+        train_table = TensorTable(data=sdf_table.data[train_mask], columns=list(sdf_table.columns))
+        val_table = TensorTable(data=sdf_table.data[val_mask], columns=list(sdf_table.columns))
+        return train_table, val_table, {
+            'sdf_fc1_holdout_active': True,
+            'sdf_fc1_holdout_seed': seed,
+            'sdf_fc1_holdout_fraction': val_fraction,
+            'sdf_fc1_train_paths': int(train_paths.numel()),
+            'sdf_fc1_val_paths': int(val_paths.numel()),
+            'sdf_fc1_train_rows': int(train_table.data.shape[0]),
+            'sdf_fc1_val_rows': int(val_table.data.shape[0]),
+        }
     
     def _init_weight_scheduler(self) -> LossWeightScheduler:
         """
@@ -5130,8 +5172,15 @@ class Episode:
         def _safe_m_metrics(name: str, parts: List[torch.Tensor]) -> None:
             if not parts:
                 return
-            m = torch.cat(parts).to(torch.float32)
-            m = m[torch.isfinite(m)]
+            raw_m = torch.cat(parts).to(torch.float32)
+            finite_mask = torch.isfinite(raw_m)
+            out[f'{prefix}_{name}_total_n'] = float(raw_m.numel())
+            out[f'{prefix}_{name}_finite_n'] = float(finite_mask.sum().item())
+            out[f'{prefix}_{name}_finite_ratio'] = (
+                float(finite_mask.to(torch.float32).mean().item()) if raw_m.numel() > 0 else float('nan')
+            )
+            out[f'{prefix}_{name}_nonfinite_n'] = float((~finite_mask).sum().item())
+            m = raw_m[finite_mask]
             out[f'{prefix}_{name}_n'] = float(m.numel())
             if m.numel() > 0:
                 out[f'{prefix}_{name}_mean'] = float(m.mean().item())
@@ -5214,27 +5263,46 @@ class Episode:
     ) -> Tuple[bool, Dict[str, Any]]:
         max_log_mean_error = float(getattr(self.hyperparams, "sdf_log_mean_error_max", 0.02))
         max_t = float(getattr(self.hyperparams, "sdf_signed_t_abs_max", 2.0))
+        min_finite_ratio = float(getattr(self.hyperparams, "sdf_gate_m_finite_ratio_min", 1.0))
+        p99_max = float(getattr(self.hyperparams, "sdf_gate_m_p99_max", float("inf")))
+        max_max = float(getattr(self.hyperparams, "sdf_gate_m_max_max", float("inf")))
         target = getattr(self.hyperparams, "sdf_log_mean_target", None)
         target = float(target) if target is not None else 0.0
         if stage == SDFTrainingPhase.SDF_TRUE_ONLY:
-            m_key = f"{prefix}_primary_true_state_M_mean"
+            m_prefix = f"{prefix}_primary_true_state_M"
             t_key = f"{prefix}_primary_true_state_signed_aio_t"
         else:
-            m_key = f"{prefix}_recursive_forecast_state_M_mean"
+            m_prefix = f"{prefix}_recursive_forecast_state_M"
             t_key = f"{prefix}_recursive_forecast_state_signed_aio_t"
+        m_key = f"{m_prefix}_mean"
         m_mean = eval_metrics.get(m_key, float("nan"))
+        finite_ratio = eval_metrics.get(f"{m_prefix}_finite_ratio", float("nan"))
+        m_p99 = eval_metrics.get(f"{m_prefix}_p99", float("nan"))
+        m_max = eval_metrics.get(f"{m_prefix}_max", float("nan"))
         signed_t = eval_metrics.get(t_key, float("nan"))
         log_mean_error = abs(np.log(max(float(m_mean), 1e-12)) - target) if np.isfinite(m_mean) else float("nan")
         passed = (
             np.isfinite(log_mean_error)
             and np.isfinite(signed_t)
+            and np.isfinite(finite_ratio)
+            and np.isfinite(m_p99)
+            and np.isfinite(m_max)
             and log_mean_error <= max_log_mean_error
             and abs(float(signed_t)) <= max_t
+            and float(finite_ratio) >= min_finite_ratio
+            and float(m_p99) <= p99_max
+            and float(m_max) <= max_max
         )
         diag = {
             "passed": bool(passed),
             "stage": stage.value,
             "m_mean": float(m_mean),
+            "m_finite_ratio": float(finite_ratio),
+            "m_finite_ratio_min": min_finite_ratio,
+            "m_p99": float(m_p99),
+            "m_p99_max": p99_max,
+            "m_max": float(m_max),
+            "m_max_max": max_max,
             "log_mean_target": target,
             "log_mean_error": float(log_mean_error),
             "max_log_mean_error": max_log_mean_error,
@@ -5290,16 +5358,23 @@ class Episode:
         prev_phase = getattr(self, "sdf_training_phase", SDFTrainingPhase.SDF_TRUE_ONLY)
         self.add_FC1loss = True
         try:
-            sdf_batches = self._create_sdf_batches_from_macro_tensor(
-                sdf_table, batch_size=batch_size, n_branches=n_branches
+            train_table, val_table, holdout_diag = self._split_sdf_table_by_path(sdf_table)
+            module_summaries['sdf_fc1_holdout_split'] = holdout_diag
+            train_batches = self._create_sdf_batches_from_macro_tensor(
+                train_table, batch_size=batch_size, n_branches=n_branches
             )
-            if not sdf_batches:
+            val_batches = self._create_sdf_batches_from_macro_tensor(
+                val_table, batch_size=batch_size, n_branches=n_branches
+            )
+            if not train_batches:
                 raise RuntimeError("FC1/SDF Stage2 could not build non-empty SDF macro batches.")
+            if not val_batches:
+                raise RuntimeError("FC1/SDF Stage2 could not build non-empty holdout validation batches.")
             eval_batches = int(getattr(self.hyperparams, "sdf_fc1_eval_max_batches", 0))
             eval_batches_arg = eval_batches if eval_batches > 0 else None
             gate_result: Dict[str, Any] = {"passed": True, "failed_stage": None}
             before_eval = self._evaluate_sdf_fc1_batches(
-                sdf_batches,
+                val_batches,
                 prefix='before',
                 max_batches=eval_batches_arg
             )
@@ -5320,10 +5395,10 @@ class Episode:
                 if fc1_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.FC1_ONLY)
                     module_summaries['sdf_fc1_fc1_only'] = self._run_batches(
-                        sdf_batches, fc1_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(fc1-only) '
+                        train_batches, fc1_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(fc1-only) '
                     )
                     fc1_eval = self._evaluate_sdf_fc1_batches(
-                        sdf_batches, prefix='after_fc1', max_batches=eval_batches_arg
+                        val_batches, prefix='after_fc1', max_batches=eval_batches_arg
                     )
                     module_summaries['sdf_fc1_eval_after_fc1_only'] = fc1_eval
                     passed, diag = self._fc1_gate_passed(fc1_eval, prefix='after_fc1')
@@ -5333,10 +5408,10 @@ class Episode:
                 if true_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.SDF_TRUE_ONLY)
                     module_summaries['sdf_fc1_sdf_true_only'] = self._run_batches(
-                        sdf_batches, true_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(sdf-true) '
+                        train_batches, true_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(sdf-true) '
                     )
                     true_eval = self._evaluate_sdf_fc1_batches(
-                        sdf_batches, prefix='after_sdf_true', max_batches=eval_batches_arg
+                        val_batches, prefix='after_sdf_true', max_batches=eval_batches_arg
                     )
                     module_summaries['sdf_fc1_eval_after_sdf_true_only'] = true_eval
                     passed, diag = self._sdf_gate_passed(
@@ -5348,10 +5423,10 @@ class Episode:
                 if recursive_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.SDF_RECURSIVE_ONLY)
                     module_summaries['sdf_fc1_sdf_recursive_only'] = self._run_batches(
-                        sdf_batches, recursive_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(sdf-recursive) '
+                        train_batches, recursive_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(sdf-recursive) '
                     )
                     recursive_eval = self._evaluate_sdf_fc1_batches(
-                        sdf_batches, prefix='after_sdf_recursive', max_batches=eval_batches_arg
+                        val_batches, prefix='after_sdf_recursive', max_batches=eval_batches_arg
                     )
                     module_summaries['sdf_fc1_eval_after_sdf_recursive_only'] = recursive_eval
                     passed, diag = self._sdf_gate_passed(
@@ -5372,17 +5447,17 @@ class Episode:
                     self.set_sdf_training_phase(SDFTrainingPhase.FC1_ONLY)
                     self._fc1_teacher_forcing_stage = True
                     module_summaries['sdf_fc1_teacher_forcing'] = self._run_batches(
-                        sdf_batches, tf_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(tf) '
+                        train_batches, tf_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(tf) '
                     )
                     self._fc1_teacher_forcing_stage = False
                 self.set_sdf_training_phase(SDFTrainingPhase.SDF_RECURSIVE_ONLY)
                 module_summaries['sdf_fc1_stage2'] = self._run_batches(
-                    sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(stage2) '
+                    train_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(stage2) '
                 )
             # keep backward compatibility for consumers expecting a single sdf_fc1 key
             module_summaries['sdf_fc1'] = module_summaries['sdf_fc1_stage2']
             after_eval = self._evaluate_sdf_fc1_batches(
-                sdf_batches,
+                val_batches,
                 prefix='after',
                 max_batches=eval_batches_arg
             )
@@ -5454,6 +5529,18 @@ class Episode:
         use_sdf_fc1 = 'sdf_fc1' in train_modules and 'sdf_fc1' in self.models
         use_policy_value = 'policy_value' in train_modules and 'policy_value' in self.models
         use_fc2 = 'fc2' in train_modules and 'fc2' in self.models
+        if (
+            mode == 'modea'
+            and self.episode_id > 0
+            and use_sdf_fc1
+            and use_policy_value
+            and not bool(getattr(self.hyperparams, "allow_modea_sdf_after_pv", False))
+        ):
+            raise ValueError(
+                "Mode A trains Policy/Value before FC1/SDF gate and is disabled for Episode>0 "
+                "when both sdf_fc1 and policy_value are active. Use modeb or set "
+                "allow_modea_sdf_after_pv=True for legacy experiments."
+            )
 
         # 记录 episode 开始时的 GPU 显存
         logger.info(f"Episode {self.episode_id} starting - GPU Memory:")
@@ -5678,6 +5765,84 @@ class Episode:
                         raise NumericalStageFailure(
                             f"FC1/SDF validation failed in {gate_result.get('failed_stage')}; skip Q/P/bp."
                         )
+
+                if use_policy_value and use_sdf_fc1 and self.episode_id > 0:
+                    rng_after_sdf_training = self._capture_rng_state()
+                    self._restore_rng_state(modeb_rng_before_first_sim)
+                    if tensor_pipeline:
+                        self._simulate_tensor(
+                            n_paths=n_paths,
+                            group_size=group_size,
+                            n_branches=n_branches,
+                            horizon=horizon_modeb,
+                            simulate_kwargs=simulate_kwargs,
+                            export_df=use_fc2
+                        )
+                    else:
+                        self._simulate_df(
+                            n_paths=n_paths,
+                            group_size=group_size,
+                            n_branches=n_branches,
+                            horizon=horizon_modeb,
+                            simulate_kwargs=simulate_kwargs
+                        )
+                    self._restore_rng_state(rng_after_sdf_training)
+                    refreshed_macro_snapshot = self._selected_frame_snapshot(
+                        self.tensor_macro,
+                        self.df_macro,
+                        macro_diag_columns,
+                        key_columns=macro_key_columns
+                    )
+                    refreshed_firm_snapshot = self._selected_frame_snapshot(
+                        self.tensor_firm,
+                        self.df,
+                        firm_diag_columns,
+                        key_columns=firm_key_columns
+                    )
+                    refreshed_firm_stats = self._snapshot_stats(
+                        'refreshed_firm',
+                        refreshed_firm_snapshot,
+                        firm_diag_columns
+                    )
+                    refreshed_firm_stats.update(
+                        self._firm_economic_moments('refreshed_firm', refreshed_firm_snapshot)
+                    )
+                    module_summaries['modeb_pre_pv_sdf_refresh_diag'] = {
+                        'resimulated_after_sdf_gate': True,
+                        'rng_state_replayed': True,
+                        'policy_value_uses_refreshed_sdf_data': True,
+                        **self._snapshot_stats('refreshed_macro', refreshed_macro_snapshot, macro_diag_columns),
+                        **refreshed_firm_stats,
+                        **self._keyed_snapshot_gap(
+                            'macro_old_to_sdf_refreshed',
+                            old_macro_snapshot,
+                            refreshed_macro_snapshot,
+                            key_columns=macro_key_columns,
+                            value_columns=macro_diag_columns
+                        ),
+                    }
+                    refreshed_firm_keys = refreshed_firm_snapshot.loc[
+                        :,
+                        [k for k in firm_key_columns if k in refreshed_firm_snapshot.columns]
+                    ].copy() if not refreshed_firm_snapshot.empty else pd.DataFrame()
+                    module_summaries['modeb_pre_pv_sdf_refresh_diag'].update(
+                        self._keyed_snapshot_gap(
+                            'firm_old_to_sdf_refreshed_keys',
+                            old_firm_keys,
+                            refreshed_firm_keys,
+                            key_columns=[
+                                k for k in firm_key_columns
+                                if k in old_firm_keys.columns and k in refreshed_firm_keys.columns
+                            ],
+                            value_columns=[]
+                        )
+                    )
+                else:
+                    module_summaries['modeb_pre_pv_sdf_refresh_diag'] = {
+                        'resimulated_after_sdf_gate': False,
+                        'rng_state_replayed': False,
+                        'policy_value_uses_refreshed_sdf_data': bool(not use_sdf_fc1),
+                    }
 
                 if use_policy_value:
                     if tensor_pipeline and self.tensor_firm is not None:

@@ -202,7 +202,13 @@ class HyperParams:
     fc1_rmse_growth_h5_max: float = 2.0
     sdf_log_mean_error_max: float = 0.02
     sdf_signed_t_abs_max: float = 2.0
+    sdf_fc1_val_fraction: float = 0.2
+    sdf_fc1_val_seed: int = 12345
+    sdf_gate_m_finite_ratio_min: float = 1.0
+    sdf_gate_m_p99_max: float = math.inf
+    sdf_gate_m_max_max: float = math.inf
     stage_gate_required_consecutive_passes: int = 3
+    allow_modea_sdf_after_pv: bool = False
 
     # ========== Policy/Value: Q 优先训练与形状约束 ==========
     # 在 policy/value 联合训练前先进行 q-only 预训练轮数

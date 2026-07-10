@@ -143,6 +143,11 @@ def build_hyperparams():
     hp.sdf_recursive_loss_weight = 0.25
     hp.sdf_recursive_moment_weight = 5e-4
     hp.sdf_recursive_anchor_weight = 0.05
+    hp.sdf_fc1_val_fraction = 0.2
+    hp.sdf_fc1_val_seed = 12345
+    hp.sdf_gate_m_finite_ratio_min = 1.0
+    hp.sdf_gate_m_p99_max = float("inf")
+    hp.sdf_gate_m_max_max = float("inf")
     hp.sdf_stage1_lr = 1e-4
     hp.sdf_stage2_lr = 2e-4
     hp.sdf_stage1_moment_weight = 5.0
