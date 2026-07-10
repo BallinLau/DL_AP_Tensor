@@ -5414,6 +5414,54 @@ class Episode:
         }
         return bool(passed), diag
 
+    def _episode0_sdf_safety_gate_passed(
+        self,
+        eval_metrics: Dict[str, float],
+        prefix: str,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        target = getattr(self.hyperparams, "sdf_log_mean_target", None)
+        target = float(target) if target is not None else 0.0
+        max_log_mean_error = float(getattr(self.hyperparams, "episode0_sdf_log_mean_error_max", 0.25))
+        max_clip_low = float(getattr(self.hyperparams, "episode0_sdf_clip_low_ratio_max", 0.20))
+        min_finite_ratio = float(getattr(self.hyperparams, "episode0_sdf_finite_ratio_min", 1.0))
+        m_prefix = f"{prefix}_primary_true_state_M"
+        m_mean = eval_metrics.get(f"{m_prefix}_mean", float("nan"))
+        finite_ratio = eval_metrics.get(f"{m_prefix}_finite_ratio", float("nan"))
+        clip_low_ratio = eval_metrics.get(f"{m_prefix}_lt_0p7_rate", float("nan"))
+        clip_high_ratio = eval_metrics.get(f"{m_prefix}_gt_1p3_rate", float("nan"))
+        m_p99 = eval_metrics.get(f"{m_prefix}_p99", float("nan"))
+        m_max = eval_metrics.get(f"{m_prefix}_max", float("nan"))
+        signed_t = eval_metrics.get(f"{prefix}_primary_true_state_signed_aio_t", float("nan"))
+        log_mean_error = abs(np.log(max(float(m_mean), 1e-12)) - target) if np.isfinite(m_mean) else float("nan")
+        passed = (
+            np.isfinite(m_mean)
+            and np.isfinite(log_mean_error)
+            and np.isfinite(finite_ratio)
+            and np.isfinite(clip_low_ratio)
+            and float(finite_ratio) >= min_finite_ratio
+            and log_mean_error <= max_log_mean_error
+            and float(clip_low_ratio) <= max_clip_low
+        )
+        diag = {
+            "passed": bool(passed),
+            "gate_type": "episode0_sdf_safety",
+            "stage": SDFTrainingPhase.EPISODE0_BOOTSTRAP.value,
+            "m_mean": float(m_mean),
+            "m_finite_ratio": float(finite_ratio),
+            "m_finite_ratio_min": min_finite_ratio,
+            "m_lt_0p7_rate": float(clip_low_ratio),
+            "m_lt_0p7_rate_max": max_clip_low,
+            "m_gt_1p3_rate": float(clip_high_ratio),
+            "m_p99": float(m_p99),
+            "m_max": float(m_max),
+            "log_mean_target": target,
+            "log_mean_error": float(log_mean_error),
+            "max_log_mean_error": max_log_mean_error,
+            "signed_aio_t_observed": float(signed_t),
+            "signed_aio_t_binding": False,
+        }
+        return bool(passed), diag
+
     def _evaluate_post_refresh_sdf_gate(
         self,
         module_summaries: Dict[str, Any],
@@ -5749,10 +5797,9 @@ class Episode:
                 prefix=prefix,
                 max_batches=eval_batches_arg
             )
-            passed, gate_diag = self._sdf_gate_passed(
+            passed, gate_diag = self._episode0_sdf_safety_gate_passed(
                 eval_metrics,
                 prefix=prefix,
-                stage=SDFTrainingPhase.EPISODE0_BOOTSTRAP,
             )
             gate_diag.update({
                 'round': display_round,

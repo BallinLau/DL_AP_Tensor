@@ -53,8 +53,9 @@ Training orchestration for episodes and modules.
   - `sdf_recursive_only`: freeze FC1 and train only `sdf_model`/`value_model` using recursive forecast parent state, plus a true-state Euler baseline.
 - The phase is recorded as `sdf_training_phase`. Effective loss weights are logged as `*_weight_effective` fields.
 - `fc1_only` never samples fresh wealth pairs and never computes Euler/moment/anchor terms.
-- Episode 0 does not run the Stage2 FC1/SDF schedule. Instead, it runs an SDF bootstrap continuation loop on a fixed path-level train/validation split: train one block, evaluate the SDF gate, continue if the gate fails, and stop before Policy/Value if `episode0_sdf_max_rounds` is exhausted.
-- `episode0_sdf_epochs_per_round <= 0` uses the run's `--epochs` value per block; `episode0_sdf_max_rounds` defaults to `10`. Slurm exposes these as `EPISODE0_SDF_EPOCHS_PER_ROUND` and `EPISODE0_SDF_MAX_ROUNDS`.
+- Episode 0 does not run the Stage2 FC1/SDF schedule. Instead, it runs an SDF bootstrap continuation loop on a fixed path-level train/validation split: train one block, evaluate the Episode 0 safety gate, continue if the gate fails, and stop before Policy/Value if `episode0_sdf_max_rounds` is exhausted.
+- The Episode 0 safety gate is intentionally weaker than the formal Episode 1+ SDF gate. It checks finite `M`, `|log E[M] - target| <= episode0_sdf_log_mean_error_max`, and `Pr(M < 0.7) <= episode0_sdf_clip_low_ratio_max`; signed-AiO t-stat is logged but not binding.
+- `episode0_sdf_epochs_per_round <= 0` uses the run's `--epochs` value per block; `episode0_sdf_max_rounds` defaults to `10`. Slurm exposes these plus `EPISODE0_SDF_LOG_MEAN_ERROR_MAX`, `EPISODE0_SDF_CLIP_LOW_RATIO_MAX`, and `EPISODE0_SDF_FINITE_RATIO_MIN`.
 - Stage2 is valid only for `episode_id > 0`.
 - In Mode B, the ordering is now: simulate with previous policies, build macro transitions, run `fc1_only -> sdf_true_only -> sdf_recursive_only` with gates, replay the same simulation seed to refresh firm data with the accepted FC1/SDF, then train Q/P/bp. Gate failure raises `NumericalStageFailure` and skips downstream Policy/Value training.
 - After the SDF refresh replay, Mode B runs a validation-only post-refresh gate before Policy/Value. This checks the distribution that Policy/Value will actually use, not only the pre-refresh macro distribution.

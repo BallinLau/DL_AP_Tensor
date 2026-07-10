@@ -10,7 +10,8 @@ sys.path.append(str(ROOT))
 
 from data import TensorTable  # noqa: E402
 from experiments.run_utils import build_hyperparams  # noqa: E402
-from training.episode import Episode, SDFTrainingPhase  # noqa: E402
+import training.episode as episode_module  # noqa: E402
+from training.episode import Episode, NumericalStageFailure, SDFTrainingPhase  # noqa: E402
 
 
 class _DummyMonitor:
@@ -366,34 +367,36 @@ class TreatmentBFlowTest(unittest.TestCase):
 
         self.assertEqual(episode.sdf_training_phase, SDFTrainingPhase.JOINT_DISABLED)
 
-    def test_episode0_sdf_gate_uses_primary_bootstrap_metrics(self):
+    def test_episode0_sdf_safety_gate_uses_clip_ratio_not_strict_t_stat(self):
         episode = Episode.__new__(Episode)
         episode.hyperparams = SimpleNamespace(
-            sdf_log_mean_error_max=0.02,
-            sdf_signed_t_abs_max=2.0,
-            sdf_gate_m_finite_ratio_min=1.0,
-            sdf_gate_m_p99_max=float("inf"),
-            sdf_gate_m_max_max=float("inf"),
             sdf_log_mean_target=0.0,
+            episode0_sdf_log_mean_error_max=0.25,
+            episode0_sdf_clip_low_ratio_max=0.20,
+            episode0_sdf_finite_ratio_min=1.0,
         )
 
-        passed, diag = episode._sdf_gate_passed(
+        passed, diag = episode._episode0_sdf_safety_gate_passed(
             {
                 "ep0_primary_true_state_M_mean": 1.0,
                 "ep0_primary_true_state_M_finite_ratio": 1.0,
                 "ep0_primary_true_state_M_p99": 1.0,
                 "ep0_primary_true_state_M_max": 1.0,
-                "ep0_primary_true_state_signed_aio_t": 0.0,
+                "ep0_primary_true_state_M_lt_0p7_rate": 0.05,
+                "ep0_primary_true_state_M_gt_1p3_rate": 0.0,
+                "ep0_primary_true_state_signed_aio_t": 99.0,
                 "ep0_recursive_forecast_state_M_mean": float("nan"),
                 "ep0_recursive_forecast_state_signed_aio_t": float("nan"),
             },
             prefix="ep0",
-            stage=SDFTrainingPhase.EPISODE0_BOOTSTRAP,
         )
 
         self.assertTrue(passed)
+        self.assertEqual(diag["gate_type"], "episode0_sdf_safety")
         self.assertEqual(diag["stage"], SDFTrainingPhase.EPISODE0_BOOTSTRAP.value)
         self.assertEqual(diag["m_mean"], 1.0)
+        self.assertEqual(diag["m_lt_0p7_rate"], 0.05)
+        self.assertFalse(diag["signed_aio_t_binding"])
 
     def test_episode0_sdf_continuation_retrains_until_gate_passes(self):
         episode = Episode.__new__(Episode)
@@ -415,13 +418,13 @@ class TreatmentBFlowTest(unittest.TestCase):
             calls["eval"] += 1
             return {"prefix": prefix}
 
-        def fake_gate(self, eval_metrics, prefix, stage):
+        def fake_gate(self, eval_metrics, prefix):
             del eval_metrics
-            return calls["eval"] >= 2, {"passed": calls["eval"] >= 2, "prefix": prefix, "stage": stage.value}
+            return calls["eval"] >= 2, {"passed": calls["eval"] >= 2, "prefix": prefix}
 
         episode._run_batches = MethodType(fake_run_batches, episode)
         episode._evaluate_sdf_fc1_batches = MethodType(fake_evaluate, episode)
-        episode._sdf_gate_passed = MethodType(fake_gate, episode)
+        episode._episode0_sdf_safety_gate_passed = MethodType(fake_gate, episode)
 
         summary = episode._run_episode0_sdf_bootstrap_until_gate(
             train_batches=[{"x": torch.tensor([1.0])}],
@@ -435,6 +438,83 @@ class TreatmentBFlowTest(unittest.TestCase):
         self.assertEqual(summary["total_bootstrap_epochs"], 4)
         self.assertEqual(calls["train"], 2)
         self.assertEqual(calls["eval"], 2)
+
+    def test_episode0_sdf_gate_failure_stops_before_policy_value(self):
+        class FakeSample:
+            policy_requested = False
+
+            def __init__(self, *args, **kwargs):
+                del args, kwargs
+
+            def build_sdf_fc1_tensor(self):
+                return TensorTable(
+                    data=torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+                    columns=["path", "dummy"],
+                )
+
+            def build_policy_value_tensor(self):
+                FakeSample.policy_requested = True
+                raise AssertionError("Policy/Value data should not be requested after Episode 0 SDF gate failure")
+
+        episode = Episode.__new__(Episode)
+        episode.models = {"sdf_fc1": object(), "policy_value": object()}
+        episode.optimizers = {}
+        episode.config = SimpleNamespace(DEVICE=torch.device("cpu"))
+        episode.hyperparams = SimpleNamespace(use_tensor_pipeline=True, simulate_horizon=2)
+        episode.device = torch.device("cpu")
+        episode.episode_id = 0
+        episode.gpu_monitor = _DummyMonitor()
+        episode.df = None
+        episode.df_macro = None
+        episode.df_sdf = None
+        episode.tensor_firm = None
+        episode.tensor_macro = None
+        episode.tensor_sdf = None
+        episode.step_count = 0
+        episode.loss_history = {}
+        episode.add_FC1loss = False
+        episode.train_mode = "2time"
+        episode._fc1_teacher_forcing_stage = False
+
+        episode.reset_sdf_shock_bank = MethodType(lambda self: None, episode)
+        episode._use_tensor_pipeline = MethodType(lambda self: True, episode)
+        episode._split_sdf_table_by_path = MethodType(
+            lambda self, table: (table, table, {"sdf_fc1_holdout_active": False}),
+            episode,
+        )
+        episode._create_sdf_batches_from_macro_tensor = MethodType(
+            lambda self, table, batch_size, n_branches: [{"parent": torch.zeros(1, 7)}],
+            episode,
+        )
+        episode._run_episode0_sdf_bootstrap_until_gate = MethodType(
+            lambda self, train_batches, val_batches, n_epochs, log_interval: {
+                "passed": False,
+                "total_bootstrap_epochs": 2,
+                "rounds_completed": 1,
+                "final_train_summary": {"final_losses": {"sdf": 1.0}},
+            },
+            episode,
+        )
+
+        original_sample = episode_module.Sample
+        episode_module.Sample = FakeSample
+        try:
+            with self.assertRaisesRegex(NumericalStageFailure, "Episode 0 SDF failed"):
+                episode.run_episode(
+                    n_epochs=1,
+                    batch_size=2,
+                    log_interval=1,
+                    n_paths=2,
+                    group_size=1,
+                    n_branches=2,
+                    train_modules=["sdf_fc1", "policy_value"],
+                    simulate_kwargs={"horizon": 2},
+                    episode_mode="mode0",
+                )
+        finally:
+            episode_module.Sample = original_sample
+
+        self.assertFalse(FakeSample.policy_requested)
 
     def test_fixed_batch_eval_reports_stage2_object_layers(self):
         episode = Episode.__new__(Episode)

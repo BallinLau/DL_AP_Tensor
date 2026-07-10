@@ -133,6 +133,24 @@ def parse_args() -> argparse.Namespace:
         help="Maximum Episode 0 SDF bootstrap gate rounds before stopping",
     )
     parser.add_argument(
+        "--episode0-sdf-log-mean-error-max",
+        type=float,
+        default=0.25,
+        help="Episode 0 bootstrap safety gate max |log E[M] - target|",
+    )
+    parser.add_argument(
+        "--episode0-sdf-clip-low-ratio-max",
+        type=float,
+        default=0.20,
+        help="Episode 0 bootstrap safety gate max share of raw M below 0.7",
+    )
+    parser.add_argument(
+        "--episode0-sdf-finite-ratio-min",
+        type=float,
+        default=1.0,
+        help="Episode 0 bootstrap safety gate minimum finite M ratio",
+    )
+    parser.add_argument(
         "--fc1-jacobian-penalty-interval",
         type=int,
         default=None,
@@ -205,6 +223,9 @@ def configure_hyperparams(args: argparse.Namespace):
     hyperparams.sdf_child_bank_seed = args.sdf_child_bank_seed
     hyperparams.episode0_sdf_epochs_per_round = int(args.episode0_sdf_epochs_per_round)
     hyperparams.episode0_sdf_max_rounds = int(args.episode0_sdf_max_rounds)
+    hyperparams.episode0_sdf_log_mean_error_max = float(args.episode0_sdf_log_mean_error_max)
+    hyperparams.episode0_sdf_clip_low_ratio_max = float(args.episode0_sdf_clip_low_ratio_max)
+    hyperparams.episode0_sdf_finite_ratio_min = float(args.episode0_sdf_finite_ratio_min)
     if args.fc1_jacobian_penalty_interval is not None:
         hyperparams.fc1_jacobian_penalty_interval = args.fc1_jacobian_penalty_interval
     if args.pv_bp_training_mode is not None:

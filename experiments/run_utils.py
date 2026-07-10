@@ -150,6 +150,9 @@ def build_hyperparams():
     hp.sdf_gate_m_max_max = float("inf")
     hp.episode0_sdf_epochs_per_round = 0
     hp.episode0_sdf_max_rounds = 10
+    hp.episode0_sdf_log_mean_error_max = 0.25
+    hp.episode0_sdf_clip_low_ratio_max = 0.20
+    hp.episode0_sdf_finite_ratio_min = 1.0
     hp.allow_in_sample_sdf_gate_for_debug = False
     hp.sdf_post_refresh_gate_enabled = True
     hp.stage_gate_required_consecutive_passes = 1
