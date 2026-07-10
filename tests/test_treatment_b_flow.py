@@ -43,7 +43,7 @@ class _FakeSdfModel:
 
 
 class TreatmentBFlowTest(unittest.TestCase):
-    def _make_episode(self, resimulate_after_pv):
+    def _make_episode(self, resimulate_after_pv, post_refresh_pass=True):
         episode = Episode.__new__(Episode)
         episode.models = {"policy_value": object(), "sdf_fc1": object()}
         episode.optimizers = {}
@@ -108,10 +108,22 @@ class TreatmentBFlowTest(unittest.TestCase):
             module_summaries["sdf_fc1_gate"] = {"passed": True, "failed_stage": None}
             return {"passed": True, "failed_stage": None}
 
+        def fake_post_refresh_gate(self, module_summaries, batch_size, n_branches):
+            calls.append("post_refresh_gate")
+            module_summaries["sdf_fc1_post_refresh_gate"] = {
+                "passed": bool(post_refresh_pass),
+                "failed_stage": None if post_refresh_pass else "post_refresh",
+            }
+            return {
+                "passed": bool(post_refresh_pass),
+                "failed_stage": None if post_refresh_pass else "post_refresh",
+            }
+
         episode._simulate_tensor = MethodType(fake_simulate_tensor, episode)
         episode._create_firm_batches_from_tensor = MethodType(fake_create_firm_batches, episode)
         episode._run_batches = MethodType(fake_run_batches, episode)
         episode._run_sdf_recon_from_macro = MethodType(fake_run_sdf, episode)
+        episode._evaluate_post_refresh_sdf_gate = MethodType(fake_post_refresh_gate, episode)
 
         summary = episode.run_episode(
             n_epochs=1,
@@ -128,7 +140,10 @@ class TreatmentBFlowTest(unittest.TestCase):
 
     def test_treatment_a_simulates_once_and_trains_sdf_on_first_macro(self):
         calls, summary = self._make_episode(resimulate_after_pv=False)
-        self.assertEqual(calls, ["simulate1", "train_sdf_marker_1", "simulate2", "build_pv_marker_2", "train_pv"])
+        self.assertEqual(
+            calls,
+            ["simulate1", "train_sdf_marker_1", "simulate2", "post_refresh_gate", "build_pv_marker_2", "train_pv"]
+        )
         self.assertEqual(summary["module_summaries"]["sdf_marker"], 1)
         refresh = summary["module_summaries"]["modeb_pre_pv_sdf_refresh_diag"]
         self.assertTrue(refresh["resimulated_after_sdf_gate"])
@@ -137,13 +152,20 @@ class TreatmentBFlowTest(unittest.TestCase):
 
     def test_treatment_b_trains_sdf_before_pv_then_resimulates(self):
         calls, summary = self._make_episode(resimulate_after_pv=True)
-        self.assertEqual(calls, ["simulate1", "train_sdf_marker_1", "simulate2", "build_pv_marker_2", "train_pv", "simulate3"])
+        self.assertEqual(
+            calls,
+            ["simulate1", "train_sdf_marker_1", "simulate2", "post_refresh_gate", "build_pv_marker_2", "train_pv", "simulate3"]
+        )
         self.assertEqual(summary["module_summaries"]["sdf_marker"], 1)
         diag = summary["module_summaries"]["modeb_post_pv_resimulation_diag"]
         self.assertTrue(diag["resimulated_after_pv"])
         self.assertTrue(diag["rng_state_replayed"])
         self.assertIn("macro_old_to_new_common_rows", diag)
         self.assertIn("firm_old_to_new_keys_common_rows", diag)
+
+    def test_post_refresh_gate_failure_skips_policy_value(self):
+        with self.assertRaisesRegex(Exception, "Post-refresh FC1/SDF gate failed"):
+            self._make_episode(resimulate_after_pv=False, post_refresh_pass=False)
 
     def test_modeb_sdf_gate_failure_skips_policy_value(self):
         episode = Episode.__new__(Episode)
@@ -330,7 +352,11 @@ class TreatmentBFlowTest(unittest.TestCase):
 
     def test_sdf_holdout_split_is_path_disjoint(self):
         episode = Episode.__new__(Episode)
-        episode.hyperparams = SimpleNamespace(sdf_fc1_val_fraction=0.25, sdf_fc1_val_seed=7)
+        episode.hyperparams = SimpleNamespace(
+            sdf_fc1_val_fraction=0.25,
+            sdf_fc1_val_seed=7,
+            allow_in_sample_sdf_gate_for_debug=False,
+        )
         rows = []
         for path in range(4):
             for t in range(3):
@@ -351,6 +377,27 @@ class TreatmentBFlowTest(unittest.TestCase):
         self.assertTrue(train_paths)
         self.assertTrue(val_paths)
         self.assertTrue(train_paths.isdisjoint(val_paths))
+
+    def test_sdf_holdout_split_requires_at_least_two_paths(self):
+        episode = Episode.__new__(Episode)
+        episode.hyperparams = SimpleNamespace(
+            sdf_fc1_val_fraction=0.25,
+            sdf_fc1_val_seed=7,
+            allow_in_sample_sdf_gate_for_debug=False,
+        )
+        sdf_table = TensorTable(
+            data=torch.tensor(
+                [[0.0, 1.0, 0.0, 1.0, 2.0, 0.1, 4.0, 1.0, 5.0, 2.0, 6.0]],
+                dtype=torch.float32,
+            ),
+            columns=[
+                "path", "t", "branch", "x_t", "x_t1", "Hatcf_t", "LnKF_t",
+                "Hatc_t", "LnK_t", "Hatc_t1", "LnK_t1",
+            ],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requires at least two paths"):
+            episode._split_sdf_table_by_path(sdf_table)
 
     def test_formal_hyperparams_use_true_state_primary_stage2(self):
         hp = build_hyperparams()

@@ -207,7 +207,9 @@ class HyperParams:
     sdf_gate_m_finite_ratio_min: float = 1.0
     sdf_gate_m_p99_max: float = math.inf
     sdf_gate_m_max_max: float = math.inf
-    stage_gate_required_consecutive_passes: int = 3
+    allow_in_sample_sdf_gate_for_debug: bool = False
+    sdf_post_refresh_gate_enabled: bool = True
+    stage_gate_required_consecutive_passes: int = 1
     allow_modea_sdf_after_pv: bool = False
 
     # ========== Policy/Value: Q 优先训练与形状约束 ==========

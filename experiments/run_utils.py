@@ -148,6 +148,9 @@ def build_hyperparams():
     hp.sdf_gate_m_finite_ratio_min = 1.0
     hp.sdf_gate_m_p99_max = float("inf")
     hp.sdf_gate_m_max_max = float("inf")
+    hp.allow_in_sample_sdf_gate_for_debug = False
+    hp.sdf_post_refresh_gate_enabled = True
+    hp.stage_gate_required_consecutive_passes = 1
     hp.sdf_stage1_lr = 1e-4
     hp.sdf_stage2_lr = 2e-4
     hp.sdf_stage1_moment_weight = 5.0

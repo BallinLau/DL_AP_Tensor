@@ -1266,10 +1266,27 @@ class Episode:
         val_fraction = min(max(val_fraction, 0.0), 0.5)
         path = sdf_table.data[:, col['path']].long()
         unique_paths = torch.unique(path)
-        if unique_paths.numel() < 2 or val_fraction <= 0.0:
+        allow_in_sample = bool(getattr(self.hyperparams, "allow_in_sample_sdf_gate_for_debug", False))
+        if val_fraction <= 0.0:
+            if not allow_in_sample:
+                raise RuntimeError(
+                    "Path-level SDF validation is disabled by sdf_fc1_val_fraction=0. "
+                    "Set allow_in_sample_sdf_gate_for_debug=True only for debug runs."
+                )
             return sdf_table, sdf_table, {
                 'sdf_fc1_holdout_active': False,
-                'sdf_fc1_holdout_reason': 'insufficient_paths_or_disabled',
+                'sdf_fc1_holdout_reason': 'disabled_debug_in_sample',
+                'sdf_fc1_holdout_n_paths': int(unique_paths.numel()),
+            }
+        if unique_paths.numel() < 2:
+            if not allow_in_sample:
+                raise RuntimeError(
+                    "Path-level SDF validation requires at least two paths. "
+                    "Set allow_in_sample_sdf_gate_for_debug=True only for debug runs."
+                )
+            return sdf_table, sdf_table, {
+                'sdf_fc1_holdout_active': False,
+                'sdf_fc1_holdout_reason': 'insufficient_paths_debug_in_sample',
                 'sdf_fc1_holdout_n_paths': int(unique_paths.numel()),
             }
         seed = int(getattr(self.hyperparams, "sdf_fc1_val_seed", 12345))
@@ -5266,6 +5283,7 @@ class Episode:
         min_finite_ratio = float(getattr(self.hyperparams, "sdf_gate_m_finite_ratio_min", 1.0))
         p99_max = float(getattr(self.hyperparams, "sdf_gate_m_p99_max", float("inf")))
         max_max = float(getattr(self.hyperparams, "sdf_gate_m_max_max", float("inf")))
+        tail_gate_active = bool(np.isfinite(p99_max) or np.isfinite(max_max))
         target = getattr(self.hyperparams, "sdf_log_mean_target", None)
         target = float(target) if target is not None else 0.0
         if stage == SDFTrainingPhase.SDF_TRUE_ONLY:
@@ -5303,6 +5321,7 @@ class Episode:
             "m_p99_max": p99_max,
             "m_max": float(m_max),
             "m_max_max": max_max,
+            "tail_gate_active": tail_gate_active,
             "log_mean_target": target,
             "log_mean_error": float(log_mean_error),
             "max_log_mean_error": max_log_mean_error,
@@ -5310,6 +5329,65 @@ class Episode:
             "max_signed_t_abs": max_t,
         }
         return bool(passed), diag
+
+    def _evaluate_post_refresh_sdf_gate(
+        self,
+        module_summaries: Dict[str, Any],
+        batch_size: int,
+        n_branches: int,
+    ) -> Dict[str, Any]:
+        if self._use_tensor_pipeline() and self.tensor_macro is not None:
+            sdf_table = self._build_sdf_pairs_from_macro_tensor(self.tensor_macro)
+        else:
+            macro_df = self.df_macro
+            if (macro_df is None or macro_df.empty) and self.tensor_macro is not None:
+                macro_df = self._table_to_dataframe(self.tensor_macro)
+            if macro_df is None or macro_df.empty:
+                raise RuntimeError("Post-refresh SDF gate requires non-empty refreshed macro data.")
+            df_macro_sdf = build_sdf_pairs_from_macro_ts(macro_df.copy(), include_hatc_lnk_t1=True)
+            sdf_table = TensorTable(
+                data=torch.tensor(df_macro_sdf.values, device=self.device, dtype=torch.float32),
+                columns=list(df_macro_sdf.columns)
+            )
+
+        prev_flag = self.add_FC1loss
+        prev_phase = getattr(self, "sdf_training_phase", SDFTrainingPhase.SDF_TRUE_ONLY)
+        self.add_FC1loss = True
+        try:
+            _, val_table, holdout_diag = self._split_sdf_table_by_path(sdf_table)
+            val_batches = self._create_sdf_batches_from_macro_tensor(
+                val_table,
+                batch_size=batch_size,
+                n_branches=n_branches,
+            )
+            if not val_batches:
+                raise RuntimeError("Post-refresh SDF gate could not build holdout validation batches.")
+            eval_batches = int(getattr(self.hyperparams, "sdf_fc1_eval_max_batches", 0))
+            eval_batches_arg = eval_batches if eval_batches > 0 else None
+            refresh_eval = self._evaluate_sdf_fc1_batches(
+                val_batches,
+                prefix="post_refresh",
+                max_batches=eval_batches_arg,
+            )
+            fc1_passed, fc1_diag = self._fc1_gate_passed(refresh_eval, prefix="post_refresh")
+            sdf_passed, sdf_diag = self._sdf_gate_passed(
+                refresh_eval,
+                prefix="post_refresh",
+                stage=SDFTrainingPhase.SDF_RECURSIVE_ONLY,
+            )
+            result = {
+                "passed": bool(fc1_passed and sdf_passed),
+                "failed_stage": None if (fc1_passed and sdf_passed) else "post_refresh",
+                "holdout_split": holdout_diag,
+                "fc1_gate": fc1_diag,
+                "sdf_recursive_gate": sdf_diag,
+            }
+            module_summaries["sdf_fc1_post_refresh_eval"] = refresh_eval
+            module_summaries["sdf_fc1_post_refresh_gate"] = result
+            return result
+        finally:
+            self.add_FC1loss = prev_flag
+            self.set_sdf_training_phase(prev_phase)
 
     def _run_sdf_recon_from_macro(
         self,
@@ -5549,6 +5627,11 @@ class Episode:
 
         try:
             if mode == 'mode0':
+                module_summaries['episode0_bootstrap_policy_training'] = {
+                    'active': bool(self.episode_id == 0 and use_policy_value),
+                    'sdf_acceptance_gate_applied': False,
+                    'reason': 'episode0_bootstrap_exception',
+                }
                 if use_sdf_fc1 or use_policy_value:
                     sampler = Sample(
                         models=self.models,
@@ -5721,7 +5804,7 @@ class Episode:
                 macro_key_columns = ['path', 't', 'branch']
                 macro_diag_columns = ['Hatc', 'LnK', 'hatcf', 'lnkf', 'M', 'n_firms', 'K', 'C']
                 firm_key_columns = ['path', 't', 'branch', 'ID']
-                firm_diag_columns = ['bp', 'Bar_i', 'Bar_z', 'entry', 'b', 'z', 'K', 'P', 'Q']
+                firm_diag_columns = ['bp', 'Bar_i', 'Bar_z', 'entry', 'b', 'z', 'K', 'P', 'Q', 'M', 'Hatcf', 'LnKF']
                 old_macro_snapshot = self._selected_frame_snapshot(
                     self.tensor_macro,
                     self.df_macro,
@@ -5740,7 +5823,6 @@ class Episode:
                     :,
                     [k for k in firm_key_columns if k in old_firm_snapshot.columns]
                 ].copy() if not old_firm_snapshot.empty else pd.DataFrame()
-                del old_firm_snapshot
                 modeb_old_diag: Dict[str, Any] = {
                     'resimulate_after_pv': bool(modeb_resimulate_after_pv),
                     'macro_r2': (
@@ -5837,6 +5919,28 @@ class Episode:
                             value_columns=[]
                         )
                     )
+                    module_summaries['modeb_pre_pv_sdf_refresh_diag'].update(
+                        self._keyed_snapshot_gap(
+                            'firm_old_to_sdf_refreshed',
+                            old_firm_snapshot,
+                            refreshed_firm_snapshot,
+                            key_columns=[
+                                k for k in firm_key_columns
+                                if k in old_firm_snapshot.columns and k in refreshed_firm_snapshot.columns
+                            ],
+                            value_columns=['M', 'Hatcf', 'LnKF']
+                        )
+                    )
+                    if bool(getattr(self.hyperparams, "sdf_post_refresh_gate_enabled", True)):
+                        post_refresh_gate = self._evaluate_post_refresh_sdf_gate(
+                            module_summaries=module_summaries,
+                            batch_size=batch_size,
+                            n_branches=n_branches,
+                        )
+                        if not post_refresh_gate.get("passed", False):
+                            raise NumericalStageFailure(
+                                "Post-refresh FC1/SDF gate failed; skip Q/P/bp."
+                            )
                 else:
                     module_summaries['modeb_pre_pv_sdf_refresh_diag'] = {
                         'resimulated_after_sdf_gate': False,
