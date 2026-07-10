@@ -8,6 +8,7 @@ Training orchestration for episodes and modules.
 - SDF, Policy/Value, FC2 losses and batch builders
 
 ### SDF/FC1: fresh wealth shock pairs
+- Formal Mode B defaults to `sdf_wealth_loss_mode='signed_aio'` and `sdf_fresh_pair_enabled=True`; use `legacy_abs_log1p` only when explicitly running the old wealth-loss ablation.
 - `HyperParams.sdf_fresh_pair_enabled` enables refreshable aggregate shock pairs for the SDF wealth Euler loss.
 - `sdf_wealth_loss_mode='signed_aio'` now requires `sdf_fresh_pair_enabled=True`; `Episode` and the multi-episode CLI entry points raise immediately if signed AiO is requested without fresh double sampling.
 - `sdf_fresh_pair_enabled=True` with legacy wealth loss is still allowed for diagnostics/ablations, but it emits a warning because the bank was designed for signed AiO.
@@ -15,7 +16,7 @@ Training orchestration for episodes and modules.
 - At each optimizer step, `_compute_sdf_loss(...)` samples two different children per parent (`j1 != j2`) and converts them into fresh `x_{t+1}` values.
 - Fresh children are used only for:
   - wealth Euler residuals
-  - `sdf_wealth_loss_mode` (`legacy_abs_log1p` or `signed_aio`)
+  - `sdf_wealth_loss_mode` (`signed_aio` by default, `legacy_abs_log1p` for explicit ablations)
   - SDF moment and mean-anchor penalties
 - Fixed Treatment B children remain the source of:
   - FC1 true-state reconstruction targets

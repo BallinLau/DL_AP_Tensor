@@ -69,14 +69,15 @@ class HyperParams:
     # AIO 权重（动态残差插值）
     aio_weight: float = 0.5
     aio_warmup_epochs: int = 10
-    # SDF wealth equation objective. Keep this separate from generic aio_weight:
+    # SDF wealth equation objective. Formal Mode B defaults to signed AiO;
+    # legacy_abs_log1p remains available only as an explicit ablation choice.
     # "legacy_abs_log1p": E[log(1 + |r1*r2|)]
     # "signed_aio": E[r1*r2]
-    sdf_wealth_loss_mode: str = "legacy_abs_log1p"
+    sdf_wealth_loss_mode: str = "signed_aio"
     # Signed AiO fresh-pair controls.  When enabled, wealth Euler residuals
     # use independently sampled AR(1) aggregate shocks; fixed Treatment B
     # children still supply FC1 reconstruction targets.
-    sdf_fresh_pair_enabled: bool = False
+    sdf_fresh_pair_enabled: bool = True
     sdf_child_bank_size: int = 16
     sdf_child_bank_refresh_epochs: int = 1
     sdf_child_bank_seed: int = 12345

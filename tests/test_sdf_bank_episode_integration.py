@@ -74,6 +74,13 @@ def test_reset_sdf_shock_bank_clears_episode_bank_state():
     assert ep._sdf_shock_bank_episode_id == 1
 
 
+def test_formal_sdf_defaults_use_signed_aio_fresh_pairs():
+    hp = HyperParams()
+
+    assert hp.sdf_wealth_loss_mode == "signed_aio"
+    assert hp.sdf_fresh_pair_enabled is True
+
+
 def test_signed_aio_requires_fresh_pair_enabled():
     hp = HyperParams()
     hp.sdf_wealth_loss_mode = "signed_aio"
@@ -91,4 +98,5 @@ if __name__ == "__main__":
     test_batch_parent_index_is_compact_after_sparse_selection()
     test_lazy_sdf_bank_expands_for_larger_later_parent_index()
     test_reset_sdf_shock_bank_clears_episode_bank_state()
+    test_formal_sdf_defaults_use_signed_aio_fresh_pairs()
     test_signed_aio_requires_fresh_pair_enabled()

@@ -102,14 +102,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sdf-wealth-loss-mode",
         type=str.lower,
-        default="legacy_abs_log1p",
+        default="signed_aio",
         choices=["legacy_abs_log1p", "signed_aio"],
-        help="SDF wealth-equation objective: legacy_abs_log1p for A, signed_aio for B",
+        help="SDF wealth-equation objective; default signed_aio for formal B, legacy_abs_log1p for explicit ablations",
     )
     parser.add_argument(
         "--sdf-fresh-pair-enabled",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Use refreshable fresh aggregate shock pairs for SDF wealth loss",
     )
     parser.add_argument("--sdf-child-bank-size", type=int, default=16, help="Fresh SDF shock bank size per parent")
