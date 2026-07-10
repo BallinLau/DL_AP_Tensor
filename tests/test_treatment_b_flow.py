@@ -708,7 +708,7 @@ class TreatmentBFlowTest(unittest.TestCase):
             "after_recursive_forecast_state_lnk_next_rmse": 0.01,
         }
 
-        passed, diag = episode._fc1_recursive_gate_passed(metrics, prefix="after")
+        passed, diag = episode._evaluate_fc1_recursive_diagnostic(metrics, prefix="after")
 
         self.assertTrue(passed)
         self.assertEqual(diag["actual_horizon"], 3.0)
@@ -744,9 +744,127 @@ class TreatmentBFlowTest(unittest.TestCase):
             },
         }
 
-        score = Episode._fc1_gate_violation_score(one_step_diag, recursive_diag)
+        score = Episode._fc1_gate_violation_score(one_step_diag)
 
         self.assertEqual(score, 0.0)
+
+    def test_run_fc1_until_gates_passes_when_one_step_passes_and_recursive_fails(self):
+        episode = Episode.__new__(Episode)
+        episode.hyperparams = SimpleNamespace(
+            fc1_epochs_per_round=1,
+            fc1_only_epochs=1,
+            fc1_max_rounds=1,
+            fc1_plateau_patience=1,
+            fc1_min_relative_improvement=0.01,
+            sdf_fc1_eval_max_batches=0,
+            fc1_gate_min_pairs=128,
+            fc1_rollout_finite_ratio_min=1.0,
+            fc1_target_std_floor=1e-4,
+            fc1_persistence_rmse_floor=1e-6,
+            fc1_one_step_r2_min=0.0,
+            fc1_one_step_skill_min=0.0,
+            fc1_one_step_hatc_rmse_abs_max=0.05,
+            fc1_one_step_lnk_rmse_abs_max=0.05,
+            fc1_recursive_r2_min=0.0,
+            fc1_rmse_growth_h5_max=2.0,
+            fc1_rollout_horizon=5,
+        )
+
+        def fake_eval(self, batches, prefix, max_batches=None):
+            base = {
+                f"{prefix}_primary_true_state_hatc_next_target_finite_n": 200.0,
+                f"{prefix}_primary_true_state_hatc_next_target_finite_ratio": 1.0,
+                f"{prefix}_primary_true_state_hatc_next_target_std": 0.1,
+                f"{prefix}_primary_true_state_hatc_next_pred_finite_ratio": 1.0,
+                f"{prefix}_primary_true_state_hatc_next_r2": 0.9,
+                f"{prefix}_primary_true_state_hatc_next_rmse": 0.01,
+                f"{prefix}_primary_true_state_hatc_next_baseline_rmse": 0.2,
+                f"{prefix}_primary_true_state_hatc_next_skill_vs_persistence": 0.5,
+                f"{prefix}_primary_true_state_lnk_next_target_finite_n": 200.0,
+                f"{prefix}_primary_true_state_lnk_next_target_finite_ratio": 1.0,
+                f"{prefix}_primary_true_state_lnk_next_target_std": 0.1,
+                f"{prefix}_primary_true_state_lnk_next_pred_finite_ratio": 1.0,
+                f"{prefix}_primary_true_state_lnk_next_r2": 0.9,
+                f"{prefix}_primary_true_state_lnk_next_rmse": 0.01,
+                f"{prefix}_primary_true_state_lnk_next_baseline_rmse": 0.2,
+                f"{prefix}_primary_true_state_lnk_next_skill_vs_persistence": 0.5,
+                f"{prefix}_fc1_rollout_actual_horizon": 5.0,
+                f"{prefix}_fc1_rmse_growth_terminal": 999.0,
+                f"{prefix}_recursive_forecast_state_hatc_next_target_std": 0.1,
+                f"{prefix}_recursive_forecast_state_hatc_next_pred_finite_ratio": 1.0,
+                f"{prefix}_recursive_forecast_state_hatc_next_r2": -1.0,
+                f"{prefix}_recursive_forecast_state_hatc_next_rmse": 999.0,
+                f"{prefix}_recursive_forecast_state_lnk_next_target_std": 0.1,
+                f"{prefix}_recursive_forecast_state_lnk_next_pred_finite_ratio": 1.0,
+                f"{prefix}_recursive_forecast_state_lnk_next_r2": -1.0,
+                f"{prefix}_recursive_forecast_state_lnk_next_rmse": 999.0,
+            }
+            return base
+
+        episode._evaluate_sdf_fc1_batches = MethodType(fake_eval, episode)
+        episode._run_batches = MethodType(
+            lambda self, batches, n_epochs, log_interval, train_modules, desc_prefix="": {"final_losses": {}},
+            episode,
+        )
+
+        result = episode._run_fc1_until_gates(
+            train_batches=[{"x": torch.tensor(1.0)}],
+            val_batches=[{"x": torch.tensor(1.0)}],
+            log_interval=100,
+        )
+
+        self.assertTrue(result["passed"])
+        self.assertIn("final_recursive_diagnostic", result)
+        self.assertFalse(result["final_recursive_diagnostic"]["passed"])
+
+    def test_fc1_only_default_loss_is_calculated_state_one_step_only(self):
+        episode = Episode.__new__(Episode)
+        episode.device = torch.device("cpu")
+        episode.models = {"sdf_fc1": _FakeSdfModel()}
+        episode.hyperparams = SimpleNamespace(
+            fc1_recon_weight=1.0,
+            fc1_hatc_recon_weight=1.0,
+            fc1_lnk_recon_weight=0.25,
+            fc1_recursive_aux_training_enabled=False,
+            fc1_forecast_recon_weight=10.0,
+            fc1_rollout_weight=10.0,
+            fc1_delta_penalty_weight=10.0,
+            fc1_jacobian_penalty_weight=10.0,
+            fc1_jacobian_penalty_interval=1,
+            fc1_rollout_horizon=2,
+        )
+        episode.sdf_fc1_step_count = 0
+        parent = torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0, 1.0, -9.0, -8.0, 0.5, 4.0],
+                [0.0, 0.0, 0.0, 0.0, 2.0, -7.0, -6.0, 0.6, 4.2],
+            ],
+            dtype=torch.float32,
+        )
+        children_t = torch.tensor(
+            [
+                [
+                    [0.0, 0.0, 0.0, 0.0, 1.1, 0.0, 0.0, 1.05, 4.30],
+                    [0.0, 0.0, 0.0, 0.0, 1.2, 0.0, 0.0, 1.10, 4.35],
+                ],
+                [
+                    [0.0, 0.0, 0.0, 0.0, 2.1, 0.0, 0.0, 1.65, 4.75],
+                    [0.0, 0.0, 0.0, 0.0, 2.2, 0.0, 0.0, 1.70, 4.80],
+                ],
+            ],
+            dtype=torch.float32,
+        )
+        batch = {"parent": parent, "children": [children_t[:, 0, :], children_t[:, 1, :]]}
+
+        episode._compute_fc1_only_loss(batch, parent, children_t)
+        terms = episode._latest_sdf_terms
+
+        self.assertEqual(terms["fc1_recon_weight_effective"], 1.0)
+        self.assertEqual(terms["fc1_forecast_weight_effective"], 0.0)
+        self.assertEqual(terms["fc1_rollout_weight_effective"], 0.0)
+        self.assertEqual(terms["fc1_delta_weight_effective"], 0.0)
+        self.assertEqual(terms["fc1_jacobian_weight_effective"], 0.0)
+        self.assertEqual(terms["fc1_recursive_aux_training_enabled"], 0.0)
 
     def test_sdf_macro_batches_include_same_path_rollout_tensors(self):
         episode = Episode.__new__(Episode)
@@ -754,7 +872,9 @@ class TreatmentBFlowTest(unittest.TestCase):
         episode.add_FC1loss = True
         episode.train_mode = "2time"
         episode.hyperparams = SimpleNamespace(
-            fc1_rollout_weight=0.5,
+            fc1_recursive_aux_training_enabled=False,
+            fc1_rollout_diagnostic_enabled=True,
+            fc1_rollout_weight=0.0,
             fc1_rollout_horizon=2,
             max_firm_train_units=0,
             pv_eta_resample_enabled=False,
@@ -851,7 +971,12 @@ class TreatmentBFlowTest(unittest.TestCase):
         hp = build_hyperparams()
         self.assertTrue(hp.fc1_use_true_macro_state_in_stage2)
         self.assertGreater(hp.fc1_recon_weight, 0.0)
+        self.assertFalse(hp.fc1_recursive_aux_training_enabled)
+        self.assertTrue(hp.fc1_rollout_diagnostic_enabled)
         self.assertEqual(hp.fc1_forecast_recon_weight, 0.0)
+        self.assertEqual(hp.fc1_rollout_weight, 0.0)
+        self.assertEqual(hp.fc1_delta_penalty_weight, 0.0)
+        self.assertEqual(hp.fc1_jacobian_penalty_weight, 0.0)
 
 
 if __name__ == "__main__":

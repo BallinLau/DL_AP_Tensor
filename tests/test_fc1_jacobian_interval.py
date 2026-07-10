@@ -44,6 +44,7 @@ class _CompositeSdfFc1(torch.nn.Module):
 def _episode_with_interval(interval: int) -> Episode:
     hp = HyperParams()
     hp.sdf_fresh_pair_enabled = False
+    hp.fc1_recursive_aux_training_enabled = True
     hp.fc1_forecast_recon_weight = 0.1
     hp.fc1_rollout_weight = 0.0
     hp.fc1_jacobian_penalty_weight = 1.0

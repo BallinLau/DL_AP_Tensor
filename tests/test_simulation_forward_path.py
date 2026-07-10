@@ -57,6 +57,7 @@ class RecordingSdfFc1(nn.Module):
     def __init__(self):
         super().__init__()
         self.calls = []
+        self.forward_fc1_inputs = []
 
     def forward_step(self, x_prev, x_curr, hatcf_prev, lnkf_prev, return_physical=True):
         self.calls.append(
@@ -71,6 +72,10 @@ class RecordingSdfFc1(nn.Module):
         hatcf_next = hatcf_prev + 0.01
         lnkf_next = lnkf_prev + 0.02
         return m, m, m, hatcf_next, lnkf_next
+
+    def forward_fc1(self, fc1_input, return_physical=True):
+        self.forward_fc1_inputs.append(fc1_input.detach().clone())
+        return fc1_input[:, 2:3] + 0.01, fc1_input[:, 3:4] + 0.02
 
 
 def test_simulation_uses_forward_simulation_and_not_grid_teacher():
@@ -149,6 +154,106 @@ def test_fc1_child_forecast_uses_calculated_parent_macro_state():
     assert not torch.allclose(call["hatcf_prev"].reshape(-1), parent_macro[forecast_hat_idx].reshape(-1))
 
 
+def test_fc1_child_forecast_uses_each_period_calculated_macro_state():
+    device = torch.device("cpu")
+    Config.DEVICE = device
+    pv_model = SimulationOnlyPolicyValue().to(device)
+    sdf_fc1 = RecordingSdfFc1()
+    models = {
+        "policy_value": pv_model,
+        "sdf_fc1": sdf_fc1,
+        "fc2": None,
+        "dist_b": None,
+    }
+    sim = SimulateTS(
+        models=models,
+        config=Config,
+        n_paths=1,
+        group_size=2,
+        horizon=2,
+        branch_num=1,
+        enable_entry=False,
+        enable_exit=False,
+        device=device,
+    )
+
+    out = sim.simulate_tensor()
+
+    assert len(sdf_fc1.calls) >= 2
+    macro = out.macro.data
+    t_idx = out.macro.columns.index("t")
+    branch_idx = out.macro.columns.index("branch")
+    lnk_idx = out.macro.columns.index("LnK")
+    hatc_idx = out.macro.columns.index("Hatc")
+    forecast_hat_idx = out.macro.columns.index("hatcf")
+    forecast_lnk_idx = out.macro.columns.index("lnkf")
+    parent_t1 = macro[(macro[:, t_idx] == 1.0) & (macro[:, branch_idx] == -1.0)][0]
+    second_call = sdf_fc1.calls[1]
+
+    assert torch.allclose(second_call["hatcf_prev"].reshape(-1), parent_t1[hatc_idx].reshape(-1))
+    assert torch.allclose(second_call["lnkf_prev"].reshape(-1), parent_t1[lnk_idx].reshape(-1))
+    assert not torch.allclose(second_call["hatcf_prev"].reshape(-1), parent_t1[forecast_hat_idx].reshape(-1))
+    assert not torch.allclose(second_call["lnkf_prev"].reshape(-1), parent_t1[forecast_lnk_idx].reshape(-1))
+
+
+def test_tensor_fallback_expand_uses_calculated_macro_state():
+    device = torch.device("cpu")
+    Config.DEVICE = device
+    pv_model = SimulationOnlyPolicyValue().to(device)
+    sdf_fc1 = RecordingSdfFc1()
+    sim = SimulateTS(
+        models={"policy_value": pv_model, "sdf_fc1": sdf_fc1, "fc2": None, "dist_b": None},
+        config=Config,
+        n_paths=1,
+        group_size=2,
+        horizon=1,
+        branch_num=1,
+        enable_entry=False,
+        enable_exit=False,
+        device=device,
+    )
+    state = sim._initialize_path_tensor(path_idx=0)
+    _, macro_row = sim._process_node_tensor(state, path_idx=0, t=0)
+
+    sim._expand_branches_tensor(state)
+
+    call = sdf_fc1.calls[0]
+    assert torch.allclose(call["hatcf_prev"].reshape(-1), macro_row[0, sim.MACRO_COLUMNS.index("Hatc")].reshape(-1))
+    assert torch.allclose(call["lnkf_prev"].reshape(-1), macro_row[0, sim.MACRO_COLUMNS.index("LnK")].reshape(-1))
+
+
+def test_plain_fallback_expand_uses_calculated_macro_state():
+    device = torch.device("cpu")
+    Config.DEVICE = device
+    pv_model = SimulationOnlyPolicyValue().to(device)
+    sdf_fc1 = RecordingSdfFc1()
+    sim = SimulateTS(
+        models={"policy_value": pv_model, "sdf_fc1": sdf_fc1, "fc2": None, "dist_b": None},
+        config=Config,
+        n_paths=1,
+        group_size=2,
+        horizon=1,
+        branch_num=1,
+        enable_entry=False,
+        enable_exit=False,
+        device=device,
+    )
+    state = sim._initialize_path(path_idx=0)
+    _, macro_row = sim._process_node(state, path_idx=0, t=0)
+
+    sim._expand_branches(state, t=0)
+
+    fc1_input = sdf_fc1.forward_fc1_inputs[0]
+    call = sdf_fc1.calls[0]
+    assert torch.allclose(fc1_input[:, 2].reshape(-1), torch.tensor([macro_row["Hatc"]], dtype=torch.float32))
+    assert torch.allclose(fc1_input[:, 3].reshape(-1), torch.tensor([macro_row["LnK"]], dtype=torch.float32))
+    assert torch.allclose(call["hatcf_prev"].reshape(-1), torch.tensor([macro_row["Hatc"]], dtype=torch.float32))
+    assert torch.allclose(call["lnkf_prev"].reshape(-1), torch.tensor([macro_row["LnK"]], dtype=torch.float32))
+
+
 if __name__ == "__main__":
     test_simulation_uses_forward_simulation_and_not_grid_teacher()
     test_fc1_child_forecast_uses_calculated_parent_macro_state()
+    test_fc1_child_forecast_uses_each_period_calculated_macro_state()
+    test_tensor_fallback_expand_uses_calculated_macro_state()
+    test_plain_fallback_expand_uses_calculated_macro_state()

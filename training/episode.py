@@ -1182,9 +1182,19 @@ class Episode:
         rollout_initial_state_rows: List[torch.Tensor] = []
         rollout_future_x_rows: List[torch.Tensor] = []
         rollout_target_state_rows: List[torch.Tensor] = []
-        rollout_weight = float(getattr(self.hyperparams, "fc1_rollout_weight", 0.0))
         rollout_horizon = max(0, int(getattr(self.hyperparams, "fc1_rollout_horizon", 5)))
-        need_rollout = bool(self.add_FC1loss and rollout_weight > 0.0 and rollout_horizon > 0)
+        rollout_train_enabled = (
+            bool(getattr(self.hyperparams, "fc1_recursive_aux_training_enabled", False))
+            and float(getattr(self.hyperparams, "fc1_rollout_weight", 0.0)) > 0.0
+        )
+        rollout_diag_enabled = bool(
+            getattr(self.hyperparams, "fc1_rollout_diagnostic_enabled", True)
+        )
+        need_rollout = bool(
+            self.add_FC1loss
+            and rollout_horizon > 0
+            and (rollout_train_enabled or rollout_diag_enabled)
+        )
         branch0_lookup: Dict[Tuple[int, int], torch.Tensor] = {}
         if need_rollout:
             if 't' not in col or 'Hatc_t1' not in col or 'LnK_t1' not in col:
@@ -2314,9 +2324,17 @@ class Episode:
         rollout_weight = float(getattr(self.hyperparams, "fc1_rollout_weight", 0.5))
         delta_weight = float(getattr(self.hyperparams, "fc1_delta_penalty_weight", 1.0))
         jac_weight = float(getattr(self.hyperparams, "fc1_jacobian_penalty_weight", 0.0))
+        recursive_aux_enabled = bool(
+            getattr(self.hyperparams, "fc1_recursive_aux_training_enabled", False)
+        )
         jac_interval = int(getattr(self.hyperparams, "fc1_jacobian_penalty_interval", 10))
         sdf_step = int(getattr(self, "sdf_fc1_step_count", 0))
-        compute_jac = jac_weight > 0.0 and jac_interval > 0 and sdf_step % jac_interval == 0
+        compute_jac = (
+            recursive_aux_enabled
+            and jac_weight > 0.0
+            and jac_interval > 0
+            and sdf_step % jac_interval == 0
+        )
         delta_hatc_abs_max = float(getattr(self.hyperparams, "fc1_delta_hatc_abs_max", 0.50))
         delta_lnk_abs_max = float(getattr(self.hyperparams, "fc1_delta_lnk_abs_max", 0.30))
 
@@ -2337,7 +2355,7 @@ class Episode:
             recon_loss_dlnk = ((lnk_pred - parent[:, 8:9].unsqueeze(1)) - (lnk_true - parent[:, 8:9].unsqueeze(1))).pow(2).mean()
             recon_loss = hatc_w * recon_loss_hatc + lnk_w * recon_loss_lnk
 
-            if forecast_weight > 0.0 or delta_weight > 0.0 or jac_weight > 0.0:
+            if recursive_aux_enabled:
                 hatcf_prev = parent[:, 5:6].detach().clone()
                 lnkf_prev = parent[:, 6:7].detach().clone()
                 if compute_jac:
@@ -2370,16 +2388,23 @@ class Episode:
                     jacobian_penalty_lnk = grad_lnk_wrt_hat.pow(2).mean() + grad_lnk_wrt_lnk.pow(2).mean()
                     jacobian_penalty = hatc_w * jacobian_penalty_hatc + lnk_w * jacobian_penalty_lnk
 
-            if rollout_weight > 0.0:
+            if recursive_aux_enabled and rollout_weight > 0.0:
                 rollout_loss = self._compute_fc1_rollout_loss(model, batch)
 
-        total = (
-            recon_weight * recon_loss
-            + forecast_weight * recon_loss_forecast
-            + rollout_weight * rollout_loss
-            + delta_weight * delta_penalty
-            + jac_weight * jacobian_penalty
-        )
+        forecast_weight_eff = float(forecast_weight) if recursive_aux_enabled else 0.0
+        rollout_weight_eff = float(rollout_weight) if recursive_aux_enabled else 0.0
+        delta_weight_eff = float(delta_weight) if recursive_aux_enabled else 0.0
+        jac_weight_eff = float(jac_weight) if recursive_aux_enabled else 0.0
+
+        total = recon_weight * recon_loss
+        if recursive_aux_enabled:
+            total = (
+                total
+                + forecast_weight_eff * recon_loss_forecast
+                + rollout_weight_eff * rollout_loss
+                + delta_weight_eff * delta_penalty
+                + jac_weight_eff * jacobian_penalty
+            )
         self._latest_sdf_terms = {
             'sdf_training_phase': SDFTrainingPhase.FC1_ONLY.value,
             'sdf_main_loss': 0.0,
@@ -2388,10 +2413,11 @@ class Episode:
             'sdf_moment_weight_effective': 0.0,
             'sdf_anchor_weight_effective': 0.0,
             'fc1_recon_weight_effective': float(recon_weight),
-            'fc1_forecast_weight_effective': float(forecast_weight),
-            'fc1_rollout_weight_effective': float(rollout_weight),
-            'fc1_delta_weight_effective': float(delta_weight),
-            'fc1_jacobian_weight_effective': float(jac_weight if jacobian_penalty_active else 0.0),
+            'fc1_forecast_weight_effective': float(forecast_weight_eff),
+            'fc1_rollout_weight_effective': float(rollout_weight_eff),
+            'fc1_delta_weight_effective': float(delta_weight_eff),
+            'fc1_jacobian_weight_effective': float(jac_weight_eff if jacobian_penalty_active else 0.0),
+            'fc1_recursive_aux_training_enabled': float(1.0 if recursive_aux_enabled else 0.0),
             'sdf_recon_loss': float(recon_loss.detach().item()),
             'sdf_fc1_true_recon': float(recon_loss.detach().item()),
             'sdf_recon_loss_hatc': float(recon_loss_hatc.detach().item()),
@@ -2604,6 +2630,9 @@ class Episode:
         forecast_recon_weight = float(
             getattr(self.hyperparams, "fc1_forecast_recon_weight", 0.0)
         )
+        recursive_aux_enabled = bool(
+            getattr(self.hyperparams, "fc1_recursive_aux_training_enabled", False)
+        )
         hatc_recon_inner_weight = float(
             getattr(self.hyperparams, "fc1_hatc_recon_weight", 1.0)
         )
@@ -2685,6 +2714,8 @@ class Episode:
             # 用 (Hatcf_t, LnKF_t) 做当前态输入，直接约束下一期预测贴近真实值。
             # 这条项补上“递推口径”目标，而不仅是 true-state teacher-forcing 口径。
             if (
+                recursive_aux_enabled
+                and
                 forecast_recon_weight > 0.0
                 and parent.shape[1] >= 7
                 and children_t.shape[-1] >= 9
@@ -2808,6 +2839,10 @@ class Episode:
         forecast_recon_weight_eff = float(forecast_recon_weight)
         delta_penalty_weight_eff = float(delta_penalty_weight)
         jacobian_penalty_weight_eff = float(jacobian_penalty_weight)
+        if not recursive_aux_enabled:
+            forecast_recon_weight_eff = 0.0
+            delta_penalty_weight_eff = 0.0
+            jacobian_penalty_weight_eff = 0.0
         if phase in {
             SDFTrainingPhase.EPISODE0_BOOTSTRAP,
             SDFTrainingPhase.SDF_TRUE_ONLY,
@@ -5535,7 +5570,7 @@ class Episode:
             "checks": checks,
         }
 
-    def _fc1_recursive_gate_passed(self, eval_metrics: Dict[str, float], prefix: str) -> Tuple[bool, Dict[str, Any]]:
+    def _evaluate_fc1_recursive_diagnostic(self, eval_metrics: Dict[str, float], prefix: str) -> Tuple[bool, Dict[str, Any]]:
         std_floor = float(getattr(self.hyperparams, "fc1_target_std_floor", 1e-4))
         pred_finite_min = float(getattr(self.hyperparams, "fc1_rollout_finite_ratio_min", 1.0))
         min_r2 = float(getattr(self.hyperparams, "fc1_recursive_r2_min", 0.0))
@@ -5604,7 +5639,7 @@ class Episode:
         }
 
     @staticmethod
-    def _fc1_gate_violation_score(one_step_diag: Dict[str, Any], recursive_diag: Dict[str, Any]) -> float:
+    def _fc1_gate_violation_score(one_step_diag: Dict[str, Any]) -> float:
         # Recursive forecast diagnostics are intentionally excluded from the hard
         # FC1 gate score. FC1 acceptance is based on calculated-state one-step
         # performance; recursive rollout remains a reported stability diagnostic.
@@ -5709,14 +5744,14 @@ class Episode:
                 max_batches=eval_batches_arg,
             )
             one_step_passed, one_step_diag = self._fc1_one_step_gate_passed(eval_metrics, prefix=prefix)
-            recursive_passed, recursive_diag = self._fc1_recursive_gate_passed(eval_metrics, prefix=prefix)
-            score = self._fc1_gate_violation_score(one_step_diag, recursive_diag)
+            _, recursive_diag = self._evaluate_fc1_recursive_diagnostic(eval_metrics, prefix=prefix)
+            score = self._fc1_gate_violation_score(one_step_diag)
             round_record = {
                 "round": display_round,
                 "train_summary": train_summary,
                 "eval_metrics": eval_metrics,
                 "one_step_gate": one_step_diag,
-                "recursive_gate": recursive_diag,
+                "recursive_diagnostic": recursive_diag,
                 "score": score,
             }
             rounds.append(round_record)
@@ -5774,7 +5809,7 @@ class Episode:
             "rounds_completed": max_rounds,
             "final_eval_metrics": final_round["eval_metrics"],
             "final_one_step_gate": final_round["one_step_gate"],
-            "final_recursive_diagnostic": final_round["recursive_gate"],
+            "final_recursive_diagnostic": final_round["recursive_diagnostic"],
             "rounds": rounds,
         }
 
@@ -5938,7 +5973,7 @@ class Episode:
                 refresh_eval,
                 prefix="post_refresh",
             )
-            _, fc1_recursive_diag = self._fc1_recursive_gate_passed(
+            _, fc1_recursive_diag = self._evaluate_fc1_recursive_diagnostic(
                 refresh_eval,
                 prefix="post_refresh",
             )

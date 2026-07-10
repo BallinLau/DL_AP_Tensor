@@ -123,13 +123,15 @@ def build_hyperparams():
     hp.w_q = 1.0
     hp.w_fc2 = 1.0
     hp.fc1_recon_weight = 1.0
+    hp.fc1_recursive_aux_training_enabled = False
+    hp.fc1_rollout_diagnostic_enabled = True
     hp.fc1_forecast_recon_weight = 0.0
     hp.fc1_hatc_recon_weight = 1.0
     hp.fc1_lnk_recon_weight = 0.25
-    hp.fc1_delta_penalty_weight = 10.0
+    hp.fc1_delta_penalty_weight = 0.0
     hp.fc1_delta_hatc_abs_max = 0.50
     hp.fc1_delta_lnk_abs_max = 0.30
-    hp.fc1_jacobian_penalty_weight = 1.0
+    hp.fc1_jacobian_penalty_weight = 0.0
     hp.fc1_use_true_macro_state_in_stage2 = True
     return hp
 

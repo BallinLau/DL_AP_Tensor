@@ -127,12 +127,14 @@ def build_hyperparams():
     hp.sdf_true_only_epochs = 20
     hp.sdf_recursive_only_epochs = 10
     hp.fc1_recon_weight = 1.0
+    hp.fc1_recursive_aux_training_enabled = False
+    hp.fc1_rollout_diagnostic_enabled = True
     hp.fc1_forecast_recon_weight = 0.0
-    hp.fc1_rollout_weight = 0.5
+    hp.fc1_rollout_weight = 0.0
     hp.fc1_rollout_horizon = 5
     hp.fc1_hatc_recon_weight = 1.0
     hp.fc1_lnk_recon_weight = 0.25
-    hp.fc1_delta_penalty_weight = 1.0
+    hp.fc1_delta_penalty_weight = 0.0
     hp.fc1_delta_hatc_abs_max = 0.50
     hp.fc1_delta_lnk_abs_max = 0.30
     hp.fc1_jacobian_penalty_weight = 0.0

@@ -157,8 +157,10 @@ class HyperParams:
     # Optional forecast-state auxiliary reconstruction kept as an explicit
     # opt-in diagnostic. The primary FC1 law of motion is calculated-state
     # one-step supervision: (Hatc_t, LnK_t) -> (Hatc_{t+1}, LnK_{t+1}).
+    fc1_recursive_aux_training_enabled: bool = False
+    fc1_rollout_diagnostic_enabled: bool = True
     fc1_forecast_recon_weight: float = 0.0
-    fc1_rollout_weight: float = 0.5
+    fc1_rollout_weight: float = 0.0
     fc1_rollout_horizon: int = 5
     # FC1 重建项内部按目标拆分权重。
     # 经验上 LnK 的原始尺度波动更大，若不单独降权，容易主导 FC1 训练并把 M 分布拉坏。
@@ -166,7 +168,7 @@ class HyperParams:
     fc1_lnk_recon_weight: float = 0.25
     # Forecast-state 一步增量幅度约束。
     # 不预设方向，只惩罚过大的单步跳跃，避免递推响应面把 child state 撕裂成多个 regime。
-    fc1_delta_penalty_weight: float = 1.0
+    fc1_delta_penalty_weight: float = 0.0
     fc1_delta_hatc_abs_max: float = 0.50
     fc1_delta_lnk_abs_max: float = 0.30
     # Forecast-state 响应面局部平滑约束（Jacobian penalty）。
