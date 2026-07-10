@@ -5243,13 +5243,26 @@ class Episode:
             y_raw = torch.cat(true_parts).to(torch.float32)
             p_raw = torch.cat(pred_parts).to(torch.float32)
             total_n = int(y_raw.numel())
-            mask = torch.isfinite(y_raw) & torch.isfinite(p_raw)
+            target_mask = torch.isfinite(y_raw)
+            pred_mask = torch.isfinite(p_raw)
+            mask = target_mask & pred_mask
+            target_finite_n = int(target_mask.sum().item())
+            pred_finite_n = int(pred_mask.sum().item())
             finite_n = int(mask.sum().item())
             out[f'{prefix}_{name}_total_n'] = float(total_n)
+            out[f'{prefix}_{name}_target_finite_n'] = float(target_finite_n)
+            out[f'{prefix}_{name}_target_finite_ratio'] = (
+                float(target_mask.to(torch.float32).mean().item()) if total_n > 0 else float('nan')
+            )
+            out[f'{prefix}_{name}_pred_finite_n'] = float(pred_finite_n)
+            out[f'{prefix}_{name}_pred_finite_ratio'] = (
+                float(pred_mask.to(torch.float32).mean().item()) if total_n > 0 else float('nan')
+            )
             out[f'{prefix}_{name}_finite_n'] = float(finite_n)
-            out[f'{prefix}_{name}_finite_ratio'] = (
+            out[f'{prefix}_{name}_joint_finite_ratio'] = (
                 float(mask.to(torch.float32).mean().item()) if total_n > 0 else float('nan')
             )
+            out[f'{prefix}_{name}_finite_ratio'] = out[f'{prefix}_{name}_joint_finite_ratio']
             out[f'{prefix}_{name}_n'] = float(finite_n)
             if int(mask.sum().item()) < 2:
                 out[f'{prefix}_{name}_r2'] = float('nan')
@@ -5284,6 +5297,7 @@ class Episode:
                     model_mse = (p_b - y_b).pow(2).mean()
                     baseline_mse = (b_b - y_b).pow(2).mean()
                     out[f'{prefix}_{name}_baseline_rmse'] = float(torch.sqrt(baseline_mse).item())
+                    out[f'{prefix}_{name}_innovation_std'] = float((y_b - b_b).std(unbiased=True).item())
                     out[f'{prefix}_{name}_skill_vs_persistence'] = (
                         float((1.0 - model_mse / baseline_mse).item())
                         if float(baseline_mse.item()) > 1e-12
@@ -5389,9 +5403,10 @@ class Episode:
             out[f'{prefix}_fc1_rollout_h{h}_rmse'] = rmse
         if 1 in rollout_rmse_by_h:
             target_h = min(max(rollout_rmse_by_h), int(getattr(self.hyperparams, "fc1_rollout_horizon", 5)))
-            out[f'{prefix}_fc1_rmse_growth_h{target_h}'] = float(
-                rollout_rmse_by_h[target_h] / (rollout_rmse_by_h[1] + 1e-8)
-            )
+            growth = float(rollout_rmse_by_h[target_h] / (rollout_rmse_by_h[1] + 1e-8))
+            out[f'{prefix}_fc1_rollout_actual_horizon'] = float(target_h)
+            out[f'{prefix}_fc1_rmse_growth_h{target_h}'] = growth
+            out[f'{prefix}_fc1_rmse_growth_terminal'] = growth
         return out
 
     def _fc1_data_viability_passed(self, eval_metrics: Dict[str, float], prefix: str) -> Tuple[bool, Dict[str, Any]]:
@@ -5405,8 +5420,8 @@ class Episode:
         details = {}
         passed_all = True
         for short_name, metric_name in variables.items():
-            n = eval_metrics.get(f"{prefix}_{metric_name}_finite_n", float("nan"))
-            finite_ratio = eval_metrics.get(f"{prefix}_{metric_name}_finite_ratio", float("nan"))
+            n = eval_metrics.get(f"{prefix}_{metric_name}_target_finite_n", float("nan"))
+            finite_ratio = eval_metrics.get(f"{prefix}_{metric_name}_target_finite_ratio", float("nan"))
             target_std = eval_metrics.get(f"{prefix}_{metric_name}_target_std", float("nan"))
             valid = (
                 np.isfinite(n)
@@ -5435,6 +5450,8 @@ class Episode:
 
     def _fc1_one_step_gate_passed(self, eval_metrics: Dict[str, float], prefix: str) -> Tuple[bool, Dict[str, Any]]:
         std_floor = float(getattr(self.hyperparams, "fc1_target_std_floor", 1e-4))
+        pred_finite_min = float(getattr(self.hyperparams, "fc1_rollout_finite_ratio_min", 1.0))
+        persistence_floor = float(getattr(self.hyperparams, "fc1_persistence_rmse_floor", 1e-6))
         r2_min = float(getattr(self.hyperparams, "fc1_one_step_r2_min", 0.0))
         skill_min = float(getattr(self.hyperparams, "fc1_one_step_skill_min", 0.0))
         configs = {
@@ -5455,10 +5472,24 @@ class Episode:
             r2 = eval_metrics.get(f"{prefix}_{name}_r2", float("nan"))
             rmse = eval_metrics.get(f"{prefix}_{name}_rmse", float("nan"))
             skill = eval_metrics.get(f"{prefix}_{name}_skill_vs_persistence", float("nan"))
+            pred_finite_ratio = eval_metrics.get(f"{prefix}_{name}_pred_finite_ratio", float("nan"))
+            baseline_rmse = eval_metrics.get(f"{prefix}_{name}_baseline_rmse", float("nan"))
+            innovation_std = eval_metrics.get(f"{prefix}_{name}_innovation_std", float("nan"))
+            pred_finite_passed = np.isfinite(pred_finite_ratio) and float(pred_finite_ratio) >= pred_finite_min
             low_variance = np.isfinite(target_std) and float(target_std) < std_floor
-            if low_variance:
+            near_perfect_persistence = np.isfinite(baseline_rmse) and float(baseline_rmse) <= persistence_floor
+            if not pred_finite_passed:
+                variable_passed = False
+                gate_mode = "prediction_nonfinite"
+                failure_source = "fc1_prediction_nonfinite"
+            elif near_perfect_persistence:
                 variable_passed = np.isfinite(rmse) and float(rmse) <= cfg["abs_rmse_max"]
-                gate_mode = "absolute_rmse"
+                gate_mode = "near_perfect_persistence"
+                failure_source = "fc1_one_step_underfit"
+            elif low_variance:
+                variable_passed = np.isfinite(rmse) and float(rmse) <= cfg["abs_rmse_max"]
+                gate_mode = "absolute_rmse_low_target_variance"
+                failure_source = "fc1_one_step_underfit"
             else:
                 variable_passed = (
                     np.isfinite(r2)
@@ -5467,28 +5498,51 @@ class Episode:
                     and float(skill) >= skill_min
                 )
                 gate_mode = "r2_and_persistence_skill"
+                failure_source = "fc1_one_step_underfit"
             checks[variable] = {
                 "passed": bool(variable_passed),
                 "gate_mode": gate_mode,
                 "target_std": float(target_std),
+                "pred_finite_ratio": float(pred_finite_ratio),
+                "pred_finite_ratio_min": pred_finite_min,
+                "baseline_rmse": float(baseline_rmse),
+                "persistence_rmse_floor": persistence_floor,
+                "innovation_std": float(innovation_std),
                 "r2": float(r2),
                 "skill_vs_persistence": float(skill),
                 "rmse": float(rmse),
                 "rmse_abs_max": cfg["abs_rmse_max"],
+                "failure_source": None if variable_passed else failure_source,
             }
             passed_all = passed_all and bool(variable_passed)
+        failure_sources = [
+            check.get("failure_source")
+            for check in checks.values()
+            if check.get("failure_source") is not None
+        ]
+        failure_source = (
+            None if passed_all else (
+                "fc1_prediction_nonfinite"
+                if "fc1_prediction_nonfinite" in failure_sources
+                else "fc1_one_step_underfit"
+            )
+        )
         return bool(passed_all), {
             "passed": bool(passed_all),
-            "failure_source": None if passed_all else "fc1_one_step_underfit",
+            "failure_source": failure_source,
+            "r2_min": r2_min,
+            "skill_min": skill_min,
             "checks": checks,
         }
 
     def _fc1_recursive_gate_passed(self, eval_metrics: Dict[str, float], prefix: str) -> Tuple[bool, Dict[str, Any]]:
         std_floor = float(getattr(self.hyperparams, "fc1_target_std_floor", 1e-4))
+        pred_finite_min = float(getattr(self.hyperparams, "fc1_rollout_finite_ratio_min", 1.0))
         min_r2 = float(getattr(self.hyperparams, "fc1_recursive_r2_min", 0.0))
         growth_max = float(getattr(self.hyperparams, "fc1_rmse_growth_h5_max", 2.0))
         horizon = int(getattr(self.hyperparams, "fc1_rollout_horizon", 5))
-        growth = eval_metrics.get(f"{prefix}_fc1_rmse_growth_h{horizon}", float("nan"))
+        actual_horizon = eval_metrics.get(f"{prefix}_fc1_rollout_actual_horizon", float("nan"))
+        growth = eval_metrics.get(f"{prefix}_fc1_rmse_growth_terminal", float("nan"))
         passed_all = np.isfinite(growth) and float(growth) <= growth_max
         variables = {}
         for variable, metric_name, abs_rmse_max in [
@@ -5498,31 +5552,115 @@ class Episode:
             target_std = eval_metrics.get(f"{prefix}_{metric_name}_target_std", float("nan"))
             r2 = eval_metrics.get(f"{prefix}_{metric_name}_r2", float("nan"))
             rmse = eval_metrics.get(f"{prefix}_{metric_name}_rmse", float("nan"))
+            pred_finite_ratio = eval_metrics.get(f"{prefix}_{metric_name}_pred_finite_ratio", float("nan"))
+            pred_finite_passed = np.isfinite(pred_finite_ratio) and float(pred_finite_ratio) >= pred_finite_min
             low_variance = np.isfinite(target_std) and float(target_std) < std_floor
-            if low_variance:
+            if not pred_finite_passed:
+                variable_passed = False
+                gate_mode = "prediction_nonfinite"
+                failure_source = "fc1_prediction_nonfinite"
+            elif low_variance:
                 variable_passed = np.isfinite(rmse) and float(rmse) <= abs_rmse_max
-                gate_mode = "absolute_rmse"
+                gate_mode = "absolute_rmse_low_target_variance"
+                failure_source = "fc1_recursive_instability"
             else:
                 variable_passed = np.isfinite(r2) and float(r2) >= min_r2
                 gate_mode = "recursive_r2"
+                failure_source = "fc1_recursive_instability"
             variables[variable] = {
                 "passed": bool(variable_passed),
                 "gate_mode": gate_mode,
                 "target_std": float(target_std),
+                "pred_finite_ratio": float(pred_finite_ratio),
+                "pred_finite_ratio_min": pred_finite_min,
                 "r2": float(r2),
                 "rmse": float(rmse),
                 "rmse_abs_max": abs_rmse_max,
+                "failure_source": None if variable_passed else failure_source,
             }
             passed_all = passed_all and bool(variable_passed)
+        failure_sources = [
+            check.get("failure_source")
+            for check in variables.values()
+            if check.get("failure_source") is not None
+        ]
+        failure_source = (
+            None if passed_all else (
+                "fc1_prediction_nonfinite"
+                if "fc1_prediction_nonfinite" in failure_sources
+                else "fc1_recursive_instability"
+            )
+        )
         return bool(passed_all), {
             "passed": bool(passed_all),
-            "failure_source": None if passed_all else "fc1_recursive_instability",
+            "failure_source": failure_source,
             "min_r2": min_r2,
+            "configured_horizon": horizon,
+            "actual_horizon": float(actual_horizon),
             "rmse_growth": float(growth),
             "rmse_growth_max": growth_max,
             "max_rmse_growth": growth_max,
             "variables": variables,
         }
+
+    @staticmethod
+    def _fc1_gate_violation_score(one_step_diag: Dict[str, Any], recursive_diag: Dict[str, Any]) -> float:
+        penalty = 1e6
+
+        def _lower(value: Any, threshold: Any) -> float:
+            try:
+                value_f = float(value)
+                threshold_f = float(threshold)
+            except (TypeError, ValueError):
+                return penalty
+            if not np.isfinite(value_f) or not np.isfinite(threshold_f):
+                return penalty
+            return max(0.0, threshold_f - value_f)
+
+        def _upper(value: Any, threshold: Any) -> float:
+            try:
+                value_f = float(value)
+                threshold_f = float(threshold)
+            except (TypeError, ValueError):
+                return penalty
+            if not np.isfinite(value_f) or not np.isfinite(threshold_f):
+                return penalty
+            return max(0.0, value_f - threshold_f)
+
+        def _rmse_violation(check: Dict[str, Any]) -> float:
+            rmse = check.get("rmse", float("nan"))
+            limit = check.get("rmse_abs_max", float("nan"))
+            try:
+                rmse_f = float(rmse)
+                limit_f = float(limit)
+            except (TypeError, ValueError):
+                return penalty
+            if not np.isfinite(rmse_f) or not np.isfinite(limit_f) or limit_f <= 0:
+                return penalty
+            return max(0.0, rmse_f / limit_f - 1.0)
+
+        score = 0.0
+        for check in one_step_diag.get("checks", {}).values():
+            mode = check.get("gate_mode")
+            if mode in {"absolute_rmse_low_target_variance", "near_perfect_persistence"}:
+                score += _rmse_violation(check)
+            elif mode == "prediction_nonfinite":
+                score += penalty
+            else:
+                score += _lower(check.get("r2"), one_step_diag.get("r2_min", 0.0))
+                score += _lower(check.get("skill_vs_persistence"), one_step_diag.get("skill_min", 0.0))
+
+        recursive_min_r2 = recursive_diag.get("min_r2", 0.0)
+        for check in recursive_diag.get("variables", {}).values():
+            mode = check.get("gate_mode")
+            if mode == "absolute_rmse_low_target_variance":
+                score += _rmse_violation(check)
+            elif mode == "prediction_nonfinite":
+                score += penalty
+            else:
+                score += _lower(check.get("r2"), recursive_min_r2)
+        score += _upper(recursive_diag.get("rmse_growth"), recursive_diag.get("rmse_growth_max"))
+        return float(score)
 
     def _run_fc1_until_gates(
         self,
@@ -5530,7 +5668,13 @@ class Episode:
         val_batches: List[Dict[str, torch.Tensor]],
         log_interval: int,
     ) -> Dict[str, Any]:
-        epochs_per_round = max(1, int(getattr(self.hyperparams, "fc1_epochs_per_round", 10)))
+        configured_epochs_per_round = int(getattr(self.hyperparams, "fc1_epochs_per_round", 0))
+        epochs_per_round = (
+            configured_epochs_per_round
+            if configured_epochs_per_round > 0
+            else int(getattr(self.hyperparams, "fc1_only_epochs", 10))
+        )
+        epochs_per_round = max(1, epochs_per_round)
         max_rounds = max(1, int(getattr(self.hyperparams, "fc1_max_rounds", 8)))
         patience = max(1, int(getattr(self.hyperparams, "fc1_plateau_patience", 2)))
         min_improvement = float(getattr(self.hyperparams, "fc1_min_relative_improvement", 0.01))
@@ -5573,10 +5717,7 @@ class Episode:
             )
             one_step_passed, one_step_diag = self._fc1_one_step_gate_passed(eval_metrics, prefix=prefix)
             recursive_passed, recursive_diag = self._fc1_recursive_gate_passed(eval_metrics, prefix=prefix)
-            hatc_rmse = eval_metrics.get(f"{prefix}_primary_true_state_hatc_next_rmse", float("inf"))
-            lnk_rmse = eval_metrics.get(f"{prefix}_primary_true_state_lnk_next_rmse", float("inf"))
-            growth = recursive_diag.get("rmse_growth", float("inf"))
-            score = float(hatc_rmse) + float(lnk_rmse) + max(0.0, float(growth) - 1.0)
+            score = self._fc1_gate_violation_score(one_step_diag, recursive_diag)
             round_record = {
                 "round": display_round,
                 "train_summary": train_summary,
@@ -5614,9 +5755,9 @@ class Episode:
                 stale_rounds = 0
             if stale_rounds >= patience:
                 failure_source = (
-                    "fc1_one_step_underfit"
+                    one_step_diag.get("failure_source", "fc1_one_step_underfit")
                     if not one_step_passed
-                    else "fc1_recursive_instability"
+                    else recursive_diag.get("failure_source", "fc1_recursive_instability")
                 )
                 return {
                     "passed": False,
@@ -5634,9 +5775,9 @@ class Episode:
 
         final_round = rounds[-1]
         failure_source = (
-            "fc1_one_step_underfit"
+            final_round["one_step_gate"].get("failure_source", "fc1_one_step_underfit")
             if not final_round["one_step_gate"].get("passed", False)
-            else "fc1_recursive_instability"
+            else final_round["recursive_gate"].get("failure_source", "fc1_recursive_instability")
         )
         return {
             "passed": False,

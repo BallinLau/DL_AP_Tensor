@@ -549,7 +549,11 @@ class TreatmentBFlowTest(unittest.TestCase):
         self.assertIn("check_primary_true_state_M_p99", out)
         self.assertIn("check_recursive_forecast_state_M_p99", out)
         self.assertIn("check_primary_true_state_hatc_next_target_std", out)
+        self.assertIn("check_primary_true_state_hatc_next_target_finite_ratio", out)
+        self.assertIn("check_primary_true_state_hatc_next_pred_finite_ratio", out)
+        self.assertIn("check_primary_true_state_hatc_next_joint_finite_ratio", out)
         self.assertIn("check_primary_true_state_hatc_next_baseline_rmse", out)
+        self.assertIn("check_primary_true_state_hatc_next_innovation_std", out)
         self.assertIn("check_primary_true_state_hatc_next_skill_vs_persistence", out)
         self.assertIn("check_recursive_forecast_state_hatc_next_target_std", out)
 
@@ -565,23 +569,60 @@ class TreatmentBFlowTest(unittest.TestCase):
             fc1_one_step_skill_min=0.0,
             fc1_one_step_hatc_rmse_abs_max=0.05,
             fc1_one_step_lnk_rmse_abs_max=0.05,
+            fc1_persistence_rmse_floor=1e-6,
+            fc1_rollout_finite_ratio_min=1.0,
         )
         metrics = {
             "after_primary_true_state_hatc_next_target_std": 0.0,
+            "after_primary_true_state_hatc_next_pred_finite_ratio": 1.0,
             "after_primary_true_state_hatc_next_r2": float("nan"),
             "after_primary_true_state_hatc_next_rmse": 0.01,
+            "after_primary_true_state_hatc_next_baseline_rmse": float("nan"),
             "after_primary_true_state_hatc_next_skill_vs_persistence": float("nan"),
             "after_primary_true_state_lnk_next_target_std": 0.0,
+            "after_primary_true_state_lnk_next_pred_finite_ratio": 1.0,
             "after_primary_true_state_lnk_next_r2": float("nan"),
             "after_primary_true_state_lnk_next_rmse": 0.01,
+            "after_primary_true_state_lnk_next_baseline_rmse": float("nan"),
             "after_primary_true_state_lnk_next_skill_vs_persistence": float("nan"),
         }
 
         passed, diag = episode._fc1_one_step_gate_passed(metrics, prefix="after")
 
         self.assertTrue(passed)
-        self.assertEqual(diag["checks"]["hatc"]["gate_mode"], "absolute_rmse")
-        self.assertEqual(diag["checks"]["lnk"]["gate_mode"], "absolute_rmse")
+        self.assertEqual(diag["checks"]["hatc"]["gate_mode"], "absolute_rmse_low_target_variance")
+        self.assertEqual(diag["checks"]["lnk"]["gate_mode"], "absolute_rmse_low_target_variance")
+
+    def test_fc1_one_step_gate_handles_near_perfect_persistence(self):
+        episode = Episode.__new__(Episode)
+        episode.hyperparams = SimpleNamespace(
+            fc1_target_std_floor=1e-4,
+            fc1_one_step_r2_min=0.0,
+            fc1_one_step_skill_min=0.0,
+            fc1_one_step_hatc_rmse_abs_max=0.05,
+            fc1_one_step_lnk_rmse_abs_max=0.05,
+            fc1_persistence_rmse_floor=1e-6,
+            fc1_rollout_finite_ratio_min=1.0,
+        )
+        metrics = {
+            "after_primary_true_state_hatc_next_target_std": 0.1,
+            "after_primary_true_state_hatc_next_pred_finite_ratio": 1.0,
+            "after_primary_true_state_hatc_next_r2": 0.99,
+            "after_primary_true_state_hatc_next_rmse": 0.01,
+            "after_primary_true_state_hatc_next_baseline_rmse": 0.0,
+            "after_primary_true_state_hatc_next_skill_vs_persistence": float("nan"),
+            "after_primary_true_state_lnk_next_target_std": 0.1,
+            "after_primary_true_state_lnk_next_pred_finite_ratio": 1.0,
+            "after_primary_true_state_lnk_next_r2": 0.99,
+            "after_primary_true_state_lnk_next_rmse": 0.01,
+            "after_primary_true_state_lnk_next_baseline_rmse": 0.0,
+            "after_primary_true_state_lnk_next_skill_vs_persistence": float("nan"),
+        }
+
+        passed, diag = episode._fc1_one_step_gate_passed(metrics, prefix="after")
+
+        self.assertTrue(passed)
+        self.assertEqual(diag["checks"]["hatc"]["gate_mode"], "near_perfect_persistence")
 
     def test_fc1_data_viability_reports_invalid_rollout_source(self):
         episode = Episode.__new__(Episode)
@@ -591,11 +632,11 @@ class TreatmentBFlowTest(unittest.TestCase):
             fc1_target_std_floor=1e-4,
         )
         metrics = {
-            "before_primary_true_state_hatc_next_finite_n": 10.0,
-            "before_primary_true_state_hatc_next_finite_ratio": 1.0,
+            "before_primary_true_state_hatc_next_target_finite_n": 10.0,
+            "before_primary_true_state_hatc_next_target_finite_ratio": 1.0,
             "before_primary_true_state_hatc_next_target_std": 0.1,
-            "before_primary_true_state_lnk_next_finite_n": 10.0,
-            "before_primary_true_state_lnk_next_finite_ratio": 1.0,
+            "before_primary_true_state_lnk_next_target_finite_n": 10.0,
+            "before_primary_true_state_lnk_next_target_finite_ratio": 1.0,
             "before_primary_true_state_lnk_next_target_std": 0.1,
         }
 
@@ -603,6 +644,74 @@ class TreatmentBFlowTest(unittest.TestCase):
 
         self.assertFalse(passed)
         self.assertEqual(diag["failure_source"], "rollout_data_invalid")
+
+    def test_fc1_prediction_nonfinite_is_not_rollout_data_invalid(self):
+        episode = Episode.__new__(Episode)
+        episode.hyperparams = SimpleNamespace(
+            fc1_gate_min_pairs=128,
+            fc1_rollout_finite_ratio_min=1.0,
+            fc1_target_std_floor=1e-4,
+            fc1_one_step_r2_min=0.0,
+            fc1_one_step_skill_min=0.0,
+            fc1_one_step_hatc_rmse_abs_max=0.05,
+            fc1_one_step_lnk_rmse_abs_max=0.05,
+            fc1_persistence_rmse_floor=1e-6,
+        )
+        metrics = {
+            "after_primary_true_state_hatc_next_target_finite_n": 200.0,
+            "after_primary_true_state_hatc_next_target_finite_ratio": 1.0,
+            "after_primary_true_state_hatc_next_target_std": 0.1,
+            "after_primary_true_state_hatc_next_pred_finite_ratio": 0.5,
+            "after_primary_true_state_hatc_next_r2": float("nan"),
+            "after_primary_true_state_hatc_next_rmse": float("nan"),
+            "after_primary_true_state_hatc_next_baseline_rmse": 0.1,
+            "after_primary_true_state_hatc_next_skill_vs_persistence": float("nan"),
+            "after_primary_true_state_lnk_next_target_finite_n": 200.0,
+            "after_primary_true_state_lnk_next_target_finite_ratio": 1.0,
+            "after_primary_true_state_lnk_next_target_std": 0.1,
+            "after_primary_true_state_lnk_next_pred_finite_ratio": 1.0,
+            "after_primary_true_state_lnk_next_r2": 0.1,
+            "after_primary_true_state_lnk_next_rmse": 0.01,
+            "after_primary_true_state_lnk_next_baseline_rmse": 0.1,
+            "after_primary_true_state_lnk_next_skill_vs_persistence": 0.1,
+        }
+
+        data_passed, data_diag = episode._fc1_data_viability_passed(metrics, prefix="after")
+        gate_passed, gate_diag = episode._fc1_one_step_gate_passed(metrics, prefix="after")
+
+        self.assertTrue(data_passed)
+        self.assertIsNone(data_diag["failure_source"])
+        self.assertFalse(gate_passed)
+        self.assertEqual(gate_diag["failure_source"], "fc1_prediction_nonfinite")
+
+    def test_fc1_recursive_gate_uses_terminal_growth_horizon(self):
+        episode = Episode.__new__(Episode)
+        episode.hyperparams = SimpleNamespace(
+            fc1_target_std_floor=1e-4,
+            fc1_recursive_r2_min=0.0,
+            fc1_rmse_growth_h5_max=2.0,
+            fc1_rollout_horizon=5,
+            fc1_rollout_finite_ratio_min=1.0,
+            fc1_one_step_hatc_rmse_abs_max=0.05,
+            fc1_one_step_lnk_rmse_abs_max=0.05,
+        )
+        metrics = {
+            "after_fc1_rollout_actual_horizon": 3.0,
+            "after_fc1_rmse_growth_terminal": 1.2,
+            "after_recursive_forecast_state_hatc_next_target_std": 0.1,
+            "after_recursive_forecast_state_hatc_next_pred_finite_ratio": 1.0,
+            "after_recursive_forecast_state_hatc_next_r2": 0.1,
+            "after_recursive_forecast_state_hatc_next_rmse": 0.01,
+            "after_recursive_forecast_state_lnk_next_target_std": 0.1,
+            "after_recursive_forecast_state_lnk_next_pred_finite_ratio": 1.0,
+            "after_recursive_forecast_state_lnk_next_r2": 0.1,
+            "after_recursive_forecast_state_lnk_next_rmse": 0.01,
+        }
+
+        passed, diag = episode._fc1_recursive_gate_passed(metrics, prefix="after")
+
+        self.assertTrue(passed)
+        self.assertEqual(diag["actual_horizon"], 3.0)
 
     def test_sdf_macro_batches_include_same_path_rollout_tensors(self):
         episode = Episode.__new__(Episode)

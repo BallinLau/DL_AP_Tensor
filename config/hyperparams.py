@@ -199,7 +199,7 @@ class HyperParams:
     sdf_recursive_loss_weight: float = 0.25
     sdf_recursive_moment_weight: float = 5e-4
     sdf_recursive_anchor_weight: float = 0.05
-    fc1_epochs_per_round: int = 10
+    fc1_epochs_per_round: int = 0
     fc1_max_rounds: int = 8
     fc1_plateau_patience: int = 2
     fc1_min_relative_improvement: float = 0.01
@@ -209,6 +209,7 @@ class HyperParams:
     fc1_one_step_skill_min: float = 0.0
     fc1_one_step_hatc_rmse_abs_max: float = 0.05
     fc1_one_step_lnk_rmse_abs_max: float = 0.05
+    fc1_persistence_rmse_floor: float = 1e-6
     fc1_recursive_r2_min: float = 0.0
     fc1_rmse_growth_h5_max: float = 2.0
     fc1_rollout_finite_ratio_min: float = 1.0
