@@ -123,7 +123,7 @@ def build_hyperparams():
     hp.w_q = 1.0
     hp.w_fc2 = 1.0
     hp.fc1_recon_weight = 1.0
-    hp.fc1_forecast_recon_weight = 0.1
+    hp.fc1_forecast_recon_weight = 0.0
     hp.fc1_hatc_recon_weight = 1.0
     hp.fc1_lnk_recon_weight = 0.25
     hp.fc1_delta_penalty_weight = 10.0

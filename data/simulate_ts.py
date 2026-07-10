@@ -280,6 +280,8 @@ class SimulateTS:
         n_alive = int(alive_idx.numel())
 
         if n_alive == 0:
+            state['hatc_cal'] = torch.tensor(-10.0, device=device)
+            state['lnk_cal'] = torch.tensor(-10.0, device=device)
             m_val = state.get('M', torch.ones((), device=device))
             m_val = m_val if torch.is_tensor(m_val) else torch.tensor(m_val, device=device)
             x = state['x'] if torch.is_tensor(state['x']) else torch.tensor(state['x'], device=device)
@@ -383,6 +385,8 @@ class SimulateTS:
         C_total = C.sum().clamp(min=0.0)
         LnK = torch.log(K_total + 1e-8)
         Hatc = torch.log(C_total / (K_total + 1e-8) + 1e-5)
+        state['hatc_cal'] = Hatc.detach()
+        state['lnk_cal'] = LnK.detach()
         macro_row = torch.stack(
             [
                 torch.tensor(float(path_idx), device=device),
@@ -489,6 +493,8 @@ class SimulateTS:
         # 构建输入张量
         n = state['alive'].sum().item()
         if n == 0:
+            state['hatc_cal'] = -10
+            state['lnk_cal'] = -10
             return [], {'path': path_idx, 't': t, 'branch': branch_k, 'K': 0, 'C': 0, 'LnK': -10, 'Hatc': -10}
         
         alive_mask = state['alive']
@@ -572,6 +578,8 @@ class SimulateTS:
             'hatcf': state['hatcf'],
             'lnkf': state['lnkf']
         }
+        state['hatc_cal'] = macro_row['Hatc']
+        state['lnk_cal'] = macro_row['LnK']
         
         # 更新内生状态（杠杆和资本）
         state['bar_i'] = output.bar_i.reshape(-1)
@@ -657,7 +665,7 @@ class SimulateTS:
 
             if 'sdf_fc1' in self.models and self.models['sdf_fc1'] is not None:
                 hatcf, lnkf, M = self._predict_macro_fc1_tensor(
-                    state['x'], new_state['x'], state['hatcf'], state['lnkf']
+                    state['x'], new_state['x'], state['hatc_cal'], state['lnk_cal']
                 )
                 new_state['hatcf'] = hatcf
                 new_state['lnkf'] = lnkf
@@ -753,7 +761,7 @@ class SimulateTS:
             # 使用 FC1 更新宏观 proxy
             if 'sdf_fc1' in self.models and self.models['sdf_fc1'] is not None:
                 hatcf, lnkf = self._predict_macro_fc1(
-                    state['x'], new_state['x'], state['hatcf'], state['lnkf']
+                    state['x'], new_state['x'], state['hatc_cal'], state['lnk_cal']
                 )
                 new_state['hatcf'] = hatcf
                 new_state['lnkf'] = lnkf
@@ -761,8 +769,8 @@ class SimulateTS:
                 _, _, M, _, _ = self.models['sdf_fc1'].forward_step(
                     x_prev=torch.tensor([state['x']], device=device, dtype=torch.float32),
                     x_curr=torch.tensor([new_state['x']], device=device, dtype=torch.float32),
-                    hatcf_prev=torch.tensor([state['hatcf']], device=device, dtype=torch.float32),
-                    lnkf_prev=torch.tensor([state['lnkf']], device=device, dtype=torch.float32),
+                    hatcf_prev=torch.tensor([state['hatc_cal']], device=device, dtype=torch.float32),
+                    lnkf_prev=torch.tensor([state['lnk_cal']], device=device, dtype=torch.float32),
                     return_physical=True
                 )
                 new_state['M'] = M.squeeze().item()

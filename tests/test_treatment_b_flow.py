@@ -713,6 +713,41 @@ class TreatmentBFlowTest(unittest.TestCase):
         self.assertTrue(passed)
         self.assertEqual(diag["actual_horizon"], 3.0)
 
+    def test_fc1_gate_score_ignores_recursive_diagnostic(self):
+        one_step_diag = {
+            "r2_min": 0.0,
+            "skill_min": 0.0,
+            "checks": {
+                "hatc": {
+                    "gate_mode": "r2_and_persistence_skill",
+                    "r2": 0.5,
+                    "skill_vs_persistence": 0.5,
+                },
+                "lnk": {
+                    "gate_mode": "r2_and_persistence_skill",
+                    "r2": 0.5,
+                    "skill_vs_persistence": 0.5,
+                },
+            },
+        }
+        recursive_diag = {
+            "min_r2": 0.0,
+            "rmse_growth": 999.0,
+            "rmse_growth_max": 2.0,
+            "variables": {
+                "hatc": {
+                    "gate_mode": "recursive_r2",
+                    "r2": -999.0,
+                    "rmse": 999.0,
+                    "rmse_abs_max": 0.05,
+                }
+            },
+        }
+
+        score = Episode._fc1_gate_violation_score(one_step_diag, recursive_diag)
+
+        self.assertEqual(score, 0.0)
+
     def test_sdf_macro_batches_include_same_path_rollout_tensors(self):
         episode = Episode.__new__(Episode)
         episode.device = torch.device("cpu")
@@ -816,7 +851,7 @@ class TreatmentBFlowTest(unittest.TestCase):
         hp = build_hyperparams()
         self.assertTrue(hp.fc1_use_true_macro_state_in_stage2)
         self.assertGreater(hp.fc1_recon_weight, 0.0)
-        self.assertLess(hp.fc1_forecast_recon_weight, hp.fc1_recon_weight)
+        self.assertEqual(hp.fc1_forecast_recon_weight, 0.0)
 
 
 if __name__ == "__main__":

@@ -5605,6 +5605,9 @@ class Episode:
 
     @staticmethod
     def _fc1_gate_violation_score(one_step_diag: Dict[str, Any], recursive_diag: Dict[str, Any]) -> float:
+        # Recursive forecast diagnostics are intentionally excluded from the hard
+        # FC1 gate score. FC1 acceptance is based on calculated-state one-step
+        # performance; recursive rollout remains a reported stability diagnostic.
         penalty = 1e6
 
         def _lower(value: Any, threshold: Any) -> float:
@@ -5650,16 +5653,6 @@ class Episode:
                 score += _lower(check.get("r2"), one_step_diag.get("r2_min", 0.0))
                 score += _lower(check.get("skill_vs_persistence"), one_step_diag.get("skill_min", 0.0))
 
-        recursive_min_r2 = recursive_diag.get("min_r2", 0.0)
-        for check in recursive_diag.get("variables", {}).values():
-            mode = check.get("gate_mode")
-            if mode == "absolute_rmse_low_target_variance":
-                score += _rmse_violation(check)
-            elif mode == "prediction_nonfinite":
-                score += penalty
-            else:
-                score += _lower(check.get("r2"), recursive_min_r2)
-        score += _upper(recursive_diag.get("rmse_growth"), recursive_diag.get("rmse_growth_max"))
         return float(score)
 
     def _run_fc1_until_gates(
@@ -5727,7 +5720,7 @@ class Episode:
                 "score": score,
             }
             rounds.append(round_record)
-            if one_step_passed and recursive_passed:
+            if one_step_passed:
                 return {
                     "passed": True,
                     "failed_stage": None,
@@ -5738,7 +5731,7 @@ class Episode:
                     "final_train_summary": train_summary,
                     "final_eval_metrics": eval_metrics,
                     "final_one_step_gate": one_step_diag,
-                    "final_recursive_gate": recursive_diag,
+                    "final_recursive_diagnostic": recursive_diag,
                     "rounds": rounds,
                 }
 
@@ -5754,11 +5747,7 @@ class Episode:
             else:
                 stale_rounds = 0
             if stale_rounds >= patience:
-                failure_source = (
-                    one_step_diag.get("failure_source", "fc1_one_step_underfit")
-                    if not one_step_passed
-                    else recursive_diag.get("failure_source", "fc1_recursive_instability")
-                )
+                failure_source = one_step_diag.get("failure_source", "fc1_one_step_underfit")
                 return {
                     "passed": False,
                     "failed_stage": "fc1_plateau",
@@ -5769,16 +5758,12 @@ class Episode:
                     "rounds_completed": display_round,
                     "final_eval_metrics": eval_metrics,
                     "final_one_step_gate": one_step_diag,
-                    "final_recursive_gate": recursive_diag,
+                    "final_recursive_diagnostic": recursive_diag,
                     "rounds": rounds,
                 }
 
         final_round = rounds[-1]
-        failure_source = (
-            final_round["one_step_gate"].get("failure_source", "fc1_one_step_underfit")
-            if not final_round["one_step_gate"].get("passed", False)
-            else final_round["recursive_gate"].get("failure_source", "fc1_recursive_instability")
-        )
+        failure_source = final_round["one_step_gate"].get("failure_source", "fc1_one_step_underfit")
         return {
             "passed": False,
             "failed_stage": "fc1_max_rounds",
@@ -5789,7 +5774,7 @@ class Episode:
             "rounds_completed": max_rounds,
             "final_eval_metrics": final_round["eval_metrics"],
             "final_one_step_gate": final_round["one_step_gate"],
-            "final_recursive_gate": final_round["recursive_gate"],
+            "final_recursive_diagnostic": final_round["recursive_gate"],
             "rounds": rounds,
         }
 
@@ -5945,7 +5930,19 @@ class Episode:
                 prefix="post_refresh",
                 max_batches=eval_batches_arg,
             )
-            fc1_passed, fc1_diag = self._fc1_recursive_gate_passed(refresh_eval, prefix="post_refresh")
+            fc1_data_passed, fc1_data_diag = self._fc1_data_viability_passed(
+                refresh_eval,
+                prefix="post_refresh",
+            )
+            fc1_one_step_passed, fc1_one_step_diag = self._fc1_one_step_gate_passed(
+                refresh_eval,
+                prefix="post_refresh",
+            )
+            _, fc1_recursive_diag = self._fc1_recursive_gate_passed(
+                refresh_eval,
+                prefix="post_refresh",
+            )
+            fc1_passed = bool(fc1_data_passed and fc1_one_step_passed)
             sdf_passed, sdf_diag = self._sdf_gate_passed(
                 refresh_eval,
                 prefix="post_refresh",
@@ -5955,7 +5952,16 @@ class Episode:
                 "passed": bool(fc1_passed and sdf_passed),
                 "failed_stage": None if (fc1_passed and sdf_passed) else "post_refresh",
                 "holdout_split": holdout_diag,
-                "fc1_gate": fc1_diag,
+                "fc1_gate": {
+                    "passed": bool(fc1_passed),
+                    "failure_source": None if fc1_passed else (
+                        fc1_data_diag.get("failure_source") or
+                        fc1_one_step_diag.get("failure_source", "fc1_one_step_underfit")
+                    ),
+                    "data_viability": fc1_data_diag,
+                    "one_step_gate": fc1_one_step_diag,
+                    "recursive_diagnostic": fc1_recursive_diag,
+                },
                 "sdf_recursive_gate": sdf_diag,
             }
             module_summaries["sdf_fc1_post_refresh_eval"] = refresh_eval

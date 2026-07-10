@@ -120,13 +120,14 @@ def build_hyperparams():
     hp.w_pi = 1.0
     hp.w_q = 1.0
     hp.w_fc2 = 1.0
-    # SDF 两阶段稳定配置：true-state one-step 是主监督，forecast-state 只做辅助递推稳定项。
+    # SDF 两阶段稳定配置：calculated-state one-step 是主监督；
+    # forecast-state reconstruction 默认关闭，仅作为显式对照开关保留。
     hp.sdf_training_schedule_enabled = True
     hp.fc1_only_epochs = 10
     hp.sdf_true_only_epochs = 20
     hp.sdf_recursive_only_epochs = 10
     hp.fc1_recon_weight = 1.0
-    hp.fc1_forecast_recon_weight = 0.25
+    hp.fc1_forecast_recon_weight = 0.0
     hp.fc1_rollout_weight = 0.5
     hp.fc1_rollout_horizon = 5
     hp.fc1_hatc_recon_weight = 1.0

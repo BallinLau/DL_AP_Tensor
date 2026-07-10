@@ -60,6 +60,10 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
 
 
 def _initialize_batched_state(sim, max_firms: int) -> Dict[str, torch.Tensor]:
+    # Macro-state semantics:
+    # - hatcf/lnkf are current-node FC1 forecasts used by Policy/Value.
+    # - hatc_cal/lnk_cal are filled after node processing from realized firm
+    #   aggregation and are the FC1 inputs for child-node forecasts.
     device = sim.device
     n_paths = sim.n_paths
     n0 = sim.group_size
@@ -125,6 +129,8 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     path_grid = torch.arange(n_paths, device=device, dtype=torch.long).unsqueeze(1).expand(n_paths, n_firms)
 
     if alive_pos.numel() == 0:
+        state["hatc_cal"] = torch.full((n_paths,), -10.0, device=device)
+        state["lnk_cal"] = torch.full((n_paths,), -10.0, device=device)
         macro_rows = torch.stack(
             [
                 torch.arange(n_paths, device=device, dtype=torch.float32),
@@ -226,6 +232,8 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     LnK = torch.where(alive_any, torch.log(K_total + 1e-8), torch.full_like(K_total, -10.0))
     Hatc_raw = torch.log(C_total / (K_total + 1e-8) + 1e-5)
     Hatc = torch.where(alive_any, Hatc_raw, torch.full_like(C_total, -10.0))
+    state["hatc_cal"] = Hatc.detach()
+    state["lnk_cal"] = LnK.detach()
 
     macro_rows = torch.stack(
         [
@@ -285,8 +293,8 @@ def _expand_branches_batched(sim, state: Dict[str, torch.Tensor]) -> List[Dict[s
                 sim,
                 state["x"],
                 x_next,
-                state["hatcf"],
-                state["lnkf"],
+                state["hatc_cal"],
+                state["lnk_cal"],
             )
             hatcf_out = torch.where(alive_any, hatcf_next, state["hatcf"])
             lnkf_out = torch.where(alive_any, lnkf_next, state["lnkf"])

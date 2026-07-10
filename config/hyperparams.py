@@ -154,9 +154,10 @@ class HyperParams:
     sdf_true_only_epochs: int = 20
     sdf_recursive_only_epochs: int = 10
     fc1_recon_weight: float = 1.0
-    # Stage2 辅助约束 forecast-state 递推：
-    # (Hatcf_t, LnKF_t) -> (Hatcf_{t+1}, LnKF_{t+1}) 也要贴近真实下一期
-    fc1_forecast_recon_weight: float = 0.25
+    # Optional forecast-state auxiliary reconstruction kept as an explicit
+    # opt-in diagnostic. The primary FC1 law of motion is calculated-state
+    # one-step supervision: (Hatc_t, LnK_t) -> (Hatc_{t+1}, LnK_{t+1}).
+    fc1_forecast_recon_weight: float = 0.0
     fc1_rollout_weight: float = 0.5
     fc1_rollout_horizon: int = 5
     # FC1 重建项内部按目标拆分权重。
