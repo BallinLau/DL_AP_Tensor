@@ -14,6 +14,7 @@ import pandas as pd
 import numpy as np
 from copy import deepcopy
 from enum import Enum
+from numbers import Number
 from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 import logging
@@ -205,6 +206,56 @@ class Episode:
 
     def set_sdf_training_phase(self, phase: str | SDFTrainingPhase) -> None:
         self.sdf_training_phase = SDFTrainingPhase(phase)
+
+    @staticmethod
+    def _normalize_metric_value(key: str, value: Any) -> Any:
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                raise TypeError(
+                    f"Metric {key!r} must be scalar, got tensor shape={tuple(value.shape)}."
+                )
+            return value.detach().item()
+        return value
+
+    @staticmethod
+    def _is_numeric_metric_value(value: Any) -> bool:
+        return (
+            isinstance(value, (Number, np.number))
+            and not isinstance(value, (str, bytes))
+        )
+
+    @classmethod
+    def _aggregate_metric_records(
+        cls,
+        records: List[Dict[str, Any]],
+    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        if not records:
+            return {}, {}
+
+        numeric_metrics: Dict[str, float] = {}
+        metadata: Dict[str, Any] = {}
+        keys = set().union(*(record.keys() for record in records))
+
+        for key in keys:
+            values = [
+                cls._normalize_metric_value(key, record[key])
+                for record in records
+                if key in record
+            ]
+            if not values:
+                continue
+            if all(cls._is_numeric_metric_value(value) for value in values):
+                numeric_metrics[key] = float(np.mean(values))
+                continue
+
+            first = values[0]
+            if any(value != first for value in values[1:]):
+                raise RuntimeError(
+                    f"Non-numeric metric {key!r} changed within one epoch: {values!r}"
+                )
+            metadata[key] = first
+
+        return numeric_metrics, metadata
 
     def reset_sdf_shock_bank(self) -> None:
         """Drop cached fresh-pair shock bank when episode/data stage changes."""
@@ -2154,9 +2205,12 @@ class Episode:
         
         # 记录历史
         for k, v in losses.items():
+            v_norm = self._normalize_metric_value(k, v)
+            if not self._is_numeric_metric_value(v_norm):
+                continue
             if k not in self.loss_history:
                 self.loss_history[k] = []
-            self.loss_history[k].append(v)
+            self.loss_history[k].append(float(v_norm))
         
         return losses
 
@@ -4860,30 +4914,25 @@ class Episode:
                             refine_losses.append(losses)
                             epoch_losses.append(losses)
                         if refine_losses:
-                            refine_avg = {
-                                k: np.mean([l[k] for l in refine_losses if k in l])
-                                for k in refine_losses[0].keys()
-                            }
+                            refine_avg, refine_metadata = self._aggregate_metric_records(refine_losses)
                             logger.info(
                                 "%sBP refine %d/%d finished: %s",
                                 desc_prefix,
                                 r + 1,
                                 bp_refine_steps,
-                                refine_avg
+                                {**refine_avg, **refine_metadata}
                             )
                 finally:
                     self._bp_only_stage = False
                 
-            avg_losses = {
-                k: np.mean([l[k] for l in epoch_losses if k in l])
-                for k in epoch_losses[0].keys()
-            }
+            avg_losses, epoch_metadata = self._aggregate_metric_records(epoch_losses)
             if 'policy_value' in train_modules and 'policy_value' in self.models:
                 self._check_policy_value_gate(
                     avg_losses,
                     context=f"episode={self.episode_id}, epoch={epoch + 1}"
                 )
-            logger.info(f"{desc_prefix}Epoch {epoch+1} finished: {avg_losses}")
+            epoch_summary = {**avg_losses, **epoch_metadata}
+            logger.info(f"{desc_prefix}Epoch {epoch+1} finished: {epoch_summary}")
             if 'sdf_log_mean_M' in avg_losses:
                 logger.info(
                     f"{desc_prefix}SDF Diagnostics | "
@@ -4904,6 +4953,8 @@ class Episode:
         result = {
             'final_losses': avg_losses
         }
+        if epoch_metadata:
+            result['metadata'] = epoch_metadata
         if convergence is not None:
             result['convergence'] = convergence
             result['target_grid_validation_batches'] = len(validation_batches)
@@ -4997,12 +5048,12 @@ class Episode:
                 )
         if not epoch_losses:
             return None
-        avg_losses = {
-            k: np.mean([l[k] for l in epoch_losses if k in l])
-            for k in epoch_losses[0].keys()
-        }
-        logger.info("FC2 Epochs finished: %s", avg_losses)
-        return {'final_losses': avg_losses}
+        avg_losses, metadata = self._aggregate_metric_records(epoch_losses)
+        logger.info("FC2 Epochs finished: %s", {**avg_losses, **metadata})
+        result = {'final_losses': avg_losses}
+        if metadata:
+            result['metadata'] = metadata
+        return result
 
     def _evaluate_sdf_fc1_batches(
         self,
@@ -6195,11 +6246,8 @@ class Episode:
                     )
             
             # Epoch 结束统计
-            avg_losses = {
-                k: np.mean([l[k] for l in epoch_losses if k in l])
-                for k in epoch_losses[0].keys()
-            }
-            logger.info(f"Epoch {epoch+1} finished: {avg_losses}")
+            avg_losses, epoch_metadata = self._aggregate_metric_records(epoch_losses)
+            logger.info(f"Epoch {epoch+1} finished: { {**avg_losses, **epoch_metadata} }")
         convergence = None
         if 'policy_value' in train_modules and 'policy_value' in self.models and batches:
             convergence = self.evaluate_bellman_convergence(batches)
@@ -6210,6 +6258,8 @@ class Episode:
             'final_losses': avg_losses,
             'loss_history': self.loss_history
         }
+        if epoch_metadata:
+            summary['metadata'] = epoch_metadata
         if convergence is not None:
             summary['convergence'] = convergence
         

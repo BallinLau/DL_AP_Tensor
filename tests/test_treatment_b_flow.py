@@ -43,6 +43,63 @@ class _FakeSdfModel:
 
 
 class TreatmentBFlowTest(unittest.TestCase):
+    def test_metric_aggregation_separates_numeric_and_metadata(self):
+        records = [
+            {"sdf": 2.0, "sdf_main_loss": 1.0, "sdf_training_phase": "episode0_bootstrap"},
+            {"sdf": 4.0, "sdf_main_loss": 3.0, "sdf_training_phase": "episode0_bootstrap"},
+        ]
+
+        numeric, metadata = Episode._aggregate_metric_records(records)
+
+        self.assertAlmostEqual(numeric["sdf"], 3.0)
+        self.assertAlmostEqual(numeric["sdf_main_loss"], 2.0)
+        self.assertEqual(metadata["sdf_training_phase"], "episode0_bootstrap")
+
+    def test_metric_aggregation_rejects_changed_phase(self):
+        records = [
+            {"sdf_training_phase": "episode0_bootstrap"},
+            {"sdf_training_phase": "sdf_true_only"},
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "changed within one epoch"):
+            Episode._aggregate_metric_records(records)
+
+    def test_run_batches_returns_metadata_separate_from_final_losses(self):
+        episode = Episode.__new__(Episode)
+        episode.models = {"sdf_fc1": object()}
+        episode.hyperparams = SimpleNamespace(
+            q_pretrain_epochs=0,
+            q_warmstart_epochs=0,
+            bp_refine_steps_per_epoch=0,
+        )
+        episode.step_count = 0
+        episode._q_only_stage = False
+        episode._bp_only_stage = False
+        episode._configure_sdf_lr_for_phase = MethodType(lambda self: None, episode)
+        episode._prepare_sdf_shock_bank_for_epoch = MethodType(lambda self, batches, epoch, train_modules: None, episode)
+        episode._maybe_update_firm_target_epoch = MethodType(lambda self, train_modules: None, episode)
+
+        def fake_train_step(self, batch, train_modules, policy_loss_terms=None):
+            self.step_count += 1
+            return {
+                "total": 2.0,
+                "sdf": 2.0,
+                "sdf_training_phase": "episode0_bootstrap",
+            }
+
+        episode.train_step = MethodType(fake_train_step, episode)
+
+        summary = episode._run_batches(
+            batches=[{"dummy": torch.tensor(1.0)}],
+            n_epochs=1,
+            log_interval=100,
+            train_modules=["sdf_fc1"],
+        )
+
+        self.assertEqual(summary["final_losses"]["sdf"], 2.0)
+        self.assertNotIn("sdf_training_phase", summary["final_losses"])
+        self.assertEqual(summary["metadata"]["sdf_training_phase"], "episode0_bootstrap")
+
     def _make_episode(self, resimulate_after_pv, post_refresh_pass=True):
         episode = Episode.__new__(Episode)
         episode.models = {"policy_value": object(), "sdf_fc1": object()}
