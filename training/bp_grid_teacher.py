@@ -8,11 +8,15 @@ detached bp labels for the policy heads. Simulation code never calls this module
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 import torch
 
 from config import Config
+
+
+logger = logging.getLogger(__name__)
 
 
 def _get_out(out: Any, name: str, idx: int) -> torch.Tensor:
@@ -157,6 +161,7 @@ class BPGridTeacher:
         self.margin_scale = max(float(margin_scale), 1e-12)
         self.confidence_relative = bool(confidence_relative)
         self.confidence_min = min(max(float(confidence_min), 0.0), 1.0)
+        self._grid_chunk_logged = False
 
     @classmethod
     def from_hyperparams(cls, target_model, p0_loss_fn, pi_loss_fn, hyperparams) -> "BPGridTeacher":
@@ -171,7 +176,7 @@ class BPGridTeacher:
             refine=bool(getattr(hyperparams, "bp_grid_refine_enabled", True)),
             quadratic_refine=bool(getattr(hyperparams, "bp_grid_quadratic_refine", False)),
             parent_chunk_size=int(getattr(hyperparams, "bp_grid_parent_chunk_size", 2048)),
-            candidate_chunk_size=int(getattr(hyperparams, "bp_grid_candidate_chunk_size", 4)),
+            candidate_chunk_size=int(getattr(hyperparams, "bp_grid_candidate_chunk_size", 0)),
             max_expanded_states=int(getattr(hyperparams, "bp_grid_max_expanded_states", 65536)),
             margin_scale=float(getattr(hyperparams, "bp_grid_margin_scale", 1e-3)),
             confidence_relative=bool(getattr(hyperparams, "bp_grid_confidence_relative", True)),
@@ -340,6 +345,15 @@ class BPGridTeacher:
         alpha = torch.linspace(0.0, 1.0, steps=self.fine_size, device=coarse_grid.device, dtype=coarse_grid.dtype)
         return left.unsqueeze(1) + (right - left).unsqueeze(1) * alpha.unsqueeze(0)
 
+    def _resolve_candidate_chunk_size(
+        self,
+        batch_size: int,
+        n_grid: int,
+    ) -> int:
+        dynamic_chunk = max(1, self.max_expanded_states // max(batch_size, 1))
+        requested_chunk = n_grid if self.candidate_chunk_size <= 0 else self.candidate_chunk_size
+        return max(1, min(requested_chunk, dynamic_chunk, n_grid))
+
     def _evaluate_grid(
         self,
         parent_state: torch.Tensor,
@@ -353,8 +367,22 @@ class BPGridTeacher:
         batch_size, n_grid = bp_grid.shape
         q_current = _target_q(self.target_model, parent_state)
         dynamic_chunk = max(1, self.max_expanded_states // max(batch_size, 1))
-        chunk_size = self.candidate_chunk_size if self.candidate_chunk_size > 0 else n_grid
-        chunk_size = max(1, min(chunk_size, dynamic_chunk, n_grid))
+        chunk_size = self._resolve_candidate_chunk_size(batch_size=batch_size, n_grid=n_grid)
+        if not self._grid_chunk_logged:
+            logger.info(
+                "BP grid chunk plan | parent_batch=%d n_grid=%d candidate_chunk_cfg=%d "
+                "dynamic_chunk=%d resolved_chunk=%d one_shot=%s expanded_states=%d "
+                "max_expanded_states=%d",
+                batch_size,
+                n_grid,
+                self.candidate_chunk_size,
+                dynamic_chunk,
+                chunk_size,
+                str(chunk_size == n_grid),
+                batch_size * chunk_size,
+                self.max_expanded_states,
+            )
+            self._grid_chunk_logged = True
         if chunk_size >= n_grid:
             return self._evaluate_grid_chunk(parent_state, children, m_list, bp_grid, branch=branch, mix_weight=mix_weight, q_current=q_current)
 

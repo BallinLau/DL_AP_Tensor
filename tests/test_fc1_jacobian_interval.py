@@ -9,7 +9,7 @@ sys.path.append(str(ROOT))
 from config import Config  # noqa: E402
 from config.hyperparams import HyperParams  # noqa: E402
 from losses.sdf_loss import SDFLoss  # noqa: E402
-from training.episode import Episode  # noqa: E402
+from training.episode import Episode, SDFTrainingPhase  # noqa: E402
 
 
 class _ToySdfFc1(torch.nn.Module):
@@ -48,6 +48,7 @@ def _episode_with_interval(interval: int) -> Episode:
     ep.device = torch.device("cpu")
     ep.add_FC1loss = True
     ep._fc1_teacher_forcing_stage = False
+    ep.sdf_training_phase = SDFTrainingPhase.FC1_ONLY
     ep._current_epoch_idx = 0
     ep.step_count = 0
     ep.sdf_fc1_step_count = 0

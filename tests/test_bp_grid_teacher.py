@@ -231,9 +231,60 @@ def test_relative_confidence_scales_margin_by_config_threshold():
     assert out["confidence"].item() > 0.9
 
 
+def test_candidate_chunk_zero_matches_chunked_grid_outputs():
+    target = ParabolicTarget()
+    parent = torch.tensor(
+        [
+            [0.1, 0.0, 1.0, 0.2, 0.0, 0.0, 0.0],
+            [0.2, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0],
+            [0.3, 0.0, 1.0, 0.4, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    child0 = parent.clone()
+    child1 = parent.clone()
+    child0[:, 2:3] = 1.0
+    child1[:, 2:3] = 0.0
+    m_list = [torch.ones(3, 1), torch.full((3, 1), 0.95)]
+
+    teacher_chunked = BPGridTeacher(
+        target,
+        P0Loss(),
+        PILoss(),
+        coarse_size=7,
+        refine=False,
+        candidate_chunk_size=4,
+        max_expanded_states=65536,
+    )
+    teacher_full = BPGridTeacher(
+        target,
+        P0Loss(),
+        PILoss(),
+        coarse_size=7,
+        refine=False,
+        candidate_chunk_size=0,
+        max_expanded_states=65536,
+    )
+
+    out_chunked = teacher_chunked.compute(parent, [child0, child1], m_list, branch="p0")
+    out_full = teacher_full.compute(parent, [child0, child1], m_list, branch="p0")
+
+    for key in [
+        "bp_star",
+        "value_star",
+        "value_grid",
+        "q_issue_grid",
+        "p_child_grid_mean",
+        "default_grid_mean",
+    ]:
+        torch.testing.assert_close(out_chunked[key], out_full[key], rtol=1e-5, atol=1e-6)
+    assert torch.equal(out_chunked["argmax_index"], out_full["argmax_index"])
+
+
 if __name__ == "__main__":
     test_bp_grid_teacher_selects_value_maximizing_bp()
     test_grid_teacher_debt_state_semantics()
     test_grid_teacher_mix_branch_and_coarse_confidence()
     test_pi_grid_target_multi_child_boundary_and_refine()
     test_relative_confidence_scales_margin_by_config_threshold()
+    test_candidate_chunk_zero_matches_chunked_grid_outputs()

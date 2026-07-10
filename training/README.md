@@ -44,6 +44,15 @@ Training orchestration for episodes and modules.
 - Diagnostics include `sdf_jacobian_penalty_interval`, `sdf_jacobian_penalty_active`, and `sdf_fc1_step_count`.
 - Slurm jobs expose the same control as `FC1_JACOBIAN_PENALTY_INTERVAL`.
 
+### SDF/FC1: explicit training phases
+- `sdf_training_schedule_enabled=True` runs simulated macro SDF/FC1 training as explicit phases:
+  - `fc1_only`: train only `fc1_model`; Euler, moment, and SDF mean-anchor weights are zero.
+  - `sdf_true_only`: freeze FC1 and train only `sdf_model`/`value_model` using true macro parent state.
+  - `sdf_recursive_only`: freeze FC1 and train only `sdf_model`/`value_model` using recursive forecast parent state, plus a true-state Euler baseline.
+- The phase is recorded as `sdf_training_phase`. Effective loss weights are logged as `*_weight_effective` fields.
+- `fc1_only` never samples fresh wealth pairs and never computes Euler/moment/anchor terms.
+- `fc1_rollout_weight` is supported only when a batch explicitly supplies same-path sequence tensors: `fc1_rollout_initial_state`, `fc1_rollout_future_x`, and `fc1_rollout_target_states`. Child branches are not treated as rollout time steps.
+
 ### Policy/Value: Q-first training hooks
 - `train_step(..., policy_loss_terms=...)` now supports selective optimization among `['q', 'p0', 'pi']`.
 - `_run_batches(...)` supports Q pretraining via `HyperParams.q_pretrain_epochs` and `HyperParams.q_warmstart_epochs`:
@@ -102,6 +111,7 @@ Training orchestration for episodes and modules.
   - `pv_target_grid_val_fraction`
   - CLI flags: `--pv-bp-training-mode`, `--bp-grid-coarse-size`, `--bp-grid-fine-size`, `--bp-grid-refine-enabled`, `--bp-grid-policy-weight`, `--bp-grid-mix-policy-weight`, `--bp-grid-margin-scale`, `--bp-grid-parent-chunk-size`, `--bp-grid-candidate-chunk-size`, `--bp-grid-max-expanded-states`, `--bp-grid-confidence-relative`, `--no-bp-grid-confidence-relative`, `--pv-target-grid-val-fraction`, `--firm-target-update`
 - Confidence is computed from coarse/global top-two margins by default. In relative mode it uses `(coarse_top2_margin / |V_star|) / bp_grid_margin_scale`; fine-grid margins are logged separately as `*_grid_fine_top2_margin_mean`.
+- `bp_grid_candidate_chunk_size=0` means evaluate the full candidate grid for each parent chunk when `bp_grid_max_expanded_states` permits it. With the default `bp_grid_parent_chunk_size=2048`, `bp_grid_coarse_size=21`, and `bp_grid_max_expanded_states=65536`, the coarse grid is evaluated one-shot because `floor(65536 / 2048) = 32 >= 21`.
 - Global low/high bp diagnostics come from the coarse grid endpoints. Local fine interval endpoints are logged only as `*_grid_local_value_left_mean` and `*_grid_local_value_right_mean`.
 - `bp_grid_quadratic_refine=True` re-evaluates `value_star`, `q_issue_at_star`, `p_child_at_star`, and `default_at_star` at the refined continuous `bp_star`.
 - `bp_grid_use_survival_gate` has been removed; continuation values use the already clipped/default-adjusted `P` from the target equity evaluator.

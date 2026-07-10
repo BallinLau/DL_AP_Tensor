@@ -13,6 +13,7 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 from copy import deepcopy
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 import logging
@@ -46,6 +47,13 @@ logger = logging.getLogger(__name__)
 
 class NumericalStageFailure(RuntimeError):
     """Raised when a training stage repeatedly produces non-finite gradients."""
+
+
+class SDFTrainingPhase(str, Enum):
+    FC1_ONLY = "fc1_only"
+    SDF_TRUE_ONLY = "sdf_true_only"
+    SDF_RECURSIVE_ONLY = "sdf_recursive_only"
+    JOINT_DISABLED = "joint_disabled"
 
 
 def convert_tree_fast(df: pd.DataFrame) -> pd.DataFrame:
@@ -158,6 +166,7 @@ class Episode:
         # 训练状态
         self.step_count = 0
         self.sdf_fc1_step_count = 0
+        self.sdf_training_phase = SDFTrainingPhase.SDF_TRUE_ONLY
         self.loss_history = {}
         self.add_FC1loss = False
         self.train_mode = '2time'
@@ -188,6 +197,9 @@ class Episode:
         self._sdf_shock_bank_episode_id: Optional[int] = None
         self._sdf_shock_bank_key: Optional[Tuple[Any, ...]] = None
         self._sdf_pair_generator: Optional[torch.Generator] = None
+
+    def set_sdf_training_phase(self, phase: str | SDFTrainingPhase) -> None:
+        self.sdf_training_phase = SDFTrainingPhase(phase)
 
     def reset_sdf_shock_bank(self) -> None:
         """Drop cached fresh-pair shock bank when episode/data stage changes."""
@@ -1542,6 +1554,40 @@ class Episode:
             self._sdf_fc1_grad_backup = {}
             self._sdf_fc1_teacher_freeze_active = False
 
+    def _set_sdf_training_phase_freeze(self) -> None:
+        """
+        Explicit SDF/FC1 phase freeze.
+
+        FC1_ONLY trains only FC1; SDF phases freeze FC1 and train SDF/value.
+        """
+        if 'sdf_fc1' not in self.models:
+            return
+        model = self.models['sdf_fc1']
+        phase = getattr(self, "sdf_training_phase", SDFTrainingPhase.SDF_TRUE_ONLY)
+        phase = SDFTrainingPhase(phase)
+
+        for p in model.parameters():
+            p.requires_grad = False
+
+        if phase == SDFTrainingPhase.FC1_ONLY:
+            if not hasattr(model, "fc1_model"):
+                raise RuntimeError("SDF/FC1 model has no fc1_model for FC1_ONLY phase.")
+            for p in model.fc1_model.parameters():
+                p.requires_grad = True
+        elif phase in {SDFTrainingPhase.SDF_TRUE_ONLY, SDFTrainingPhase.SDF_RECURSIVE_ONLY}:
+            if not hasattr(model, "sdf_model") or not hasattr(model, "value_model"):
+                raise RuntimeError("SDF/FC1 model must expose sdf_model and value_model for SDF-only phases.")
+            for p in model.sdf_model.parameters():
+                p.requires_grad = True
+            for p in model.value_model.parameters():
+                p.requires_grad = True
+        elif phase == SDFTrainingPhase.JOINT_DISABLED:
+            raise RuntimeError(
+                "Joint FC1/SDF training is disabled until separate-stage validation has passed."
+            )
+        else:
+            raise ValueError(f"Unknown SDF training phase: {phase}")
+
     def _compute_stage2_hj_warmup_factor(self) -> float:
         """
         Stage2 联合训练初期，线性放大 HJ 相关项权重，避免 FC1 被过早牵引。
@@ -1810,7 +1856,6 @@ class Episode:
         # 先恢复，再按当前 step 规则决定是否冻结
         self._set_policy_q_only_freeze(False)
         self._set_policy_bp_only_freeze(False)
-        self._set_sdf_fc1_teacher_only_freeze(False)
         q_only_step = (
             'policy_value' in train_modules and
             set(policy_loss_terms) == {'q'} and
@@ -1822,14 +1867,11 @@ class Episode:
             len(policy_loss_terms) == 2 and
             bool(getattr(self, "_bp_only_stage", False))
         )
-        fc1_teacher_step = (
-            'sdf_fc1' in train_modules and
-            bool(getattr(self, "_fc1_teacher_forcing_stage", False))
-        )
         self._set_policy_q_only_freeze(q_only_step)
         if not q_only_step:
             self._set_policy_bp_only_freeze(bp_only_step)
-        self._set_sdf_fc1_teacher_only_freeze(fc1_teacher_step)
+        if 'sdf_fc1' in train_modules:
+            self._set_sdf_training_phase_freeze()
         
         losses = {}
         
@@ -1968,7 +2010,6 @@ class Episode:
         finally:
             self._set_policy_q_only_freeze(False)
             self._set_policy_bp_only_freeze(False)
-            self._set_sdf_fc1_teacher_only_freeze(False)
         
         # 更新调度器
         self.weight_scheduler.step(losses)
@@ -1988,6 +2029,202 @@ class Episode:
             self.loss_history[k].append(v)
         
         return losses
+
+    def _extract_fc1_targets(
+        self,
+        children_t: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if children_t.shape[-1] >= 10:
+            return children_t[:, :, 8:9], children_t[:, :, 9:10]
+        if children_t.shape[-1] >= 9:
+            return children_t[:, :, 7:8], children_t[:, :, 8:9]
+        return None, None
+
+    def _compute_fc1_rollout_loss(
+        self,
+        model: nn.Module,
+        batch: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Optional multi-step FC1 rollout loss.
+
+        This intentionally requires explicit same-path time-series tensors and
+        never treats child branches as a time sequence.
+        """
+        if not all(k in batch for k in ("fc1_rollout_initial_state", "fc1_rollout_future_x", "fc1_rollout_target_states")):
+            return torch.tensor(0.0, device=self.device)
+
+        initial_state = batch["fc1_rollout_initial_state"].to(self.device)
+        future_x = batch["fc1_rollout_future_x"].to(self.device)
+        target_states = batch["fc1_rollout_target_states"].to(self.device)
+        horizon = min(
+            int(getattr(self.hyperparams, "fc1_rollout_horizon", 5)),
+            int(future_x.shape[1]),
+            int(target_states.shape[1]),
+        )
+        if horizon <= 0:
+            return torch.tensor(0.0, device=self.device)
+
+        hatc = initial_state[:, 0:1]
+        lnk = initial_state[:, 1:2]
+        x_prev = future_x[:, 0, :]
+        weights = torch.ones(horizon, device=self.device, dtype=future_x.dtype) / float(horizon)
+        losses = []
+        for h in range(horizon):
+            x_curr = future_x[:, h, :]
+            _, _, _, hatc_next, lnk_next = model.forward_step(
+                x_prev=x_prev,
+                x_curr=x_curr.unsqueeze(1),
+                hatcf_prev=hatc,
+                lnkf_prev=lnk,
+                return_physical=True,
+            )
+            hatc = hatc_next[:, 0, :]
+            lnk = lnk_next[:, 0, :]
+            pred = torch.cat([hatc, lnk], dim=1)
+            target = target_states[:, h, :]
+            losses.append(weights[h] * (pred - target).pow(2).mean())
+            x_prev = x_curr
+        return torch.stack(losses).sum()
+
+    def _compute_fc1_only_loss(
+        self,
+        batch: Dict[str, torch.Tensor],
+        parent: torch.Tensor,
+        children_t: torch.Tensor,
+    ) -> torch.Tensor:
+        model = self.models['sdf_fc1']
+        device = self.device
+        hatc_true, lnk_true = self._extract_fc1_targets(children_t)
+        zero = torch.tensor(0.0, device=device)
+
+        recon_loss = zero
+        recon_loss_hatc = zero
+        recon_loss_lnk = zero
+        recon_loss_dlnk = zero
+        recon_loss_forecast = zero
+        recon_loss_forecast_hatc = zero
+        recon_loss_forecast_lnk = zero
+        recon_loss_forecast_dlnk = zero
+        delta_penalty = zero
+        delta_penalty_hatc = zero
+        delta_penalty_lnk = zero
+        jacobian_penalty = zero
+        jacobian_penalty_hatc = zero
+        jacobian_penalty_lnk = zero
+        rollout_loss = zero
+        jacobian_penalty_active = False
+
+        hatc_w = float(getattr(self.hyperparams, "fc1_hatc_recon_weight", 1.0))
+        lnk_w = float(getattr(self.hyperparams, "fc1_lnk_recon_weight", 0.25))
+        recon_weight = float(getattr(self.hyperparams, "fc1_recon_weight", 1.0))
+        forecast_weight = float(getattr(self.hyperparams, "fc1_forecast_recon_weight", 0.25))
+        rollout_weight = float(getattr(self.hyperparams, "fc1_rollout_weight", 0.5))
+        delta_weight = float(getattr(self.hyperparams, "fc1_delta_penalty_weight", 1.0))
+        jac_weight = float(getattr(self.hyperparams, "fc1_jacobian_penalty_weight", 0.0))
+        jac_interval = int(getattr(self.hyperparams, "fc1_jacobian_penalty_interval", 10))
+        sdf_step = int(getattr(self, "sdf_fc1_step_count", 0))
+        compute_jac = jac_weight > 0.0 and jac_interval > 0 and sdf_step % jac_interval == 0
+        delta_hatc_abs_max = float(getattr(self.hyperparams, "fc1_delta_hatc_abs_max", 0.50))
+        delta_lnk_abs_max = float(getattr(self.hyperparams, "fc1_delta_lnk_abs_max", 0.30))
+
+        if hatc_true is None or lnk_true is None or parent.shape[1] < 9:
+            logger.warning("FC1_ONLY phase requires parent true macro and child true targets; returning zero FC1 loss.")
+        else:
+            _, _, _, hatc_pred, lnk_pred = model.forward_step(
+                x_prev=parent[:, 4:5],
+                x_curr=children_t[:, :, 4:5],
+                hatcf_prev=parent[:, 7:8],
+                lnkf_prev=parent[:, 8:9],
+                return_physical=True,
+            )
+            recon_loss_hatc = (hatc_pred - hatc_true).pow(2).mean()
+            recon_loss_lnk = (lnk_pred - lnk_true).pow(2).mean()
+            recon_loss_dlnk = ((lnk_pred - parent[:, 8:9].unsqueeze(1)) - (lnk_true - parent[:, 8:9].unsqueeze(1))).pow(2).mean()
+            recon_loss = hatc_w * recon_loss_hatc + lnk_w * recon_loss_lnk
+
+            if forecast_weight > 0.0 or delta_weight > 0.0 or jac_weight > 0.0:
+                hatcf_prev = parent[:, 5:6].detach().clone()
+                lnkf_prev = parent[:, 6:7].detach().clone()
+                if compute_jac:
+                    hatcf_prev.requires_grad_(True)
+                    lnkf_prev.requires_grad_(True)
+                _, _, _, hatc_forecast, lnk_forecast = model.forward_step(
+                    x_prev=parent[:, 4:5],
+                    x_curr=children_t[:, :, 4:5],
+                    hatcf_prev=hatcf_prev,
+                    lnkf_prev=lnkf_prev,
+                    return_physical=True,
+                )
+                recon_loss_forecast_hatc = (hatc_forecast - hatc_true).pow(2).mean()
+                recon_loss_forecast_lnk = (lnk_forecast - lnk_true).pow(2).mean()
+                recon_loss_forecast_dlnk = ((lnk_forecast - lnkf_prev.unsqueeze(1)) - (lnk_true - lnkf_prev.unsqueeze(1))).pow(2).mean()
+                recon_loss_forecast = hatc_w * recon_loss_forecast_hatc + lnk_w * recon_loss_forecast_lnk
+                d_hatcf = hatc_forecast - parent[:, 5:6].unsqueeze(1)
+                d_lnkf = lnk_forecast - parent[:, 6:7].unsqueeze(1)
+                delta_penalty_hatc = torch.relu(d_hatcf.abs() - delta_hatc_abs_max).pow(2).mean()
+                delta_penalty_lnk = torch.relu(d_lnkf.abs() - delta_lnk_abs_max).pow(2).mean()
+                delta_penalty = hatc_w * delta_penalty_hatc + lnk_w * delta_penalty_lnk
+
+                if compute_jac:
+                    jacobian_penalty_active = True
+                    grad_hat_wrt_hat = torch.autograd.grad(hatc_forecast.sum(), hatcf_prev, create_graph=True, retain_graph=True)[0]
+                    grad_hat_wrt_lnk = torch.autograd.grad(hatc_forecast.sum(), lnkf_prev, create_graph=True, retain_graph=True)[0]
+                    grad_lnk_wrt_hat = torch.autograd.grad(lnk_forecast.sum(), hatcf_prev, create_graph=True, retain_graph=True)[0]
+                    grad_lnk_wrt_lnk = torch.autograd.grad(lnk_forecast.sum(), lnkf_prev, create_graph=True, retain_graph=True)[0]
+                    jacobian_penalty_hatc = grad_hat_wrt_hat.pow(2).mean() + grad_hat_wrt_lnk.pow(2).mean()
+                    jacobian_penalty_lnk = grad_lnk_wrt_hat.pow(2).mean() + grad_lnk_wrt_lnk.pow(2).mean()
+                    jacobian_penalty = hatc_w * jacobian_penalty_hatc + lnk_w * jacobian_penalty_lnk
+
+            if rollout_weight > 0.0:
+                rollout_loss = self._compute_fc1_rollout_loss(model, batch)
+
+        total = (
+            recon_weight * recon_loss
+            + forecast_weight * recon_loss_forecast
+            + rollout_weight * rollout_loss
+            + delta_weight * delta_penalty
+            + jac_weight * jacobian_penalty
+        )
+        self._latest_sdf_terms = {
+            'sdf_training_phase': SDFTrainingPhase.FC1_ONLY.value,
+            'sdf_main_loss': 0.0,
+            'sdf_total_loss': float(total.detach().item()),
+            'sdf_main_weight_effective': 0.0,
+            'sdf_moment_weight_effective': 0.0,
+            'sdf_anchor_weight_effective': 0.0,
+            'fc1_recon_weight_effective': float(recon_weight),
+            'fc1_forecast_weight_effective': float(forecast_weight),
+            'fc1_rollout_weight_effective': float(rollout_weight),
+            'fc1_delta_weight_effective': float(delta_weight),
+            'fc1_jacobian_weight_effective': float(jac_weight if jacobian_penalty_active else 0.0),
+            'sdf_recon_loss': float(recon_loss.detach().item()),
+            'sdf_fc1_true_recon': float(recon_loss.detach().item()),
+            'sdf_recon_loss_hatc': float(recon_loss_hatc.detach().item()),
+            'sdf_recon_loss_lnk': float(recon_loss_lnk.detach().item()),
+            'sdf_recon_loss_dlnk': float(recon_loss_dlnk.detach().item()),
+            'sdf_recon_loss_forecast': float(recon_loss_forecast.detach().item()),
+            'sdf_fc1_forecast_recon': float(recon_loss_forecast.detach().item()),
+            'sdf_recon_loss_forecast_hatc': float(recon_loss_forecast_hatc.detach().item()),
+            'sdf_recon_loss_forecast_lnk': float(recon_loss_forecast_lnk.detach().item()),
+            'sdf_recon_loss_forecast_dlnk': float(recon_loss_forecast_dlnk.detach().item()),
+            'sdf_fc1_rollout_loss': float(rollout_loss.detach().item()),
+            'sdf_delta_penalty': float(delta_penalty.detach().item()),
+            'sdf_delta_penalty_hatc': float(delta_penalty_hatc.detach().item()),
+            'sdf_delta_penalty_lnk': float(delta_penalty_lnk.detach().item()),
+            'sdf_jacobian_penalty': float(jacobian_penalty.detach().item()),
+            'sdf_jacobian_penalty_hatc': float(jacobian_penalty_hatc.detach().item()),
+            'sdf_jacobian_penalty_lnk': float(jacobian_penalty_lnk.detach().item()),
+            'sdf_jacobian_penalty_active': float(1.0 if jacobian_penalty_active else 0.0),
+            'sdf_jacobian_penalty_interval': float(jac_interval),
+            'sdf_fc1_step_count': float(sdf_step),
+            'sdf_fresh_pair_requested': 0.0,
+            'sdf_fresh_pair_used': 0.0,
+            'sdf_fresh_pair_enabled': 0.0,
+            'sdf_use_true_prev_macro': 1.0,
+        }
+        self._latest_sdf_diag = {}
+        return total
     
     def _compute_sdf_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
@@ -2015,14 +2252,24 @@ class Episode:
             children = children[:2]
 
         children_t = torch.stack(children, dim=1)  # (batch, 2, feat)
+        phase = SDFTrainingPhase(getattr(self, "sdf_training_phase", SDFTrainingPhase.SDF_TRUE_ONLY))
+        if phase == SDFTrainingPhase.FC1_ONLY:
+            return self._compute_fc1_only_loss(batch, parent, children_t)
+        if phase == SDFTrainingPhase.JOINT_DISABLED:
+            raise RuntimeError("Joint FC1/SDF loss is disabled by explicit SDF training phase.")
 
-        use_true_prev_macro = bool(
-            self.add_FC1loss and
-            parent.shape[1] >= 9 and
-            getattr(self.hyperparams, "fc1_use_true_macro_state_in_stage2", True)
-        )
-        if self._fc1_teacher_forcing_stage and parent.shape[1] >= 9:
+        use_true_prev_macro = False
+        if phase == SDFTrainingPhase.SDF_TRUE_ONLY:
+            use_true_prev_macro = bool(parent.shape[1] >= 9)
+        elif phase == SDFTrainingPhase.SDF_RECURSIVE_ONLY:
+            use_true_prev_macro = False
+        elif self._fc1_teacher_forcing_stage and parent.shape[1] >= 9:
             use_true_prev_macro = True
+        elif self.add_FC1loss:
+            use_true_prev_macro = bool(
+                parent.shape[1] >= 9 and
+                getattr(self.hyperparams, "fc1_use_true_macro_state_in_stage2", True)
+            )
         c_prev_input = parent[:, 7:8] if use_true_prev_macro else parent[:, 5:6]
         k_prev_input = parent[:, 8:9] if use_true_prev_macro else parent[:, 6:7]
 
@@ -2081,6 +2328,24 @@ class Episode:
             c_parent.squeeze(-1), c_children_wealth.squeeze(-1)
         )  # (batch, n_children)
         main_loss, wealth_main_details = loss_fn.compute_wealth_main_loss(residuals)
+        true_state_main_loss = main_loss
+        if phase == SDFTrainingPhase.SDF_RECURSIVE_ONLY and parent.shape[1] >= 9:
+            w_parent_true, w_children_true, _, c_children_true, k_children_true = model.forward_step(
+                x_prev=parent[:, 4:5],
+                x_curr=fixed_children_x,
+                hatcf_prev=parent[:, 7:8],
+                lnkf_prev=parent[:, 8:9],
+                return_physical=True,
+            )
+            residuals_true = loss_fn.compute_euler_residuals(
+                w_parent_true.squeeze(-1),
+                w_children_true.squeeze(-1),
+                parent[:, 8:9].squeeze(-1),
+                k_children_true.squeeze(-1),
+                parent[:, 7:8].squeeze(-1),
+                c_children_true.squeeze(-1),
+            )
+            true_state_main_loss, _ = loss_fn.compute_wealth_main_loss(residuals_true)
 
         moment_loss = torch.tensor(0.0, device=self.device)
         M_use = M_wealth.squeeze(-1) if M_wealth.dim() == 3 else M_wealth
@@ -2090,11 +2355,20 @@ class Episode:
             L1, L2 = moment_penalty(M_use[:, j], loss_fn.mu_lo, loss_fn.mu_hi, loss_fn.var_hi)
             moment_loss = moment_loss + L1 + L2
 
-        # 第一阶段（add_FC1loss=False）加强矩约束权重
-        if self.add_FC1loss:
-            moment_weight = getattr(self.hyperparams, "sdf_moment_weight", 1.0)
+        euler_weight = 1.0
+        recursive_euler_weight = 0.0
+        # Explicit SDF phases use phase-specific weights to avoid legacy stage1/stage2 ambiguity.
+        if phase == SDFTrainingPhase.SDF_TRUE_ONLY:
+            euler_weight = float(getattr(self.hyperparams, "sdf_euler_weight", 1.0))
+            moment_weight = float(getattr(self.hyperparams, "sdf_true_moment_weight", 5e-4))
+        elif phase == SDFTrainingPhase.SDF_RECURSIVE_ONLY:
+            euler_weight = 1.0
+            recursive_euler_weight = float(getattr(self.hyperparams, "sdf_recursive_loss_weight", 0.25))
+            moment_weight = float(getattr(self.hyperparams, "sdf_recursive_moment_weight", 5e-4))
+        elif self.add_FC1loss:
+            moment_weight = float(getattr(self.hyperparams, "sdf_moment_weight", 1.0))
         else:
-            moment_weight = getattr(self.hyperparams, "sdf_stage1_moment_weight", 5.0)
+            moment_weight = float(getattr(self.hyperparams, "sdf_stage1_moment_weight", 5.0))
 
         # 对 log(E[M]) 增加显式锚，避免 SDF 均值在两阶段切换后漂移
         mean_anchor_loss = torch.tensor(0.0, device=self.device)
@@ -2102,10 +2376,12 @@ class Episode:
         if mean_anchor_target is not None:
             log_mu_for_anchor = torch.log(M_use.mean().clamp_min(1e-8))
             mean_anchor_loss = (log_mu_for_anchor - float(mean_anchor_target)) ** 2
-        if self.add_FC1loss:
-            mean_anchor_weight = float(
-                getattr(self.hyperparams, "sdf_log_mean_anchor_weight_stage2", 5.0)
-            )
+        if phase == SDFTrainingPhase.SDF_TRUE_ONLY:
+            mean_anchor_weight = float(getattr(self.hyperparams, "sdf_true_anchor_weight", 0.05))
+        elif phase == SDFTrainingPhase.SDF_RECURSIVE_ONLY:
+            mean_anchor_weight = float(getattr(self.hyperparams, "sdf_recursive_anchor_weight", 0.05))
+        elif self.add_FC1loss:
+            mean_anchor_weight = float(getattr(self.hyperparams, "sdf_log_mean_anchor_weight_stage2", 5.0))
         else:
             mean_anchor_weight = float(
                 getattr(self.hyperparams, "sdf_log_mean_anchor_weight_stage1", 1.0)
@@ -2307,28 +2583,40 @@ class Episode:
             logger.warning("Non-finite mean-anchor loss detected. Replace with 0.0 for stability.")
             mean_anchor_loss = torch.tensor(0.0, device=self.device)
 
-        hj_warmup_factor = self._compute_stage2_hj_warmup_factor()
+        hj_warmup_factor = 1.0
+        if phase not in {SDFTrainingPhase.SDF_TRUE_ONLY, SDFTrainingPhase.SDF_RECURSIVE_ONLY}:
+            hj_warmup_factor = self._compute_stage2_hj_warmup_factor()
         moment_weight_eff = float(moment_weight) * hj_warmup_factor
         mean_anchor_weight_eff = float(mean_anchor_weight) * hj_warmup_factor
+        recon_weight_eff = float(recon_weight)
+        forecast_recon_weight_eff = float(forecast_recon_weight)
+        delta_penalty_weight_eff = float(delta_penalty_weight)
+        jacobian_penalty_weight_eff = float(jacobian_penalty_weight)
+        if phase in {SDFTrainingPhase.SDF_TRUE_ONLY, SDFTrainingPhase.SDF_RECURSIVE_ONLY}:
+            recon_weight_eff = 0.0
+            forecast_recon_weight_eff = 0.0
+            delta_penalty_weight_eff = 0.0
+            jacobian_penalty_weight_eff = 0.0
 
         if bool(getattr(self, "_fc1_teacher_forcing_stage", False)) and self.add_FC1loss:
             teacher_weight = float(getattr(self.hyperparams, "fc1_teacher_forcing_weight", 1.0))
             total_sdf_loss = teacher_weight * (
                 recon_loss
-                + forecast_recon_weight * recon_loss_forecast
-                + delta_penalty_weight * delta_penalty
-                + jacobian_penalty_weight * jacobian_penalty
+                + forecast_recon_weight_eff * recon_loss_forecast
+                + delta_penalty_weight_eff * delta_penalty
+                + jacobian_penalty_weight_eff * jacobian_penalty
             )
             moment_weight_eff = 0.0
             mean_anchor_weight_eff = 0.0
         else:
             total_sdf_loss = (
-                main_loss
+                euler_weight * true_state_main_loss
+                + recursive_euler_weight * main_loss
                 + moment_weight_eff * moment_loss
-                + recon_weight * recon_loss
-                + forecast_recon_weight * recon_loss_forecast
-                + delta_penalty_weight * delta_penalty
-                + jacobian_penalty_weight * jacobian_penalty
+                + recon_weight_eff * recon_loss
+                + forecast_recon_weight_eff * recon_loss_forecast
+                + delta_penalty_weight_eff * delta_penalty
+                + jacobian_penalty_weight_eff * jacobian_penalty
                 + mean_anchor_weight_eff * mean_anchor_loss
             )
 
@@ -2352,8 +2640,19 @@ class Episode:
                 if torch.is_tensor(value) and value.numel() == 1
             }
             self._latest_sdf_terms = {
+                'sdf_training_phase': phase.value,
                 'sdf_main_loss': float(main_loss.detach().item()),
+                'sdf_true_state_main_loss': float(true_state_main_loss.detach().item()),
                 'sdf_total_loss': float(total_sdf_loss.detach().item()),
+                'sdf_main_weight_effective': float(euler_weight),
+                'sdf_recursive_main_weight_effective': float(recursive_euler_weight),
+                'sdf_moment_weight_effective': float(moment_weight_eff),
+                'sdf_anchor_weight_effective': float(mean_anchor_weight_eff),
+                'fc1_recon_weight_effective': float(recon_weight_eff),
+                'fc1_forecast_weight_effective': float(forecast_recon_weight_eff),
+                'fc1_rollout_weight_effective': 0.0,
+                'fc1_delta_weight_effective': float(delta_penalty_weight_eff),
+                'fc1_jacobian_weight_effective': float(jacobian_penalty_weight_eff if jacobian_penalty_active else 0.0),
                 'sdf_wealth_loss_mode_signed_aio': float(
                     1.0 if getattr(loss_fn, "wealth_loss_mode", "legacy_abs_log1p") == "signed_aio" else 0.0
                 ),
@@ -2380,13 +2679,13 @@ class Episode:
                     float(mean_anchor_target) if mean_anchor_target is not None else float('nan')
                 ),
                 'sdf_moment_weight': float(moment_weight_eff),
-                'sdf_forecast_recon_weight': float(forecast_recon_weight),
+                'sdf_forecast_recon_weight': float(forecast_recon_weight_eff),
                 'sdf_hatc_recon_inner_weight': float(hatc_recon_inner_weight),
                 'sdf_lnk_recon_inner_weight': float(lnk_recon_inner_weight),
-                'sdf_delta_penalty_weight': float(delta_penalty_weight),
+                'sdf_delta_penalty_weight': float(delta_penalty_weight_eff),
                 'sdf_delta_hatc_abs_max': float(delta_hatc_abs_max),
                 'sdf_delta_lnk_abs_max': float(delta_lnk_abs_max),
-                'sdf_jacobian_penalty_weight': float(jacobian_penalty_weight),
+                'sdf_jacobian_penalty_weight': float(jacobian_penalty_weight_eff),
                 'sdf_jacobian_penalty_interval': float(jacobian_penalty_interval),
                 'sdf_jacobian_penalty_active': float(1.0 if jacobian_penalty_active else 0.0),
                 'sdf_fc1_step_count': float(sdf_fc1_step_count),
@@ -4748,6 +5047,7 @@ class Episode:
 
         prev_flag = self.add_FC1loss
         prev_teacher_flag = self._fc1_teacher_forcing_stage
+        prev_phase = getattr(self, "sdf_training_phase", SDFTrainingPhase.SDF_TRUE_ONLY)
         self.add_FC1loss = True
         try:
             sdf_batches = self._create_sdf_batches_from_macro_tensor(
@@ -4763,16 +5063,43 @@ class Episode:
                 )
                 if before_eval:
                     module_summaries['sdf_fc1_fixed_batch_eval_before'] = before_eval
-                tf_epochs = max(0, int(getattr(self.hyperparams, "fc1_teacher_forcing_epochs", 0)))
-                if tf_epochs > 0:
-                    self._fc1_teacher_forcing_stage = True
-                    module_summaries['sdf_fc1_teacher_forcing'] = self._run_batches(
-                        sdf_batches, tf_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(tf) '
+                if bool(getattr(self.hyperparams, "sdf_training_schedule_enabled", True)):
+                    fc1_epochs = max(0, int(getattr(self.hyperparams, "fc1_only_epochs", 10)))
+                    true_epochs = max(0, int(getattr(self.hyperparams, "sdf_true_only_epochs", 20)))
+                    recursive_epochs = max(0, int(getattr(self.hyperparams, "sdf_recursive_only_epochs", 10)))
+
+                    if fc1_epochs > 0:
+                        self.set_sdf_training_phase(SDFTrainingPhase.FC1_ONLY)
+                        module_summaries['sdf_fc1_fc1_only'] = self._run_batches(
+                            sdf_batches, fc1_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(fc1-only) '
+                        )
+                    if true_epochs > 0:
+                        self.set_sdf_training_phase(SDFTrainingPhase.SDF_TRUE_ONLY)
+                        module_summaries['sdf_fc1_sdf_true_only'] = self._run_batches(
+                            sdf_batches, true_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(sdf-true) '
+                        )
+                    if recursive_epochs > 0:
+                        self.set_sdf_training_phase(SDFTrainingPhase.SDF_RECURSIVE_ONLY)
+                        module_summaries['sdf_fc1_sdf_recursive_only'] = self._run_batches(
+                            sdf_batches, recursive_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(sdf-recursive) '
+                        )
+                    module_summaries['sdf_fc1_stage2'] = module_summaries.get(
+                        'sdf_fc1_sdf_recursive_only',
+                        module_summaries.get('sdf_fc1_sdf_true_only', module_summaries.get('sdf_fc1_fc1_only', {}))
                     )
-                    self._fc1_teacher_forcing_stage = False
-                module_summaries['sdf_fc1_stage2'] = self._run_batches(
-                    sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(stage2) '
-                )
+                else:
+                    tf_epochs = max(0, int(getattr(self.hyperparams, "fc1_teacher_forcing_epochs", 0)))
+                    if tf_epochs > 0:
+                        self.set_sdf_training_phase(SDFTrainingPhase.FC1_ONLY)
+                        self._fc1_teacher_forcing_stage = True
+                        module_summaries['sdf_fc1_teacher_forcing'] = self._run_batches(
+                            sdf_batches, tf_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(tf) '
+                        )
+                        self._fc1_teacher_forcing_stage = False
+                    self.set_sdf_training_phase(SDFTrainingPhase.SDF_RECURSIVE_ONLY)
+                    module_summaries['sdf_fc1_stage2'] = self._run_batches(
+                        sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(stage2) '
+                    )
                 # keep backward compatibility for consumers expecting a single sdf_fc1 key
                 module_summaries['sdf_fc1'] = module_summaries['sdf_fc1_stage2']
                 after_eval = self._evaluate_sdf_fc1_batches(
@@ -4785,6 +5112,7 @@ class Episode:
         finally:
             self.add_FC1loss = prev_flag
             self._fc1_teacher_forcing_stage = prev_teacher_flag
+            self.set_sdf_training_phase(prev_phase)
 
     def _resolve_episode_mode(self, episode_mode: Optional[str]) -> str:
         if episode_mode is None:

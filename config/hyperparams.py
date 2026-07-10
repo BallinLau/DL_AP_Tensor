@@ -148,22 +148,28 @@ class HyperParams:
     # Stage2 true-state 重建损失权重：
     # (Hatc_t, LnK_t) -> (Hatc_{t+1}, LnK_{t+1})
     # 这是 Gomes 口径下识别 FC1 law of motion 的主要监督。
+    sdf_training_schedule_enabled: bool = True
+    fc1_only_epochs: int = 10
+    sdf_true_only_epochs: int = 20
+    sdf_recursive_only_epochs: int = 10
     fc1_recon_weight: float = 1.0
     # Stage2 辅助约束 forecast-state 递推：
     # (Hatcf_t, LnKF_t) -> (Hatcf_{t+1}, LnKF_{t+1}) 也要贴近真实下一期
-    fc1_forecast_recon_weight: float = 0.1
+    fc1_forecast_recon_weight: float = 0.25
+    fc1_rollout_weight: float = 0.5
+    fc1_rollout_horizon: int = 5
     # FC1 重建项内部按目标拆分权重。
     # 经验上 LnK 的原始尺度波动更大，若不单独降权，容易主导 FC1 训练并把 M 分布拉坏。
     fc1_hatc_recon_weight: float = 1.0
     fc1_lnk_recon_weight: float = 0.25
     # Forecast-state 一步增量幅度约束。
     # 不预设方向，只惩罚过大的单步跳跃，避免递推响应面把 child state 撕裂成多个 regime。
-    fc1_delta_penalty_weight: float = 10.0
+    fc1_delta_penalty_weight: float = 1.0
     fc1_delta_hatc_abs_max: float = 0.50
     fc1_delta_lnk_abs_max: float = 0.30
     # Forecast-state 响应面局部平滑约束（Jacobian penalty）。
     # 用于抑制 FC1 对 (hatcf_prev, lnkf_prev) 的过强局部敏感性，减少 child state regime splitting。
-    fc1_jacobian_penalty_weight: float = 1.0
+    fc1_jacobian_penalty_weight: float = 0.0
     # Jacobian penalty 涉及二阶反传，默认每 10 个 SDF/FC1 optimizer step 计算一次；<=0 表示禁用该项。
     fc1_jacobian_penalty_interval: int = 10
     # Stage2 先做若干轮 FC1 teacher forcing 预训练（使用真实 Hatc_t/LnK_t 输入）
@@ -186,6 +192,17 @@ class HyperParams:
     # Stage2 联合训练初期，对 HJ 相关项做 warmup，避免 FC1 还未收敛时被过早牵引
     sdf_stage2_hj_warmup_epochs: int = 5
     sdf_stage2_hj_warmup_start: float = 0.2
+    sdf_euler_weight: float = 1.0
+    sdf_true_moment_weight: float = 5e-4
+    sdf_true_anchor_weight: float = 0.05
+    sdf_recursive_loss_weight: float = 0.25
+    sdf_recursive_moment_weight: float = 5e-4
+    sdf_recursive_anchor_weight: float = 0.05
+    fc1_recursive_r2_min: float = 0.0
+    fc1_rmse_growth_h5_max: float = 2.0
+    sdf_log_mean_error_max: float = 0.02
+    sdf_signed_t_abs_max: float = 2.0
+    stage_gate_required_consecutive_passes: int = 3
 
     # ========== Policy/Value: Q 优先训练与形状约束 ==========
     # 在 policy/value 联合训练前先进行 q-only 预训练轮数
@@ -234,7 +251,7 @@ class HyperParams:
     bp_grid_fine_size: int = 9
     bp_grid_quadratic_refine: bool = False
     bp_grid_parent_chunk_size: int = 2048
-    bp_grid_candidate_chunk_size: int = 4
+    bp_grid_candidate_chunk_size: int = 0
     bp_grid_max_expanded_states: int = 65536
     # Huber losses for target-grid value backup and policy distillation.
     bp_grid_value_huber_delta: float = 1.0

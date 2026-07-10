@@ -121,16 +121,28 @@ def build_hyperparams():
     hp.w_q = 1.0
     hp.w_fc2 = 1.0
     # SDF 两阶段稳定配置：true-state one-step 是主监督，forecast-state 只做辅助递推稳定项。
+    hp.sdf_training_schedule_enabled = True
+    hp.fc1_only_epochs = 10
+    hp.sdf_true_only_epochs = 20
+    hp.sdf_recursive_only_epochs = 10
     hp.fc1_recon_weight = 1.0
-    hp.fc1_forecast_recon_weight = 0.1
+    hp.fc1_forecast_recon_weight = 0.25
+    hp.fc1_rollout_weight = 0.5
+    hp.fc1_rollout_horizon = 5
     hp.fc1_hatc_recon_weight = 1.0
     hp.fc1_lnk_recon_weight = 0.25
-    hp.fc1_delta_penalty_weight = 10.0
+    hp.fc1_delta_penalty_weight = 1.0
     hp.fc1_delta_hatc_abs_max = 0.50
     hp.fc1_delta_lnk_abs_max = 0.30
-    hp.fc1_jacobian_penalty_weight = 1.0
+    hp.fc1_jacobian_penalty_weight = 0.0
     hp.fc1_jacobian_penalty_interval = 10
     hp.fc1_use_true_macro_state_in_stage2 = True
+    hp.sdf_euler_weight = 1.0
+    hp.sdf_true_moment_weight = 5e-4
+    hp.sdf_true_anchor_weight = 0.05
+    hp.sdf_recursive_loss_weight = 0.25
+    hp.sdf_recursive_moment_weight = 5e-4
+    hp.sdf_recursive_anchor_weight = 0.05
     hp.sdf_stage1_lr = 1e-4
     hp.sdf_stage2_lr = 2e-4
     hp.sdf_stage1_moment_weight = 5.0
@@ -144,6 +156,9 @@ def build_hyperparams():
     hp.pv_use_clipped_m = True
     hp.pv_m_clamp_min = 0.7
     hp.pv_m_clamp_max = 1.3
+    hp.bp_grid_parent_chunk_size = 2048
+    hp.bp_grid_candidate_chunk_size = 0
+    hp.bp_grid_max_expanded_states = 65536
     return hp
 
 
