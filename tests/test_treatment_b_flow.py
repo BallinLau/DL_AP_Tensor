@@ -10,7 +10,7 @@ sys.path.append(str(ROOT))
 
 from data import TensorTable  # noqa: E402
 from experiments.run_utils import build_hyperparams  # noqa: E402
-from training.episode import Episode  # noqa: E402
+from training.episode import Episode, SDFTrainingPhase  # noqa: E402
 
 
 class _DummyMonitor:
@@ -269,6 +269,45 @@ class TreatmentBFlowTest(unittest.TestCase):
                 simulate_kwargs={"horizon": 2},
                 episode_mode="modea",
             )
+
+    def test_run_episode_resets_post0_stale_bootstrap_phase(self):
+        episode = Episode.__new__(Episode)
+        episode.models = {}
+        episode.optimizers = {}
+        episode.config = SimpleNamespace(DEVICE=torch.device("cpu"))
+        episode.hyperparams = SimpleNamespace(use_tensor_pipeline=True, simulate_horizon=2)
+        episode.device = torch.device("cpu")
+        episode.episode_id = 1
+        episode.gpu_monitor = _DummyMonitor()
+        episode.df = None
+        episode.df_macro = None
+        episode.df_sdf = None
+        episode.tensor_firm = None
+        episode.tensor_macro = None
+        episode.tensor_sdf = None
+        episode.step_count = 0
+        episode.loss_history = {}
+        episode.add_FC1loss = False
+        episode.train_mode = "2time"
+        episode.sdf_training_phase = SDFTrainingPhase.EPISODE0_BOOTSTRAP
+        episode.reset_sdf_shock_bank = MethodType(lambda self: None, episode)
+        episode._resolve_episode_mode = MethodType(lambda self, episode_mode: "modeb", episode)
+        episode._use_tensor_pipeline = MethodType(lambda self: True, episode)
+        episode._simulate_tensor = MethodType(lambda self, *args, **kwargs: None, episode)
+
+        episode.run_episode(
+            n_epochs=1,
+            batch_size=2,
+            log_interval=1,
+            n_paths=1,
+            group_size=1,
+            n_branches=2,
+            train_modules=[],
+            simulate_kwargs={"horizon": 2},
+            episode_mode="modeb",
+        )
+
+        self.assertEqual(episode.sdf_training_phase, SDFTrainingPhase.JOINT_DISABLED)
 
     def test_fixed_batch_eval_reports_stage2_object_layers(self):
         episode = Episode.__new__(Episode)

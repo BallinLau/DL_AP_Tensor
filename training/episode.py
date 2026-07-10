@@ -2754,7 +2754,11 @@ class Episode:
         forecast_recon_weight_eff = float(forecast_recon_weight)
         delta_penalty_weight_eff = float(delta_penalty_weight)
         jacobian_penalty_weight_eff = float(jacobian_penalty_weight)
-        if phase in {SDFTrainingPhase.SDF_TRUE_ONLY, SDFTrainingPhase.SDF_RECURSIVE_ONLY}:
+        if phase in {
+            SDFTrainingPhase.EPISODE0_BOOTSTRAP,
+            SDFTrainingPhase.SDF_TRUE_ONLY,
+            SDFTrainingPhase.SDF_RECURSIVE_ONLY,
+        }:
             recon_weight_eff = 0.0
             forecast_recon_weight_eff = 0.0
             delta_penalty_weight_eff = 0.0
@@ -5619,6 +5623,10 @@ class Episode:
         train_modules = train_modules or ['sdf_fc1', 'policy_value', 'fc2']
         self.train_mode = train_mode
         self.add_FC1loss = False
+        if int(self.episode_id) == 0:
+            self.set_sdf_training_phase(SDFTrainingPhase.EPISODE0_BOOTSTRAP)
+        else:
+            self.set_sdf_training_phase(SDFTrainingPhase.JOINT_DISABLED)
         self.reset_sdf_shock_bank()
 
         horizon_mode1 = int(simulate_kwargs.pop('horizon_mode1', 1))

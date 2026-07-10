@@ -111,6 +111,10 @@ def test_episode0_bootstrap_accepts_proxy_macro_state():
     assert ep._latest_sdf_terms["sdf_training_phase"] == SDFTrainingPhase.EPISODE0_BOOTSTRAP.value
     assert ep._latest_sdf_terms["sdf_moment_weight_effective"] == ep.hyperparams.sdf_stage1_moment_weight
     assert ep._latest_sdf_terms["sdf_anchor_weight_effective"] == ep.hyperparams.sdf_log_mean_anchor_weight_stage1
+    assert ep._latest_sdf_terms["fc1_recon_weight_effective"] == 0.0
+    assert ep._latest_sdf_terms["fc1_forecast_weight_effective"] == 0.0
+    assert ep._latest_sdf_terms["fc1_delta_weight_effective"] == 0.0
+    assert ep._latest_sdf_terms["fc1_jacobian_weight_effective"] == 0.0
     assert ep._latest_sdf_terms["sdf_hj_warmup_factor"] == 1.0
 
 
