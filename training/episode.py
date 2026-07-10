@@ -5072,8 +5072,10 @@ class Episode:
 
         hatc_true_parts: List[torch.Tensor] = []
         hatc_pred_parts: List[torch.Tensor] = []
+        primary_hatc_baseline_parts: List[torch.Tensor] = []
         lnk_true_parts: List[torch.Tensor] = []
         lnk_pred_parts: List[torch.Tensor] = []
+        primary_lnk_baseline_parts: List[torch.Tensor] = []
         dlnk_true_parts: List[torch.Tensor] = []
         dlnk_pred_parts: List[torch.Tensor] = []
         current_hatc_forecast_parts: List[torch.Tensor] = []
@@ -5162,8 +5164,14 @@ class Episode:
                     if hatcf_true is not None and lnkf_true is not None:
                         hatc_true_parts.append(hatcf_true.detach().reshape(-1).cpu())
                         hatc_pred_parts.append(c_children_primary.detach().reshape(-1).cpu())
+                        primary_hatc_baseline_parts.append(
+                            c_prev_true.unsqueeze(1).expand_as(hatcf_true).detach().reshape(-1).cpu()
+                        )
                         lnk_true_parts.append(lnkf_true.detach().reshape(-1).cpu())
                         lnk_pred_parts.append(k_children_primary.detach().reshape(-1).cpu())
+                        primary_lnk_baseline_parts.append(
+                            k_prev_true.unsqueeze(1).expand_as(lnkf_true).detach().reshape(-1).cpu()
+                        )
                         dlnk_true_parts.append((lnkf_true - k_prev_true.unsqueeze(1)).detach().reshape(-1).cpu())
                         dlnk_pred_parts.append((k_children_primary - k_prev_true.unsqueeze(1)).detach().reshape(-1).cpu())
                         if has_true_prev_macro:
@@ -5224,32 +5232,82 @@ class Episode:
 
         out: Dict[str, float] = {}
 
-        def _safe_metric_pair(name: str, true_parts: List[torch.Tensor], pred_parts: List[torch.Tensor]) -> None:
+        def _safe_forecast_metrics(
+            name: str,
+            true_parts: List[torch.Tensor],
+            pred_parts: List[torch.Tensor],
+            baseline_parts: Optional[List[torch.Tensor]] = None,
+        ) -> None:
             if not true_parts or not pred_parts:
                 return
-            y = torch.cat(true_parts).to(torch.float32)
-            p = torch.cat(pred_parts).to(torch.float32)
-            mask = torch.isfinite(y) & torch.isfinite(p)
-            out[f'{prefix}_{name}_n'] = float(mask.sum().item())
+            y_raw = torch.cat(true_parts).to(torch.float32)
+            p_raw = torch.cat(pred_parts).to(torch.float32)
+            total_n = int(y_raw.numel())
+            mask = torch.isfinite(y_raw) & torch.isfinite(p_raw)
+            finite_n = int(mask.sum().item())
+            out[f'{prefix}_{name}_total_n'] = float(total_n)
+            out[f'{prefix}_{name}_finite_n'] = float(finite_n)
+            out[f'{prefix}_{name}_finite_ratio'] = (
+                float(mask.to(torch.float32).mean().item()) if total_n > 0 else float('nan')
+            )
+            out[f'{prefix}_{name}_n'] = float(finite_n)
             if int(mask.sum().item()) < 2:
                 out[f'{prefix}_{name}_r2'] = float('nan')
                 out[f'{prefix}_{name}_rmse'] = float('nan')
                 return
-            y = y[mask]
-            p = p[mask]
-            sst = (y - y.mean()).pow(2).sum()
-            sse = (y - p).pow(2).sum()
+            y = y_raw[mask]
+            p = p_raw[mask]
+            err = p - y
+            target_mean = y.mean()
+            target_std = y.std(unbiased=True)
+            pred_mean = p.mean()
+            pred_std = p.std(unbiased=True)
+            sst = (y - target_mean).pow(2).sum()
+            sse = err.pow(2).sum()
+            out[f'{prefix}_{name}_target_mean'] = float(target_mean.item())
+            out[f'{prefix}_{name}_target_std'] = float(target_std.item())
+            out[f'{prefix}_{name}_target_min'] = float(y.min().item())
+            out[f'{prefix}_{name}_target_max'] = float(y.max().item())
+            out[f'{prefix}_{name}_pred_mean'] = float(pred_mean.item())
+            out[f'{prefix}_{name}_pred_std'] = float(pred_std.item())
+            out[f'{prefix}_{name}_bias'] = float(err.mean().item())
+            out[f'{prefix}_{name}_mae'] = float(err.abs().mean().item())
             out[f'{prefix}_{name}_r2'] = float((1.0 - sse / sst).item()) if float(sst.item()) > 1e-12 else float('nan')
-            out[f'{prefix}_{name}_rmse'] = float(torch.sqrt((y - p).pow(2).mean()).item())
+            out[f'{prefix}_{name}_rmse'] = float(torch.sqrt(err.pow(2).mean()).item())
+            if baseline_parts:
+                b_raw = torch.cat(baseline_parts).to(torch.float32)
+                baseline_mask = mask & torch.isfinite(b_raw)
+                if int(baseline_mask.sum().item()) >= 2:
+                    y_b = y_raw[baseline_mask]
+                    p_b = p_raw[baseline_mask]
+                    b_b = b_raw[baseline_mask]
+                    model_mse = (p_b - y_b).pow(2).mean()
+                    baseline_mse = (b_b - y_b).pow(2).mean()
+                    out[f'{prefix}_{name}_baseline_rmse'] = float(torch.sqrt(baseline_mse).item())
+                    out[f'{prefix}_{name}_skill_vs_persistence'] = (
+                        float((1.0 - model_mse / baseline_mse).item())
+                        if float(baseline_mse.item()) > 1e-12
+                        else float('nan')
+                    )
 
-        _safe_metric_pair('hatc', hatc_true_parts, hatc_pred_parts)
-        _safe_metric_pair('lnk', lnk_true_parts, lnk_pred_parts)
-        _safe_metric_pair('primary_true_state_hatc_next', hatc_true_parts, hatc_pred_parts)
-        _safe_metric_pair('primary_true_state_lnk_next', lnk_true_parts, lnk_pred_parts)
-        _safe_metric_pair('primary_true_state_dlnk_next', dlnk_true_parts, dlnk_pred_parts)
-        _safe_metric_pair('recursive_forecast_state_hatc_next', recursive_hatc_true_parts, recursive_hatc_pred_parts)
-        _safe_metric_pair('recursive_forecast_state_lnk_next', recursive_lnk_true_parts, recursive_lnk_pred_parts)
-        _safe_metric_pair('recursive_forecast_state_dlnk_next', recursive_dlnk_true_parts, recursive_dlnk_pred_parts)
+        _safe_forecast_metrics('hatc', hatc_true_parts, hatc_pred_parts, primary_hatc_baseline_parts)
+        _safe_forecast_metrics('lnk', lnk_true_parts, lnk_pred_parts, primary_lnk_baseline_parts)
+        _safe_forecast_metrics(
+            'primary_true_state_hatc_next',
+            hatc_true_parts,
+            hatc_pred_parts,
+            primary_hatc_baseline_parts,
+        )
+        _safe_forecast_metrics(
+            'primary_true_state_lnk_next',
+            lnk_true_parts,
+            lnk_pred_parts,
+            primary_lnk_baseline_parts,
+        )
+        _safe_forecast_metrics('primary_true_state_dlnk_next', dlnk_true_parts, dlnk_pred_parts)
+        _safe_forecast_metrics('recursive_forecast_state_hatc_next', recursive_hatc_true_parts, recursive_hatc_pred_parts)
+        _safe_forecast_metrics('recursive_forecast_state_lnk_next', recursive_lnk_true_parts, recursive_lnk_pred_parts)
+        _safe_forecast_metrics('recursive_forecast_state_dlnk_next', recursive_dlnk_true_parts, recursive_dlnk_pred_parts)
 
         def _safe_gap_metrics(name: str, true_parts: List[torch.Tensor], pred_parts: List[torch.Tensor]) -> None:
             if not true_parts or not pred_parts:
@@ -5336,30 +5394,263 @@ class Episode:
             )
         return out
 
-    def _fc1_gate_passed(self, eval_metrics: Dict[str, float], prefix: str) -> Tuple[bool, Dict[str, Any]]:
+    def _fc1_data_viability_passed(self, eval_metrics: Dict[str, float], prefix: str) -> Tuple[bool, Dict[str, Any]]:
+        min_pairs = int(getattr(self.hyperparams, "fc1_gate_min_pairs", 128))
+        finite_min = float(getattr(self.hyperparams, "fc1_rollout_finite_ratio_min", 1.0))
+        std_floor = float(getattr(self.hyperparams, "fc1_target_std_floor", 1e-4))
+        variables = {
+            "hatc": "primary_true_state_hatc_next",
+            "lnk": "primary_true_state_lnk_next",
+        }
+        details = {}
+        passed_all = True
+        for short_name, metric_name in variables.items():
+            n = eval_metrics.get(f"{prefix}_{metric_name}_finite_n", float("nan"))
+            finite_ratio = eval_metrics.get(f"{prefix}_{metric_name}_finite_ratio", float("nan"))
+            target_std = eval_metrics.get(f"{prefix}_{metric_name}_target_std", float("nan"))
+            valid = (
+                np.isfinite(n)
+                and np.isfinite(finite_ratio)
+                and np.isfinite(target_std)
+                and float(n) >= min_pairs
+                and float(finite_ratio) >= finite_min
+            )
+            low_variance = np.isfinite(target_std) and float(target_std) < std_floor
+            details[short_name] = {
+                "n": float(n),
+                "finite_ratio": float(finite_ratio),
+                "target_std": float(target_std),
+                "low_variance": bool(low_variance),
+                "valid": bool(valid),
+            }
+            passed_all = passed_all and bool(valid)
+        return bool(passed_all), {
+            "passed": bool(passed_all),
+            "failure_source": None if passed_all else "rollout_data_invalid",
+            "min_pairs": min_pairs,
+            "finite_ratio_min": finite_min,
+            "target_std_floor": std_floor,
+            "variables": details,
+        }
+
+    def _fc1_one_step_gate_passed(self, eval_metrics: Dict[str, float], prefix: str) -> Tuple[bool, Dict[str, Any]]:
+        std_floor = float(getattr(self.hyperparams, "fc1_target_std_floor", 1e-4))
+        r2_min = float(getattr(self.hyperparams, "fc1_one_step_r2_min", 0.0))
+        skill_min = float(getattr(self.hyperparams, "fc1_one_step_skill_min", 0.0))
+        configs = {
+            "hatc": {
+                "name": "primary_true_state_hatc_next",
+                "abs_rmse_max": float(getattr(self.hyperparams, "fc1_one_step_hatc_rmse_abs_max", 0.05)),
+            },
+            "lnk": {
+                "name": "primary_true_state_lnk_next",
+                "abs_rmse_max": float(getattr(self.hyperparams, "fc1_one_step_lnk_rmse_abs_max", 0.05)),
+            },
+        }
+        checks = {}
+        passed_all = True
+        for variable, cfg in configs.items():
+            name = cfg["name"]
+            target_std = eval_metrics.get(f"{prefix}_{name}_target_std", float("nan"))
+            r2 = eval_metrics.get(f"{prefix}_{name}_r2", float("nan"))
+            rmse = eval_metrics.get(f"{prefix}_{name}_rmse", float("nan"))
+            skill = eval_metrics.get(f"{prefix}_{name}_skill_vs_persistence", float("nan"))
+            low_variance = np.isfinite(target_std) and float(target_std) < std_floor
+            if low_variance:
+                variable_passed = np.isfinite(rmse) and float(rmse) <= cfg["abs_rmse_max"]
+                gate_mode = "absolute_rmse"
+            else:
+                variable_passed = (
+                    np.isfinite(r2)
+                    and np.isfinite(skill)
+                    and float(r2) >= r2_min
+                    and float(skill) >= skill_min
+                )
+                gate_mode = "r2_and_persistence_skill"
+            checks[variable] = {
+                "passed": bool(variable_passed),
+                "gate_mode": gate_mode,
+                "target_std": float(target_std),
+                "r2": float(r2),
+                "skill_vs_persistence": float(skill),
+                "rmse": float(rmse),
+                "rmse_abs_max": cfg["abs_rmse_max"],
+            }
+            passed_all = passed_all and bool(variable_passed)
+        return bool(passed_all), {
+            "passed": bool(passed_all),
+            "failure_source": None if passed_all else "fc1_one_step_underfit",
+            "checks": checks,
+        }
+
+    def _fc1_recursive_gate_passed(self, eval_metrics: Dict[str, float], prefix: str) -> Tuple[bool, Dict[str, Any]]:
+        std_floor = float(getattr(self.hyperparams, "fc1_target_std_floor", 1e-4))
         min_r2 = float(getattr(self.hyperparams, "fc1_recursive_r2_min", 0.0))
-        max_growth = float(getattr(self.hyperparams, "fc1_rmse_growth_h5_max", 2.0))
+        growth_max = float(getattr(self.hyperparams, "fc1_rmse_growth_h5_max", 2.0))
         horizon = int(getattr(self.hyperparams, "fc1_rollout_horizon", 5))
-        checks = {
-            "recursive_hatc_r2": eval_metrics.get(f"{prefix}_recursive_forecast_state_hatc_next_r2", float("nan")),
-            "recursive_lnk_r2": eval_metrics.get(f"{prefix}_recursive_forecast_state_lnk_next_r2", float("nan")),
-            "rmse_growth": eval_metrics.get(f"{prefix}_fc1_rmse_growth_h{horizon}", float("nan")),
-        }
-        passed = (
-            np.isfinite(checks["recursive_hatc_r2"])
-            and np.isfinite(checks["recursive_lnk_r2"])
-            and np.isfinite(checks["rmse_growth"])
-            and checks["recursive_hatc_r2"] >= min_r2
-            and checks["recursive_lnk_r2"] >= min_r2
-            and checks["rmse_growth"] <= max_growth
-        )
-        diag = {
-            "passed": bool(passed),
+        growth = eval_metrics.get(f"{prefix}_fc1_rmse_growth_h{horizon}", float("nan"))
+        passed_all = np.isfinite(growth) and float(growth) <= growth_max
+        variables = {}
+        for variable, metric_name, abs_rmse_max in [
+            ("hatc", "recursive_forecast_state_hatc_next", float(getattr(self.hyperparams, "fc1_one_step_hatc_rmse_abs_max", 0.05))),
+            ("lnk", "recursive_forecast_state_lnk_next", float(getattr(self.hyperparams, "fc1_one_step_lnk_rmse_abs_max", 0.05))),
+        ]:
+            target_std = eval_metrics.get(f"{prefix}_{metric_name}_target_std", float("nan"))
+            r2 = eval_metrics.get(f"{prefix}_{metric_name}_r2", float("nan"))
+            rmse = eval_metrics.get(f"{prefix}_{metric_name}_rmse", float("nan"))
+            low_variance = np.isfinite(target_std) and float(target_std) < std_floor
+            if low_variance:
+                variable_passed = np.isfinite(rmse) and float(rmse) <= abs_rmse_max
+                gate_mode = "absolute_rmse"
+            else:
+                variable_passed = np.isfinite(r2) and float(r2) >= min_r2
+                gate_mode = "recursive_r2"
+            variables[variable] = {
+                "passed": bool(variable_passed),
+                "gate_mode": gate_mode,
+                "target_std": float(target_std),
+                "r2": float(r2),
+                "rmse": float(rmse),
+                "rmse_abs_max": abs_rmse_max,
+            }
+            passed_all = passed_all and bool(variable_passed)
+        return bool(passed_all), {
+            "passed": bool(passed_all),
+            "failure_source": None if passed_all else "fc1_recursive_instability",
             "min_r2": min_r2,
-            "max_rmse_growth": max_growth,
-            **checks,
+            "rmse_growth": float(growth),
+            "rmse_growth_max": growth_max,
+            "max_rmse_growth": growth_max,
+            "variables": variables,
         }
-        return bool(passed), diag
+
+    def _run_fc1_until_gates(
+        self,
+        train_batches: List[Dict[str, torch.Tensor]],
+        val_batches: List[Dict[str, torch.Tensor]],
+        log_interval: int,
+    ) -> Dict[str, Any]:
+        epochs_per_round = max(1, int(getattr(self.hyperparams, "fc1_epochs_per_round", 10)))
+        max_rounds = max(1, int(getattr(self.hyperparams, "fc1_max_rounds", 8)))
+        patience = max(1, int(getattr(self.hyperparams, "fc1_plateau_patience", 2)))
+        min_improvement = float(getattr(self.hyperparams, "fc1_min_relative_improvement", 0.01))
+        eval_batches = int(getattr(self.hyperparams, "sdf_fc1_eval_max_batches", 0))
+        eval_batches_arg = eval_batches if eval_batches > 0 else None
+
+        before_eval = self._evaluate_sdf_fc1_batches(
+            val_batches,
+            prefix="fc1_before",
+            max_batches=eval_batches_arg,
+        )
+        data_passed, data_diag = self._fc1_data_viability_passed(before_eval, prefix="fc1_before")
+        if not data_passed:
+            return {
+                "passed": False,
+                "failed_stage": "rollout_data_viability",
+                "failure_source": "rollout_data_invalid",
+                "data_viability": data_diag,
+                "before_eval_metrics": before_eval,
+                "rounds": [],
+            }
+
+        rounds: List[Dict[str, Any]] = []
+        best_score = float("inf")
+        stale_rounds = 0
+        for round_idx in range(max_rounds):
+            display_round = round_idx + 1
+            train_summary = self._run_batches(
+                train_batches,
+                epochs_per_round,
+                log_interval,
+                ["sdf_fc1"],
+                desc_prefix=f"SDF/FC1(fc1 r{display_round}/{max_rounds}) ",
+            )
+            prefix = f"after_fc1_round{display_round}"
+            eval_metrics = self._evaluate_sdf_fc1_batches(
+                val_batches,
+                prefix=prefix,
+                max_batches=eval_batches_arg,
+            )
+            one_step_passed, one_step_diag = self._fc1_one_step_gate_passed(eval_metrics, prefix=prefix)
+            recursive_passed, recursive_diag = self._fc1_recursive_gate_passed(eval_metrics, prefix=prefix)
+            hatc_rmse = eval_metrics.get(f"{prefix}_primary_true_state_hatc_next_rmse", float("inf"))
+            lnk_rmse = eval_metrics.get(f"{prefix}_primary_true_state_lnk_next_rmse", float("inf"))
+            growth = recursive_diag.get("rmse_growth", float("inf"))
+            score = float(hatc_rmse) + float(lnk_rmse) + max(0.0, float(growth) - 1.0)
+            round_record = {
+                "round": display_round,
+                "train_summary": train_summary,
+                "eval_metrics": eval_metrics,
+                "one_step_gate": one_step_diag,
+                "recursive_gate": recursive_diag,
+                "score": score,
+            }
+            rounds.append(round_record)
+            if one_step_passed and recursive_passed:
+                return {
+                    "passed": True,
+                    "failed_stage": None,
+                    "failure_source": None,
+                    "data_viability": data_diag,
+                    "before_eval_metrics": before_eval,
+                    "rounds_completed": display_round,
+                    "final_train_summary": train_summary,
+                    "final_eval_metrics": eval_metrics,
+                    "final_one_step_gate": one_step_diag,
+                    "final_recursive_gate": recursive_diag,
+                    "rounds": rounds,
+                }
+
+            relative_improvement = (
+                (best_score - score) / max(abs(best_score), 1e-12)
+                if np.isfinite(best_score)
+                else float("inf")
+            )
+            if score < best_score:
+                best_score = score
+            if relative_improvement < min_improvement:
+                stale_rounds += 1
+            else:
+                stale_rounds = 0
+            if stale_rounds >= patience:
+                failure_source = (
+                    "fc1_one_step_underfit"
+                    if not one_step_passed
+                    else "fc1_recursive_instability"
+                )
+                return {
+                    "passed": False,
+                    "failed_stage": "fc1_plateau",
+                    "failure_source": failure_source,
+                    "reason": "fc1_metrics_plateaued",
+                    "data_viability": data_diag,
+                    "before_eval_metrics": before_eval,
+                    "rounds_completed": display_round,
+                    "final_eval_metrics": eval_metrics,
+                    "final_one_step_gate": one_step_diag,
+                    "final_recursive_gate": recursive_diag,
+                    "rounds": rounds,
+                }
+
+        final_round = rounds[-1]
+        failure_source = (
+            "fc1_one_step_underfit"
+            if not final_round["one_step_gate"].get("passed", False)
+            else "fc1_recursive_instability"
+        )
+        return {
+            "passed": False,
+            "failed_stage": "fc1_max_rounds",
+            "failure_source": failure_source,
+            "reason": "fc1_failed_after_max_rounds",
+            "data_viability": data_diag,
+            "before_eval_metrics": before_eval,
+            "rounds_completed": max_rounds,
+            "final_eval_metrics": final_round["eval_metrics"],
+            "final_one_step_gate": final_round["one_step_gate"],
+            "final_recursive_gate": final_round["recursive_gate"],
+            "rounds": rounds,
+        }
 
     def _sdf_gate_passed(
         self,
@@ -5513,7 +5804,7 @@ class Episode:
                 prefix="post_refresh",
                 max_batches=eval_batches_arg,
             )
-            fc1_passed, fc1_diag = self._fc1_gate_passed(refresh_eval, prefix="post_refresh")
+            fc1_passed, fc1_diag = self._fc1_recursive_gate_passed(refresh_eval, prefix="post_refresh")
             sdf_passed, sdf_diag = self._sdf_gate_passed(
                 refresh_eval,
                 prefix="post_refresh",
@@ -5604,7 +5895,12 @@ class Episode:
                 module_summaries['sdf_fc1_fixed_batch_eval_before'] = before_eval
 
             def _fail(stage_name: str, diag: Dict[str, Any]) -> Dict[str, Any]:
-                result = {"passed": False, "failed_stage": stage_name, "diagnostics": diag}
+                result = {
+                    "passed": False,
+                    "failed_stage": stage_name,
+                    "failure_source": diag.get("failure_source") if isinstance(diag, dict) else None,
+                    "diagnostics": diag,
+                }
                 module_summaries['sdf_fc1_gate'] = result
                 logger.warning("FC1/SDF gate failed at %s: %s", stage_name, diag)
                 return result
@@ -5616,17 +5912,21 @@ class Episode:
 
                 if fc1_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.FC1_ONLY)
-                    module_summaries['sdf_fc1_fc1_only'] = self._run_batches(
-                        train_batches, fc1_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(fc1-only) '
+                    fc1_result = self._run_fc1_until_gates(
+                        train_batches=train_batches,
+                        val_batches=val_batches,
+                        log_interval=log_interval,
                     )
-                    fc1_eval = self._evaluate_sdf_fc1_batches(
-                        val_batches, prefix='after_fc1', max_batches=eval_batches_arg
-                    )
-                    module_summaries['sdf_fc1_eval_after_fc1_only'] = fc1_eval
-                    passed, diag = self._fc1_gate_passed(fc1_eval, prefix='after_fc1')
-                    module_summaries['sdf_fc1_gate_fc1_only'] = diag
-                    if not passed:
-                        return _fail(SDFTrainingPhase.FC1_ONLY.value, diag)
+                    module_summaries['sdf_fc1_fc1_continuation'] = fc1_result
+                    module_summaries['sdf_fc1_fc1_only'] = fc1_result.get('final_train_summary', {})
+                    if fc1_result.get('final_eval_metrics'):
+                        module_summaries['sdf_fc1_eval_after_fc1_only'] = fc1_result['final_eval_metrics']
+                    module_summaries['sdf_fc1_gate_fc1_only'] = fc1_result
+                    if not fc1_result.get("passed", False):
+                        return _fail(
+                            fc1_result.get("failed_stage", SDFTrainingPhase.FC1_ONLY.value),
+                            fc1_result,
+                        )
                 if true_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.SDF_TRUE_ONLY)
                     module_summaries['sdf_fc1_sdf_true_only'] = self._run_batches(

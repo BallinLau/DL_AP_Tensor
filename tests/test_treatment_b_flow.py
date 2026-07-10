@@ -548,10 +548,61 @@ class TreatmentBFlowTest(unittest.TestCase):
         self.assertIn("check_recursive_forecast_state_dlnk_next_rmse", out)
         self.assertIn("check_primary_true_state_M_p99", out)
         self.assertIn("check_recursive_forecast_state_M_p99", out)
+        self.assertIn("check_primary_true_state_hatc_next_target_std", out)
+        self.assertIn("check_primary_true_state_hatc_next_baseline_rmse", out)
+        self.assertIn("check_primary_true_state_hatc_next_skill_vs_persistence", out)
+        self.assertIn("check_recursive_forecast_state_hatc_next_target_std", out)
 
         self.assertAlmostEqual(out["check_primary_true_state_dlnk_next_rmse"], 0.0, places=6)
         self.assertAlmostEqual(out["check_recursive_forecast_state_dlnk_next_rmse"], 0.0, places=6)
         self.assertAlmostEqual(out["check_current_belief_lnk_vs_realized_rmse"], 0.2, places=6)
+
+    def test_fc1_one_step_gate_uses_absolute_rmse_for_low_variance_targets(self):
+        episode = Episode.__new__(Episode)
+        episode.hyperparams = SimpleNamespace(
+            fc1_target_std_floor=1e-4,
+            fc1_one_step_r2_min=0.0,
+            fc1_one_step_skill_min=0.0,
+            fc1_one_step_hatc_rmse_abs_max=0.05,
+            fc1_one_step_lnk_rmse_abs_max=0.05,
+        )
+        metrics = {
+            "after_primary_true_state_hatc_next_target_std": 0.0,
+            "after_primary_true_state_hatc_next_r2": float("nan"),
+            "after_primary_true_state_hatc_next_rmse": 0.01,
+            "after_primary_true_state_hatc_next_skill_vs_persistence": float("nan"),
+            "after_primary_true_state_lnk_next_target_std": 0.0,
+            "after_primary_true_state_lnk_next_r2": float("nan"),
+            "after_primary_true_state_lnk_next_rmse": 0.01,
+            "after_primary_true_state_lnk_next_skill_vs_persistence": float("nan"),
+        }
+
+        passed, diag = episode._fc1_one_step_gate_passed(metrics, prefix="after")
+
+        self.assertTrue(passed)
+        self.assertEqual(diag["checks"]["hatc"]["gate_mode"], "absolute_rmse")
+        self.assertEqual(diag["checks"]["lnk"]["gate_mode"], "absolute_rmse")
+
+    def test_fc1_data_viability_reports_invalid_rollout_source(self):
+        episode = Episode.__new__(Episode)
+        episode.hyperparams = SimpleNamespace(
+            fc1_gate_min_pairs=128,
+            fc1_rollout_finite_ratio_min=1.0,
+            fc1_target_std_floor=1e-4,
+        )
+        metrics = {
+            "before_primary_true_state_hatc_next_finite_n": 10.0,
+            "before_primary_true_state_hatc_next_finite_ratio": 1.0,
+            "before_primary_true_state_hatc_next_target_std": 0.1,
+            "before_primary_true_state_lnk_next_finite_n": 10.0,
+            "before_primary_true_state_lnk_next_finite_ratio": 1.0,
+            "before_primary_true_state_lnk_next_target_std": 0.1,
+        }
+
+        passed, diag = episode._fc1_data_viability_passed(metrics, prefix="before")
+
+        self.assertFalse(passed)
+        self.assertEqual(diag["failure_source"], "rollout_data_invalid")
 
     def test_sdf_macro_batches_include_same_path_rollout_tensors(self):
         episode = Episode.__new__(Episode)

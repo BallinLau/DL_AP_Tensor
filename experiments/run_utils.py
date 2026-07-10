@@ -143,6 +143,17 @@ def build_hyperparams():
     hp.sdf_recursive_loss_weight = 0.25
     hp.sdf_recursive_moment_weight = 5e-4
     hp.sdf_recursive_anchor_weight = 0.05
+    hp.fc1_epochs_per_round = 10
+    hp.fc1_max_rounds = 8
+    hp.fc1_plateau_patience = 2
+    hp.fc1_min_relative_improvement = 0.01
+    hp.fc1_gate_min_pairs = 128
+    hp.fc1_target_std_floor = 1e-4
+    hp.fc1_one_step_r2_min = 0.0
+    hp.fc1_one_step_skill_min = 0.0
+    hp.fc1_one_step_hatc_rmse_abs_max = 0.05
+    hp.fc1_one_step_lnk_rmse_abs_max = 0.05
+    hp.fc1_rollout_finite_ratio_min = 1.0
     hp.sdf_fc1_val_fraction = 0.2
     hp.sdf_fc1_val_seed = 12345
     hp.sdf_gate_m_finite_ratio_min = 1.0
