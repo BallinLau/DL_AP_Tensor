@@ -170,6 +170,18 @@ def main():
     )
     parser.add_argument("--sdf-child-bank-seed", type=int, default=12345, help="Base seed for SDF shock bank")
     parser.add_argument(
+        "--episode0-sdf-epochs-per-round",
+        type=int,
+        default=0,
+        help="Episode 0 SDF bootstrap epochs per gate round; <=0 uses --epochs",
+    )
+    parser.add_argument(
+        "--episode0-sdf-max-rounds",
+        type=int,
+        default=10,
+        help="Maximum Episode 0 SDF bootstrap gate rounds before stopping",
+    )
+    parser.add_argument(
         "--fc1-jacobian-penalty-interval",
         type=int,
         default=None,
@@ -190,6 +202,8 @@ def main():
     hyperparams.sdf_child_bank_size = args.sdf_child_bank_size
     hyperparams.sdf_child_bank_refresh_epochs = args.sdf_child_bank_refresh_epochs
     hyperparams.sdf_child_bank_seed = args.sdf_child_bank_seed
+    hyperparams.episode0_sdf_epochs_per_round = int(args.episode0_sdf_epochs_per_round)
+    hyperparams.episode0_sdf_max_rounds = int(args.episode0_sdf_max_rounds)
     if args.fc1_jacobian_penalty_interval is not None:
         hyperparams.fc1_jacobian_penalty_interval = args.fc1_jacobian_penalty_interval
     validate_sdf_fresh_pair_config(hyperparams)

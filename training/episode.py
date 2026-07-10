@@ -4823,9 +4823,11 @@ class Episode:
             and any(m != 'policy_value' for m in train_modules)
         )
 
+        epoch_offset = int(getattr(self, "_run_batches_epoch_offset", 0))
         for epoch in range(n_epochs):
-            self._current_epoch_idx = epoch
-            self._prepare_sdf_shock_bank_for_epoch(batches, epoch, train_modules)
+            effective_epoch = epoch_offset + epoch
+            self._current_epoch_idx = effective_epoch
+            self._prepare_sdf_shock_bank_for_epoch(batches, effective_epoch, train_modules)
             self._q_only_stage = bool(
                 'policy_value' in train_modules and q_only_epochs > 0 and epoch < q_only_epochs
             )
@@ -5368,7 +5370,7 @@ class Episode:
         tail_gate_active = bool(np.isfinite(p99_max) or np.isfinite(max_max))
         target = getattr(self.hyperparams, "sdf_log_mean_target", None)
         target = float(target) if target is not None else 0.0
-        if stage == SDFTrainingPhase.SDF_TRUE_ONLY:
+        if stage in (SDFTrainingPhase.EPISODE0_BOOTSTRAP, SDFTrainingPhase.SDF_TRUE_ONLY):
             m_prefix = f"{prefix}_primary_true_state_M"
             t_key = f"{prefix}_primary_true_state_signed_aio_t"
         else:
@@ -5650,6 +5652,154 @@ class Episode:
             logger.warning("episode_id=0 uses %s (not mode0); this is allowed but not recommended.", mode)
         return mode
 
+    def _split_sdf_dataframe_by_path(
+        self,
+        sdf_df: pd.DataFrame,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+        if sdf_df is None or sdf_df.empty or 'path' not in sdf_df.columns:
+            return sdf_df, sdf_df, {
+                'sdf_fc1_holdout_active': False,
+                'sdf_fc1_holdout_reason': 'empty_or_missing_path',
+            }
+        val_fraction = float(getattr(self.hyperparams, "sdf_fc1_val_fraction", 0.2))
+        val_fraction = min(max(val_fraction, 0.0), 0.5)
+        unique_paths = np.asarray(pd.unique(sdf_df['path']))
+        allow_in_sample = bool(getattr(self.hyperparams, "allow_in_sample_sdf_gate_for_debug", False))
+        if val_fraction <= 0.0:
+            if not allow_in_sample:
+                raise RuntimeError(
+                    "Path-level Episode 0 SDF validation is disabled by sdf_fc1_val_fraction=0. "
+                    "Set allow_in_sample_sdf_gate_for_debug=True only for debug runs."
+                )
+            return sdf_df, sdf_df, {
+                'sdf_fc1_holdout_active': False,
+                'sdf_fc1_holdout_reason': 'disabled_debug_in_sample',
+                'sdf_fc1_holdout_n_paths': int(unique_paths.size),
+            }
+        if unique_paths.size < 2:
+            if not allow_in_sample:
+                raise RuntimeError(
+                    "Path-level Episode 0 SDF validation requires at least two paths. "
+                    "Set allow_in_sample_sdf_gate_for_debug=True only for debug runs."
+                )
+            return sdf_df, sdf_df, {
+                'sdf_fc1_holdout_active': False,
+                'sdf_fc1_holdout_reason': 'insufficient_paths_debug_in_sample',
+                'sdf_fc1_holdout_n_paths': int(unique_paths.size),
+            }
+        seed = int(getattr(self.hyperparams, "sdf_fc1_val_seed", 12345))
+        rng = np.random.default_rng(seed)
+        order = rng.permutation(unique_paths.size)
+        n_val = int(round(unique_paths.size * val_fraction))
+        n_val = min(max(1, n_val), unique_paths.size - 1)
+        val_paths = set(unique_paths[order[:n_val]].tolist())
+        val_mask = sdf_df['path'].isin(val_paths)
+        train_df = sdf_df.loc[~val_mask].copy()
+        val_df = sdf_df.loc[val_mask].copy()
+        return train_df, val_df, {
+            'sdf_fc1_holdout_active': True,
+            'sdf_fc1_holdout_seed': seed,
+            'sdf_fc1_holdout_fraction': val_fraction,
+            'sdf_fc1_train_paths': int(unique_paths.size - n_val),
+            'sdf_fc1_val_paths': int(n_val),
+            'sdf_fc1_train_rows': int(len(train_df)),
+            'sdf_fc1_val_rows': int(len(val_df)),
+        }
+
+    def _run_episode0_sdf_bootstrap_until_gate(
+        self,
+        train_batches: List[Dict[str, torch.Tensor]],
+        val_batches: List[Dict[str, torch.Tensor]],
+        n_epochs: int,
+        log_interval: int,
+    ) -> Dict[str, Any]:
+        if int(self.episode_id) != 0:
+            raise RuntimeError("Episode 0 SDF bootstrap continuation is only valid for episode_id == 0.")
+        if not train_batches:
+            raise RuntimeError("Episode 0 SDF bootstrap requires non-empty training batches.")
+        if not val_batches:
+            raise RuntimeError("Episode 0 SDF bootstrap requires non-empty validation batches.")
+
+        epochs_per_round = int(getattr(self.hyperparams, "episode0_sdf_epochs_per_round", 0))
+        if epochs_per_round <= 0:
+            epochs_per_round = int(n_epochs)
+        epochs_per_round = max(1, epochs_per_round)
+        max_rounds = max(1, int(getattr(self.hyperparams, "episode0_sdf_max_rounds", 10)))
+        eval_batches = int(getattr(self.hyperparams, "sdf_fc1_eval_max_batches", 0))
+        eval_batches_arg = eval_batches if eval_batches > 0 else None
+
+        rounds: List[Dict[str, Any]] = []
+        for round_idx in range(max_rounds):
+            display_round = round_idx + 1
+            prev_epoch_offset = getattr(self, "_run_batches_epoch_offset", 0)
+            self._run_batches_epoch_offset = round_idx * epochs_per_round
+            try:
+                train_summary = self._run_batches(
+                    train_batches,
+                    epochs_per_round,
+                    log_interval,
+                    ['sdf_fc1'],
+                    desc_prefix=f'SDF/FC1(ep0-sdf r{display_round}/{max_rounds}) '
+                )
+            finally:
+                self._run_batches_epoch_offset = prev_epoch_offset
+            prefix = f'episode0_sdf_round{display_round}'
+            eval_metrics = self._evaluate_sdf_fc1_batches(
+                val_batches,
+                prefix=prefix,
+                max_batches=eval_batches_arg
+            )
+            passed, gate_diag = self._sdf_gate_passed(
+                eval_metrics,
+                prefix=prefix,
+                stage=SDFTrainingPhase.EPISODE0_BOOTSTRAP,
+            )
+            gate_diag.update({
+                'round': display_round,
+                'max_rounds': max_rounds,
+                'epochs_per_round': epochs_per_round,
+                'total_bootstrap_epochs': display_round * epochs_per_round,
+                'sdf_acceptance_gate_applied': True,
+            })
+            round_record = {
+                'round': display_round,
+                'train_summary': train_summary,
+                'eval_metrics': eval_metrics,
+                'gate': gate_diag,
+            }
+            rounds.append(round_record)
+            if passed:
+                return {
+                    'active': True,
+                    'sdf_acceptance_gate_applied': True,
+                    'passed': True,
+                    'rounds_completed': display_round,
+                    'epochs_per_round': epochs_per_round,
+                    'total_bootstrap_epochs': display_round * epochs_per_round,
+                    'max_rounds': max_rounds,
+                    'final_train_summary': train_summary,
+                    'final_eval_metrics': eval_metrics,
+                    'final_gate': gate_diag,
+                    'rounds': rounds,
+                }
+            logger.warning("Episode 0 SDF bootstrap gate failed at round %s/%s: %s", display_round, max_rounds, gate_diag)
+
+        final_record = rounds[-1]
+        return {
+            'active': True,
+            'sdf_acceptance_gate_applied': True,
+            'passed': False,
+            'rounds_completed': max_rounds,
+            'epochs_per_round': epochs_per_round,
+            'total_bootstrap_epochs': max_rounds * epochs_per_round,
+            'max_rounds': max_rounds,
+            'final_train_summary': final_record['train_summary'],
+            'final_eval_metrics': final_record['eval_metrics'],
+            'final_gate': final_record['gate'],
+            'rounds': rounds,
+            'reason': 'episode0_sdf_gate_failed_after_max_rounds',
+        }
+
     def run_episode(
         self,
         n_epochs: int = 10,
@@ -5715,8 +5865,8 @@ class Episode:
             if mode == 'mode0':
                 module_summaries['episode0_bootstrap_policy_training'] = {
                     'active': bool(self.episode_id == 0 and use_policy_value),
-                    'sdf_acceptance_gate_applied': False,
-                    'reason': 'episode0_bootstrap_exception',
+                    'sdf_acceptance_gate_applied': bool(self.episode_id == 0 and use_sdf_fc1),
+                    'reason': 'awaiting_episode0_sdf_gate' if self.episode_id == 0 and use_sdf_fc1 else 'no_sdf_bootstrap_gate',
                 }
                 if use_sdf_fc1 or use_policy_value:
                     sampler = Sample(
@@ -5734,24 +5884,56 @@ class Episode:
                     if tensor_pipeline:
                         self.tensor_sdf = sampler.build_sdf_fc1_tensor()
                         self.df_sdf = None
+                        train_table, val_table, holdout_diag = self._split_sdf_table_by_path(self.tensor_sdf)
                         sdf_batches = self._create_sdf_batches_from_macro_tensor(
-                            self.tensor_sdf, batch_size=batch_size, n_branches=n_branches
+                            train_table, batch_size=batch_size, n_branches=n_branches
+                        )
+                        sdf_val_batches = self._create_sdf_batches_from_macro_tensor(
+                            val_table, batch_size=batch_size, n_branches=n_branches
                         )
                     else:
                         self.df_sdf = sampler.build_sdf_fc1_df()
                         self.tensor_sdf = None
+                        train_df, val_df, holdout_diag = self._split_sdf_dataframe_by_path(self.df_sdf)
                         sdf_batches = self._create_sdf_batches_from_macro_df(
-                            self.df_sdf, batch_size=batch_size, n_branches=n_branches
+                            train_df, batch_size=batch_size, n_branches=n_branches
                         )
+                        sdf_val_batches = self._create_sdf_batches_from_macro_df(
+                            val_df, batch_size=batch_size, n_branches=n_branches
+                        )
+                    module_summaries['episode0_sdf_holdout_split'] = holdout_diag
+                    if not sdf_batches:
+                        raise RuntimeError("Episode 0 SDF bootstrap could not build non-empty training batches.")
                     if sdf_batches:
                         if int(self.episode_id) != 0:
                             raise RuntimeError("EPISODE0_BOOTSTRAP stage1 is only valid for episode_id == 0.")
                         prev_phase = getattr(self, "sdf_training_phase", SDFTrainingPhase.EPISODE0_BOOTSTRAP)
                         self.set_sdf_training_phase(SDFTrainingPhase.EPISODE0_BOOTSTRAP)
                         try:
-                            module_summaries['sdf_fc1_stage1'] = self._run_batches(
-                                sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(stage1) '
+                            episode0_sdf_gate = self._run_episode0_sdf_bootstrap_until_gate(
+                                train_batches=sdf_batches,
+                                val_batches=sdf_val_batches,
+                                n_epochs=n_epochs,
+                                log_interval=log_interval,
                             )
+                            module_summaries['episode0_sdf_bootstrap_gate'] = episode0_sdf_gate
+                            module_summaries['sdf_fc1_stage1'] = episode0_sdf_gate['final_train_summary']
+                            module_summaries['episode0_bootstrap_policy_training'].update({
+                                'sdf_acceptance_gate_applied': True,
+                                'sdf_acceptance_gate_passed': bool(episode0_sdf_gate.get('passed', False)),
+                                'sdf_rounds_completed': episode0_sdf_gate.get('rounds_completed'),
+                                'reason': (
+                                    'episode0_sdf_gate_passed'
+                                    if episode0_sdf_gate.get('passed', False)
+                                    else 'episode0_sdf_gate_failed_after_max_rounds'
+                                ),
+                            })
+                            if not episode0_sdf_gate.get('passed', False):
+                                total_epochs = episode0_sdf_gate.get('total_bootstrap_epochs')
+                                raise NumericalStageFailure(
+                                    f"Episode 0 SDF failed after {total_epochs} bootstrap epochs; "
+                                    "skip Policy/Value to avoid training on invalid M."
+                                )
                         finally:
                             self.set_sdf_training_phase(prev_phase)
 

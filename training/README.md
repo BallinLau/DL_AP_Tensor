@@ -53,7 +53,9 @@ Training orchestration for episodes and modules.
   - `sdf_recursive_only`: freeze FC1 and train only `sdf_model`/`value_model` using recursive forecast parent state, plus a true-state Euler baseline.
 - The phase is recorded as `sdf_training_phase`. Effective loss weights are logged as `*_weight_effective` fields.
 - `fc1_only` never samples fresh wealth pairs and never computes Euler/moment/anchor terms.
-- Episode 0 does not run the Stage2 FC1/SDF schedule. Stage2 is valid only for `episode_id > 0`.
+- Episode 0 does not run the Stage2 FC1/SDF schedule. Instead, it runs an SDF bootstrap continuation loop on a fixed path-level train/validation split: train one block, evaluate the SDF gate, continue if the gate fails, and stop before Policy/Value if `episode0_sdf_max_rounds` is exhausted.
+- `episode0_sdf_epochs_per_round <= 0` uses the run's `--epochs` value per block; `episode0_sdf_max_rounds` defaults to `10`. Slurm exposes these as `EPISODE0_SDF_EPOCHS_PER_ROUND` and `EPISODE0_SDF_MAX_ROUNDS`.
+- Stage2 is valid only for `episode_id > 0`.
 - In Mode B, the ordering is now: simulate with previous policies, build macro transitions, run `fc1_only -> sdf_true_only -> sdf_recursive_only` with gates, replay the same simulation seed to refresh firm data with the accepted FC1/SDF, then train Q/P/bp. Gate failure raises `NumericalStageFailure` and skips downstream Policy/Value training.
 - After the SDF refresh replay, Mode B runs a validation-only post-refresh gate before Policy/Value. This checks the distribution that Policy/Value will actually use, not only the pre-refresh macro distribution.
 - SDF/FC1 gates are evaluated on a path-level holdout split controlled by `sdf_fc1_val_fraction` and `sdf_fc1_val_seed`; train and validation paths are disjoint when at least two paths are available.
@@ -65,7 +67,7 @@ Training orchestration for episodes and modules.
 - SDF gates include finite-ratio diagnostics for `M`; non-finite `M` values are no longer silently ignored by the pass/fail decision.
 - SDF tail checks report `tail_gate_active`. The default p99/max thresholds are infinite, so tail diagnostics are logged but not binding until finite thresholds are configured from a healthy short run.
 - `stage_gate_required_consecutive_passes=1` matches the current fixed-epoch schedule. Multi-pass adaptive gates require a separate min/max-epoch training loop and are not advertised by default.
-- Episode 0 is explicitly recorded as `episode0_bootstrap_policy_training`; it remains a bootstrap exception rather than a formally gated SDF/FC1 stage.
+- Episode 0 is explicitly recorded as `episode0_bootstrap_policy_training`; Policy/Value is allowed only after the Episode 0 SDF gate passes.
 
 ### Policy/Value: Q-first training hooks
 - `train_step(..., policy_loss_terms=...)` now supports selective optimization among `['q', 'p0', 'pi']`.

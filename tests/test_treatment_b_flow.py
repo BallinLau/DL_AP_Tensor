@@ -366,6 +366,76 @@ class TreatmentBFlowTest(unittest.TestCase):
 
         self.assertEqual(episode.sdf_training_phase, SDFTrainingPhase.JOINT_DISABLED)
 
+    def test_episode0_sdf_gate_uses_primary_bootstrap_metrics(self):
+        episode = Episode.__new__(Episode)
+        episode.hyperparams = SimpleNamespace(
+            sdf_log_mean_error_max=0.02,
+            sdf_signed_t_abs_max=2.0,
+            sdf_gate_m_finite_ratio_min=1.0,
+            sdf_gate_m_p99_max=float("inf"),
+            sdf_gate_m_max_max=float("inf"),
+            sdf_log_mean_target=0.0,
+        )
+
+        passed, diag = episode._sdf_gate_passed(
+            {
+                "ep0_primary_true_state_M_mean": 1.0,
+                "ep0_primary_true_state_M_finite_ratio": 1.0,
+                "ep0_primary_true_state_M_p99": 1.0,
+                "ep0_primary_true_state_M_max": 1.0,
+                "ep0_primary_true_state_signed_aio_t": 0.0,
+                "ep0_recursive_forecast_state_M_mean": float("nan"),
+                "ep0_recursive_forecast_state_signed_aio_t": float("nan"),
+            },
+            prefix="ep0",
+            stage=SDFTrainingPhase.EPISODE0_BOOTSTRAP,
+        )
+
+        self.assertTrue(passed)
+        self.assertEqual(diag["stage"], SDFTrainingPhase.EPISODE0_BOOTSTRAP.value)
+        self.assertEqual(diag["m_mean"], 1.0)
+
+    def test_episode0_sdf_continuation_retrains_until_gate_passes(self):
+        episode = Episode.__new__(Episode)
+        episode.episode_id = 0
+        episode.hyperparams = SimpleNamespace(
+            episode0_sdf_epochs_per_round=2,
+            episode0_sdf_max_rounds=3,
+            sdf_fc1_eval_max_batches=0,
+        )
+        calls = {"train": 0, "eval": 0}
+
+        def fake_run_batches(self, batches, n_epochs, log_interval, train_modules, desc_prefix=""):
+            del batches, log_interval, train_modules, desc_prefix
+            calls["train"] += 1
+            return {"final_losses": {"sdf": float(calls["train"])}, "n_epochs": n_epochs}
+
+        def fake_evaluate(self, batches, prefix, max_batches=None):
+            del batches, max_batches
+            calls["eval"] += 1
+            return {"prefix": prefix}
+
+        def fake_gate(self, eval_metrics, prefix, stage):
+            del eval_metrics
+            return calls["eval"] >= 2, {"passed": calls["eval"] >= 2, "prefix": prefix, "stage": stage.value}
+
+        episode._run_batches = MethodType(fake_run_batches, episode)
+        episode._evaluate_sdf_fc1_batches = MethodType(fake_evaluate, episode)
+        episode._sdf_gate_passed = MethodType(fake_gate, episode)
+
+        summary = episode._run_episode0_sdf_bootstrap_until_gate(
+            train_batches=[{"x": torch.tensor([1.0])}],
+            val_batches=[{"x": torch.tensor([2.0])}],
+            n_epochs=20,
+            log_interval=1,
+        )
+
+        self.assertTrue(summary["passed"])
+        self.assertEqual(summary["rounds_completed"], 2)
+        self.assertEqual(summary["total_bootstrap_epochs"], 4)
+        self.assertEqual(calls["train"], 2)
+        self.assertEqual(calls["eval"], 2)
+
     def test_fixed_batch_eval_reports_stage2_object_layers(self):
         episode = Episode.__new__(Episode)
         episode.models = {"sdf_fc1": _FakeSdfModel()}

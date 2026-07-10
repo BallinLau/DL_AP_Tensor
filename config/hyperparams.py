@@ -208,6 +208,8 @@ class HyperParams:
     sdf_gate_m_finite_ratio_min: float = 1.0
     sdf_gate_m_p99_max: float = math.inf
     sdf_gate_m_max_max: float = math.inf
+    episode0_sdf_epochs_per_round: int = 0
+    episode0_sdf_max_rounds: int = 10
     allow_in_sample_sdf_gate_for_debug: bool = False
     sdf_post_refresh_gate_enabled: bool = True
     stage_gate_required_consecutive_passes: int = 1
