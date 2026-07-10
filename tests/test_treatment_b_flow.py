@@ -384,6 +384,9 @@ class TreatmentBFlowTest(unittest.TestCase):
                 "ep0_primary_true_state_M_max": 1.0,
                 "ep0_primary_true_state_M_lt_0p7_rate": 0.05,
                 "ep0_primary_true_state_M_gt_1p3_rate": 0.0,
+                "ep0_primary_true_state_signed_aio_mean": 0.10,
+                "ep0_primary_true_state_signed_aio_std": 0.20,
+                "ep0_primary_true_state_signed_aio_se": 0.05,
                 "ep0_primary_true_state_signed_aio_t": 99.0,
                 "ep0_recursive_forecast_state_M_mean": float("nan"),
                 "ep0_recursive_forecast_state_signed_aio_t": float("nan"),
@@ -396,6 +399,10 @@ class TreatmentBFlowTest(unittest.TestCase):
         self.assertEqual(diag["stage"], SDFTrainingPhase.EPISODE0_BOOTSTRAP.value)
         self.assertEqual(diag["m_mean"], 1.0)
         self.assertEqual(diag["m_lt_0p7_rate"], 0.05)
+        self.assertEqual(diag["signed_aio_mean"], 0.10)
+        self.assertEqual(diag["signed_aio_std"], 0.20)
+        self.assertEqual(diag["signed_aio_se"], 0.05)
+        self.assertEqual(diag["signed_aio_t"], 99.0)
         self.assertFalse(diag["signed_aio_t_binding"])
 
     def test_episode0_sdf_continuation_retrains_until_gate_passes(self):

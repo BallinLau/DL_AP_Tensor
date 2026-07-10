@@ -5303,11 +5303,16 @@ class Episode:
             out[f'{prefix}_{name}_n'] = float(v.numel())
             if v.numel() < 2:
                 out[f'{prefix}_{name}_mean'] = float('nan')
+                out[f'{prefix}_{name}_std'] = float('nan')
+                out[f'{prefix}_{name}_se'] = float('nan')
                 out[f'{prefix}_{name}_t'] = float('nan')
                 return
             mean = v.mean()
-            se = v.std(unbiased=True).clamp_min(1e-12) / float(v.numel()) ** 0.5
+            std = v.std(unbiased=True)
+            se = std.clamp_min(1e-12) / float(v.numel()) ** 0.5
             out[f'{prefix}_{name}_mean'] = float(mean.item())
+            out[f'{prefix}_{name}_std'] = float(std.item())
+            out[f'{prefix}_{name}_se'] = float(se.item())
             out[f'{prefix}_{name}_t'] = float((mean / se).item())
 
         _safe_signed_t('primary_true_state_signed_aio', primary_signed_parts)
@@ -5431,6 +5436,9 @@ class Episode:
         clip_high_ratio = eval_metrics.get(f"{m_prefix}_gt_1p3_rate", float("nan"))
         m_p99 = eval_metrics.get(f"{m_prefix}_p99", float("nan"))
         m_max = eval_metrics.get(f"{m_prefix}_max", float("nan"))
+        signed_mean = eval_metrics.get(f"{prefix}_primary_true_state_signed_aio_mean", float("nan"))
+        signed_std = eval_metrics.get(f"{prefix}_primary_true_state_signed_aio_std", float("nan"))
+        signed_se = eval_metrics.get(f"{prefix}_primary_true_state_signed_aio_se", float("nan"))
         signed_t = eval_metrics.get(f"{prefix}_primary_true_state_signed_aio_t", float("nan"))
         log_mean_error = abs(np.log(max(float(m_mean), 1e-12)) - target) if np.isfinite(m_mean) else float("nan")
         passed = (
@@ -5457,6 +5465,10 @@ class Episode:
             "log_mean_target": target,
             "log_mean_error": float(log_mean_error),
             "max_log_mean_error": max_log_mean_error,
+            "signed_aio_mean": float(signed_mean),
+            "signed_aio_std": float(signed_std),
+            "signed_aio_se": float(signed_se),
+            "signed_aio_t": float(signed_t),
             "signed_aio_t_observed": float(signed_t),
             "signed_aio_t_binding": False,
         }
