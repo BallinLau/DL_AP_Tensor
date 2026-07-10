@@ -50,6 +50,7 @@ class NumericalStageFailure(RuntimeError):
 
 
 class SDFTrainingPhase(str, Enum):
+    EPISODE0_BOOTSTRAP = "episode0_bootstrap"
     FC1_ONLY = "fc1_only"
     SDF_TRUE_ONLY = "sdf_true_only"
     SDF_RECURSIVE_ONLY = "sdf_recursive_only"
@@ -166,7 +167,11 @@ class Episode:
         # 训练状态
         self.step_count = 0
         self.sdf_fc1_step_count = 0
-        self.sdf_training_phase = SDFTrainingPhase.SDF_TRUE_ONLY
+        self.sdf_training_phase = (
+            SDFTrainingPhase.EPISODE0_BOOTSTRAP
+            if int(self.episode_id) == 0
+            else SDFTrainingPhase.SDF_TRUE_ONLY
+        )
         self.loss_history = {}
         self.add_FC1loss = False
         self.train_mode = '2time'
@@ -1684,7 +1689,7 @@ class Episode:
         if 'sdf_fc1' not in self.models:
             return
         model = self.models['sdf_fc1']
-        phase = getattr(self, "sdf_training_phase", SDFTrainingPhase.SDF_TRUE_ONLY)
+        phase = getattr(self, "sdf_training_phase", SDFTrainingPhase.EPISODE0_BOOTSTRAP)
         phase = SDFTrainingPhase(phase)
 
         for p in model.parameters():
@@ -1695,7 +1700,11 @@ class Episode:
                 raise RuntimeError("SDF/FC1 model has no fc1_model for FC1_ONLY phase.")
             for p in model.fc1_model.parameters():
                 p.requires_grad = True
-        elif phase in {SDFTrainingPhase.SDF_TRUE_ONLY, SDFTrainingPhase.SDF_RECURSIVE_ONLY}:
+        elif phase in {
+            SDFTrainingPhase.EPISODE0_BOOTSTRAP,
+            SDFTrainingPhase.SDF_TRUE_ONLY,
+            SDFTrainingPhase.SDF_RECURSIVE_ONLY,
+        }:
             if not hasattr(model, "sdf_model") or not hasattr(model, "value_model"):
                 raise RuntimeError("SDF/FC1 model must expose sdf_model and value_model for SDF-only phases.")
             for p in model.sdf_model.parameters():
@@ -2383,14 +2392,22 @@ class Episode:
             children = children[:2]
 
         children_t = torch.stack(children, dim=1)  # (batch, 2, feat)
-        phase = SDFTrainingPhase(getattr(self, "sdf_training_phase", SDFTrainingPhase.SDF_TRUE_ONLY))
+        phase = SDFTrainingPhase(getattr(self, "sdf_training_phase", SDFTrainingPhase.EPISODE0_BOOTSTRAP))
         if phase == SDFTrainingPhase.FC1_ONLY:
             return self._compute_fc1_only_loss(batch, parent, children_t)
         if phase == SDFTrainingPhase.JOINT_DISABLED:
             raise RuntimeError("Joint FC1/SDF loss is disabled by explicit SDF training phase.")
 
         use_true_prev_macro = False
-        if phase == SDFTrainingPhase.SDF_TRUE_ONLY:
+        if phase == SDFTrainingPhase.EPISODE0_BOOTSTRAP:
+            if int(getattr(self, "episode_id", -1)) != 0:
+                raise RuntimeError("EPISODE0_BOOTSTRAP requires episode_id == 0.")
+            if bool(getattr(self, "add_FC1loss", False)):
+                raise RuntimeError("Episode 0 bootstrap must not train FC1.")
+            if parent.shape[1] < 7:
+                raise RuntimeError("Episode 0 bootstrap requires x_t, Hatcf_t and LnKF_t.")
+            use_true_prev_macro = False
+        elif phase == SDFTrainingPhase.SDF_TRUE_ONLY:
             if parent.shape[1] < 9:
                 raise RuntimeError("SDF_TRUE_ONLY requires true Hatc_t and LnK_t in the parent batch.")
             use_true_prev_macro = True
@@ -2493,7 +2510,11 @@ class Episode:
         euler_weight = 1.0
         recursive_euler_weight = 0.0
         # Explicit SDF phases use phase-specific weights to avoid legacy stage1/stage2 ambiguity.
-        if phase == SDFTrainingPhase.SDF_TRUE_ONLY:
+        if phase == SDFTrainingPhase.EPISODE0_BOOTSTRAP:
+            euler_weight = 1.0
+            recursive_euler_weight = 0.0
+            moment_weight = float(getattr(self.hyperparams, "sdf_stage1_moment_weight", 5.0))
+        elif phase == SDFTrainingPhase.SDF_TRUE_ONLY:
             euler_weight = float(getattr(self.hyperparams, "sdf_euler_weight", 1.0))
             moment_weight = float(getattr(self.hyperparams, "sdf_true_moment_weight", 5e-4))
         elif phase == SDFTrainingPhase.SDF_RECURSIVE_ONLY:
@@ -2511,7 +2532,9 @@ class Episode:
         if mean_anchor_target is not None:
             log_mu_for_anchor = torch.log(M_use.mean().clamp_min(1e-8))
             mean_anchor_loss = (log_mu_for_anchor - float(mean_anchor_target)) ** 2
-        if phase == SDFTrainingPhase.SDF_TRUE_ONLY:
+        if phase == SDFTrainingPhase.EPISODE0_BOOTSTRAP:
+            mean_anchor_weight = float(getattr(self.hyperparams, "sdf_log_mean_anchor_weight_stage1", 1.0))
+        elif phase == SDFTrainingPhase.SDF_TRUE_ONLY:
             mean_anchor_weight = float(getattr(self.hyperparams, "sdf_true_anchor_weight", 0.05))
         elif phase == SDFTrainingPhase.SDF_RECURSIVE_ONLY:
             mean_anchor_weight = float(getattr(self.hyperparams, "sdf_recursive_anchor_weight", 0.05))
@@ -2719,7 +2742,11 @@ class Episode:
             mean_anchor_loss = torch.tensor(0.0, device=self.device)
 
         hj_warmup_factor = 1.0
-        if phase not in {SDFTrainingPhase.SDF_TRUE_ONLY, SDFTrainingPhase.SDF_RECURSIVE_ONLY}:
+        if phase not in {
+            SDFTrainingPhase.EPISODE0_BOOTSTRAP,
+            SDFTrainingPhase.SDF_TRUE_ONLY,
+            SDFTrainingPhase.SDF_RECURSIVE_ONLY,
+        }:
             hj_warmup_factor = self._compute_stage2_hj_warmup_factor()
         moment_weight_eff = float(moment_weight) * hj_warmup_factor
         mean_anchor_weight_eff = float(mean_anchor_weight) * hj_warmup_factor
@@ -5658,9 +5685,16 @@ class Episode:
                             self.df_sdf, batch_size=batch_size, n_branches=n_branches
                         )
                     if sdf_batches:
-                        module_summaries['sdf_fc1_stage1'] = self._run_batches(
-                            sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(stage1) '
-                        )
+                        if int(self.episode_id) != 0:
+                            raise RuntimeError("EPISODE0_BOOTSTRAP stage1 is only valid for episode_id == 0.")
+                        prev_phase = getattr(self, "sdf_training_phase", SDFTrainingPhase.EPISODE0_BOOTSTRAP)
+                        self.set_sdf_training_phase(SDFTrainingPhase.EPISODE0_BOOTSTRAP)
+                        try:
+                            module_summaries['sdf_fc1_stage1'] = self._run_batches(
+                                sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(stage1) '
+                            )
+                        finally:
+                            self.set_sdf_training_phase(prev_phase)
 
                 if use_policy_value and sampler is not None:
                     if tensor_pipeline:

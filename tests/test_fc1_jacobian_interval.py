@@ -33,6 +33,14 @@ class _ToySdfFc1(torch.nn.Module):
         return w_parent, w_children, m, c_children, k_children
 
 
+class _CompositeSdfFc1(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1_model = torch.nn.Linear(1, 1)
+        self.sdf_model = torch.nn.Linear(1, 1)
+        self.value_model = torch.nn.Linear(1, 1)
+
+
 def _episode_with_interval(interval: int) -> Episode:
     hp = HyperParams()
     hp.sdf_fresh_pair_enabled = False
@@ -81,6 +89,55 @@ def _batch():
         dtype=torch.float32,
     )
     return {"parent": parent, "children": [child0, child1]}
+
+
+def _proxy_batch():
+    batch = _batch()
+    return {
+        "parent": batch["parent"][:, :7],
+        "children": [child[:, :7] for child in batch["children"]],
+    }
+
+
+def test_episode0_bootstrap_accepts_proxy_macro_state():
+    ep = _episode_with_interval(interval=0)
+    ep.episode_id = 0
+    ep.add_FC1loss = False
+    ep.sdf_training_phase = SDFTrainingPhase.EPISODE0_BOOTSTRAP
+
+    loss = ep._compute_sdf_loss(_proxy_batch())
+
+    assert torch.isfinite(loss)
+    assert ep._latest_sdf_terms["sdf_training_phase"] == SDFTrainingPhase.EPISODE0_BOOTSTRAP.value
+    assert ep._latest_sdf_terms["sdf_moment_weight_effective"] == ep.hyperparams.sdf_stage1_moment_weight
+    assert ep._latest_sdf_terms["sdf_anchor_weight_effective"] == ep.hyperparams.sdf_log_mean_anchor_weight_stage1
+    assert ep._latest_sdf_terms["sdf_hj_warmup_factor"] == 1.0
+
+
+def test_episode0_bootstrap_freezes_fc1_parameters():
+    ep = Episode.__new__(Episode)
+    ep.models = {"sdf_fc1": _CompositeSdfFc1()}
+    ep.sdf_training_phase = SDFTrainingPhase.EPISODE0_BOOTSTRAP
+
+    ep._set_sdf_training_phase_freeze()
+
+    assert all(not p.requires_grad for p in ep.models["sdf_fc1"].fc1_model.parameters())
+    assert all(p.requires_grad for p in ep.models["sdf_fc1"].sdf_model.parameters())
+    assert all(p.requires_grad for p in ep.models["sdf_fc1"].value_model.parameters())
+
+
+def test_post0_true_state_phase_still_rejects_proxy_macro_state():
+    ep = _episode_with_interval(interval=0)
+    ep.episode_id = 1
+    ep.add_FC1loss = False
+    ep.sdf_training_phase = SDFTrainingPhase.SDF_TRUE_ONLY
+
+    try:
+        ep._compute_sdf_loss(_proxy_batch())
+    except RuntimeError as exc:
+        assert "SDF_TRUE_ONLY requires true Hatc_t and LnK_t" in str(exc)
+    else:
+        raise AssertionError("Expected SDF_TRUE_ONLY to reject proxy-only macro state.")
 
 
 def test_fc1_jacobian_penalty_uses_interval_gate():
@@ -155,6 +212,9 @@ def test_fc1_jacobian_active_batch_backward_has_finite_grads():
 
 
 if __name__ == "__main__":
+    test_episode0_bootstrap_accepts_proxy_macro_state()
+    test_episode0_bootstrap_freezes_fc1_parameters()
+    test_post0_true_state_phase_still_rejects_proxy_macro_state()
     test_fc1_jacobian_penalty_uses_interval_gate()
     test_fc1_jacobian_penalty_uses_sdf_counter_not_global_counter()
     test_fc1_jacobian_interval_zero_disables_penalty()

@@ -46,6 +46,7 @@ Training orchestration for episodes and modules.
 
 ### SDF/FC1: explicit training phases
 - `sdf_training_schedule_enabled=True` runs simulated macro SDF/FC1 training as explicit phases:
+  - `episode0_bootstrap`: Episode 0 only; use `Hatcf_t/LnKF_t` as bootstrap macro state, freeze FC1, train SDF/value with Stage1 moment/anchor weights, and do not require true `Hatc_t/LnK_t`.
   - `fc1_only`: train only `fc1_model`; Euler, moment, and SDF mean-anchor weights are zero.
   - `sdf_true_only`: freeze FC1 and train only `sdf_model`/`value_model` using true macro parent state.
   - `sdf_recursive_only`: freeze FC1 and train only `sdf_model`/`value_model` using recursive forecast parent state, plus a true-state Euler baseline.
