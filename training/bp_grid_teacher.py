@@ -140,7 +140,7 @@ class BPGridTeacher:
         refine: bool = True,
         quadratic_refine: bool = False,
         parent_chunk_size: int = 2048,
-        candidate_chunk_size: int = 4,
+        candidate_chunk_size: int = 0,
         max_expanded_states: int = 65536,
         margin_scale: float = 1e-3,
         confidence_relative: bool = True,

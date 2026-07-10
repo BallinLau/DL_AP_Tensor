@@ -51,7 +51,11 @@ Training orchestration for episodes and modules.
   - `sdf_recursive_only`: freeze FC1 and train only `sdf_model`/`value_model` using recursive forecast parent state, plus a true-state Euler baseline.
 - The phase is recorded as `sdf_training_phase`. Effective loss weights are logged as `*_weight_effective` fields.
 - `fc1_only` never samples fresh wealth pairs and never computes Euler/moment/anchor terms.
-- `fc1_rollout_weight` is supported only when a batch explicitly supplies same-path sequence tensors: `fc1_rollout_initial_state`, `fc1_rollout_future_x`, and `fc1_rollout_target_states`. Child branches are not treated as rollout time steps.
+- Episode 0 does not run the Stage2 FC1/SDF schedule. Stage2 is valid only for `episode_id > 0`.
+- In Mode B, the ordering is now: simulate with previous policies, build macro transitions, run `fc1_only -> sdf_true_only -> sdf_recursive_only` with gates, then train Q/P/bp. Gate failure raises `NumericalStageFailure` and skips downstream Policy/Value training.
+- `fc1_rollout_weight` requires same-path sequence tensors: `fc1_rollout_initial_x`, `fc1_rollout_initial_state`, `fc1_rollout_future_x`, and `fc1_rollout_target_states`. Child branches are not treated as rollout time steps.
+- FC1 rollout tensors are constructed from consecutive macro rows in the tensor pipeline. If rollout is enabled but these tensors are missing, FC1 training fails fast instead of silently using a zero rollout loss.
+- `sdf_true_only` and `sdf_recursive_only` require true `Hatc_t`/`LnK_t` in the parent batch; they no longer fall back to forecast state while logging a true-state phase.
 
 ### Policy/Value: Q-first training hooks
 - `train_step(..., policy_loss_terms=...)` now supports selective optimization among `['q', 'p0', 'pi']`.

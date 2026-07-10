@@ -37,6 +37,7 @@ def _episode_with_interval(interval: int) -> Episode:
     hp = HyperParams()
     hp.sdf_fresh_pair_enabled = False
     hp.fc1_forecast_recon_weight = 0.1
+    hp.fc1_rollout_weight = 0.0
     hp.fc1_jacobian_penalty_weight = 1.0
     hp.fc1_jacobian_penalty_interval = interval
     hp.fc1_use_true_macro_state_in_stage2 = True
@@ -129,6 +130,18 @@ def test_fc1_jacobian_interval_one_computes_every_sdf_step():
         assert ep._latest_sdf_terms["sdf_jacobian_penalty"] > 0.0
 
 
+def test_fc1_rollout_enabled_requires_sequence_tensors():
+    ep = _episode_with_interval(interval=0)
+    ep.hyperparams.fc1_rollout_weight = 0.5
+
+    try:
+        ep._compute_sdf_loss(_batch())
+    except RuntimeError as exc:
+        assert "FC1 rollout enabled but batch is missing" in str(exc)
+    else:
+        raise AssertionError("Expected missing rollout tensors to fail fast.")
+
+
 def test_fc1_jacobian_active_batch_backward_has_finite_grads():
     ep = _episode_with_interval(interval=1)
     loss = ep._compute_sdf_loss(_batch())
@@ -146,4 +159,5 @@ if __name__ == "__main__":
     test_fc1_jacobian_penalty_uses_sdf_counter_not_global_counter()
     test_fc1_jacobian_interval_zero_disables_penalty()
     test_fc1_jacobian_interval_one_computes_every_sdf_step()
+    test_fc1_rollout_enabled_requires_sequence_tensors()
     test_fc1_jacobian_active_batch_backward_has_finite_grads()

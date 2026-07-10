@@ -103,6 +103,8 @@ class TreatmentBFlowTest(unittest.TestCase):
             marker = int(self.tensor_macro.data[0, hatc_idx].item())
             calls.append(f"train_sdf_marker_{marker}")
             module_summaries["sdf_marker"] = marker
+            module_summaries["sdf_fc1_gate"] = {"passed": True, "failed_stage": None}
+            return {"passed": True, "failed_stage": None}
 
         episode._simulate_tensor = MethodType(fake_simulate_tensor, episode)
         episode._create_firm_batches_from_tensor = MethodType(fake_create_firm_batches, episode)
@@ -124,19 +126,85 @@ class TreatmentBFlowTest(unittest.TestCase):
 
     def test_treatment_a_simulates_once_and_trains_sdf_on_first_macro(self):
         calls, summary = self._make_episode(resimulate_after_pv=False)
-        self.assertEqual(calls, ["simulate1", "train_pv", "train_sdf_marker_1"])
+        self.assertEqual(calls, ["simulate1", "train_sdf_marker_1", "train_pv"])
         self.assertEqual(summary["module_summaries"]["sdf_marker"], 1)
         self.assertFalse(summary["module_summaries"]["modeb_post_pv_resimulation_diag"]["resimulated_after_pv"])
 
-    def test_treatment_b_resimulates_after_pv_and_trains_sdf_on_second_macro(self):
+    def test_treatment_b_trains_sdf_before_pv_then_resimulates(self):
         calls, summary = self._make_episode(resimulate_after_pv=True)
-        self.assertEqual(calls, ["simulate1", "train_pv", "simulate2", "train_sdf_marker_2"])
-        self.assertEqual(summary["module_summaries"]["sdf_marker"], 2)
+        self.assertEqual(calls, ["simulate1", "train_sdf_marker_1", "train_pv", "simulate2"])
+        self.assertEqual(summary["module_summaries"]["sdf_marker"], 1)
         diag = summary["module_summaries"]["modeb_post_pv_resimulation_diag"]
         self.assertTrue(diag["resimulated_after_pv"])
         self.assertTrue(diag["rng_state_replayed"])
         self.assertIn("macro_old_to_new_common_rows", diag)
         self.assertIn("firm_old_to_new_keys_common_rows", diag)
+
+    def test_modeb_sdf_gate_failure_skips_policy_value(self):
+        episode = Episode.__new__(Episode)
+        episode.models = {"policy_value": object(), "sdf_fc1": object()}
+        episode.optimizers = {}
+        episode.config = SimpleNamespace(DEVICE=torch.device("cpu"))
+        episode.hyperparams = SimpleNamespace(use_tensor_pipeline=True, simulate_horizon=2)
+        episode.device = torch.device("cpu")
+        episode.episode_id = 1
+        episode.gpu_monitor = _DummyMonitor()
+        episode.df = None
+        episode.df_macro = None
+        episode.df_sdf = None
+        episode.tensor_firm = None
+        episode.tensor_macro = None
+        episode.tensor_sdf = None
+        episode.step_count = 0
+        episode.loss_history = {}
+        episode.add_FC1loss = False
+        episode.train_mode = "2time"
+        episode._fc1_teacher_forcing_stage = False
+
+        calls = []
+
+        def fake_simulate_tensor(self, n_paths, group_size, n_branches, horizon, simulate_kwargs, export_df=False):
+            calls.append("simulate")
+            self.tensor_macro = TensorTable(
+                data=torch.tensor(
+                    [[0.0, 0.0, -1.0, 10.0, 2.0, 1.0, 1.0, 3.0, 1.0, 0.1, 0.5, 4.0]],
+                    dtype=torch.float32,
+                ),
+                columns=["path", "t", "branch", "K", "C", "LnK", "Hatc", "n_firms", "M", "x", "hatcf", "lnkf"],
+            )
+            self.tensor_firm = TensorTable(
+                data=torch.zeros(1, 27),
+                columns=[
+                    "path", "t", "branch", "ID", "entry", "b", "z", "ETA", "i", "x", "Hatcf", "LnKF",
+                    "K", "M", "Q", "P0", "PI", "Bar_i", "Bar_z", "P", "bp0", "bpI", "bp", "Y", "I", "Phi", "C",
+                ],
+            )
+
+        def fake_run_sdf(self, module_summaries, n_epochs, batch_size, log_interval, n_branches):
+            calls.append("train_sdf_failed")
+            return {"passed": False, "failed_stage": "fc1_only"}
+
+        def fake_run_batches(self, batches, n_epochs, log_interval, train_modules, desc_prefix=""):
+            calls.append("train_pv")
+            return {"final_losses": {"total": 0.0}}
+
+        episode._simulate_tensor = MethodType(fake_simulate_tensor, episode)
+        episode._run_sdf_recon_from_macro = MethodType(fake_run_sdf, episode)
+        episode._run_batches = MethodType(fake_run_batches, episode)
+
+        with self.assertRaisesRegex(Exception, "skip Q/P/bp"):
+            episode.run_episode(
+                n_epochs=1,
+                batch_size=2,
+                log_interval=1,
+                n_paths=1,
+                group_size=1,
+                n_branches=2,
+                train_modules=["policy_value", "sdf_fc1"],
+                simulate_kwargs={"horizon": 2, "modeb_resimulate_after_pv": False},
+                episode_mode="modeb",
+            )
+        self.assertEqual(calls, ["simulate", "train_sdf_failed"])
 
     def test_fixed_batch_eval_reports_stage2_object_layers(self):
         episode = Episode.__new__(Episode)
@@ -167,6 +235,56 @@ class TreatmentBFlowTest(unittest.TestCase):
         self.assertAlmostEqual(out["check_primary_true_state_dlnk_next_rmse"], 0.0, places=6)
         self.assertAlmostEqual(out["check_recursive_forecast_state_dlnk_next_rmse"], 0.0, places=6)
         self.assertAlmostEqual(out["check_current_belief_lnk_vs_realized_rmse"], 0.2, places=6)
+
+    def test_sdf_macro_batches_include_same_path_rollout_tensors(self):
+        episode = Episode.__new__(Episode)
+        episode.device = torch.device("cpu")
+        episode.add_FC1loss = True
+        episode.train_mode = "2time"
+        episode.hyperparams = SimpleNamespace(
+            fc1_rollout_weight=0.5,
+            fc1_rollout_horizon=2,
+            max_firm_train_units=0,
+            pv_eta_resample_enabled=False,
+        )
+        rows = []
+        for t in (1.0, 2.0, 3.0):
+            for branch in (0.0, 1.0):
+                rows.append(
+                    [
+                        0.0,
+                        t,
+                        branch,
+                        10.0 + t,
+                        20.0 + t + branch,
+                        0.1 * t,
+                        4.0 + 0.1 * t,
+                        1.0 + t,
+                        5.0 + t,
+                        2.0 + t + branch,
+                        6.0 + t + branch,
+                    ]
+                )
+        sdf_table = TensorTable(
+            data=torch.tensor(rows, dtype=torch.float32),
+            columns=[
+                "path", "t", "branch", "x_t", "x_t1", "Hatcf_t", "LnKF_t",
+                "Hatc_t", "LnK_t", "Hatc_t1", "LnK_t1",
+            ],
+        )
+
+        batches = episode._create_sdf_batches_from_macro_tensor(sdf_table, batch_size=8, n_branches=2)
+
+        self.assertEqual(len(batches), 1)
+        batch = batches[0]
+        self.assertIn("fc1_rollout_initial_x", batch)
+        self.assertIn("fc1_rollout_future_x", batch)
+        self.assertIn("fc1_rollout_target_states", batch)
+        self.assertEqual(tuple(batch["fc1_rollout_future_x"].shape[1:]), (2, 1))
+        first_source = int(batch["parent_source_index"][0].item())
+        self.assertAlmostEqual(batch["fc1_rollout_initial_x"][0, 0].item(), 11.0 + first_source)
+        self.assertAlmostEqual(batch["fc1_rollout_future_x"][0, 0, 0].item(), 21.0 + first_source)
+        self.assertAlmostEqual(batch["fc1_rollout_future_x"][0, 1, 0].item(), 22.0 + first_source)
 
     def test_formal_hyperparams_use_true_state_primary_stage2(self):
         hp = build_hyperparams()

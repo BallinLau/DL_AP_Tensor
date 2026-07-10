@@ -879,7 +879,8 @@ class Episode:
         parent: torch.Tensor,
         children: List[torch.Tensor],
         batch_size: int,
-        eta_resample: bool = True
+        eta_resample: bool = True,
+        extra_tensors: Optional[Dict[str, torch.Tensor]] = None
     ) -> List[Dict[str, torch.Tensor]]:
         if parent is None or parent.numel() == 0:
             return []
@@ -938,6 +939,9 @@ class Episode:
                 'parent_index': compact_indices[start:end],
                 'parent_source_index': idx,
             }
+            if extra_tensors:
+                for name, value in extra_tensors.items():
+                    batch[name] = value[idx]
             batches.append(batch)
         return batches
 
@@ -1118,6 +1122,23 @@ class Episode:
         unique_keys = torch.unique(key)
         parent_rows: List[torch.Tensor] = []
         child_rows: List[List[torch.Tensor]] = [[] for _ in range(n_branches)]
+        rollout_initial_x_rows: List[torch.Tensor] = []
+        rollout_initial_state_rows: List[torch.Tensor] = []
+        rollout_future_x_rows: List[torch.Tensor] = []
+        rollout_target_state_rows: List[torch.Tensor] = []
+        rollout_weight = float(getattr(self.hyperparams, "fc1_rollout_weight", 0.0))
+        rollout_horizon = max(0, int(getattr(self.hyperparams, "fc1_rollout_horizon", 5)))
+        need_rollout = bool(self.add_FC1loss and rollout_weight > 0.0 and rollout_horizon > 0)
+        branch0_lookup: Dict[Tuple[int, int], torch.Tensor] = {}
+        if need_rollout:
+            if 't' not in col or 'Hatc_t1' not in col or 'LnK_t1' not in col:
+                raise RuntimeError(
+                    "FC1 rollout enabled but SDF macro table lacks t/Hatc_t1/LnK_t1 columns."
+                )
+            branch0_mask = branch == 0
+            branch0_idx = torch.nonzero(branch0_mask, as_tuple=False).squeeze(-1)
+            for ridx in branch0_idx.tolist():
+                branch0_lookup[(int(path[ridx].item()), int(data[ridx, col['t']].item()))] = data[ridx]
 
         for gk in unique_keys:
             gm = key == gk
@@ -1153,6 +1174,25 @@ class Episode:
                     torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device),
                     x_t, hatcf_t, lnkf_t
                 ])
+
+            rollout_future_x = None
+            rollout_target_states = None
+            if need_rollout:
+                path_id = int(group_children[0][col['path']].item())
+                first_child_t = int(group_children[0][col['t']].item())
+                future_x_parts = []
+                target_state_parts = []
+                for h in range(rollout_horizon):
+                    row = branch0_lookup.get((path_id, first_child_t + h))
+                    if row is None:
+                        ok = False
+                        break
+                    future_x_parts.append(row[col['x_t1']].reshape(1))
+                    target_state_parts.append(torch.stack([row[col['Hatc_t1']], row[col['LnK_t1']]]))
+                if not ok:
+                    continue
+                rollout_future_x = torch.stack(future_x_parts, dim=0)
+                rollout_target_states = torch.stack(target_state_parts, dim=0)
             parent_rows.append(p)
 
             for k in range(n_branches):
@@ -1183,12 +1223,34 @@ class Episode:
                 for k in range(n_branches):
                     if child_rows[k]:
                         child_rows[k].pop()
+                continue
+            if need_rollout:
+                rollout_initial_x_rows.append(x_t.reshape(1))
+                rollout_initial_state_rows.append(torch.stack([hatc_t, lnk_t]))
+                rollout_future_x_rows.append(rollout_future_x)
+                rollout_target_state_rows.append(rollout_target_states)
 
         if not parent_rows:
             return []
         parent = torch.stack(parent_rows, dim=0).to(torch.float32)
         children = [torch.stack(rows, dim=0).to(torch.float32) for rows in child_rows]
-        return self._build_batches_from_parent_children(parent, children, batch_size=batch_size, eta_resample=False)
+        extra_tensors = None
+        if need_rollout:
+            if len(rollout_future_x_rows) != parent.shape[0]:
+                raise RuntimeError("FC1 rollout construction produced misaligned sequence tensors.")
+            extra_tensors = {
+                'fc1_rollout_initial_x': torch.stack(rollout_initial_x_rows, dim=0).to(torch.float32),
+                'fc1_rollout_initial_state': torch.stack(rollout_initial_state_rows, dim=0).to(torch.float32),
+                'fc1_rollout_future_x': torch.stack(rollout_future_x_rows, dim=0).to(torch.float32),
+                'fc1_rollout_target_states': torch.stack(rollout_target_state_rows, dim=0).to(torch.float32),
+            }
+        return self._build_batches_from_parent_children(
+            parent,
+            children,
+            batch_size=batch_size,
+            eta_resample=False,
+            extra_tensors=extra_tensors
+        )
     
     def _init_weight_scheduler(self) -> LossWeightScheduler:
         """
@@ -2051,10 +2113,18 @@ class Episode:
         This intentionally requires explicit same-path time-series tensors and
         never treats child branches as a time sequence.
         """
-        if not all(k in batch for k in ("fc1_rollout_initial_state", "fc1_rollout_future_x", "fc1_rollout_target_states")):
-            return torch.tensor(0.0, device=self.device)
+        required = {
+            "fc1_rollout_initial_state",
+            "fc1_rollout_initial_x",
+            "fc1_rollout_future_x",
+            "fc1_rollout_target_states",
+        }
+        missing = required.difference(batch.keys())
+        if missing:
+            raise RuntimeError(f"FC1 rollout enabled but batch is missing: {sorted(missing)}")
 
         initial_state = batch["fc1_rollout_initial_state"].to(self.device)
+        initial_x = batch["fc1_rollout_initial_x"].to(self.device)
         future_x = batch["fc1_rollout_future_x"].to(self.device)
         target_states = batch["fc1_rollout_target_states"].to(self.device)
         horizon = min(
@@ -2067,7 +2137,7 @@ class Episode:
 
         hatc = initial_state[:, 0:1]
         lnk = initial_state[:, 1:2]
-        x_prev = future_x[:, 0, :]
+        x_prev = initial_x
         weights = torch.ones(horizon, device=self.device, dtype=future_x.dtype) / float(horizon)
         losses = []
         for h in range(horizon):
@@ -2129,7 +2199,9 @@ class Episode:
         delta_lnk_abs_max = float(getattr(self.hyperparams, "fc1_delta_lnk_abs_max", 0.30))
 
         if hatc_true is None or lnk_true is None or parent.shape[1] < 9:
-            logger.warning("FC1_ONLY phase requires parent true macro and child true targets; returning zero FC1 loss.")
+            raise RuntimeError(
+                "FC1_ONLY phase requires parent true Hatc/LnK and child true Hatc/LnK targets."
+            )
         else:
             _, _, _, hatc_pred, lnk_pred = model.forward_step(
                 x_prev=parent[:, 4:5],
@@ -2260,8 +2332,12 @@ class Episode:
 
         use_true_prev_macro = False
         if phase == SDFTrainingPhase.SDF_TRUE_ONLY:
-            use_true_prev_macro = bool(parent.shape[1] >= 9)
+            if parent.shape[1] < 9:
+                raise RuntimeError("SDF_TRUE_ONLY requires true Hatc_t and LnK_t in the parent batch.")
+            use_true_prev_macro = True
         elif phase == SDFTrainingPhase.SDF_RECURSIVE_ONLY:
+            if parent.shape[1] < 9:
+                raise RuntimeError("SDF_RECURSIVE_ONLY requires true Hatc_t/LnK_t for its true-state baseline.")
             use_true_prev_macro = False
         elif self._fc1_teacher_forcing_stage and parent.shape[1] >= 9:
             use_true_prev_macro = True
@@ -2329,7 +2405,7 @@ class Episode:
         )  # (batch, n_children)
         main_loss, wealth_main_details = loss_fn.compute_wealth_main_loss(residuals)
         true_state_main_loss = main_loss
-        if phase == SDFTrainingPhase.SDF_RECURSIVE_ONLY and parent.shape[1] >= 9:
+        if phase == SDFTrainingPhase.SDF_RECURSIVE_ONLY:
             w_parent_true, w_children_true, _, c_children_true, k_children_true = model.forward_step(
                 x_prev=parent[:, 4:5],
                 x_curr=fixed_children_x,
@@ -4869,6 +4945,9 @@ class Episode:
         recursive_dlnk_pred_parts: List[torch.Tensor] = []
         primary_m_parts: List[torch.Tensor] = []
         recursive_m_parts: List[torch.Tensor] = []
+        primary_signed_parts: List[torch.Tensor] = []
+        recursive_signed_parts: List[torch.Tensor] = []
+        rollout_rmse_parts: Dict[int, List[torch.Tensor]] = {}
 
         try:
             with torch.no_grad():
@@ -4888,20 +4967,46 @@ class Episode:
                     k_prev_true = parent[:, 8:9] if has_true_prev_macro else parent[:, 6:7]
                     c_prev_forecast = parent[:, 5:6]
                     k_prev_forecast = parent[:, 6:7]
-                    _, _, M_primary, c_children_primary, k_children_primary = model.forward_step(
+                    w_parent_primary, w_children_primary, M_primary, c_children_primary, k_children_primary = model.forward_step(
                         x_prev=parent[:, 4:5],
                         x_curr=children_t[:, :, 4:5],
                         hatcf_prev=c_prev_true,
                         lnkf_prev=k_prev_true,
                         return_physical=True
                     )
-                    _, _, M_recursive, c_children_recursive, k_children_recursive = model.forward_step(
+                    w_parent_recursive, w_children_recursive, M_recursive, c_children_recursive, k_children_recursive = model.forward_step(
                         x_prev=parent[:, 4:5],
                         x_curr=children_t[:, :, 4:5],
                         hatcf_prev=c_prev_forecast,
                         lnkf_prev=k_prev_forecast,
                         return_physical=True
                     )
+                    loss_fn = getattr(self, "loss_fns", {}).get("sdf") if hasattr(self, "loss_fns") else None
+                    if loss_fn is not None:
+                        residuals_primary = loss_fn.compute_euler_residuals(
+                            w_parent_primary.squeeze(-1),
+                            w_children_primary.squeeze(-1),
+                            k_prev_true.squeeze(-1),
+                            k_children_primary.squeeze(-1),
+                            c_prev_true.squeeze(-1),
+                            c_children_primary.squeeze(-1),
+                        )
+                        residuals_recursive = loss_fn.compute_euler_residuals(
+                            w_parent_recursive.squeeze(-1),
+                            w_children_recursive.squeeze(-1),
+                            k_prev_forecast.squeeze(-1),
+                            k_children_recursive.squeeze(-1),
+                            c_prev_forecast.squeeze(-1),
+                            c_children_recursive.squeeze(-1),
+                        )
+                        if residuals_primary.shape[1] >= 2:
+                            primary_signed_parts.append(
+                                (residuals_primary[:, 0] * residuals_primary[:, 1]).detach().reshape(-1).cpu()
+                            )
+                        if residuals_recursive.shape[1] >= 2:
+                            recursive_signed_parts.append(
+                                (residuals_recursive[:, 0] * residuals_recursive[:, 1]).detach().reshape(-1).cpu()
+                            )
                     if children_t.shape[-1] >= 10:
                         hatcf_true = children_t[:, :, 8:9]
                         lnkf_true = children_t[:, :, 9:10]
@@ -4935,6 +5040,41 @@ class Episode:
                             )
                     primary_m_parts.append(M_primary.detach().reshape(-1).cpu())
                     recursive_m_parts.append(M_recursive.detach().reshape(-1).cpu())
+
+                    rollout_required = {
+                        "fc1_rollout_initial_state",
+                        "fc1_rollout_initial_x",
+                        "fc1_rollout_future_x",
+                        "fc1_rollout_target_states",
+                    }
+                    if rollout_required.issubset(batch.keys()):
+                        initial_state = batch["fc1_rollout_initial_state"]
+                        x_prev_roll = batch["fc1_rollout_initial_x"]
+                        future_x = batch["fc1_rollout_future_x"]
+                        target_states = batch["fc1_rollout_target_states"]
+                        hatc_roll = initial_state[:, 0:1]
+                        lnk_roll = initial_state[:, 1:2]
+                        horizon = min(
+                            int(getattr(self.hyperparams, "fc1_rollout_horizon", future_x.shape[1])),
+                            int(future_x.shape[1]),
+                            int(target_states.shape[1]),
+                        )
+                        for h in range(horizon):
+                            x_curr = future_x[:, h, :]
+                            _, _, _, hatc_next, lnk_next = model.forward_step(
+                                x_prev=x_prev_roll,
+                                x_curr=x_curr.unsqueeze(1),
+                                hatcf_prev=hatc_roll,
+                                lnkf_prev=lnk_roll,
+                                return_physical=True,
+                            )
+                            hatc_roll = hatc_next[:, 0, :]
+                            lnk_roll = lnk_next[:, 0, :]
+                            pred_state = torch.cat([hatc_roll, lnk_roll], dim=1)
+                            target_state = target_states[:, h, :]
+                            se = (pred_state - target_state).pow(2).mean(dim=1).detach().cpu()
+                            rollout_rmse_parts.setdefault(h + 1, []).append(se)
+                            x_prev_roll = x_curr
         finally:
             if was_training:
                 model.train()
@@ -4994,6 +5134,7 @@ class Episode:
             m = m[torch.isfinite(m)]
             out[f'{prefix}_{name}_n'] = float(m.numel())
             if m.numel() > 0:
+                out[f'{prefix}_{name}_mean'] = float(m.mean().item())
                 out[f'{prefix}_{name}_p50'] = float(torch.quantile(m, 0.50).item())
                 out[f'{prefix}_{name}_p90'] = float(torch.quantile(m, 0.90).item())
                 out[f'{prefix}_{name}_p99'] = float(torch.quantile(m, 0.99).item())
@@ -5003,7 +5144,104 @@ class Episode:
 
         _safe_m_metrics('primary_true_state_M', primary_m_parts)
         _safe_m_metrics('recursive_forecast_state_M', recursive_m_parts)
+
+        def _safe_signed_t(name: str, parts: List[torch.Tensor]) -> None:
+            if not parts:
+                return
+            v = torch.cat(parts).to(torch.float32)
+            v = v[torch.isfinite(v)]
+            out[f'{prefix}_{name}_n'] = float(v.numel())
+            if v.numel() < 2:
+                out[f'{prefix}_{name}_mean'] = float('nan')
+                out[f'{prefix}_{name}_t'] = float('nan')
+                return
+            mean = v.mean()
+            se = v.std(unbiased=True).clamp_min(1e-12) / float(v.numel()) ** 0.5
+            out[f'{prefix}_{name}_mean'] = float(mean.item())
+            out[f'{prefix}_{name}_t'] = float((mean / se).item())
+
+        _safe_signed_t('primary_true_state_signed_aio', primary_signed_parts)
+        _safe_signed_t('recursive_forecast_state_signed_aio', recursive_signed_parts)
+
+        rollout_rmse_by_h: Dict[int, float] = {}
+        for h, parts in rollout_rmse_parts.items():
+            if not parts:
+                continue
+            se = torch.cat(parts).to(torch.float32)
+            se = se[torch.isfinite(se)]
+            if se.numel() == 0:
+                continue
+            rmse = float(torch.sqrt(se.mean()).item())
+            rollout_rmse_by_h[h] = rmse
+            out[f'{prefix}_fc1_rollout_h{h}_rmse'] = rmse
+        if 1 in rollout_rmse_by_h:
+            target_h = min(max(rollout_rmse_by_h), int(getattr(self.hyperparams, "fc1_rollout_horizon", 5)))
+            out[f'{prefix}_fc1_rmse_growth_h{target_h}'] = float(
+                rollout_rmse_by_h[target_h] / (rollout_rmse_by_h[1] + 1e-8)
+            )
         return out
+
+    def _fc1_gate_passed(self, eval_metrics: Dict[str, float], prefix: str) -> Tuple[bool, Dict[str, Any]]:
+        min_r2 = float(getattr(self.hyperparams, "fc1_recursive_r2_min", 0.0))
+        max_growth = float(getattr(self.hyperparams, "fc1_rmse_growth_h5_max", 2.0))
+        horizon = int(getattr(self.hyperparams, "fc1_rollout_horizon", 5))
+        checks = {
+            "recursive_hatc_r2": eval_metrics.get(f"{prefix}_recursive_forecast_state_hatc_next_r2", float("nan")),
+            "recursive_lnk_r2": eval_metrics.get(f"{prefix}_recursive_forecast_state_lnk_next_r2", float("nan")),
+            "rmse_growth": eval_metrics.get(f"{prefix}_fc1_rmse_growth_h{horizon}", float("nan")),
+        }
+        passed = (
+            np.isfinite(checks["recursive_hatc_r2"])
+            and np.isfinite(checks["recursive_lnk_r2"])
+            and np.isfinite(checks["rmse_growth"])
+            and checks["recursive_hatc_r2"] >= min_r2
+            and checks["recursive_lnk_r2"] >= min_r2
+            and checks["rmse_growth"] <= max_growth
+        )
+        diag = {
+            "passed": bool(passed),
+            "min_r2": min_r2,
+            "max_rmse_growth": max_growth,
+            **checks,
+        }
+        return bool(passed), diag
+
+    def _sdf_gate_passed(
+        self,
+        eval_metrics: Dict[str, float],
+        prefix: str,
+        stage: SDFTrainingPhase
+    ) -> Tuple[bool, Dict[str, Any]]:
+        max_log_mean_error = float(getattr(self.hyperparams, "sdf_log_mean_error_max", 0.02))
+        max_t = float(getattr(self.hyperparams, "sdf_signed_t_abs_max", 2.0))
+        target = getattr(self.hyperparams, "sdf_log_mean_target", None)
+        target = float(target) if target is not None else 0.0
+        if stage == SDFTrainingPhase.SDF_TRUE_ONLY:
+            m_key = f"{prefix}_primary_true_state_M_mean"
+            t_key = f"{prefix}_primary_true_state_signed_aio_t"
+        else:
+            m_key = f"{prefix}_recursive_forecast_state_M_mean"
+            t_key = f"{prefix}_recursive_forecast_state_signed_aio_t"
+        m_mean = eval_metrics.get(m_key, float("nan"))
+        signed_t = eval_metrics.get(t_key, float("nan"))
+        log_mean_error = abs(np.log(max(float(m_mean), 1e-12)) - target) if np.isfinite(m_mean) else float("nan")
+        passed = (
+            np.isfinite(log_mean_error)
+            and np.isfinite(signed_t)
+            and log_mean_error <= max_log_mean_error
+            and abs(float(signed_t)) <= max_t
+        )
+        diag = {
+            "passed": bool(passed),
+            "stage": stage.value,
+            "m_mean": float(m_mean),
+            "log_mean_target": target,
+            "log_mean_error": float(log_mean_error),
+            "max_log_mean_error": max_log_mean_error,
+            "signed_aio_t": float(signed_t),
+            "max_signed_t_abs": max_t,
+        }
+        return bool(passed), diag
 
     def _run_sdf_recon_from_macro(
         self,
@@ -5012,7 +5250,9 @@ class Episode:
         batch_size: int,
         log_interval: int,
         n_branches: int
-    ) -> None:
+    ) -> Dict[str, Any]:
+        if self.episode_id <= 0:
+            raise RuntimeError("FC1/SDF Stage2 is only valid after Episode 0.")
         macro_df = self.df_macro
         macro_r2_diag: Dict[str, Any] = {}
         if self._use_tensor_pipeline() and self.tensor_macro is not None:
@@ -5021,7 +5261,7 @@ class Episode:
             if (macro_df is None or macro_df.empty) and self.tensor_macro is not None:
                 macro_df = self._table_to_dataframe(self.tensor_macro)
             if macro_df is None or macro_df.empty:
-                return
+                raise RuntimeError("FC1/SDF Stage2 requires non-empty macro simulation data.")
             self.df_macro = macro_df
             macro_r2_diag = self._macro_forecast_r2(macro_df)
 
@@ -5038,7 +5278,7 @@ class Episode:
             sdf_table = self._build_sdf_pairs_from_macro_tensor(self.tensor_macro)
         else:
             if macro_df is None or macro_df.empty:
-                return
+                raise RuntimeError("FC1/SDF Stage2 requires non-empty macro simulation data.")
             df_macro_sdf = build_sdf_pairs_from_macro_ts(macro_df.copy(), include_hatc_lnk_t1=True)
             sdf_table = TensorTable(
                 data=torch.tensor(df_macro_sdf.values, device=self.device, dtype=torch.float32),
@@ -5053,62 +5293,103 @@ class Episode:
             sdf_batches = self._create_sdf_batches_from_macro_tensor(
                 sdf_table, batch_size=batch_size, n_branches=n_branches
             )
-            if sdf_batches:
-                eval_batches = int(getattr(self.hyperparams, "sdf_fc1_eval_max_batches", 0))
-                eval_batches_arg = eval_batches if eval_batches > 0 else None
-                before_eval = self._evaluate_sdf_fc1_batches(
-                    sdf_batches,
-                    prefix='before',
-                    max_batches=eval_batches_arg
-                )
-                if before_eval:
-                    module_summaries['sdf_fc1_fixed_batch_eval_before'] = before_eval
-                if bool(getattr(self.hyperparams, "sdf_training_schedule_enabled", True)):
-                    fc1_epochs = max(0, int(getattr(self.hyperparams, "fc1_only_epochs", 10)))
-                    true_epochs = max(0, int(getattr(self.hyperparams, "sdf_true_only_epochs", 20)))
-                    recursive_epochs = max(0, int(getattr(self.hyperparams, "sdf_recursive_only_epochs", 10)))
+            if not sdf_batches:
+                raise RuntimeError("FC1/SDF Stage2 could not build non-empty SDF macro batches.")
+            eval_batches = int(getattr(self.hyperparams, "sdf_fc1_eval_max_batches", 0))
+            eval_batches_arg = eval_batches if eval_batches > 0 else None
+            gate_result: Dict[str, Any] = {"passed": True, "failed_stage": None}
+            before_eval = self._evaluate_sdf_fc1_batches(
+                sdf_batches,
+                prefix='before',
+                max_batches=eval_batches_arg
+            )
+            if before_eval:
+                module_summaries['sdf_fc1_fixed_batch_eval_before'] = before_eval
 
-                    if fc1_epochs > 0:
-                        self.set_sdf_training_phase(SDFTrainingPhase.FC1_ONLY)
-                        module_summaries['sdf_fc1_fc1_only'] = self._run_batches(
-                            sdf_batches, fc1_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(fc1-only) '
-                        )
-                    if true_epochs > 0:
-                        self.set_sdf_training_phase(SDFTrainingPhase.SDF_TRUE_ONLY)
-                        module_summaries['sdf_fc1_sdf_true_only'] = self._run_batches(
-                            sdf_batches, true_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(sdf-true) '
-                        )
-                    if recursive_epochs > 0:
-                        self.set_sdf_training_phase(SDFTrainingPhase.SDF_RECURSIVE_ONLY)
-                        module_summaries['sdf_fc1_sdf_recursive_only'] = self._run_batches(
-                            sdf_batches, recursive_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(sdf-recursive) '
-                        )
-                    module_summaries['sdf_fc1_stage2'] = module_summaries.get(
-                        'sdf_fc1_sdf_recursive_only',
-                        module_summaries.get('sdf_fc1_sdf_true_only', module_summaries.get('sdf_fc1_fc1_only', {}))
+            def _fail(stage_name: str, diag: Dict[str, Any]) -> Dict[str, Any]:
+                result = {"passed": False, "failed_stage": stage_name, "diagnostics": diag}
+                module_summaries['sdf_fc1_gate'] = result
+                logger.warning("FC1/SDF gate failed at %s: %s", stage_name, diag)
+                return result
+
+            if bool(getattr(self.hyperparams, "sdf_training_schedule_enabled", True)):
+                fc1_epochs = max(0, int(getattr(self.hyperparams, "fc1_only_epochs", 10)))
+                true_epochs = max(0, int(getattr(self.hyperparams, "sdf_true_only_epochs", 20)))
+                recursive_epochs = max(0, int(getattr(self.hyperparams, "sdf_recursive_only_epochs", 10)))
+
+                if fc1_epochs > 0:
+                    self.set_sdf_training_phase(SDFTrainingPhase.FC1_ONLY)
+                    module_summaries['sdf_fc1_fc1_only'] = self._run_batches(
+                        sdf_batches, fc1_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(fc1-only) '
                     )
-                else:
-                    tf_epochs = max(0, int(getattr(self.hyperparams, "fc1_teacher_forcing_epochs", 0)))
-                    if tf_epochs > 0:
-                        self.set_sdf_training_phase(SDFTrainingPhase.FC1_ONLY)
-                        self._fc1_teacher_forcing_stage = True
-                        module_summaries['sdf_fc1_teacher_forcing'] = self._run_batches(
-                            sdf_batches, tf_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(tf) '
-                        )
-                        self._fc1_teacher_forcing_stage = False
+                    fc1_eval = self._evaluate_sdf_fc1_batches(
+                        sdf_batches, prefix='after_fc1', max_batches=eval_batches_arg
+                    )
+                    module_summaries['sdf_fc1_eval_after_fc1_only'] = fc1_eval
+                    passed, diag = self._fc1_gate_passed(fc1_eval, prefix='after_fc1')
+                    module_summaries['sdf_fc1_gate_fc1_only'] = diag
+                    if not passed:
+                        return _fail(SDFTrainingPhase.FC1_ONLY.value, diag)
+                if true_epochs > 0:
+                    self.set_sdf_training_phase(SDFTrainingPhase.SDF_TRUE_ONLY)
+                    module_summaries['sdf_fc1_sdf_true_only'] = self._run_batches(
+                        sdf_batches, true_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(sdf-true) '
+                    )
+                    true_eval = self._evaluate_sdf_fc1_batches(
+                        sdf_batches, prefix='after_sdf_true', max_batches=eval_batches_arg
+                    )
+                    module_summaries['sdf_fc1_eval_after_sdf_true_only'] = true_eval
+                    passed, diag = self._sdf_gate_passed(
+                        true_eval, prefix='after_sdf_true', stage=SDFTrainingPhase.SDF_TRUE_ONLY
+                    )
+                    module_summaries['sdf_fc1_gate_sdf_true_only'] = diag
+                    if not passed:
+                        return _fail(SDFTrainingPhase.SDF_TRUE_ONLY.value, diag)
+                if recursive_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.SDF_RECURSIVE_ONLY)
-                    module_summaries['sdf_fc1_stage2'] = self._run_batches(
-                        sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(stage2) '
+                    module_summaries['sdf_fc1_sdf_recursive_only'] = self._run_batches(
+                        sdf_batches, recursive_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(sdf-recursive) '
                     )
-                # keep backward compatibility for consumers expecting a single sdf_fc1 key
-                module_summaries['sdf_fc1'] = module_summaries['sdf_fc1_stage2']
-                after_eval = self._evaluate_sdf_fc1_batches(
-                    sdf_batches,
-                    prefix='after',
-                    max_batches=eval_batches_arg
+                    recursive_eval = self._evaluate_sdf_fc1_batches(
+                        sdf_batches, prefix='after_sdf_recursive', max_batches=eval_batches_arg
+                    )
+                    module_summaries['sdf_fc1_eval_after_sdf_recursive_only'] = recursive_eval
+                    passed, diag = self._sdf_gate_passed(
+                        recursive_eval,
+                        prefix='after_sdf_recursive',
+                        stage=SDFTrainingPhase.SDF_RECURSIVE_ONLY,
+                    )
+                    module_summaries['sdf_fc1_gate_sdf_recursive_only'] = diag
+                    if not passed:
+                        return _fail(SDFTrainingPhase.SDF_RECURSIVE_ONLY.value, diag)
+                module_summaries['sdf_fc1_stage2'] = module_summaries.get(
+                    'sdf_fc1_sdf_recursive_only',
+                    module_summaries.get('sdf_fc1_sdf_true_only', module_summaries.get('sdf_fc1_fc1_only', {}))
                 )
-                if after_eval:
-                    module_summaries['sdf_fc1_fixed_batch_eval_after'] = after_eval
+            else:
+                tf_epochs = max(0, int(getattr(self.hyperparams, "fc1_teacher_forcing_epochs", 0)))
+                if tf_epochs > 0:
+                    self.set_sdf_training_phase(SDFTrainingPhase.FC1_ONLY)
+                    self._fc1_teacher_forcing_stage = True
+                    module_summaries['sdf_fc1_teacher_forcing'] = self._run_batches(
+                        sdf_batches, tf_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(tf) '
+                    )
+                    self._fc1_teacher_forcing_stage = False
+                self.set_sdf_training_phase(SDFTrainingPhase.SDF_RECURSIVE_ONLY)
+                module_summaries['sdf_fc1_stage2'] = self._run_batches(
+                    sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(stage2) '
+                )
+            # keep backward compatibility for consumers expecting a single sdf_fc1 key
+            module_summaries['sdf_fc1'] = module_summaries['sdf_fc1_stage2']
+            after_eval = self._evaluate_sdf_fc1_batches(
+                sdf_batches,
+                prefix='after',
+                max_batches=eval_batches_arg
+            )
+            if after_eval:
+                module_summaries['sdf_fc1_fixed_batch_eval_after'] = after_eval
+            module_summaries['sdf_fc1_gate'] = gate_result
+            return gate_result
         finally:
             self.add_FC1loss = prev_flag
             self._fc1_teacher_forcing_stage = prev_teacher_flag
@@ -5253,14 +5534,18 @@ class Episode:
                     if fc2_summary is not None:
                         module_summaries['fc2'] = fc2_summary
 
-                if use_sdf_fc1:
-                    self._run_sdf_recon_from_macro(
+                if use_sdf_fc1 and self.episode_id > 0:
+                    gate_result = self._run_sdf_recon_from_macro(
                         module_summaries=module_summaries,
                         n_epochs=n_epochs,
                         batch_size=batch_size,
                         log_interval=log_interval,
                         n_branches=n_branches
                     )
+                    if not gate_result.get("passed", False):
+                        raise NumericalStageFailure(
+                            f"FC1/SDF validation failed in {gate_result.get('failed_stage')}; skip downstream training."
+                        )
 
             elif mode == 'modea':
                 if use_policy_value:
@@ -5313,14 +5598,18 @@ class Episode:
                     if fc2_summary is not None:
                         module_summaries['fc2'] = fc2_summary
 
-                if use_sdf_fc1:
-                    self._run_sdf_recon_from_macro(
+                if use_sdf_fc1 and self.episode_id > 0:
+                    gate_result = self._run_sdf_recon_from_macro(
                         module_summaries=module_summaries,
                         n_epochs=n_epochs,
                         batch_size=batch_size,
                         log_interval=log_interval,
                         n_branches=n_branches
                     )
+                    if not gate_result.get("passed", False):
+                        raise NumericalStageFailure(
+                            f"FC1/SDF validation failed in {gate_result.get('failed_stage')}; skip downstream training."
+                        )
 
             elif mode == 'modeb':
                 modeb_rng_before_first_sim = self._capture_rng_state()
@@ -5376,6 +5665,19 @@ class Episode:
                 modeb_old_diag.update(self._snapshot_stats('old_macro', old_macro_snapshot, macro_diag_columns))
                 modeb_old_diag.update(old_firm_stats)
                 module_summaries['modeb_pre_pv_simulation_diag'] = modeb_old_diag
+
+                if use_sdf_fc1 and self.episode_id > 0:
+                    gate_result = self._run_sdf_recon_from_macro(
+                        module_summaries=module_summaries,
+                        n_epochs=n_epochs,
+                        batch_size=batch_size,
+                        log_interval=log_interval,
+                        n_branches=n_branches
+                    )
+                    if not gate_result.get("passed", False):
+                        raise NumericalStageFailure(
+                            f"FC1/SDF validation failed in {gate_result.get('failed_stage')}; skip Q/P/bp."
+                        )
 
                 if use_policy_value:
                     if tensor_pipeline and self.tensor_firm is not None:
@@ -5475,29 +5777,20 @@ class Episode:
                         'rng_state_replayed': False,
                     }
 
-                if use_sdf_fc1:
-                    if self.episode_id > 0:
-                        self._run_sdf_recon_from_macro(
-                            module_summaries=module_summaries,
-                            n_epochs=n_epochs,
-                            batch_size=batch_size,
-                            log_interval=log_interval,
-                            n_branches=n_branches
+                if use_sdf_fc1 and self.episode_id <= 0:
+                    self.add_FC1loss = False
+                    if tensor_pipeline and self.tensor_firm is not None:
+                        sdf_batches = self._create_firm_batches_from_tensor(
+                            self.tensor_firm, batch_size=batch_size, n_branches=n_branches, eta_resample=False
                         )
                     else:
-                        self.add_FC1loss = False
-                        if tensor_pipeline and self.tensor_firm is not None:
-                            sdf_batches = self._create_firm_batches_from_tensor(
-                                self.tensor_firm, batch_size=batch_size, n_branches=n_branches, eta_resample=False
-                            )
-                        else:
-                            sdf_batches = self._create_firm_batches_from_df(
-                                self.df, batch_size=batch_size, n_branches=n_branches, eta_resample=False
-                            )
-                        if sdf_batches:
-                            module_summaries['sdf_fc1'] = self._run_batches(
-                                sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1 '
-                            )
+                        sdf_batches = self._create_firm_batches_from_df(
+                            self.df, batch_size=batch_size, n_branches=n_branches, eta_resample=False
+                        )
+                    if sdf_batches:
+                        module_summaries['sdf_fc1'] = self._run_batches(
+                            sdf_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1 '
+                        )
 
                 if use_fc2:
                     fc2_summary = self._run_fc2_epochs(n_epochs=n_epochs, log_interval=log_interval)
