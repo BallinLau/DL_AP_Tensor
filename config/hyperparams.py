@@ -197,8 +197,8 @@ class HyperParams:
     sdf_stage2_hj_warmup_epochs: int = 5
     sdf_stage2_hj_warmup_start: float = 0.2
     sdf_euler_weight: float = 1.0
-    sdf_true_moment_weight: float = 5e-4
-    sdf_true_anchor_weight: float = 0.05
+    sdf_true_moment_weight: float = 0.01
+    sdf_true_anchor_weight: float = 1.0
     sdf_recursive_loss_weight: float = 0.25
     sdf_recursive_moment_weight: float = 5e-4
     sdf_recursive_anchor_weight: float = 0.05
