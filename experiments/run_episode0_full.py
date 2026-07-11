@@ -150,6 +150,15 @@ def build_hyperparams():
     hp.sdf_reset_optimizer_on_true_start = False
     hp.sdf_clear_optimizer_after_restore = True
     hp.stage_parameter_invariance_check_enabled = True
+    hp.stage_epochwise_validation = True
+    hp.sdf_collapse_lower_ratio = 0.1
+    hp.sdf_collapse_upper_ratio = 10.0
+    hp.fc1_sdf_preserve_ratio = 0.5
+    hp.stage_min_improvement = 1e-4
+    hp.stage_lr_decay_on_reject = 0.1
+    hp.stage_max_retries = 1
+    hp.sdf_score_t_weight = 0.05
+    hp.sdf_score_t_cap = 20.0
     return hp
 
 

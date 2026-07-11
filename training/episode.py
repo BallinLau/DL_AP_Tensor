@@ -251,6 +251,50 @@ class Episode:
                 optimizer.state.pop(param, None)
 
     @staticmethod
+    def _optimizer_state_to_cpu(
+        optimizer: torch.optim.Optimizer,
+    ) -> Dict[str, Any]:
+        state = deepcopy(optimizer.state_dict())
+        for param_state in state.get("state", {}).values():
+            for key, value in list(param_state.items()):
+                if torch.is_tensor(value):
+                    param_state[key] = value.detach().cpu().clone()
+        return state
+
+    def _stage_checkpoint(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+    ) -> Dict[str, Any]:
+        return {
+            "model_state": self._state_dict_to_cpu(model),
+            "optimizer_state": self._optimizer_state_to_cpu(optimizer),
+        }
+
+    def _restore_stage_checkpoint(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        checkpoint: Dict[str, Any],
+    ) -> None:
+        self._restore_module_state(model, checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+
+    @staticmethod
+    def _optimizer_lrs(optimizer: torch.optim.Optimizer) -> List[float]:
+        return [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
+
+    @staticmethod
+    def _decay_optimizer_lr(
+        optimizer: torch.optim.Optimizer,
+        factor: float,
+    ) -> List[float]:
+        factor = float(factor)
+        for group in optimizer.param_groups:
+            group["lr"] = float(group.get("lr", 0.0)) * factor
+        return Episode._optimizer_lrs(optimizer)
+
+    @staticmethod
     def _parameter_snapshot(module: nn.Module) -> Dict[str, torch.Tensor]:
         return {
             name: param.detach().cpu().clone()
@@ -6084,91 +6128,166 @@ class Episode:
             }
 
         rounds: List[Dict[str, Any]] = []
-        best_score = float("inf")
-        stale_rounds = 0
-        for round_idx in range(max_rounds):
-            display_round = round_idx + 1
-            train_summary = self._run_batches(
-                train_batches,
-                epochs_per_round,
-                log_interval,
-                ["sdf_fc1"],
-                desc_prefix=f"SDF/FC1(fc1 r{display_round}/{max_rounds}) ",
-            )
-            _check_fc1_only_invariance()
-            prefix = f"after_fc1_round{display_round}"
-            eval_metrics = self._evaluate_sdf_fc1_batches(
-                val_batches,
-                prefix=prefix,
-                max_batches=eval_batches_arg,
-            )
-            one_step_passed, one_step_diag = self._fc1_one_step_gate_passed(eval_metrics, prefix=prefix)
-            _, recursive_diag = self._evaluate_fc1_recursive_diagnostic(eval_metrics, prefix=prefix)
-            score = self._fc1_gate_violation_score(one_step_diag)
-            round_record = {
-                "round": display_round,
-                "train_summary": train_summary,
-                "eval_metrics": eval_metrics,
-                "one_step_gate": one_step_diag,
-                "recursive_diagnostic": recursive_diag,
-                "score": score,
-            }
-            rounds.append(round_record)
-            if one_step_passed:
-                return {
-                    "passed": True,
-                    "failed_stage": None,
-                    "failure_source": None,
-                    "data_viability": data_diag,
-                    "before_eval_metrics": before_eval,
-                    "rounds_completed": display_round,
-                    "final_train_summary": train_summary,
-                    "final_eval_metrics": eval_metrics,
-                    "final_one_step_gate": one_step_diag,
-                    "final_recursive_diagnostic": recursive_diag,
-                    "rounds": rounds,
-                }
+        checkpoint_enabled = model is not None and "sdf_fc1" in getattr(self, "optimizers", {})
+        optimizer = self.optimizers["sdf_fc1"] if checkpoint_enabled else None
+        before_summary = self._stage_validation_summary(
+            before_eval,
+            prefix="fc1_before",
+            stage=SDFTrainingPhase.FC1_ONLY,
+        )
+        accepted_checkpoint = (
+            self._stage_checkpoint(model, optimizer)
+            if checkpoint_enabled
+            else None
+        )
+        max_epochs = max(1, epochs_per_round * max_rounds)
+        max_retries = max(0, int(getattr(self.hyperparams, "stage_max_retries", 1)))
+        lr_decay = float(getattr(self.hyperparams, "stage_lr_decay_on_reject", 0.1))
+        accepted_epochs = 0
+        rejected_epochs = 0
+        skipped_current_stage = False
+        final_record: Dict[str, Any] = {
+            "eval_metrics": before_eval,
+            "one_step_gate": {},
+            "recursive_diagnostic": {},
+            "train_summary": None,
+            "validation_summary": before_summary,
+        }
 
-            relative_improvement = (
-                (best_score - score) / max(abs(best_score), 1e-12)
-                if np.isfinite(best_score)
-                else float("inf")
-            )
-            if score < best_score:
-                best_score = score
-            if relative_improvement < min_improvement:
-                stale_rounds += 1
-            else:
-                stale_rounds = 0
-            if stale_rounds >= patience:
-                failure_source = one_step_diag.get("failure_source", "fc1_one_step_underfit")
-                return {
-                    "passed": False,
-                    "failed_stage": "fc1_plateau",
-                    "failure_source": failure_source,
-                    "reason": "fc1_metrics_plateaued",
-                    "data_viability": data_diag,
-                    "before_eval_metrics": before_eval,
-                    "rounds_completed": display_round,
-                    "final_eval_metrics": eval_metrics,
-                    "final_one_step_gate": one_step_diag,
-                    "final_recursive_diagnostic": recursive_diag,
-                    "rounds": rounds,
+        for epoch_idx in range(1, max_epochs + 1):
+            epoch_accepted = False
+            last_reject_reason = None
+            for attempt_idx in range(max_retries + 1):
+                attempt_checkpoint = (
+                    self._stage_checkpoint(model, optimizer)
+                    if checkpoint_enabled
+                    else None
+                )
+                train_summary = self._run_batches(
+                    train_batches,
+                    1,
+                    log_interval,
+                    ["sdf_fc1"],
+                    desc_prefix=(
+                        f"SDF/FC1(fc1 e{epoch_idx}/{max_epochs} "
+                        f"try {attempt_idx + 1}/{max_retries + 1}) "
+                    ),
+                )
+                _check_fc1_only_invariance()
+                prefix = f"after_fc1_epoch{epoch_idx}_try{attempt_idx + 1}"
+                eval_metrics = self._evaluate_sdf_fc1_batches(
+                    val_batches,
+                    prefix=prefix,
+                    max_batches=eval_batches_arg,
+                )
+                one_step_passed, one_step_diag = self._fc1_one_step_gate_passed(eval_metrics, prefix=prefix)
+                _, recursive_diag = self._evaluate_fc1_recursive_diagnostic(eval_metrics, prefix=prefix)
+                score = self._fc1_gate_violation_score(one_step_diag)
+                after_summary = self._stage_validation_summary(
+                    eval_metrics,
+                    prefix=prefix,
+                    stage=SDFTrainingPhase.FC1_ONLY,
+                )
+                if checkpoint_enabled:
+                    accepted, reason = self._fc1_epoch_acceptance(before_summary, after_summary)
+                else:
+                    accepted, reason = bool(one_step_passed), (
+                        "accepted" if one_step_passed else "mock_fc1_gate_not_passed"
+                    )
+                round_record = {
+                    "round": epoch_idx,
+                    "epoch": epoch_idx,
+                    "attempt": attempt_idx + 1,
+                    "train_summary": train_summary,
+                    "eval_metrics": eval_metrics,
+                    "one_step_gate": one_step_diag,
+                    "recursive_diagnostic": recursive_diag,
+                    "validation_summary": after_summary,
+                    "score": score,
+                    "accepted": bool(accepted),
+                    "rollback_reason": None if accepted else reason,
+                    "learning_rate": self._optimizer_lrs(optimizer) if optimizer is not None else [],
                 }
+                rounds.append(round_record)
+                final_record = round_record
 
-        final_round = rounds[-1]
-        failure_source = final_round["one_step_gate"].get("failure_source", "fc1_one_step_underfit")
+                if accepted:
+                    if checkpoint_enabled:
+                        accepted_checkpoint = self._stage_checkpoint(model, optimizer)
+                    before_summary = after_summary
+                    accepted_epochs += 1
+                    epoch_accepted = True
+                    if one_step_passed:
+                        return {
+                            "passed": True,
+                            "strict_gate_passed": True,
+                            "failed_stage": None,
+                            "failure_source": None,
+                            "data_viability": data_diag,
+                            "before_eval_metrics": before_eval,
+                            "before_validation_summary": before_summary,
+                            "rounds_completed": epoch_idx,
+                            "accepted_epochs": accepted_epochs,
+                            "rejected_epochs": rejected_epochs,
+                            "skipped_current_stage": False,
+                            "final_train_summary": train_summary,
+                            "final_eval_metrics": eval_metrics,
+                            "final_validation_summary": after_summary,
+                            "final_one_step_gate": one_step_diag,
+                            "final_recursive_diagnostic": recursive_diag,
+                            "rounds": rounds,
+                        }
+                    break
+
+                rejected_epochs += 1
+                last_reject_reason = reason
+                if checkpoint_enabled and attempt_checkpoint is not None:
+                    self._restore_stage_checkpoint(model, optimizer, attempt_checkpoint)
+                    decayed_lrs = self._decay_optimizer_lr(optimizer, lr_decay)
+                    round_record["learning_rate_after_rollback"] = decayed_lrs
+                logger.warning(
+                    "FC1_ONLY rejected epoch %d attempt %d/%d: %s; rollback applied=%s",
+                    epoch_idx,
+                    attempt_idx + 1,
+                    max_retries + 1,
+                    reason,
+                    bool(checkpoint_enabled),
+                )
+
+            if not epoch_accepted:
+                skipped_current_stage = True
+                logger.warning(
+                    "FC1_ONLY skipped after epoch %d failed to improve safely: %s",
+                    epoch_idx,
+                    last_reject_reason,
+                )
+                break
+
+        if checkpoint_enabled and accepted_checkpoint is not None:
+            self._restore_stage_checkpoint(model, optimizer, accepted_checkpoint)
+
+        final_eval = final_record.get("eval_metrics", before_eval)
+        final_summary = final_record.get("validation_summary", before_summary)
+        final_one_step = final_record.get("one_step_gate", {})
+        final_recursive = final_record.get("recursive_diagnostic", {})
         return {
-            "passed": False,
-            "failed_stage": "fc1_max_rounds",
-            "failure_source": failure_source,
-            "reason": "fc1_failed_after_max_rounds",
+            "passed": True,
+            "strict_gate_passed": False,
+            "failed_stage": None,
+            "failure_source": None,
+            "reason": "fc1_stage_skipped_without_safe_improvement" if skipped_current_stage else "fc1_safe_updates_applied",
             "data_viability": data_diag,
             "before_eval_metrics": before_eval,
-            "rounds_completed": max_rounds,
-            "final_eval_metrics": final_round["eval_metrics"],
-            "final_one_step_gate": final_round["one_step_gate"],
-            "final_recursive_diagnostic": final_round["recursive_diagnostic"],
+            "before_validation_summary": before_summary,
+            "rounds_completed": len(rounds),
+            "accepted_epochs": accepted_epochs,
+            "rejected_epochs": rejected_epochs,
+            "skipped_current_stage": bool(skipped_current_stage),
+            "final_train_summary": final_record.get("train_summary"),
+            "final_eval_metrics": final_eval,
+            "final_validation_summary": final_summary,
+            "final_one_step_gate": final_one_step,
+            "final_recursive_diagnostic": final_recursive,
             "rounds": rounds,
         }
 
@@ -6284,6 +6403,121 @@ class Episode:
             or m_mean < target_mean * min_mean_ratio
         )
 
+    def _stage_validation_summary(
+        self,
+        eval_metrics: Dict[str, float],
+        *,
+        prefix: str,
+        stage: SDFTrainingPhase,
+    ) -> Dict[str, Any]:
+        target_log = float(getattr(self.hyperparams, "sdf_log_mean_target", np.log(0.98)))
+        m_prefix = (
+            f"{prefix}_primary_true_state_M"
+            if stage in (SDFTrainingPhase.FC1_ONLY, SDFTrainingPhase.SDF_TRUE_ONLY)
+            else f"{prefix}_recursive_forecast_state_M"
+        )
+        residual_mode = str(
+            getattr(self.hyperparams, "sdf_gate_residual_mode", "normalized_ratio")
+        ).lower()
+        signed_suffix = "normalized_signed_aio" if residual_mode == "normalized_ratio" else "raw_signed_aio"
+        signed_prefix = (
+            f"{prefix}_primary_true_state_{signed_suffix}"
+            if stage in (SDFTrainingPhase.FC1_ONLY, SDFTrainingPhase.SDF_TRUE_ONLY)
+            else f"{prefix}_recursive_forecast_state_{signed_suffix}"
+        )
+        m_mean = float(eval_metrics.get(f"{m_prefix}_mean", float("nan")))
+        finite_ratio = float(eval_metrics.get(f"{m_prefix}_finite_ratio", float("nan")))
+        aio_t = float(eval_metrics.get(f"{signed_prefix}_t", float("nan")))
+        if not np.isfinite(aio_t):
+            legacy_prefix = signed_prefix.replace(f"_{signed_suffix}", "_signed_aio")
+            aio_t = float(eval_metrics.get(f"{legacy_prefix}_t", float("nan")))
+        hatc_rmse = float(
+            eval_metrics.get(f"{prefix}_primary_true_state_hatc_next_rmse", float("nan"))
+        )
+        lnk_rmse = float(
+            eval_metrics.get(f"{prefix}_primary_true_state_lnk_next_rmse", float("nan"))
+        )
+        fc1_loss_terms = [v for v in (hatc_rmse, lnk_rmse) if np.isfinite(v)]
+        fc1_loss = float(sum(v * v for v in fc1_loss_terms)) if fc1_loss_terms else float("nan")
+        m_target = float(np.exp(target_log))
+        lower_ratio = float(getattr(self.hyperparams, "sdf_collapse_lower_ratio", 0.1))
+        upper_ratio = float(getattr(self.hyperparams, "sdf_collapse_upper_ratio", 10.0))
+        safe = bool(
+            np.isfinite(finite_ratio)
+            and finite_ratio >= 1.0
+            and np.isfinite(m_mean)
+            and m_mean >= lower_ratio * m_target
+            and m_mean <= upper_ratio * m_target
+        )
+        t_weight = float(getattr(self.hyperparams, "sdf_score_t_weight", 0.05))
+        t_cap = float(getattr(self.hyperparams, "sdf_score_t_cap", 20.0))
+        sdf_score = (
+            abs(np.log(max(m_mean, 1e-12)) - target_log)
+            + t_weight * min(abs(aio_t), t_cap)
+            if np.isfinite(m_mean) and np.isfinite(aio_t)
+            else float("inf")
+        )
+        return {
+            "prefix": prefix,
+            "stage": stage.value,
+            "m_mean": m_mean,
+            "m_target": m_target,
+            "m_finite_ratio": finite_ratio,
+            "safe": safe,
+            "aio_t": aio_t,
+            "fc1_loss": fc1_loss,
+            "hatc_rmse": hatc_rmse,
+            "lnk_rmse": lnk_rmse,
+            "sdf_score": float(sdf_score),
+            "wealth_ratio_p50": float(
+                eval_metrics.get(f"{prefix}_primary_true_state_wealth_ratio_p50", float("nan"))
+            ),
+            "wealth_ratio_p99": float(
+                eval_metrics.get(f"{prefix}_primary_true_state_wealth_ratio_p99", float("nan"))
+            ),
+        }
+
+    def _fc1_epoch_acceptance(
+        self,
+        before: Dict[str, Any],
+        after: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        min_improvement = float(getattr(self.hyperparams, "stage_min_improvement", 1e-4))
+        preserve_ratio = float(getattr(self.hyperparams, "fc1_sdf_preserve_ratio", 0.5))
+        if not bool(after.get("safe", False)):
+            return False, "unsafe_sdf_distribution"
+        before_loss = float(before.get("fc1_loss", float("nan")))
+        after_loss = float(after.get("fc1_loss", float("nan")))
+        if not (np.isfinite(before_loss) and np.isfinite(after_loss)):
+            return False, "nonfinite_fc1_loss"
+        if after_loss >= before_loss - min_improvement:
+            return False, "fc1_loss_not_improved"
+        m_before = float(before.get("m_mean", float("nan")))
+        m_after = float(after.get("m_mean", float("nan")))
+        m_target = float(after.get("m_target", float("nan")))
+        if not (np.isfinite(m_before) and np.isfinite(m_after) and np.isfinite(m_target)):
+            return False, "nonfinite_sdf_mean"
+        floor = max(0.1 * m_target, preserve_ratio * m_before)
+        if m_after < floor:
+            return False, "sdf_mean_not_preserved"
+        return True, "accepted"
+
+    def _sdf_epoch_acceptance(
+        self,
+        before: Dict[str, Any],
+        after: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        min_improvement = float(getattr(self.hyperparams, "stage_min_improvement", 1e-4))
+        if not bool(after.get("safe", False)):
+            return False, "unsafe_sdf_distribution"
+        before_score = float(before.get("sdf_score", float("inf")))
+        after_score = float(after.get("sdf_score", float("inf")))
+        if not (np.isfinite(before_score) and np.isfinite(after_score)):
+            return False, "nonfinite_sdf_score"
+        if after_score >= before_score - min_improvement:
+            return False, "sdf_score_not_improved"
+        return True, "accepted"
+
     def _run_sdf_phase_with_validation(
         self,
         *,
@@ -6320,8 +6554,14 @@ class Episode:
             prefix=initial_prefix,
             stage=stage,
         )
-        best_state = self._state_dict_to_cpu(model)
-        best_epoch = 0
+        before_summary = self._stage_validation_summary(
+            initial_eval,
+            prefix=initial_prefix,
+            stage=stage,
+        )
+        optimizer = self.optimizers["sdf_fc1"]
+        accepted_checkpoint = self._stage_checkpoint(model, optimizer)
+        accepted_epoch = 0
         best_eval = initial_eval
         best_gate = initial_gate
         best_score = self._sdf_gate_score(initial_gate)
@@ -6330,9 +6570,13 @@ class Episode:
             "train_summary": None,
             "eval_metrics": initial_eval,
             "gate": initial_gate,
+            "validation_summary": before_summary,
             "score": list(best_score),
             "passed": bool(initial_passed),
             "collapse_detected": self._sdf_collapse_detected(initial_gate),
+            "accepted": True,
+            "rollback_reason": None,
+            "learning_rate": self._optimizer_lrs(optimizer),
         })
 
         if (
@@ -6344,9 +6588,11 @@ class Episode:
                 [model.sdf_model, model.value_model],
             )
 
-        collapse_streak = 0
         pass_streak = 1 if initial_passed else 0
         last_epoch = 0
+        accepted_epochs = 0
+        rejected_epochs = 0
+        skipped_current_stage = False
         fc1_before = None
         if (
             stage == SDFTrainingPhase.SDF_TRUE_ONLY
@@ -6354,88 +6600,123 @@ class Episode:
         ):
             fc1_before = self._parameter_snapshot(model.fc1_model)
 
+        max_retries = max(0, int(getattr(self.hyperparams, "stage_max_retries", 1)))
+        lr_decay = float(getattr(self.hyperparams, "stage_lr_decay_on_reject", 0.1))
         for epoch_idx in range(1, n_epochs + 1):
-            previous_offset = getattr(self, "_run_batches_epoch_offset", 0)
-            self._run_batches_epoch_offset = epoch_idx - 1
-            try:
-                train_summary = self._run_batches(
-                    train_batches,
-                    n_epochs=1,
-                    log_interval=log_interval,
-                    train_modules=["sdf_fc1"],
-                    desc_prefix=f"{stage.value} epoch {epoch_idx}/{n_epochs} ",
-                )
-            finally:
-                self._run_batches_epoch_offset = previous_offset
-
-            if fc1_before is not None:
-                fc1_change = self._parameter_max_change(model.fc1_model, fc1_before)
-                if fc1_change != 0.0:
-                    raise RuntimeError(
-                        "FC1 parameters changed during "
-                        f"{stage.value}: max_change={fc1_change}"
+            epoch_accepted = False
+            last_reject_reason = None
+            for attempt_idx in range(max_retries + 1):
+                attempt_checkpoint = self._stage_checkpoint(model, optimizer)
+                previous_offset = getattr(self, "_run_batches_epoch_offset", 0)
+                self._run_batches_epoch_offset = epoch_idx - 1
+                try:
+                    train_summary = self._run_batches(
+                        train_batches,
+                        n_epochs=1,
+                        log_interval=log_interval,
+                        train_modules=["sdf_fc1"],
+                        desc_prefix=(
+                            f"{stage.value} epoch {epoch_idx}/{n_epochs} "
+                            f"try {attempt_idx + 1}/{max_retries + 1} "
+                        ),
                     )
+                finally:
+                    self._run_batches_epoch_offset = previous_offset
 
-            eval_prefix = f"{prefix}_epoch{epoch_idx}"
-            eval_metrics = self._evaluate_sdf_fc1_batches(
-                val_batches,
-                prefix=eval_prefix,
-                max_batches=eval_batch_limit,
-            )
-            passed, gate = self._sdf_gate_passed(
-                eval_metrics,
-                prefix=eval_prefix,
-                stage=stage,
-            )
-            score = self._sdf_gate_score(gate)
-            collapsed = self._sdf_collapse_detected(gate)
-            history.append({
-                "epoch": epoch_idx,
-                "train_summary": train_summary,
-                "eval_metrics": eval_metrics,
-                "gate": gate,
-                "score": list(score),
-                "passed": bool(passed),
-                "collapse_detected": bool(collapsed),
-            })
-            last_epoch = epoch_idx
+                if fc1_before is not None:
+                    fc1_change = self._parameter_max_change(model.fc1_model, fc1_before)
+                    if fc1_change != 0.0:
+                        raise RuntimeError(
+                            "FC1 parameters changed during "
+                            f"{stage.value}: max_change={fc1_change}"
+                        )
 
-            if score < best_score:
-                best_score = score
-                best_state = self._state_dict_to_cpu(model)
-                best_epoch = epoch_idx
-                best_eval = eval_metrics
-                best_gate = gate
+                eval_prefix = f"{prefix}_epoch{epoch_idx}_try{attempt_idx + 1}"
+                eval_metrics = self._evaluate_sdf_fc1_batches(
+                    val_batches,
+                    prefix=eval_prefix,
+                    max_batches=eval_batch_limit,
+                )
+                passed, gate = self._sdf_gate_passed(
+                    eval_metrics,
+                    prefix=eval_prefix,
+                    stage=stage,
+                )
+                score = self._sdf_gate_score(gate)
+                collapsed = self._sdf_collapse_detected(gate)
+                after_summary = self._stage_validation_summary(
+                    eval_metrics,
+                    prefix=eval_prefix,
+                    stage=stage,
+                )
+                accepted, reason = self._sdf_epoch_acceptance(before_summary, after_summary)
+                record = {
+                    "epoch": epoch_idx,
+                    "attempt": attempt_idx + 1,
+                    "train_summary": train_summary,
+                    "eval_metrics": eval_metrics,
+                    "gate": gate,
+                    "validation_summary": after_summary,
+                    "score": list(score),
+                    "passed": bool(passed),
+                    "collapse_detected": bool(collapsed),
+                    "accepted": bool(accepted),
+                    "rollback_reason": None if accepted else reason,
+                    "learning_rate": self._optimizer_lrs(optimizer),
+                }
+                history.append(record)
+                last_epoch = epoch_idx
 
-            pass_streak = pass_streak + 1 if passed else 0
+                if accepted:
+                    accepted_checkpoint = self._stage_checkpoint(model, optimizer)
+                    accepted_epoch = epoch_idx
+                    accepted_epochs += 1
+                    before_summary = after_summary
+                    best_eval = eval_metrics
+                    best_gate = gate
+                    best_score = score
+                    epoch_accepted = True
+                    pass_streak = pass_streak + 1 if passed else 0
+                    break
+
+                rejected_epochs += 1
+                last_reject_reason = reason
+                self._restore_stage_checkpoint(model, optimizer, attempt_checkpoint)
+                decayed_lrs = self._decay_optimizer_lr(optimizer, lr_decay)
+                record["learning_rate_after_rollback"] = decayed_lrs
+                logger.warning(
+                    "%s rejected epoch %d attempt %d/%d: %s; rollback and lr=%s",
+                    stage.value,
+                    epoch_idx,
+                    attempt_idx + 1,
+                    max_retries + 1,
+                    reason,
+                    decayed_lrs,
+                )
+
+            if not epoch_accepted:
+                skipped_current_stage = True
+                logger.warning(
+                    "%s skipped after epoch %d failed to improve safely: %s",
+                    stage.value,
+                    epoch_idx,
+                    last_reject_reason,
+                )
+                break
+
             required_passes = max(
                 1,
                 int(getattr(self.hyperparams, "sdf_required_consecutive_passes", 1)),
             )
             if (
-                passed
-                and pass_streak >= required_passes
+                pass_streak >= required_passes
                 and bool(getattr(self.hyperparams, "sdf_stop_when_gate_passes", True))
             ):
                 break
 
-            collapse_streak = collapse_streak + 1 if collapsed else 0
-            collapse_patience = max(
-                1,
-                int(getattr(self.hyperparams, "sdf_collapse_patience", 1)),
-            )
-            if collapse_streak >= collapse_patience:
-                logger.warning(
-                    "%s collapse detected at epoch %d; stop stage and restore best epoch %d.",
-                    stage.value,
-                    epoch_idx,
-                    best_epoch,
-                )
-                break
-
         restored = False
         if bool(getattr(self.hyperparams, "sdf_restore_best_checkpoint", True)):
-            self._restore_module_state(model, best_state)
+            self._restore_stage_checkpoint(model, optimizer, accepted_checkpoint)
             restored = True
             if bool(getattr(self.hyperparams, "sdf_clear_optimizer_after_restore", True)):
                 self._clear_optimizer_state_for_modules(
@@ -6454,20 +6735,31 @@ class Episode:
             prefix=final_prefix,
             stage=stage,
         )
+        final_summary = self._stage_validation_summary(
+            final_eval,
+            prefix=final_prefix,
+            stage=stage,
+        )
         return {
             "stage": stage.value,
-            "passed": bool(final_passed),
+            "passed": bool(final_summary.get("safe", False) or skipped_current_stage),
+            "strict_gate_passed": bool(final_passed),
+            "skipped_current_stage": bool(skipped_current_stage),
             "epochs_requested": int(n_epochs),
             "epochs_completed": int(last_epoch),
-            "best_epoch": int(best_epoch),
+            "accepted_epochs": int(accepted_epochs),
+            "rejected_epochs": int(rejected_epochs),
+            "best_epoch": int(accepted_epoch),
             "best_score": list(best_score),
             "restored_best_checkpoint": bool(restored),
             "initial_eval_metrics": initial_eval,
             "initial_gate": initial_gate,
+            "initial_validation_summary": history[0].get("validation_summary", {}),
             "best_eval_metrics": best_eval,
             "best_gate": best_gate,
             "final_eval_metrics": final_eval,
             "final_gate": final_gate,
+            "final_validation_summary": final_summary,
             "history": history,
         }
 
@@ -6747,7 +7039,10 @@ class Episode:
                     )
                     module_summaries['sdf_boundary_before_sdf_true'] = pre_true_eval
                     self._last_partial_module_summaries = deepcopy(module_summaries)
-                    if bool(getattr(self.hyperparams, "sdf_epoch_validation_enabled", True)):
+                    if (
+                        bool(getattr(self.hyperparams, "stage_epochwise_validation", True))
+                        and bool(getattr(self.hyperparams, "sdf_epoch_validation_enabled", True))
+                    ):
                         true_result = self._run_sdf_phase_with_validation(
                             train_batches=train_batches,
                             val_batches=val_batches,

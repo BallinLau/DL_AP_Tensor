@@ -44,6 +44,14 @@ def _make_episode(eval_items):
         item = episode._eval_items.pop(0)
         item = dict(item)
         item["prefix"] = prefix
+        gate = item.get("gate", {})
+        item.setdefault(f"{prefix}_primary_true_state_M_mean", gate.get("m_mean", 0.98))
+        item.setdefault(f"{prefix}_primary_true_state_M_finite_ratio", gate.get("m_finite_ratio", 1.0))
+        item.setdefault(f"{prefix}_primary_true_state_normalized_signed_aio_t", gate.get("signed_aio_t", 0.0))
+        item.setdefault(f"{prefix}_primary_true_state_hatc_next_rmse", gate.get("hatc_rmse", 0.1))
+        item.setdefault(f"{prefix}_primary_true_state_lnk_next_rmse", gate.get("lnk_rmse", 0.1))
+        item.setdefault(f"{prefix}_primary_true_state_wealth_ratio_p50", gate.get("wealth_ratio_p50", 1.0))
+        item.setdefault(f"{prefix}_primary_true_state_wealth_ratio_p99", gate.get("wealth_ratio_p99", 1.0))
         return item
 
     def _gate(eval_metrics, prefix, stage):
@@ -100,6 +108,7 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         episode = _make_episode([
             {"gate": good_gate},
             {"gate": collapsed_gate},
+            {"gate": collapsed_gate},
             {"gate": good_gate},
         ])
         model = episode.models["sdf_fc1"]
@@ -119,11 +128,24 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
 
         self.assertEqual(result["epochs_completed"], 1)
         self.assertEqual(result["best_epoch"], 0)
+        self.assertEqual(result["accepted_epochs"], 0)
+        self.assertTrue(result["skipped_current_stage"])
         self.assertTrue(result["restored_best_checkpoint"])
         for name, tensor in model.state_dict().items():
             self.assertTrue(torch.equal(tensor, before[name]))
 
     def test_sdf_true_only_keeps_fc1_fixed(self):
+        before_gate = {
+            "passed": False,
+            "m_mean": 0.7,
+            "m_finite_ratio": 1.0,
+            "m_finite_ratio_min": 1.0,
+            "log_mean_error": 0.3,
+            "max_log_mean_error": 0.02,
+            "signed_aio_t": 5.0,
+            "max_signed_t_abs": 2.0,
+            "log_mean_target": 0.0,
+        }
         gate = {
             "passed": True,
             "m_mean": 0.98,
@@ -136,7 +158,7 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             "log_mean_target": 0.0,
         }
         episode = _make_episode([
-            {"gate": gate},
+            {"gate": before_gate},
             {"gate": gate},
             {"gate": gate},
         ])
@@ -150,6 +172,7 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             prefix="sdf_true",
         )
         self.assertTrue(result["passed"])
+        self.assertEqual(result["accepted_epochs"], 1)
         self.assertEqual(
             Episode._parameter_max_change(episode.models["sdf_fc1"].fc1_model, before),
             0.0,

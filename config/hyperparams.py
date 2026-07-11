@@ -223,6 +223,15 @@ class HyperParams:
     sdf_reset_optimizer_on_true_start: bool = False
     sdf_clear_optimizer_after_restore: bool = True
     stage_parameter_invariance_check_enabled: bool = True
+    stage_epochwise_validation: bool = True
+    sdf_collapse_lower_ratio: float = 0.1
+    sdf_collapse_upper_ratio: float = 10.0
+    fc1_sdf_preserve_ratio: float = 0.5
+    stage_min_improvement: float = 1e-4
+    stage_lr_decay_on_reject: float = 0.1
+    stage_max_retries: int = 1
+    sdf_score_t_weight: float = 0.05
+    sdf_score_t_cap: float = 20.0
     fc1_epochs_per_round: int = 0
     fc1_max_rounds: int = 8
     fc1_plateau_patience: int = 2
