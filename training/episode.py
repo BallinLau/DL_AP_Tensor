@@ -292,6 +292,44 @@ class Episode:
         return [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
 
     @staticmethod
+    def _resolve_stage_batch_sizes(
+        batch_size: int,
+        pv_batch_size: Optional[int],
+        sdf_fc1_batch_size: Optional[int],
+    ) -> Tuple[int, int]:
+        resolved_pv = int(batch_size if pv_batch_size is None else pv_batch_size)
+        resolved_sdf_fc1 = int(
+            batch_size if sdf_fc1_batch_size is None else sdf_fc1_batch_size
+        )
+        if resolved_pv <= 0:
+            raise ValueError(
+                "pv_batch_size must be positive, "
+                f"got {resolved_pv}."
+            )
+        if resolved_sdf_fc1 <= 0:
+            raise ValueError(
+                "sdf_fc1_batch_size must be positive, "
+                f"got {resolved_sdf_fc1}."
+            )
+        return resolved_pv, resolved_sdf_fc1
+
+    @staticmethod
+    def _parent_batching_summary(
+        batches: List[Dict[str, torch.Tensor]],
+    ) -> Dict[str, int]:
+        sizes = [
+            int(batch["parent"].shape[0])
+            for batch in batches
+            if "parent" in batch
+        ]
+        return {
+            "batches": int(len(sizes)),
+            "parent_groups": int(sum(sizes)),
+            "min_parent_groups": int(min(sizes)) if sizes else 0,
+            "max_parent_groups": int(max(sizes)) if sizes else 0,
+        }
+
+    @staticmethod
     def _decay_optimizer_lr(
         optimizer: torch.optim.Optimizer,
         factor: float,
@@ -7642,6 +7680,8 @@ class Episode:
         self,
         n_epochs: int = 10,
         batch_size: int = 256,
+        pv_batch_size: Optional[int] = None,
+        sdf_fc1_batch_size: Optional[int] = None,
         log_interval: int = 100,
         n_samples: int = 10000,
         n_paths: int = 100,
@@ -7659,6 +7699,11 @@ class Episode:
         - modeB: SimulateTS(h=T) 直接训练 PV/SDF（可选 FC2）
         """
         simulate_kwargs = dict(simulate_kwargs or {})
+        resolved_pv_batch_size, resolved_sdf_fc1_batch_size = self._resolve_stage_batch_sizes(
+            batch_size=batch_size,
+            pv_batch_size=pv_batch_size,
+            sdf_fc1_batch_size=sdf_fc1_batch_size,
+        )
         train_modules = train_modules or ['sdf_fc1', 'policy_value', 'fc2']
         self.train_mode = train_mode
         self.add_FC1loss = False
@@ -7675,12 +7720,45 @@ class Episode:
         tensor_pipeline = self._use_tensor_pipeline()
 
         module_summaries = {}
+        module_summaries["batch_configuration"] = {
+            "fallback_batch_size": int(batch_size),
+            "pv_batch_size": int(resolved_pv_batch_size),
+            "sdf_fc1_batch_size": int(resolved_sdf_fc1_batch_size),
+            "sdf_true_target_batches": int(
+                getattr(self.hyperparams, "sdf_true_target_batches", 0)
+            ),
+        }
+        logger.info(
+            "Episode batch configuration | fallback=%d pv=%d sdf_fc1=%d sdf_true_target_batches=%d",
+            int(batch_size),
+            int(resolved_pv_batch_size),
+            int(resolved_sdf_fc1_batch_size),
+            int(getattr(self.hyperparams, "sdf_true_target_batches", 0)),
+        )
         self.tensor_firm = None
         self.tensor_macro = None
         self.tensor_sdf = None
         use_sdf_fc1 = 'sdf_fc1' in train_modules and 'sdf_fc1' in self.models
         use_policy_value = 'policy_value' in train_modules and 'policy_value' in self.models
         use_fc2 = 'fc2' in train_modules and 'fc2' in self.models
+
+        def _record_policy_value_batching(stage_name: str, batches: List[Dict[str, torch.Tensor]]) -> None:
+            pv_batching = self._parent_batching_summary(batches)
+            module_summaries[f"policy_value_batching_{stage_name}"] = pv_batching
+            module_summaries["policy_value_batching"] = pv_batching
+            logger.info(
+                "Policy/Value batching | episode=%d mode=%s stage=%s requested=%d "
+                "actual_batches=%d parent_groups=%d min=%d max=%d",
+                int(self.episode_id),
+                str(mode),
+                str(stage_name),
+                int(resolved_pv_batch_size),
+                pv_batching["batches"],
+                pv_batching["parent_groups"],
+                pv_batching["min_parent_groups"],
+                pv_batching["max_parent_groups"],
+            )
+
         if (
             mode == 'modea'
             and self.episode_id > 0
@@ -7724,20 +7802,20 @@ class Episode:
                         self.df_sdf = None
                         train_table, val_table, holdout_diag = self._split_sdf_table_by_path(self.tensor_sdf)
                         sdf_batches = self._create_sdf_batches_from_macro_tensor(
-                            train_table, batch_size=batch_size, n_branches=n_branches
+                            train_table, batch_size=resolved_sdf_fc1_batch_size, n_branches=n_branches
                         )
                         sdf_val_batches = self._create_sdf_batches_from_macro_tensor(
-                            val_table, batch_size=batch_size, n_branches=n_branches
+                            val_table, batch_size=resolved_sdf_fc1_batch_size, n_branches=n_branches
                         )
                     else:
                         self.df_sdf = sampler.build_sdf_fc1_df()
                         self.tensor_sdf = None
                         train_df, val_df, holdout_diag = self._split_sdf_dataframe_by_path(self.df_sdf)
                         sdf_batches = self._create_sdf_batches_from_macro_df(
-                            train_df, batch_size=batch_size, n_branches=n_branches
+                            train_df, batch_size=resolved_sdf_fc1_batch_size, n_branches=n_branches
                         )
                         sdf_val_batches = self._create_sdf_batches_from_macro_df(
-                            val_df, batch_size=batch_size, n_branches=n_branches
+                            val_df, batch_size=resolved_sdf_fc1_batch_size, n_branches=n_branches
                         )
                     module_summaries['episode0_sdf_holdout_split'] = holdout_diag
                     if not sdf_batches:
@@ -7780,15 +7858,16 @@ class Episode:
                         self.tensor_firm = sampler.build_policy_value_tensor()
                         self.df = None
                         pv_batches = self._create_firm_batches_from_tensor(
-                            self.tensor_firm, batch_size=batch_size, n_branches=n_branches
+                            self.tensor_firm, batch_size=resolved_pv_batch_size, n_branches=n_branches
                         )
                     else:
                         self.df = sampler.build_policy_value_df()
                         self.tensor_firm = None
                         pv_batches = self._create_firm_batches_from_df(
-                            self.df, batch_size=batch_size, n_branches=n_branches
+                            self.df, batch_size=resolved_pv_batch_size, n_branches=n_branches
                         )
                     if pv_batches:
+                        _record_policy_value_batching("mode0", pv_batches)
                         module_summaries['policy_value'] = self._run_batches(
                             pv_batches, n_epochs, log_interval, ['policy_value'], desc_prefix='Policy/Value '
                         )
@@ -7821,7 +7900,7 @@ class Episode:
                     gate_result = self._run_sdf_recon_from_macro(
                         module_summaries=module_summaries,
                         n_epochs=n_epochs,
-                        batch_size=batch_size,
+                        batch_size=resolved_sdf_fc1_batch_size,
                         log_interval=log_interval,
                         n_branches=n_branches
                     )
@@ -7846,15 +7925,16 @@ class Episode:
                         self.tensor_firm = sampler.build_policy_value_tensor()
                         self.df = None
                         pv_batches = self._create_firm_batches_from_tensor(
-                            self.tensor_firm, batch_size=batch_size, n_branches=n_branches
+                            self.tensor_firm, batch_size=resolved_pv_batch_size, n_branches=n_branches
                         )
                     else:
                         self.df = sampler.build_policy_value_df()
                         self.tensor_firm = None
                         pv_batches = self._create_firm_batches_from_df(
-                            self.df, batch_size=batch_size, n_branches=n_branches
+                            self.df, batch_size=resolved_pv_batch_size, n_branches=n_branches
                         )
                     if pv_batches:
+                        _record_policy_value_batching("modea", pv_batches)
                         module_summaries['policy_value'] = self._run_batches(
                             pv_batches, n_epochs, log_interval, ['policy_value'], desc_prefix='Policy/Value '
                         )
@@ -7887,7 +7967,7 @@ class Episode:
                     gate_result = self._run_sdf_recon_from_macro(
                         module_summaries=module_summaries,
                         n_epochs=n_epochs,
-                        batch_size=batch_size,
+                        batch_size=resolved_sdf_fc1_batch_size,
                         log_interval=log_interval,
                         n_branches=n_branches
                     )
@@ -7956,7 +8036,7 @@ class Episode:
                     gate_result = self._run_sdf_recon_from_macro(
                         module_summaries=module_summaries,
                         n_epochs=n_epochs,
-                        batch_size=batch_size,
+                        batch_size=resolved_sdf_fc1_batch_size,
                         log_interval=log_interval,
                         n_branches=n_branches
                     )
@@ -8053,7 +8133,7 @@ class Episode:
                     if bool(getattr(self.hyperparams, "sdf_post_refresh_gate_enabled", True)):
                         post_refresh_gate = self._evaluate_post_refresh_sdf_gate(
                             module_summaries=module_summaries,
-                            batch_size=batch_size,
+                            batch_size=resolved_sdf_fc1_batch_size,
                             n_branches=n_branches,
                         )
                         if not post_refresh_gate.get("passed", False):
@@ -8076,13 +8156,14 @@ class Episode:
                 if use_policy_value:
                     if tensor_pipeline and self.tensor_firm is not None:
                         pv_batches = self._create_firm_batches_from_tensor(
-                            self.tensor_firm, batch_size=batch_size, n_branches=n_branches
+                            self.tensor_firm, batch_size=resolved_pv_batch_size, n_branches=n_branches
                         )
                     else:
                         pv_batches = self._create_firm_batches_from_df(
-                            self.df, batch_size=batch_size, n_branches=n_branches
+                            self.df, batch_size=resolved_pv_batch_size, n_branches=n_branches
                         )
                     if pv_batches:
+                        _record_policy_value_batching("modeb", pv_batches)
                         module_summaries['policy_value'] = self._run_batches(
                             pv_batches, n_epochs, log_interval, ['policy_value'], desc_prefix='Policy/Value '
                         )
@@ -8175,11 +8256,11 @@ class Episode:
                     self.add_FC1loss = False
                     if tensor_pipeline and self.tensor_firm is not None:
                         sdf_batches = self._create_firm_batches_from_tensor(
-                            self.tensor_firm, batch_size=batch_size, n_branches=n_branches, eta_resample=False
+                            self.tensor_firm, batch_size=resolved_sdf_fc1_batch_size, n_branches=n_branches, eta_resample=False
                         )
                     else:
                         sdf_batches = self._create_firm_batches_from_df(
-                            self.df, batch_size=batch_size, n_branches=n_branches, eta_resample=False
+                            self.df, batch_size=resolved_sdf_fc1_batch_size, n_branches=n_branches, eta_resample=False
                         )
                     if sdf_batches:
                         module_summaries['sdf_fc1'] = self._run_batches(

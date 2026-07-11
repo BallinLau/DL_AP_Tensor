@@ -19,6 +19,12 @@ class HyperParams:
     # ========== 训练基础参数 ==========
     epochs: int = 100
     batch_size: int = 8192
+    # Stage-specific batch sizes.
+    #
+    # A value <= 0 means falling back to the legacy/global batch_size.
+    # These values are normally resolved by the CLI runner.
+    pv_batch_size: int = 0
+    sdf_fc1_batch_size: int = 0
     
     # ========== 优化器参数 ==========
     # SDF & FC1

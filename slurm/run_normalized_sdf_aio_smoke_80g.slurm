@@ -24,7 +24,12 @@ N_EPISODES="${N_EPISODES:-2}"
 EPOCHS="${EPOCHS:-20}"
 N_PATHS="${N_PATHS:-200}"
 POST0_N_PATHS="${POST0_N_PATHS:-$N_PATHS}"
+# Legacy fallback for entrypoints that still consume the global batch size.
 BATCH_SIZE="${BATCH_SIZE:-4096}"
+# Firm-level Policy/Value batch.
+PV_BATCH_SIZE="${PV_BATCH_SIZE:-20480}"
+# Macro parent-group FC1/SDF batch.
+SDF_FC1_BATCH_SIZE="${SDF_FC1_BATCH_SIZE:-4096}"
 SIMULATE_GROUP_SIZE="${SIMULATE_GROUP_SIZE:-200}"
 SIMULATE_HORIZON="${SIMULATE_HORIZON:-100}"
 POST0_MODE="${POST0_MODE:-modeb}"
@@ -127,6 +132,8 @@ echo "  EPOCHS=$EPOCHS"
 echo "  N_PATHS=$N_PATHS"
 echo "  POST0_N_PATHS=$POST0_N_PATHS"
 echo "  BATCH_SIZE=$BATCH_SIZE"
+echo "  PV_BATCH_SIZE=$PV_BATCH_SIZE"
+echo "  SDF_FC1_BATCH_SIZE=$SDF_FC1_BATCH_SIZE"
 echo "  SIMULATE_GROUP_SIZE=$SIMULATE_GROUP_SIZE"
 echo "  SIMULATE_HORIZON=$SIMULATE_HORIZON"
 echo "  POST0_MODE=$POST0_MODE"
@@ -166,6 +173,8 @@ python3 -u experiments/run_multi_episode_job.py \
   --n-paths "$N_PATHS" \
   --post0-n-paths "$POST0_N_PATHS" \
   --batch-size "$BATCH_SIZE" \
+  --pv-batch-size "$PV_BATCH_SIZE" \
+  --sdf-fc1-batch-size "$SDF_FC1_BATCH_SIZE" \
   --simulate-group-size "$SIMULATE_GROUP_SIZE" \
   --simulate-horizon "$SIMULATE_HORIZON" \
   --post0-mode "$POST0_MODE" \

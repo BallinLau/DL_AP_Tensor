@@ -61,6 +61,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-paths", type=int, default=None, help="Override n_paths for data")
     parser.add_argument("--post0-n-paths", type=int, default=None, help="Override n_paths for episodes > 0; default keeps full n_paths")
     parser.add_argument("--batch-size", type=int, default=None, help="Override training batch size")
+    parser.add_argument(
+        "--pv-batch-size",
+        type=int,
+        default=None,
+        help="Policy/Value firm-level batch size. Falls back to --batch-size when omitted.",
+    )
+    parser.add_argument(
+        "--sdf-fc1-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "FC1, Episode-0 SDF bootstrap, SDF validation, and post-refresh "
+            "SDF gate batch size. Falls back to --batch-size when omitted."
+        ),
+    )
     parser.add_argument("--simulate-group-size", type=int, default=None, help="Override firm count per simulated path for episodes > 0")
     parser.add_argument("--simulate-horizon", type=int, default=None, help="Override simulate horizon")
     parser.add_argument("--device", type=str, default=None, help="Force device, e.g. cuda:0 or cpu")
@@ -252,7 +267,28 @@ def configure_hyperparams(args: argparse.Namespace):
     if args.n_paths is not None:
         hyperparams.n_paths = args.n_paths
     if args.batch_size is not None:
-        hyperparams.batch_size = args.batch_size
+        hyperparams.batch_size = int(args.batch_size)
+    fallback_batch_size = int(hyperparams.batch_size)
+    hyperparams.pv_batch_size = int(
+        args.pv_batch_size
+        if args.pv_batch_size is not None
+        else fallback_batch_size
+    )
+    hyperparams.sdf_fc1_batch_size = int(
+        args.sdf_fc1_batch_size
+        if args.sdf_fc1_batch_size is not None
+        else fallback_batch_size
+    )
+    if hyperparams.pv_batch_size <= 0:
+        raise ValueError(
+            "pv_batch_size must be positive, "
+            f"got {hyperparams.pv_batch_size}."
+        )
+    if hyperparams.sdf_fc1_batch_size <= 0:
+        raise ValueError(
+            "sdf_fc1_batch_size must be positive, "
+            f"got {hyperparams.sdf_fc1_batch_size}."
+        )
     if args.epochs is not None:
         hyperparams.epochs = args.epochs
     if args.simulate_horizon is not None:
@@ -433,6 +469,8 @@ def main():
             summary = episode.run_episode(
                 n_epochs=hyperparams.epochs,
                 batch_size=hyperparams.batch_size,
+                pv_batch_size=hyperparams.pv_batch_size,
+                sdf_fc1_batch_size=hyperparams.sdf_fc1_batch_size,
                 log_interval=50,
                 train_modules=train_modules,
                 simulate_kwargs=simulate_kwargs,
@@ -465,6 +503,8 @@ def main():
                     "epochs": hyperparams.epochs,
                     "n_paths": data_kwargs["n_paths"],
                     "batch_size": hyperparams.batch_size,
+                    "pv_batch_size": hyperparams.pv_batch_size,
+                    "sdf_fc1_batch_size": hyperparams.sdf_fc1_batch_size,
                     "simulate_group_size": simulate_group_size,
                     "simulate_horizon": hyperparams.simulate_horizon,
                     "post0_mode": args.post0_mode,
@@ -535,6 +575,8 @@ def main():
         print(
             f"[Episode {ep}] mode={episode_mode} "
             f"batch_size={hyperparams.batch_size} "
+            f"pv_batch_size={hyperparams.pv_batch_size} "
+            f"sdf_fc1_batch_size={hyperparams.sdf_fc1_batch_size} "
             f"n_paths={data_kwargs['n_paths']} "
             f"group_size={data_kwargs['group_size']} "
             f"horizon={hyperparams.simulate_horizon} "
