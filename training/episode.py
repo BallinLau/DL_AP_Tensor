@@ -3589,6 +3589,63 @@ class Episode:
                 self._latest_pi_terms = terms
         return total_loss
 
+    def _build_vectorized_policy_child_states(
+        self,
+        children: List[torch.Tensor],
+        bp: torch.Tensor,
+        b_parent: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not children:
+            raise ValueError(
+                "Policy child vectorization requires at least one child tensor."
+            )
+
+        children_t = torch.stack(children, dim=1)
+        child_state_raw = children_t[..., :7] if children_t.shape[-1] > 7 else children_t
+        eta_children = children_t[..., 2:3]
+        bp_expanded = bp.unsqueeze(1)
+        b_parent_expanded = b_parent.unsqueeze(1)
+        b_children = (
+            eta_children * bp_expanded
+            + (1.0 - eta_children) * b_parent_expanded
+        )
+        child_states = torch.cat(
+            [
+                b_children,
+                child_state_raw[..., 1:],
+            ],
+            dim=-1,
+        )
+        return child_states, eta_children
+
+    def _forward_vectorized_policy_children(
+        self,
+        children: List[torch.Tensor],
+        bp: torch.Tensor,
+        b_parent: torch.Tensor,
+        model,
+        target_model,
+    ) -> Dict[str, Any]:
+        child_states, eta_children = self._build_vectorized_policy_child_states(
+            children=children,
+            bp=bp,
+            b_parent=b_parent,
+        )
+        batch_size = int(child_states.shape[0])
+        n_children = int(child_states.shape[1])
+        state_dim = int(child_states.shape[2])
+        child_states_flat = child_states.reshape(batch_size * n_children, state_dim)
+        online_output_flat = model(child_states_flat)
+        with torch.no_grad():
+            target_output_flat = target_model(child_states_flat.detach())
+        return {
+            "online_output_flat": online_output_flat,
+            "target_output_flat": target_output_flat,
+            "eta_children": eta_children,
+            "batch_size": batch_size,
+            "n_children": n_children,
+        }
+
     def _compute_p0_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         计算 P0 损失（支持任意 N 分支）
@@ -3652,19 +3709,18 @@ class Episode:
                 loss_fn=loss_fn,
             )
 
-        output_children = []
-        output_children_target = []
-        eta_children = []
-
-        for child in children:
-            child_state_raw = strip_extra(child)
-            eta_child = child[:, 2:3]
-            child_state = child_state_raw.clone()
-            child_state[:, 0:1] = eta_child * bp_for_p0 + (1 - eta_child) * b_parent
-            output_children.append(model(child_state))
-            with torch.no_grad():
-                output_children_target.append(target_model(child_state.detach()))
-            eta_children.append(eta_child)
+        child_pack = self._forward_vectorized_policy_children(
+            children=children,
+            bp=bp_for_p0,
+            b_parent=b_parent,
+            model=model,
+            target_model=target_model,
+        )
+        online_children_flat = child_pack["online_output_flat"]
+        target_children_flat = child_pack["target_output_flat"]
+        B = child_pack["batch_size"]
+        N = child_pack["n_children"]
+        eta_children_tensor = child_pack["eta_children"]
             
         childp0_state = parent_state.clone()
         childp0_state[:, 0:1] = bp_for_p0
@@ -3674,15 +3730,23 @@ class Episode:
         
         # 提取 P0 和所需变量
         P0 = _get_out(output_t, 'P0', 3)
-        P_children = [_get_out(out, 'P', 7).detach() for out in output_children_target]
+        P_children_tensor = _get_out(target_children_flat, 'P', 7).reshape(B, N, -1).detach()
         # FOC/KKT 梯度通道可选用 Phat，避免 P=max(Phat,0) 在违约区产生大面积零梯度
         use_phat_for_bp_foc = bool(getattr(self.hyperparams, "bp_foc_use_phat_children", True))
-        P_children_for_foc = [
-            _get_out(out, 'Phat', 8) if use_phat_for_bp_foc else _get_out(out, 'P', 7)
-            for out in output_children
-        ]
-        bar_z_children = [_get_out(out, 'bar_z', 6).detach() for out in output_children_target]
-        bar_z_children_for_foc = [_get_out(out, 'bar_z', 6) for out in output_children]
+        p_foc_name = 'Phat' if use_phat_for_bp_foc else 'P'
+        p_foc_idx = 8 if use_phat_for_bp_foc else 7
+        P_children_for_foc_tensor = _get_out(
+            online_children_flat,
+            p_foc_name,
+            p_foc_idx,
+        ).reshape(B, N, -1)
+        bar_z_children_tensor = _get_out(target_children_flat, 'bar_z', 6).reshape(B, N, -1).detach()
+        bar_z_children_for_foc_tensor = _get_out(online_children_flat, 'bar_z', 6).reshape(B, N, -1)
+        P_children = list(P_children_tensor.unbind(dim=1))
+        P_children_for_foc = list(P_children_for_foc_tensor.unbind(dim=1))
+        bar_z_children = list(bar_z_children_tensor.unbind(dim=1))
+        bar_z_children_for_foc = list(bar_z_children_for_foc_tensor.unbind(dim=1))
+        eta_children = list(eta_children_tensor.unbind(dim=1))
         
         # Q 值
         Q = _get_out(output_t, 'Q', 0)
@@ -3891,19 +3955,18 @@ class Episode:
                 mix_policy_sample_weight=mix_survival_target,
             )
 
-        output_children = []
-        output_children_target = []
-        eta_children = []
-
-        for child in children:
-            child_state_raw = strip_extra(child)
-            eta_child = child[:, 2:3]
-            child_state = child_state_raw.clone()
-            child_state[:, 0:1] = eta_child * bp_for_pi + (1 - eta_child) * b_parent
-            output_children.append(model(child_state))
-            with torch.no_grad():
-                output_children_target.append(target_model(child_state.detach()))
-            eta_children.append(eta_child)
+        child_pack = self._forward_vectorized_policy_children(
+            children=children,
+            bp=bp_for_pi,
+            b_parent=b_parent,
+            model=model,
+            target_model=target_model,
+        )
+        online_children_flat = child_pack["online_output_flat"]
+        target_children_flat = child_pack["target_output_flat"]
+        B = child_pack["batch_size"]
+        N = child_pack["n_children"]
+        eta_children_tensor = child_pack["eta_children"]
             
         childpI_state = parent_state.clone()
         childpI_state[:, 0:1] = bp_for_pi
@@ -3914,15 +3977,23 @@ class Episode:
         # 提取 PI 和所需变量
         Q = _get_out(output_t, 'Q', 0)
         PI = _get_out(output_t, 'PI', 4)
-        P_children = [_get_out(out, 'P', 7).detach() for out in output_children_target]
+        P_children_tensor = _get_out(target_children_flat, 'P', 7).reshape(B, N, -1).detach()
         # FOC/KKT 梯度通道可选用 Phat，避免 P=max(Phat,0) 在违约区产生大面积零梯度
         use_phat_for_bp_foc = bool(getattr(self.hyperparams, "bp_foc_use_phat_children", True))
-        P_children_for_foc = [
-            _get_out(out, 'Phat', 8) if use_phat_for_bp_foc else _get_out(out, 'P', 7)
-            for out in output_children
-        ]
-        bar_z_children = [_get_out(out, 'bar_z', 6).detach() for out in output_children_target]
-        bar_z_children_for_foc = [_get_out(out, 'bar_z', 6) for out in output_children]
+        p_foc_name = 'Phat' if use_phat_for_bp_foc else 'P'
+        p_foc_idx = 8 if use_phat_for_bp_foc else 7
+        P_children_for_foc_tensor = _get_out(
+            online_children_flat,
+            p_foc_name,
+            p_foc_idx,
+        ).reshape(B, N, -1)
+        bar_z_children_tensor = _get_out(target_children_flat, 'bar_z', 6).reshape(B, N, -1).detach()
+        bar_z_children_for_foc_tensor = _get_out(online_children_flat, 'bar_z', 6).reshape(B, N, -1)
+        P_children = list(P_children_tensor.unbind(dim=1))
+        P_children_for_foc = list(P_children_for_foc_tensor.unbind(dim=1))
+        bar_z_children = list(bar_z_children_tensor.unbind(dim=1))
+        bar_z_children_for_foc = list(bar_z_children_for_foc_tensor.unbind(dim=1))
+        eta_children = list(eta_children_tensor.unbind(dim=1))
         QpI = _get_out(outputpI_children_target, 'Q', 0).detach()
         QpI_for_foc = _get_out(outputpI_children, 'Q', 0)
         
