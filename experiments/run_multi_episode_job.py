@@ -151,6 +151,18 @@ def parse_args() -> argparse.Namespace:
         help="Episode 0 bootstrap safety gate minimum finite M ratio",
     )
     parser.add_argument(
+        "--sdf-true-only-epochs",
+        type=int,
+        default=None,
+        help="Override SDF_TRUE_ONLY epochs; use 5 for normalized residual smoke tests",
+    )
+    parser.add_argument(
+        "--sdf-recursive-only-epochs",
+        type=int,
+        default=None,
+        help="Override SDF_RECURSIVE_ONLY epochs; use 0 to disable the recursive stage",
+    )
+    parser.add_argument(
         "--fc1-jacobian-penalty-interval",
         type=int,
         default=None,
@@ -226,6 +238,10 @@ def configure_hyperparams(args: argparse.Namespace):
     hyperparams.episode0_sdf_log_mean_error_max = float(args.episode0_sdf_log_mean_error_max)
     hyperparams.episode0_sdf_clip_low_ratio_max = float(args.episode0_sdf_clip_low_ratio_max)
     hyperparams.episode0_sdf_finite_ratio_min = float(args.episode0_sdf_finite_ratio_min)
+    if args.sdf_true_only_epochs is not None:
+        hyperparams.sdf_true_only_epochs = int(args.sdf_true_only_epochs)
+    if args.sdf_recursive_only_epochs is not None:
+        hyperparams.sdf_recursive_only_epochs = int(args.sdf_recursive_only_epochs)
     if args.fc1_jacobian_penalty_interval is not None:
         hyperparams.fc1_jacobian_penalty_interval = args.fc1_jacobian_penalty_interval
     if args.pv_bp_training_mode is not None:
