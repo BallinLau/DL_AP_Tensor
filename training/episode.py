@@ -1725,11 +1725,12 @@ class Episode:
         """
         在 SDF 第一阶段/第二阶段按子模块设置学习率。
         """
-        if 'sdf_fc1' not in self.optimizers or 'sdf_fc1' not in self.lr_schedulers:
+        lr_schedulers = getattr(self, "lr_schedulers", {})
+        if 'sdf_fc1' not in self.optimizers or 'sdf_fc1' not in lr_schedulers:
             return
 
         opt = self.optimizers['sdf_fc1']
-        scheduler = self.lr_schedulers['sdf_fc1']
+        scheduler = lr_schedulers['sdf_fc1']
         sdf_lr = float(getattr(self.hyperparams, "sdf_stage1_lr", getattr(self.hyperparams, "sdf_lr", scheduler.base_lr)))
         if self.add_FC1loss:
             stage2_lr = getattr(self.hyperparams, "sdf_stage2_lr", None)
@@ -5011,12 +5012,13 @@ class Episode:
         n_epochs: int,
         log_interval: int,
         train_modules: List[str],
-        desc_prefix: str = ''
+        desc_prefix: str = '',
+        configure_sdf_lr: bool = True,
     ) -> Dict:
         """
         使用预生成的 batches 执行训练循环
         """
-        if 'sdf_fc1' in train_modules:
+        if 'sdf_fc1' in train_modules and configure_sdf_lr:
             self._configure_sdf_lr_for_phase()
 
         q_pretrain_epochs = 0
@@ -6130,6 +6132,8 @@ class Episode:
         rounds: List[Dict[str, Any]] = []
         checkpoint_enabled = model is not None and "sdf_fc1" in getattr(self, "optimizers", {})
         optimizer = self.optimizers["sdf_fc1"] if checkpoint_enabled else None
+        if checkpoint_enabled:
+            self._configure_sdf_lr_for_phase()
         before_summary = self._stage_validation_summary(
             before_eval,
             prefix="fc1_before",
@@ -6163,15 +6167,20 @@ class Episode:
                     if checkpoint_enabled
                     else None
                 )
+                run_kwargs = {
+                    "desc_prefix": (
+                        f"SDF/FC1(fc1 e{epoch_idx}/{max_epochs} "
+                        f"try {attempt_idx + 1}/{max_retries + 1}) "
+                    )
+                }
+                if checkpoint_enabled:
+                    run_kwargs["configure_sdf_lr"] = False
                 train_summary = self._run_batches(
                     train_batches,
                     1,
                     log_interval,
                     ["sdf_fc1"],
-                    desc_prefix=(
-                        f"SDF/FC1(fc1 e{epoch_idx}/{max_epochs} "
-                        f"try {attempt_idx + 1}/{max_retries + 1}) "
-                    ),
+                    **run_kwargs,
                 )
                 _check_fc1_only_invariance()
                 prefix = f"after_fc1_epoch{epoch_idx}_try{attempt_idx + 1}"
@@ -6194,6 +6203,8 @@ class Episode:
                     accepted, reason = bool(one_step_passed), (
                         "accepted" if one_step_passed else "mock_fc1_gate_not_passed"
                     )
+                before_distance = self._sdf_safety_distance(before_summary)
+                after_distance = self._sdf_safety_distance(after_summary)
                 round_record = {
                     "round": epoch_idx,
                     "epoch": epoch_idx,
@@ -6206,6 +6217,9 @@ class Episode:
                     "score": score,
                     "accepted": bool(accepted),
                     "rollback_reason": None if accepted else reason,
+                    "acceptance_mode": "safe" if before_summary.get("safe", False) else "recovery",
+                    "safety_distance_before": before_distance,
+                    "safety_distance_after": after_distance,
                     "learning_rate": self._optimizer_lrs(optimizer) if optimizer is not None else [],
                 }
                 rounds.append(round_record)
@@ -6499,12 +6513,26 @@ class Episode:
     ) -> Tuple[bool, str]:
         min_improvement = float(getattr(self.hyperparams, "stage_min_improvement", 1e-4))
         preserve_ratio = float(getattr(self.hyperparams, "fc1_sdf_preserve_ratio", 0.5))
-        if not bool(after.get("safe", False)):
-            return False, "unsafe_sdf_distribution"
+        before_safe = bool(before.get("safe", False))
+        after_safe = bool(after.get("safe", False))
+        after_finite = float(after.get("m_finite_ratio", 0.0))
+        if after_finite < 1.0:
+            return False, "nonfinite_sdf_distribution"
         before_loss = float(before.get("fc1_loss", float("nan")))
         after_loss = float(after.get("fc1_loss", float("nan")))
         if not (np.isfinite(before_loss) and np.isfinite(after_loss)):
             return False, "nonfinite_fc1_loss"
+        if not before_safe:
+            before_distance = self._sdf_safety_distance(before)
+            after_distance = self._sdf_safety_distance(after)
+            tolerance = float(getattr(self.hyperparams, "stage_min_improvement", 1e-4))
+            if after_distance > before_distance + tolerance:
+                return False, "fc1_worsened_sdf_recovery"
+            if after_loss >= before_loss - min_improvement:
+                return False, "fc1_loss_not_improved"
+            return True, "accepted_fc1_recovery_step"
+        if not after_safe:
+            return False, "left_safe_region"
         if after_loss >= before_loss - min_improvement:
             return False, "fc1_loss_not_improved"
         m_before = float(before.get("m_mean", float("nan")))
@@ -6515,7 +6543,7 @@ class Episode:
         floor = max(0.1 * m_target, preserve_ratio * m_before)
         if m_after < floor:
             return False, "sdf_mean_not_preserved"
-        return True, "accepted"
+        return True, "accepted_safe_improvement"
 
     def _sdf_epoch_acceptance(
         self,
@@ -6523,15 +6551,46 @@ class Episode:
         after: Dict[str, Any],
     ) -> Tuple[bool, str]:
         min_improvement = float(getattr(self.hyperparams, "stage_min_improvement", 1e-4))
-        if not bool(after.get("safe", False)):
-            return False, "unsafe_sdf_distribution"
+        before_safe = bool(before.get("safe", False))
+        after_safe = bool(after.get("safe", False))
         before_score = float(before.get("sdf_score", float("inf")))
         after_score = float(after.get("sdf_score", float("inf")))
-        if not (np.isfinite(before_score) and np.isfinite(after_score)):
+        before_finite = float(before.get("m_finite_ratio", 0.0))
+        after_finite = float(after.get("m_finite_ratio", 0.0))
+        if not np.isfinite(after_score):
             return False, "nonfinite_sdf_score"
-        if after_score >= before_score - min_improvement:
-            return False, "sdf_score_not_improved"
-        return True, "accepted"
+        if after_finite < 1.0:
+            return False, "nonfinite_sdf_distribution"
+        if before_safe:
+            if not after_safe:
+                return False, "left_safe_region"
+            if not np.isfinite(before_score):
+                return False, "nonfinite_sdf_score"
+            if after_score >= before_score - min_improvement:
+                return False, "sdf_score_not_improved"
+            return True, "accepted_safe_improvement"
+        before_distance = self._sdf_safety_distance(before)
+        after_distance = self._sdf_safety_distance(after)
+        if after_distance >= before_distance - min_improvement:
+            return False, "not_moving_toward_safe_region"
+        if np.isfinite(before_score) and after_score >= before_score - min_improvement:
+            return False, "recovery_score_not_improved"
+        return True, "accepted_recovery_step"
+
+    def _sdf_safety_distance(self, summary: Dict[str, Any]) -> float:
+        m_mean = float(summary.get("m_mean", float("nan")))
+        m_target = float(summary.get("m_target", 0.98))
+        lower_ratio = float(getattr(self.hyperparams, "sdf_collapse_lower_ratio", 0.1))
+        upper_ratio = float(getattr(self.hyperparams, "sdf_collapse_upper_ratio", 10.0))
+        lower = lower_ratio * m_target
+        upper = upper_ratio * m_target
+        if not np.isfinite(m_mean) or m_mean <= 0:
+            return float("inf")
+        if m_mean < lower:
+            return float(np.log(lower / m_mean))
+        if m_mean > upper:
+            return float(np.log(m_mean / upper))
+        return 0.0
 
     def _run_sdf_phase_with_validation(
         self,
@@ -6575,6 +6634,7 @@ class Episode:
             stage=stage,
         )
         optimizer = self.optimizers["sdf_fc1"]
+        self._configure_sdf_lr_for_phase()
         accepted_checkpoint = self._stage_checkpoint(model, optimizer)
         accepted_epoch = 0
         best_eval = initial_eval
@@ -6610,7 +6670,7 @@ class Episode:
         skipped_current_stage = False
         fc1_before = None
         if (
-            stage == SDFTrainingPhase.SDF_TRUE_ONLY
+            stage in {SDFTrainingPhase.SDF_TRUE_ONLY, SDFTrainingPhase.SDF_RECURSIVE_ONLY}
             and bool(getattr(self.hyperparams, "stage_parameter_invariance_check_enabled", True))
         ):
             fc1_before = self._parameter_snapshot(model.fc1_model)
@@ -6634,6 +6694,7 @@ class Episode:
                             f"{stage.value} epoch {epoch_idx}/{n_epochs} "
                             f"try {attempt_idx + 1}/{max_retries + 1} "
                         ),
+                        configure_sdf_lr=False,
                     )
                 finally:
                     self._run_batches_epoch_offset = previous_offset
@@ -6665,6 +6726,8 @@ class Episode:
                     stage=stage,
                 )
                 accepted, reason = self._sdf_epoch_acceptance(before_summary, after_summary)
+                before_distance = self._sdf_safety_distance(before_summary)
+                after_distance = self._sdf_safety_distance(after_summary)
                 record = {
                     "epoch": epoch_idx,
                     "attempt": attempt_idx + 1,
@@ -6677,6 +6740,9 @@ class Episode:
                     "collapse_detected": bool(collapsed),
                     "accepted": bool(accepted),
                     "rollback_reason": None if accepted else reason,
+                    "acceptance_mode": "safe" if before_summary.get("safe", False) else "recovery",
+                    "safety_distance_before": before_distance,
+                    "safety_distance_after": after_distance,
                     "learning_rate": self._optimizer_lrs(optimizer),
                 }
                 history.append(record)
@@ -7130,22 +7196,32 @@ class Episode:
                         )
                 if recursive_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.SDF_RECURSIVE_ONLY)
-                    module_summaries['sdf_fc1_sdf_recursive_only'] = self._run_batches(
-                        train_batches, recursive_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(sdf-recursive) '
-                    )
-                    recursive_eval = self._evaluate_sdf_fc1_batches(
-                        val_batches, prefix='after_sdf_recursive', max_batches=eval_batches_arg
-                    )
-                    module_summaries['sdf_fc1_eval_after_sdf_recursive_only'] = recursive_eval
-                    passed, diag = self._sdf_gate_passed(
-                        recursive_eval,
-                        prefix='after_sdf_recursive',
+                    recursive_result = self._run_sdf_phase_with_validation(
+                        train_batches=train_batches,
+                        val_batches=val_batches,
+                        n_epochs=recursive_epochs,
+                        log_interval=log_interval,
                         stage=SDFTrainingPhase.SDF_RECURSIVE_ONLY,
+                        prefix="sdf_recursive",
                     )
-                    module_summaries['sdf_fc1_gate_sdf_recursive_only'] = diag
+                    module_summaries['sdf_fc1_sdf_recursive_only'] = recursive_result
+                    module_summaries['sdf_fc1_eval_after_sdf_recursive_only'] = recursive_result.get(
+                        'final_eval_metrics',
+                        {},
+                    )
+                    module_summaries['sdf_fc1_gate_sdf_recursive_only'] = recursive_result.get(
+                        'final_gate',
+                        {},
+                    )
                     self._last_partial_module_summaries = deepcopy(module_summaries)
-                    if not passed:
-                        return _fail(SDFTrainingPhase.SDF_RECURSIVE_ONLY.value, diag)
+                    if not recursive_result.get("passed", False):
+                        return _fail(
+                            SDFTrainingPhase.SDF_RECURSIVE_ONLY.value,
+                            {
+                                **recursive_result.get("final_gate", {}),
+                                "phase_result": recursive_result,
+                            },
+                        )
                 module_summaries['sdf_fc1_stage2'] = module_summaries.get(
                     'sdf_fc1_sdf_recursive_only',
                     module_summaries.get('sdf_fc1_sdf_true_only', module_summaries.get('sdf_fc1_fc1_only', {}))

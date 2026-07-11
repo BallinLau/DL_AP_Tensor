@@ -125,7 +125,7 @@ def build_hyperparams():
     hp.sdf_training_schedule_enabled = True
     hp.fc1_only_epochs = 10
     hp.sdf_true_only_epochs = 5
-    hp.sdf_recursive_only_epochs = 0
+    hp.sdf_recursive_only_epochs = 5
     hp.sdf_wealth_residual_mode = "normalized_ratio"
     hp.sdf_gate_residual_mode = "normalized_ratio"
     hp.sdf_normalized_logr_clip = 20.0

@@ -21,13 +21,22 @@ class _DummySdfFc1(nn.Module):
         self.fc1_model = nn.Linear(1, 1)
 
 
+class _DummyScheduler:
+    def __init__(self, base_lr=2e-4):
+        self.base_lr = base_lr
+        self.current_lr = base_lr
+        self.group_base_lrs = [base_lr]
+
+
 def _make_episode(eval_items):
     model = _DummySdfFc1()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     episode = Episode.__new__(Episode)
     episode.models = {"sdf_fc1": model}
     episode.optimizers = {"sdf_fc1": optimizer}
+    episode.lr_schedulers = {}
     episode.device = torch.device("cpu")
+    episode.add_FC1loss = True
     episode.hyperparams = SimpleNamespace(
         sdf_fc1_eval_max_batches=0,
         sdf_reset_optimizer_on_true_start=False,
@@ -37,6 +46,11 @@ def _make_episode(eval_items):
         sdf_restore_best_checkpoint=True,
         sdf_clear_optimizer_after_restore=True,
         stage_parameter_invariance_check_enabled=True,
+        sdf_stage2_lr=2e-4,
+        sdf_stage1_lr=2e-4,
+        fc1_lr=2e-4,
+        stage_lr_decay_on_reject=0.1,
+        stage_max_retries=1,
     )
     episode._eval_items = list(eval_items)
     episode._train_calls = 0
@@ -178,6 +192,51 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             Episode._parameter_max_change(episode.models["sdf_fc1"].fc1_model, before),
             0.0,
         )
+
+    def test_sdf_retry_uses_decayed_lr_after_rollback(self):
+        before_gate = {
+            "passed": False,
+            "m_mean": 0.98,
+            "m_finite_ratio": 1.0,
+            "m_finite_ratio_min": 1.0,
+            "log_mean_error": 0.01,
+            "max_log_mean_error": 0.02,
+            "signed_aio_t": 0.0,
+            "max_signed_t_abs": 2.0,
+            "log_mean_target": 0.0,
+        }
+        bad_gate = {
+            **before_gate,
+            "m_mean": 0.01,
+            "log_mean_error": 4.0,
+        }
+        episode = _make_episode([
+            {"gate": before_gate},
+            {"gate": bad_gate},
+            {"gate": bad_gate},
+            {"gate": before_gate},
+        ])
+        optimizer = episode.optimizers["sdf_fc1"]
+        optimizer.param_groups[0]["group_name"] = "sdf"
+        episode.lr_schedulers = {"sdf_fc1": _DummyScheduler(base_lr=2e-4)}
+        observed_lrs = []
+
+        def _train(*_args, **_kwargs):
+            observed_lrs.append(float(optimizer.param_groups[0]["lr"]))
+            return {"final_losses": {"total": float(len(observed_lrs))}}
+
+        episode._run_batches = _train
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=1,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        self.assertEqual(observed_lrs, [2e-4, 2e-5])
+        self.assertTrue(result["skipped_current_stage"])
 
     def test_post_refresh_safety_mode_can_pass_when_strict_gate_fails(self):
         episode = Episode.__new__(Episode)
