@@ -149,6 +149,16 @@ def build_hyperparams():
     hp.sdf_recursive_loss_weight = 0.25
     hp.sdf_recursive_moment_weight = 5e-4
     hp.sdf_recursive_anchor_weight = 0.05
+    hp.sdf_epoch_validation_enabled = True
+    hp.sdf_restore_best_checkpoint = True
+    hp.sdf_stop_when_gate_passes = True
+    hp.sdf_required_consecutive_passes = 1
+    hp.sdf_collapse_log_mean_error = 0.5
+    hp.sdf_collapse_mean_ratio = 0.10
+    hp.sdf_collapse_patience = 1
+    hp.sdf_reset_optimizer_on_true_start = False
+    hp.sdf_clear_optimizer_after_restore = True
+    hp.stage_parameter_invariance_check_enabled = True
     hp.fc1_epochs_per_round = 0
     hp.fc1_max_rounds = 8
     hp.fc1_plateau_patience = 2

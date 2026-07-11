@@ -162,6 +162,33 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override SDF_RECURSIVE_ONLY epochs; use 0 to disable the recursive stage",
     )
+    parser.add_argument("--sdf-stage2-lr", type=float, default=None, help="Override Stage2 SDF/FC1 learning rate")
+    parser.add_argument("--sdf-true-moment-weight", type=float, default=None, help="Override SDF_TRUE moment weight")
+    parser.add_argument("--sdf-true-anchor-weight", type=float, default=None, help="Override SDF_TRUE log-mean anchor weight")
+    parser.add_argument(
+        "--sdf-reset-optimizer-on-true-start",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Reset SDF/value Adam moments before SDF_TRUE_ONLY starts",
+    )
+    parser.add_argument(
+        "--sdf-restore-best-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Restore the best SDF phase checkpoint after epochwise validation",
+    )
+    parser.add_argument(
+        "--sdf-collapse-log-mean-error",
+        type=float,
+        default=None,
+        help="Collapse threshold for |log E[M] - target| during SDF phase validation",
+    )
+    parser.add_argument(
+        "--sdf-collapse-mean-ratio",
+        type=float,
+        default=None,
+        help="Collapse threshold for E[M] relative to target mean during SDF phase validation",
+    )
     parser.add_argument(
         "--fc1-jacobian-penalty-interval",
         type=int,
@@ -242,6 +269,20 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.sdf_true_only_epochs = int(args.sdf_true_only_epochs)
     if args.sdf_recursive_only_epochs is not None:
         hyperparams.sdf_recursive_only_epochs = int(args.sdf_recursive_only_epochs)
+    if args.sdf_stage2_lr is not None:
+        hyperparams.sdf_stage2_lr = float(args.sdf_stage2_lr)
+    if args.sdf_true_moment_weight is not None:
+        hyperparams.sdf_true_moment_weight = float(args.sdf_true_moment_weight)
+    if args.sdf_true_anchor_weight is not None:
+        hyperparams.sdf_true_anchor_weight = float(args.sdf_true_anchor_weight)
+    if args.sdf_reset_optimizer_on_true_start is not None:
+        hyperparams.sdf_reset_optimizer_on_true_start = bool(args.sdf_reset_optimizer_on_true_start)
+    if args.sdf_restore_best_checkpoint is not None:
+        hyperparams.sdf_restore_best_checkpoint = bool(args.sdf_restore_best_checkpoint)
+    if args.sdf_collapse_log_mean_error is not None:
+        hyperparams.sdf_collapse_log_mean_error = float(args.sdf_collapse_log_mean_error)
+    if args.sdf_collapse_mean_ratio is not None:
+        hyperparams.sdf_collapse_mean_ratio = float(args.sdf_collapse_mean_ratio)
     if args.fc1_jacobian_penalty_interval is not None:
         hyperparams.fc1_jacobian_penalty_interval = args.fc1_jacobian_penalty_interval
     if args.pv_bp_training_mode is not None:
@@ -395,6 +436,17 @@ def main():
                 "episode_mode": episode_mode,
                 "exception_type": type(exc).__name__,
                 "exception": str(exc),
+                "stage_diagnostics": getattr(exc, "diagnostics", {}),
+                "partial_module_summaries": getattr(
+                    episode,
+                    "_last_partial_module_summaries",
+                    {},
+                ),
+                "last_failed_stage_diagnostics": getattr(
+                    episode,
+                    "_last_failed_stage_diagnostics",
+                    {},
+                ),
                 "ablation_mode": args.ablation_mode,
                 "gate_context": getattr(episode, "_last_policy_value_gate_context", {}),
                 "last_policy_value_stage_summary": getattr(episode, "_last_policy_value_stage_summary", {}),
@@ -408,6 +460,15 @@ def main():
                     "simulate_horizon": hyperparams.simulate_horizon,
                     "post0_mode": args.post0_mode,
                     "sdf_wealth_loss_mode": hyperparams.sdf_wealth_loss_mode,
+                    "sdf_true_only_epochs": hyperparams.sdf_true_only_epochs,
+                    "sdf_recursive_only_epochs": hyperparams.sdf_recursive_only_epochs,
+                    "sdf_stage2_lr": hyperparams.sdf_stage2_lr,
+                    "sdf_true_moment_weight": hyperparams.sdf_true_moment_weight,
+                    "sdf_true_anchor_weight": hyperparams.sdf_true_anchor_weight,
+                    "sdf_reset_optimizer_on_true_start": hyperparams.sdf_reset_optimizer_on_true_start,
+                    "sdf_restore_best_checkpoint": hyperparams.sdf_restore_best_checkpoint,
+                    "sdf_collapse_log_mean_error": hyperparams.sdf_collapse_log_mean_error,
+                    "sdf_collapse_mean_ratio": hyperparams.sdf_collapse_mean_ratio,
                     "pv_bp_training_mode": hyperparams.pv_bp_training_mode,
                     "firm_target_update": hyperparams.firm_target_update,
                     "modeb_resimulate_after_pv": args.modeb_resimulate_after_pv,

@@ -210,6 +210,19 @@ class HyperParams:
     sdf_recursive_loss_weight: float = 0.25
     sdf_recursive_moment_weight: float = 5e-4
     sdf_recursive_anchor_weight: float = 0.05
+    # SDF phase validation / recovery. These controls are diagnostic guards for
+    # locating whether post-Episode-0 SDF collapse starts in FC1_ONLY or
+    # SDF_TRUE_ONLY without changing the baseline optimization problem.
+    sdf_epoch_validation_enabled: bool = True
+    sdf_restore_best_checkpoint: bool = True
+    sdf_stop_when_gate_passes: bool = True
+    sdf_required_consecutive_passes: int = 1
+    sdf_collapse_log_mean_error: float = 0.5
+    sdf_collapse_mean_ratio: float = 0.10
+    sdf_collapse_patience: int = 1
+    sdf_reset_optimizer_on_true_start: bool = False
+    sdf_clear_optimizer_after_restore: bool = True
+    stage_parameter_invariance_check_enabled: bool = True
     fc1_epochs_per_round: int = 0
     fc1_max_rounds: int = 8
     fc1_plateau_patience: int = 2

@@ -47,7 +47,16 @@ logger = logging.getLogger(__name__)
 
 
 class NumericalStageFailure(RuntimeError):
-    """Raised when a training stage repeatedly produces non-finite gradients."""
+    """Raised when a training stage fails with structured diagnostics."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
 
 
 class SDFTrainingPhase(str, Enum):
@@ -197,6 +206,8 @@ class Episode:
         self._last_nonfinite_grad_params: Dict[str, List[str]] = {}
         self._last_policy_value_stage_summary: Optional[Dict[str, float]] = None
         self._last_policy_value_gate_context: Dict[str, float] = {}
+        self._last_partial_module_summaries: Dict[str, Any] = {}
+        self._last_failed_stage_diagnostics: Dict[str, Any] = {}
         self._sdf_shock_bank: Optional[SDFShockBank] = None
         self._sdf_shock_bank_n_parents: int = 0
         self._sdf_shock_bank_epoch: Optional[int] = None
@@ -206,6 +217,57 @@ class Episode:
 
     def set_sdf_training_phase(self, phase: str | SDFTrainingPhase) -> None:
         self.sdf_training_phase = SDFTrainingPhase(phase)
+
+    @staticmethod
+    def _state_dict_to_cpu(module: nn.Module) -> Dict[str, torch.Tensor]:
+        return {
+            name: value.detach().cpu().clone()
+            for name, value in module.state_dict().items()
+        }
+
+    def _restore_module_state(
+        self,
+        module: nn.Module,
+        state: Dict[str, torch.Tensor],
+    ) -> None:
+        module.load_state_dict(state, strict=True)
+        module.to(self.device)
+
+    def _clear_optimizer_state_for_modules(
+        self,
+        optimizer_name: str,
+        modules: List[nn.Module],
+    ) -> None:
+        optimizer = self.optimizers.get(optimizer_name)
+        if optimizer is None:
+            return
+        target_params = {
+            param
+            for module in modules
+            for param in module.parameters()
+        }
+        for param in list(optimizer.state.keys()):
+            if param in target_params:
+                optimizer.state.pop(param, None)
+
+    @staticmethod
+    def _parameter_snapshot(module: nn.Module) -> Dict[str, torch.Tensor]:
+        return {
+            name: param.detach().cpu().clone()
+            for name, param in module.named_parameters()
+        }
+
+    @staticmethod
+    def _parameter_max_change(
+        module: nn.Module,
+        before: Dict[str, torch.Tensor],
+    ) -> float:
+        max_change = 0.0
+        for name, param in module.named_parameters():
+            previous = before[name].to(param.device)
+            change = (param.detach() - previous).abs().max().item()
+            max_change = max(max_change, float(change))
+        return max_change
 
     @staticmethod
     def _normalize_metric_value(key: str, value: Any) -> Any:
@@ -5219,6 +5281,20 @@ class Episode:
         primary_normalized_signed_parts: List[torch.Tensor] = []
         recursive_raw_signed_parts: List[torch.Tensor] = []
         recursive_normalized_signed_parts: List[torch.Tensor] = []
+        primary_wealth_ratio_parts: List[torch.Tensor] = []
+        primary_log_wealth_ratio_parts: List[torch.Tensor] = []
+        primary_surplus_parts: List[torch.Tensor] = []
+        primary_normalized_r1_parts: List[torch.Tensor] = []
+        primary_normalized_r2_parts: List[torch.Tensor] = []
+        primary_normalized_product_parts: List[torch.Tensor] = []
+        primary_delta_c_parts: List[torch.Tensor] = []
+        primary_delta_k_parts: List[torch.Tensor] = []
+        primary_log_m_macro_unclipped_parts: List[torch.Tensor] = []
+        primary_log_m_macro_clipped_parts: List[torch.Tensor] = []
+        primary_log_m_wealth_parts: List[torch.Tensor] = []
+        primary_log_m_reconstructed_parts: List[torch.Tensor] = []
+        primary_log_m_actual_parts: List[torch.Tensor] = []
+        primary_macro_exponent_clip_parts: List[torch.Tensor] = []
         rollout_rmse_parts: Dict[int, List[torch.Tensor]] = {}
 
         try:
@@ -5288,6 +5364,64 @@ class Episode:
                             residual_pack_recursive["normalized"]
                             if residual_mode == "normalized_ratio"
                             else residual_pack_recursive["raw"]
+                        )
+                        surplus_parent = residual_pack_primary["surplus_parent"]
+                        wealth_ratio = residual_pack_primary["wealth_ratio"]
+                        log_wealth_ratio = torch.log(wealth_ratio.clamp_min(1e-12))
+                        normalized_residual = residual_pack_primary["normalized"]
+                        delta_k = (
+                            k_children_primary.squeeze(-1)
+                            - k_prev_true.squeeze(-1).unsqueeze(-1)
+                        )
+                        delta_c = (
+                            c_children_primary.squeeze(-1)
+                            - c_prev_true.squeeze(-1).unsqueeze(-1)
+                        )
+                        beta = float(loss_fn.beta)
+                        gamma = float(loss_fn.gamma)
+                        kappa = float(loss_fn.kappa)
+                        sigma = float(loss_fn.sigma)
+                        log_m_beta = torch.full_like(delta_k, kappa * np.log(beta))
+                        macro_exponent_unclipped = -gamma * delta_k - kappa / sigma * delta_c
+                        sdf_exponent_clip = getattr(self.config, "SDF_EXPONENT_CLAMP", None)
+                        if sdf_exponent_clip is None:
+                            macro_exponent_clipped = macro_exponent_unclipped
+                            macro_clip_mask = torch.zeros_like(
+                                macro_exponent_unclipped,
+                                dtype=torch.bool,
+                            )
+                        else:
+                            clip = float(sdf_exponent_clip)
+                            macro_exponent_clipped = macro_exponent_unclipped.clamp(-clip, clip)
+                            macro_clip_mask = macro_exponent_unclipped.abs() > clip
+                        log_m_wealth = (kappa - 1.0) * log_wealth_ratio
+                        log_m_reconstructed = log_m_beta + macro_exponent_clipped + log_m_wealth
+                        log_m_actual = torch.log(M_primary.squeeze(-1).clamp_min(1e-30))
+
+                        primary_wealth_ratio_parts.append(wealth_ratio.detach().reshape(-1).cpu())
+                        primary_log_wealth_ratio_parts.append(log_wealth_ratio.detach().reshape(-1).cpu())
+                        primary_surplus_parts.append(surplus_parent.detach().reshape(-1).cpu())
+                        if normalized_residual.shape[1] >= 2:
+                            primary_normalized_r1_parts.append(normalized_residual[:, 0].detach().cpu())
+                            primary_normalized_r2_parts.append(normalized_residual[:, 1].detach().cpu())
+                            primary_normalized_product_parts.append(
+                                (normalized_residual[:, 0] * normalized_residual[:, 1]).detach().cpu()
+                            )
+                        primary_delta_c_parts.append(delta_c.detach().reshape(-1).cpu())
+                        primary_delta_k_parts.append(delta_k.detach().reshape(-1).cpu())
+                        primary_log_m_macro_unclipped_parts.append(
+                            macro_exponent_unclipped.detach().reshape(-1).cpu()
+                        )
+                        primary_log_m_macro_clipped_parts.append(
+                            macro_exponent_clipped.detach().reshape(-1).cpu()
+                        )
+                        primary_log_m_wealth_parts.append(log_m_wealth.detach().reshape(-1).cpu())
+                        primary_log_m_reconstructed_parts.append(
+                            log_m_reconstructed.detach().reshape(-1).cpu()
+                        )
+                        primary_log_m_actual_parts.append(log_m_actual.detach().reshape(-1).cpu())
+                        primary_macro_exponent_clip_parts.append(
+                            macro_clip_mask.detach().reshape(-1).cpu()
                         )
                         if residual_pack_primary["raw"].shape[1] >= 2:
                             primary_raw_signed_parts.append(
@@ -5562,6 +5696,70 @@ class Episode:
         _safe_signed_t('primary_true_state_normalized_signed_aio', primary_normalized_signed_parts)
         _safe_signed_t('recursive_forecast_state_raw_signed_aio', recursive_raw_signed_parts)
         _safe_signed_t('recursive_forecast_state_normalized_signed_aio', recursive_normalized_signed_parts)
+
+        def _safe_distribution(name: str, parts: List[torch.Tensor]) -> None:
+            if not parts:
+                return
+            raw = torch.cat(parts).to(torch.float64)
+            finite = raw[torch.isfinite(raw)]
+            out[f"{prefix}_{name}_total_n"] = float(raw.numel())
+            out[f"{prefix}_{name}_finite_n"] = float(finite.numel())
+            out[f"{prefix}_{name}_finite_ratio"] = float(
+                finite.numel() / max(raw.numel(), 1)
+            )
+            if finite.numel() == 0:
+                return
+            out[f"{prefix}_{name}_mean"] = float(finite.mean().item())
+            out[f"{prefix}_{name}_std"] = float(finite.std(unbiased=False).item())
+            out[f"{prefix}_{name}_p01"] = float(torch.quantile(finite, 0.01).item())
+            out[f"{prefix}_{name}_p10"] = float(torch.quantile(finite, 0.10).item())
+            out[f"{prefix}_{name}_p50"] = float(torch.quantile(finite, 0.50).item())
+            out[f"{prefix}_{name}_p90"] = float(torch.quantile(finite, 0.90).item())
+            out[f"{prefix}_{name}_p99"] = float(torch.quantile(finite, 0.99).item())
+            out[f"{prefix}_{name}_min"] = float(finite.min().item())
+            out[f"{prefix}_{name}_max"] = float(finite.max().item())
+
+        _safe_distribution("primary_true_state_wealth_ratio", primary_wealth_ratio_parts)
+        _safe_distribution("primary_true_state_log_wealth_ratio", primary_log_wealth_ratio_parts)
+        _safe_distribution("primary_true_state_surplus", primary_surplus_parts)
+        _safe_distribution("primary_true_state_normalized_r1", primary_normalized_r1_parts)
+        _safe_distribution("primary_true_state_normalized_r2", primary_normalized_r2_parts)
+        _safe_distribution("primary_true_state_normalized_product", primary_normalized_product_parts)
+        _safe_distribution("primary_true_state_delta_c", primary_delta_c_parts)
+        _safe_distribution("primary_true_state_delta_k", primary_delta_k_parts)
+        _safe_distribution(
+            "primary_true_state_log_m_macro_unclipped",
+            primary_log_m_macro_unclipped_parts,
+        )
+        _safe_distribution(
+            "primary_true_state_log_m_macro_clipped",
+            primary_log_m_macro_clipped_parts,
+        )
+        _safe_distribution("primary_true_state_log_m_wealth", primary_log_m_wealth_parts)
+        _safe_distribution(
+            "primary_true_state_log_m_reconstructed",
+            primary_log_m_reconstructed_parts,
+        )
+        _safe_distribution("primary_true_state_log_m_actual", primary_log_m_actual_parts)
+
+        if primary_log_m_actual_parts and primary_log_m_reconstructed_parts:
+            actual = torch.cat(primary_log_m_actual_parts).to(torch.float64)
+            reconstructed = torch.cat(primary_log_m_reconstructed_parts).to(torch.float64)
+            mask = torch.isfinite(actual) & torch.isfinite(reconstructed)
+            if mask.any():
+                error = actual[mask] - reconstructed[mask]
+                out[f"{prefix}_primary_true_state_log_m_reconstruction_mae"] = float(
+                    error.abs().mean().item()
+                )
+                out[f"{prefix}_primary_true_state_log_m_reconstruction_max_abs"] = float(
+                    error.abs().max().item()
+                )
+
+        if primary_macro_exponent_clip_parts:
+            clip_mask = torch.cat(primary_macro_exponent_clip_parts).to(torch.float32)
+            out[f"{prefix}_primary_true_state_macro_exponent_clip_share"] = float(
+                clip_mask.mean().item()
+            )
 
         rollout_rmse_by_h: Dict[int, float] = {}
         for h, parts in rollout_rmse_parts.items():
@@ -5852,6 +6050,28 @@ class Episode:
             prefix="fc1_before",
             max_batches=eval_batches_arg,
         )
+        model = getattr(self, "models", {}).get("sdf_fc1")
+        invariance_enabled = bool(
+            getattr(self.hyperparams, "stage_parameter_invariance_check_enabled", True)
+            and model is not None
+        )
+        sdf_before = None
+        value_before = None
+        if invariance_enabled:
+            sdf_before = self._parameter_snapshot(model.sdf_model)
+            value_before = self._parameter_snapshot(model.value_model)
+
+        def _check_fc1_only_invariance() -> None:
+            if not invariance_enabled or sdf_before is None or value_before is None:
+                return
+            sdf_change = self._parameter_max_change(model.sdf_model, sdf_before)
+            value_change = self._parameter_max_change(model.value_model, value_before)
+            if sdf_change != 0.0 or value_change != 0.0:
+                raise RuntimeError(
+                    "SDF/value parameters changed during FC1_ONLY: "
+                    f"sdf_change={sdf_change}, value_change={value_change}"
+                )
+
         data_passed, data_diag = self._fc1_data_viability_passed(before_eval, prefix="fc1_before")
         if not data_passed:
             return {
@@ -5875,6 +6095,7 @@ class Episode:
                 ["sdf_fc1"],
                 desc_prefix=f"SDF/FC1(fc1 r{display_round}/{max_rounds}) ",
             )
+            _check_fc1_only_invariance()
             prefix = f"after_fc1_round{display_round}"
             eval_metrics = self._evaluate_sdf_fc1_batches(
                 val_batches,
@@ -6022,6 +6243,233 @@ class Episode:
             "max_signed_t_abs": max_t,
         }
         return bool(passed), diag
+
+    def _sdf_gate_score(self, gate_diag: Dict[str, Any]) -> Tuple[float, float, float]:
+        finite_ratio = float(gate_diag.get("m_finite_ratio", float("nan")))
+        finite_min = float(gate_diag.get("m_finite_ratio_min", 1.0))
+        log_error = float(gate_diag.get("log_mean_error", float("inf")))
+        log_limit = max(float(gate_diag.get("max_log_mean_error", 0.02)), 1e-12)
+        signed_t = abs(float(gate_diag.get("signed_aio_t", float("inf"))))
+        t_limit = max(float(gate_diag.get("max_signed_t_abs", 2.0)), 1e-12)
+        finite_failure = (
+            0.0
+            if np.isfinite(finite_ratio) and finite_ratio >= finite_min
+            else 1.0
+        )
+        m_violation = log_error / log_limit if np.isfinite(log_error) else float("inf")
+        t_violation = signed_t / t_limit if np.isfinite(signed_t) else float("inf")
+        return (
+            float(finite_failure),
+            float(max(m_violation, t_violation)),
+            float(m_violation + t_violation),
+        )
+
+    def _sdf_collapse_detected(self, gate_diag: Dict[str, Any]) -> bool:
+        m_mean = float(gate_diag.get("m_mean", float("nan")))
+        finite_ratio = float(gate_diag.get("m_finite_ratio", float("nan")))
+        log_error = float(gate_diag.get("log_mean_error", float("inf")))
+        target_log = float(gate_diag.get("log_mean_target", 0.0))
+        target_mean = float(np.exp(target_log))
+        max_log_error = float(
+            getattr(self.hyperparams, "sdf_collapse_log_mean_error", 0.5)
+        )
+        min_mean_ratio = float(
+            getattr(self.hyperparams, "sdf_collapse_mean_ratio", 0.10)
+        )
+        return bool(
+            not np.isfinite(m_mean)
+            or not np.isfinite(finite_ratio)
+            or finite_ratio < 1.0
+            or log_error > max_log_error
+            or m_mean < target_mean * min_mean_ratio
+        )
+
+    def _run_sdf_phase_with_validation(
+        self,
+        *,
+        train_batches: List[Dict[str, torch.Tensor]],
+        val_batches: List[Dict[str, torch.Tensor]],
+        n_epochs: int,
+        log_interval: int,
+        stage: SDFTrainingPhase,
+        prefix: str,
+    ) -> Dict[str, Any]:
+        if stage not in {
+            SDFTrainingPhase.SDF_TRUE_ONLY,
+            SDFTrainingPhase.SDF_RECURSIVE_ONLY,
+        }:
+            raise ValueError(f"Unsupported validated SDF stage: {stage}")
+        if not train_batches:
+            raise RuntimeError(f"{stage.value} requires training batches.")
+        if not val_batches:
+            raise RuntimeError(f"{stage.value} requires validation batches.")
+
+        model = self.models["sdf_fc1"]
+        eval_batch_limit = int(getattr(self.hyperparams, "sdf_fc1_eval_max_batches", 0))
+        eval_batch_limit = eval_batch_limit if eval_batch_limit > 0 else None
+        history: List[Dict[str, Any]] = []
+
+        initial_prefix = f"{prefix}_epoch0"
+        initial_eval = self._evaluate_sdf_fc1_batches(
+            val_batches,
+            prefix=initial_prefix,
+            max_batches=eval_batch_limit,
+        )
+        initial_passed, initial_gate = self._sdf_gate_passed(
+            initial_eval,
+            prefix=initial_prefix,
+            stage=stage,
+        )
+        best_state = self._state_dict_to_cpu(model)
+        best_epoch = 0
+        best_eval = initial_eval
+        best_gate = initial_gate
+        best_score = self._sdf_gate_score(initial_gate)
+        history.append({
+            "epoch": 0,
+            "train_summary": None,
+            "eval_metrics": initial_eval,
+            "gate": initial_gate,
+            "score": list(best_score),
+            "passed": bool(initial_passed),
+            "collapse_detected": self._sdf_collapse_detected(initial_gate),
+        })
+
+        if (
+            stage == SDFTrainingPhase.SDF_TRUE_ONLY
+            and bool(getattr(self.hyperparams, "sdf_reset_optimizer_on_true_start", False))
+        ):
+            self._clear_optimizer_state_for_modules(
+                "sdf_fc1",
+                [model.sdf_model, model.value_model],
+            )
+
+        collapse_streak = 0
+        pass_streak = 1 if initial_passed else 0
+        last_epoch = 0
+        fc1_before = None
+        if (
+            stage == SDFTrainingPhase.SDF_TRUE_ONLY
+            and bool(getattr(self.hyperparams, "stage_parameter_invariance_check_enabled", True))
+        ):
+            fc1_before = self._parameter_snapshot(model.fc1_model)
+
+        for epoch_idx in range(1, n_epochs + 1):
+            previous_offset = getattr(self, "_run_batches_epoch_offset", 0)
+            self._run_batches_epoch_offset = epoch_idx - 1
+            try:
+                train_summary = self._run_batches(
+                    train_batches,
+                    n_epochs=1,
+                    log_interval=log_interval,
+                    train_modules=["sdf_fc1"],
+                    desc_prefix=f"{stage.value} epoch {epoch_idx}/{n_epochs} ",
+                )
+            finally:
+                self._run_batches_epoch_offset = previous_offset
+
+            if fc1_before is not None:
+                fc1_change = self._parameter_max_change(model.fc1_model, fc1_before)
+                if fc1_change != 0.0:
+                    raise RuntimeError(
+                        "FC1 parameters changed during "
+                        f"{stage.value}: max_change={fc1_change}"
+                    )
+
+            eval_prefix = f"{prefix}_epoch{epoch_idx}"
+            eval_metrics = self._evaluate_sdf_fc1_batches(
+                val_batches,
+                prefix=eval_prefix,
+                max_batches=eval_batch_limit,
+            )
+            passed, gate = self._sdf_gate_passed(
+                eval_metrics,
+                prefix=eval_prefix,
+                stage=stage,
+            )
+            score = self._sdf_gate_score(gate)
+            collapsed = self._sdf_collapse_detected(gate)
+            history.append({
+                "epoch": epoch_idx,
+                "train_summary": train_summary,
+                "eval_metrics": eval_metrics,
+                "gate": gate,
+                "score": list(score),
+                "passed": bool(passed),
+                "collapse_detected": bool(collapsed),
+            })
+            last_epoch = epoch_idx
+
+            if score < best_score:
+                best_score = score
+                best_state = self._state_dict_to_cpu(model)
+                best_epoch = epoch_idx
+                best_eval = eval_metrics
+                best_gate = gate
+
+            pass_streak = pass_streak + 1 if passed else 0
+            required_passes = max(
+                1,
+                int(getattr(self.hyperparams, "sdf_required_consecutive_passes", 1)),
+            )
+            if (
+                passed
+                and pass_streak >= required_passes
+                and bool(getattr(self.hyperparams, "sdf_stop_when_gate_passes", True))
+            ):
+                break
+
+            collapse_streak = collapse_streak + 1 if collapsed else 0
+            collapse_patience = max(
+                1,
+                int(getattr(self.hyperparams, "sdf_collapse_patience", 1)),
+            )
+            if collapse_streak >= collapse_patience:
+                logger.warning(
+                    "%s collapse detected at epoch %d; stop stage and restore best epoch %d.",
+                    stage.value,
+                    epoch_idx,
+                    best_epoch,
+                )
+                break
+
+        restored = False
+        if bool(getattr(self.hyperparams, "sdf_restore_best_checkpoint", True)):
+            self._restore_module_state(model, best_state)
+            restored = True
+            if bool(getattr(self.hyperparams, "sdf_clear_optimizer_after_restore", True)):
+                self._clear_optimizer_state_for_modules(
+                    "sdf_fc1",
+                    [model.sdf_model, model.value_model],
+                )
+
+        final_prefix = f"{prefix}_restored_best"
+        final_eval = self._evaluate_sdf_fc1_batches(
+            val_batches,
+            prefix=final_prefix,
+            max_batches=eval_batch_limit,
+        )
+        final_passed, final_gate = self._sdf_gate_passed(
+            final_eval,
+            prefix=final_prefix,
+            stage=stage,
+        )
+        return {
+            "stage": stage.value,
+            "passed": bool(final_passed),
+            "epochs_requested": int(n_epochs),
+            "epochs_completed": int(last_epoch),
+            "best_epoch": int(best_epoch),
+            "best_score": list(best_score),
+            "restored_best_checkpoint": bool(restored),
+            "initial_eval_metrics": initial_eval,
+            "initial_gate": initial_gate,
+            "best_eval_metrics": best_eval,
+            "best_gate": best_gate,
+            "final_eval_metrics": final_eval,
+            "final_gate": final_gate,
+            "history": history,
+        }
 
     def _episode0_sdf_safety_gate_passed(
         self,
@@ -6244,6 +6692,8 @@ class Episode:
             )
             if before_eval:
                 module_summaries['sdf_fc1_fixed_batch_eval_before'] = before_eval
+                module_summaries['sdf_boundary_before_fc1'] = before_eval
+                self._last_partial_module_summaries = deepcopy(module_summaries)
 
             def _fail(stage_name: str, diag: Dict[str, Any]) -> Dict[str, Any]:
                 result = {
@@ -6253,6 +6703,14 @@ class Episode:
                     "diagnostics": diag,
                 }
                 module_summaries['sdf_fc1_gate'] = result
+                self._last_failed_stage_diagnostics = {
+                    "episode_id": int(self.episode_id),
+                    "failed_stage": stage_name,
+                    "gate_result": deepcopy(result),
+                    "partial_module_summaries": deepcopy(module_summaries),
+                    "sdf_training_phase": str(self.sdf_training_phase.value),
+                }
+                self._last_partial_module_summaries = deepcopy(module_summaries)
                 logger.warning("FC1/SDF gate failed at %s: %s", stage_name, diag)
                 return result
 
@@ -6272,7 +6730,9 @@ class Episode:
                     module_summaries['sdf_fc1_fc1_only'] = fc1_result.get('final_train_summary', {})
                     if fc1_result.get('final_eval_metrics'):
                         module_summaries['sdf_fc1_eval_after_fc1_only'] = fc1_result['final_eval_metrics']
+                        module_summaries['sdf_boundary_after_fc1_before_true'] = fc1_result['final_eval_metrics']
                     module_summaries['sdf_fc1_gate_fc1_only'] = fc1_result
+                    self._last_partial_module_summaries = deepcopy(module_summaries)
                     if not fc1_result.get("passed", False):
                         return _fail(
                             fc1_result.get("failed_stage", SDFTrainingPhase.FC1_ONLY.value),
@@ -6280,19 +6740,67 @@ class Episode:
                         )
                 if true_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.SDF_TRUE_ONLY)
-                    module_summaries['sdf_fc1_sdf_true_only'] = self._run_batches(
-                        train_batches, true_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(sdf-true) '
+                    pre_true_eval = self._evaluate_sdf_fc1_batches(
+                        val_batches,
+                        prefix='before_sdf_true',
+                        max_batches=eval_batches_arg,
                     )
-                    true_eval = self._evaluate_sdf_fc1_batches(
-                        val_batches, prefix='after_sdf_true', max_batches=eval_batches_arg
+                    module_summaries['sdf_boundary_before_sdf_true'] = pre_true_eval
+                    self._last_partial_module_summaries = deepcopy(module_summaries)
+                    if bool(getattr(self.hyperparams, "sdf_epoch_validation_enabled", True)):
+                        true_result = self._run_sdf_phase_with_validation(
+                            train_batches=train_batches,
+                            val_batches=val_batches,
+                            n_epochs=true_epochs,
+                            log_interval=log_interval,
+                            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+                            prefix="sdf_true",
+                        )
+                    else:
+                        train_summary = self._run_batches(
+                            train_batches,
+                            true_epochs,
+                            log_interval,
+                            ['sdf_fc1'],
+                            desc_prefix='SDF/FC1(sdf-true) ',
+                        )
+                        true_eval = self._evaluate_sdf_fc1_batches(
+                            val_batches,
+                            prefix='after_sdf_true',
+                            max_batches=eval_batches_arg,
+                        )
+                        passed, diag = self._sdf_gate_passed(
+                            true_eval,
+                            prefix='after_sdf_true',
+                            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+                        )
+                        true_result = {
+                            "stage": SDFTrainingPhase.SDF_TRUE_ONLY.value,
+                            "passed": bool(passed),
+                            "epochs_requested": int(true_epochs),
+                            "epochs_completed": int(true_epochs),
+                            "final_train_summary": train_summary,
+                            "final_eval_metrics": true_eval,
+                            "final_gate": diag,
+                        }
+                    module_summaries['sdf_fc1_sdf_true_only'] = true_result
+                    module_summaries['sdf_fc1_eval_after_sdf_true_only'] = true_result.get(
+                        'final_eval_metrics',
+                        {},
                     )
-                    module_summaries['sdf_fc1_eval_after_sdf_true_only'] = true_eval
-                    passed, diag = self._sdf_gate_passed(
-                        true_eval, prefix='after_sdf_true', stage=SDFTrainingPhase.SDF_TRUE_ONLY
+                    module_summaries['sdf_fc1_gate_sdf_true_only'] = true_result.get(
+                        'final_gate',
+                        {},
                     )
-                    module_summaries['sdf_fc1_gate_sdf_true_only'] = diag
-                    if not passed:
-                        return _fail(SDFTrainingPhase.SDF_TRUE_ONLY.value, diag)
+                    self._last_partial_module_summaries = deepcopy(module_summaries)
+                    if not true_result.get("passed", False):
+                        return _fail(
+                            SDFTrainingPhase.SDF_TRUE_ONLY.value,
+                            {
+                                **true_result.get("final_gate", {}),
+                                "phase_result": true_result,
+                            },
+                        )
                 if recursive_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.SDF_RECURSIVE_ONLY)
                     module_summaries['sdf_fc1_sdf_recursive_only'] = self._run_batches(
@@ -6308,6 +6816,7 @@ class Episode:
                         stage=SDFTrainingPhase.SDF_RECURSIVE_ONLY,
                     )
                     module_summaries['sdf_fc1_gate_sdf_recursive_only'] = diag
+                    self._last_partial_module_summaries = deepcopy(module_summaries)
                     if not passed:
                         return _fail(SDFTrainingPhase.SDF_RECURSIVE_ONLY.value, diag)
                 module_summaries['sdf_fc1_stage2'] = module_summaries.get(
@@ -6342,6 +6851,30 @@ class Episode:
             self.add_FC1loss = prev_flag
             self._fc1_teacher_forcing_stage = prev_teacher_flag
             self.set_sdf_training_phase(prev_phase)
+
+    def _raise_sdf_gate_failure(
+        self,
+        gate_result: Dict[str, Any],
+        module_summaries: Dict[str, Any],
+        *,
+        message_suffix: str,
+    ) -> None:
+        failure_payload = {
+            "episode_id": int(self.episode_id),
+            "failed_stage": gate_result.get("failed_stage"),
+            "gate_result": deepcopy(gate_result),
+            "partial_module_summaries": deepcopy(module_summaries),
+            "sdf_training_phase": str(self.sdf_training_phase.value),
+        }
+        self._last_failed_stage_diagnostics = failure_payload
+        self._last_partial_module_summaries = deepcopy(module_summaries)
+        raise NumericalStageFailure(
+            (
+                "FC1/SDF validation failed in "
+                f"{gate_result.get('failed_stage')}; {message_suffix}"
+            ),
+            diagnostics=failure_payload,
+        )
 
     def _resolve_episode_mode(self, episode_mode: Optional[str]) -> str:
         if episode_mode is None:
@@ -6698,8 +7231,10 @@ class Episode:
                         n_branches=n_branches
                     )
                     if not gate_result.get("passed", False):
-                        raise NumericalStageFailure(
-                            f"FC1/SDF validation failed in {gate_result.get('failed_stage')}; skip downstream training."
+                        self._raise_sdf_gate_failure(
+                            gate_result,
+                            module_summaries,
+                            message_suffix="skip downstream training.",
                         )
 
             elif mode == 'modea':
@@ -6762,8 +7297,10 @@ class Episode:
                         n_branches=n_branches
                     )
                     if not gate_result.get("passed", False):
-                        raise NumericalStageFailure(
-                            f"FC1/SDF validation failed in {gate_result.get('failed_stage')}; skip downstream training."
+                        self._raise_sdf_gate_failure(
+                            gate_result,
+                            module_summaries,
+                            message_suffix="skip downstream training.",
                         )
 
             elif mode == 'modeb':
@@ -6829,8 +7366,10 @@ class Episode:
                         n_branches=n_branches
                     )
                     if not gate_result.get("passed", False):
-                        raise NumericalStageFailure(
-                            f"FC1/SDF validation failed in {gate_result.get('failed_stage')}; skip Q/P/bp."
+                        self._raise_sdf_gate_failure(
+                            gate_result,
+                            module_summaries,
+                            message_suffix="skip Q/P/bp.",
                         )
 
                 if use_policy_value and use_sdf_fc1 and self.episode_id > 0:
