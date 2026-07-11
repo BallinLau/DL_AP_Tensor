@@ -2552,14 +2552,35 @@ class Episode:
         c_parent = c_prev_input
         k_parent = k_prev_input
         
-        # 计算损失
-        # 构造残差并按 parent 聚合
-        residuals = loss_fn.compute_euler_residuals(
-            w_parent.squeeze(-1), w_children_wealth.squeeze(-1),
-            k_parent.squeeze(-1), k_children_wealth.squeeze(-1),
-            c_parent.squeeze(-1), c_children_wealth.squeeze(-1)
-        )  # (batch, n_children)
+        residual_mode = str(
+            getattr(self.hyperparams, "sdf_wealth_residual_mode", "raw")
+        ).lower()
+        normalized_logr_clip = float(
+            getattr(self.hyperparams, "sdf_normalized_logr_clip", 20.0)
+        )
+
+        def _select_wealth_residuals(residual_pack: Dict[str, torch.Tensor]) -> torch.Tensor:
+            if residual_mode == "raw":
+                return residual_pack["raw"]
+            if residual_mode == "normalized_ratio":
+                return residual_pack["normalized"]
+            raise ValueError(f"Unknown sdf_wealth_residual_mode={residual_mode!r}")
+
+        residual_pack = loss_fn.compute_wealth_residuals(
+            w_parent=w_parent.squeeze(-1),
+            w_children=w_children_wealth.squeeze(-1),
+            k_parent=k_parent.squeeze(-1),
+            k_children=k_children_wealth.squeeze(-1),
+            c_parent=c_parent.squeeze(-1),
+            c_children=c_children_wealth.squeeze(-1),
+            normalized_logr_clip=normalized_logr_clip,
+        )
+        raw_residuals = residual_pack["raw"]
+        normalized_residuals = residual_pack["normalized"]
+        residuals = _select_wealth_residuals(residual_pack)
         main_loss, wealth_main_details = loss_fn.compute_wealth_main_loss(residuals)
+        _, raw_wealth_details = loss_fn.compute_wealth_main_loss(raw_residuals)
+        _, normalized_wealth_details = loss_fn.compute_wealth_main_loss(normalized_residuals)
         true_state_main_loss = main_loss
         if phase == SDFTrainingPhase.SDF_RECURSIVE_ONLY:
             w_parent_true, w_children_true, _, c_children_true, k_children_true = model.forward_step(
@@ -2569,14 +2590,16 @@ class Episode:
                 lnkf_prev=parent[:, 8:9],
                 return_physical=True,
             )
-            residuals_true = loss_fn.compute_euler_residuals(
-                w_parent_true.squeeze(-1),
-                w_children_true.squeeze(-1),
-                parent[:, 8:9].squeeze(-1),
-                k_children_true.squeeze(-1),
-                parent[:, 7:8].squeeze(-1),
-                c_children_true.squeeze(-1),
+            residual_pack_true = loss_fn.compute_wealth_residuals(
+                w_parent=w_parent_true.squeeze(-1),
+                w_children=w_children_true.squeeze(-1),
+                k_parent=parent[:, 8:9].squeeze(-1),
+                k_children=k_children_true.squeeze(-1),
+                c_parent=parent[:, 7:8].squeeze(-1),
+                c_children=c_children_true.squeeze(-1),
+                normalized_logr_clip=normalized_logr_clip,
             )
+            residuals_true = _select_wealth_residuals(residual_pack_true)
             true_state_main_loss, _ = loss_fn.compute_wealth_main_loss(residuals_true)
 
         moment_loss = torch.tensor(0.0, device=self.device)
@@ -2887,11 +2910,63 @@ class Episode:
             def _q(v: torch.Tensor, q: float) -> float:
                 return float(torch.quantile(v, q).item()) if v.numel() > 0 else 0.0
 
+            eps_diag = 1e-8
+            w_parent_diag = w_parent.detach().squeeze(-1).reshape(-1)
+            w_child_diag = w_children_wealth.detach().squeeze(-1).reshape(-1)
+            c_child_diag = c_children_wealth.detach().squeeze(-1)
+            surplus_parent_raw_diag = (
+                w_parent.detach().squeeze(-1) - torch.exp(c_parent.detach().squeeze(-1))
+            ).reshape(-1)
+            surplus_parent_diag = residual_pack["surplus_parent"].detach().reshape(-1)
+            surplus_child_diag = (
+                w_children_wealth.detach().squeeze(-1) - torch.exp(c_child_diag)
+            ).clamp_min(eps_diag).reshape(-1)
+            wealth_ratio_diag = residual_pack["wealth_ratio"].detach().reshape(-1)
+            log_wealth_ratio_diag = torch.log(wealth_ratio_diag.clamp_min(eps_diag))
+
+            value_scale_diag = {
+                'sdf_w_parent_p01': _q(w_parent_diag, 0.01),
+                'sdf_w_parent_p50': _q(w_parent_diag, 0.50),
+                'sdf_w_parent_p99': _q(w_parent_diag, 0.99),
+                'sdf_w_child_p01': _q(w_child_diag, 0.01),
+                'sdf_w_child_p50': _q(w_child_diag, 0.50),
+                'sdf_w_child_p99': _q(w_child_diag, 0.99),
+                'sdf_surplus_parent_p01': _q(surplus_parent_diag, 0.01),
+                'sdf_surplus_parent_p50': _q(surplus_parent_diag, 0.50),
+                'sdf_surplus_parent_p99': _q(surplus_parent_diag, 0.99),
+                'sdf_surplus_child_p01': _q(surplus_child_diag, 0.01),
+                'sdf_surplus_child_p50': _q(surplus_child_diag, 0.50),
+                'sdf_surplus_child_p99': _q(surplus_child_diag, 0.99),
+                'sdf_wealth_ratio_p01': _q(wealth_ratio_diag, 0.01),
+                'sdf_wealth_ratio_p50': _q(wealth_ratio_diag, 0.50),
+                'sdf_wealth_ratio_p99': _q(wealth_ratio_diag, 0.99),
+                'sdf_log_wealth_ratio_p01': _q(log_wealth_ratio_diag, 0.01),
+                'sdf_log_wealth_ratio_p50': _q(log_wealth_ratio_diag, 0.50),
+                'sdf_log_wealth_ratio_p99': _q(log_wealth_ratio_diag, 0.99),
+                'sdf_surplus_parent_floor_share': float(
+                    (surplus_parent_raw_diag <= eps_diag).to(torch.float32).mean().item()
+                ),
+            }
+
             wealth_diag = {
                 f"sdf_{key if key != 'signed_aio' else 'signed_aio_main'}": float(
                     value.detach().item()
                 )
                 for key, value in wealth_main_details.items()
+                if torch.is_tensor(value) and value.numel() == 1
+            }
+            raw_wealth_diag = {
+                f"sdf_raw_{key if key != 'signed_aio' else 'signed_aio_main'}": float(
+                    value.detach().item()
+                )
+                for key, value in raw_wealth_details.items()
+                if torch.is_tensor(value) and value.numel() == 1
+            }
+            normalized_wealth_diag = {
+                f"sdf_normalized_{key if key != 'signed_aio' else 'signed_aio_main'}": float(
+                    value.detach().item()
+                )
+                for key, value in normalized_wealth_details.items()
                 if torch.is_tensor(value) and value.numel() == 1
             }
             self._latest_sdf_terms = {
@@ -2911,6 +2986,14 @@ class Episode:
                 'sdf_wealth_loss_mode_signed_aio': float(
                     1.0 if getattr(loss_fn, "wealth_loss_mode", "legacy_abs_log1p") == "signed_aio" else 0.0
                 ),
+                'sdf_wealth_residual_mode_normalized_ratio': float(
+                    1.0 if residual_mode == "normalized_ratio" else 0.0
+                ),
+                'sdf_normalized_logr_clip': float(normalized_logr_clip),
+                'sdf_normalized_logr_clip_share': float(residual_pack["log_R_clip_share"].detach().item()),
+                'sdf_normalized_logr_abs_mean': float(residual_pack["log_R"].detach().abs().mean().item()),
+                'sdf_wealth_ratio_mean': float(residual_pack["wealth_ratio"].detach().mean().item()),
+                'sdf_surplus_parent_mean': float(residual_pack["surplus_parent"].detach().mean().item()),
                 'sdf_moment_loss': float(moment_loss.detach().item()),
                 'sdf_recon_loss': float(recon_loss.detach().item()),
                 'sdf_fc1_true_recon': float(recon_loss.detach().item()),
@@ -2949,6 +3032,9 @@ class Episode:
                 'sdf_use_true_prev_macro': float(1.0 if use_true_prev_macro else 0.0),
             }
             self._latest_sdf_terms.update(wealth_diag)
+            self._latest_sdf_terms.update(raw_wealth_diag)
+            self._latest_sdf_terms.update(normalized_wealth_diag)
+            self._latest_sdf_terms.update(value_scale_diag)
             self._latest_sdf_terms.update(fresh_pair_diag)
             self._latest_sdf_diag = {
                 'sdf_log_mean_M': float(torch.log(mu).item()),
@@ -5127,6 +5213,10 @@ class Episode:
         recursive_m_parts: List[torch.Tensor] = []
         primary_signed_parts: List[torch.Tensor] = []
         recursive_signed_parts: List[torch.Tensor] = []
+        primary_raw_signed_parts: List[torch.Tensor] = []
+        primary_normalized_signed_parts: List[torch.Tensor] = []
+        recursive_raw_signed_parts: List[torch.Tensor] = []
+        recursive_normalized_signed_parts: List[torch.Tensor] = []
         rollout_rmse_parts: Dict[int, List[torch.Tensor]] = {}
 
         try:
@@ -5163,27 +5253,69 @@ class Episode:
                     )
                     loss_fn = getattr(self, "loss_fns", {}).get("sdf") if hasattr(self, "loss_fns") else None
                     if loss_fn is not None:
-                        residuals_primary = loss_fn.compute_euler_residuals(
-                            w_parent_primary.squeeze(-1),
-                            w_children_primary.squeeze(-1),
-                            k_prev_true.squeeze(-1),
-                            k_children_primary.squeeze(-1),
-                            c_prev_true.squeeze(-1),
-                            c_children_primary.squeeze(-1),
+                        normalized_logr_clip = float(
+                            getattr(self.hyperparams, "sdf_normalized_logr_clip", 20.0)
                         )
-                        residuals_recursive = loss_fn.compute_euler_residuals(
-                            w_parent_recursive.squeeze(-1),
-                            w_children_recursive.squeeze(-1),
-                            k_prev_forecast.squeeze(-1),
-                            k_children_recursive.squeeze(-1),
-                            c_prev_forecast.squeeze(-1),
-                            c_children_recursive.squeeze(-1),
+                        residual_pack_primary = loss_fn.compute_wealth_residuals(
+                            w_parent=w_parent_primary.squeeze(-1),
+                            w_children=w_children_primary.squeeze(-1),
+                            k_parent=k_prev_true.squeeze(-1),
+                            k_children=k_children_primary.squeeze(-1),
+                            c_parent=c_prev_true.squeeze(-1),
+                            c_children=c_children_primary.squeeze(-1),
+                            normalized_logr_clip=normalized_logr_clip,
                         )
-                        if residuals_primary.shape[1] >= 2:
+                        residual_pack_recursive = loss_fn.compute_wealth_residuals(
+                            w_parent=w_parent_recursive.squeeze(-1),
+                            w_children=w_children_recursive.squeeze(-1),
+                            k_parent=k_prev_forecast.squeeze(-1),
+                            k_children=k_children_recursive.squeeze(-1),
+                            c_parent=c_prev_forecast.squeeze(-1),
+                            c_children=c_children_recursive.squeeze(-1),
+                            normalized_logr_clip=normalized_logr_clip,
+                        )
+                        residual_mode = str(
+                            getattr(self.hyperparams, "sdf_gate_residual_mode", "normalized_ratio")
+                        ).lower()
+                        residuals_primary = (
+                            residual_pack_primary["normalized"]
+                            if residual_mode == "normalized_ratio"
+                            else residual_pack_primary["raw"]
+                        )
+                        residuals_recursive = (
+                            residual_pack_recursive["normalized"]
+                            if residual_mode == "normalized_ratio"
+                            else residual_pack_recursive["raw"]
+                        )
+                        if residual_pack_primary["raw"].shape[1] >= 2:
+                            primary_raw_signed_parts.append(
+                                (
+                                    residual_pack_primary["raw"][:, 0]
+                                    * residual_pack_primary["raw"][:, 1]
+                                ).detach().reshape(-1).cpu()
+                            )
+                            primary_normalized_signed_parts.append(
+                                (
+                                    residual_pack_primary["normalized"][:, 0]
+                                    * residual_pack_primary["normalized"][:, 1]
+                                ).detach().reshape(-1).cpu()
+                            )
                             primary_signed_parts.append(
                                 (residuals_primary[:, 0] * residuals_primary[:, 1]).detach().reshape(-1).cpu()
                             )
-                        if residuals_recursive.shape[1] >= 2:
+                        if residual_pack_recursive["raw"].shape[1] >= 2:
+                            recursive_raw_signed_parts.append(
+                                (
+                                    residual_pack_recursive["raw"][:, 0]
+                                    * residual_pack_recursive["raw"][:, 1]
+                                ).detach().reshape(-1).cpu()
+                            )
+                            recursive_normalized_signed_parts.append(
+                                (
+                                    residual_pack_recursive["normalized"][:, 0]
+                                    * residual_pack_recursive["normalized"][:, 1]
+                                ).detach().reshape(-1).cpu()
+                            )
                             recursive_signed_parts.append(
                                 (residuals_recursive[:, 0] * residuals_recursive[:, 1]).detach().reshape(-1).cpu()
                             )
@@ -5424,6 +5556,10 @@ class Episode:
 
         _safe_signed_t('primary_true_state_signed_aio', primary_signed_parts)
         _safe_signed_t('recursive_forecast_state_signed_aio', recursive_signed_parts)
+        _safe_signed_t('primary_true_state_raw_signed_aio', primary_raw_signed_parts)
+        _safe_signed_t('primary_true_state_normalized_signed_aio', primary_normalized_signed_parts)
+        _safe_signed_t('recursive_forecast_state_raw_signed_aio', recursive_raw_signed_parts)
+        _safe_signed_t('recursive_forecast_state_normalized_signed_aio', recursive_normalized_signed_parts)
 
         rollout_rmse_by_h: Dict[int, float] = {}
         for h, parts in rollout_rmse_parts.items():
@@ -5827,18 +5963,31 @@ class Episode:
         tail_gate_active = bool(np.isfinite(p99_max) or np.isfinite(max_max))
         target = getattr(self.hyperparams, "sdf_log_mean_target", None)
         target = float(target) if target is not None else 0.0
+        gate_residual_mode = str(
+            getattr(self.hyperparams, "sdf_gate_residual_mode", "normalized_ratio")
+        ).lower()
+        if gate_residual_mode == "normalized_ratio":
+            signed_suffix = "normalized_signed_aio"
+        elif gate_residual_mode == "raw":
+            signed_suffix = "raw_signed_aio"
+        else:
+            raise ValueError(f"Unknown sdf_gate_residual_mode={gate_residual_mode!r}")
         if stage in (SDFTrainingPhase.EPISODE0_BOOTSTRAP, SDFTrainingPhase.SDF_TRUE_ONLY):
             m_prefix = f"{prefix}_primary_true_state_M"
-            t_key = f"{prefix}_primary_true_state_signed_aio_t"
+            signed_prefix = f"{prefix}_primary_true_state_{signed_suffix}"
         else:
             m_prefix = f"{prefix}_recursive_forecast_state_M"
-            t_key = f"{prefix}_recursive_forecast_state_signed_aio_t"
+            signed_prefix = f"{prefix}_recursive_forecast_state_{signed_suffix}"
+        t_key = f"{signed_prefix}_t"
         m_key = f"{m_prefix}_mean"
         m_mean = eval_metrics.get(m_key, float("nan"))
         finite_ratio = eval_metrics.get(f"{m_prefix}_finite_ratio", float("nan"))
         m_p99 = eval_metrics.get(f"{m_prefix}_p99", float("nan"))
         m_max = eval_metrics.get(f"{m_prefix}_max", float("nan"))
         signed_t = eval_metrics.get(t_key, float("nan"))
+        if not np.isfinite(signed_t):
+            legacy_prefix = signed_prefix.replace(f"_{signed_suffix}", "_signed_aio")
+            signed_t = eval_metrics.get(f"{legacy_prefix}_t", float("nan"))
         log_mean_error = abs(np.log(max(float(m_mean), 1e-12)) - target) if np.isfinite(m_mean) else float("nan")
         passed = (
             np.isfinite(log_mean_error)
@@ -5866,6 +6015,7 @@ class Episode:
             "log_mean_target": target,
             "log_mean_error": float(log_mean_error),
             "max_log_mean_error": max_log_mean_error,
+            "gate_residual_mode": gate_residual_mode,
             "signed_aio_t": float(signed_t),
             "max_signed_t_abs": max_t,
         }
@@ -5888,10 +6038,26 @@ class Episode:
         clip_high_ratio = eval_metrics.get(f"{m_prefix}_gt_1p3_rate", float("nan"))
         m_p99 = eval_metrics.get(f"{m_prefix}_p99", float("nan"))
         m_max = eval_metrics.get(f"{m_prefix}_max", float("nan"))
-        signed_mean = eval_metrics.get(f"{prefix}_primary_true_state_signed_aio_mean", float("nan"))
-        signed_std = eval_metrics.get(f"{prefix}_primary_true_state_signed_aio_std", float("nan"))
-        signed_se = eval_metrics.get(f"{prefix}_primary_true_state_signed_aio_se", float("nan"))
-        signed_t = eval_metrics.get(f"{prefix}_primary_true_state_signed_aio_t", float("nan"))
+        gate_residual_mode = str(
+            getattr(self.hyperparams, "sdf_gate_residual_mode", "normalized_ratio")
+        ).lower()
+        if gate_residual_mode == "normalized_ratio":
+            signed_suffix = "normalized_signed_aio"
+        elif gate_residual_mode == "raw":
+            signed_suffix = "raw_signed_aio"
+        else:
+            raise ValueError(f"Unknown sdf_gate_residual_mode={gate_residual_mode!r}")
+        signed_prefix = f"{prefix}_primary_true_state_{signed_suffix}"
+        signed_mean = eval_metrics.get(f"{signed_prefix}_mean", float("nan"))
+        signed_std = eval_metrics.get(f"{signed_prefix}_std", float("nan"))
+        signed_se = eval_metrics.get(f"{signed_prefix}_se", float("nan"))
+        signed_t = eval_metrics.get(f"{signed_prefix}_t", float("nan"))
+        if not np.isfinite(signed_t):
+            legacy_prefix = f"{prefix}_primary_true_state_signed_aio"
+            signed_mean = eval_metrics.get(f"{legacy_prefix}_mean", float("nan"))
+            signed_std = eval_metrics.get(f"{legacy_prefix}_std", float("nan"))
+            signed_se = eval_metrics.get(f"{legacy_prefix}_se", float("nan"))
+            signed_t = eval_metrics.get(f"{legacy_prefix}_t", float("nan"))
         log_mean_error = abs(np.log(max(float(m_mean), 1e-12)) - target) if np.isfinite(m_mean) else float("nan")
         passed = (
             np.isfinite(m_mean)
@@ -5917,6 +6083,7 @@ class Episode:
             "log_mean_target": target,
             "log_mean_error": float(log_mean_error),
             "max_log_mean_error": max_log_mean_error,
+            "gate_residual_mode": gate_residual_mode,
             "signed_aio_mean": float(signed_mean),
             "signed_aio_std": float(signed_std),
             "signed_aio_se": float(signed_se),

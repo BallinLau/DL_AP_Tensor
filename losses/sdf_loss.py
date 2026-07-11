@@ -274,6 +274,76 @@ class SDFLoss(nn.Module):
             residuals.append(residual)
 
         return residuals
+
+    def compute_wealth_residuals(
+        self,
+        w_parent: torch.Tensor,
+        w_children: torch.Tensor,
+        k_parent: torch.Tensor,
+        k_children: torch.Tensor,
+        c_parent: torch.Tensor,
+        c_children: torch.Tensor,
+        eps: float = 1e-8,
+        normalized_logr_clip: float = 20.0,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Return both raw and scale-normalized wealth Euler residuals.
+
+        raw:
+            A_j*w_{t+1,j}^kappa - (w_t-exp(c_t))^kappa
+
+        normalized:
+            A_j*(w_{t+1,j}/(w_t-exp(c_t)))^kappa - 1
+        """
+        if not isinstance(w_children, torch.Tensor):
+            raise TypeError("compute_wealth_residuals expects tensor children with shape [batch, branches].")
+        if w_children.dim() == 3 and w_children.shape[-1] == 1:
+            w_children = w_children.squeeze(-1)
+        if k_children.dim() == 3 and k_children.shape[-1] == 1:
+            k_children = k_children.squeeze(-1)
+        if c_children.dim() == 3 and c_children.shape[-1] == 1:
+            c_children = c_children.squeeze(-1)
+        if w_children.dim() == 1:
+            w_children = w_children.unsqueeze(-1)
+        if k_children.dim() == 1:
+            k_children = k_children.unsqueeze(-1)
+        if c_children.dim() == 1:
+            c_children = c_children.unsqueeze(-1)
+
+        w_parent_t = w_parent.squeeze(-1) if w_parent.dim() > 1 else w_parent
+        k_parent_t = k_parent.squeeze(-1) if k_parent.dim() > 1 else k_parent
+        c_parent_t = c_parent.squeeze(-1) if c_parent.dim() > 1 else c_parent
+
+        surplus_parent = (w_parent_t - torch.exp(c_parent_t)).clamp_min(eps)
+        w_children_safe = w_children.clamp_min(eps)
+        beta = torch.tensor(self.beta, device=w_parent_t.device, dtype=w_parent_t.dtype)
+        log_A = (
+            self.kappa * torch.log(beta.clamp_min(eps))
+            + (1.0 - self.gamma) * (k_children - k_parent_t.unsqueeze(-1))
+            + self.kappa / self.sigma * (c_children - c_parent_t.unsqueeze(-1))
+        )
+
+        raw_residual = (
+            torch.exp(log_A) * torch.pow(w_children_safe, self.kappa)
+            - torch.pow(surplus_parent, self.kappa).unsqueeze(-1)
+        )
+
+        log_ratio = torch.log(w_children_safe) - torch.log(surplus_parent).unsqueeze(-1)
+        log_R_unclipped = log_A + self.kappa * log_ratio
+        clip = float(normalized_logr_clip)
+        log_R = log_R_unclipped.clamp(min=-clip, max=clip)
+        normalized_residual = torch.expm1(log_R)
+        clip_share = (log_R_unclipped.abs() > clip).to(w_parent_t.dtype).mean()
+
+        return {
+            "raw": raw_residual,
+            "normalized": normalized_residual,
+            "surplus_parent": surplus_parent,
+            "wealth_ratio": w_children_safe / surplus_parent.unsqueeze(-1),
+            "log_R": log_R_unclipped,
+            "log_R_clipped": log_R,
+            "log_R_clip_share": clip_share,
+        }
     
     def forward(
         self,

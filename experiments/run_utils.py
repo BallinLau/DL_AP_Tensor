@@ -141,8 +141,8 @@ def build_hyperparams():
     hp.fc1_jacobian_penalty_interval = 10
     hp.fc1_use_true_macro_state_in_stage2 = True
     hp.sdf_euler_weight = 1.0
-    hp.sdf_true_moment_weight = 0.01
-    hp.sdf_true_anchor_weight = 1.0
+    hp.sdf_true_moment_weight = 5e-4
+    hp.sdf_true_anchor_weight = 0.05
     hp.sdf_recursive_loss_weight = 0.25
     hp.sdf_recursive_moment_weight = 5e-4
     hp.sdf_recursive_anchor_weight = 0.05

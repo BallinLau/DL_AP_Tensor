@@ -74,6 +74,14 @@ class HyperParams:
     # "legacy_abs_log1p": E[log(1 + |r1*r2|)]
     # "signed_aio": E[r1*r2]
     sdf_wealth_loss_mode: str = "signed_aio"
+    # Residual scale is separate from residual aggregation. Keep raw as the
+    # first-step default so adding normalized diagnostics does not change legacy
+    # training until formal configs explicitly switch modes.
+    # "raw": A_j*w_{t+1,j}^kappa - (w_t-exp(c_t))^kappa
+    # "normalized_ratio": A_j*(w_{t+1,j}/(w_t-exp(c_t)))^kappa - 1
+    sdf_wealth_residual_mode: str = "normalized_ratio"
+    sdf_normalized_logr_clip: float = 20.0
+    sdf_gate_residual_mode: str = "normalized_ratio"
     # Signed AiO fresh-pair controls.  When enabled, wealth Euler residuals
     # use independently sampled AR(1) aggregate shocks; fixed Treatment B
     # children still supply FC1 reconstruction targets.
@@ -197,8 +205,8 @@ class HyperParams:
     sdf_stage2_hj_warmup_epochs: int = 5
     sdf_stage2_hj_warmup_start: float = 0.2
     sdf_euler_weight: float = 1.0
-    sdf_true_moment_weight: float = 0.01
-    sdf_true_anchor_weight: float = 1.0
+    sdf_true_moment_weight: float = 5e-4
+    sdf_true_anchor_weight: float = 0.05
     sdf_recursive_loss_weight: float = 0.25
     sdf_recursive_moment_weight: float = 5e-4
     sdf_recursive_anchor_weight: float = 0.05
