@@ -282,6 +282,11 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         source_indices = torch.cat([batch["parent_source_index"] for batch in batches])
         self.assertEqual(source_indices.numel(), n_parent_groups)
         self.assertEqual(torch.unique(source_indices).numel(), n_parent_groups)
+        parent_indices = torch.cat([batch["parent_index"] for batch in batches])
+        self.assertEqual(parent_indices.numel(), n_parent_groups)
+        self.assertEqual(torch.unique(parent_indices).numel(), n_parent_groups)
+        self.assertEqual(int(parent_indices.min().item()), 0)
+        self.assertEqual(int(parent_indices.max().item()), n_parent_groups - 1)
 
     def test_numerical_stage_failure_carries_partial_summary(self):
         with self.assertRaises(NumericalStageFailure) as ctx:

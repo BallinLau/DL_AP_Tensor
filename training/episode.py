@@ -1465,10 +1465,8 @@ class Episode:
                 int(max_batches_by_min_size),
                 n_parents,
             )
-            index_chunks = torch.tensor_split(
-                torch.arange(n_parents, device=parent.device),
-                actual_num_batches,
-            )
+            global_parent_indices = torch.randperm(n_parents, device=parent.device)
+            index_chunks = torch.tensor_split(global_parent_indices, actual_num_batches)
             batches: List[Dict[str, torch.Tensor]] = []
             for chunk in index_chunks:
                 if chunk.numel() == 0:
@@ -1478,7 +1476,7 @@ class Episode:
                     'children': [c[chunk] for c in children],
                     'child0': children[0][chunk] if len(children) > 0 else None,
                     'child1': children[1][chunk] if len(children) > 1 else None,
-                    'parent_index': torch.arange(chunk.numel(), device=parent.device),
+                    'parent_index': chunk,
                     'parent_source_index': chunk,
                 }
                 if extra_tensors:
