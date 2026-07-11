@@ -72,7 +72,7 @@ class SDFWealthLossModeTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["heldout_cm_mse"], float(expected_cm.item()), places=12)
         self.assertEqual(metrics["heldout_n_children"], 4.0)
 
-    def test_wealth_residual_consumption_growth_uses_positive_kappa_over_sigma(self):
+    def test_wealth_residual_consumption_growth_uses_minus_kappa_over_sigma(self):
         loss_fn = SDFLoss(gamma=2.0, kappa=-6.0, sigma=2.0, beta=0.9)
         w_parent = torch.tensor([5.0])
         w_children = torch.tensor([[4.0, 4.5]])
@@ -95,7 +95,7 @@ class SDFWealthLossModeTest(unittest.TestCase):
 
         expected_exp = torch.exp(
             (k_children - k_parent.unsqueeze(-1)) * (1.0 - loss_fn.gamma)
-            + loss_fn.kappa / loss_fn.sigma * (c_children - c_parent.unsqueeze(-1))
+            - loss_fn.kappa / loss_fn.sigma * (c_children - c_parent.unsqueeze(-1))
         ) * loss_fn.tmp
         expected = (
             expected_exp * torch.pow(w_children, loss_fn.kappa)
@@ -105,7 +105,7 @@ class SDFWealthLossModeTest(unittest.TestCase):
         self.assertTrue(torch.allclose(residual_tensor, expected))
         self.assertTrue(torch.allclose(torch.stack(residual_list, dim=1), expected))
 
-    def test_compute_sdf_consumption_growth_uses_positive_kappa_over_sigma(self):
+    def test_compute_sdf_consumption_growth_uses_minus_kappa_over_sigma(self):
         beta = 0.9
         gamma = 2.0
         kappa = -6.0
@@ -149,7 +149,7 @@ class SDFWealthLossModeTest(unittest.TestCase):
         expected = (
             torch.exp(
                 (k_children - k_parent.unsqueeze(-1)) * (-gamma)
-                + kappa / sigma * (c_children - c_parent.unsqueeze(-1))
+                - kappa / sigma * (c_children - c_parent.unsqueeze(-1))
             )
             * torch.pow(ratio, kappa - 1)
             * (beta ** kappa)

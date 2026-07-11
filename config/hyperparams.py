@@ -74,9 +74,9 @@ class HyperParams:
     # "legacy_abs_log1p": E[log(1 + |r1*r2|)]
     # "signed_aio": E[r1*r2]
     sdf_wealth_loss_mode: str = "signed_aio"
-    # Residual scale is separate from residual aggregation. Keep raw as the
-    # first-step default so adding normalized diagnostics does not change legacy
-    # training until formal configs explicitly switch modes.
+    # Residual scale is separate from residual aggregation. The normalized-AiO
+    # diagnostic experiment uses normalized_ratio. Set raw explicitly only for
+    # legacy comparison.
     # "raw": A_j*w_{t+1,j}^kappa - (w_t-exp(c_t))^kappa
     # "normalized_ratio": A_j*(w_{t+1,j}/(w_t-exp(c_t)))^kappa - 1
     sdf_wealth_residual_mode: str = "normalized_ratio"
@@ -159,8 +159,8 @@ class HyperParams:
     # 这是 Gomes 口径下识别 FC1 law of motion 的主要监督。
     sdf_training_schedule_enabled: bool = True
     fc1_only_epochs: int = 10
-    sdf_true_only_epochs: int = 20
-    sdf_recursive_only_epochs: int = 10
+    sdf_true_only_epochs: int = 5
+    sdf_recursive_only_epochs: int = 0
     fc1_recon_weight: float = 1.0
     # Optional forecast-state auxiliary reconstruction kept as an explicit
     # opt-in diagnostic. The primary FC1 law of motion is calculated-state

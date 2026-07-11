@@ -124,8 +124,11 @@ def build_hyperparams():
     # forecast-state reconstruction 默认关闭，仅作为显式对照开关保留。
     hp.sdf_training_schedule_enabled = True
     hp.fc1_only_epochs = 10
-    hp.sdf_true_only_epochs = 20
-    hp.sdf_recursive_only_epochs = 10
+    hp.sdf_true_only_epochs = 5
+    hp.sdf_recursive_only_epochs = 0
+    hp.sdf_wealth_residual_mode = "normalized_ratio"
+    hp.sdf_gate_residual_mode = "normalized_ratio"
+    hp.sdf_normalized_logr_clip = 20.0
     hp.fc1_recon_weight = 1.0
     hp.fc1_recursive_aux_training_enabled = False
     hp.fc1_rollout_diagnostic_enabled = True

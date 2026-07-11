@@ -2911,6 +2911,7 @@ class Episode:
                 return float(torch.quantile(v, q).item()) if v.numel() > 0 else 0.0
 
             eps_diag = 1e-8
+            surplus_floor = float(getattr(self.config, "W_SURPLUS_FLOOR", 1e-3))
             w_parent_diag = w_parent.detach().squeeze(-1).reshape(-1)
             w_child_diag = w_children_wealth.detach().squeeze(-1).reshape(-1)
             c_child_diag = c_children_wealth.detach().squeeze(-1)
@@ -2944,8 +2945,9 @@ class Episode:
                 'sdf_log_wealth_ratio_p50': _q(log_wealth_ratio_diag, 0.50),
                 'sdf_log_wealth_ratio_p99': _q(log_wealth_ratio_diag, 0.99),
                 'sdf_surplus_parent_floor_share': float(
-                    (surplus_parent_raw_diag <= eps_diag).to(torch.float32).mean().item()
+                    (surplus_parent_raw_diag <= surplus_floor * (1.0 + 1e-4)).to(torch.float32).mean().item()
                 ),
+                'sdf_surplus_parent_floor': surplus_floor,
             }
 
             wealth_diag = {

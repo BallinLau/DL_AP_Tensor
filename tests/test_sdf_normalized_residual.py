@@ -40,7 +40,7 @@ def test_raw_and_normalized_residuals_have_same_zero():
     log_a = (
         loss_fn.kappa * torch.log(torch.tensor(loss_fn.beta))
         + (1.0 - loss_fn.gamma) * (k_children - k_parent.unsqueeze(-1))
-        + loss_fn.kappa / loss_fn.sigma * (c_children - c_parent.unsqueeze(-1))
+        - loss_fn.kappa / loss_fn.sigma * (c_children - c_parent.unsqueeze(-1))
     )
     w_children = surplus.unsqueeze(-1) * torch.exp(-log_a / loss_fn.kappa)
 
@@ -106,9 +106,34 @@ def test_normalized_residual_clipping_reports_share_and_keeps_finite_values():
     assert torch.isfinite(pack["normalized"]).all()
 
 
+def test_new_raw_residual_matches_legacy_euler_residual_and_expected_formula():
+    loss_fn = _loss_fn()
+    w_parent, w_children, k_parent, k_children, c_parent, c_children = _base_inputs()
+
+    legacy = loss_fn.compute_euler_residuals(
+        w_parent, w_children, k_parent, k_children, c_parent, c_children
+    )
+    pack = loss_fn.compute_wealth_residuals(
+        w_parent, w_children, k_parent, k_children, c_parent, c_children, normalized_logr_clip=100.0
+    )
+    expected_log_a = (
+        loss_fn.kappa * torch.log(torch.tensor(loss_fn.beta))
+        + (1.0 - loss_fn.gamma) * (k_children - k_parent.unsqueeze(-1))
+        - loss_fn.kappa / loss_fn.sigma * (c_children - c_parent.unsqueeze(-1))
+    )
+    expected = (
+        torch.exp(expected_log_a) * torch.pow(w_children.clamp_min(1e-8), loss_fn.kappa)
+        - torch.pow((w_parent - torch.exp(c_parent)).clamp_min(1e-8), loss_fn.kappa).unsqueeze(-1)
+    )
+
+    assert torch.allclose(pack["raw"], legacy, rtol=1e-6, atol=1e-7)
+    assert torch.allclose(pack["raw"], expected, rtol=1e-6, atol=1e-7)
+
+
 if __name__ == "__main__":
     test_raw_and_normalized_residuals_match_algebra_without_clipping()
     test_raw_and_normalized_residuals_have_same_zero()
     test_normalized_residual_is_scale_invariant_and_raw_scales_by_kappa()
     test_normalized_residual_gradients_are_finite()
     test_normalized_residual_clipping_reports_share_and_keeps_finite_values()
+    test_new_raw_residual_matches_legacy_euler_residual_and_expected_formula()

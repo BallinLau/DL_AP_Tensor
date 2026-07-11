@@ -10,7 +10,7 @@ SDF Loss: 随机贴现因子损失
 - 每条路径中 η 通过伯努利分布随机抽取
 
 SDF 计算（对每条路径 j）：
-    M^{(j)} = β^κ * exp((k_{t+1}^{(j)} - k_t)*(-γ) + κ/σ*(c_{t+1}^{(j)} - c_t))
+    M^{(j)} = β^κ * exp((k_{t+1}^{(j)} - k_t)*(-γ) - κ/σ*(c_{t+1}^{(j)} - c_t))
               * (w_{t+1}^{(j)} / (w_t - exp(c_t)))^(κ-1)
 
 欧拉方程残差（对每条路径 j）：
@@ -254,7 +254,7 @@ class SDFLoss(nn.Module):
 
             exp_term = torch.exp(
                 (k_children_t - k_parent_t.unsqueeze(-1)) * (1.0 - self.gamma)
-                + self.kappa / self.sigma * (c_children_t - c_parent_t.unsqueeze(-1))
+                - self.kappa / self.sigma * (c_children_t - c_parent_t.unsqueeze(-1))
             ) * self.tmp
 
             residuals = exp_term * torch.pow(w_children_t, self.kappa) - current_value_kappa
@@ -268,7 +268,7 @@ class SDFLoss(nn.Module):
         for w_child, k_child, c_child in zip(w_children, k_children, c_children):
             exp_term = torch.exp(
                 (k_child - k_parent) * (1.0 - self.gamma)
-                + self.kappa / self.sigma * (c_child - c_parent)
+                - self.kappa / self.sigma * (c_child - c_parent)
             ) * self.tmp
             residual = exp_term * torch.pow(w_child, self.kappa) - current_value_kappa
             residuals.append(residual)
@@ -320,7 +320,7 @@ class SDFLoss(nn.Module):
         log_A = (
             self.kappa * torch.log(beta.clamp_min(eps))
             + (1.0 - self.gamma) * (k_children - k_parent_t.unsqueeze(-1))
-            + self.kappa / self.sigma * (c_children - c_parent_t.unsqueeze(-1))
+            - self.kappa / self.sigma * (c_children - c_parent_t.unsqueeze(-1))
         )
 
         raw_residual = (
