@@ -137,7 +137,7 @@ def build_hyperparams():
     hp.sdf_gate_residual_mode = "normalized_ratio"
     hp.sdf_normalized_logr_clip = 20.0
     hp.sdf_true_only_epochs = 5
-    hp.sdf_recursive_only_epochs = 5
+    hp.sdf_recursive_only_epochs = 0
     hp.sdf_true_moment_weight = 5e-4
     hp.sdf_true_anchor_weight = 0.05
     hp.sdf_epoch_validation_enabled = True

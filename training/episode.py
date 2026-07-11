@@ -6821,9 +6821,18 @@ class Episode:
             prefix=final_prefix,
             stage=stage,
         )
+        final_m_mean = float(final_summary.get("m_mean", float("nan")))
+        final_finite_ratio = float(final_summary.get("m_finite_ratio", 0.0))
+        catastrophic_failure = bool(
+            not np.isfinite(final_m_mean)
+            or final_finite_ratio < 1.0
+        )
+        stage_safe = bool(final_summary.get("safe", False))
         return {
             "stage": stage.value,
-            "passed": bool(final_summary.get("safe", False) or skipped_current_stage),
+            "passed": bool(not catastrophic_failure),
+            "safe": bool(stage_safe),
+            "catastrophic_failure": bool(catastrophic_failure),
             "strict_gate_passed": bool(final_passed),
             "skipped_current_stage": bool(skipped_current_stage),
             "epochs_requested": int(n_epochs),
@@ -6968,12 +6977,17 @@ class Episode:
                 prefix="post_refresh",
             )
             fc1_passed = bool(fc1_data_passed and fc1_one_step_passed)
-            sdf_passed, sdf_diag = self._sdf_gate_passed(
+            primary_sdf_passed, primary_sdf_diag = self._sdf_gate_passed(
                 refresh_eval,
                 prefix="post_refresh",
-                stage=SDFTrainingPhase.SDF_RECURSIVE_ONLY,
+                stage=SDFTrainingPhase.SDF_TRUE_ONLY,
             )
-            safety_summary = self._stage_validation_summary(
+            primary_safety_summary = self._stage_validation_summary(
+                refresh_eval,
+                prefix="post_refresh",
+                stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            )
+            _, forecast_counterfactual_diag = self._sdf_gate_passed(
                 refresh_eval,
                 prefix="post_refresh",
                 stage=SDFTrainingPhase.SDF_RECURSIVE_ONLY,
@@ -6983,17 +6997,25 @@ class Episode:
             ).lower()
             if gate_mode not in {"strict", "safety"}:
                 raise ValueError(f"Unknown sdf_post_refresh_gate_mode={gate_mode!r}")
-            strict_passed = bool(fc1_passed and sdf_passed)
-            safety_passed = bool(safety_summary.get("safe", False))
+            strict_passed = bool(
+                fc1_data_passed
+                and fc1_one_step_passed
+                and primary_sdf_passed
+            )
+            safety_passed = bool(
+                fc1_data_passed
+                and primary_safety_summary.get("safe", False)
+            )
             gate_passed = strict_passed if gate_mode == "strict" else safety_passed
             result = {
                 "passed": bool(gate_passed),
                 "strict_passed": bool(strict_passed),
                 "safety_passed": bool(safety_passed),
                 "gate_mode": gate_mode,
+                "hard_gate_state": "primary_calculated_state",
                 "failed_stage": None if gate_passed else "post_refresh",
                 "holdout_split": holdout_diag,
-                "safety_summary": safety_summary,
+                "primary_safety_summary": primary_safety_summary,
                 "fc1_gate": {
                     "passed": bool(fc1_passed),
                     "failure_source": None if fc1_passed else (
@@ -7002,9 +7024,10 @@ class Episode:
                     ),
                     "data_viability": fc1_data_diag,
                     "one_step_gate": fc1_one_step_diag,
-                    "recursive_diagnostic": fc1_recursive_diag,
+                    "forecast_counterfactual_diagnostic": fc1_recursive_diag,
                 },
-                "sdf_recursive_gate": sdf_diag,
+                "sdf_primary_gate": primary_sdf_diag,
+                "sdf_forecast_counterfactual_diagnostic": forecast_counterfactual_diag,
             }
             module_summaries["sdf_fc1_post_refresh_eval"] = refresh_eval
             module_summaries["sdf_fc1_post_refresh_gate"] = result

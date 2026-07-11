@@ -160,7 +160,7 @@ class HyperParams:
     sdf_training_schedule_enabled: bool = True
     fc1_only_epochs: int = 10
     sdf_true_only_epochs: int = 5
-    sdf_recursive_only_epochs: int = 5
+    sdf_recursive_only_epochs: int = 0
     fc1_recon_weight: float = 1.0
     # Optional forecast-state auxiliary reconstruction kept as an explicit
     # opt-in diagnostic. The primary FC1 law of motion is calculated-state

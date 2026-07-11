@@ -86,6 +86,72 @@ def _make_episode(eval_items):
     return episode
 
 
+def _make_post_refresh_episode(primary_m=0.98, recursive_m=0.98):
+    episode = Episode.__new__(Episode)
+    episode.tensor_macro = TensorTable(
+        data=torch.zeros(1, 12),
+        columns=["path", "t", "branch", "K", "C", "LnK", "Hatc", "n_firms", "M", "x", "hatcf", "lnkf"],
+    )
+    episode.df_macro = None
+    episode.add_FC1loss = False
+    episode.hyperparams = SimpleNamespace(
+        sdf_fc1_eval_max_batches=0,
+        sdf_gate_residual_mode="normalized_ratio",
+        sdf_log_mean_target=0.0,
+        sdf_collapse_lower_ratio=0.1,
+        sdf_collapse_upper_ratio=10.0,
+        sdf_post_refresh_gate_mode="safety",
+        fc1_gate_min_pairs=1,
+        fc1_rollout_finite_ratio_min=1.0,
+        fc1_target_std_floor=1e-4,
+    )
+
+    def _use_tensor_pipeline():
+        return True
+
+    def _build_sdf_pairs(_table):
+        return episode.tensor_macro
+
+    def _split(_table):
+        return _table, _table, {"mock": True}
+
+    def _create(_table, batch_size, n_branches):
+        return [{"mock": True}]
+
+    def _eval(_batches, prefix, max_batches=None):
+        return {
+            f"{prefix}_primary_true_state_M_mean": primary_m,
+            f"{prefix}_primary_true_state_M_finite_ratio": 1.0,
+            f"{prefix}_primary_true_state_normalized_signed_aio_t": 99.0,
+            f"{prefix}_recursive_forecast_state_M_mean": recursive_m,
+            f"{prefix}_recursive_forecast_state_M_finite_ratio": 1.0,
+            f"{prefix}_recursive_forecast_state_normalized_signed_aio_t": 99.0,
+            f"{prefix}_primary_true_state_hatc_next_target_finite_n": 10.0,
+            f"{prefix}_primary_true_state_hatc_next_target_finite_ratio": 1.0,
+            f"{prefix}_primary_true_state_hatc_next_target_std": 1.0,
+            f"{prefix}_primary_true_state_hatc_next_pred_finite_ratio": 1.0,
+            f"{prefix}_primary_true_state_hatc_next_r2": -1.0,
+            f"{prefix}_primary_true_state_hatc_next_skill_vs_persistence": -1.0,
+            f"{prefix}_primary_true_state_hatc_next_rmse": 10.0,
+            f"{prefix}_primary_true_state_lnk_next_target_finite_n": 10.0,
+            f"{prefix}_primary_true_state_lnk_next_target_finite_ratio": 1.0,
+            f"{prefix}_primary_true_state_lnk_next_target_std": 1.0,
+            f"{prefix}_primary_true_state_lnk_next_pred_finite_ratio": 1.0,
+            f"{prefix}_primary_true_state_lnk_next_r2": -1.0,
+            f"{prefix}_primary_true_state_lnk_next_skill_vs_persistence": -1.0,
+            f"{prefix}_primary_true_state_lnk_next_rmse": 10.0,
+        }
+
+    episode._use_tensor_pipeline = _use_tensor_pipeline
+    episode._build_sdf_pairs_from_macro_tensor = _build_sdf_pairs
+    episode._split_sdf_table_by_path = _split
+    episode._create_sdf_batches_from_macro_tensor = _create
+    episode._evaluate_sdf_fc1_batches = _eval
+    episode.set_sdf_training_phase = lambda phase: None
+    episode.sdf_training_phase = SDFTrainingPhase.SDF_TRUE_ONLY
+    return episode
+
+
 class SdfPhaseRecoveryTest(unittest.TestCase):
     def test_numerical_stage_failure_carries_partial_summary(self):
         with self.assertRaises(NumericalStageFailure) as ctx:
@@ -238,66 +304,48 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         self.assertEqual(observed_lrs, [2e-4, 2e-5])
         self.assertTrue(result["skipped_current_stage"])
 
+    def test_sdf_recovery_accepts_step_toward_safe_region(self):
+        episode = _make_episode([])
+        before = {
+            "safe": False,
+            "m_mean": 0.017,
+            "m_target": 0.98,
+            "m_finite_ratio": 1.0,
+            "sdf_score": 4.1,
+        }
+        after = {
+            "safe": False,
+            "m_mean": 0.021,
+            "m_target": 0.98,
+            "m_finite_ratio": 1.0,
+            "sdf_score": 3.8,
+        }
+        accepted, reason = episode._sdf_epoch_acceptance(before, after)
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "accepted_recovery_step")
+
+    def test_sdf_recovery_rejects_step_away_from_safe_region(self):
+        episode = _make_episode([])
+        before = {
+            "safe": False,
+            "m_mean": 0.017,
+            "m_target": 0.98,
+            "m_finite_ratio": 1.0,
+            "sdf_score": 4.1,
+        }
+        after = {
+            "safe": False,
+            "m_mean": 0.002,
+            "m_target": 0.98,
+            "m_finite_ratio": 1.0,
+            "sdf_score": 3.8,
+        }
+        accepted, reason = episode._sdf_epoch_acceptance(before, after)
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "not_moving_toward_safe_region")
+
     def test_post_refresh_safety_mode_can_pass_when_strict_gate_fails(self):
-        episode = Episode.__new__(Episode)
-        episode.tensor_macro = TensorTable(
-            data=torch.zeros(1, 12),
-            columns=["path", "t", "branch", "K", "C", "LnK", "Hatc", "n_firms", "M", "x", "hatcf", "lnkf"],
-        )
-        episode.df_macro = None
-        episode.add_FC1loss = False
-        episode.hyperparams = SimpleNamespace(
-            sdf_fc1_eval_max_batches=0,
-            sdf_gate_residual_mode="normalized_ratio",
-            sdf_log_mean_target=0.0,
-            sdf_collapse_lower_ratio=0.1,
-            sdf_collapse_upper_ratio=10.0,
-            sdf_post_refresh_gate_mode="safety",
-        )
-
-        def _use_tensor_pipeline():
-            return True
-
-        def _build_sdf_pairs(_table):
-            return episode.tensor_macro
-
-        def _split(_table):
-            return _table, _table, {"mock": True}
-
-        def _create(_table, batch_size, n_branches):
-            return [{"mock": True}]
-
-        def _eval(_batches, prefix, max_batches=None):
-            return {
-                f"{prefix}_primary_true_state_M_mean": 0.98,
-                f"{prefix}_primary_true_state_M_finite_ratio": 1.0,
-                f"{prefix}_primary_true_state_normalized_signed_aio_t": 99.0,
-                f"{prefix}_recursive_forecast_state_M_mean": 0.98,
-                f"{prefix}_recursive_forecast_state_M_finite_ratio": 1.0,
-                f"{prefix}_recursive_forecast_state_normalized_signed_aio_t": 99.0,
-                f"{prefix}_primary_true_state_hatc_next_target_finite_n": 10.0,
-                f"{prefix}_primary_true_state_hatc_next_target_finite_ratio": 1.0,
-                f"{prefix}_primary_true_state_hatc_next_target_std": 1.0,
-                f"{prefix}_primary_true_state_hatc_next_pred_finite_ratio": 1.0,
-                f"{prefix}_primary_true_state_hatc_next_r2": -1.0,
-                f"{prefix}_primary_true_state_hatc_next_skill_vs_persistence": -1.0,
-                f"{prefix}_primary_true_state_hatc_next_rmse": 10.0,
-                f"{prefix}_primary_true_state_lnk_next_target_finite_n": 10.0,
-                f"{prefix}_primary_true_state_lnk_next_target_finite_ratio": 1.0,
-                f"{prefix}_primary_true_state_lnk_next_target_std": 1.0,
-                f"{prefix}_primary_true_state_lnk_next_pred_finite_ratio": 1.0,
-                f"{prefix}_primary_true_state_lnk_next_r2": -1.0,
-                f"{prefix}_primary_true_state_lnk_next_skill_vs_persistence": -1.0,
-                f"{prefix}_primary_true_state_lnk_next_rmse": 10.0,
-            }
-
-        episode._use_tensor_pipeline = _use_tensor_pipeline
-        episode._build_sdf_pairs_from_macro_tensor = _build_sdf_pairs
-        episode._split_sdf_table_by_path = _split
-        episode._create_sdf_batches_from_macro_tensor = _create
-        episode._evaluate_sdf_fc1_batches = _eval
-        episode.set_sdf_training_phase = lambda phase: None
-        episode.sdf_training_phase = SDFTrainingPhase.SDF_TRUE_ONLY
+        episode = _make_post_refresh_episode(primary_m=0.98, recursive_m=0.98)
 
         result = episode._evaluate_post_refresh_sdf_gate(
             module_summaries={},
@@ -309,6 +357,28 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         self.assertTrue(result["safety_passed"])
         self.assertFalse(result["strict_passed"])
         self.assertEqual(result["gate_mode"], "safety")
+
+    def test_post_refresh_uses_primary_state_when_recursive_collapses(self):
+        episode = _make_post_refresh_episode(primary_m=0.98, recursive_m=0.001)
+        result = episode._evaluate_post_refresh_sdf_gate(
+            module_summaries={},
+            batch_size=2,
+            n_branches=2,
+        )
+        self.assertTrue(result["safety_passed"])
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["hard_gate_state"], "primary_calculated_state")
+
+    def test_post_refresh_rejects_primary_collapse_even_if_recursive_normal(self):
+        episode = _make_post_refresh_episode(primary_m=0.001, recursive_m=0.98)
+        result = episode._evaluate_post_refresh_sdf_gate(
+            module_summaries={},
+            batch_size=2,
+            n_branches=2,
+        )
+        self.assertFalse(result["safety_passed"])
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["hard_gate_state"], "primary_calculated_state")
 
 
 if __name__ == "__main__":
