@@ -276,18 +276,22 @@ class LearningRateScheduler:
         保存状态
         """
         return {
-            'current_step': self.current_step,
-            'current_lr': self.current_lr,
-            'group_base_lrs': list(self.group_base_lrs),
+            'current_step': int(self.current_step),
+            'base_lr': float(self.base_lr),
+            'current_lr': float(self.current_lr),
+            'group_base_lrs': [float(v) for v in self.group_base_lrs],
         }
     
     def load_state_dict(self, state: Dict):
         """
         加载状态
         """
-        self.current_step = state['current_step']
-        self.current_lr = state['current_lr']
-        self.group_base_lrs = list(state.get('group_base_lrs', self.group_base_lrs))
+        self.current_step = int(state['current_step'])
+        self.base_lr = float(state.get('base_lr', self.base_lr))
+        self.current_lr = float(state['current_lr'])
+        self.group_base_lrs = [
+            float(v) for v in state.get('group_base_lrs', self.group_base_lrs)
+        ]
 
 
 class EpisodeScheduler:

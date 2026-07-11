@@ -17,6 +17,7 @@ Outputs:
 
 import sys
 from pathlib import Path
+import os
 import torch
 import pandas as pd
 import numpy as np
@@ -138,6 +139,11 @@ def build_hyperparams():
     hp.sdf_normalized_logr_clip = 20.0
     hp.sdf_true_only_epochs = 5
     hp.sdf_recursive_only_epochs = 0
+    hp.sdf_true_only_lr = float(os.environ.get("SDF_TRUE_ONLY_LR", 4e-5))
+    hp.sdf_true_target_batches = int(os.environ.get("SDF_TRUE_TARGET_BATCHES", 20))
+    hp.sdf_min_parent_groups_per_batch = int(
+        os.environ.get("SDF_MIN_PARENT_GROUPS_PER_BATCH", 256)
+    )
     hp.sdf_true_moment_weight = 5e-4
     hp.sdf_true_anchor_weight = 0.05
     hp.sdf_epoch_validation_enabled = True

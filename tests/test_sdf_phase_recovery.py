@@ -11,6 +11,7 @@ sys.path.append(str(ROOT))
 
 from data import TensorTable
 from training.episode import Episode, NumericalStageFailure, SDFTrainingPhase
+from training.scheduler import LearningRateScheduler
 
 
 class _DummySdfFc1(nn.Module):
@@ -26,6 +27,19 @@ class _DummyScheduler:
         self.base_lr = base_lr
         self.current_lr = base_lr
         self.group_base_lrs = [base_lr]
+
+    def state_dict(self):
+        return {
+            "current_step": 0,
+            "base_lr": float(self.base_lr),
+            "current_lr": float(self.current_lr),
+            "group_base_lrs": list(self.group_base_lrs),
+        }
+
+    def load_state_dict(self, state):
+        self.base_lr = float(state["base_lr"])
+        self.current_lr = float(state["current_lr"])
+        self.group_base_lrs = list(state["group_base_lrs"])
 
 
 def _make_episode(eval_items):
@@ -49,6 +63,9 @@ def _make_episode(eval_items):
         sdf_stage2_lr=2e-4,
         sdf_stage1_lr=2e-4,
         fc1_lr=2e-4,
+        sdf_true_only_lr=4e-5,
+        sdf_true_target_batches=20,
+        sdf_min_parent_groups_per_batch=256,
         stage_lr_decay_on_reject=0.1,
         stage_max_retries=1,
     )
@@ -153,6 +170,119 @@ def _make_post_refresh_episode(primary_m=0.98, recursive_m=0.98):
 
 
 class SdfPhaseRecoveryTest(unittest.TestCase):
+    def test_learning_rate_scheduler_round_trip_restores_base_lr(self):
+        param = nn.Parameter(torch.ones(1))
+        optimizer = torch.optim.Adam([{"params": [param], "lr": 1e-3, "base_lr": 1e-3}])
+        scheduler = LearningRateScheduler(
+            optimizer,
+            base_lr=1e-3,
+            warmup_steps=0,
+            decay_type="fixed",
+            total_steps=10,
+            min_lr=1e-8,
+        )
+        state = scheduler.state_dict()
+        scheduler.base_lr = 9.0
+        scheduler.current_lr = 9.0
+        scheduler.group_base_lrs = [9.0]
+
+        scheduler.load_state_dict(state)
+
+        self.assertEqual(scheduler.current_step, 0)
+        self.assertAlmostEqual(scheduler.base_lr, 1e-3)
+        self.assertAlmostEqual(scheduler.current_lr, 1e-3)
+        self.assertEqual(scheduler.group_base_lrs, [1e-3])
+
+    def test_scheduler_step_keeps_decayed_retry_lr(self):
+        param = nn.Parameter(torch.ones(1))
+        optimizer = torch.optim.Adam([{"params": [param], "lr": 1e-3, "base_lr": 1e-3}])
+        scheduler = LearningRateScheduler(
+            optimizer,
+            base_lr=1e-3,
+            warmup_steps=0,
+            decay_type="fixed",
+            total_steps=10,
+            min_lr=1e-8,
+        )
+
+        decayed = Episode._decay_optimizer_and_scheduler_lr(optimizer, scheduler, 0.1)
+        scheduler.step()
+
+        self.assertEqual(decayed, [1e-4])
+        self.assertAlmostEqual(scheduler.base_lr, 1e-4)
+        self.assertAlmostEqual(scheduler.current_lr, 1e-4)
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 1e-4)
+        self.assertAlmostEqual(optimizer.param_groups[0]["base_lr"], 1e-4)
+
+    def test_sdf_true_target_batching_preserves_parent_groups_and_children(self):
+        episode = Episode.__new__(Episode)
+        episode.device = torch.device("cpu")
+        episode.add_FC1loss = True
+        episode.train_mode = "multi"
+        episode.hyperparams = SimpleNamespace(
+            fc1_rollout_horizon=0,
+            fc1_recursive_aux_training_enabled=False,
+            fc1_rollout_weight=0.0,
+            fc1_rollout_diagnostic_enabled=False,
+            max_firm_train_units=0,
+            pv_eta_resample_enabled=False,
+        )
+        columns = [
+            "path",
+            "t",
+            "branch",
+            "x_t",
+            "x_t1",
+            "Hatcf_t",
+            "LnKF_t",
+            "Hatc_t",
+            "LnK_t",
+            "Hatc_t1",
+            "LnK_t1",
+        ]
+        rows = []
+        n_parent_groups = 400
+        for path in range(n_parent_groups):
+            for branch in range(2):
+                rows.append([
+                    float(path),
+                    3.0,
+                    float(branch),
+                    0.1 * path,
+                    0.1 * path + branch,
+                    1.0,
+                    2.0,
+                    3.0,
+                    4.0,
+                    5.0 + branch,
+                    6.0 + branch,
+                ])
+        table = TensorTable(
+            data=torch.tensor(rows, dtype=torch.float32),
+            columns=columns,
+        )
+
+        batches = episode._create_sdf_batches_from_macro_tensor(
+            table,
+            batch_size=4096,
+            n_branches=2,
+            target_num_batches=20,
+            min_parent_groups_per_batch=10,
+        )
+
+        parent_counts = [int(batch["parent"].shape[0]) for batch in batches]
+        self.assertEqual(len(batches), 20)
+        self.assertEqual(sum(parent_counts), n_parent_groups)
+        self.assertEqual(min(parent_counts), 20)
+        self.assertEqual(max(parent_counts), 20)
+        for batch in batches:
+            self.assertEqual(len(batch["children"]), 2)
+            self.assertEqual(batch["children"][0].shape[0], batch["parent"].shape[0])
+            self.assertEqual(batch["children"][1].shape[0], batch["parent"].shape[0])
+        source_indices = torch.cat([batch["parent_source_index"] for batch in batches])
+        self.assertEqual(source_indices.numel(), n_parent_groups)
+        self.assertEqual(torch.unique(source_indices).numel(), n_parent_groups)
+
     def test_numerical_stage_failure_carries_partial_summary(self):
         with self.assertRaises(NumericalStageFailure) as ctx:
             raise NumericalStageFailure(
@@ -301,7 +431,9 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             prefix="sdf_true",
         )
 
-        self.assertEqual(observed_lrs, [2e-4, 2e-5])
+        self.assertEqual(len(observed_lrs), 2)
+        self.assertAlmostEqual(observed_lrs[0], 4e-5)
+        self.assertAlmostEqual(observed_lrs[1], 4e-6)
         self.assertTrue(result["skipped_current_stage"])
 
     def test_sdf_recovery_accepts_step_toward_safe_region(self):

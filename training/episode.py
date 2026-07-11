@@ -265,20 +265,27 @@ class Episode:
         self,
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
+        scheduler: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        return {
+        checkpoint = {
             "model_state": self._state_dict_to_cpu(model),
             "optimizer_state": self._optimizer_state_to_cpu(optimizer),
         }
+        if scheduler is not None:
+            checkpoint["scheduler_state"] = deepcopy(scheduler.state_dict())
+        return checkpoint
 
     def _restore_stage_checkpoint(
         self,
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         checkpoint: Dict[str, Any],
+        scheduler: Optional[Any] = None,
     ) -> None:
         self._restore_module_state(model, checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
+        if scheduler is not None and "scheduler_state" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state"])
 
     @staticmethod
     def _optimizer_lrs(optimizer: torch.optim.Optimizer) -> List[float]:
@@ -292,6 +299,36 @@ class Episode:
         factor = float(factor)
         for group in optimizer.param_groups:
             group["lr"] = float(group.get("lr", 0.0)) * factor
+        return Episode._optimizer_lrs(optimizer)
+
+    @staticmethod
+    def _decay_optimizer_and_scheduler_lr(
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[Any],
+        factor: float,
+    ) -> List[float]:
+        factor = float(factor)
+        if scheduler is None:
+            for group in optimizer.param_groups:
+                decayed = float(group.get("lr", 0.0)) * factor
+                group["lr"] = decayed
+                if "base_lr" in group:
+                    group["base_lr"] = float(group.get("base_lr", decayed)) * factor
+            return Episode._optimizer_lrs(optimizer)
+
+        scheduler.group_base_lrs = [
+            float(v) * factor for v in getattr(scheduler, "group_base_lrs", [])
+        ]
+        scheduler.base_lr = float(getattr(scheduler, "base_lr", 0.0)) * factor
+        scheduler.current_lr = float(getattr(scheduler, "current_lr", scheduler.base_lr)) * factor
+        for idx, group in enumerate(optimizer.param_groups):
+            group_lr = (
+                scheduler.group_base_lrs[idx]
+                if idx < len(scheduler.group_base_lrs)
+                else scheduler.base_lr
+            )
+            group["base_lr"] = float(group_lr)
+            group["lr"] = float(group_lr)
         return Episode._optimizer_lrs(optimizer)
 
     @staticmethod
@@ -1254,7 +1291,10 @@ class Episode:
         self,
         sdf_table: TensorTable,
         batch_size: int = 1024,
-        n_branches: int = 2
+        n_branches: int = 2,
+        *,
+        target_num_batches: Optional[int] = None,
+        min_parent_groups_per_batch: int = 1,
     ) -> List[Dict[str, torch.Tensor]]:
         """
         从宏观跨期 TensorTable 创建 SDF 批次。
@@ -1416,6 +1456,37 @@ class Episode:
                 'fc1_rollout_future_x': torch.stack(rollout_future_x_rows, dim=0).to(torch.float32),
                 'fc1_rollout_target_states': torch.stack(rollout_target_state_rows, dim=0).to(torch.float32),
             }
+        n_parents = int(parent.shape[0])
+        if target_num_batches is not None and int(target_num_batches) > 0:
+            min_parent_groups_per_batch = max(1, int(min_parent_groups_per_batch))
+            max_batches_by_min_size = max(1, n_parents // min_parent_groups_per_batch)
+            actual_num_batches = min(
+                int(target_num_batches),
+                int(max_batches_by_min_size),
+                n_parents,
+            )
+            index_chunks = torch.tensor_split(
+                torch.arange(n_parents, device=parent.device),
+                actual_num_batches,
+            )
+            batches: List[Dict[str, torch.Tensor]] = []
+            for chunk in index_chunks:
+                if chunk.numel() == 0:
+                    continue
+                batch = {
+                    'parent': parent[chunk],
+                    'children': [c[chunk] for c in children],
+                    'child0': children[0][chunk] if len(children) > 0 else None,
+                    'child1': children[1][chunk] if len(children) > 1 else None,
+                    'parent_index': torch.arange(chunk.numel(), device=parent.device),
+                    'parent_source_index': chunk,
+                }
+                if extra_tensors:
+                    for name, value in extra_tensors.items():
+                        batch[name] = value[chunk]
+                batches.append(batch)
+            return batches
+
         return self._build_batches_from_parent_children(
             parent,
             children,
@@ -1731,8 +1802,11 @@ class Episode:
 
         opt = self.optimizers['sdf_fc1']
         scheduler = lr_schedulers['sdf_fc1']
+        phase = getattr(self, "sdf_training_phase", SDFTrainingPhase.SDF_TRUE_ONLY)
         sdf_lr = float(getattr(self.hyperparams, "sdf_stage1_lr", getattr(self.hyperparams, "sdf_lr", scheduler.base_lr)))
-        if self.add_FC1loss:
+        if phase == SDFTrainingPhase.SDF_TRUE_ONLY:
+            sdf_lr = float(getattr(self.hyperparams, "sdf_true_only_lr", 4e-5))
+        elif self.add_FC1loss:
             stage2_lr = getattr(self.hyperparams, "sdf_stage2_lr", None)
             if stage2_lr is not None:
                 sdf_lr = float(stage2_lr)
@@ -2277,6 +2351,13 @@ class Episode:
                                 )
                         for name in train_modules:
                             if name in self.optimizers:
+                                if (
+                                    name == "sdf_fc1"
+                                    and getattr(self, "_current_attempt_first_step_lrs", None) is None
+                                ):
+                                    self._current_attempt_first_step_lrs = self._optimizer_lrs(
+                                        self.optimizers[name]
+                                    )
                                 self.optimizers[name].step()
                                 stepped_modules.add(name)
                         self._maybe_update_firm_target(train_modules)
@@ -2302,6 +2383,13 @@ class Episode:
                     # 优化器步骤
                     for name in train_modules:
                         if name in self.optimizers:
+                            if (
+                                name == "sdf_fc1"
+                                and getattr(self, "_current_attempt_first_step_lrs", None) is None
+                            ):
+                                self._current_attempt_first_step_lrs = self._optimizer_lrs(
+                                    self.optimizers[name]
+                                )
                             self.optimizers[name].step()
                             stepped_modules.add(name)
                     self._maybe_update_firm_target(train_modules)
@@ -6132,6 +6220,7 @@ class Episode:
         rounds: List[Dict[str, Any]] = []
         checkpoint_enabled = model is not None and "sdf_fc1" in getattr(self, "optimizers", {})
         optimizer = self.optimizers["sdf_fc1"] if checkpoint_enabled else None
+        scheduler = getattr(self, "lr_schedulers", {}).get("sdf_fc1") if checkpoint_enabled else None
         if checkpoint_enabled:
             self._configure_sdf_lr_for_phase()
         before_summary = self._stage_validation_summary(
@@ -6140,7 +6229,7 @@ class Episode:
             stage=SDFTrainingPhase.FC1_ONLY,
         )
         accepted_checkpoint = (
-            self._stage_checkpoint(model, optimizer)
+            self._stage_checkpoint(model, optimizer, scheduler)
             if checkpoint_enabled
             else None
         )
@@ -6163,10 +6252,12 @@ class Episode:
             last_reject_reason = None
             for attempt_idx in range(max_retries + 1):
                 attempt_checkpoint = (
-                    self._stage_checkpoint(model, optimizer)
+                    self._stage_checkpoint(model, optimizer, scheduler)
                     if checkpoint_enabled
                     else None
                 )
+                lr_at_attempt_start = self._optimizer_lrs(optimizer) if optimizer is not None else []
+                self._current_attempt_first_step_lrs = None
                 run_kwargs = {
                     "desc_prefix": (
                         f"SDF/FC1(fc1 e{epoch_idx}/{max_epochs} "
@@ -6220,6 +6311,13 @@ class Episode:
                     "acceptance_mode": "safe" if before_summary.get("safe", False) else "recovery",
                     "safety_distance_before": before_distance,
                     "safety_distance_after": after_distance,
+                    "lr_at_attempt_start": lr_at_attempt_start,
+                    "lr_at_first_optimizer_step": (
+                        list(self._current_attempt_first_step_lrs)
+                        if self._current_attempt_first_step_lrs is not None
+                        else []
+                    ),
+                    "lr_at_attempt_end": self._optimizer_lrs(optimizer) if optimizer is not None else [],
                     "learning_rate": self._optimizer_lrs(optimizer) if optimizer is not None else [],
                 }
                 rounds.append(round_record)
@@ -6227,7 +6325,7 @@ class Episode:
 
                 if accepted:
                     if checkpoint_enabled:
-                        accepted_checkpoint = self._stage_checkpoint(model, optimizer)
+                        accepted_checkpoint = self._stage_checkpoint(model, optimizer, scheduler)
                     before_summary = after_summary
                     accepted_epochs += 1
                     epoch_accepted = True
@@ -6256,8 +6354,12 @@ class Episode:
                 rejected_epochs += 1
                 last_reject_reason = reason
                 if checkpoint_enabled and attempt_checkpoint is not None:
-                    self._restore_stage_checkpoint(model, optimizer, attempt_checkpoint)
-                    decayed_lrs = self._decay_optimizer_lr(optimizer, lr_decay)
+                    self._restore_stage_checkpoint(model, optimizer, attempt_checkpoint, scheduler)
+                    decayed_lrs = self._decay_optimizer_and_scheduler_lr(
+                        optimizer,
+                        scheduler,
+                        lr_decay,
+                    )
                     round_record["learning_rate_after_rollback"] = decayed_lrs
                 logger.warning(
                     "FC1_ONLY rejected epoch %d attempt %d/%d: %s; rollback applied=%s",
@@ -6278,7 +6380,7 @@ class Episode:
                 break
 
         if checkpoint_enabled and accepted_checkpoint is not None:
-            self._restore_stage_checkpoint(model, optimizer, accepted_checkpoint)
+            self._restore_stage_checkpoint(model, optimizer, accepted_checkpoint, scheduler)
 
         final_prefix = "fc1_restored_best"
         final_eval = self._evaluate_sdf_fc1_batches(
@@ -6634,8 +6736,9 @@ class Episode:
             stage=stage,
         )
         optimizer = self.optimizers["sdf_fc1"]
+        scheduler = getattr(self, "lr_schedulers", {}).get("sdf_fc1")
         self._configure_sdf_lr_for_phase()
-        accepted_checkpoint = self._stage_checkpoint(model, optimizer)
+        accepted_checkpoint = self._stage_checkpoint(model, optimizer, scheduler)
         accepted_epoch = 0
         best_eval = initial_eval
         best_gate = initial_gate
@@ -6651,6 +6754,9 @@ class Episode:
             "collapse_detected": self._sdf_collapse_detected(initial_gate),
             "accepted": True,
             "rollback_reason": None,
+            "lr_at_attempt_start": self._optimizer_lrs(optimizer),
+            "lr_at_first_optimizer_step": [],
+            "lr_at_attempt_end": self._optimizer_lrs(optimizer),
             "learning_rate": self._optimizer_lrs(optimizer),
         })
 
@@ -6681,7 +6787,9 @@ class Episode:
             epoch_accepted = False
             last_reject_reason = None
             for attempt_idx in range(max_retries + 1):
-                attempt_checkpoint = self._stage_checkpoint(model, optimizer)
+                attempt_checkpoint = self._stage_checkpoint(model, optimizer, scheduler)
+                lr_at_attempt_start = self._optimizer_lrs(optimizer)
+                self._current_attempt_first_step_lrs = None
                 previous_offset = getattr(self, "_run_batches_epoch_offset", 0)
                 self._run_batches_epoch_offset = epoch_idx - 1
                 try:
@@ -6743,13 +6851,20 @@ class Episode:
                     "acceptance_mode": "safe" if before_summary.get("safe", False) else "recovery",
                     "safety_distance_before": before_distance,
                     "safety_distance_after": after_distance,
+                    "lr_at_attempt_start": lr_at_attempt_start,
+                    "lr_at_first_optimizer_step": (
+                        list(self._current_attempt_first_step_lrs)
+                        if self._current_attempt_first_step_lrs is not None
+                        else []
+                    ),
+                    "lr_at_attempt_end": self._optimizer_lrs(optimizer),
                     "learning_rate": self._optimizer_lrs(optimizer),
                 }
                 history.append(record)
                 last_epoch = epoch_idx
 
                 if accepted:
-                    accepted_checkpoint = self._stage_checkpoint(model, optimizer)
+                    accepted_checkpoint = self._stage_checkpoint(model, optimizer, scheduler)
                     accepted_epoch = epoch_idx
                     accepted_epochs += 1
                     before_summary = after_summary
@@ -6762,8 +6877,12 @@ class Episode:
 
                 rejected_epochs += 1
                 last_reject_reason = reason
-                self._restore_stage_checkpoint(model, optimizer, attempt_checkpoint)
-                decayed_lrs = self._decay_optimizer_lr(optimizer, lr_decay)
+                self._restore_stage_checkpoint(model, optimizer, attempt_checkpoint, scheduler)
+                decayed_lrs = self._decay_optimizer_and_scheduler_lr(
+                    optimizer,
+                    scheduler,
+                    lr_decay,
+                )
                 record["learning_rate_after_rollback"] = decayed_lrs
                 logger.warning(
                     "%s rejected epoch %d attempt %d/%d: %s; rollback and lr=%s",
@@ -6797,7 +6916,7 @@ class Episode:
 
         restored = False
         if bool(getattr(self.hyperparams, "sdf_restore_best_checkpoint", True)):
-            self._restore_stage_checkpoint(model, optimizer, accepted_checkpoint)
+            self._restore_stage_checkpoint(model, optimizer, accepted_checkpoint, scheduler)
             restored = True
             if bool(getattr(self.hyperparams, "sdf_clear_optimizer_after_restore", True)):
                 self._clear_optimizer_state_for_modules(
@@ -7085,16 +7204,68 @@ class Episode:
         try:
             train_table, val_table, holdout_diag = self._split_sdf_table_by_path(sdf_table)
             module_summaries['sdf_fc1_holdout_split'] = holdout_diag
-            train_batches = self._create_sdf_batches_from_macro_tensor(
+            fc1_train_batches = self._create_sdf_batches_from_macro_tensor(
                 train_table, batch_size=batch_size, n_branches=n_branches
+            )
+            sdf_true_target_batches = int(
+                getattr(self.hyperparams, "sdf_true_target_batches", 20)
+            )
+            sdf_min_parent_groups = int(
+                getattr(self.hyperparams, "sdf_min_parent_groups_per_batch", 256)
+            )
+            sdf_train_batches = self._create_sdf_batches_from_macro_tensor(
+                train_table,
+                batch_size=batch_size,
+                n_branches=n_branches,
+                target_num_batches=sdf_true_target_batches,
+                min_parent_groups_per_batch=sdf_min_parent_groups,
             )
             val_batches = self._create_sdf_batches_from_macro_tensor(
                 val_table, batch_size=batch_size, n_branches=n_branches
             )
-            if not train_batches:
+            if not fc1_train_batches:
                 raise RuntimeError("FC1/SDF Stage2 could not build non-empty SDF macro batches.")
+            if not sdf_train_batches:
+                raise RuntimeError("FC1/SDF Stage2 could not build non-empty SDF_TRUE macro batches.")
             if not val_batches:
                 raise RuntimeError("FC1/SDF Stage2 could not build non-empty holdout validation batches.")
+
+            def _batching_summary(batches: List[Dict[str, torch.Tensor]]) -> Dict[str, Any]:
+                sizes = [int(batch["parent"].shape[0]) for batch in batches if "parent" in batch]
+                child_rows = 0
+                for batch in batches:
+                    child_rows += sum(int(child.shape[0]) for child in batch.get("children", []))
+                return {
+                    "batches": int(len(batches)),
+                    "parent_groups": int(sum(sizes)),
+                    "min_parent_groups": int(min(sizes)) if sizes else 0,
+                    "max_parent_groups": int(max(sizes)) if sizes else 0,
+                    "child_rows": int(child_rows),
+                }
+
+            fc1_batching = _batching_summary(fc1_train_batches)
+            sdf_true_batching = _batching_summary(sdf_train_batches)
+            sdf_true_batching["target_batches"] = int(sdf_true_target_batches)
+            sdf_true_batching["min_parent_groups_per_batch"] = int(sdf_min_parent_groups)
+            module_summaries["sdf_fc1_fc1_batching"] = fc1_batching
+            module_summaries["sdf_fc1_sdf_true_batching"] = sdf_true_batching
+            logger.info(
+                "FC1 batching | batches=%d parent_groups=%d min=%d max=%d child_rows=%d",
+                fc1_batching["batches"],
+                fc1_batching["parent_groups"],
+                fc1_batching["min_parent_groups"],
+                fc1_batching["max_parent_groups"],
+                fc1_batching["child_rows"],
+            )
+            logger.info(
+                "SDF_TRUE batching | target_batches=%d actual_batches=%d parent_groups=%d min=%d max=%d child_rows=%d",
+                sdf_true_batching["target_batches"],
+                sdf_true_batching["batches"],
+                sdf_true_batching["parent_groups"],
+                sdf_true_batching["min_parent_groups"],
+                sdf_true_batching["max_parent_groups"],
+                sdf_true_batching["child_rows"],
+            )
             eval_batches = int(getattr(self.hyperparams, "sdf_fc1_eval_max_batches", 0))
             eval_batches_arg = eval_batches if eval_batches > 0 else None
             gate_result: Dict[str, Any] = {"passed": True, "failed_stage": None}
@@ -7135,7 +7306,7 @@ class Episode:
                 if fc1_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.FC1_ONLY)
                     fc1_result = self._run_fc1_until_gates(
-                        train_batches=train_batches,
+                        train_batches=fc1_train_batches,
                         val_batches=val_batches,
                         log_interval=log_interval,
                     )
@@ -7165,7 +7336,7 @@ class Episode:
                         and bool(getattr(self.hyperparams, "sdf_epoch_validation_enabled", True))
                     ):
                         true_result = self._run_sdf_phase_with_validation(
-                            train_batches=train_batches,
+                            train_batches=sdf_train_batches,
                             val_batches=val_batches,
                             n_epochs=true_epochs,
                             log_interval=log_interval,
@@ -7174,7 +7345,7 @@ class Episode:
                         )
                     else:
                         train_summary = self._run_batches(
-                            train_batches,
+                            sdf_train_batches,
                             true_epochs,
                             log_interval,
                             ['sdf_fc1'],
@@ -7220,7 +7391,7 @@ class Episode:
                 if recursive_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.SDF_RECURSIVE_ONLY)
                     recursive_result = self._run_sdf_phase_with_validation(
-                        train_batches=train_batches,
+                        train_batches=sdf_train_batches,
                         val_batches=val_batches,
                         n_epochs=recursive_epochs,
                         log_interval=log_interval,
@@ -7255,12 +7426,12 @@ class Episode:
                     self.set_sdf_training_phase(SDFTrainingPhase.FC1_ONLY)
                     self._fc1_teacher_forcing_stage = True
                     module_summaries['sdf_fc1_teacher_forcing'] = self._run_batches(
-                        train_batches, tf_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(tf) '
+                        fc1_train_batches, tf_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(tf) '
                     )
                     self._fc1_teacher_forcing_stage = False
                 self.set_sdf_training_phase(SDFTrainingPhase.SDF_RECURSIVE_ONLY)
                 module_summaries['sdf_fc1_stage2'] = self._run_batches(
-                    train_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(stage2) '
+                    fc1_train_batches, n_epochs, log_interval, ['sdf_fc1'], desc_prefix='SDF/FC1(stage2) '
                 )
             # keep backward compatibility for consumers expecting a single sdf_fc1 key
             module_summaries['sdf_fc1'] = module_summaries['sdf_fc1_stage2']

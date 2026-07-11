@@ -4,6 +4,7 @@ Utilities for multi-episode runs: model/optimizer/hparam builders, I/O helpers, 
 
 from pathlib import Path
 from typing import Optional
+import os
 import torch
 import pandas as pd
 import numpy as np
@@ -196,6 +197,11 @@ def build_hyperparams():
     hp.stage_gate_required_consecutive_passes = 1
     hp.sdf_stage1_lr = 1e-4
     hp.sdf_stage2_lr = 2e-4
+    hp.sdf_true_only_lr = float(os.environ.get("SDF_TRUE_ONLY_LR", 4e-5))
+    hp.sdf_true_target_batches = int(os.environ.get("SDF_TRUE_TARGET_BATCHES", 20))
+    hp.sdf_min_parent_groups_per_batch = int(
+        os.environ.get("SDF_MIN_PARENT_GROUPS_PER_BATCH", 256)
+    )
     hp.sdf_stage1_moment_weight = 5.0
     hp.sdf_moment_weight = 5.0
     hp.sdf_log_mean_anchor_weight_stage1 = 1.0

@@ -163,6 +163,9 @@ def parse_args() -> argparse.Namespace:
         help="Override SDF_RECURSIVE_ONLY epochs; use 0 to disable the recursive stage",
     )
     parser.add_argument("--sdf-stage2-lr", type=float, default=None, help="Override Stage2 SDF/FC1 learning rate")
+    parser.add_argument("--sdf-true-only-lr", type=float, default=None, help="Override SDF_TRUE_ONLY SDF/value learning rate")
+    parser.add_argument("--sdf-true-target-batches", type=int, default=None, help="Target number of SDF_TRUE parent-group batches")
+    parser.add_argument("--sdf-min-parent-groups-per-batch", type=int, default=None, help="Minimum parent groups per SDF_TRUE batch")
     parser.add_argument("--sdf-true-moment-weight", type=float, default=None, help="Override SDF_TRUE moment weight")
     parser.add_argument("--sdf-true-anchor-weight", type=float, default=None, help="Override SDF_TRUE log-mean anchor weight")
     parser.add_argument(
@@ -271,6 +274,12 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.sdf_recursive_only_epochs = int(args.sdf_recursive_only_epochs)
     if args.sdf_stage2_lr is not None:
         hyperparams.sdf_stage2_lr = float(args.sdf_stage2_lr)
+    if args.sdf_true_only_lr is not None:
+        hyperparams.sdf_true_only_lr = float(args.sdf_true_only_lr)
+    if args.sdf_true_target_batches is not None:
+        hyperparams.sdf_true_target_batches = int(args.sdf_true_target_batches)
+    if args.sdf_min_parent_groups_per_batch is not None:
+        hyperparams.sdf_min_parent_groups_per_batch = int(args.sdf_min_parent_groups_per_batch)
     if args.sdf_true_moment_weight is not None:
         hyperparams.sdf_true_moment_weight = float(args.sdf_true_moment_weight)
     if args.sdf_true_anchor_weight is not None:
@@ -463,6 +472,9 @@ def main():
                     "sdf_true_only_epochs": hyperparams.sdf_true_only_epochs,
                     "sdf_recursive_only_epochs": hyperparams.sdf_recursive_only_epochs,
                     "sdf_stage2_lr": hyperparams.sdf_stage2_lr,
+                    "sdf_true_only_lr": hyperparams.sdf_true_only_lr,
+                    "sdf_true_target_batches": hyperparams.sdf_true_target_batches,
+                    "sdf_min_parent_groups_per_batch": hyperparams.sdf_min_parent_groups_per_batch,
                     "sdf_true_moment_weight": hyperparams.sdf_true_moment_weight,
                     "sdf_true_anchor_weight": hyperparams.sdf_true_anchor_weight,
                     "sdf_reset_optimizer_on_true_start": hyperparams.sdf_reset_optimizer_on_true_start,

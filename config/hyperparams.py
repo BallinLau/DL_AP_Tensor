@@ -197,6 +197,11 @@ class HyperParams:
     sdf_stage1_moment_weight: float = 5.0
     # SDF 第二阶段（有 FC1 重建监督）可选专用学习率；None 表示回退到基础 lr
     sdf_stage2_lr: Optional[float] = 2e-4
+    # SDF_TRUE_ONLY uses a smaller LR and dynamic parent-group batching so
+    # retry validation tests local improvements instead of large epoch jumps.
+    sdf_true_only_lr: float = 4e-5
+    sdf_true_target_batches: int = 20
+    sdf_min_parent_groups_per_batch: int = 256
     # SDF 均值锚：约束 log(E[M]) 靠近理论目标（默认 log(0.98)）
     sdf_log_mean_target: float = field(default_factory=lambda: math.log(0.98))
     sdf_log_mean_anchor_weight_stage1: float = 1.0
