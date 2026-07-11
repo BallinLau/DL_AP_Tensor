@@ -15,7 +15,7 @@ FC1: 宏观状态预测网络（FC1_C 预测 ĉf，FC1_K 预测 ln Kf）
 - 每条路径中 η 通过伯努利分布随机抽取
 
 SDF 计算（对每条路径 j）：
-    M^{(j)} = β^κ * exp((k_{t+1}^{(j)} - k_t)*(-γ) - κ/σ*(c_{t+1}^{(j)} - c_t)) 
+    M^{(j)} = β^κ * exp((k_{t+1}^{(j)} - k_t)*(-γ) + κ/σ*(c_{t+1}^{(j)} - c_t))
               * (w_{t+1}^{(j)} / (w_t - exp(c_t)))^(κ-1)
 """
 
@@ -46,7 +46,7 @@ def compute_sdf(
     """
     计算 SDF（支持任意数量的分支路径）
     
-    M^{(j)} = β^κ * exp((k_{t+1}^{(j)} - k_t)*(-γ) - κ/σ*(c_{t+1}^{(j)} - c_t)) 
+    M^{(j)} = β^κ * exp((k_{t+1}^{(j)} - k_t)*(-γ) + κ/σ*(c_{t+1}^{(j)} - c_t))
               * (w_{t+1}^{(j)} / (w_t - exp(c_t)))^(κ-1)
     
     Args:
@@ -102,7 +102,7 @@ def compute_sdf(
 
         exponent = (
             (k_children_t - k_parent_t.unsqueeze(-1)) * (-gamma)
-            - kappa / sigma * (c_children_t - c_parent_t.unsqueeze(-1))
+            + kappa / sigma * (c_children_t - c_parent_t.unsqueeze(-1))
         )
         if exponent_clip is not None:
             exponent = exponent.clamp(min=-exponent_clip, max=exponent_clip)
@@ -120,7 +120,7 @@ def compute_sdf(
     for w_child, k_child, c_child in zip(w_children, k_children, c_children):
         ratio = (w_child / denom).clamp_min(eps)
         exponent = (
-            (k_child - k_parent) * (-gamma) - kappa / sigma * (c_child - c_parent)
+            (k_child - k_parent) * (-gamma) + kappa / sigma * (c_child - c_parent)
         )
         if exponent_clip is not None:
             exponent = exponent.clamp(min=-exponent_clip, max=exponent_clip)
@@ -180,7 +180,7 @@ class SDFModel(nn.Module):
     E_t[M_{t,t+1} R_{t+1}] = 1
     
     支持任意数量的分支路径：
-        M^{(j)} = β^κ * exp((k_{t+1}^{(j)} - k_t)*(-γ) - κ/σ*(c_{t+1}^{(j)} - c_t)) 
+        M^{(j)} = β^κ * exp((k_{t+1}^{(j)} - k_t)*(-γ) + κ/σ*(c_{t+1}^{(j)} - c_t))
                   * (w_{t+1}^{(j)} / (w_t - exp(c_t)))^(κ-1)
     """
     
