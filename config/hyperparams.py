@@ -260,6 +260,7 @@ class HyperParams:
     episode0_sdf_finite_ratio_min: float = 1.0
     allow_in_sample_sdf_gate_for_debug: bool = False
     sdf_post_refresh_gate_enabled: bool = True
+    sdf_post_refresh_gate_mode: str = "safety"
     stage_gate_required_consecutive_passes: int = 1
     allow_modea_sdf_after_pv: bool = False
 

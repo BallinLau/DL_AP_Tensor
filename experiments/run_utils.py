@@ -192,6 +192,7 @@ def build_hyperparams():
     hp.episode0_sdf_finite_ratio_min = 1.0
     hp.allow_in_sample_sdf_gate_for_debug = False
     hp.sdf_post_refresh_gate_enabled = True
+    hp.sdf_post_refresh_gate_mode = "safety"
     hp.stage_gate_required_consecutive_passes = 1
     hp.sdf_stage1_lr = 1e-4
     hp.sdf_stage2_lr = 2e-4

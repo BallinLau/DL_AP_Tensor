@@ -6266,13 +6266,28 @@ class Episode:
         if checkpoint_enabled and accepted_checkpoint is not None:
             self._restore_stage_checkpoint(model, optimizer, accepted_checkpoint)
 
-        final_eval = final_record.get("eval_metrics", before_eval)
-        final_summary = final_record.get("validation_summary", before_summary)
-        final_one_step = final_record.get("one_step_gate", {})
-        final_recursive = final_record.get("recursive_diagnostic", {})
+        final_prefix = "fc1_restored_best"
+        final_eval = self._evaluate_sdf_fc1_batches(
+            val_batches,
+            prefix=final_prefix,
+            max_batches=eval_batches_arg,
+        )
+        final_summary = self._stage_validation_summary(
+            final_eval,
+            prefix=final_prefix,
+            stage=SDFTrainingPhase.FC1_ONLY,
+        )
+        _, final_one_step = self._fc1_one_step_gate_passed(
+            final_eval,
+            prefix=final_prefix,
+        )
+        _, final_recursive = self._evaluate_fc1_recursive_diagnostic(
+            final_eval,
+            prefix=final_prefix,
+        )
         return {
             "passed": True,
-            "strict_gate_passed": False,
+            "strict_gate_passed": bool(final_one_step.get("passed", False)),
             "failed_stage": None,
             "failure_source": None,
             "reason": "fc1_stage_skipped_without_safe_improvement" if skipped_current_stage else "fc1_safe_updates_applied",
@@ -6892,10 +6907,27 @@ class Episode:
                 prefix="post_refresh",
                 stage=SDFTrainingPhase.SDF_RECURSIVE_ONLY,
             )
+            safety_summary = self._stage_validation_summary(
+                refresh_eval,
+                prefix="post_refresh",
+                stage=SDFTrainingPhase.SDF_RECURSIVE_ONLY,
+            )
+            gate_mode = str(
+                getattr(self.hyperparams, "sdf_post_refresh_gate_mode", "safety")
+            ).lower()
+            if gate_mode not in {"strict", "safety"}:
+                raise ValueError(f"Unknown sdf_post_refresh_gate_mode={gate_mode!r}")
+            strict_passed = bool(fc1_passed and sdf_passed)
+            safety_passed = bool(safety_summary.get("safe", False))
+            gate_passed = strict_passed if gate_mode == "strict" else safety_passed
             result = {
-                "passed": bool(fc1_passed and sdf_passed),
-                "failed_stage": None if (fc1_passed and sdf_passed) else "post_refresh",
+                "passed": bool(gate_passed),
+                "strict_passed": bool(strict_passed),
+                "safety_passed": bool(safety_passed),
+                "gate_mode": gate_mode,
+                "failed_stage": None if gate_passed else "post_refresh",
                 "holdout_split": holdout_diag,
+                "safety_summary": safety_summary,
                 "fc1_gate": {
                     "passed": bool(fc1_passed),
                     "failure_source": None if fc1_passed else (
@@ -7758,7 +7790,13 @@ class Episode:
                         )
                         if not post_refresh_gate.get("passed", False):
                             raise NumericalStageFailure(
-                                "Post-refresh FC1/SDF gate failed; skip Q/P/bp."
+                                "Post-refresh FC1/SDF gate failed; skip Q/P/bp.",
+                                diagnostics={
+                                    "episode_id": int(self.episode_id),
+                                    "failed_stage": "post_refresh",
+                                    "gate_result": deepcopy(post_refresh_gate),
+                                    "partial_module_summaries": deepcopy(module_summaries),
+                                },
                             )
                 else:
                     module_summaries['modeb_pre_pv_sdf_refresh_diag'] = {

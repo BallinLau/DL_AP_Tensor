@@ -9,6 +9,7 @@ import torch.nn as nn
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
+from data import TensorTable
 from training.episode import Episode, NumericalStageFailure, SDFTrainingPhase
 
 
@@ -177,6 +178,78 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             Episode._parameter_max_change(episode.models["sdf_fc1"].fc1_model, before),
             0.0,
         )
+
+    def test_post_refresh_safety_mode_can_pass_when_strict_gate_fails(self):
+        episode = Episode.__new__(Episode)
+        episode.tensor_macro = TensorTable(
+            data=torch.zeros(1, 12),
+            columns=["path", "t", "branch", "K", "C", "LnK", "Hatc", "n_firms", "M", "x", "hatcf", "lnkf"],
+        )
+        episode.df_macro = None
+        episode.add_FC1loss = False
+        episode.hyperparams = SimpleNamespace(
+            sdf_fc1_eval_max_batches=0,
+            sdf_gate_residual_mode="normalized_ratio",
+            sdf_log_mean_target=0.0,
+            sdf_collapse_lower_ratio=0.1,
+            sdf_collapse_upper_ratio=10.0,
+            sdf_post_refresh_gate_mode="safety",
+        )
+
+        def _use_tensor_pipeline():
+            return True
+
+        def _build_sdf_pairs(_table):
+            return episode.tensor_macro
+
+        def _split(_table):
+            return _table, _table, {"mock": True}
+
+        def _create(_table, batch_size, n_branches):
+            return [{"mock": True}]
+
+        def _eval(_batches, prefix, max_batches=None):
+            return {
+                f"{prefix}_primary_true_state_M_mean": 0.98,
+                f"{prefix}_primary_true_state_M_finite_ratio": 1.0,
+                f"{prefix}_primary_true_state_normalized_signed_aio_t": 99.0,
+                f"{prefix}_recursive_forecast_state_M_mean": 0.98,
+                f"{prefix}_recursive_forecast_state_M_finite_ratio": 1.0,
+                f"{prefix}_recursive_forecast_state_normalized_signed_aio_t": 99.0,
+                f"{prefix}_primary_true_state_hatc_next_target_finite_n": 10.0,
+                f"{prefix}_primary_true_state_hatc_next_target_finite_ratio": 1.0,
+                f"{prefix}_primary_true_state_hatc_next_target_std": 1.0,
+                f"{prefix}_primary_true_state_hatc_next_pred_finite_ratio": 1.0,
+                f"{prefix}_primary_true_state_hatc_next_r2": -1.0,
+                f"{prefix}_primary_true_state_hatc_next_skill_vs_persistence": -1.0,
+                f"{prefix}_primary_true_state_hatc_next_rmse": 10.0,
+                f"{prefix}_primary_true_state_lnk_next_target_finite_n": 10.0,
+                f"{prefix}_primary_true_state_lnk_next_target_finite_ratio": 1.0,
+                f"{prefix}_primary_true_state_lnk_next_target_std": 1.0,
+                f"{prefix}_primary_true_state_lnk_next_pred_finite_ratio": 1.0,
+                f"{prefix}_primary_true_state_lnk_next_r2": -1.0,
+                f"{prefix}_primary_true_state_lnk_next_skill_vs_persistence": -1.0,
+                f"{prefix}_primary_true_state_lnk_next_rmse": 10.0,
+            }
+
+        episode._use_tensor_pipeline = _use_tensor_pipeline
+        episode._build_sdf_pairs_from_macro_tensor = _build_sdf_pairs
+        episode._split_sdf_table_by_path = _split
+        episode._create_sdf_batches_from_macro_tensor = _create
+        episode._evaluate_sdf_fc1_batches = _eval
+        episode.set_sdf_training_phase = lambda phase: None
+        episode.sdf_training_phase = SDFTrainingPhase.SDF_TRUE_ONLY
+
+        result = episode._evaluate_post_refresh_sdf_gate(
+            module_summaries={},
+            batch_size=2,
+            n_branches=2,
+        )
+
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["safety_passed"])
+        self.assertFalse(result["strict_passed"])
+        self.assertEqual(result["gate_mode"], "safety")
 
 
 if __name__ == "__main__":
