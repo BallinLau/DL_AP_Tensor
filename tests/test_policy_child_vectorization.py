@@ -10,6 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
 from models import PolicyValueModel
+from losses.p0_loss import P0Loss
+from losses.pi_loss import PILoss
+from config import Config
+from training.bp_grid_teacher import BPGridTeacher, _forward_equity_grid_children
 from training.episode import Episode
 
 
@@ -38,6 +42,106 @@ def _reference_child_states(children, bp, b_parent):
         )
         reference_states.append(state)
     return torch.stack(reference_states, dim=1)
+
+
+class _CountingTargetModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.equity_calls = 0
+        self.q_calls = 0
+
+    def _q_output(self, state):
+        self.q_calls += 1
+        return (
+            0.70
+            + 0.03 * state[:, 0:1]
+            - 0.02 * state[:, 1:2]
+            + 0.01 * state[:, 4:5]
+        )
+
+    def forward_equity(self, state):
+        self.equity_calls += 1
+        p = (
+            1.10
+            + 0.20 * state[:, 0:1]
+            - 0.10 * state[:, 1:2]
+            + 0.05 * state[:, 3:4]
+            + 0.03 * state[:, 4:5]
+        )
+        bar_z = torch.sigmoid(0.40 * state[:, 1:2] - 0.30 * state[:, 0:1])
+        return {"P": p, "bar_z": bar_z, "Q": self._q_output(state)}
+
+
+def _reference_target_grid_chunk(teacher, parent_state, children, m_list, bp_grid, branch, mix_weight=None):
+    batch_size, n_grid = bp_grid.shape
+    q_current = teacher.target_model._q_output(parent_state)
+    issue_state = parent_state.unsqueeze(1).expand(batch_size, n_grid, parent_state.shape[-1]).reshape(batch_size * n_grid, -1).clone()
+    issue_state[:, 0:1] = bp_grid.reshape(-1, 1)
+    q_issue = teacher.target_model._q_output(issue_state).reshape(batch_size, n_grid)
+
+    value_grid = torch.zeros(batch_size, n_grid, dtype=parent_state.dtype, device=parent_state.device)
+    p_sum = torch.zeros_like(value_grid)
+    default_sum = torch.zeros_like(value_grid)
+    b_parent = parent_state[:, 0:1]
+    x_parent = parent_state[:, 4:5]
+    z_parent = parent_state[:, 1:2]
+    i_parent = parent_state[:, 3:4]
+    q_current_grid = q_current.expand(batch_size, n_grid)
+    mix_w = None if mix_weight is None else mix_weight.clamp(0.0, 1.0).expand(batch_size, n_grid)
+
+    for child, m in zip(children, m_list):
+        child_raw = child[:, :7] if child.shape[1] > 7 else child
+        eta_grid = child[:, 2:3].clamp(0.0, 1.0).expand(batch_size, n_grid)
+        child_state = child_raw.unsqueeze(1).expand(batch_size, n_grid, child_raw.shape[-1]).reshape(batch_size * n_grid, -1).clone()
+        child_state[:, 0:1] = (
+            eta_grid * bp_grid
+            + (1.0 - eta_grid) * b_parent.expand(batch_size, n_grid)
+        ).reshape(-1, 1)
+        out = teacher.target_model.forward_equity(child_state)
+        p_child = out["P"].reshape(batch_size, n_grid)
+        bar_z_child = out["bar_z"].reshape(batch_size, n_grid).clamp(0.0, 1.0)
+
+        cf0 = teacher.p0_loss_fn.compute_cashflow_p0(
+            x_parent.expand(batch_size, n_grid).reshape(-1, 1),
+            z_parent.expand(batch_size, n_grid).reshape(-1, 1),
+            b_parent.expand(batch_size, n_grid).reshape(-1, 1),
+            q_current_grid.reshape(-1, 1),
+            q_issue.reshape(-1, 1),
+            eta_grid.reshape(-1, 1),
+        ).reshape(batch_size, n_grid)
+        value0 = cf0 + m.expand(batch_size, n_grid) * p_child
+
+        cfi = teacher.pi_loss_fn.compute_cashflow_pi(
+            x_parent.expand(batch_size, n_grid).reshape(-1, 1),
+            z_parent.expand(batch_size, n_grid).reshape(-1, 1),
+            b_parent.expand(batch_size, n_grid).reshape(-1, 1),
+            i_parent.expand(batch_size, n_grid).reshape(-1, 1),
+            q_current_grid.reshape(-1, 1),
+            q_issue.reshape(-1, 1),
+            eta_grid.reshape(-1, 1),
+        ).reshape(batch_size, n_grid)
+        valuei = cfi + Config.G * m.expand(batch_size, n_grid) * p_child
+
+        if branch == "p0":
+            branch_value = value0
+        elif branch == "pi":
+            branch_value = valuei
+        else:
+            branch_value = (1.0 - mix_w) * value0 + mix_w * valuei
+
+        value_grid = value_grid + branch_value
+        p_sum = p_sum + p_child
+        default_sum = default_sum + bar_z_child
+
+    n_children = len(children)
+    return {
+        "bp_grid": bp_grid,
+        "value_grid": value_grid / n_children,
+        "q_issue_grid": q_issue,
+        "p_child_grid_mean": p_sum / n_children,
+        "default_grid_mean": default_sum / n_children,
+        "argmax_index": (value_grid / n_children).argmax(dim=1, keepdim=True),
+    }
 
 
 class PolicyChildVectorizationTest(unittest.TestCase):
@@ -158,6 +262,114 @@ class PolicyChildVectorizationTest(unittest.TestCase):
                 rtol=1e-5,
                 atol=1e-6,
             )
+
+    def test_target_grid_child_equity_forward_is_vectorized(self):
+        children = _make_children(batch_size=4, n_children=3)
+        bp_grid = torch.linspace(0.05, 0.95, steps=5, dtype=torch.float64).reshape(1, -1).expand(4, -1)
+        b_parent = torch.linspace(0.10, 0.40, steps=4, dtype=torch.float64).reshape(-1, 1)
+        model = _CountingTargetModel().to(dtype=torch.float64)
+
+        p_child, bar_z_child, eta_grid = _forward_equity_grid_children(
+            model,
+            children,
+            bp_grid,
+            b_parent,
+        )
+        self.assertEqual(model.equity_calls, 1)
+
+        reference_states = []
+        for child in children:
+            raw = child[:, :7]
+            states = raw.unsqueeze(1).expand(4, bp_grid.shape[1], 7).clone()
+            eta = child[:, 2:3].expand(4, bp_grid.shape[1])
+            states[:, :, 0:1] = (
+                eta * bp_grid
+                + (1.0 - eta) * b_parent.expand(4, bp_grid.shape[1])
+            ).unsqueeze(-1)
+            reference_states.append(states)
+        reference_states = torch.stack(reference_states, dim=2)
+        reference_out = model.forward_equity(reference_states.reshape(-1, 7))
+
+        torch.testing.assert_close(
+            p_child,
+            reference_out["P"].reshape(4, bp_grid.shape[1], len(children)),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        torch.testing.assert_close(
+            bar_z_child,
+            reference_out["bar_z"].reshape(4, bp_grid.shape[1], len(children)),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        torch.testing.assert_close(
+            eta_grid,
+            torch.stack([child[:, 2:3].expand(4, bp_grid.shape[1]) for child in children], dim=2),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_target_grid_vectorized_chunk_matches_reference_child_loop(self):
+        torch.manual_seed(321)
+        batch_size = 3
+        n_children = 4
+        parent_state = torch.randn(batch_size, 7, dtype=torch.float64)
+        parent_state[:, 0:1] = torch.sigmoid(parent_state[:, 0:1])
+        parent_state[:, 2:3] = torch.sigmoid(parent_state[:, 2:3])
+        children = _make_children(batch_size=batch_size, n_children=n_children)
+        m_list = [
+            torch.full((batch_size, 1), 0.90 + 0.03 * j, dtype=torch.float64)
+            for j in range(n_children)
+        ]
+        bp_grid = torch.tensor(
+            [
+                [0.05, 0.20, 0.60],
+                [0.10, 0.40, 0.90],
+                [0.00, 0.50, 1.00],
+            ],
+            dtype=torch.float64,
+        )
+        mix_weight = torch.tensor([[0.2], [0.5], [0.8]], dtype=torch.float64)
+
+        for branch in ("p0", "pi", "mix"):
+            vector_model = _CountingTargetModel().to(dtype=torch.float64)
+            reference_model = _CountingTargetModel().to(dtype=torch.float64)
+            vector_teacher = BPGridTeacher(
+                vector_model,
+                P0Loss(),
+                PILoss(),
+                refine=False,
+            )
+            reference_teacher = BPGridTeacher(
+                reference_model,
+                P0Loss(),
+                PILoss(),
+                refine=False,
+            )
+
+            vector = vector_teacher._evaluate_grid_chunk(
+                parent_state,
+                children,
+                m_list,
+                bp_grid,
+                branch=branch,
+                mix_weight=mix_weight if branch == "mix" else None,
+            )
+            reference = _reference_target_grid_chunk(
+                reference_teacher,
+                parent_state,
+                children,
+                m_list,
+                bp_grid,
+                branch=branch,
+                mix_weight=mix_weight if branch == "mix" else None,
+            )
+
+            for key in ("bp_grid", "value_grid", "q_issue_grid", "p_child_grid_mean", "default_grid_mean"):
+                torch.testing.assert_close(vector[key], reference[key], rtol=1e-10, atol=1e-10)
+            torch.testing.assert_close(vector["argmax_index"], reference["argmax_index"], rtol=0.0, atol=0.0)
+            self.assertEqual(vector_model.equity_calls, 1)
+            self.assertEqual(reference_model.equity_calls, n_children)
 
 
 if __name__ == "__main__":

@@ -62,6 +62,57 @@ def _candidate_flat(candidates: torch.Tensor) -> torch.Tensor:
     return candidates.reshape(-1, 1)
 
 
+def _expand_grid_children(
+    children: List[torch.Tensor],
+    bp_grid: torch.Tensor,
+    b_parent: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build child states over both candidate and child dimensions.
+
+    Returns:
+        child_states: (B, J, N, D) tensor of candidate child states.
+        eta_grid: (B, J, N) tensor of child eta weights.
+    """
+    if not children:
+        raise ValueError("BP grid evaluation requires at least one child tensor.")
+
+    children_t = torch.stack(children, dim=1)
+    child_state_raw = children_t[..., :7] if children_t.shape[-1] > 7 else children_t
+    batch_size, n_children, state_dim = child_state_raw.shape
+    n_grid = bp_grid.shape[1]
+
+    child_states = (
+        child_state_raw.unsqueeze(1)
+        .expand(batch_size, n_grid, n_children, state_dim)
+        .clone()
+    )
+    eta_grid = (
+        children_t[..., 2:3]
+        .clamp(0.0, 1.0)
+        .unsqueeze(1)
+        .expand(batch_size, n_grid, n_children, 1)
+    )
+    bp_expanded = bp_grid.unsqueeze(-1).unsqueeze(-1)
+    b_parent_expanded = b_parent.unsqueeze(1).unsqueeze(1)
+    child_states[..., 0:1] = eta_grid * bp_expanded + (1.0 - eta_grid) * b_parent_expanded
+    return child_states, eta_grid.squeeze(-1)
+
+
+def _forward_equity_grid_children(
+    model: Any,
+    children: List[torch.Tensor],
+    bp_grid: torch.Tensor,
+    b_parent: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    child_states, eta_grid = _expand_grid_children(children, bp_grid, b_parent)
+    batch_size, n_grid, n_children, state_dim = child_states.shape
+    flat_states = child_states.reshape(batch_size * n_grid * n_children, state_dim)
+    p_raw, bar_z_raw = _target_equity(model, flat_states)
+    p_child = p_raw.reshape(batch_size, n_grid, n_children)
+    bar_z_child = bar_z_raw.reshape(batch_size, n_grid, n_children).clamp(0.0, 1.0)
+    return p_child, bar_z_child, eta_grid
+
+
 def _safe_top2_margin(value_grid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if value_grid.shape[1] < 2:
         margin = torch.full((value_grid.shape[0], 1), float("inf"), device=value_grid.device, dtype=value_grid.dtype)
@@ -428,14 +479,11 @@ class BPGridTeacher:
         issue_state[:, 0:1] = _candidate_flat(bp_grid)
         q_issue = _target_q(self.target_model, issue_state).reshape(batch_size, n_grid)
 
-        value_grid = torch.zeros(batch_size, n_grid, device=parent_state.device, dtype=parent_state.dtype)
-        p_grid_sum = torch.zeros_like(value_grid)
-        default_grid_sum = torch.zeros_like(value_grid)
         mix_w = None
         if branch == "mix":
             if mix_weight is None:
                 raise ValueError("mix_weight is required for branch='mix'")
-            mix_w = mix_weight.clamp(0.0, 1.0).expand(batch_size, n_grid)
+            mix_w = mix_weight.clamp(0.0, 1.0).reshape(batch_size, 1, 1).expand(batch_size, n_grid, len(children))
 
         b_parent = parent_state[:, 0:1]
         x_parent = parent_state[:, 4:5]
@@ -443,55 +491,54 @@ class BPGridTeacher:
         i_parent = parent_state[:, 3:4]
         q_current_grid = q_current.expand(batch_size, n_grid)
 
-        for child, m in zip(children, m_list):
-            child_state_raw = _strip_extra(child)
-            eta_child = child[:, 2:3].clamp(0.0, 1.0)
-            child_state = _expand_candidates(child_state_raw, bp_grid)
-            eta_grid = eta_child.expand(batch_size, n_grid)
-            b_grid = b_parent.expand(batch_size, n_grid)
-            child_state[:, 0:1] = (eta_grid * bp_grid + (1.0 - eta_grid) * b_grid).reshape(-1, 1)
+        p_child, bar_z_child, eta_grid = _forward_equity_grid_children(
+            self.target_model,
+            children,
+            bp_grid,
+            b_parent,
+        )
+        n_children = p_child.shape[2]
+        m_grid = torch.stack(m_list, dim=1).reshape(batch_size, 1, n_children).expand(batch_size, n_grid, n_children)
+        flat_shape = (batch_size * n_grid * n_children, 1)
+        x_grid = x_parent.unsqueeze(1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
+        z_grid = z_parent.unsqueeze(1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
+        b_grid = b_parent.unsqueeze(1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
+        i_grid = i_parent.unsqueeze(1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
+        q_current_flat = q_current_grid.unsqueeze(-1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
+        q_issue_flat = q_issue.unsqueeze(-1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
+        eta_flat = eta_grid.reshape(flat_shape)
 
-            p_child_raw, bar_z_child_raw = _target_equity(self.target_model, child_state)
-            p_child = p_child_raw.reshape(batch_size, n_grid)
-            bar_z_child = bar_z_child_raw.reshape(batch_size, n_grid).clamp(0.0, 1.0)
+        cf0 = self.p0_loss_fn.compute_cashflow_p0(
+            x_grid,
+            z_grid,
+            b_grid,
+            q_current_flat,
+            q_issue_flat,
+            eta_flat,
+        ).reshape(batch_size, n_grid, n_children)
+        value0 = cf0 + m_grid * p_child
 
-            eta_flat = eta_grid.reshape(-1, 1)
-            cf0 = self.p0_loss_fn.compute_cashflow_p0(
-                x_parent.expand(batch_size, n_grid).reshape(-1, 1),
-                z_parent.expand(batch_size, n_grid).reshape(-1, 1),
-                b_parent.expand(batch_size, n_grid).reshape(-1, 1),
-                q_current_grid.reshape(-1, 1),
-                q_issue.reshape(-1, 1),
-                eta_flat,
-            ).reshape(batch_size, n_grid)
-            value0 = cf0 + m.expand(batch_size, n_grid) * p_child
+        cfi = self.pi_loss_fn.compute_cashflow_pi(
+            x_grid,
+            z_grid,
+            b_grid,
+            i_grid,
+            q_current_flat,
+            q_issue_flat,
+            eta_flat,
+        ).reshape(batch_size, n_grid, n_children)
+        valuei = cfi + Config.G * m_grid * p_child
 
-            cfi = self.pi_loss_fn.compute_cashflow_pi(
-                x_parent.expand(batch_size, n_grid).reshape(-1, 1),
-                z_parent.expand(batch_size, n_grid).reshape(-1, 1),
-                b_parent.expand(batch_size, n_grid).reshape(-1, 1),
-                i_parent.expand(batch_size, n_grid).reshape(-1, 1),
-                q_current_grid.reshape(-1, 1),
-                q_issue.reshape(-1, 1),
-                eta_flat,
-            ).reshape(batch_size, n_grid)
-            valuei = cfi + Config.G * m.expand(batch_size, n_grid) * p_child
+        if branch == "p0":
+            branch_value = value0
+        elif branch == "pi":
+            branch_value = valuei
+        else:
+            branch_value = (1.0 - mix_w) * value0 + mix_w * valuei
 
-            if branch == "p0":
-                branch_value = value0
-            elif branch == "pi":
-                branch_value = valuei
-            else:
-                branch_value = (1.0 - mix_w) * value0 + mix_w * valuei
-
-            value_grid = value_grid + branch_value
-            p_grid_sum = p_grid_sum + p_child
-            default_grid_sum = default_grid_sum + bar_z_child
-
-        n_children = max(1, len(children))
-        value_grid = value_grid / n_children
-        p_grid_mean = p_grid_sum / n_children
-        default_grid_mean = default_grid_sum / n_children
+        value_grid = branch_value.mean(dim=2)
+        p_grid_mean = p_child.mean(dim=2)
+        default_grid_mean = bar_z_child.mean(dim=2)
         argmax_index = value_grid.argmax(dim=1, keepdim=True)
 
         return {
