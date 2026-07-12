@@ -400,8 +400,10 @@ class BPGridTeacher:
         self,
         batch_size: int,
         n_grid: int,
+        n_children: int,
     ) -> int:
-        dynamic_chunk = max(1, self.max_expanded_states // max(batch_size, 1))
+        expanded_per_candidate = max(batch_size * n_children, 1)
+        dynamic_chunk = max(1, self.max_expanded_states // expanded_per_candidate)
         requested_chunk = n_grid if self.candidate_chunk_size <= 0 else self.candidate_chunk_size
         return max(1, min(requested_chunk, dynamic_chunk, n_grid))
 
@@ -416,21 +418,29 @@ class BPGridTeacher:
         mix_weight: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size, n_grid = bp_grid.shape
+        n_children = len(children)
         q_current = _target_q(self.target_model, parent_state)
-        dynamic_chunk = max(1, self.max_expanded_states // max(batch_size, 1))
-        chunk_size = self._resolve_candidate_chunk_size(batch_size=batch_size, n_grid=n_grid)
+        expanded_per_candidate = max(batch_size * n_children, 1)
+        dynamic_chunk = max(1, self.max_expanded_states // expanded_per_candidate)
+        chunk_size = self._resolve_candidate_chunk_size(
+            batch_size=batch_size,
+            n_grid=n_grid,
+            n_children=n_children,
+        )
+        actual_expanded_states = batch_size * chunk_size * max(n_children, 1)
         if not self._grid_chunk_logged:
             logger.info(
-                "BP grid chunk plan | parent_batch=%d n_grid=%d candidate_chunk_cfg=%d "
+                "BP grid chunk plan | parent_batch=%d n_grid=%d n_children=%d candidate_chunk_cfg=%d "
                 "dynamic_chunk=%d resolved_chunk=%d one_shot=%s expanded_states=%d "
                 "max_expanded_states=%d",
                 batch_size,
                 n_grid,
+                n_children,
                 self.candidate_chunk_size,
                 dynamic_chunk,
                 chunk_size,
                 str(chunk_size == n_grid),
-                batch_size * chunk_size,
+                actual_expanded_states,
                 self.max_expanded_states,
             )
             self._grid_chunk_logged = True

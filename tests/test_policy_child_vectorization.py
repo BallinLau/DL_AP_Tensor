@@ -309,6 +309,24 @@ class PolicyChildVectorizationTest(unittest.TestCase):
             atol=0.0,
         )
 
+    def test_candidate_chunk_accounts_for_children(self):
+        teacher = BPGridTeacher(
+            target_model=None,
+            p0_loss_fn=None,
+            pi_loss_fn=None,
+            refine=False,
+            max_expanded_states=24,
+        )
+
+        chunk = teacher._resolve_candidate_chunk_size(
+            batch_size=4,
+            n_grid=10,
+            n_children=3,
+        )
+
+        self.assertEqual(chunk, 2)
+        self.assertLessEqual(4 * chunk * 3, 24)
+
     def test_target_grid_vectorized_chunk_matches_reference_child_loop(self):
         torch.manual_seed(321)
         batch_size = 3
