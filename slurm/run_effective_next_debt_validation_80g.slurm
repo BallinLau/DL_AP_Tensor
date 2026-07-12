@@ -19,14 +19,20 @@ LOG_DIR="${LOG_DIR:-$WORK_ROOT/logs}"
 
 # Tiny simulation smoke scale. This job validates output identities only; it
 # does not run formal training, GPU experiments, or long episode loops.
-SMOKE_N_PATHS="${SMOKE_N_PATHS:-2}"
-SMOKE_GROUP_SIZE="${SMOKE_GROUP_SIZE:-5}"
-SMOKE_HORIZON="${SMOKE_HORIZON:-2}"
-SMOKE_BRANCH_NUM="${SMOKE_BRANCH_NUM:-2}"
-SMOKE_TOL="${SMOKE_TOL:-1e-6}"
+export SMOKE_N_PATHS="${SMOKE_N_PATHS:-2}"
+export SMOKE_GROUP_SIZE="${SMOKE_GROUP_SIZE:-5}"
+export SMOKE_HORIZON="${SMOKE_HORIZON:-2}"
+export SMOKE_BRANCH_NUM="${SMOKE_BRANCH_NUM:-2}"
+export SMOKE_TOL="${SMOKE_TOL:-1e-6}"
 
 mkdir -p "$LOG_DIR" "$WORK_ROOT/.mplcache"
 cd "$REPO_DIR"
+
+REQUIRED_COMMIT="${REQUIRED_COMMIT:-77923d7}"
+if ! git merge-base --is-ancestor "$REQUIRED_COMMIT" HEAD; then
+  echo "ERROR: HEAD does not contain required commit $REQUIRED_COMMIT"
+  exit 1
+fi
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
