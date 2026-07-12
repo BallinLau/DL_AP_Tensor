@@ -18,6 +18,7 @@ sys.path.append(str(ROOT))
 
 from config import Config  # noqa: E402
 from data import simulate_ts_parallel  # noqa: E402
+from data import simulate_ts as simulate_ts_module  # noqa: E402
 from data.sample import Sample  # noqa: E402
 from data.simulate_ts import SimulateTS  # noqa: E402
 from models.policy_value import PolicyValueModel  # noqa: E402
@@ -100,6 +101,78 @@ def test_sample_update_child_leverage_uses_parent_eta_not_child_eta():
     assert set(b_children["b"].round(8).tolist()) == {0.9}
     assert a_children["ETA"].tolist() == [1.0, 0.0]
     assert b_children["ETA"].tolist() == [0.0, 1.0]
+
+
+def _make_serial_sim(device: torch.device):
+    return SimulateTS(
+        models={"policy_value": None, "sdf_fc1": None, "fc2": None},
+        config=Config,
+        n_paths=1,
+        group_size=2,
+        horizon=1,
+        branch_num=2,
+        enable_entry=False,
+        enable_exit=False,
+        device=device,
+    )
+
+
+def _serial_state(device: torch.device):
+    return {
+        "x": torch.tensor(0.0, device=device),
+        "b": torch.tensor([0.6, 0.4], device=device),
+        "bp": torch.tensor([0.2, 0.9], device=device),
+        "z": torch.zeros(2, device=device),
+        "eta": torch.tensor([1.0, 0.0], device=device),
+        "i": torch.zeros(2, device=device),
+        "K": torch.ones(2, device=device),
+        "hatcf": torch.tensor(0.0, device=device),
+        "lnkf": torch.tensor(0.0, device=device),
+        "M": torch.tensor(1.0, device=device),
+        "hatc_cal": torch.tensor(0.0, device=device),
+        "lnk_cal": torch.tensor(0.0, device=device),
+        "alive": torch.ones(2, dtype=torch.bool, device=device),
+        "entry": torch.zeros(2, device=device),
+        "firm_id": torch.arange(2, device=device),
+        "ids": ["0", "1"],
+        "next_firm_id": torch.tensor(2, device=device),
+        "bar_i": torch.zeros(2, device=device),
+        "bar_z": torch.zeros(2, device=device),
+    }
+
+
+def test_serial_tensor_expand_branches_uses_parent_eta(monkeypatch):
+    device = torch.device("cpu")
+    eta_draws = [torch.zeros(2, device=device), torch.ones(2, device=device)]
+
+    def fake_bernoulli(numel, p, device_arg):
+        return eta_draws.pop(0).reshape(-1)
+
+    monkeypatch.setattr(simulate_ts_module, "sample_bernoulli", fake_bernoulli)
+    sim = _make_serial_sim(device)
+    branches = sim._expand_branches_tensor(_serial_state(device))
+
+    expected_b = torch.tensor([0.2, 0.4], device=device)
+    torch.testing.assert_close(branches[0]["b"], expected_b)
+    torch.testing.assert_close(branches[1]["b"], expected_b)
+    assert not torch.equal(branches[0]["eta"], branches[1]["eta"])
+
+
+def test_serial_legacy_expand_branches_uses_parent_eta(monkeypatch):
+    device = torch.device("cpu")
+    eta_draws = [torch.zeros(2, device=device), torch.ones(2, device=device)]
+
+    def fake_bernoulli(numel, p, device_arg):
+        return eta_draws.pop(0).reshape(-1)
+
+    monkeypatch.setattr(simulate_ts_module, "sample_bernoulli", fake_bernoulli)
+    sim = _make_serial_sim(device)
+    branches = sim._expand_branches(_serial_state(device), t=0)
+
+    expected_b = torch.tensor([0.2, 0.4], device=device)
+    torch.testing.assert_close(branches[0]["b"], expected_b)
+    torch.testing.assert_close(branches[1]["b"], expected_b)
+    assert not torch.equal(branches[0]["eta"], branches[1]["eta"])
 
 
 def main():

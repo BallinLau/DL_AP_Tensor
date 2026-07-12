@@ -1131,8 +1131,8 @@ class Episode:
         # eta 稀疏时，对 Policy/Value 批次进行条件重采样，增强 eta=1 信号。
         resample_enabled = bool(getattr(self.hyperparams, "pv_eta_resample_enabled", True))
         if eta_resample and resample_enabled and n_units > 1 and len(children) > 0:
-            eta_child_stack = torch.stack([c[:, 2:3] for c in children], dim=1)  # (B, N, 1)
-            active_mask = (eta_child_stack.max(dim=1).values.squeeze(-1) > 0.5)
+            eta_current = parent[:, 2:3].clamp(0.0, 1.0)
+            active_mask = eta_current.squeeze(-1) > 0.5
             active_idx = torch.where(active_mask)[0]
             inactive_idx = torch.where(~active_mask)[0]
             if active_idx.numel() > 0 and inactive_idx.numel() > 0:
@@ -3320,6 +3320,13 @@ class Episode:
                 return float(value[active_mask].mean().item())
             return 0.0
 
+        def _active_low_share(value: torch.Tensor) -> float:
+            value = value.reshape_as(grid["bp_star"]).detach()
+            if bool(active_mask.any()):
+                low_threshold = float(getattr(self.hyperparams, "bp_grid_boundary_low_threshold", 0.05))
+                return float((value[active_mask] <= low_threshold).to(torch.float32).mean().item())
+            return 0.0
+
         terms = {
             f'{prefix}_main': float(value_loss.item()),
             f'{prefix}_foc': 0.0,
@@ -3366,6 +3373,8 @@ class Episode:
             f'{prefix}_grid_boundary_high_share_active': _active_mean(grid["boundary_high"]),
             f'{prefix}_grid_bp_star_mean': float(grid["bp_star"].mean().item()),
             f'{prefix}_grid_bp_star_mean_active': _active_mean(grid["bp_star"]),
+            f'{prefix}_grid_bp_candidate_mean_active': _active_mean(bp_pred),
+            f'{prefix}_grid_bp_candidate_low_share_active': _active_low_share(bp_pred),
             f'{prefix}_grid_bp_star_p50': self._safe_quantile(grid["bp_star"], 0.50),
             f'{prefix}_grid_bp_star_p90': self._safe_quantile(grid["bp_star"], 0.90),
             f'{prefix}_grid_value_star_mean': float(grid["value_star"].mean().item()),
@@ -3413,6 +3422,13 @@ class Episode:
                 return float(value[active_mask].mean().item())
             return 0.0
 
+        def _active_low_share(value: torch.Tensor) -> float:
+            value = value.reshape_as(grid["bp_star"]).detach()
+            if bool(active_mask.any()):
+                low_threshold = float(getattr(self.hyperparams, "bp_grid_boundary_low_threshold", 0.05))
+                return float((value[active_mask] <= low_threshold).to(torch.float32).mean().item())
+            return 0.0
+
         return {
             f'{prefix}_grid_policy_loss': float(policy_loss.item()),
             f'{prefix}_grid_policy_loss_elem_mean': float(policy_loss_elem.detach().mean().item()),
@@ -3432,6 +3448,8 @@ class Episode:
             f'{prefix}_grid_boundary_high_share_active': _active_mean(grid["boundary_high"]),
             f'{prefix}_grid_bp_star_mean': float(grid["bp_star"].mean().item()),
             f'{prefix}_grid_bp_star_mean_active': _active_mean(grid["bp_star"]),
+            f'{prefix}_grid_bp_candidate_mean_active': _active_mean(bp_pred),
+            f'{prefix}_grid_bp_candidate_low_share_active': _active_low_share(bp_pred),
             f'{prefix}_grid_bp_star_p50': self._safe_quantile(grid["bp_star"], 0.50),
             f'{prefix}_grid_bp_star_p90': self._safe_quantile(grid["bp_star"], 0.90),
             f'{prefix}_grid_value_star_mean': float(grid["value_star"].mean().item()),
@@ -4582,8 +4600,8 @@ class Episode:
         # eta 稀疏时，对 Policy/Value 批次进行条件重采样，增强 eta=1 信号。
         resample_enabled = bool(getattr(self.hyperparams, "pv_eta_resample_enabled", True))
         if eta_resample and resample_enabled and n_units > 1 and len(children) > 0:
-            eta_child_stack = torch.stack([c[:, 2:3] for c in children], dim=1)  # (B, N, 1)
-            active_mask = (eta_child_stack.max(dim=1).values.squeeze(-1) > 0.5)
+            eta_current = parent[:, 2:3].clamp(0.0, 1.0)
+            active_mask = eta_current.squeeze(-1) > 0.5
             active_idx = torch.where(active_mask)[0]
             inactive_idx = torch.where(~active_mask)[0]
             if active_idx.numel() > 0 and inactive_idx.numel() > 0:
@@ -4963,8 +4981,22 @@ class Episode:
                         err_eval = err[active]
                         regret_eval = regret[active]
                     else:
-                        err_eval = err
-                        regret_eval = regret
+                        return {
+                            'enabled': False,
+                            'n': int(err.numel()),
+                            'n_active': 0,
+                            'mae': float('nan'),
+                            'mae_p90': float('nan'),
+                            'regret_mean': float('nan'),
+                            'regret_p90': float('nan'),
+                            'mae_all': mae_all,
+                            'mae_p90_all': mae_p90_all,
+                            'regret_mean_all': regret_mean_all,
+                            'regret_p90_all': regret_p90_all,
+                            'survival_active_share': active_share,
+                            'passed': True,
+                            'skip_reason': 'no_active_refinancing_states',
+                        }
                 else:
                     err_eval = err
                     regret_eval = regret
@@ -5054,9 +5086,14 @@ class Episode:
                     bp_pred=bp_mix_cond,
                     mix_weight=mix_weight_target,
                 )
-                p0_acc.update(bp0_t, p0_grid)
-                pi_acc.update(bpI_t, pi_grid)
-                mix_acc.update(bp_mix_cond, mix_grid, active_weight=mix_survival_target)
+                p0_acc.update(bp0_t, p0_grid, active_weight=p0_grid.get("refi_active"))
+                pi_acc.update(bpI_t, pi_grid, active_weight=pi_grid.get("refi_active"))
+                mix_active_weight = mix_grid.get("refi_active")
+                if mix_active_weight is not None:
+                    mix_active_weight = mix_active_weight * mix_survival_target.detach().clamp(0.0, 1.0)
+                else:
+                    mix_active_weight = mix_survival_target
+                mix_acc.update(bp_mix_cond, mix_grid, active_weight=mix_active_weight)
 
         policies = {
             'bp0': p0_acc.summarize(),
@@ -5064,7 +5101,13 @@ class Episode:
             'mix': mix_acc.summarize(),
         }
         enabled = [v for v in policies.values() if v.get('enabled', False)]
-        passed = bool(enabled) and all(v.get('passed', False) for v in enabled)
+        skipped = [
+            v for v in policies.values()
+            if (not v.get('enabled', False)) and v.get('passed', False)
+        ]
+        passed = (bool(enabled) or bool(skipped)) and all(
+            v.get('passed', False) for v in enabled + skipped
+        )
         logger.info(
             "Target-grid policy convergence | mae<%.3e, regret_p90<%.3e, passed=%s",
             mae_thr,

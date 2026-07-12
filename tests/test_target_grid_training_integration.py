@@ -89,6 +89,30 @@ def test_target_grid_loss_logs_mix_regret_and_freezes_target_gradients():
     assert all(p.grad is None for p in episode.firm_target.parameters())
 
 
+def test_target_grid_policy_convergence_skips_without_active_refinancing():
+    device = torch.device("cpu")
+    Config.DEVICE = device
+    online = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8).to(device)
+    target = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8).to(device)
+    episode = Episode(
+        models={"policy_value": online},
+        optimizers={"policy_value": torch.optim.Adam(online.parameters(), lr=1e-3)},
+        config=Config,
+        hyperparams=_small_hyperparams(),
+        device=device,
+        firm_target=target,
+    )
+
+    batch = _batch(device)
+    batch["parent"][:, 2:3] = 0.0
+    result = episode.evaluate_target_grid_policy_convergence([batch])
+
+    assert result["enabled"] is True
+    assert result["passed"] is True
+    assert result["policies"]["bp0"]["skip_reason"] == "no_active_refinancing_states"
+    assert result["policies"]["bpI"]["skip_reason"] == "no_active_refinancing_states"
+
+
 def _module_grad_sum(module: torch.nn.Module) -> float:
     total = 0.0
     for p in module.parameters():
