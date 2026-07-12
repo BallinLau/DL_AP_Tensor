@@ -333,6 +333,10 @@ class HyperParams:
     bp_grid_margin_scale: float = 1e-3
     bp_grid_confidence_relative: bool = True
     bp_grid_confidence_min: float = 0.0
+    # Diagnostic-only threshold for reporting the share of active refinancing
+    # policy candidates near the lower bp boundary. This parameter does not
+    # enter the policy loss or grid search.
+    bp_grid_boundary_low_threshold: float = 0.05
     # Under target_grid mode, policy convergence is checked in addition to
     # Bellman residual convergence.
     bp_grid_conv_mae_thresh: float = 0.05

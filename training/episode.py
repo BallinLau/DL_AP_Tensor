@@ -3294,6 +3294,30 @@ class Episode:
             return diff
         return torch.where(diff < beta, 0.5 * diff.pow(2) / beta, diff - 0.5 * beta)
 
+    @staticmethod
+    def _masked_diag_mean(value: torch.Tensor, mask: torch.Tensor) -> float:
+        value_flat = value.detach().reshape(-1)
+        mask_flat = mask.detach().reshape(-1).to(torch.bool)
+        if value_flat.numel() != mask_flat.numel():
+            raise ValueError("masked diagnostic value and mask must have the same length")
+        selected = value_flat[mask_flat]
+        selected = selected[torch.isfinite(selected)]
+        if selected.numel() == 0:
+            return 0.0
+        return float(selected.mean().item())
+
+    @staticmethod
+    def _masked_diag_quantile(value: torch.Tensor, mask: torch.Tensor, q: float) -> float:
+        value_flat = value.detach().reshape(-1)
+        mask_flat = mask.detach().reshape(-1).to(torch.bool)
+        if value_flat.numel() != mask_flat.numel():
+            raise ValueError("masked diagnostic value and mask must have the same length")
+        selected = value_flat[mask_flat]
+        selected = selected[torch.isfinite(selected)]
+        if selected.numel() == 0:
+            return 0.0
+        return float(torch.quantile(selected, float(q)).item())
+
     def _grid_diag_terms(
         self,
         prefix: str,
@@ -3313,19 +3337,19 @@ class Episode:
         if refi_active is None:
             refi_active = torch.ones_like(grid["bp_star"])
         active_mask = refi_active.reshape_as(grid["bp_star"]) > 0.5
+        active_n = int(active_mask.to(torch.int64).sum().item())
+        active_available = float(active_n > 0)
+        low_threshold = float(getattr(self.hyperparams, "bp_grid_boundary_low_threshold", 0.05))
 
         def _active_mean(value: torch.Tensor) -> float:
-            value = value.reshape_as(grid["bp_star"]).detach()
-            if bool(active_mask.any()):
-                return float(value[active_mask].mean().item())
-            return 0.0
+            return self._masked_diag_mean(value.reshape_as(grid["bp_star"]), active_mask)
+
+        def _active_quantile(value: torch.Tensor, q: float) -> float:
+            return self._masked_diag_quantile(value.reshape_as(grid["bp_star"]), active_mask, q)
 
         def _active_low_share(value: torch.Tensor) -> float:
-            value = value.reshape_as(grid["bp_star"]).detach()
-            if bool(active_mask.any()):
-                low_threshold = float(getattr(self.hyperparams, "bp_grid_boundary_low_threshold", 0.05))
-                return float((value[active_mask] <= low_threshold).to(torch.float32).mean().item())
-            return 0.0
+            value = (value.reshape_as(grid["bp_star"]) <= low_threshold).to(torch.float32)
+            return self._masked_diag_mean(value, active_mask)
 
         terms = {
             f'{prefix}_main': float(value_loss.item()),
@@ -3367,22 +3391,40 @@ class Episode:
             f'{prefix}_grid_top2_margin_p10': self._safe_quantile(grid["top2_margin"], 0.10),
             f'{prefix}_grid_confidence_mean': float(grid["confidence"].mean().item()),
             f'{prefix}_grid_refi_active_share': float(refi_active.detach().mean().item()),
+            f'{prefix}_grid_refi_active_n': float(active_n),
+            f'{prefix}_grid_refi_active_available': active_available,
             f'{prefix}_grid_boundary_low_share': float(grid["boundary_low"].mean().item()),
             f'{prefix}_grid_boundary_high_share': float(grid["boundary_high"].mean().item()),
             f'{prefix}_grid_boundary_low_share_active': _active_mean(grid["boundary_low"]),
             f'{prefix}_grid_boundary_high_share_active': _active_mean(grid["boundary_high"]),
             f'{prefix}_grid_bp_star_mean': float(grid["bp_star"].mean().item()),
+            f'{prefix}_grid_bp_mae_active': _active_mean(bp_err),
+            f'{prefix}_grid_bp_err_p90_active': _active_quantile(bp_err, 0.90),
+            f'{prefix}_grid_regret_mean_active': _active_mean(grid["regret"]),
+            f'{prefix}_grid_regret_p90_active': _active_quantile(grid["regret"], 0.90),
             f'{prefix}_grid_bp_star_mean_active': _active_mean(grid["bp_star"]),
             f'{prefix}_grid_bp_candidate_mean_active': _active_mean(bp_pred),
+            f'{prefix}_grid_bp_star_p50_active': _active_quantile(grid["bp_star"], 0.50),
+            f'{prefix}_grid_bp_star_p90_active': _active_quantile(grid["bp_star"], 0.90),
+            f'{prefix}_grid_bp_candidate_p50_active': _active_quantile(bp_pred, 0.50),
+            f'{prefix}_grid_bp_candidate_p90_active': _active_quantile(bp_pred, 0.90),
             f'{prefix}_grid_bp_candidate_low_share_active': _active_low_share(bp_pred),
             f'{prefix}_grid_bp_star_p50': self._safe_quantile(grid["bp_star"], 0.50),
             f'{prefix}_grid_bp_star_p90': self._safe_quantile(grid["bp_star"], 0.90),
+            f'{prefix}_grid_confidence_mean_active': _active_mean(grid["confidence"]),
+            f'{prefix}_grid_top2_margin_mean_active': _active_mean(grid["top2_margin"]),
+            f'{prefix}_grid_fine_top2_margin_mean_active': _active_mean(grid["fine_top2_margin"]),
             f'{prefix}_grid_value_star_mean': float(grid["value_star"].mean().item()),
             f'{prefix}_grid_value_pred_mean': float(grid["value_pred"].mean().item()),
+            f'{prefix}_grid_value_star_mean_active': _active_mean(grid["value_star"]),
+            f'{prefix}_grid_value_pred_mean_active': _active_mean(grid["value_pred"]),
             f'{prefix}_grid_value_online_mean': float(value_pred_online.detach().mean().item()),
             f'{prefix}_grid_default_at_star_mean': float(grid["default_at_star"].mean().item()),
             f'{prefix}_grid_p_child_at_star_mean': float(grid["p_child_at_star"].mean().item()),
             f'{prefix}_grid_q_issue_at_star_mean': float(grid["q_issue_at_star"].mean().item()),
+            f'{prefix}_grid_default_at_star_mean_active': _active_mean(grid["default_at_star"]),
+            f'{prefix}_grid_p_child_at_star_mean_active': _active_mean(grid["p_child_at_star"]),
+            f'{prefix}_grid_q_issue_at_star_mean_active': _active_mean(grid["q_issue_at_star"]),
             f'{prefix}_grid_argmax_index_mean': float(grid["argmax_index"].to(torch.float32).mean().item()),
             f'{prefix}_grid_value_low_bp_mean': float(grid["coarse_value_grid"][:, 0:1].mean().item()),
             f'{prefix}_grid_value_high_bp_mean': float(grid["coarse_value_grid"][:, -1:].mean().item()),
@@ -3415,19 +3457,19 @@ class Episode:
         if refi_active is None:
             refi_active = torch.ones_like(grid["bp_star"])
         active_mask = refi_active.reshape_as(grid["bp_star"]) > 0.5
+        active_n = int(active_mask.to(torch.int64).sum().item())
+        active_available = float(active_n > 0)
+        low_threshold = float(getattr(self.hyperparams, "bp_grid_boundary_low_threshold", 0.05))
 
         def _active_mean(value: torch.Tensor) -> float:
-            value = value.reshape_as(grid["bp_star"]).detach()
-            if bool(active_mask.any()):
-                return float(value[active_mask].mean().item())
-            return 0.0
+            return self._masked_diag_mean(value.reshape_as(grid["bp_star"]), active_mask)
+
+        def _active_quantile(value: torch.Tensor, q: float) -> float:
+            return self._masked_diag_quantile(value.reshape_as(grid["bp_star"]), active_mask, q)
 
         def _active_low_share(value: torch.Tensor) -> float:
-            value = value.reshape_as(grid["bp_star"]).detach()
-            if bool(active_mask.any()):
-                low_threshold = float(getattr(self.hyperparams, "bp_grid_boundary_low_threshold", 0.05))
-                return float((value[active_mask] <= low_threshold).to(torch.float32).mean().item())
-            return 0.0
+            value = (value.reshape_as(grid["bp_star"]) <= low_threshold).to(torch.float32)
+            return self._masked_diag_mean(value, active_mask)
 
         return {
             f'{prefix}_grid_policy_loss': float(policy_loss.item()),
@@ -3442,21 +3484,39 @@ class Episode:
             f'{prefix}_grid_top2_margin_p10': self._safe_quantile(grid["top2_margin"], 0.10),
             f'{prefix}_grid_confidence_mean': float(grid["confidence"].mean().item()),
             f'{prefix}_grid_refi_active_share': float(refi_active.detach().mean().item()),
+            f'{prefix}_grid_refi_active_n': float(active_n),
+            f'{prefix}_grid_refi_active_available': active_available,
             f'{prefix}_grid_boundary_low_share': float(grid["boundary_low"].mean().item()),
             f'{prefix}_grid_boundary_high_share': float(grid["boundary_high"].mean().item()),
             f'{prefix}_grid_boundary_low_share_active': _active_mean(grid["boundary_low"]),
             f'{prefix}_grid_boundary_high_share_active': _active_mean(grid["boundary_high"]),
             f'{prefix}_grid_bp_star_mean': float(grid["bp_star"].mean().item()),
+            f'{prefix}_grid_bp_mae_active': _active_mean(bp_err),
+            f'{prefix}_grid_bp_err_p90_active': _active_quantile(bp_err, 0.90),
+            f'{prefix}_grid_regret_mean_active': _active_mean(grid["regret"]),
+            f'{prefix}_grid_regret_p90_active': _active_quantile(grid["regret"], 0.90),
             f'{prefix}_grid_bp_star_mean_active': _active_mean(grid["bp_star"]),
             f'{prefix}_grid_bp_candidate_mean_active': _active_mean(bp_pred),
+            f'{prefix}_grid_bp_star_p50_active': _active_quantile(grid["bp_star"], 0.50),
+            f'{prefix}_grid_bp_star_p90_active': _active_quantile(grid["bp_star"], 0.90),
+            f'{prefix}_grid_bp_candidate_p50_active': _active_quantile(bp_pred, 0.50),
+            f'{prefix}_grid_bp_candidate_p90_active': _active_quantile(bp_pred, 0.90),
             f'{prefix}_grid_bp_candidate_low_share_active': _active_low_share(bp_pred),
             f'{prefix}_grid_bp_star_p50': self._safe_quantile(grid["bp_star"], 0.50),
             f'{prefix}_grid_bp_star_p90': self._safe_quantile(grid["bp_star"], 0.90),
+            f'{prefix}_grid_confidence_mean_active': _active_mean(grid["confidence"]),
+            f'{prefix}_grid_top2_margin_mean_active': _active_mean(grid["top2_margin"]),
+            f'{prefix}_grid_fine_top2_margin_mean_active': _active_mean(grid["fine_top2_margin"]),
             f'{prefix}_grid_value_star_mean': float(grid["value_star"].mean().item()),
             f'{prefix}_grid_value_pred_mean': float(grid["value_pred"].mean().item()),
+            f'{prefix}_grid_value_star_mean_active': _active_mean(grid["value_star"]),
+            f'{prefix}_grid_value_pred_mean_active': _active_mean(grid["value_pred"]),
             f'{prefix}_grid_default_at_star_mean': float(grid["default_at_star"].mean().item()),
             f'{prefix}_grid_p_child_at_star_mean': float(grid["p_child_at_star"].mean().item()),
             f'{prefix}_grid_q_issue_at_star_mean': float(grid["q_issue_at_star"].mean().item()),
+            f'{prefix}_grid_default_at_star_mean_active': _active_mean(grid["default_at_star"]),
+            f'{prefix}_grid_p_child_at_star_mean_active': _active_mean(grid["p_child_at_star"]),
+            f'{prefix}_grid_q_issue_at_star_mean_active': _active_mean(grid["q_issue_at_star"]),
             f'{prefix}_grid_argmax_index_mean': float(grid["argmax_index"].to(torch.float32).mean().item()),
             f'{prefix}_grid_value_low_bp_mean': float(grid["coarse_value_grid"][:, 0:1].mean().item()),
             f'{prefix}_grid_value_high_bp_mean': float(grid["coarse_value_grid"][:, -1:].mean().item()),

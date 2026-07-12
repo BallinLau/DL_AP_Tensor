@@ -79,6 +79,28 @@ def test_target_grid_loss_logs_mix_regret_and_freezes_target_gradients():
     assert "mix_grid_bp_mae" in episode._latest_pi_terms
     assert "mix_grid_regret_p90" in episode._latest_pi_terms
     assert episode._latest_pi_terms["mix_grid_policy_weight"] == 1.0
+    required_active_diag_keys = [
+        "mix_grid_refi_active_n",
+        "mix_grid_refi_active_available",
+        "mix_grid_bp_mae_active",
+        "mix_grid_bp_err_p90_active",
+        "mix_grid_regret_mean_active",
+        "mix_grid_regret_p90_active",
+        "mix_grid_bp_star_p50_active",
+        "mix_grid_bp_star_p90_active",
+        "mix_grid_bp_candidate_p50_active",
+        "mix_grid_bp_candidate_p90_active",
+        "mix_grid_bp_candidate_low_share_active",
+        "mix_grid_default_at_star_mean_active",
+        "mix_grid_p_child_at_star_mean_active",
+        "mix_grid_q_issue_at_star_mean_active",
+    ]
+    for key in required_active_diag_keys:
+        assert key in episode._latest_pi_terms
+        assert torch.isfinite(torch.tensor(episode._latest_pi_terms[key]))
+    assert episode._latest_pi_terms["mix_grid_refi_active_n"] == 1.0
+    assert episode._latest_pi_terms["mix_grid_refi_active_available"] == 1.0
+    assert episode._latest_pi_terms["mix_grid_refi_active_share"] == 0.5
 
     online_grad = [
         p.grad.detach().abs().sum().item()
@@ -87,6 +109,29 @@ def test_target_grid_loss_logs_mix_regret_and_freezes_target_gradients():
     ]
     assert online_grad and sum(online_grad) > 0.0
     assert all(p.grad is None for p in episode.firm_target.parameters())
+
+
+def test_masked_grid_diagnostics_ignore_inactive_observations():
+    value = torch.tensor([[1.0], [100.0]])
+    active = torch.tensor([[True], [False]])
+
+    assert Episode._masked_diag_mean(value, active) == 1.0
+    assert Episode._masked_diag_quantile(value, active, 0.90) == 1.0
+
+
+def test_masked_grid_diagnostics_are_finite_without_active_observations():
+    value = torch.tensor([[1.0], [2.0]])
+    active = torch.tensor([[False], [False]])
+
+    assert Episode._masked_diag_mean(value, active) == 0.0
+    assert Episode._masked_diag_quantile(value, active, 0.90) == 0.0
+
+
+def test_bp_grid_boundary_low_threshold_is_explicit_hyperparameter():
+    hp = HyperParams()
+
+    assert hasattr(hp, "bp_grid_boundary_low_threshold")
+    assert hp.bp_grid_boundary_low_threshold == 0.05
 
 
 def test_target_grid_policy_convergence_skips_without_active_refinancing():
