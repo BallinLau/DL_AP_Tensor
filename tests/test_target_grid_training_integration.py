@@ -109,8 +109,80 @@ def test_target_grid_policy_convergence_skips_without_active_refinancing():
 
     assert result["enabled"] is True
     assert result["passed"] is True
+    assert result["informative"] is False
+    assert result["all_skipped"] is True
+    assert result["skip_reason"] == "no_active_refinancing_states"
+    assert result["informative_policies"] == []
+    assert result["skipped_policies"] == ["bp0", "bpI", "mix"]
     assert result["policies"]["bp0"]["skip_reason"] == "no_active_refinancing_states"
     assert result["policies"]["bpI"]["skip_reason"] == "no_active_refinancing_states"
+
+
+def test_policy_convergence_selector_prefers_informative_validation():
+    train = {"enabled": True, "informative": True, "passed": False}
+    val = {"enabled": True, "informative": True, "passed": True}
+
+    selected, source = Episode._select_policy_convergence_result(train, val)
+
+    assert selected is val
+    assert source == "validation"
+
+
+def test_policy_convergence_selector_falls_back_to_training_when_validation_skipped():
+    train = {"enabled": True, "informative": True, "passed": True}
+    val = {
+        "enabled": True,
+        "informative": False,
+        "all_skipped": True,
+        "passed": True,
+        "skip_reason": "no_active_refinancing_states",
+    }
+
+    selected, source = Episode._select_policy_convergence_result(train, val)
+
+    assert selected is train
+    assert source == "training_fallback"
+
+
+def test_policy_convergence_selector_skips_only_when_train_and_validation_uninformative():
+    train = {
+        "enabled": True,
+        "informative": False,
+        "all_skipped": True,
+        "passed": True,
+        "skip_reason": "no_active_refinancing_states",
+    }
+    val = {
+        "enabled": True,
+        "informative": False,
+        "all_skipped": True,
+        "passed": True,
+        "skip_reason": "no_active_refinancing_states",
+    }
+
+    selected, source = Episode._select_policy_convergence_result(train, val)
+
+    assert source == "skipped"
+    assert selected["passed"] is True
+    assert selected["informative"] is False
+    assert selected["all_skipped"] is True
+
+
+def test_policy_convergence_selector_marks_unavailable_errors_as_failed():
+    train = {"enabled": False, "informative": False, "passed": False, "policies": {}}
+    val = {
+        "enabled": True,
+        "informative": False,
+        "all_skipped": True,
+        "passed": True,
+        "skip_reason": "no_active_refinancing_states",
+    }
+
+    selected, source = Episode._select_policy_convergence_result(train, val)
+
+    assert source == "unavailable"
+    assert selected["passed"] is False
+    assert selected["skip_reason"] == "policy_convergence_unavailable"
 
 
 def _module_grad_sum(module: torch.nn.Module) -> float:

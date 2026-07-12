@@ -5100,27 +5100,108 @@ class Episode:
             'bpI': pi_acc.summarize(),
             'mix': mix_acc.summarize(),
         }
-        enabled = [v for v in policies.values() if v.get('enabled', False)]
-        skipped = [
-            v for v in policies.values()
-            if (not v.get('enabled', False)) and v.get('passed', False)
-        ]
-        passed = (bool(enabled) or bool(skipped)) and all(
-            v.get('passed', False) for v in enabled + skipped
-        )
+        informative_policies = {
+            name: result
+            for name, result in policies.items()
+            if result.get('enabled', False)
+        }
+        skipped_policies = {
+            name: result
+            for name, result in policies.items()
+            if (
+                not result.get('enabled', False)
+                and result.get('skip_reason') == 'no_active_refinancing_states'
+            )
+        }
+        invalid_policies = {
+            name: result
+            for name, result in policies.items()
+            if name not in informative_policies and name not in skipped_policies
+        }
+
+        informative = bool(informative_policies)
+        all_skipped = (not informative) and len(skipped_policies) == len(policies)
+        if informative:
+            passed = (
+                not invalid_policies
+                and all(result.get('passed', False) for result in informative_policies.values())
+            )
+        elif all_skipped:
+            passed = True
+        else:
+            passed = False
+
+        if all_skipped:
+            skip_reason = 'no_active_refinancing_states'
+        elif invalid_policies and not informative:
+            skip_reason = 'policy_convergence_unavailable'
+        else:
+            skip_reason = None
+
         logger.info(
-            "Target-grid policy convergence | mae<%.3e, regret_p90<%.3e, passed=%s",
+            (
+                "Target-grid policy convergence | mae<%.3e, regret_p90<%.3e, "
+                "informative=%s, all_skipped=%s, invalid=%s, passed=%s"
+            ),
             mae_thr,
             regret_thr,
+            str(informative),
+            str(all_skipped),
+            sorted(invalid_policies.keys()),
             str(passed),
         )
         return {
             'enabled': True,
+            'informative': informative,
+            'all_skipped': all_skipped,
+            'skip_reason': skip_reason,
+            'n_informative_policies': len(informative_policies),
+            'informative_policies': sorted(informative_policies.keys()),
+            'skipped_policies': sorted(skipped_policies.keys()),
+            'invalid_policies': sorted(invalid_policies.keys()),
             'thresholds': {'mae': mae_thr, 'regret_p90': regret_thr, 'survival_eps': survival_eps},
             'max_batches': max_batches,
             'policies': policies,
             'passed': passed,
         }
+
+    @staticmethod
+    def _select_policy_convergence_result(
+        policy_train: Dict[str, Any],
+        policy_val: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], str]:
+        """Select an informative policy convergence result."""
+        if policy_val.get('informative', False):
+            return policy_val, 'validation'
+
+        if policy_train.get('informative', False):
+            return policy_train, 'training_fallback'
+
+        val_not_available = not policy_val.get('enabled', False)
+        val_all_skipped = policy_val.get('all_skipped', False)
+        train_all_skipped = policy_train.get('all_skipped', False)
+
+        if train_all_skipped and (val_not_available or val_all_skipped):
+            return {
+                'enabled': False,
+                'informative': False,
+                'all_skipped': True,
+                'passed': True,
+                'skip_reason': 'no_active_refinancing_states_in_train_or_validation',
+                'policies': {},
+            }, 'skipped'
+
+        return {
+            'enabled': True,
+            'informative': False,
+            'all_skipped': False,
+            'passed': False,
+            'skip_reason': 'policy_convergence_unavailable',
+            'policies': {
+                'train': policy_train,
+                'validation': policy_val,
+            },
+        }, 'unavailable'
 
     def evaluate_bellman_convergence(
         self,
@@ -5263,17 +5344,25 @@ class Episode:
         policy_val = (
             self.evaluate_target_grid_policy_convergence(validation_batches)
             if validation_batches
-            else {'enabled': False, 'passed': True, 'policies': {}}
+            else {
+                'enabled': False,
+                'informative': False,
+                'all_skipped': False,
+                'passed': True,
+                'skip_reason': 'no_validation_batches',
+                'policies': {},
+            }
         )
-        policy_convergence = policy_val if policy_val.get('enabled', False) else policy_train
+        policy_convergence, policy_source = (
+            self._select_policy_convergence_result(
+                policy_train=policy_train,
+                policy_val=policy_val,
+            )
+        )
 
         enabled_eq = [m for m in equations.values() if m.get('enabled', False)]
         bellman_passed = bool(enabled_eq) and all(m.get('passed', False) for m in enabled_eq)
-        policy_passed = (
-            bool(policy_convergence.get('passed', False))
-            if policy_convergence.get('enabled', False)
-            else True
-        )
+        policy_passed = bool(policy_convergence.get('passed', False))
         all_passed = bool(bellman_passed and policy_passed)
         summary = {
             'enabled': True,
@@ -5283,16 +5372,25 @@ class Episode:
             'policy': policy_convergence,
             'policy_train': policy_train,
             'policy_val': policy_val,
+            'policy_source': policy_source,
+            'policy_informative': bool(policy_convergence.get('informative', False)),
+            'policy_all_skipped': bool(policy_convergence.get('all_skipped', False)),
             'bellman_passed': bellman_passed,
             'policy_passed': policy_passed,
             'passed': all_passed
         }
         logger.info(
-            "Bellman convergence summary | mean<%.3e, p90<%.3e, bellman_passed=%s, policy_passed=%s, passed=%s",
+            (
+                "Bellman convergence summary | mean<%.3e, p90<%.3e, "
+                "bellman_passed=%s, policy_passed=%s, policy_source=%s, "
+                "policy_informative=%s, passed=%s"
+            ),
             mean_thr,
             p90_thr,
             str(bellman_passed),
             str(policy_passed),
+            policy_source,
+            str(policy_convergence.get('informative', False)),
             str(all_passed)
         )
         return summary
