@@ -4,6 +4,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pandas as pd
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,6 +109,74 @@ class StageBatchSizeTest(unittest.TestCase):
         selected = batches[0]["parent_source_index"]
         selected_parent_eta = parent[selected, 2]
         self.assertEqual(int((selected_parent_eta > 0.5).sum().item()), 2)
+
+    def test_dataframe_pv_eta_resampling_uses_parent_eta_not_child_eta(self):
+        episode = Episode.__new__(Episode)
+        episode.device = torch.device("cpu")
+        episode.hyperparams = SimpleNamespace(
+            pv_eta_resample_enabled=True,
+            pv_eta_resample_active_share=0.75,
+            max_firm_train_units=0,
+        )
+
+        rows = []
+        parent_eta = [1.0, 0.0, 0.0, 0.0]
+
+        for group_id, eta_parent in enumerate(parent_eta):
+            common = {
+                "path": group_id,
+                "ID": str(group_id),
+                "b": 0.1 + 0.1 * group_id,
+                "z": 0.2,
+                "i": 0.1,
+                "x": 0.0,
+                "Hatcf": -2.0,
+                "LnKF": 4.0,
+                "M": 1.0,
+            }
+
+            rows.append(
+                {
+                    **common,
+                    "t": 0,
+                    "branch": -1,
+                    "ETA": eta_parent,
+                }
+            )
+
+            eta_child = 1.0 - eta_parent
+            for branch in range(2):
+                rows.append(
+                    {
+                        **common,
+                        "t": 1,
+                        "branch": branch,
+                        "ETA": eta_child,
+                    }
+                )
+
+        df = pd.DataFrame(rows)
+
+        torch.manual_seed(1234)
+        batches = episode._create_firm_batches_from_df(
+            df,
+            batch_size=4,
+            n_branches=2,
+        )
+
+        self.assertTrue(batches)
+
+        selected_parent = torch.cat(
+            [batch["parent"] for batch in batches],
+            dim=0,
+        )
+        selected_parent_eta = selected_parent[:, 2]
+
+        self.assertEqual(selected_parent.shape[0], 4)
+        self.assertEqual(
+            int((selected_parent_eta > 0.5).sum().item()),
+            3,
+        )
 
 
 if __name__ == "__main__":
