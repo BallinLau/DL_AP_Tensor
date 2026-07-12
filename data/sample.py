@@ -32,6 +32,7 @@ from .data_utils import (
 )
 from .tensor_data import TensorTable
 from .sample_parallel import build_policy_value_tables_parallel
+from utils.firm_transition import apply_refinancing_policy
 
 
 class Sample:
@@ -794,7 +795,7 @@ class Sample:
         ]:
             df.loc[parent_mask, col] = val.cpu().numpy()
 
-        # 基于 parent 的 bp 与 child 的 ETA(eta_{t+1}) 更新 child 杠杆
+        # 基于 parent 的 bp 与当前 ETA(eta_t) 更新 child 杠杆；child ETA 是 eta_{t+1}
         self._update_child_leverage(df)
 
         # 更新 child 输入后再跑一次模型获取 child 输出
@@ -898,9 +899,10 @@ class Sample:
     
     def _update_child_leverage(self, df: pd.DataFrame):
         """
-        根据 parent 的决策更新 child 的杠杆
-        
-        b_{t+1} = η_{t+1} * bp_t + (1 - η_{t+1}) * b_t
+        根据 parent 的当前 refinancing shock 和政策更新 child 的杠杆。
+
+        b_{t+1} = η_t * bp_t + (1 - η_t) * b_t
+        child 行的 ETA 保持为 η_{t+1}，不能进入当前杠杆 transition。
         """
         if 'bp' not in df.columns:
             return
@@ -912,8 +914,13 @@ class Sample:
                     continue
                 bp_parent = parent_rows['bp'].values[0]
                 b_parent = parent_rows['b'].values[0]
-                eta_child = child_rows['ETA'].values
-                df.loc[child_rows.index, 'b'] = eta_child * bp_parent + (1 - eta_child) * b_parent
+                eta_current = parent_rows['ETA'].values[0]
+                b_next = apply_refinancing_policy(
+                    b_current=torch.tensor([[b_parent]], dtype=torch.float64),
+                    bp_candidate=torch.tensor([[bp_parent]], dtype=torch.float64),
+                    eta_current=torch.tensor([[eta_current]], dtype=torch.float64),
+                ).item()
+                df.loc[child_rows.index, 'b'] = b_next
     
     def diagnose(self, df: pd.DataFrame) -> Dict:
         """

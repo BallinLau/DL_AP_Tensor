@@ -29,6 +29,7 @@ from .data_utils import (
 from .tensor_data import TensorTable, TensorSimulationOutput, cat_rows
 from .simulate_ts_parallel import simulate_tensor_parallel
 from .simulation_forward import forward_policy_value_for_simulation
+from utils.firm_transition import apply_refinancing_policy
 
 
 class SimulateTS:
@@ -644,8 +645,12 @@ class SimulateTS:
                         bp_prev = torch.cat([bp_prev, pad], dim=0)
                     else:
                         bp_prev = bp_prev[: b_prev.numel()]
-                eta_next = new_state['eta'].reshape(-1)
-                new_state['b'] = eta_next * bp_prev + (1 - eta_next) * b_prev
+                eta_current = state['eta'].reshape(-1)
+                new_state['b'] = apply_refinancing_policy(
+                    b_current=b_prev,
+                    bp_candidate=bp_prev,
+                    eta_current=eta_current,
+                )
             else:
                 new_state['b'] = b_prev.clone()
 
@@ -736,9 +741,13 @@ class SimulateTS:
                 else:
                     bp_prev = bp_prev[: b_prev.numel()]
             if bp_prev is not None:
-                # 按 eta_{t+1} 更新 b_{t+1}
-                eta_next = new_state['eta'].reshape(-1)
-                new_state['b'] = eta_next * bp_prev + (1 - eta_next) * b_prev
+                # Apply the current-period refinancing shock eta_t to b_{t+1}.
+                eta_current = state['eta'].reshape(-1)
+                new_state['b'] = apply_refinancing_policy(
+                    b_current=b_prev,
+                    bp_candidate=bp_prev,
+                    eta_current=eta_current,
+                )
             else:
                 new_state['b'] = b_prev.clone()
             

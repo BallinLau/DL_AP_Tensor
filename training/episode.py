@@ -41,6 +41,7 @@ from .sdf_shock_bank import (
 from .bp_grid_teacher import BPGridTeacher
 from .target_utils import hard_update, soft_update
 from utils.gpu_monitor import GPUMonitor, print_memory_summary
+from utils.firm_transition import apply_refinancing_policy
 
 
 logger = logging.getLogger(__name__)
@@ -3308,6 +3309,17 @@ class Episode:
         extra_terms: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
         bp_err = (bp_pred.detach() - grid["bp_star"]).abs()
+        refi_active = grid.get("refi_active")
+        if refi_active is None:
+            refi_active = torch.ones_like(grid["bp_star"])
+        active_mask = refi_active.reshape_as(grid["bp_star"]) > 0.5
+
+        def _active_mean(value: torch.Tensor) -> float:
+            value = value.reshape_as(grid["bp_star"]).detach()
+            if bool(active_mask.any()):
+                return float(value[active_mask].mean().item())
+            return 0.0
+
         terms = {
             f'{prefix}_main': float(value_loss.item()),
             f'{prefix}_foc': 0.0,
@@ -3347,9 +3359,13 @@ class Episode:
             f'{prefix}_grid_fine_top2_margin_mean': float(grid["fine_top2_margin"].mean().item()),
             f'{prefix}_grid_top2_margin_p10': self._safe_quantile(grid["top2_margin"], 0.10),
             f'{prefix}_grid_confidence_mean': float(grid["confidence"].mean().item()),
+            f'{prefix}_grid_refi_active_share': float(refi_active.detach().mean().item()),
             f'{prefix}_grid_boundary_low_share': float(grid["boundary_low"].mean().item()),
             f'{prefix}_grid_boundary_high_share': float(grid["boundary_high"].mean().item()),
+            f'{prefix}_grid_boundary_low_share_active': _active_mean(grid["boundary_low"]),
+            f'{prefix}_grid_boundary_high_share_active': _active_mean(grid["boundary_high"]),
             f'{prefix}_grid_bp_star_mean': float(grid["bp_star"].mean().item()),
+            f'{prefix}_grid_bp_star_mean_active': _active_mean(grid["bp_star"]),
             f'{prefix}_grid_bp_star_p50': self._safe_quantile(grid["bp_star"], 0.50),
             f'{prefix}_grid_bp_star_p90': self._safe_quantile(grid["bp_star"], 0.90),
             f'{prefix}_grid_value_star_mean': float(grid["value_star"].mean().item()),
@@ -3386,6 +3402,17 @@ class Episode:
         policy_weight: float,
     ) -> Dict[str, float]:
         bp_err = (bp_pred.detach() - grid["bp_star"]).abs()
+        refi_active = grid.get("refi_active")
+        if refi_active is None:
+            refi_active = torch.ones_like(grid["bp_star"])
+        active_mask = refi_active.reshape_as(grid["bp_star"]) > 0.5
+
+        def _active_mean(value: torch.Tensor) -> float:
+            value = value.reshape_as(grid["bp_star"]).detach()
+            if bool(active_mask.any()):
+                return float(value[active_mask].mean().item())
+            return 0.0
+
         return {
             f'{prefix}_grid_policy_loss': float(policy_loss.item()),
             f'{prefix}_grid_policy_loss_elem_mean': float(policy_loss_elem.detach().mean().item()),
@@ -3398,9 +3425,13 @@ class Episode:
             f'{prefix}_grid_fine_top2_margin_mean': float(grid["fine_top2_margin"].mean().item()),
             f'{prefix}_grid_top2_margin_p10': self._safe_quantile(grid["top2_margin"], 0.10),
             f'{prefix}_grid_confidence_mean': float(grid["confidence"].mean().item()),
+            f'{prefix}_grid_refi_active_share': float(refi_active.detach().mean().item()),
             f'{prefix}_grid_boundary_low_share': float(grid["boundary_low"].mean().item()),
             f'{prefix}_grid_boundary_high_share': float(grid["boundary_high"].mean().item()),
+            f'{prefix}_grid_boundary_low_share_active': _active_mean(grid["boundary_low"]),
+            f'{prefix}_grid_boundary_high_share_active': _active_mean(grid["boundary_high"]),
             f'{prefix}_grid_bp_star_mean': float(grid["bp_star"].mean().item()),
+            f'{prefix}_grid_bp_star_mean_active': _active_mean(grid["bp_star"]),
             f'{prefix}_grid_bp_star_p50': self._safe_quantile(grid["bp_star"], 0.50),
             f'{prefix}_grid_bp_star_p90': self._safe_quantile(grid["bp_star"], 0.90),
             f'{prefix}_grid_value_star_mean': float(grid["value_star"].mean().item()),
@@ -3594,6 +3625,7 @@ class Episode:
         children: List[torch.Tensor],
         bp: torch.Tensor,
         b_parent: torch.Tensor,
+        eta_current: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not children:
             raise ValueError(
@@ -3602,13 +3634,13 @@ class Episode:
 
         children_t = torch.stack(children, dim=1)
         child_state_raw = children_t[..., :7] if children_t.shape[-1] > 7 else children_t
-        eta_children = children_t[..., 2:3]
-        bp_expanded = bp.unsqueeze(1)
-        b_parent_expanded = b_parent.unsqueeze(1)
-        b_children = (
-            eta_children * bp_expanded
-            + (1.0 - eta_children) * b_parent_expanded
+        n_children = child_state_raw.shape[1]
+        b_next = apply_refinancing_policy(
+            b_current=b_parent,
+            bp_candidate=bp,
+            eta_current=eta_current,
         )
+        b_children = b_next.unsqueeze(1).expand(-1, n_children, -1)
         child_states = torch.cat(
             [
                 b_children,
@@ -3616,13 +3648,15 @@ class Episode:
             ],
             dim=-1,
         )
-        return child_states, eta_children
+        eta_next = children_t[..., 2:3]
+        return child_states, eta_next
 
     def _forward_vectorized_policy_children(
         self,
         children: List[torch.Tensor],
         bp: torch.Tensor,
         b_parent: torch.Tensor,
+        eta_current: torch.Tensor,
         model,
         target_model,
     ) -> Dict[str, Any]:
@@ -3630,6 +3664,7 @@ class Episode:
             children=children,
             bp=bp,
             b_parent=b_parent,
+            eta_current=eta_current,
         )
         batch_size = int(child_states.shape[0])
         n_children = int(child_states.shape[1])
@@ -3691,6 +3726,7 @@ class Episode:
             bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
         # P0 分支使用不投资场景的杠杆候选 bp0
         b_parent = parent_state[:, 0:1]
+        eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
         bp_for_p0 = self._apply_policy_ablation(bp0_t, b_parent)
 
         if self._pv_use_target_grid_bp() and not self._policy_value_bellman_only():
@@ -3713,6 +3749,7 @@ class Episode:
             children=children,
             bp=bp_for_p0,
             b_parent=b_parent,
+            eta_current=eta_current,
             model=model,
             target_model=target_model,
         )
@@ -3720,13 +3757,8 @@ class Episode:
         target_children_flat = child_pack["target_output_flat"]
         B = child_pack["batch_size"]
         N = child_pack["n_children"]
-        eta_children_tensor = child_pack["eta_children"]
             
         childp0_state = parent_state.clone()
-        childp0_state[:, 0:1] = bp_for_p0
-        outputp0_children = model(childp0_state)
-        with torch.no_grad():
-            outputp0_children_target = target_model(childp0_state.detach())
         
         # 提取 P0 和所需变量
         P0 = _get_out(output_t, 'P0', 3)
@@ -3746,10 +3778,19 @@ class Episode:
         P_children_for_foc = list(P_children_for_foc_tensor.unbind(dim=1))
         bar_z_children = list(bar_z_children_tensor.unbind(dim=1))
         bar_z_children_for_foc = list(bar_z_children_for_foc_tensor.unbind(dim=1))
-        eta_children = list(eta_children_tensor.unbind(dim=1))
+        eta_current_by_branch = [eta_current for _ in range(N)]
+        b_effective_p0 = apply_refinancing_policy(
+            b_current=b_parent,
+            bp_candidate=bp_for_p0,
+            eta_current=eta_current,
+        )
         
         # Q 值
         Q = _get_out(output_t, 'Q', 0)
+        childp0_state[:, 0:1] = b_effective_p0
+        outputp0_children = model(childp0_state)
+        with torch.no_grad():
+            outputp0_children_target = target_model(childp0_state.detach())
         Qp = _get_out(outputp0_children_target, 'Q', 0).detach()
         Qp_for_foc = _get_out(outputp0_children, 'Q', 0)
 
@@ -3761,9 +3802,9 @@ class Episode:
                 parent_state[:, 1:2],  # z
                 parent_state[:, 0:1],  # b
                 Q, Qp,
-                eta_j
+                eta_current
             )
-            for eta_j in eta_children
+            for _ in range(N)
         ]
         CF0p_for_foc = [
             loss_fn.compute_cashflow_p0(
@@ -3771,9 +3812,9 @@ class Episode:
                 parent_state[:, 1:2],  # z
                 parent_state[:, 0:1],  # b
                 Q, Qp_for_foc,
-                eta_j
+                eta_current
             )
-            for eta_j in eta_children
+            for _ in range(N)
         ]
         residuals = loss_fn.compute_bellman_residual(
             P0, CF0p, M_list, P_children, bar_z_children
@@ -3806,18 +3847,18 @@ class Episode:
                 P_children=P_children_for_foc,
                 bar_z_children=bar_z_children_for_foc,
                 bp=bp_for_p0,
-                eta=eta_children
+                eta=eta_current_by_branch
             )
             loss_foc, penalty_z_foc, foc_diag = self._compute_conditional_signed_foc_terms(
                 foc_residuals=foc_residuals,
-                eta_children=eta_children,
+                eta_children=eta_current_by_branch,
                 z_parent=parent_state[:, 1:2],
                 alpha_z=loss_fn.alpha_z,
                 beta_z=loss_fn.beta_z,
                 z0=loss_fn.z0
             )
             kkt_penalty_base, kkt_diag = self._compute_bp_kkt_penalty(
-                bp_for_p0, foc_residuals, eta_children=eta_children
+                bp_for_p0, foc_residuals, eta_children=eta_current_by_branch
             )
             p0_kkt_w = float(getattr(self.hyperparams, "p0_kkt_weight", 1.0))
             kkt_penalty = p0_kkt_w * kkt_penalty_base
@@ -3911,6 +3952,7 @@ class Episode:
             bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
         # PI 分支使用投资场景的杠杆候选 bpI
         b_parent = parent_state[:, 0:1]
+        eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
         bp_for_pi = self._apply_policy_ablation(bpI_t, b_parent)
 
         if self._pv_use_target_grid_bp() and not self._policy_value_bellman_only():
@@ -3959,6 +4001,7 @@ class Episode:
             children=children,
             bp=bp_for_pi,
             b_parent=b_parent,
+            eta_current=eta_current,
             model=model,
             target_model=target_model,
         )
@@ -3966,13 +4009,8 @@ class Episode:
         target_children_flat = child_pack["target_output_flat"]
         B = child_pack["batch_size"]
         N = child_pack["n_children"]
-        eta_children_tensor = child_pack["eta_children"]
             
         childpI_state = parent_state.clone()
-        childpI_state[:, 0:1] = bp_for_pi
-        outputpI_children = model(childpI_state)
-        with torch.no_grad():
-            outputpI_children_target = target_model(childpI_state.detach())
         
         # 提取 PI 和所需变量
         Q = _get_out(output_t, 'Q', 0)
@@ -3993,7 +4031,16 @@ class Episode:
         P_children_for_foc = list(P_children_for_foc_tensor.unbind(dim=1))
         bar_z_children = list(bar_z_children_tensor.unbind(dim=1))
         bar_z_children_for_foc = list(bar_z_children_for_foc_tensor.unbind(dim=1))
-        eta_children = list(eta_children_tensor.unbind(dim=1))
+        eta_current_by_branch = [eta_current for _ in range(N)]
+        b_effective_pi = apply_refinancing_policy(
+            b_current=b_parent,
+            bp_candidate=bp_for_pi,
+            eta_current=eta_current,
+        )
+        childpI_state[:, 0:1] = b_effective_pi
+        outputpI_children = model(childpI_state)
+        with torch.no_grad():
+            outputpI_children_target = target_model(childpI_state.detach())
         QpI = _get_out(outputpI_children_target, 'Q', 0).detach()
         QpI_for_foc = _get_out(outputpI_children, 'Q', 0)
         
@@ -4012,9 +4059,9 @@ class Episode:
                 parent_state[:, 0:1],  # b
                 parent_state[:, 3:4],  # i
                 Q, QpI,
-                eta_j
+                eta_current
             )
-            for eta_j in eta_children
+            for _ in range(N)
         ]
         CFip_for_foc = [
             loss_fn.compute_cashflow_pi(
@@ -4023,9 +4070,9 @@ class Episode:
                 parent_state[:, 0:1],  # b
                 parent_state[:, 3:4],  # i
                 Q, QpI_for_foc,
-                eta_j
+                eta_current
             )
-            for eta_j in eta_children
+            for _ in range(N)
         ]
         residuals = loss_fn.compute_bellman_residual(
             PI, CFip, M_list, P_children, bar_z_children
@@ -4059,18 +4106,18 @@ class Episode:
                 P_children=P_children_for_foc,
                 bar_z_children=bar_z_children_for_foc,
                 bp=bp_for_pi,
-                eta=eta_children
+                eta=eta_current_by_branch
             )
             loss_foc, penalty_z_foc, foc_diag = self._compute_conditional_signed_foc_terms(
                 foc_residuals=foc_residuals,
-                eta_children=eta_children,
+                eta_children=eta_current_by_branch,
                 z_parent=parent_state[:, 1:2],
                 alpha_z=loss_fn.alpha_z,
                 beta_z=loss_fn.beta_z,
                 z0=loss_fn.z0
             )
             kkt_penalty_base, kkt_diag = self._compute_bp_kkt_penalty(
-                bp_for_pi, foc_residuals, eta_children=eta_children
+                bp_for_pi, foc_residuals, eta_children=eta_current_by_branch
             )
             pi_kkt_w = float(getattr(self.hyperparams, "pi_kkt_weight", 1.0))
             kkt_penalty = pi_kkt_w * kkt_penalty_base
@@ -4681,18 +4728,21 @@ class Episode:
 
         bp_for_p0 = bp0_t
         b_parent = parent_state[:, 0:1]
+        eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
+        b_effective_p0 = apply_refinancing_policy(
+            b_current=b_parent,
+            bp_candidate=bp_for_p0,
+            eta_current=eta_current,
+        )
         output_children = []
-        eta_children = []
         for child in children:
             child_state_raw = self._policy_strip_extra(child)
-            eta_child = child[:, 2:3]
             child_state = child_state_raw.clone()
-            child_state[:, 0:1] = eta_child * bp_for_p0 + (1 - eta_child) * b_parent
+            child_state[:, 0:1] = b_effective_p0
             output_children.append(model(child_state))
-            eta_children.append(eta_child)
 
         childp0_state = parent_state.clone()
-        childp0_state[:, 0:1] = bp_for_p0
+        childp0_state[:, 0:1] = b_effective_p0
         outputp0_children = model(childp0_state)
 
         P0 = self._policy_get_out(output_t, 'P0', 3)
@@ -4708,9 +4758,9 @@ class Episode:
                 parent_state[:, 0:1],
                 Q,
                 Qp,
-                eta_j
+                eta_current
             )
-            for eta_j in eta_children
+            for _ in children
         ]
         residuals = loss_fn.compute_bellman_residual(P0, CF0p, M_list, P_children, bar_z_children)
         return self._flatten_abs_residuals(residuals)
@@ -4741,18 +4791,21 @@ class Episode:
 
         bp_for_pi = bpI_t
         b_parent = parent_state[:, 0:1]
+        eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
+        b_effective_pi = apply_refinancing_policy(
+            b_current=b_parent,
+            bp_candidate=bp_for_pi,
+            eta_current=eta_current,
+        )
         output_children = []
-        eta_children = []
         for child in children:
             child_state_raw = self._policy_strip_extra(child)
-            eta_child = child[:, 2:3]
             child_state = child_state_raw.clone()
-            child_state[:, 0:1] = eta_child * bp_for_pi + (1 - eta_child) * b_parent
+            child_state[:, 0:1] = b_effective_pi
             output_children.append(model(child_state))
-            eta_children.append(eta_child)
 
         childpI_state = parent_state.clone()
-        childpI_state[:, 0:1] = bp_for_pi
+        childpI_state[:, 0:1] = b_effective_pi
         outputpI_children = model(childpI_state)
 
         Q = self._policy_get_out(output_t, 'Q', 0)
@@ -4769,9 +4822,9 @@ class Episode:
                 parent_state[:, 3:4],
                 Q,
                 QpI,
-                eta_j
+                eta_current
             )
-            for eta_j in eta_children
+            for _ in children
         ]
         residuals = loss_fn.compute_bellman_residual(PI, CFip, M_list, P_children, bar_z_children)
         return self._flatten_abs_residuals(residuals)

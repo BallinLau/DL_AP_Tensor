@@ -124,8 +124,28 @@ def test_grid_teacher_debt_state_semantics():
     assert torch.allclose(issue_b, expected_issue_b, atol=1e-6)
 
     child_b = target.equity_b[0].reshape(-1)
-    expected_child_b = 0.25 * expected_issue_b + 0.75 * torch.tensor(0.2)
-    assert torch.allclose(child_b, expected_child_b, atol=1e-6)
+    assert torch.allclose(child_b, expected_issue_b, atol=1e-6)
+
+    inactive_target = RecordingTarget()
+    inactive_teacher = BPGridTeacher(
+        inactive_target,
+        P0Loss(),
+        PILoss(),
+        coarse_size=3,
+        refine=False,
+        candidate_chunk_size=3,
+        margin_scale=1e-4,
+    )
+    inactive_parent = parent.clone()
+    inactive_parent[:, 2:3] = 0.0
+    inactive_child = child.clone()
+    inactive_child[:, 2:3] = 1.0
+    inactive_teacher.compute(inactive_parent, [inactive_child], [torch.ones(1, 1)], branch="p0")
+    inactive_issue_b = [x.reshape(-1) for x in inactive_target.q_b if x.numel() == 3][0]
+    inactive_child_b = inactive_target.equity_b[0].reshape(-1)
+    expected_inactive_b = torch.full((3,), 0.2)
+    assert torch.allclose(inactive_issue_b, expected_inactive_b, atol=1e-6)
+    assert torch.allclose(inactive_child_b, expected_inactive_b, atol=1e-6)
 
 
 def test_grid_teacher_mix_branch_and_coarse_confidence():

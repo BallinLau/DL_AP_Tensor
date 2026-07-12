@@ -8,6 +8,7 @@ from tqdm import tqdm
 from .data_utils import sample_ar1, sample_bernoulli, sample_stationary_ar1, sample_uniform
 from .simulation_forward import forward_policy_value_for_simulation
 from .tensor_data import TensorSimulationOutput, TensorTable, cat_rows
+from utils.firm_transition import apply_refinancing_policy
 
 
 def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
@@ -270,16 +271,20 @@ def _expand_branches_batched(sim, state: Dict[str, torch.Tensor]) -> List[Dict[s
     device = sim.device
     alive_any = state["alive"].any(dim=1)
     branches: List[Dict[str, torch.Tensor]] = []
+    b_prev = state["b"]
+    bp_prev = state.get("bp", b_prev)
+    eta_current = state["eta"].clamp(0.0, 1.0)
+    b_next = apply_refinancing_policy(
+        b_current=b_prev,
+        bp_candidate=bp_prev,
+        eta_current=eta_current,
+    )
 
     for _ in range(sim.branch_num):
         x_next = sample_ar1(state["x"], sim.config.RHO_X, sim.config.SIGMA_X, sim.config.XBAR)
         z_next = sample_ar1(state["z"], sim.config.RHO_Z, sim.config.SIGMA_Z, sim.config.ZBAR)
         eta_next = sample_bernoulli(state["eta"].numel(), sim.config.ZETA, device).view_as(state["eta"])
         i_next = sample_uniform(state["i"].numel(), 0.0, sim.config.I_THRESHOLD, device).view_as(state["i"])
-
-        b_prev = state["b"]
-        bp_prev = state.get("bp", b_prev)
-        b_next = eta_next * bp_prev + (1.0 - eta_next) * b_prev
 
         k_prev = state["K"]
         bar_i_prev = state.get("bar_i")
