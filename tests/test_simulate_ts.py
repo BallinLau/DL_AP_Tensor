@@ -22,6 +22,7 @@ from data import simulate_ts as simulate_ts_module  # noqa: E402
 from data.sample import Sample  # noqa: E402
 from data.simulate_ts import SimulateTS  # noqa: E402
 from models.policy_value import PolicyValueModel  # noqa: E402
+from utils.firm_transition import apply_refinancing_policy  # noqa: E402
 
 
 def build_dummy_models(device: torch.device):
@@ -33,6 +34,49 @@ def build_dummy_models(device: torch.device):
         'fc2': None,
         'dist_b': None
     }
+
+
+def _assert_effective_debt_identity(
+    b: torch.Tensor,
+    eta: torch.Tensor,
+    bp: torch.Tensor,
+    b_next: torch.Tensor,
+    atol: float = 1e-6,
+) -> None:
+    expected = eta * bp + (1.0 - eta) * b
+    torch.testing.assert_close(b_next, expected, atol=atol, rtol=0.0)
+
+
+def _fake_policy_value_output(firm_state: torch.Tensor):
+    n = firm_state.shape[0]
+    device = firm_state.device
+    zeros = torch.zeros(n, 1, device=device)
+    return SimpleNamespace(
+        Q=zeros,
+        P0=zeros,
+        PI=zeros,
+        bar_i=zeros,
+        bar_z=zeros,
+        P=zeros,
+        bp0=torch.tensor([[0.2], [0.7]], device=device)[:n],
+        bpI=torch.tensor([[0.3], [0.8]], device=device)[:n],
+        bp=torch.tensor([[0.25], [0.9]], device=device)[:n],
+    )
+
+
+def test_effective_next_debt_uses_current_eta():
+    b = torch.tensor([0.6, 0.4])
+    eta = torch.tensor([1.0, 0.0])
+    bp = torch.tensor([0.2, 0.9])
+
+    b_next = apply_refinancing_policy(
+        b_current=b,
+        bp_candidate=bp,
+        eta_current=eta,
+    )
+
+    torch.testing.assert_close(b_next, torch.tensor([0.2, 0.4]))
+    _assert_effective_debt_identity(b, eta, bp, b_next)
 
 
 def test_parallel_simulation_next_eta_does_not_change_branch_leverage(monkeypatch):
@@ -158,6 +202,136 @@ def test_serial_tensor_expand_branches_uses_parent_eta(monkeypatch):
     assert not torch.equal(branches[0]["eta"], branches[1]["eta"])
 
 
+def test_serial_tensor_node_reports_effective_next_debt(monkeypatch):
+    device = torch.device("cpu")
+    sim = _make_serial_sim(device)
+    sim.models["policy_value"] = object()
+
+    def fake_forward(model, firm_state):
+        return _fake_policy_value_output(firm_state)
+
+    monkeypatch.setattr(
+        simulate_ts_module,
+        "forward_policy_value_for_simulation",
+        fake_forward,
+    )
+
+    firm_rows, _ = sim._process_node_tensor(
+        _serial_state(device),
+        path_idx=0,
+        t=0,
+        branch_k=-1,
+    )
+    columns = {name: idx for idx, name in enumerate(sim.FIRM_COLUMNS)}
+
+    assert firm_rows.shape[1] == len(sim.FIRM_COLUMNS)
+    b = firm_rows[:, columns["b"]]
+    eta = firm_rows[:, columns["ETA"]]
+    bp0 = firm_rows[:, columns["bp0"]]
+    bpI = firm_rows[:, columns["bpI"]]
+    bp = firm_rows[:, columns["bp"]]
+
+    _assert_effective_debt_identity(
+        b,
+        eta,
+        bp0,
+        firm_rows[:, columns["b_next_p0"]],
+    )
+    _assert_effective_debt_identity(
+        b,
+        eta,
+        bpI,
+        firm_rows[:, columns["b_next_pi"]],
+    )
+    _assert_effective_debt_identity(
+        b,
+        eta,
+        bp,
+        firm_rows[:, columns["b_next_policy"]],
+    )
+    torch.testing.assert_close(
+        firm_rows[:, columns["b_next_p0"]],
+        torch.tensor([0.2, 0.4], device=device),
+    )
+    torch.testing.assert_close(
+        firm_rows[:, columns["b_next_pi"]],
+        torch.tensor([0.3, 0.4], device=device),
+    )
+    torch.testing.assert_close(
+        firm_rows[:, columns["b_next_policy"]],
+        torch.tensor([0.25, 0.4], device=device),
+    )
+
+
+def test_parallel_tensor_node_reports_effective_next_debt(monkeypatch):
+    device = torch.device("cpu")
+    sim = _make_serial_sim(device)
+    sim.models["policy_value"] = object()
+    sim.n_paths = 1
+
+    def fake_forward(model, firm_state):
+        return _fake_policy_value_output(firm_state)
+
+    monkeypatch.setattr(
+        simulate_ts_parallel,
+        "forward_policy_value_for_simulation",
+        fake_forward,
+    )
+
+    state = {
+        "x": torch.zeros(1, device=device),
+        "b": torch.tensor([[0.6, 0.4]], device=device),
+        "z": torch.zeros(1, 2, device=device),
+        "eta": torch.tensor([[1.0, 0.0]], device=device),
+        "i": torch.zeros(1, 2, device=device),
+        "K": torch.ones(1, 2, device=device),
+        "hatcf": torch.zeros(1, device=device),
+        "lnkf": torch.zeros(1, device=device),
+        "M": torch.ones(1, device=device),
+        "alive": torch.ones(1, 2, dtype=torch.bool, device=device),
+        "entry": torch.zeros(1, 2, device=device),
+        "firm_id": torch.arange(2, device=device).reshape(1, 2),
+        "next_firm_id": torch.full((1,), 2, device=device),
+        "bar_i": torch.zeros(1, 2, device=device),
+        "bar_z": torch.zeros(1, 2, device=device),
+        "bp": torch.tensor([[0.6, 0.4]], device=device),
+    }
+
+    firm_rows, _ = simulate_ts_parallel._process_node_batched(
+        sim,
+        state,
+        t=0,
+        branch_k=-1,
+    )
+    columns = {name: idx for idx, name in enumerate(sim.FIRM_COLUMNS)}
+
+    assert firm_rows.shape[1] == len(sim.FIRM_COLUMNS)
+    b = firm_rows[:, columns["b"]]
+    eta = firm_rows[:, columns["ETA"]]
+    bp0 = firm_rows[:, columns["bp0"]]
+    bpI = firm_rows[:, columns["bpI"]]
+    bp = firm_rows[:, columns["bp"]]
+
+    _assert_effective_debt_identity(
+        b,
+        eta,
+        bp0,
+        firm_rows[:, columns["b_next_p0"]],
+    )
+    _assert_effective_debt_identity(
+        b,
+        eta,
+        bpI,
+        firm_rows[:, columns["b_next_pi"]],
+    )
+    _assert_effective_debt_identity(
+        b,
+        eta,
+        bp,
+        firm_rows[:, columns["b_next_policy"]],
+    )
+
+
 def test_serial_legacy_expand_branches_uses_parent_eta(monkeypatch):
     device = torch.device("cpu")
     eta_draws = [torch.zeros(2, device=device), torch.ones(2, device=device)]
@@ -173,6 +347,46 @@ def test_serial_legacy_expand_branches_uses_parent_eta(monkeypatch):
     torch.testing.assert_close(branches[0]["b"], expected_b)
     torch.testing.assert_close(branches[1]["b"], expected_b)
     assert not torch.equal(branches[0]["eta"], branches[1]["eta"])
+
+
+def test_simulation_dataframe_reports_effective_next_debt():
+    device = torch.device("cpu")
+    Config.DEVICE = device
+
+    sim = SimulateTS(
+        models=build_dummy_models(device),
+        config=Config,
+        n_paths=1,
+        group_size=3,
+        horizon=1,
+        branch_num=2,
+        enable_entry=False,
+        enable_exit=False,
+        device=device,
+    )
+
+    df_firm, _ = sim.simulate()
+
+    required = {"b_next_p0", "b_next_pi", "b_next_policy"}
+    assert required.issubset(set(df_firm.columns))
+    expected = df_firm["ETA"] * df_firm["bp"] + (1.0 - df_firm["ETA"]) * df_firm["b"]
+    error = (df_firm["b_next_policy"] - expected).abs()
+    assert error.max() < 1e-6
+
+    parents = df_firm[df_firm["branch"] == -1]
+    children = df_firm[df_firm["branch"] == 0]
+    merged = parents.merge(
+        children,
+        left_on=["path", "ID"],
+        right_on=["path", "ID"],
+        suffixes=("_parent", "_child"),
+    )
+    merged = merged[merged["t_child"] == merged["t_parent"] + 1]
+    assert not merged.empty
+    max_transition_error = (
+        merged["b_next_policy_parent"] - merged["b_child"]
+    ).abs().max()
+    assert max_transition_error < 1e-6
 
 
 def main():

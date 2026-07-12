@@ -190,6 +190,22 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         bpI = b.clone()
         bp = b.clone()
 
+    b_next_p0 = apply_refinancing_policy(
+        b_current=b,
+        bp_candidate=bp0,
+        eta_current=eta,
+    )
+    b_next_pi = apply_refinancing_policy(
+        b_current=b,
+        bp_candidate=bpI,
+        eta_current=eta,
+    )
+    b_next_policy = apply_refinancing_policy(
+        b_current=b,
+        bp_candidate=bp,
+        eta_current=eta,
+    )
+
     Y, I, Phi, C = sim._resource_accounting(K, z, x, bar_i, bar_z, i)
 
     firm_rows = torch.stack(
@@ -217,6 +233,9 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             bp0,
             bpI,
             bp,
+            b_next_p0,
+            b_next_pi,
+            b_next_policy,
             Y,
             I,
             Phi,

@@ -43,7 +43,9 @@ class SimulateTS:
         'path', 't', 'branch', 'ID', 'entry',
         'b', 'z', 'ETA', 'i', 'x', 'Hatcf', 'LnKF',
         'K', 'M', 'Q', 'P0', 'PI', 'Bar_i', 'Bar_z', 'P',
-        'bp0', 'bpI', 'bp', 'Y', 'I', 'Phi', 'C'
+        'bp0', 'bpI', 'bp',
+        'b_next_p0', 'b_next_pi', 'b_next_policy',
+        'Y', 'I', 'Phi', 'C'
     ]
     MACRO_COLUMNS = [
         'path', 't', 'branch', 'K', 'C', 'LnK', 'Hatc',
@@ -347,6 +349,22 @@ class SimulateTS:
             bpI = b.clone()
             bp = b.clone()
 
+        b_next_p0 = apply_refinancing_policy(
+            b_current=b,
+            bp_candidate=bp0,
+            eta_current=eta,
+        )
+        b_next_pi = apply_refinancing_policy(
+            b_current=b,
+            bp_candidate=bpI,
+            eta_current=eta,
+        )
+        b_next_policy = apply_refinancing_policy(
+            b_current=b,
+            bp_candidate=bp,
+            eta_current=eta,
+        )
+
         Y, I, Phi, C = self._resource_accounting(K, z, x_scalar, bar_i, bar_z, i)
 
         firm_rows = torch.stack(
@@ -374,6 +392,9 @@ class SimulateTS:
                 bp0,
                 bpI,
                 bp,
+                b_next_p0,
+                b_next_pi,
+                b_next_policy,
                 Y,
                 I,
                 Phi,
@@ -520,6 +541,24 @@ class SimulateTS:
         # Policy/Value forward
         with torch.no_grad():
             output = forward_policy_value_for_simulation(self.models['policy_value'], firm_state)
+        bp0 = output.bp0.reshape(-1)
+        bpI = output.bpI.reshape(-1)
+        bp = output.bp.reshape(-1)
+        b_next_p0 = apply_refinancing_policy(
+            b_current=b,
+            bp_candidate=bp0,
+            eta_current=eta,
+        )
+        b_next_pi = apply_refinancing_policy(
+            b_current=b,
+            bp_candidate=bpI,
+            eta_current=eta,
+        )
+        b_next_policy = apply_refinancing_policy(
+            b_current=b,
+            bp_candidate=bp,
+            eta_current=eta,
+        )
         
         # 资源核算
         Y, I, Phi, C = self._resource_accounting(
@@ -552,9 +591,12 @@ class SimulateTS:
                 'Bar_i': output.bar_i[j].item(),
                 'Bar_z': output.bar_z[j].item(),
                 'P': output.P[j].item(),
-                'bp0': output.bp0[j].item(),
-                'bpI': output.bpI[j].item(),
-                'bp': output.bp[j].item(),
+                'bp0': bp0[j].item(),
+                'bpI': bpI[j].item(),
+                'bp': bp[j].item(),
+                'b_next_p0': b_next_p0[j].item(),
+                'b_next_pi': b_next_pi[j].item(),
+                'b_next_policy': b_next_policy[j].item(),
                 'Y': Y[j].item(),
                 'I': I[j].item(),
                 'Phi': Phi[j].item(),
@@ -585,7 +627,7 @@ class SimulateTS:
         # 更新内生状态（杠杆和资本）
         state['bar_i'] = output.bar_i.reshape(-1)
         state['bar_z'] = output.bar_z.reshape(-1)
-        state['bp'] = output.bp.reshape(-1)
+        state['bp'] = bp
         
         return firm_data, macro_row
     
