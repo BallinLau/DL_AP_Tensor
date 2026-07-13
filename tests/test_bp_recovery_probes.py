@@ -6,6 +6,7 @@ import torch
 
 from experiments.run_bp_recovery_probes import (
     PROBE_BASELINE,
+    PROBE_BRANCH,
     PROBE_LOGIT,
     PROBE_RECENTER,
     ProbeConfig,
@@ -178,7 +179,7 @@ def test_probe_suite_is_deterministic_and_does_not_mutate_online_model_or_target
         initial_bp_target=0.5,
         logit_target_eps=1e-4,
         logit_huber_delta=1.0,
-        probes=[PROBE_BASELINE, PROBE_RECENTER, PROBE_LOGIT],
+        probes=[PROBE_BASELINE, PROBE_BRANCH, PROBE_RECENTER, PROBE_LOGIT],
     )
 
     history1, states1, summary1 = run_probe_suite(
@@ -202,8 +203,15 @@ def test_probe_suite_is_deterministic_and_does_not_mutate_online_model_or_target
         torch.testing.assert_close(value, online_before[key], rtol=0, atol=0)
     for key, value in targets.items():
         torch.testing.assert_close(value, target_before[key], rtol=0, atol=0)
-    assert set(summary1["probe"]) == {PROBE_BASELINE, PROBE_RECENTER, PROBE_LOGIT}
+    assert set(summary1["probe"]) == {PROBE_BASELINE, PROBE_BRANCH, PROBE_RECENTER, PROBE_LOGIT}
     assert set(history1["branch"]) == {"p0", "pi", "mix", "combined"}
+    assert history1.loc[history1["probe"] == PROBE_BRANCH, "mix_training_included"].eq(False).all()
+    assert history1.loc[history1["probe"] == PROBE_LOGIT, "mix_training_included"].eq(False).all()
+    assert history1.loc[history1["probe"] == PROBE_BASELINE, "mix_training_included"].eq(True).all()
+    assert set(summary1["seed"]) == {99}
+    assert "output_mae_p90" in history1.columns
+    assert "pred_target_spearman" in history1.columns
+    assert "bp0_checkpoint_initial" in states1.columns
     assert "bp0_bias_shift" in states1.columns
     assert "bp0_target_logit" in states1.columns
     torch.testing.assert_close(

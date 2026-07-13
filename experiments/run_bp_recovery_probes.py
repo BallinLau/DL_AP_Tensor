@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import argparse
 import copy
-import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -39,8 +38,11 @@ from training.bp_policy_loss import (  # noqa: E402
 
 TRAINABLE_PREFIXES = ("policy_encoder.", "bp0_head.", "bpi_head.")
 PROBE_BASELINE = "baseline_output_loss"
+PROBE_BRANCH = "branch_only_output_loss"
 PROBE_RECENTER = "bias_recenter_output_loss"
 PROBE_LOGIT = "original_init_logit_loss"
+OPTIMIZER_SEMANTICS = "full_batch_fresh_adamw"
+TEACHER_SEMANTICS = "checkpoint_online_greedy_proxy"
 
 
 @dataclass
@@ -79,7 +81,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--probes",
         type=str,
-        default="baseline_output_loss,bias_recenter_output_loss,original_init_logit_loss",
+        default=(
+            "baseline_output_loss,branch_only_output_loss,"
+            "bias_recenter_output_loss,original_init_logit_loss"
+        ),
     )
     parser.add_argument(
         "--record-steps",
@@ -94,11 +99,59 @@ def parse_args() -> argparse.Namespace:
 
 def parse_probes(value: str) -> List[str]:
     probes = [item.strip() for item in value.split(",") if item.strip()]
-    valid = {PROBE_BASELINE, PROBE_RECENTER, PROBE_LOGIT}
+    if len(probes) != len(set(probes)):
+        raise ValueError(f"Duplicate probe entries are not allowed: {probes}")
+    valid = {PROBE_BASELINE, PROBE_BRANCH, PROBE_RECENTER, PROBE_LOGIT}
     unknown = sorted(set(probes) - valid)
     if unknown:
         raise ValueError(f"Unknown probe(s): {unknown}")
     return probes
+
+
+def probe_semantics(probe: str) -> Dict[str, object]:
+    if probe == PROBE_BASELINE:
+        return {
+            "teacher_semantics": TEACHER_SEMANTICS,
+            "loss_semantics": "full_target_grid_output_space",
+            "initialization_semantics": "original_checkpoint",
+            "mix_training_included": True,
+            "optimizer_semantics": OPTIMIZER_SEMANTICS,
+        }
+    if probe == PROBE_BRANCH:
+        return {
+            "teacher_semantics": TEACHER_SEMANTICS,
+            "loss_semantics": "branch_target_grid_output_space",
+            "initialization_semantics": "original_checkpoint",
+            "mix_training_included": False,
+            "optimizer_semantics": OPTIMIZER_SEMANTICS,
+        }
+    if probe == PROBE_RECENTER:
+        return {
+            "teacher_semantics": TEACHER_SEMANTICS,
+            "loss_semantics": "full_target_grid_output_space",
+            "initialization_semantics": "last_bias_median_recenter",
+            "mix_training_included": True,
+            "optimizer_semantics": OPTIMIZER_SEMANTICS,
+        }
+    if probe == PROBE_LOGIT:
+        return {
+            "teacher_semantics": TEACHER_SEMANTICS,
+            "loss_semantics": "branch_logit_space",
+            "initialization_semantics": "original_checkpoint",
+            "mix_training_included": False,
+            "optimizer_semantics": OPTIMIZER_SEMANTICS,
+        }
+    raise ValueError(f"Unknown probe: {probe}")
+
+
+def semantic_fields(probe: str, cfg: ProbeConfig) -> Dict[str, object]:
+    return {
+        **probe_semantics(probe),
+        "seed": cfg.seed,
+        "logit_target_eps": cfg.logit_target_eps,
+        "logit_huber_delta": cfg.logit_huber_delta,
+        "initial_bp_target": cfg.initial_bp_target,
+    }
 
 
 def last_linear(module: nn.Module) -> nn.Linear:
@@ -147,17 +200,21 @@ def output_space_loss(
     targets: Dict[str, torch.Tensor],
     indices: torch.Tensor,
     hp,
+    *,
+    include_mix: bool = True,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     policy_delta = float(getattr(hp, "bp_grid_policy_huber_delta", 0.05))
     policy_weight = float(getattr(hp, "bp_grid_policy_weight", 1.0))
     mix_weight = float(getattr(hp, "bp_grid_mix_policy_weight", 1.0))
     parts: Dict[str, torch.Tensor] = {}
     total = torch.zeros((), device=indices.device)
-    for pred_key, target_key, branch_weight in [
+    branches = [
         ("bp0", "bp0", policy_weight),
         ("bpI", "bpI", policy_weight),
-        ("bp_mix", "bp_mix", mix_weight),
-    ]:
+    ]
+    if include_mix:
+        branches.append(("bp_mix", "bp_mix", mix_weight))
+    for pred_key, target_key, branch_weight in branches:
         sample_weight = targets["bp_mix_survival_weight"] if target_key == "bp_mix" else None
         loss, _, _ = compute_target_grid_policy_distillation_loss(
             bundle[pred_key][indices],
@@ -211,13 +268,46 @@ def probe_loss(
             target_eps=cfg.logit_target_eps,
             huber_delta=cfg.logit_huber_delta,
         )
-    return output_space_loss(bundle, targets, indices, hp)
+    return output_space_loss(
+        bundle,
+        targets,
+        indices,
+        hp,
+        include_mix=bool(probe_semantics(probe)["mix_training_included"]),
+    )
 
 
 def branch_weights(targets: Dict[str, torch.Tensor], branch: str) -> torch.Tensor:
     if branch == "bp_mix":
         return targets["bp_mix_confidence"] * targets["bp_mix_survival_weight"]
     return targets[f"{branch}_confidence"]
+
+
+def pearson_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    x = x.detach().reshape(-1).to(torch.float64)
+    y = y.detach().reshape(-1).to(torch.float64)
+    if x.numel() < 2:
+        return 0.0
+    x_centered = x - x.mean()
+    y_centered = y - y.mean()
+    denom = x_centered.norm() * y_centered.norm()
+    if float(denom.item()) <= 1e-18:
+        return 0.0
+    return float((x_centered * y_centered).sum().div(denom).item())
+
+
+def rank_1d(x: torch.Tensor) -> torch.Tensor:
+    x = x.detach().reshape(-1).to(torch.float64)
+    order = torch.argsort(x, stable=True)
+    ranks = torch.empty_like(x)
+    ranks[order] = torch.arange(x.numel(), device=x.device, dtype=x.dtype)
+    return ranks
+
+
+def spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    if x.numel() < 2:
+        return 0.0
+    return pearson_corr(rank_1d(x), rank_1d(y))
 
 
 def eval_branch_metrics(
@@ -240,6 +330,9 @@ def eval_branch_metrics(
     mse = (pred - target).pow(2).mean()
     weighted_mae = (weights * abs_err).sum() / weights.sum().clamp_min(1e-12)
     training_loss = torch.zeros((), device=pred.device)
+    policy_weight = float(getattr(hp, "bp_grid_policy_weight", 1.0))
+    mix_weight = float(getattr(hp, "bp_grid_mix_policy_weight", 1.0))
+    mix_training_included = bool(probe_semantics(probe)["mix_training_included"])
     if branch in {"bp0", "bpI"}:
         target_logit = stable_logit(target, cfg.logit_target_eps)
         logit_abs = (bundle[f"{branch}_logit"][indices] - target_logit).abs()
@@ -248,23 +341,26 @@ def eval_branch_metrics(
             training_loss = (
                 huber_element(bundle[f"{branch}_logit"][indices], target_logit, cfg.logit_huber_delta)
                 * weights
-            ).mean()
+            ).mean() * policy_weight
     else:
         logit_abs = torch.zeros_like(abs_err)
         sigmoid_deriv = torch.zeros_like(abs_err)
-    if probe != PROBE_LOGIT:
+    if probe != PROBE_LOGIT and (branch != "bp_mix" or mix_training_included):
         loss, _, _ = compute_target_grid_policy_distillation_loss(
             pred,
             target,
             targets[f"{branch}_confidence"][indices],
             huber_delta=float(getattr(hp, "bp_grid_policy_huber_delta", 0.05)),
-            branch_weight=1.0,
+            branch_weight=mix_weight if branch == "bp_mix" else policy_weight,
             sample_weight=targets["bp_mix_survival_weight"][indices] if branch == "bp_mix" else None,
         )
         training_loss = loss
+    output_mae_p50 = torch.quantile(abs_err.detach().reshape(-1), 0.5)
+    output_mae_p90 = torch.quantile(abs_err.detach().reshape(-1), 0.9)
     return {
         "episode": cfg.episode,
         "probe": probe,
+        **semantic_fields(probe, cfg),
         "step": step,
         "split": split,
         "branch": branch.replace("bpI", "pi").replace("bp0", "p0").replace("bp_mix", "mix"),
@@ -272,11 +368,22 @@ def eval_branch_metrics(
         "training_loss": float(training_loss.detach().item()),
         "output_mse": float(mse.detach().item()),
         "output_mae": float(abs_err.mean().detach().item()),
+        "output_mae_p50": float(output_mae_p50.item()),
+        "output_mae_p90": float(output_mae_p90.item()),
+        "output_mae_max": float(abs_err.detach().max().item()),
         "weighted_output_mae": float(weighted_mae.detach().item()),
         "bp_pred_mean": float(pred.detach().mean().item()),
         "bp_pred_min": float(pred.detach().min().item()),
         "bp_pred_max": float(pred.detach().max().item()),
+        "bp_pred_std": float(pred.detach().std(unbiased=False).item()),
         "bp_target_mean": float(target.detach().mean().item()),
+        "bp_target_std": float(target.detach().std(unbiased=False).item()),
+        "pred_target_corr": float(pearson_corr(pred.detach(), target.detach())),
+        "pred_target_spearman": float(spearman_corr(pred.detach(), target.detach())),
+        "constant_policy_flag": bool(
+            pred.detach().std(unbiased=False).item()
+            < 0.05 * max(target.detach().std(unbiased=False).item(), 1e-12)
+        ),
         "logit_abs_error_mean": float(logit_abs.detach().mean().item()),
         "sigmoid_derivative_mean": float(sigmoid_deriv.detach().mean().item()),
         **grad_norms,
@@ -308,9 +415,14 @@ def eval_combined_metrics(
     )
     loss, _ = probe_loss(probe, bundle, targets, indices, hp, cfg)
     abs_err = (pred - target).abs()
+    output_mae_p50 = torch.quantile(abs_err.detach().reshape(-1), 0.5)
+    output_mae_p90 = torch.quantile(abs_err.detach().reshape(-1), 0.9)
+    pred_std = float(pred.detach().std(unbiased=False).item())
+    target_std = float(target.detach().std(unbiased=False).item())
     return {
         "episode": cfg.episode,
         "probe": probe,
+        **semantic_fields(probe, cfg),
         "step": step,
         "split": split,
         "branch": "combined",
@@ -318,11 +430,19 @@ def eval_combined_metrics(
         "training_loss": float(loss.detach().item()),
         "output_mse": float((pred - target).pow(2).mean().detach().item()),
         "output_mae": float(abs_err.mean().detach().item()),
+        "output_mae_p50": float(output_mae_p50.item()),
+        "output_mae_p90": float(output_mae_p90.item()),
+        "output_mae_max": float(abs_err.detach().max().item()),
         "weighted_output_mae": float((weights * abs_err).sum().div(weights.sum().clamp_min(1e-12)).detach().item()),
         "bp_pred_mean": float(pred.detach().mean().item()),
         "bp_pred_min": float(pred.detach().min().item()),
         "bp_pred_max": float(pred.detach().max().item()),
+        "bp_pred_std": pred_std,
         "bp_target_mean": float(target.detach().mean().item()),
+        "bp_target_std": target_std,
+        "pred_target_corr": float(pearson_corr(pred.detach(), target.detach())),
+        "pred_target_spearman": float(spearman_corr(pred.detach(), target.detach())),
+        "constant_policy_flag": bool(pred_std < 0.05 * max(target_std, 1e-12)),
         "logit_abs_error_mean": float(
             torch.cat(
                 [
@@ -355,10 +475,12 @@ def compute_grad_norms(
     hp,
     cfg: ProbeConfig,
 ) -> Dict[str, float]:
+    model.eval()
     model.zero_grad(set_to_none=True)
-    bundle = forward_policy_bundle(model, parent_state)
-    loss, _ = probe_loss(probe, bundle, targets, train_idx, hp, cfg)
-    loss.backward()
+    with torch.enable_grad():
+        bundle = forward_policy_bundle(model, parent_state)
+        loss, _ = probe_loss(probe, bundle, targets, train_idx, hp, cfg)
+        loss.backward()
     norms = {
         "bp0_head_grad_norm": tensor_l2_grad_norm(model.bp0_head),
         "bpI_head_grad_norm": tensor_l2_grad_norm(model.bpi_head),
@@ -435,6 +557,34 @@ def validate_recenter_translation(
         torch.testing.assert_close(diff, expected, rtol=1e-5, atol=1e-5)
 
 
+def final_bias_parameter_names(model: torch.nn.Module) -> set[str]:
+    bp0_bias = last_linear(model.bp0_head).bias
+    bpi_bias = last_linear(model.bpi_head).bias
+    names = set()
+    for name, param in model.named_parameters():
+        if param is bp0_bias or param is bpi_bias:
+            names.add(name)
+    if len(names) != 2:
+        raise RuntimeError(f"Expected two BP final bias parameters, found {sorted(names)}")
+    return names
+
+
+def assert_only_recenter_bias_changed(
+    before: Dict[str, torch.Tensor],
+    model: torch.nn.Module,
+) -> None:
+    allowed = final_bias_parameter_names(model)
+    changed = []
+    for name, param in model.named_parameters():
+        if not torch.equal(before[name].to(param.device), param.detach()):
+            changed.append(name)
+    if set(changed) != allowed:
+        raise AssertionError(
+            "Probe B recenter changed unexpected parameters: "
+            f"changed={changed}, expected={sorted(allowed)}"
+        )
+
+
 def subset_targets(targets: Dict[str, torch.Tensor], n: int) -> Dict[str, torch.Tensor]:
     return {key: value[:n].clone() for key, value in targets.items()}
 
@@ -460,6 +610,7 @@ def state_rows_for_probe(
     source_index: torch.Tensor,
     splits: Dict[str, torch.Tensor],
     targets: Dict[str, torch.Tensor],
+    checkpoint_bundle: Dict[str, torch.Tensor],
     initial_bundle: Dict[str, torch.Tensor],
     final_bundle: Dict[str, torch.Tensor],
     recenter_stats: Dict[str, float],
@@ -473,6 +624,7 @@ def state_rows_for_probe(
             {
                 "episode": cfg.episode,
                 "probe": probe,
+                **semantic_fields(probe, cfg),
                 "source_index": int(source_index[i].item()),
                 "state_pos": i,
                 "split": split_name[i],
@@ -483,6 +635,9 @@ def state_rows_for_probe(
                 "x": float(parent_state[i, 4].item()),
                 "hatcf": float(parent_state[i, 5].item()),
                 "lnkf": float(parent_state[i, 6].item()),
+                "bp0_checkpoint_initial": float(checkpoint_bundle["bp0"][i].detach().item()),
+                "bpI_checkpoint_initial": float(checkpoint_bundle["bpI"][i].detach().item()),
+                "bp_mix_checkpoint_initial": float(checkpoint_bundle["bp_mix"][i].detach().item()),
                 "bp0_initial": float(initial_bundle["bp0"][i].detach().item()),
                 "bpI_initial": float(initial_bundle["bpI"][i].detach().item()),
                 "bp_mix_initial": float(initial_bundle["bp_mix"][i].detach().item()),
@@ -498,6 +653,8 @@ def state_rows_for_probe(
                 "bpI_final_logit": float(final_bundle["bpI_logit"][i].detach().item()),
                 "bp0_target_logit": float(stable_logit(targets["bp0"][i], cfg.logit_target_eps).item()),
                 "bpI_target_logit": float(stable_logit(targets["bpI"][i], cfg.logit_target_eps).item()),
+                "bp0_checkpoint_initial_logit": float(checkpoint_bundle["bp0_logit"][i].detach().item()),
+                "bpI_checkpoint_initial_logit": float(checkpoint_bundle["bpI_logit"][i].detach().item()),
                 "bp0_confidence": float(targets["bp0_confidence"][i].item()),
                 "bpI_confidence": float(targets["bpI_confidence"][i].item()),
                 "bp_mix_confidence": float(targets["bp_mix_confidence"][i].item()),
@@ -536,6 +693,7 @@ def make_summary_rows(history: pd.DataFrame, states: pd.DataFrame, cfg: ProbeCon
             {
                 "episode": cfg.episode,
                 "probe": probe,
+                **semantic_fields(probe, cfg),
                 "steps": cfg.steps,
                 "learning_rate": cfg.learning_rate,
                 "weight_decay": cfg.weight_decay,
@@ -544,10 +702,18 @@ def make_summary_rows(history: pd.DataFrame, states: pd.DataFrame, cfg: ProbeCon
                 "n_holdout": int((s["split"] == "holdout").sum()),
                 "initial_train_mae": initial_train_mae,
                 "final_train_mae": final_train_mae,
+                "initial_train_mae_p90": float(initial_train["output_mae_p90"]),
+                "final_train_mae_p90": float(final_train["output_mae_p90"]),
+                "initial_train_mae_max": float(initial_train["output_mae_max"]),
+                "final_train_mae_max": float(final_train["output_mae_max"]),
                 "train_mae_improvement": initial_train_mae - final_train_mae,
                 "train_mae_improvement_ratio": (initial_train_mae - final_train_mae) / max(initial_train_mae, 1e-12),
                 "initial_holdout_mae": initial_holdout_mae,
                 "final_holdout_mae": final_holdout_mae,
+                "initial_holdout_mae_p90": float(initial_holdout["output_mae_p90"]),
+                "final_holdout_mae_p90": float(final_holdout["output_mae_p90"]),
+                "initial_holdout_mae_max": float(initial_holdout["output_mae_max"]),
+                "final_holdout_mae_max": float(final_holdout["output_mae_max"]),
                 "holdout_mae_improvement": initial_holdout_mae - final_holdout_mae,
                 "holdout_mae_improvement_ratio": (initial_holdout_mae - final_holdout_mae)
                 / max(initial_holdout_mae, 1e-12),
@@ -570,6 +736,11 @@ def make_summary_rows(history: pd.DataFrame, states: pd.DataFrame, cfg: ProbeCon
                 "bp_mix_initial_mean": float(s["bp_mix_initial"].mean()),
                 "bp_mix_final_mean": float(s["bp_mix_final"].mean()),
                 "bp_mix_target_mean": float(s["bp_mix_target"].mean()),
+                "final_bp_pred_std": float(final_train["bp_pred_std"]),
+                "final_bp_target_std": float(final_train["bp_target_std"]),
+                "final_pred_target_corr": float(final_train["pred_target_corr"]),
+                "final_pred_target_spearman": float(final_train["pred_target_spearman"]),
+                "constant_policy_flag": bool(final_train["constant_policy_flag"]),
                 "recovered_from_low_saturation": bool(
                     s[["bp0_initial", "bpI_initial"]].to_numpy().mean() < 0.01
                     and final_train_mae < max(0.05, initial_train_mae * 0.5)
@@ -599,14 +770,16 @@ def run_probe_suite(
 
     for probe in cfg.probes:
         torch.manual_seed(cfg.seed)
-        probe_model = copy.deepcopy(online_model).to(parent_state.device)
+        probe_model = copy.deepcopy(online_model).to(parent_state.device).eval()
         configure_refit_trainable_parameters(probe_model)
         probe_initial_params = {name: param.detach().cpu().clone() for name, param in probe_model.named_parameters()}
         recenter_stats: Dict[str, float] = {}
-        initial_bundle = forward_policy_bundle(probe_model, parent_state)
+        checkpoint_bundle = forward_policy_bundle(probe_model, parent_state)
+        initial_bundle = checkpoint_bundle
         if probe == PROBE_RECENTER:
             before_recenter = {key: value.detach().clone() for key, value in initial_bundle.items()}
             recenter_stats = apply_bias_recenter(probe_model, parent_state, splits["train"], cfg)
+            assert_only_recenter_bias_changed(probe_initial_params, probe_model)
             initial_bundle = forward_policy_bundle(probe_model, parent_state)
             validate_recenter_translation(before_recenter, initial_bundle, recenter_stats, splits["train"])
 
@@ -660,11 +833,12 @@ def run_probe_suite(
         record(0, grad0)
         last_grad = grad0
         for step in range(1, cfg.steps + 1):
-            probe_model.train()
+            probe_model.eval()
             optimizer.zero_grad(set_to_none=True)
-            bundle = forward_policy_bundle(probe_model, parent_state)
-            loss, _ = probe_loss(probe, bundle, targets, splits["train"], hp, cfg)
-            loss.backward()
+            with torch.enable_grad():
+                bundle = forward_policy_bundle(probe_model, parent_state)
+                loss, _ = probe_loss(probe, bundle, targets, splits["train"], hp, cfg)
+                loss.backward()
             last_grad = {
                 "bp0_head_grad_norm": tensor_l2_grad_norm(probe_model.bp0_head),
                 "bpI_head_grad_norm": tensor_l2_grad_norm(probe_model.bpi_head),
@@ -688,6 +862,7 @@ def run_probe_suite(
                 source_index=source_index,
                 splits=splits,
                 targets=targets,
+                checkpoint_bundle=checkpoint_bundle,
                 initial_bundle=initial_bundle,
                 final_bundle=final_bundle,
                 recenter_stats=recenter_stats,
@@ -709,6 +884,14 @@ def main() -> None:
         raise ValueError("--steps must be non-negative")
     if not (0.0 < args.initial_bp_target < 1.0):
         raise ValueError("--initial-bp-target must be in (0, 1)")
+    if not (0.0 <= args.holdout_fraction < 1.0):
+        raise ValueError("--holdout-fraction must be in [0, 1)")
+    if not (0.0 < args.logit_target_eps < 0.5):
+        raise ValueError("--logit-target-eps must be in (0, 0.5)")
+    if args.logit_huber_delta <= 0.0:
+        raise ValueError("--logit-huber-delta must be positive")
+    if args.n_states < 0:
+        raise ValueError("--n-states must be non-negative")
     device = torch.device(args.device)
     Config.DEVICE = device
     run_root = args.run_root.resolve()
@@ -724,6 +907,10 @@ def main() -> None:
     hp.max_firm_train_units = 0
     lr = float(args.learning_rate if args.learning_rate is not None else getattr(hp, "policy_lr", 1e-3))
     weight_decay = float(args.weight_decay if args.weight_decay is not None else getattr(hp, "policy_weight_decay", 0.0))
+    if lr <= 0.0:
+        raise ValueError("--learning-rate must be positive")
+    if weight_decay < 0.0:
+        raise ValueError("--weight-decay must be non-negative")
     cfg = ProbeConfig(
         episode=args.episode,
         steps=args.steps,
