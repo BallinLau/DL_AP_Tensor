@@ -427,24 +427,54 @@ def export_cashflow_components(
             "q_minus_raw_recovery_mean",
         ]
     ]
-    cashflow_summary = (
-        cashflow_long.groupby(["episode", "branch"])
-        .agg(
-            n_rows=("source_index", "size"),
-            n_states=("source_index", "nunique"),
-            cashflow_mean=("cashflow", "mean"),
-            production_cashflow_mean=("production_cashflow", "mean"),
-            debt_adjustment_mean=("debt_adjustment", "mean"),
-            equity_financing_cost_mean=("equity_financing_cost", "mean"),
-            investment_adjustment_mean=("investment_adjustment", "mean"),
-            q_current_mean=("q_current", "mean"),
-            q_issue_mean=("q_issue", "mean"),
-            recovery_grid_mean=("recovery_grid_mean", "mean"),
-            q_minus_raw_recovery_mean=("q_minus_raw_recovery_mean", "mean"),
-            max_cashflow_identity_error=("cashflow_identity_error", "max"),
+    summary_rows: List[Dict[str, object]] = []
+    for (ep, source, branch), group in cashflow_long.groupby(["episode", "source_index", "branch"]):
+        group = group.sort_values("bp_candidate").reset_index(drop=True)
+        low = group.iloc[0]
+        star = group.loc[group["cashflow"].idxmax()]
+        delta_production = float(star["production_cashflow"] - low["production_cashflow"])
+        delta_debt = float(star["debt_adjustment"] - low["debt_adjustment"])
+        delta_equity = float(star["equity_financing_cost"] - low["equity_financing_cost"])
+        delta_invest = float(star["investment_adjustment"] - low["investment_adjustment"])
+        delta_cashflow = float(star["cashflow"] - low["cashflow"])
+        delta_identity_error = abs(
+            delta_cashflow
+            - (delta_production + delta_debt - delta_equity + delta_invest)
         )
-        .reset_index()
-    )
+        summary_rows.append(
+            {
+                "episode": int(ep),
+                "source_index": int(source),
+                "branch": branch,
+                "bp_low": float(low["bp_candidate"]),
+                "bp_star": float(star["bp_candidate"]),
+                "production_low": float(low["production_cashflow"]),
+                "production_star": float(star["production_cashflow"]),
+                "delta_production": delta_production,
+                "debt_adjustment_low": float(low["debt_adjustment"]),
+                "debt_adjustment_star": float(star["debt_adjustment"]),
+                "delta_debt_adjustment": delta_debt,
+                "equity_cost_low": float(low["equity_financing_cost"]),
+                "equity_cost_star": float(star["equity_financing_cost"]),
+                "delta_equity_cost": delta_equity,
+                "investment_adjustment_low": float(low["investment_adjustment"]),
+                "investment_adjustment_star": float(star["investment_adjustment"]),
+                "delta_investment_adjustment": delta_invest,
+                "cashflow_low": float(low["cashflow"]),
+                "cashflow_star": float(star["cashflow"]),
+                "delta_cashflow": delta_cashflow,
+                "delta_cashflow_identity_error": float(delta_identity_error),
+                "max_cashflow_identity_error": float(group["cashflow_identity_error"].max()),
+                "q_current_low": float(low["q_current"]),
+                "q_issue_star": float(star["q_issue"]),
+                "recovery_star": float(star["recovery_grid_mean"]),
+                "q_minus_raw_recovery_star": float(star["q_minus_raw_recovery_mean"]),
+            }
+        )
+    cashflow_summary = pd.DataFrame(summary_rows)
+    max_delta_error = float(cashflow_summary["delta_cashflow_identity_error"].max())
+    if max_delta_error >= 1e-5:
+        raise RuntimeError(f"Cashflow low-to-star delta identity error too large: {max_delta_error}")
     cashflow_long.to_csv(output_dir / f"ep{episode}_cashflow_components_long.csv", index=False)
     cashflow_summary.to_csv(output_dir / f"ep{episode}_cashflow_components_summary.csv", index=False)
 

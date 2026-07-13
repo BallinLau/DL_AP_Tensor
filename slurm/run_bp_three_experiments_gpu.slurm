@@ -25,6 +25,14 @@ N_STATES="${N_STATES:-20}"
 DEVICE="${DEVICE:-cuda}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 N_BRANCHES="${N_BRANCHES:-2}"
+REFIT_STEPS="${REFIT_STEPS:-1000}"
+REFIT_LR="${REFIT_LR:-}"
+REFERENCE_EPISODE="${REFERENCE_EPISODE:-2}"
+STATES_PER_GROUP="${STATES_PER_GROUP:-20}"
+FLIP_THRESHOLD="${FLIP_THRESHOLD:-0.2}"
+B_GRID_SIZE="${B_GRID_SIZE:-21}"
+Z_GRID_SIZE="${Z_GRID_SIZE:-41}"
+BASE_STATE_SOURCE_INDEX="${BASE_STATE_SOURCE_INDEX:-}"
 RUN_RELATED_TESTS="${RUN_RELATED_TESTS:-0}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$RUN_ROOT/data/outputs/bp_three_experiments}"
 REQUIRED_COMMIT="${REQUIRED_COMMIT:-85a9d49}"
@@ -73,7 +81,10 @@ fi
 
 python3 -m py_compile \
     experiments/export_target_grid_decomposition.py \
-    experiments/export_bp_deep_diagnostics.py
+    experiments/export_bp_deep_diagnostics.py \
+    experiments/run_bp_fixed_teacher_refit_probe.py \
+    experiments/export_bp_fixed_state_cross_episode.py \
+    experiments/export_continuation_surface.py
 
 nvidia-smi
 
@@ -382,8 +393,81 @@ print(cf_summary.to_string(index=False))
 PY
 
     echo "EP$EP passed all three diagnostic experiments."
+
+    echo
+    echo "[EP$EP][Stage 3] Fixed-teacher refit probe"
+
+    REFIT_ARGS=()
+    if [[ -n "$REFIT_LR" ]]; then
+        REFIT_ARGS+=(--learning-rate "$REFIT_LR")
+    fi
+    python3 experiments/run_bp_fixed_teacher_refit_probe.py \
+        --run-root "$RUN_ROOT" \
+        --episode "$EP" \
+        --firm-pkl "$FIRM_PKL" \
+        --decomposition-summary "$SUMMARY_CSV" \
+        --device "$DEVICE" \
+        --steps "$REFIT_STEPS" \
+        --batch-size "$BATCH_SIZE" \
+        --n-branches "$N_BRANCHES" \
+        --output-dir "$EP_DIR" \
+        "${REFIT_ARGS[@]}" \
+        2>&1 | tee "$EP_DIR/fixed_teacher_refit_probe.log"
+
     nvidia-smi
 done
+
+echo
+echo "============================================================"
+echo "[Stage 4] Fixed-state cross-episode probe"
+echo "============================================================"
+
+REFERENCE_FIRM_PKL="$(expand_episode_path "$FIRM_TEMPLATE" "$REFERENCE_EPISODE")"
+python3 experiments/export_bp_fixed_state_cross_episode.py \
+    --run-root "$RUN_ROOT" \
+    --episodes "$EPISODES" \
+    --reference-episode "$REFERENCE_EPISODE" \
+    --reference-firm-pkl "$REFERENCE_FIRM_PKL" \
+    --device "$DEVICE" \
+    --states-per-group "$STATES_PER_GROUP" \
+    --flip-threshold "$FLIP_THRESHOLD" \
+    --batch-size "$BATCH_SIZE" \
+    --n-branches "$N_BRANCHES" \
+    --output-dir "$OUTPUT_ROOT/fixed_state_cross_episode" \
+    2>&1 | tee "$OUTPUT_ROOT/fixed_state_cross_episode.log"
+
+if [[ -z "$BASE_STATE_SOURCE_INDEX" ]]; then
+    BASE_STATE_SOURCE_INDEX="$(
+        python3 - <<'PY'
+from pathlib import Path
+import os
+import pandas as pd
+
+path = Path(os.environ["OUTPUT_ROOT"]) / "fixed_state_cross_episode" / "fixed_probe_states.csv"
+df = pd.read_csv(path)
+print(int(df["source_index"].iloc[0]))
+PY
+    )"
+fi
+
+echo
+echo "============================================================"
+echo "[Stage 4] Continuation and bond-value surface"
+echo "============================================================"
+
+python3 experiments/export_continuation_surface.py \
+    --run-root "$RUN_ROOT" \
+    --episode "$REFERENCE_EPISODE" \
+    --base-state-source-index "$BASE_STATE_SOURCE_INDEX" \
+    --firm-pkl "$REFERENCE_FIRM_PKL" \
+    --b-grid-size "$B_GRID_SIZE" \
+    --z-grid-size "$Z_GRID_SIZE" \
+    --m-mode observed_child_mean \
+    --device "$DEVICE" \
+    --batch-size "$BATCH_SIZE" \
+    --n-branches "$N_BRANCHES" \
+    --output-dir "$OUTPUT_ROOT/continuation_surface_ep${REFERENCE_EPISODE}" \
+    2>&1 | tee "$OUTPUT_ROOT/continuation_surface_ep${REFERENCE_EPISODE}.log"
 
 export OUTPUT_ROOT
 export EPISODES
@@ -468,6 +552,10 @@ PY
 if [[ "$RUN_RELATED_TESTS" == "1" ]]; then
     echo "[Tests] Running related test files"
     python3 -m pytest \
+        tests/test_bp_deep_diagnostics.py \
+        tests/test_bp_fixed_teacher_refit.py \
+        tests/test_bp_fixed_state_cross_episode.py \
+        tests/test_continuation_surface.py \
         tests/test_bp_grid_teacher.py \
         tests/test_target_grid_training_integration.py \
         -q
@@ -476,7 +564,7 @@ else
 fi
 
 echo "============================================================"
-echo "All three GPU experiments passed."
+echo "All BP GPU diagnostic stages passed."
 echo "Output root: $OUTPUT_ROOT"
 echo "Finished: $(date)"
 echo "============================================================"
