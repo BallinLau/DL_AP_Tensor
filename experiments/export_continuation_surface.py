@@ -25,12 +25,23 @@ def validate_q_decomposition_frame(q_long: pd.DataFrame, *, tolerance: float = 1
         "q_target_total",
         "q_training_residual",
         "q_issue_minus_target",
+        "bar_i",
+        "bar_i_multiplier",
+        "bar_i_mode",
     ]
     missing = [col for col in required if col not in q_long.columns]
     if missing:
         raise RuntimeError(f"Q decomposition CSV is missing required columns: {missing}")
 
-    values = q_long[required].apply(pd.to_numeric, errors="coerce")
+    numeric_cols = [
+        "q_issue",
+        "q_target_total",
+        "q_training_residual",
+        "q_issue_minus_target",
+        "bar_i",
+        "bar_i_multiplier",
+    ]
+    values = q_long[numeric_cols].apply(pd.to_numeric, errors="coerce")
     finite = torch.isfinite(torch.as_tensor(values.to_numpy(dtype="float64")))
     if not bool(finite.all().item()):
         raise RuntimeError("Q decomposition residual columns contain non-finite values.")
@@ -50,6 +61,26 @@ def validate_q_decomposition_frame(q_long: pd.DataFrame, *, tolerance: float = 1
         )
 
 
+def _extract_bar_i(model_output) -> torch.Tensor:
+    if isinstance(model_output, dict):
+        return model_output["bar_i"]
+    return model_output.bar_i
+
+
+def compute_issue_bar_i(
+    model,
+    parent: torch.Tensor,
+    issue_states: torch.Tensor,
+    *,
+    mode: str,
+) -> torch.Tensor:
+    if mode == "fixed_parent":
+        return _extract_bar_i(model(parent)).expand(issue_states.shape[0], -1)
+    if mode == "recompute_issue_state":
+        return _extract_bar_i(model(issue_states))
+    raise ValueError(f"Unknown bar_i mode: {mode}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export continuation and Q decomposition surfaces.")
     parser.add_argument("--run-root", type=Path, required=True)
@@ -62,6 +93,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--z-grid-size", type=int, default=41)
     parser.add_argument("--m-mode", choices=["observed_child_mean", "fixed"], default="observed_child_mean")
     parser.add_argument("--m-fixed", type=float, default=1.0)
+    parser.add_argument(
+        "--bar-i-mode",
+        choices=["fixed_parent", "recompute_issue_state"],
+        default="fixed_parent",
+        help=(
+            "fixed_parent keeps bar_i(b)=bar_i(base_parent) as a partial-equilibrium "
+            "debt slice; recompute_issue_state evaluates bar_i on each issue_state(b)."
+        ),
+    )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=4096)
@@ -147,11 +187,6 @@ def main() -> None:
         p_child = equity["P"]
         survival = equity["survival_prob"]
         default = equity["bar_z"].clamp(0.0, 1.0)
-        parent_out = target_model(parent)
-        if isinstance(parent_out, dict):
-            bar_i_parent = parent_out["bar_i"]
-        else:
-            bar_i_parent = parent_out.bar_i
 
     rows = []
     for branch, multiplier in [("p0", 1.0), ("pi", Config.G)]:
@@ -180,7 +215,12 @@ def main() -> None:
         issue_states = parent.expand(b_values.shape[0], -1).clone()
         issue_states[:, 0:1] = b_values
         q_issue = target_model._q_output(issue_states)
-        bar_i_issue = bar_i_parent.expand_as(b_values)
+        bar_i_issue = compute_issue_bar_i(
+            target_model,
+            parent,
+            issue_states,
+            mode=args.bar_i_mode,
+        ).clamp(0.0, 1.0)
         multiplier = bar_i_issue * (Config.G - 1.0) + 1.0
         q_target_survival_sum = torch.zeros_like(b_values)
         q_target_recovery_sum = torch.zeros_like(b_values)
@@ -246,7 +286,9 @@ def main() -> None:
                     "recovery_share": float(recovery_share[i].item()),
                     "default_child_mean": float(default_mean[i].item()),
                     "m_used_mean": float(m_mean[i].item()),
+                    "bar_i": float(bar_i_issue[i].item()),
                     "bar_i_multiplier": float(multiplier[i].item()),
+                    "bar_i_mode": args.bar_i_mode,
                 }
             )
 
@@ -271,7 +313,7 @@ def main() -> None:
     violation_count = int(((z_vals[1:] - z_vals[:-1]) < -1e-8).sum()) if len(z_vals) > 1 else 0
     boundary["boundary_monotonicity_violation_count"] = violation_count
     q_summary = (
-        q_long.groupby(["episode", "branch"])
+        q_long.groupby(["episode", "branch", "bar_i_mode"])
         .agg(
             n_rows=("source_index", "size"),
             q_issue_mean=("q_issue", "mean"),
@@ -298,6 +340,7 @@ def main() -> None:
     print(boundary_path)
     print(q_long_path)
     print(q_summary_path)
+    print("bar_i_mode:", args.bar_i_mode)
     print("boundary_monotonicity_violation_count:", violation_count)
 
 

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from config import Config
 from experiments.export_continuation_surface import (
+    compute_issue_bar_i,
     make_surface_states,
     validate_q_decomposition_frame,
 )
@@ -141,6 +144,9 @@ def test_q_csv_validator_checks_finiteness_and_sign_identity():
             "q_target_total": q_target_total.tolist(),
             "q_training_residual": q_training_residual.tolist(),
             "q_issue_minus_target": q_issue_minus_target.tolist(),
+            "bar_i": [0.2, 0.4],
+            "bar_i_multiplier": [1.0 + 0.2 * (Config.G - 1.0), 1.0 + 0.4 * (Config.G - 1.0)],
+            "bar_i_mode": ["fixed_parent", "fixed_parent"],
         }
     )
     validate_q_decomposition_frame(df)
@@ -153,3 +159,35 @@ def test_q_csv_validator_checks_finiteness_and_sign_identity():
         assert "sign identity failed" in str(exc)
     else:
         raise AssertionError("validator should reject inconsistent residual signs")
+
+
+class _BarIVariesWithDebtModel:
+    def __call__(self, state):
+        return SimpleNamespace(bar_i=(0.1 + 0.7 * state[:, 0:1]).clamp(0.0, 1.0))
+
+
+def test_bar_i_mode_fixed_parent_vs_recompute_issue_state():
+    model = _BarIVariesWithDebtModel()
+    parent = torch.tensor([[0.2, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
+    issue_states = parent.expand(3, -1).clone()
+    issue_states[:, 0:1] = torch.tensor([[0.0], [0.5], [1.0]], dtype=torch.float64)
+
+    fixed = compute_issue_bar_i(
+        model,
+        parent,
+        issue_states,
+        mode="fixed_parent",
+    )
+    recomputed = compute_issue_bar_i(
+        model,
+        parent,
+        issue_states,
+        mode="recompute_issue_state",
+    )
+
+    expected_fixed = torch.full_like(fixed, 0.1 + 0.7 * 0.2)
+    expected_recomputed = 0.1 + 0.7 * issue_states[:, 0:1]
+    torch.testing.assert_close(fixed, expected_fixed)
+    torch.testing.assert_close(recomputed, expected_recomputed)
+    assert torch.unique(fixed).numel() == 1
+    assert torch.unique(recomputed).numel() == issue_states.shape[0]
