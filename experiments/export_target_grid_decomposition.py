@@ -338,7 +338,6 @@ def main() -> None:
                     source_index=source_index,
                     branch=branch,
                     bp_pred=inputs["bp_pred"],
-                    mix_survival_weight=mix_survival_weight,
                 )
             )
             summary_rows.extend(
@@ -348,6 +347,7 @@ def main() -> None:
                     source_index=source_index,
                     branch=branch,
                     bp_pred=inputs["bp_pred"],
+                    mix_survival_weight=mix_survival_weight,
                 )
             )
 
