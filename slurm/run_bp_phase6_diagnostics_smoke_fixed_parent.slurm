@@ -19,6 +19,7 @@ RUN_ROOT="${RUN_ROOT:-$WORK_ROOT/cachedir/normalized_sdf_aio_full_20260712_17410
 export WORK_ROOT
 export REPO_DIR
 export RUN_ROOT
+export FIRM_TEMPLATE="$RUN_ROOT/data/outputs/ep{ep}_stage_modeb.pkl"
 export EPISODES="${EPISODES:-2}"
 export REFERENCE_EPISODE="${REFERENCE_EPISODE:-2}"
 export N_STATES="${N_STATES:-5}"
@@ -26,6 +27,7 @@ export REFIT_STEPS="${REFIT_STEPS:-20}"
 export B_GRID_SIZE="${B_GRID_SIZE:-11}"
 export Z_GRID_SIZE="${Z_GRID_SIZE:-21}"
 export RUN_RELATED_TESTS="${RUN_RELATED_TESTS:-1}"
+export ALLOW_DIRTY_WORKTREE="${ALLOW_DIRTY_WORKTREE:-1}"
 export BAR_I_MODE="${BAR_I_MODE:-fixed_parent}"
 export OUTPUT_ROOT="${OUTPUT_ROOT:-$RUN_ROOT/data/outputs/bp_phase6_smoke_fixed_parent}"
 
