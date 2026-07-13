@@ -185,6 +185,18 @@ def test_grid_teacher_mix_branch_and_coarse_confidence():
     assert out["bp_star"].shape == (2, 1)
     assert out["coarse_value_grid"].shape == (2, 5)
     assert out["value_grid"].shape == (2, 5)
+    torch.testing.assert_close(
+        out["value_grid"],
+        out["cashflow_grid_mean"] + out["continuation_grid_mean"],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        out["coarse_value_grid"],
+        out["coarse_cashflow_grid_mean"] + out["coarse_continuation_grid_mean"],
+        rtol=1e-5,
+        atol=1e-6,
+    )
     assert torch.all(out["coarse_top2_margin"] >= out["fine_top2_margin"] - 1e-6)
     assert torch.all(out["confidence"] > 0)
     assert torch.all(out["regret"] >= 0)
@@ -293,9 +305,13 @@ def test_candidate_chunk_zero_matches_chunked_grid_outputs():
         "bp_star",
         "value_star",
         "value_grid",
+        "cashflow_grid_mean",
+        "continuation_grid_mean",
         "q_issue_grid",
         "p_child_grid_mean",
         "default_grid_mean",
+        "coarse_cashflow_grid_mean",
+        "coarse_continuation_grid_mean",
     ]:
         torch.testing.assert_close(out_chunked[key], out_full[key], rtol=1e-5, atol=1e-6)
     assert torch.equal(out_chunked["argmax_index"], out_full["argmax_index"])

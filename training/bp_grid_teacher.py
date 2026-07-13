@@ -353,6 +353,8 @@ class BPGridTeacher:
                     "refi_active": eta_current.detach(),
                     "coarse_bp_grid": coarse["bp_grid"].detach(),
                     "coarse_value_grid": coarse["value_grid"].detach(),
+                    "coarse_cashflow_grid_mean": coarse["cashflow_grid_mean"].detach(),
+                    "coarse_continuation_grid_mean": coarse["continuation_grid_mean"].detach(),
                     "coarse_q_issue_grid": coarse["q_issue_grid"].detach(),
                     "coarse_p_child_grid_mean": coarse["p_child_grid_mean"].detach(),
                     "coarse_default_grid_mean": coarse["default_grid_mean"].detach(),
@@ -468,6 +470,8 @@ class BPGridTeacher:
         return {
             "bp_grid": torch.cat([c["bp_grid"] for c in chunks], dim=1),
             "value_grid": torch.cat([c["value_grid"] for c in chunks], dim=1),
+            "cashflow_grid_mean": torch.cat([c["cashflow_grid_mean"] for c in chunks], dim=1),
+            "continuation_grid_mean": torch.cat([c["continuation_grid_mean"] for c in chunks], dim=1),
             "q_issue_grid": torch.cat([c["q_issue_grid"] for c in chunks], dim=1),
             "p_child_grid_mean": torch.cat([c["p_child_grid_mean"] for c in chunks], dim=1),
             "default_grid_mean": torch.cat([c["default_grid_mean"] for c in chunks], dim=1),
@@ -541,7 +545,8 @@ class BPGridTeacher:
             q_issue_flat,
             eta_current_flat,
         ).reshape(batch_size, n_grid, n_children)
-        value0 = cf0 + m_grid * p_child
+        continuation0 = m_grid * p_child
+        value0 = cf0 + continuation0
 
         cfi = self.pi_loss_fn.compute_cashflow_pi(
             x_grid,
@@ -552,16 +557,25 @@ class BPGridTeacher:
             q_issue_flat,
             eta_current_flat,
         ).reshape(batch_size, n_grid, n_children)
-        valuei = cfi + Config.G * m_grid * p_child
+        continuationi = Config.G * m_grid * p_child
+        valuei = cfi + continuationi
 
         if branch == "p0":
+            branch_cashflow = cf0
+            branch_continuation = continuation0
             branch_value = value0
         elif branch == "pi":
+            branch_cashflow = cfi
+            branch_continuation = continuationi
             branch_value = valuei
         else:
+            branch_cashflow = (1.0 - mix_w) * cf0 + mix_w * cfi
+            branch_continuation = (1.0 - mix_w) * continuation0 + mix_w * continuationi
             branch_value = (1.0 - mix_w) * value0 + mix_w * valuei
 
         value_grid = branch_value.mean(dim=2)
+        cashflow_grid_mean = branch_cashflow.mean(dim=2)
+        continuation_grid_mean = branch_continuation.mean(dim=2)
         p_grid_mean = p_child.mean(dim=2)
         default_grid_mean = bar_z_child.mean(dim=2)
         argmax_index = value_grid.argmax(dim=1, keepdim=True)
@@ -569,6 +583,8 @@ class BPGridTeacher:
         return {
             "bp_grid": bp_grid,
             "value_grid": value_grid,
+            "cashflow_grid_mean": cashflow_grid_mean,
+            "continuation_grid_mean": continuation_grid_mean,
             "argmax_index": argmax_index,
             "q_issue_grid": q_issue,
             "p_child_grid_mean": p_grid_mean,

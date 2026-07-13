@@ -92,6 +92,8 @@ def _reference_target_grid_chunk(teacher, parent_state, children, m_list, bp_gri
     q_issue = teacher.target_model._q_output(issue_state).reshape(batch_size, n_grid)
 
     value_grid = torch.zeros(batch_size, n_grid, dtype=parent_state.dtype, device=parent_state.device)
+    cashflow_grid = torch.zeros_like(value_grid)
+    continuation_grid = torch.zeros_like(value_grid)
     p_sum = torch.zeros_like(value_grid)
     default_sum = torch.zeros_like(value_grid)
     x_parent = parent_state[:, 4:5]
@@ -116,7 +118,8 @@ def _reference_target_grid_chunk(teacher, parent_state, children, m_list, bp_gri
             q_issue.reshape(-1, 1),
             eta_current.expand(batch_size, n_grid).reshape(-1, 1),
         ).reshape(batch_size, n_grid)
-        value0 = cf0 + m.expand(batch_size, n_grid) * p_child
+        continuation0 = m.expand(batch_size, n_grid) * p_child
+        value0 = cf0 + continuation0
 
         cfi = teacher.pi_loss_fn.compute_cashflow_pi(
             x_parent.expand(batch_size, n_grid).reshape(-1, 1),
@@ -127,16 +130,25 @@ def _reference_target_grid_chunk(teacher, parent_state, children, m_list, bp_gri
             q_issue.reshape(-1, 1),
             eta_current.expand(batch_size, n_grid).reshape(-1, 1),
         ).reshape(batch_size, n_grid)
-        valuei = cfi + Config.G * m.expand(batch_size, n_grid) * p_child
+        continuationi = Config.G * m.expand(batch_size, n_grid) * p_child
+        valuei = cfi + continuationi
 
         if branch == "p0":
+            branch_cashflow = cf0
+            branch_continuation = continuation0
             branch_value = value0
         elif branch == "pi":
+            branch_cashflow = cfi
+            branch_continuation = continuationi
             branch_value = valuei
         else:
+            branch_cashflow = (1.0 - mix_w) * cf0 + mix_w * cfi
+            branch_continuation = (1.0 - mix_w) * continuation0 + mix_w * continuationi
             branch_value = (1.0 - mix_w) * value0 + mix_w * valuei
 
         value_grid = value_grid + branch_value
+        cashflow_grid = cashflow_grid + branch_cashflow
+        continuation_grid = continuation_grid + branch_continuation
         p_sum = p_sum + p_child
         default_sum = default_sum + bar_z_child
 
@@ -144,6 +156,8 @@ def _reference_target_grid_chunk(teacher, parent_state, children, m_list, bp_gri
     return {
         "bp_grid": bp_grid,
         "value_grid": value_grid / n_children,
+        "cashflow_grid_mean": cashflow_grid / n_children,
+        "continuation_grid_mean": continuation_grid / n_children,
         "q_issue_grid": q_issue,
         "p_child_grid_mean": p_sum / n_children,
         "default_grid_mean": default_sum / n_children,
@@ -431,7 +445,15 @@ class PolicyChildVectorizationTest(unittest.TestCase):
                 mix_weight=mix_weight if branch == "mix" else None,
             )
 
-            for key in ("bp_grid", "value_grid", "q_issue_grid", "p_child_grid_mean", "default_grid_mean"):
+            for key in (
+                "bp_grid",
+                "value_grid",
+                "cashflow_grid_mean",
+                "continuation_grid_mean",
+                "q_issue_grid",
+                "p_child_grid_mean",
+                "default_grid_mean",
+            ):
                 torch.testing.assert_close(vector[key], reference[key], rtol=1e-10, atol=1e-10)
             torch.testing.assert_close(vector["argmax_index"], reference["argmax_index"], rtol=0.0, atol=0.0)
             self.assertEqual(vector_model.equity_calls, 1)
