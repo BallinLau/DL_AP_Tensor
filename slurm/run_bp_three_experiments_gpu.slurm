@@ -525,6 +525,45 @@ for path in paths:
     df = pd.read_csv(path)
     if df.empty:
         raise AssertionError(f"{path} is empty")
+    if path.name.endswith("_default_boundary.csv"):
+        required = {
+            "boundary_censoring",
+            "z_survival_boundary",
+            "z_boundary_lower_bound",
+            "z_boundary_upper_bound",
+        }
+        missing = required.difference(df.columns)
+        if missing:
+            raise AssertionError(f"{path} missing columns: {sorted(missing)}")
+        allowed = {"observed", "left_censored", "right_censored"}
+        invalid = set(df["boundary_censoring"].dropna().unique()).difference(allowed)
+        if invalid:
+            raise AssertionError(f"{path} invalid boundary_censoring values: {sorted(invalid)}")
+        observed = df["boundary_censoring"] == "observed"
+        if not np.isfinite(df.loc[observed, "z_survival_boundary"].to_numpy()).all():
+            raise AssertionError(f"{path} observed rows contain non-finite z_survival_boundary")
+        counts = df["boundary_censoring"].value_counts().reindex(
+            ["observed", "left_censored", "right_censored"],
+            fill_value=0,
+        )
+        print(
+            f"{path.name} censoring counts: "
+            f"observed={int(counts['observed'])}, "
+            f"left_censored={int(counts['left_censored'])}, "
+            f"right_censored={int(counts['right_censored'])}"
+        )
+        numeric = df.select_dtypes(include=["number"]).drop(
+            columns=[
+                "z_survival_boundary",
+                "z_boundary_lower_bound",
+                "z_boundary_upper_bound",
+            ],
+            errors="ignore",
+        )
+        finite = np.isfinite(numeric.to_numpy()).all()
+        if not finite:
+            raise AssertionError(f"{path} contains NaN/Inf outside censoring boundary columns")
+        continue
     numeric = df.select_dtypes(include=["number"])
     finite = np.isfinite(numeric.to_numpy()).all()
     if not finite:

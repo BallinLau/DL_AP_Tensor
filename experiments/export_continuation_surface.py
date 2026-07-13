@@ -81,6 +81,63 @@ def compute_issue_bar_i(
     raise ValueError(f"Unknown bar_i mode: {mode}")
 
 
+def make_default_boundary_frame(
+    surface: pd.DataFrame,
+    *,
+    episode: int,
+    source_index: int,
+    z_min: float,
+    z_max: float,
+) -> pd.DataFrame:
+    boundary_rows = []
+    p0_surface = surface[surface["branch"] == "p0"]
+    for b_val, group in p0_surface.groupby("b_candidate", sort=True):
+        ordered = group.sort_values("z_child")
+        survival = ordered["survival_child"] >= 0.5
+        if bool(survival.any()) and not bool(survival.all()):
+            z_boundary = float(ordered.loc[survival, "z_child"].iloc[0])
+            censoring = "observed"
+            lower_bound = float("nan")
+            upper_bound = float("nan")
+            boundary_found = True
+        elif bool(survival.all()):
+            z_boundary = float("nan")
+            censoring = "left_censored"
+            lower_bound = float("nan")
+            upper_bound = float(z_min)
+            boundary_found = False
+        else:
+            z_boundary = float("nan")
+            censoring = "right_censored"
+            lower_bound = float(z_max)
+            upper_bound = float("nan")
+            boundary_found = False
+        boundary_rows.append(
+            {
+                "episode": episode,
+                "source_index": source_index,
+                "b_candidate": b_val,
+                "z_survival_boundary": z_boundary,
+                "boundary_found": boundary_found,
+                "boundary_censoring": censoring,
+                "z_boundary_lower_bound": lower_bound,
+                "z_boundary_upper_bound": upper_bound,
+            }
+        )
+    boundary = pd.DataFrame(boundary_rows)
+    ordered_boundary = boundary.sort_values("b_candidate").reset_index(drop=True)
+    violation_count = 0
+    for pos in range(len(ordered_boundary) - 1):
+        current = ordered_boundary.iloc[pos]
+        nxt = ordered_boundary.iloc[pos + 1]
+        if current["boundary_censoring"] != "observed" or nxt["boundary_censoring"] != "observed":
+            continue
+        if float(nxt["z_survival_boundary"]) - float(current["z_survival_boundary"]) < -1e-8:
+            violation_count += 1
+    boundary["boundary_monotonicity_violation_count"] = violation_count
+    return boundary
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export continuation and Q decomposition surfaces.")
     parser.add_argument("--run-root", type=Path, required=True)
@@ -295,23 +352,14 @@ def main() -> None:
     surface = pd.DataFrame(rows)
     q_long = pd.DataFrame(q_rows)
     validate_q_decomposition_frame(q_long)
-    boundary_rows = []
-    for b_val, group in surface[surface["branch"] == "p0"].groupby("b_candidate"):
-        survived = group[group["survival_child"] >= 0.5].sort_values("z_child")
-        boundary_found = not survived.empty
-        boundary_rows.append(
-            {
-                "episode": args.episode,
-                "source_index": args.base_state_source_index,
-                "b_candidate": b_val,
-                "z_survival_boundary": float(survived["z_child"].iloc[0]) if boundary_found else float(args.z_max),
-                "boundary_found": boundary_found,
-            }
-        )
-    boundary = pd.DataFrame(boundary_rows)
-    z_vals = boundary["z_survival_boundary"].dropna().to_numpy()
-    violation_count = int(((z_vals[1:] - z_vals[:-1]) < -1e-8).sum()) if len(z_vals) > 1 else 0
-    boundary["boundary_monotonicity_violation_count"] = violation_count
+    boundary = make_default_boundary_frame(
+        surface,
+        episode=args.episode,
+        source_index=args.base_state_source_index,
+        z_min=args.z_min,
+        z_max=args.z_max,
+    )
+    violation_count = int(boundary["boundary_monotonicity_violation_count"].iloc[0]) if not boundary.empty else 0
     q_summary = (
         q_long.groupby(["episode", "branch", "bar_i_mode"])
         .agg(

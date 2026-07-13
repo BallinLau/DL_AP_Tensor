@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pandas as pd
 import torch
 
 from config import Config
 from experiments.export_continuation_surface import (
     compute_issue_bar_i,
+    make_default_boundary_frame,
     make_surface_states,
     validate_q_decomposition_frame,
 )
@@ -136,8 +138,6 @@ def test_q_csv_validator_checks_finiteness_and_sign_identity():
     q_training_residual = q_target_total - q_issue
     q_issue_minus_target = q_issue - q_target_total
 
-    import pandas as pd
-
     df = pd.DataFrame(
         {
             "q_issue": q_issue.tolist(),
@@ -191,3 +191,40 @@ def test_bar_i_mode_fixed_parent_vs_recompute_issue_state():
     torch.testing.assert_close(recomputed, expected_recomputed)
     assert torch.unique(fixed).numel() == 1
     assert torch.unique(recomputed).numel() == issue_states.shape[0]
+
+
+def test_default_boundary_censoring_and_monotonicity_use_observed_only():
+    rows = []
+    # Observed boundary at z=0.0.
+    for z, survival in [(-1.0, 0.0), (0.0, 0.7), (1.0, 1.0)]:
+        rows.append({"branch": "p0", "b_candidate": 0.0, "z_child": z, "survival_child": survival})
+    # Entire grid survives: boundary lies below z_min.
+    for z in [-1.0, 0.0, 1.0]:
+        rows.append({"branch": "p0", "b_candidate": 0.5, "z_child": z, "survival_child": 1.0})
+    # Observed boundary at z=-1.0; this would be a violation if censored rows
+    # were dropped before checking adjacency.
+    for z, survival in [(-1.0, 0.8), (0.0, 1.0), (1.0, 1.0)]:
+        rows.append({"branch": "p0", "b_candidate": 1.0, "z_child": z, "survival_child": survival})
+    # Entire grid defaults: boundary lies above z_max.
+    for z in [-1.0, 0.0, 1.0]:
+        rows.append({"branch": "p0", "b_candidate": 1.5, "z_child": z, "survival_child": 0.0})
+
+    boundary = make_default_boundary_frame(
+        pd.DataFrame(rows),
+        episode=2,
+        source_index=7,
+        z_min=-1.0,
+        z_max=1.0,
+    )
+
+    by_b = boundary.set_index("b_candidate")
+    assert by_b.loc[0.0, "boundary_censoring"] == "observed"
+    assert by_b.loc[0.0, "boundary_found"]
+    assert by_b.loc[0.0, "z_survival_boundary"] == 0.0
+    assert by_b.loc[0.5, "boundary_censoring"] == "left_censored"
+    assert pd.isna(by_b.loc[0.5, "z_survival_boundary"])
+    assert by_b.loc[0.5, "z_boundary_upper_bound"] == -1.0
+    assert by_b.loc[1.5, "boundary_censoring"] == "right_censored"
+    assert pd.isna(by_b.loc[1.5, "z_survival_boundary"])
+    assert by_b.loc[1.5, "z_boundary_lower_bound"] == 1.0
+    assert int(boundary["boundary_monotonicity_violation_count"].iloc[0]) == 0
