@@ -6,6 +6,7 @@
 #SBATCH -e /home/fit/zhuyingz/WORK/LiuHao/logs/dl_grid_decomposition_smoke_error.%j
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
 #SBATCH --time=0-01:00:00
 
 set -euo pipefail
@@ -25,7 +26,7 @@ POLICY_CKPT="${POLICY_CKPT:-$RUN_ROOT/checkpoints/ep2_policy_value.pt}"
 FC2_CKPT="${FC2_CKPT:-$RUN_ROOT/checkpoints/ep2_fc2.pt}"
 
 N_STATES="${N_STATES:-5}"
-DEVICE="${DEVICE:-cpu}"
+DEVICE="${DEVICE:-cuda}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 N_BRANCHES="${N_BRANCHES:-2}"
 RUN_EXPORTER_PYTEST="${RUN_EXPORTER_PYTEST:-0}"
@@ -93,7 +94,14 @@ print("Torch:", torch.__version__)
 print("Pandas:", pd.__version__)
 print("CUDA available:", torch.cuda.is_available())
 print("CUDA device count:", torch.cuda.device_count())
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA is not available on this Slurm allocation.")
+print("CUDA device 0:", torch.cuda.get_device_name(0))
 PY
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi
+fi
 
 echo "[1/4] Syntax and CLI validation"
 
