@@ -114,6 +114,9 @@ def make_summary_rows(
     q_issue = result["coarse_q_issue_grid"]
     p_child = result["coarse_p_child_grid_mean"]
     default = result["coarse_default_grid_mean"]
+    bp_star_teacher = result["bp_star"].reshape(-1)
+    value_star_teacher = result["value_star"].reshape(-1)
+    regret_at_pred = result["regret"].reshape(-1)
 
     argmax = value.argmax(dim=1)
     bp_pred_flat = bp_pred.reshape(-1)
@@ -126,13 +129,13 @@ def make_summary_rows(
         cf_low = cashflow[state_pos, 0]
         cont_low = continuation[state_pos, 0]
 
-        value_star = value[state_pos, j_star]
-        cf_star = cashflow[state_pos, j_star]
-        cont_star = continuation[state_pos, j_star]
+        value_star_coarse = value[state_pos, j_star]
+        cf_star_coarse = cashflow[state_pos, j_star]
+        cont_star_coarse = continuation[state_pos, j_star]
 
-        delta_cf = cf_star - cf_low
-        delta_cont = cont_star - cont_low
-        delta_value = value_star - value_low
+        delta_cf = cf_star_coarse - cf_low
+        delta_cont = cont_star_coarse - cont_low
+        delta_value = value_star_coarse - value_low
         identity_error = (value[state_pos] - cashflow[state_pos] - continuation[state_pos]).abs().max()
 
         if abs(float(delta_cf.item())) >= abs(float(delta_cont.item())):
@@ -153,17 +156,20 @@ def make_summary_rows(
                 "hatcf": float(parent_state[state_pos, 5].item()),
                 "lnkf": float(parent_state[state_pos, 6].item()),
                 "bp_pred": float(bp_pred_flat[state_pos].item()),
-                "bp_star": float(grid[state_pos, j_star].item()),
+                "bp_star_coarse": float(grid[state_pos, j_star].item()),
+                "bp_star_teacher": float(bp_star_teacher[state_pos].item()),
                 "argmax_index": j_star,
                 "value_low": float(value_low.item()),
-                "value_star": float(value_star.item()),
+                "value_star_coarse": float(value_star_coarse.item()),
+                "value_star_teacher": float(value_star_teacher[state_pos].item()),
+                "regret_at_pred": float(regret_at_pred[state_pos].item()),
                 "cashflow_low": float(cf_low.item()),
-                "cashflow_star": float(cf_star.item()),
+                "cashflow_coarse_star": float(cf_star_coarse.item()),
                 "continuation_low": float(cont_low.item()),
-                "continuation_star": float(cont_star.item()),
-                "delta_cashflow_low_to_star": float(delta_cf.item()),
-                "delta_continuation_low_to_star": float(delta_cont.item()),
-                "delta_value_low_to_star": float(delta_value.item()),
+                "continuation_coarse_star": float(cont_star_coarse.item()),
+                "delta_cashflow_low_to_coarse_star": float(delta_cf.item()),
+                "delta_continuation_low_to_coarse_star": float(delta_cont.item()),
+                "delta_value_low_to_coarse_star": float(delta_value.item()),
                 "q_issue_star": float(q_issue[state_pos, j_star].item()),
                 "p_child_star": float(p_child[state_pos, j_star].item()),
                 "default_star": float(default[state_pos, j_star].item()),
@@ -194,9 +200,19 @@ def main() -> None:
     if not firm_pkl.exists():
         raise FileNotFoundError(f"Firm pickle not found: {firm_pkl}")
 
+    checkpoint_dir = run_root / "checkpoints"
+    policy_ckpt = checkpoint_dir / f"ep{args.episode}_policy_value.pt"
+    if not policy_ckpt.exists():
+        raise FileNotFoundError(
+            "Policy/value checkpoint is required for decomposition export; "
+            f"missing {policy_ckpt}. Refusing to fall back to a random model."
+        )
+    print(f"Using policy checkpoint: {policy_ckpt}")
+    print(f"Using firm data: {firm_pkl}")
+
     models = build_models(
         device=device,
-        ckpt_dir=run_root / "checkpoints",
+        ckpt_dir=checkpoint_dir,
         ckpt_prefix=f"ep{args.episode}",
         strict=True,
     )
@@ -331,16 +347,18 @@ def main() -> None:
         "branch",
         "b",
         "bp_pred",
-        "bp_star",
-        "delta_cashflow_low_to_star",
-        "delta_continuation_low_to_star",
-        "delta_value_low_to_star",
+        "bp_star_coarse",
+        "bp_star_teacher",
+        "regret_at_pred",
+        "delta_cashflow_low_to_coarse_star",
+        "delta_continuation_low_to_coarse_star",
+        "delta_value_low_to_coarse_star",
         "default_star",
         "dominant_component",
     ]
     print(
         summary_df[display_cols]
-        .sort_values(["branch", "bp_star"], ascending=[True, False])
+        .sort_values(["branch", "bp_star_coarse"], ascending=[True, False])
         .to_string(index=False)
     )
 
