@@ -19,6 +19,37 @@ from experiments.run_utils import build_hyperparams, build_models  # noqa: E402
 from losses.q_loss import compute_q_survival_recovery_components  # noqa: E402
 
 
+def validate_q_decomposition_frame(q_long: pd.DataFrame, *, tolerance: float = 1e-7) -> None:
+    required = [
+        "q_issue",
+        "q_target_total",
+        "q_training_residual",
+        "q_issue_minus_target",
+    ]
+    missing = [col for col in required if col not in q_long.columns]
+    if missing:
+        raise RuntimeError(f"Q decomposition CSV is missing required columns: {missing}")
+
+    values = q_long[required].apply(pd.to_numeric, errors="coerce")
+    finite = torch.isfinite(torch.as_tensor(values.to_numpy(dtype="float64")))
+    if not bool(finite.all().item()):
+        raise RuntimeError("Q decomposition residual columns contain non-finite values.")
+
+    training_identity = (
+        values["q_training_residual"]
+        - (values["q_target_total"] - values["q_issue"])
+    ).abs().max()
+    sign_identity = (
+        values["q_issue_minus_target"] + values["q_training_residual"]
+    ).abs().max()
+    max_error = max(float(training_identity), float(sign_identity))
+    if max_error > tolerance:
+        raise RuntimeError(
+            "Q decomposition residual sign identity failed: "
+            f"max_error={max_error:.6g}, tolerance={tolerance:.6g}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export continuation and Q decomposition surfaces.")
     parser.add_argument("--run-root", type=Path, required=True)
@@ -153,6 +184,9 @@ def main() -> None:
         multiplier = bar_i_issue * (Config.G - 1.0) + 1.0
         q_target_survival_sum = torch.zeros_like(b_values)
         q_target_recovery_sum = torch.zeros_like(b_values)
+        q_target_total_sum = torch.zeros_like(b_values)
+        q_training_residual_sum = torch.zeros_like(b_values)
+        q_issue_minus_target_sum = torch.zeros_like(b_values)
         default_sum = torch.zeros_like(b_values)
         m_sum = torch.zeros_like(b_values)
         for child_idx, child in enumerate(children):
@@ -182,13 +216,17 @@ def main() -> None:
             )
             q_target_survival_sum = q_target_survival_sum + components["q_target_survival"]
             q_target_recovery_sum = q_target_recovery_sum + components["q_target_recovery"]
+            q_target_total_sum = q_target_total_sum + components["q_target_total"]
+            q_training_residual_sum = q_training_residual_sum + components["q_training_residual"]
+            q_issue_minus_target_sum = q_issue_minus_target_sum + components["q_issue_minus_target"]
             default_sum = default_sum + child_default
             m_sum = m_sum + child_m
         n_children = float(len(children))
         q_target_survival = q_target_survival_sum / n_children
         q_target_recovery = q_target_recovery_sum / n_children
-        q_target_total = q_target_survival + q_target_recovery
-        q_residual = q_issue - q_target_total
+        q_target_total = q_target_total_sum / n_children
+        q_training_residual = q_training_residual_sum / n_children
+        q_issue_minus_target = q_issue_minus_target_sum / n_children
         recovery_share = q_target_recovery / q_target_total.clamp_min(1e-12)
         default_mean = default_sum / n_children
         m_mean = m_sum / n_children
@@ -203,7 +241,8 @@ def main() -> None:
                     "q_target_survival": float(q_target_survival[i].item()),
                     "q_target_recovery": float(q_target_recovery[i].item()),
                     "q_target_total": float(q_target_total[i].item()),
-                    "q_pricing_residual": float(q_residual[i].item()),
+                    "q_training_residual": float(q_training_residual[i].item()),
+                    "q_issue_minus_target": float(q_issue_minus_target[i].item()),
                     "recovery_share": float(recovery_share[i].item()),
                     "default_child_mean": float(default_mean[i].item()),
                     "m_used_mean": float(m_mean[i].item()),
@@ -213,6 +252,7 @@ def main() -> None:
 
     surface = pd.DataFrame(rows)
     q_long = pd.DataFrame(q_rows)
+    validate_q_decomposition_frame(q_long)
     boundary_rows = []
     for b_val, group in surface[surface["branch"] == "p0"].groupby("b_candidate"):
         survived = group[group["survival_child"] >= 0.5].sort_values("z_child")
@@ -238,7 +278,8 @@ def main() -> None:
             q_target_survival_mean=("q_target_survival", "mean"),
             q_target_recovery_mean=("q_target_recovery", "mean"),
             q_target_total_mean=("q_target_total", "mean"),
-            q_pricing_residual_mean=("q_pricing_residual", "mean"),
+            q_training_residual_mean=("q_training_residual", "mean"),
+            q_issue_minus_target_mean=("q_issue_minus_target", "mean"),
             recovery_share_mean=("recovery_share", "mean"),
         )
         .reset_index()

@@ -3,7 +3,10 @@ from __future__ import annotations
 import torch
 
 from config import Config
-from experiments.export_continuation_surface import make_surface_states
+from experiments.export_continuation_surface import (
+    make_surface_states,
+    validate_q_decomposition_frame,
+)
 from losses.q_loss import QLoss, compute_q_survival_recovery_components
 
 
@@ -31,8 +34,9 @@ def test_q_survival_recovery_decomposition_identity():
     survival_part = m * (b + multiplier * q_child) * (1.0 - default)
     recovery_part = m * recovery * multiplier * default
     total = survival_part + recovery_part
-    residual = q_issue - total
-    torch.testing.assert_close(q_issue, total + residual)
+    residual = total - q_issue
+    torch.testing.assert_close(residual, total - q_issue)
+    torch.testing.assert_close(q_issue - total, -residual)
     recovery_share = recovery_part / total.clamp_min(1e-12)
     assert torch.isfinite(recovery_share).all()
 
@@ -70,8 +74,82 @@ def test_q_decomposition_helper_matches_q_loss_residual():
         delta=loss_fn.delta,
         phi=loss_fn.phi,
     )
-    torch.testing.assert_close(residual, components["q_pricing_residual"])
+    torch.testing.assert_close(residual, components["q_training_residual"])
+    torch.testing.assert_close(
+        components["q_training_residual"],
+        components["q_target_total"] - Q,
+    )
+    torch.testing.assert_close(
+        components["q_issue_minus_target"],
+        -components["q_training_residual"],
+    )
+    torch.testing.assert_close(
+        components["q_pricing_residual"],
+        components["q_training_residual"],
+    )
     torch.testing.assert_close(
         components["q_target_total"],
         components["q_target_survival"] + components["q_target_recovery"],
     )
+
+
+def test_q_residual_signs_cover_positive_and_negative_cases():
+    components = compute_q_survival_recovery_components(
+        Q=torch.tensor([[0.0], [0.5]], dtype=torch.float64),
+        b=torch.tensor([[1.0], [0.0]], dtype=torch.float64),
+        bar_i=torch.zeros(2, 1, dtype=torch.float64),
+        M=torch.ones(2, 1, dtype=torch.float64),
+        Qsp=torch.zeros(2, 1, dtype=torch.float64),
+        bar_z=torch.zeros(2, 1, dtype=torch.float64),
+        x_child=torch.zeros(2, 1, dtype=torch.float64),
+        z_child=torch.zeros(2, 1, dtype=torch.float64),
+        g=Config.G,
+        delta=Config.DELTA,
+        phi=Config.PHI,
+    )
+
+    torch.testing.assert_close(
+        components["q_training_residual"],
+        components["q_target_total"] - torch.tensor([[0.0], [0.5]], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        components["q_issue_minus_target"],
+        -components["q_training_residual"],
+    )
+    assert components["q_training_residual"][0].item() > 0.0
+    assert components["q_training_residual"][1].item() < 0.0
+
+
+def test_q_csv_validator_checks_finiteness_and_sign_identity():
+    frame = torch.tensor(
+        [
+            [0.2, 0.5],
+            [0.8, 0.3],
+        ],
+        dtype=torch.float64,
+    )
+    q_issue = frame[:, 0]
+    q_target_total = frame[:, 1]
+    q_training_residual = q_target_total - q_issue
+    q_issue_minus_target = q_issue - q_target_total
+
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "q_issue": q_issue.tolist(),
+            "q_target_total": q_target_total.tolist(),
+            "q_training_residual": q_training_residual.tolist(),
+            "q_issue_minus_target": q_issue_minus_target.tolist(),
+        }
+    )
+    validate_q_decomposition_frame(df)
+
+    bad = df.copy()
+    bad.loc[0, "q_issue_minus_target"] *= -1.0
+    try:
+        validate_q_decomposition_frame(bad)
+    except RuntimeError as exc:
+        assert "sign identity failed" in str(exc)
+    else:
+        raise AssertionError("validator should reject inconsistent residual signs")
