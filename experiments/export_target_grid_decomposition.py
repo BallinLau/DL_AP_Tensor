@@ -122,6 +122,14 @@ def make_summary_rows(
     default_teacher_star = result["default_at_star"].reshape(-1)
 
     argmax = value.argmax(dim=1)
+    top2_count = min(2, value.shape[1])
+    top_values = torch.topk(value, k=top2_count, dim=1).values
+    value_best = top_values[:, 0]
+    value_second_best = top_values[:, 1] if top2_count > 1 else value_best
+    value_margin = value_best - value_second_best
+    relative_value_margin = value_margin / value_best.abs().clamp_min(1e-8)
+    confidence_weight = result["confidence"].reshape(-1)
+    active_refinancing = result["refi_active"].reshape(-1)
     bp_pred_flat = bp_pred.reshape(-1)
     rows: List[Dict[str, object]] = []
 
@@ -165,6 +173,12 @@ def make_summary_rows(
                 "value_low": float(value_low.item()),
                 "value_star_coarse": float(value_star_coarse.item()),
                 "value_star_teacher": float(value_star_teacher[state_pos].item()),
+                "value_best": float(value_best[state_pos].item()),
+                "value_second_best": float(value_second_best[state_pos].item()),
+                "value_margin": float(value_margin[state_pos].item()),
+                "relative_value_margin": float(relative_value_margin[state_pos].item()),
+                "confidence_weight": float(confidence_weight[state_pos].item()),
+                "active_refinancing": float(active_refinancing[state_pos].item()),
                 "regret_at_pred": float(regret_at_pred[state_pos].item()),
                 "cashflow_low": float(cf_low.item()),
                 "cashflow_coarse_star": float(cf_star_coarse.item()),
@@ -333,6 +347,10 @@ def main() -> None:
 
     long_df = pd.DataFrame(long_rows)
     summary_df = pd.DataFrame(summary_rows)
+    if not (summary_df["value_margin"] >= -1e-7).all():
+        raise RuntimeError("Target-grid value_margin contains negative values beyond tolerance.")
+    if not summary_df["confidence_weight"].between(0.0, 1.0).all():
+        raise RuntimeError("Target-grid confidence_weight is outside [0, 1].")
 
     long_path = output_dir / f"ep{args.episode}_target_grid_decomposition_long.csv"
     summary_path = output_dir / f"ep{args.episode}_target_grid_decomposition_summary.csv"

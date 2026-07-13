@@ -39,6 +39,10 @@ from .sdf_shock_bank import (
     shocks_to_x_children,
 )
 from .bp_grid_teacher import BPGridTeacher
+from .bp_policy_loss import (
+    compute_target_grid_policy_distillation_loss,
+    huber_element,
+)
 from .target_utils import hard_update, soft_update
 from utils.gpu_monitor import GPUMonitor, print_memory_summary
 from utils.firm_transition import apply_refinancing_policy
@@ -3288,11 +3292,7 @@ class Episode:
         return total_sdf_loss
     
     def _huber_element(self, pred: torch.Tensor, target: torch.Tensor, beta: float) -> torch.Tensor:
-        diff = (pred - target).abs()
-        beta = float(beta)
-        if beta <= 0:
-            return diff
-        return torch.where(diff < beta, 0.5 * diff.pow(2) / beta, diff - 0.5 * beta)
+        return huber_element(pred, target, beta)
 
     @staticmethod
     def _masked_diag_mean(value: torch.Tensor, mask: torch.Tensor) -> float:
@@ -3633,9 +3633,14 @@ class Episode:
             loss_fn.beta_z,
             loss_fn.z0,
         )
-        policy_loss_elem = self._huber_element(bp_pred, grid["bp_star"], policy_delta)
-        policy_loss = (grid["confidence"] * policy_loss_elem).mean()
-        total_loss = value_loss + penalty_z + policy_weight * policy_loss
+        policy_total, policy_loss, policy_loss_elem = compute_target_grid_policy_distillation_loss(
+            bp_pred,
+            grid["bp_star"],
+            grid["confidence"],
+            huber_delta=policy_delta,
+            branch_weight=policy_weight,
+        )
+        total_loss = value_loss + penalty_z + policy_total
 
         extra_terms: Dict[str, float] = {}
         if branch == 'pi':
@@ -3654,12 +3659,16 @@ class Episode:
                 mix_weight=mix_weight,
             )
             mix_policy_weight = float(getattr(self.hyperparams, "bp_grid_mix_policy_weight", 1.0))
-            mix_policy_loss_elem = self._huber_element(bp_mix_pred, mix_grid["bp_star"], policy_delta)
-            mix_sample_weight = mix_grid["confidence"]
-            if mix_policy_sample_weight is not None:
-                mix_sample_weight = mix_sample_weight * mix_policy_sample_weight.detach().clamp(0.0, 1.0)
-            mix_policy_loss = (mix_sample_weight * mix_policy_loss_elem).mean()
-            total_loss = total_loss + mix_policy_weight * mix_policy_loss
+            mix_sample_weight = mix_policy_sample_weight
+            mix_total, mix_policy_loss, mix_policy_loss_elem = compute_target_grid_policy_distillation_loss(
+                bp_mix_pred,
+                mix_grid["bp_star"],
+                mix_grid["confidence"],
+                huber_delta=policy_delta,
+                branch_weight=mix_policy_weight,
+                sample_weight=mix_sample_weight,
+            )
+            total_loss = total_loss + mix_total
             mix_terms = self._grid_policy_only_diag_terms(
                 'mix',
                 mix_grid,

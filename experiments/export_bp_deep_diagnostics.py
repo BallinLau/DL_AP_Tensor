@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 from config import Config  # noqa: E402
 from experiments.run_utils import build_hyperparams, build_models  # noqa: E402
 from losses.utils import compute_cashflow  # noqa: E402
+from training.bp_policy_loss import compute_target_grid_policy_distillation_loss  # noqa: E402
 from training.episode import Episode  # noqa: E402
 from utils.firm_transition import apply_refinancing_policy  # noqa: E402
 
@@ -129,9 +130,17 @@ def select_exported_states(
     }
 
 
-def stable_logit(bp: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    bp = bp.clamp(eps, 1.0 - eps)
-    return torch.log(bp / (1.0 - bp))
+def stable_logit_with_censoring(
+    bp: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bp64 = bp.detach().to(torch.float64)
+    exact_zero = bp64 <= 0.0
+    exact_one = bp64 >= 1.0
+    lower = torch.finfo(torch.float64).tiny
+    upper = 1.0 - torch.finfo(torch.float64).eps
+    safe = bp64.clamp(min=lower, max=upper)
+    logit = torch.log(safe) - torch.log1p(-safe)
+    return logit, exact_zero, exact_one
 
 
 def module_grad_norm(module: torch.nn.Module) -> float:
@@ -166,12 +175,13 @@ def export_logits_and_gradients(
     episode: int,
     output_dir: Path,
 ) -> None:
-    model.train()
-    out = model(parent_state)
+    model.eval()
+    with torch.enable_grad():
+        out = model(parent_state)
     mix_weight = out.bar_i_cond.clamp(0.0, 1.0)
     bp_mix = (1.0 - mix_weight) * out.bp0 + mix_weight * out.bpI
-    bp0_logit = stable_logit(out.bp0)
-    bpI_logit = stable_logit(out.bpI)
+    bp0_logit, bp0_censored_low, bp0_censored_high = stable_logit_with_censoring(out.bp0)
+    bpI_logit, bpI_censored_low, bpI_censored_high = stable_logit_with_censoring(out.bpI)
     bp0_deriv = out.bp0.clamp(0.0, 1.0) * (1.0 - out.bp0.clamp(0.0, 1.0))
     bpI_deriv = out.bpI.clamp(0.0, 1.0) * (1.0 - out.bpI.clamp(0.0, 1.0))
 
@@ -198,6 +208,10 @@ def export_logits_and_gradients(
                 "bp_star_teacher": float(row["bp_star_teacher"]),
                 "bp0_logit": float(bp0_logit[i].detach().item()),
                 "bpI_logit": float(bpI_logit[i].detach().item()),
+                "bp0_logit_censored_low": bool(bp0_censored_low[i].detach().item()),
+                "bpI_logit_censored_low": bool(bpI_censored_low[i].detach().item()),
+                "bp0_logit_censored_high": bool(bp0_censored_high[i].detach().item()),
+                "bpI_logit_censored_high": bool(bpI_censored_high[i].detach().item()),
                 "bp0_sigmoid_derivative": float(bp0_deriv[i].detach().item()),
                 "bpI_sigmoid_derivative": float(bpI_deriv[i].detach().item()),
             }
@@ -205,24 +219,54 @@ def export_logits_and_gradients(
 
     gradient_rows: List[Dict[str, object]] = []
     branches = {
-        "p0": out.bp0,
-        "pi": out.bpI,
-        "mix": bp_mix,
+        "p0": (out.bp0, float(getattr(build_hyperparams(), "bp_grid_policy_weight", 1.0)), None),
+        "pi": (out.bpI, float(getattr(build_hyperparams(), "bp_grid_policy_weight", 1.0)), None),
+        "mix": (bp_mix, float(getattr(build_hyperparams(), "bp_grid_mix_policy_weight", 1.0)), None),
     }
-    for branch, pred in branches.items():
+    policy_delta = float(getattr(build_hyperparams(), "bp_grid_policy_huber_delta", 0.05))
+    for branch, (pred, branch_weight, sample_weight) in branches.items():
         target = branch_targets(summary_df, branch, parent_state.device).to(pred.dtype)
+        branch_summary = summary_df.loc[summary_df["branch"] == branch].sort_values("state_pos")
+        confidence = torch.as_tensor(
+            branch_summary["confidence_weight"].to_numpy(dtype=np.float64),
+            device=parent_state.device,
+            dtype=pred.dtype,
+        ).reshape_as(pred)
         model.zero_grad(set_to_none=True)
-        loss = F.mse_loss(pred, target)
-        loss.backward(retain_graph=True)
+        posthoc_loss = F.mse_loss(pred, target)
+        posthoc_loss.backward(retain_graph=True)
+        posthoc_bp0 = module_grad_norm(model.bp0_head)
+        posthoc_bpI = module_grad_norm(model.bpi_head)
+        posthoc_encoder = module_grad_norm(model.policy_encoder)
+
+        model.zero_grad(set_to_none=True)
+        training_loss, _, _ = compute_target_grid_policy_distillation_loss(
+            pred,
+            target,
+            confidence,
+            huber_delta=policy_delta,
+            branch_weight=branch_weight,
+            sample_weight=sample_weight,
+        )
+        training_loss.backward(retain_graph=True)
         gradient_rows.append(
             {
                 "episode": episode,
                 "branch": branch,
                 "n_states": int(parent_state.shape[0]),
-                "diagnostic_target_loss": float(loss.detach().item()),
-                "bp0_head_grad_norm": module_grad_norm(model.bp0_head),
-                "bpI_head_grad_norm": module_grad_norm(model.bpi_head),
-                "policy_encoder_grad_norm": module_grad_norm(model.policy_encoder),
+                "diagnostic_target_loss": float(posthoc_loss.detach().item()),
+                "gradient_semantics": "posthoc_unweighted_mse_and_target_grid_training_equivalent",
+                "posthoc_mse_loss": float(posthoc_loss.detach().item()),
+                "posthoc_mse_bp0_head_grad_norm": posthoc_bp0,
+                "posthoc_mse_bpI_head_grad_norm": posthoc_bpI,
+                "posthoc_mse_policy_encoder_grad_norm": posthoc_encoder,
+                "training_equivalent_loss": float(training_loss.detach().item()),
+                "training_equivalent_bp0_head_grad_norm": module_grad_norm(model.bp0_head),
+                "training_equivalent_bpI_head_grad_norm": module_grad_norm(model.bpi_head),
+                "training_equivalent_policy_encoder_grad_norm": module_grad_norm(model.policy_encoder),
+                "bp0_head_grad_norm": posthoc_bp0,
+                "bpI_head_grad_norm": posthoc_bpI,
+                "policy_encoder_grad_norm": posthoc_encoder,
                 "bp0_logit_mean": float(bp0_logit.detach().mean().item()),
                 "bp0_logit_p01": quantile(bp0_logit, 0.01),
                 "bp0_logit_p50": quantile(bp0_logit, 0.50),
@@ -355,7 +399,7 @@ def export_cashflow_components(
         group["q_current"] = q_current.detach().cpu().reshape(-1).numpy()
         group["q_unit"] = q_unit.detach().cpu().reshape(-1).numpy()
         group["recovery_grid_mean"] = recovery.detach().cpu().reshape(-1).numpy()
-        group["q_minus_recovery"] = (
+        group["q_minus_raw_recovery_mean"] = (
             q_issue - recovery
         ).detach().cpu().reshape(-1).numpy()
         rows.append(group)
@@ -380,7 +424,7 @@ def export_cashflow_components(
             "p_child_mean",
             "default_mean",
             "recovery_grid_mean",
-            "q_minus_recovery",
+            "q_minus_raw_recovery_mean",
         ]
     ]
     cashflow_summary = (
@@ -396,7 +440,7 @@ def export_cashflow_components(
             q_current_mean=("q_current", "mean"),
             q_issue_mean=("q_issue", "mean"),
             recovery_grid_mean=("recovery_grid_mean", "mean"),
-            q_minus_recovery_mean=("q_minus_recovery", "mean"),
+            q_minus_raw_recovery_mean=("q_minus_raw_recovery_mean", "mean"),
             max_cashflow_identity_error=("cashflow_identity_error", "max"),
         )
         .reset_index()

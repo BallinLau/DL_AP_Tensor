@@ -318,7 +318,7 @@ required_cashflow_columns = {
     "p_child_mean",
     "default_mean",
     "recovery_grid_mean",
-    "q_minus_recovery",
+    "q_minus_raw_recovery_mean",
 }
 missing = required_cashflow_columns.difference(cf_long.columns)
 if missing:
@@ -337,7 +337,7 @@ for column in [
     "p_child_mean",
     "default_mean",
     "recovery_grid_mean",
-    "q_minus_recovery",
+    "q_minus_raw_recovery_mean",
 ]:
     values = pd.to_numeric(cf_long[column], errors="coerce").to_numpy()
     if not np.isfinite(values).all():
