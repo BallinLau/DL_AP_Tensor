@@ -20,7 +20,9 @@ REPO_DIR="${REPO_DIR:-$WORK_ROOT/DL_AP_Tensor}"
 LOG_DIR="${LOG_DIR:-$WORK_ROOT/logs}"
 RUN_ROOT="${RUN_ROOT:-$WORK_ROOT/cachedir/normalized_sdf_aio_full_20260712_174101}"
 EPISODES="${EPISODES:-0 1 2}"
-FIRM_TEMPLATE="${FIRM_TEMPLATE:-$RUN_ROOT/data/outputs/ep{ep}_stage_modeb.pkl}"
+EP0_FIRM_PKL="${EP0_FIRM_PKL:-$RUN_ROOT/data/outputs/ep0_stage_mode0.pkl}"
+POST0_FIRM_TEMPLATE="${POST0_FIRM_TEMPLATE:-$RUN_ROOT/data/outputs/ep{ep}_stage_modeb.pkl}"
+FIRM_TEMPLATE="${FIRM_TEMPLATE:-$POST0_FIRM_TEMPLATE}"
 N_STATES="${N_STATES:-20}"
 DEVICE="${DEVICE:-cuda}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
@@ -62,7 +64,8 @@ git status --short
 echo "Required commit: $REQUIRED_COMMIT"
 echo "Run root: $RUN_ROOT"
 echo "Episodes: $EPISODES"
-echo "Firm template: $FIRM_TEMPLATE"
+echo "Episode 0 firm data: $EP0_FIRM_PKL"
+echo "Post-0 firm template: $POST0_FIRM_TEMPLATE"
 echo "N states: $N_STATES"
 echo "Device: $DEVICE"
 echo "Bar i mode: $BAR_I_MODE"
@@ -130,6 +133,15 @@ expand_episode_path() {
     echo "${template//\{ep\}/$episode}"
 }
 
+firm_path_for_episode() {
+    local episode="$1"
+    if [[ "$episode" == "0" ]]; then
+        echo "$EP0_FIRM_PKL"
+    else
+        expand_episode_path "$POST0_FIRM_TEMPLATE" "$episode"
+    fi
+}
+
 for EP in $EPISODES; do
     echo
     echo "============================================================"
@@ -140,7 +152,7 @@ for EP in $EPISODES; do
     mkdir -p "$EP_DIR"
 
     POLICY_CKPT="$RUN_ROOT/checkpoints/ep${EP}_policy_value.pt"
-    FIRM_PKL="$(expand_episode_path "$FIRM_TEMPLATE" "$EP")"
+    FIRM_PKL="$(firm_path_for_episode "$EP")"
 
     if [[ ! -f "$POLICY_CKPT" ]]; then
         echo "ERROR: missing policy checkpoint:"
@@ -497,7 +509,7 @@ echo "============================================================"
 echo "[Stage 4] Fixed-state cross-episode probe"
 echo "============================================================"
 
-REFERENCE_FIRM_PKL="$(expand_episode_path "$FIRM_TEMPLATE" "$REFERENCE_EPISODE")"
+REFERENCE_FIRM_PKL="$(firm_path_for_episode "$REFERENCE_EPISODE")"
 python3 experiments/export_bp_fixed_state_cross_episode.py \
     --run-root "$RUN_ROOT" \
     --episodes "$EPISODES" \

@@ -19,7 +19,9 @@ RUN_ROOT="${RUN_ROOT:-$WORK_ROOT/cachedir/normalized_sdf_aio_full_20260712_17410
 export WORK_ROOT
 export REPO_DIR
 export RUN_ROOT
-export FIRM_TEMPLATE="$RUN_ROOT/data/outputs/ep{ep}_stage_modeb.pkl"
+export EP0_FIRM_PKL="$RUN_ROOT/data/outputs/ep0_stage_mode0.pkl"
+export POST0_FIRM_TEMPLATE="$RUN_ROOT/data/outputs/ep{ep}_stage_modeb.pkl"
+unset FIRM_TEMPLATE
 export EPISODES="${EPISODES:-0 1 2}"
 export REFERENCE_EPISODE="${REFERENCE_EPISODE:-2}"
 export N_STATES="${N_STATES:-100}"
