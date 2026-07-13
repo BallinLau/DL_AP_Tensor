@@ -117,6 +117,9 @@ def make_summary_rows(
     bp_star_teacher = result["bp_star"].reshape(-1)
     value_star_teacher = result["value_star"].reshape(-1)
     regret_at_pred = result["regret"].reshape(-1)
+    q_issue_teacher_star = result["q_issue_at_star"].reshape(-1)
+    p_child_teacher_star = result["p_child_at_star"].reshape(-1)
+    default_teacher_star = result["default_at_star"].reshape(-1)
 
     argmax = value.argmax(dim=1)
     bp_pred_flat = bp_pred.reshape(-1)
@@ -170,9 +173,12 @@ def make_summary_rows(
                 "delta_cashflow_low_to_coarse_star": float(delta_cf.item()),
                 "delta_continuation_low_to_coarse_star": float(delta_cont.item()),
                 "delta_value_low_to_coarse_star": float(delta_value.item()),
-                "q_issue_star": float(q_issue[state_pos, j_star].item()),
-                "p_child_star": float(p_child[state_pos, j_star].item()),
-                "default_star": float(default[state_pos, j_star].item()),
+                "q_issue_coarse_star": float(q_issue[state_pos, j_star].item()),
+                "p_child_coarse_star": float(p_child[state_pos, j_star].item()),
+                "default_coarse_star": float(default[state_pos, j_star].item()),
+                "q_issue_teacher_star": float(q_issue_teacher_star[state_pos].item()),
+                "p_child_teacher_star": float(p_child_teacher_star[state_pos].item()),
+                "default_teacher_star": float(default_teacher_star[state_pos].item()),
                 "identity_error_max": float(identity_error.item()),
                 "dominant_component": dominant_component,
             }
@@ -353,7 +359,12 @@ def main() -> None:
         "delta_cashflow_low_to_coarse_star",
         "delta_continuation_low_to_coarse_star",
         "delta_value_low_to_coarse_star",
-        "default_star",
+        "q_issue_coarse_star",
+        "p_child_coarse_star",
+        "default_coarse_star",
+        "q_issue_teacher_star",
+        "p_child_teacher_star",
+        "default_teacher_star",
         "dominant_component",
     ]
     print(
