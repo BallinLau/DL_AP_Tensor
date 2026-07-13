@@ -121,6 +121,23 @@ class BpHead(nn.Module):
             output_dim=1,
             output_activation=output_activation
         )
+
+    def _prepare_input(self, h: torch.Tensor, i: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.requires_i:
+            if i is None:
+                raise ValueError("Investment cost i is required for bpI head")
+            h = torch.cat([h, i], dim=-1)
+        return h
+
+    def forward_logits(self, h: torch.Tensor, i: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return the pre-sigmoid bp logits for diagnostics."""
+        h = self._prepare_input(h, i)
+        layers = list(self.network.network.children())
+        if not layers or not isinstance(layers[-1], nn.Sigmoid):
+            raise RuntimeError("BpHead.forward_logits() requires a sigmoid output activation.")
+        for layer in layers[:-1]:
+            h = layer(h)
+        return h
     
     def forward(self, h: torch.Tensor, i: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -130,12 +147,7 @@ class BpHead(nn.Module):
         Returns:
             bp: (batch, 1) - 杠杆候选
         """
-        if self.requires_i:
-            if i is None:
-                raise ValueError("Investment cost i is required for bpI head")
-            h = torch.cat([h, i], dim=-1)
-        
-        return self.network(h)
+        return torch.sigmoid(self.forward_logits(h, i))
 
 
 class PHead(nn.Module):
