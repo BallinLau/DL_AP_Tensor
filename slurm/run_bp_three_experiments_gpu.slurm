@@ -33,9 +33,10 @@ FLIP_THRESHOLD="${FLIP_THRESHOLD:-0.2}"
 B_GRID_SIZE="${B_GRID_SIZE:-21}"
 Z_GRID_SIZE="${Z_GRID_SIZE:-41}"
 BASE_STATE_SOURCE_INDEX="${BASE_STATE_SOURCE_INDEX:-}"
-RUN_RELATED_TESTS="${RUN_RELATED_TESTS:-0}"
+RUN_RELATED_TESTS="${RUN_RELATED_TESTS:-1}"
+ALLOW_DIRTY_WORKTREE="${ALLOW_DIRTY_WORKTREE:-0}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$RUN_ROOT/data/outputs/bp_three_experiments}"
-REQUIRED_COMMIT="${REQUIRED_COMMIT:-c0487b8}"
+REQUIRED_COMMIT="${REQUIRED_COMMIT:-c3a6d98}"
 
 mkdir -p "$LOG_DIR" "$WORK_ROOT/.mplcache" "$OUTPUT_ROOT"
 cd "$REPO_DIR"
@@ -53,6 +54,10 @@ echo "Host: $(hostname)"
 echo "Repo: $REPO_DIR"
 echo "Branch: $(git branch --show-current)"
 echo "Commit: $(git rev-parse --short HEAD)"
+echo "git rev-parse HEAD:"
+git rev-parse HEAD
+echo "git status --short:"
+git status --short
 echo "Required commit: $REQUIRED_COMMIT"
 echo "Run root: $RUN_ROOT"
 echo "Episodes: $EPISODES"
@@ -66,6 +71,12 @@ echo "============================================================"
 if ! git merge-base --is-ancestor "$REQUIRED_COMMIT" HEAD; then
     echo "ERROR: HEAD does not contain required commit $REQUIRED_COMMIT"
     echo "Actual HEAD: $(git rev-parse --short HEAD)"
+    exit 1
+fi
+
+if [[ "$ALLOW_DIRTY_WORKTREE" != "1" ]] && [[ -n "$(git status --short)" ]]; then
+    echo "ERROR: working tree is not clean. Set ALLOW_DIRTY_WORKTREE=1 only for intentional local smoke runs."
+    git status --short
     exit 1
 fi
 
@@ -85,6 +96,15 @@ python3 -m py_compile \
     experiments/run_bp_fixed_teacher_refit_probe.py \
     experiments/export_bp_fixed_state_cross_episode.py \
     experiments/export_continuation_surface.py
+
+if [[ "$RUN_RELATED_TESTS" == "1" ]]; then
+    echo "[Preflight] Running exporter integration test"
+    python3 -m pytest tests/test_target_grid_exporter.py -q
+
+    echo "[Preflight] Running Q residual sign, bar_i mode, and boundary censoring tests"
+    python3 -m pytest tests/test_continuation_surface.py -q -k \
+        "q_residual_signs_cover_positive_and_negative_cases or q_csv_validator_checks_finiteness_and_sign_identity or bar_i_mode_fixed_parent_vs_recompute_issue_state or default_boundary_censoring_and_monotonicity_use_observed_only"
+fi
 
 nvidia-smi
 
@@ -246,6 +266,24 @@ for column in ["confidence_weight", "mix_survival_weight", "value_margin"]:
     values = pd.to_numeric(summary_df[column], errors="coerce").to_numpy()
     if not np.isfinite(values).all():
         raise AssertionError(f"EP{ep}: non-finite values in {column}")
+    if column == "mix_survival_weight" and ((values < -1e-8).any() or (values > 1.0 + 1e-8).any()):
+        raise AssertionError(f"EP{ep}: mix_survival_weight outside [0, 1]")
+
+for column in ["value_star_coarse", "cashflow_coarse_star", "continuation_coarse_star"]:
+    if column not in summary_df.columns:
+        raise AssertionError(f"EP{ep}: summary missing {column}")
+    values = pd.to_numeric(summary_df[column], errors="coerce").to_numpy()
+    if not np.isfinite(values).all():
+        raise AssertionError(f"EP{ep}: non-finite values in {column}")
+coarse_star_identity_error = np.max(
+    np.abs(
+        summary_df["value_star_coarse"].to_numpy()
+        - summary_df["cashflow_coarse_star"].to_numpy()
+        - summary_df["continuation_coarse_star"].to_numpy()
+    )
+)
+if coarse_star_identity_error >= 1e-5:
+    raise AssertionError(f"EP{ep}: coarse value-star cashflow identity error {coarse_star_identity_error}")
 
 logit_df = pd.read_csv(logit_states_path)
 grad_df = pd.read_csv(gradient_path)
@@ -390,6 +428,7 @@ print()
 print(f"EP{ep} validation passed")
 print("Selected states:", n_states)
 print("Bellman identity error:", identity_error)
+print("Coarse value-star cashflow identity error:", coarse_star_identity_error)
 print("Cashflow identity error:", max_cf_error)
 
 print("\nPolicy-teacher summary:")
@@ -542,6 +581,9 @@ for path in paths:
         observed = df["boundary_censoring"] == "observed"
         if not np.isfinite(df.loc[observed, "z_survival_boundary"].to_numpy()).all():
             raise AssertionError(f"{path} observed rows contain non-finite z_survival_boundary")
+        censored = ~observed
+        if not df.loc[censored, "z_survival_boundary"].isna().all():
+            raise AssertionError(f"{path} censored rows must have NaN z_survival_boundary")
         counts = df["boundary_censoring"].value_counts().reindex(
             ["observed", "left_censored", "right_censored"],
             fill_value=0,
@@ -564,6 +606,66 @@ for path in paths:
         if not finite:
             raise AssertionError(f"{path} contains NaN/Inf outside censoring boundary columns")
         continue
+    if path.name.endswith("_bond_value_decomposition_long.csv"):
+        required = {
+            "q_issue",
+            "q_target_total",
+            "q_training_residual",
+            "q_issue_minus_target",
+            "bar_i",
+            "bar_i_multiplier",
+            "bar_i_mode",
+        }
+        missing = required.difference(df.columns)
+        if missing:
+            raise AssertionError(f"{path} missing columns: {sorted(missing)}")
+        allowed_modes = {"fixed_parent", "recompute_issue_state"}
+        invalid_modes = set(df["bar_i_mode"].dropna().unique()).difference(allowed_modes)
+        if invalid_modes:
+            raise AssertionError(f"{path} invalid bar_i_mode values: {sorted(invalid_modes)}")
+        numeric_cols = [
+            "q_issue",
+            "q_target_total",
+            "q_training_residual",
+            "q_issue_minus_target",
+            "bar_i",
+            "bar_i_multiplier",
+        ]
+        numeric = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+        if not np.isfinite(numeric.to_numpy()).all():
+            raise AssertionError(f"{path} contains non-finite Q residual/bar_i values")
+        q_training_error = np.max(
+            np.abs(
+                numeric["q_training_residual"].to_numpy()
+                - (numeric["q_target_total"].to_numpy() - numeric["q_issue"].to_numpy())
+            )
+        )
+        q_issue_minus_error = np.max(
+            np.abs(
+                numeric["q_issue_minus_target"].to_numpy()
+                + numeric["q_training_residual"].to_numpy()
+            )
+        )
+        if q_training_error >= 1e-7 or q_issue_minus_error >= 1e-7:
+            raise AssertionError(
+                f"{path} Q residual sign identity failed: "
+                f"training={q_training_error}, issue_minus={q_issue_minus_error}"
+            )
+        print(
+            f"{path.name} Q residual identities: "
+            f"training_error={q_training_error:.3e}, "
+            f"issue_minus_error={q_issue_minus_error:.3e}, "
+            f"bar_i_modes={sorted(df['bar_i_mode'].dropna().unique())}"
+        )
+        continue
+    if path.name.endswith("_bond_value_decomposition_summary.csv"):
+        if "bar_i_mode" not in df.columns:
+            raise AssertionError(f"{path} missing bar_i_mode")
+        invalid_modes = set(df["bar_i_mode"].dropna().unique()).difference(
+            {"fixed_parent", "recompute_issue_state"}
+        )
+        if invalid_modes:
+            raise AssertionError(f"{path} invalid bar_i_mode values: {sorted(invalid_modes)}")
     numeric = df.select_dtypes(include=["number"])
     finite = np.isfinite(numeric.to_numpy()).all()
     if not finite:
