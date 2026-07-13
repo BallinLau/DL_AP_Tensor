@@ -21,6 +21,7 @@ export REPO_DIR
 export RUN_ROOT
 export EP0_FIRM_PKL="$RUN_ROOT/data/outputs/ep0_stage_mode0.pkl"
 export POST0_FIRM_TEMPLATE="$RUN_ROOT/data/outputs/ep{ep}_stage_modeb.pkl"
+export FORCE_CANONICAL_FIRM_PATHS=1
 unset FIRM_TEMPLATE
 export EPISODES="${EPISODES:-0 1 2}"
 export REFERENCE_EPISODE="${REFERENCE_EPISODE:-2}"
