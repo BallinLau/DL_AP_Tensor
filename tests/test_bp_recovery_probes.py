@@ -11,10 +11,13 @@ from experiments.run_bp_recovery_probes import (
     PROBE_RECENTER,
     ProbeConfig,
     apply_bias_recenter,
+    assert_only_recenter_bias_changed,
     forward_policy_bundle,
     logit_space_loss,
     output_space_loss,
+    parse_probes,
     run_probe_suite,
+    spearman_corr,
 )
 from models.policy_value import PolicyValueModel
 from models.share_layer import BpHead
@@ -79,6 +82,55 @@ def test_bias_recenter_translates_logits_without_changing_pairwise_distances():
     assert abs(float(after["bpI_logit"].median().item())) < 1e-5
 
 
+def test_spearman_corr_is_tie_aware():
+    x_constant = torch.ones(10)
+    y = torch.arange(10.0)
+    assert spearman_corr(x_constant, y) == 0.0
+
+    x_tied = torch.tensor([1.0, 1.0, 2.0, 2.0])
+    y_tied = torch.tensor([1.0, 1.0, 2.0, 2.0])
+    assert abs(spearman_corr(x_tied, y_tied) - 1.0) < 1e-12
+
+
+def test_probe_b_zero_shift_recenter_is_valid():
+    torch.manual_seed(12)
+    model = PolicyValueModel(share_hidden_dims=[], share_output_dim=3)
+    parent = torch.tensor(
+        [
+            [0.1, -0.2, 1.0, 0.0, 0.2, 0.1, 0.0],
+            [0.2, -0.1, 1.0, 0.1, 0.3, 0.2, 0.1],
+        ],
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        model.bp0_head.network.network[-2].weight.zero_()
+        model.bp0_head.network.network[-2].bias.zero_()
+        model.bpi_head.network.network[-2].weight.zero_()
+        model.bpi_head.network.network[-2].bias.zero_()
+    before_params = {name: param.detach().cpu().clone() for name, param in model.named_parameters()}
+    stats = apply_bias_recenter(
+        model,
+        parent,
+        torch.tensor([0, 1], dtype=torch.long),
+        ProbeConfig(
+            episode=0,
+            steps=0,
+            record_steps=[0],
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            holdout_fraction=0.0,
+            seed=1,
+            initial_bp_target=0.5,
+            logit_target_eps=1e-4,
+            logit_huber_delta=1.0,
+            probes=[PROBE_RECENTER],
+        ),
+    )
+    assert stats["bp0_bias_shift"] == 0.0
+    assert stats["bpI_bias_shift"] == 0.0
+    assert_only_recenter_bias_changed(before_params, model, stats)
+
+
 def test_logit_loss_has_large_gradient_when_output_loss_is_saturated():
     hp = SimpleNamespace(
         bp_grid_policy_huber_delta=0.05,
@@ -135,6 +187,42 @@ def test_logit_loss_has_large_gradient_when_output_loss_is_saturated():
     loss.backward()
     logit_grad = abs(float(logit.grad.item()))
     assert logit_grad > output_grad * 1e8
+
+
+def test_branch_only_output_loss_equals_full_loss_minus_mix_loss():
+    hp = SimpleNamespace(
+        bp_grid_policy_huber_delta=0.05,
+        bp_grid_policy_weight=1.0,
+        bp_grid_mix_policy_weight=1.0,
+    )
+    indices = torch.tensor([0, 1], dtype=torch.long)
+    bundle = {
+        "bp0": torch.tensor([[0.1], [0.2]]),
+        "bpI": torch.tensor([[0.3], [0.4]]),
+        "bp_mix": torch.tensor([[0.2], [0.3]]),
+    }
+    targets = {
+        "bp0": torch.tensor([[0.2], [0.2]]),
+        "bpI": torch.tensor([[0.4], [0.5]]),
+        "bp_mix": torch.tensor([[0.6], [0.7]]),
+        "bp0_confidence": torch.ones(2, 1),
+        "bpI_confidence": torch.ones(2, 1),
+        "bp_mix_confidence": torch.ones(2, 1),
+        "bp_mix_survival_weight": torch.ones(2, 1),
+    }
+    full, parts = output_space_loss(bundle, targets, indices, hp, include_mix=True)
+    branch_only, _ = output_space_loss(bundle, targets, indices, hp, include_mix=False)
+    torch.testing.assert_close(branch_only, parts["bp0"] + parts["bpI"], rtol=0, atol=0)
+    torch.testing.assert_close(full - branch_only, parts["bp_mix"], rtol=0, atol=0)
+
+
+def test_parse_probes_rejects_empty_list():
+    try:
+        parse_probes("")
+    except ValueError as exc:
+        assert "At least one probe" in str(exc)
+    else:
+        raise AssertionError("parse_probes should reject an empty probe list")
 
 
 def test_probe_suite_is_deterministic_and_does_not_mutate_online_model_or_targets():
@@ -211,6 +299,12 @@ def test_probe_suite_is_deterministic_and_does_not_mutate_online_model_or_target
     assert set(summary1["seed"]) == {99}
     assert "output_mae_p90" in history1.columns
     assert "pred_target_spearman" in history1.columns
+    assert "final_train_pred_target_spearman" in summary1.columns
+    assert "final_holdout_pred_target_spearman" in summary1.columns
+    assert "train_constant_policy_flag" in summary1.columns
+    assert "holdout_constant_policy_flag" in summary1.columns
+    assert "fixed_target_learnable_flag" in summary1.columns
+    assert "schedule_or_target_drift_suspected" not in summary1.columns
     assert "bp0_checkpoint_initial" in states1.columns
     assert "bp0_bias_shift" in states1.columns
     assert "bp0_target_logit" in states1.columns

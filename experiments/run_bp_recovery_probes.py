@@ -99,6 +99,8 @@ def parse_args() -> argparse.Namespace:
 
 def parse_probes(value: str) -> List[str]:
     probes = [item.strip() for item in value.split(",") if item.strip()]
+    if not probes:
+        raise ValueError("At least one probe is required")
     if len(probes) != len(set(probes)):
         raise ValueError(f"Duplicate probe entries are not allowed: {probes}")
     valid = {PROBE_BASELINE, PROBE_BRANCH, PROBE_RECENTER, PROBE_LOGIT}
@@ -298,9 +300,19 @@ def pearson_corr(x: torch.Tensor, y: torch.Tensor) -> float:
 
 def rank_1d(x: torch.Tensor) -> torch.Tensor:
     x = x.detach().reshape(-1).to(torch.float64)
+    if x.numel() == 0:
+        return x
     order = torch.argsort(x, stable=True)
     ranks = torch.empty_like(x)
-    ranks[order] = torch.arange(x.numel(), device=x.device, dtype=x.dtype)
+    sorted_x = x[order]
+    start = 0
+    while start < x.numel():
+        end = start + 1
+        while end < x.numel() and sorted_x[end] == sorted_x[start]:
+            end += 1
+        avg_rank = 0.5 * float(start + end - 1)
+        ranks[order[start:end]] = avg_rank
+        start = end
     return ranks
 
 
@@ -557,32 +569,34 @@ def validate_recenter_translation(
         torch.testing.assert_close(diff, expected, rtol=1e-5, atol=1e-5)
 
 
-def final_bias_parameter_names(model: torch.nn.Module) -> set[str]:
+def final_bias_parameter_map(model: torch.nn.Module) -> Dict[str, str]:
     bp0_bias = last_linear(model.bp0_head).bias
     bpi_bias = last_linear(model.bpi_head).bias
-    names = set()
+    names = {}
     for name, param in model.named_parameters():
         if param is bp0_bias or param is bpi_bias:
-            names.add(name)
-    if len(names) != 2:
-        raise RuntimeError(f"Expected two BP final bias parameters, found {sorted(names)}")
+            names["bp0" if param is bp0_bias else "bpI"] = name
+    if set(names) != {"bp0", "bpI"}:
+        raise RuntimeError(f"Expected two BP final bias parameters, found {names}")
     return names
 
 
 def assert_only_recenter_bias_changed(
     before: Dict[str, torch.Tensor],
     model: torch.nn.Module,
+    recenter_stats: Dict[str, float],
 ) -> None:
-    allowed = final_bias_parameter_names(model)
-    changed = []
+    bias_names = final_bias_parameter_map(model)
+    allowed = set(bias_names.values())
     for name, param in model.named_parameters():
-        if not torch.equal(before[name].to(param.device), param.detach()):
-            changed.append(name)
-    if set(changed) != allowed:
-        raise AssertionError(
-            "Probe B recenter changed unexpected parameters: "
-            f"changed={changed}, expected={sorted(allowed)}"
-        )
+        before_param = before[name].to(param.device)
+        if name not in allowed:
+            if not torch.equal(before_param, param.detach()):
+                raise AssertionError(f"Probe B recenter changed non-bias parameter: {name}")
+            continue
+        branch = "bp0" if name == bias_names["bp0"] else "bpI"
+        expected = before_param + float(recenter_stats[f"{branch}_bias_shift"])
+        torch.testing.assert_close(param.detach(), expected, rtol=1e-6, atol=1e-6)
 
 
 def subset_targets(targets: Dict[str, torch.Tensor], n: int) -> Dict[str, torch.Tensor]:
@@ -736,17 +750,23 @@ def make_summary_rows(history: pd.DataFrame, states: pd.DataFrame, cfg: ProbeCon
                 "bp_mix_initial_mean": float(s["bp_mix_initial"].mean()),
                 "bp_mix_final_mean": float(s["bp_mix_final"].mean()),
                 "bp_mix_target_mean": float(s["bp_mix_target"].mean()),
-                "final_bp_pred_std": float(final_train["bp_pred_std"]),
-                "final_bp_target_std": float(final_train["bp_target_std"]),
-                "final_pred_target_corr": float(final_train["pred_target_corr"]),
-                "final_pred_target_spearman": float(final_train["pred_target_spearman"]),
-                "constant_policy_flag": bool(final_train["constant_policy_flag"]),
+                "final_train_bp_pred_std": float(final_train["bp_pred_std"]),
+                "final_holdout_bp_pred_std": float(final_holdout["bp_pred_std"]),
+                "final_train_bp_target_std": float(final_train["bp_target_std"]),
+                "final_holdout_bp_target_std": float(final_holdout["bp_target_std"]),
+                "final_train_pred_target_corr": float(final_train["pred_target_corr"]),
+                "final_holdout_pred_target_corr": float(final_holdout["pred_target_corr"]),
+                "final_train_pred_target_spearman": float(final_train["pred_target_spearman"]),
+                "final_holdout_pred_target_spearman": float(final_holdout["pred_target_spearman"]),
+                "train_constant_policy_flag": bool(final_train["constant_policy_flag"]),
+                "holdout_constant_policy_flag": bool(final_holdout["constant_policy_flag"]),
+                "constant_policy_flag": bool(final_holdout["constant_policy_flag"]),
                 "recovered_from_low_saturation": bool(
-                    s[["bp0_initial", "bpI_initial"]].to_numpy().mean() < 0.01
-                    and final_train_mae < max(0.05, initial_train_mae * 0.5)
+                    s[["bp0_checkpoint_initial", "bpI_checkpoint_initial"]].to_numpy().mean() < 0.01
+                    and final_holdout_mae < max(0.05, initial_holdout_mae * 0.5)
                 ),
                 "optimization_failure_suspected": bool(final_train_mae >= initial_train_mae * 0.95),
-                "schedule_or_target_drift_suspected": bool(final_train_mae < initial_train_mae * 0.5),
+                "fixed_target_learnable_flag": bool(final_holdout_mae < max(0.05, initial_holdout_mae * 0.5)),
             }
         )
     return pd.DataFrame(rows)
@@ -779,7 +799,7 @@ def run_probe_suite(
         if probe == PROBE_RECENTER:
             before_recenter = {key: value.detach().clone() for key, value in initial_bundle.items()}
             recenter_stats = apply_bias_recenter(probe_model, parent_state, splits["train"], cfg)
-            assert_only_recenter_bias_changed(probe_initial_params, probe_model)
+            assert_only_recenter_bias_changed(probe_initial_params, probe_model, recenter_stats)
             initial_bundle = forward_policy_bundle(probe_model, parent_state)
             validate_recenter_translation(before_recenter, initial_bundle, recenter_stats, splits["train"])
 
