@@ -100,6 +100,12 @@ def fixed_targets(summary_df: pd.DataFrame, device: torch.device, dtype: torch.d
             device=device,
             dtype=dtype,
         ).reshape(-1, 1)
+        if branch == "mix":
+            targets["bp_mix_survival_weight"] = torch.as_tensor(
+                branch_df["mix_survival_weight"].to_numpy(dtype=np.float64),
+                device=device,
+                dtype=dtype,
+            ).reshape(-1, 1)
     return targets
 
 
@@ -153,12 +159,14 @@ def refit_loss(
         ("bpI", "bpI", policy_weight),
         ("bp_mix", "bp_mix", mix_weight),
     ]:
+        sample_weight = targets["bp_mix_survival_weight"] if target_key == "bp_mix" else None
         loss, _, _ = compute_target_grid_policy_distillation_loss(
             bundle[pred_key][indices],
             targets[target_key][indices],
             targets[f"{target_key}_confidence"][indices],
             huber_delta=policy_delta,
             branch_weight=branch_weight,
+            sample_weight=sample_weight[indices] if sample_weight is not None else None,
         )
         parts[pred_key] = loss
         total = total + loss

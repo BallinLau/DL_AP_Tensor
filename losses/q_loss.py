@@ -23,6 +23,38 @@ from config import Config
 from .utils import compute_aio_residual, compute_z_penalty
 
 
+def compute_q_survival_recovery_components(
+    *,
+    Q: torch.Tensor,
+    b: torch.Tensor,
+    bar_i: torch.Tensor,
+    M: torch.Tensor,
+    Qsp: torch.Tensor,
+    bar_z: torch.Tensor,
+    x_child: torch.Tensor,
+    z_child: torch.Tensor,
+    g: float,
+    delta: float,
+    phi: float,
+) -> Dict[str, torch.Tensor]:
+    multiplier = bar_i * (g - 1) + 1
+    b_nonneg = torch.clamp(b, min=0.0)
+    recovery_total = b_nonneg * phi * (1 - delta + torch.exp(x_child + z_child))
+    q_target_survival = M * (b_nonneg + Qsp * multiplier) * (1 - bar_z)
+    q_target_recovery = M * recovery_total * multiplier * bar_z
+    q_target_total = q_target_survival + q_target_recovery
+    return {
+        "q_target_survival": q_target_survival,
+        "q_target_recovery": q_target_recovery,
+        "q_target_total": q_target_total,
+        "q_training_residual": q_target_total - Q,
+        "q_issue_minus_target": Q - q_target_total,
+        "q_pricing_residual": q_target_total - Q,
+        "multiplier": multiplier,
+        "recovery_total": recovery_total,
+    }
+
+
 class QLoss(nn.Module):
     """
     Q（债券价格）损失函数
@@ -104,15 +136,20 @@ class QLoss(nn.Module):
         
         residuals = []
         for M, Qsp, bar_z, x, z in zip(M_list, Qsp_children, bar_z_children, x_children, z_children):
-            # 回收价值（总债价值口径）
-            recovery_total = self.compute_total_recovery(b_nonneg, x, z)
-            
-            # 债券定价方程
-            # loss = M * [(b + Qsp * multiplier) * (1-bar_z) + recovery_total * multiplier * bar_z] - Q
-            residual = M * (
-                (b_nonneg + Qsp * multiplier) * (1 - bar_z) +
-                recovery_total * multiplier * bar_z
-            ) - Q
+            components = compute_q_survival_recovery_components(
+                Q=Q,
+                b=b_nonneg,
+                bar_i=bar_i,
+                M=M,
+                Qsp=Qsp,
+                bar_z=bar_z,
+                x_child=x,
+                z_child=z,
+                g=self.g,
+                delta=self.delta,
+                phi=self.phi,
+            )
+            residual = components["q_training_residual"]
             
             residuals.append(residual)
         

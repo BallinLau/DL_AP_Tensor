@@ -35,7 +35,7 @@ Z_GRID_SIZE="${Z_GRID_SIZE:-41}"
 BASE_STATE_SOURCE_INDEX="${BASE_STATE_SOURCE_INDEX:-}"
 RUN_RELATED_TESTS="${RUN_RELATED_TESTS:-0}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$RUN_ROOT/data/outputs/bp_three_experiments}"
-REQUIRED_COMMIT="${REQUIRED_COMMIT:-85a9d49}"
+REQUIRED_COMMIT="${REQUIRED_COMMIT:-c0487b8}"
 
 mkdir -p "$LOG_DIR" "$WORK_ROOT/.mplcache" "$OUTPUT_ROOT"
 cd "$REPO_DIR"
@@ -240,6 +240,13 @@ for column in ["bp_pred", "bp_star_coarse", "bp_star_teacher", "regret_at_pred"]
     if not np.isfinite(values).all():
         raise AssertionError(f"EP{ep}: non-finite values in {column}")
 
+for column in ["confidence_weight", "mix_survival_weight", "value_margin"]:
+    if column not in summary_df.columns:
+        raise AssertionError(f"EP{ep}: summary missing {column}")
+    values = pd.to_numeric(summary_df[column], errors="coerce").to_numpy()
+    if not np.isfinite(values).all():
+        raise AssertionError(f"EP{ep}: non-finite values in {column}")
+
 logit_df = pd.read_csv(logit_states_path)
 grad_df = pd.read_csv(gradient_path)
 
@@ -255,6 +262,10 @@ required_logit_columns = {
     "bpI_logit",
     "bp0_sigmoid_derivative",
     "bpI_sigmoid_derivative",
+    "bp0_logit_censored_low",
+    "bpI_logit_censored_low",
+    "bp0_logit_censored_high",
+    "bpI_logit_censored_high",
 }
 required_gradient_columns = {
     "episode",
@@ -274,6 +285,15 @@ required_gradient_columns = {
     "bpI_logit_p99",
     "bp0_sigmoid_derivative_mean",
     "bpI_sigmoid_derivative_mean",
+    "gradient_semantics",
+    "posthoc_mse_loss",
+    "posthoc_mse_bp0_head_grad_norm",
+    "posthoc_mse_bpI_head_grad_norm",
+    "posthoc_mse_policy_encoder_grad_norm",
+    "training_equivalent_loss",
+    "training_equivalent_bp0_head_grad_norm",
+    "training_equivalent_bpI_head_grad_norm",
+    "training_equivalent_policy_encoder_grad_norm",
 }
 missing = required_logit_columns.difference(logit_df.columns)
 if missing:
@@ -301,6 +321,14 @@ for column in [
     "bp0_head_grad_norm",
     "bpI_head_grad_norm",
     "policy_encoder_grad_norm",
+    "posthoc_mse_loss",
+    "posthoc_mse_bp0_head_grad_norm",
+    "posthoc_mse_bpI_head_grad_norm",
+    "posthoc_mse_policy_encoder_grad_norm",
+    "training_equivalent_loss",
+    "training_equivalent_bp0_head_grad_norm",
+    "training_equivalent_bpI_head_grad_norm",
+    "training_equivalent_policy_encoder_grad_norm",
 ]:
     values = pd.to_numeric(grad_df[column], errors="coerce").to_numpy()
     if not np.isfinite(values).all():
@@ -390,6 +418,12 @@ print(
 
 print("\nCashflow component summary:")
 print(cf_summary.to_string(index=False))
+
+if "delta_cashflow_identity_error" not in cf_summary.columns:
+    raise AssertionError(f"EP{ep}: cashflow summary missing delta_cashflow_identity_error")
+max_delta_cf_error = float(np.abs(cf_summary["delta_cashflow_identity_error"]).max())
+if max_delta_cf_error >= 1e-5:
+    raise AssertionError(f"EP{ep}: cashflow delta identity error {max_delta_cf_error}")
 PY
 
     echo "EP$EP passed all three diagnostic experiments."
@@ -468,6 +502,35 @@ python3 experiments/export_continuation_surface.py \
     --n-branches "$N_BRANCHES" \
     --output-dir "$OUTPUT_ROOT/continuation_surface_ep${REFERENCE_EPISODE}" \
     2>&1 | tee "$OUTPUT_ROOT/continuation_surface_ep${REFERENCE_EPISODE}.log"
+
+export SURFACE_DIR="$OUTPUT_ROOT/continuation_surface_ep${REFERENCE_EPISODE}"
+export REFERENCE_EPISODE
+python3 - <<'PY'
+from pathlib import Path
+import os
+import numpy as np
+import pandas as pd
+
+surface_dir = Path(os.environ["SURFACE_DIR"])
+ep = int(os.environ["REFERENCE_EPISODE"])
+paths = [
+    surface_dir / f"ep{ep}_continuation_surface.csv",
+    surface_dir / f"ep{ep}_default_boundary.csv",
+    surface_dir / f"ep{ep}_bond_value_decomposition_long.csv",
+    surface_dir / f"ep{ep}_bond_value_decomposition_summary.csv",
+]
+for path in paths:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    df = pd.read_csv(path)
+    if df.empty:
+        raise AssertionError(f"{path} is empty")
+    numeric = df.select_dtypes(include=["number"])
+    finite = np.isfinite(numeric.to_numpy()).all()
+    if not finite:
+        raise AssertionError(f"{path} contains NaN/Inf")
+print("Continuation/Q surface validation passed.")
+PY
 
 export OUTPUT_ROOT
 export EPISODES

@@ -6,6 +6,7 @@ import torch
 from experiments.export_bp_fixed_state_cross_episode import (
     attach_flip_flags,
     build_fixed_probe_panel,
+    make_transition_rows,
 )
 
 
@@ -71,3 +72,26 @@ def test_flip_flags_and_teacher_semantics_are_explicit():
     assert not bool(last["teacher_flip_not_followed_by_policy"])
     assert set(df["teacher_semantics"]) == {"checkpoint_online_greedy_proxy"}
     assert not df.duplicated(["episode", "source_index", "branch"]).any()
+
+
+def test_transition_rows_cover_all_adjacent_episode_pairs():
+    rows = []
+    for ep, pred, teacher in [(0, 0.1, 0.1), (1, 0.4, 0.15), (2, 0.45, 0.6)]:
+        rows.append(
+            {
+                "episode": ep,
+                "source_index": 7,
+                "branch": "mix",
+                "probe_group": "middle-z",
+                "bp_pred": pred,
+                "bp_teacher": teacher,
+            }
+        )
+    transitions = make_transition_rows(pd.DataFrame(rows), threshold=0.2)
+    assert set(zip(transitions["episode_from"], transitions["episode_to"])) == {(0, 1), (1, 2)}
+    ep01 = transitions[transitions["episode_from"] == 0].iloc[0]
+    ep12 = transitions[transitions["episode_from"] == 1].iloc[0]
+    assert bool(ep01["policy_flip"])
+    assert not bool(ep01["teacher_flip"])
+    assert bool(ep12["teacher_flip"])
+    assert not bool(ep12["policy_flip"])

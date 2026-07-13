@@ -99,13 +99,32 @@ def test_decomposition_summary_margin_and_confidence_fields_are_finite():
         source_index=torch.tensor([42]),
         branch="p0",
         bp_pred=torch.tensor([[0.4]], dtype=torch.float64),
+        mix_survival_weight=torch.tensor([[1.0]], dtype=torch.float64),
     )
     row = rows[0]
     assert row["value_best"] == 2.0
     assert row["value_second_best"] == 1.5
     assert row["value_margin"] >= -1e-7
     assert 0.0 <= row["confidence_weight"] <= 1.0
+    assert row["mix_survival_weight"] == 1.0
     assert torch.isfinite(torch.tensor(row["relative_value_margin"]))
+
+
+def test_mix_training_equivalent_loss_uses_survival_sample_weight():
+    pred = torch.tensor([[0.1], [0.9]], dtype=torch.float64)
+    target = torch.tensor([[0.3], [0.2]], dtype=torch.float64)
+    confidence = torch.ones_like(pred)
+    survival = torch.tensor([[1.0], [0.0]], dtype=torch.float64)
+    loss, _, elem = compute_target_grid_policy_distillation_loss(
+        pred,
+        target,
+        confidence,
+        huber_delta=0.05,
+        branch_weight=2.0,
+        sample_weight=survival,
+    )
+    expected = 2.0 * (confidence * survival * elem).mean()
+    torch.testing.assert_close(loss, expected)
 
 
 def test_cashflow_identity_formula_is_small():

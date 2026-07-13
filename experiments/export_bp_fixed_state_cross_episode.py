@@ -217,6 +217,39 @@ def attach_flip_flags(long_df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     return long_df
 
 
+def make_transition_rows(long_df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    rows = []
+    episodes = sorted(long_df["episode"].unique())
+    key = ["source_index", "branch"]
+    for ep_from, ep_to in zip(episodes[:-1], episodes[1:]):
+        left = long_df[long_df["episode"] == ep_from][
+            key + ["probe_group", "bp_pred", "bp_teacher"]
+        ]
+        right = long_df[long_df["episode"] == ep_to][key + ["bp_pred", "bp_teacher"]]
+        merged = left.merge(right, on=key, suffixes=("_from", "_to"), validate="one_to_one")
+        for _, row in merged.iterrows():
+            delta_pred = float(row["bp_pred_to"] - row["bp_pred_from"])
+            delta_teacher = float(row["bp_teacher_to"] - row["bp_teacher_from"])
+            teacher_flip = abs(delta_teacher) > threshold
+            policy_flip = abs(delta_pred) > threshold
+            rows.append(
+                {
+                    "episode_from": int(ep_from),
+                    "episode_to": int(ep_to),
+                    "source_index": int(row["source_index"]),
+                    "branch": row["branch"],
+                    "probe_group": row["probe_group"],
+                    "delta_bp_pred": delta_pred,
+                    "delta_bp_teacher": delta_teacher,
+                    "teacher_flip": teacher_flip,
+                    "policy_flip": policy_flip,
+                    "policy_flip_without_teacher_flip": policy_flip and not teacher_flip,
+                    "teacher_flip_not_followed_by_policy": teacher_flip and not policy_flip,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
@@ -265,6 +298,7 @@ def main() -> None:
             )
         )
     long_df = attach_flip_flags(pd.DataFrame(rows), args.flip_threshold)
+    transitions = make_transition_rows(long_df, args.flip_threshold)
     if long_df.duplicated(["episode", "source_index", "branch"]).any():
         raise RuntimeError("Duplicate episode/source_index/branch rows in fixed-state export.")
 
@@ -292,11 +326,14 @@ def main() -> None:
 
     long_path = output_dir / "fixed_state_cross_episode_long.csv"
     summary_path = output_dir / "fixed_state_cross_episode_summary.csv"
+    transitions_path = output_dir / "fixed_state_cross_episode_transitions.csv"
     long_df.to_csv(long_path, index=False)
     summary.to_csv(summary_path, index=False)
+    transitions.to_csv(transitions_path, index=False)
     print("Saved:")
     print(long_path)
     print(summary_path)
+    print(transitions_path)
     print(panel.head().to_string(index=False))
 
 

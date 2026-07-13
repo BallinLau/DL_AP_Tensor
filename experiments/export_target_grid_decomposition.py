@@ -106,6 +106,7 @@ def make_summary_rows(
     source_index: torch.Tensor,
     branch: str,
     bp_pred: torch.Tensor,
+    mix_survival_weight: torch.Tensor,
 ) -> List[Dict[str, object]]:
     grid = result["coarse_bp_grid"]
     value = result["coarse_value_grid"]
@@ -130,6 +131,7 @@ def make_summary_rows(
     relative_value_margin = value_margin / value_best.abs().clamp_min(1e-8)
     confidence_weight = result["confidence"].reshape(-1)
     active_refinancing = result["refi_active"].reshape(-1)
+    mix_survival_weight = mix_survival_weight.reshape(-1)
     bp_pred_flat = bp_pred.reshape(-1)
     rows: List[Dict[str, object]] = []
 
@@ -179,6 +181,7 @@ def make_summary_rows(
                 "relative_value_margin": float(relative_value_margin[state_pos].item()),
                 "confidence_weight": float(confidence_weight[state_pos].item()),
                 "active_refinancing": float(active_refinancing[state_pos].item()),
+                "mix_survival_weight": float(mix_survival_weight[state_pos].item()),
                 "regret_at_pred": float(regret_at_pred[state_pos].item()),
                 "cashflow_low": float(cf_low.item()),
                 "cashflow_coarse_star": float(cf_star_coarse.item()),
@@ -300,6 +303,8 @@ def main() -> None:
         selected_out = online_model(parent_state)
         mix_weight = selected_out.bar_i_cond.clamp(0.0, 1.0)
         bp_mix = (1.0 - mix_weight) * selected_out.bp0 + mix_weight * selected_out.bpI
+        target_equity = target_model.forward_equity(parent_state)
+        mix_survival_weight = target_equity["survival_prob"].clamp(0.0, 1.0)
 
     teacher = BPGridTeacher.from_hyperparams(
         target_model=target_model,
@@ -333,6 +338,7 @@ def main() -> None:
                     source_index=source_index,
                     branch=branch,
                     bp_pred=inputs["bp_pred"],
+                    mix_survival_weight=mix_survival_weight,
                 )
             )
             summary_rows.extend(

@@ -46,6 +46,7 @@ def test_fixed_teacher_refit_decreases_loss_and_preserves_original_model():
         "bpI_confidence": confidence,
         "bp_mix": target,
         "bp_mix_confidence": confidence,
+        "bp_mix_survival_weight": confidence,
     }
     idx = torch.arange(parent_state.shape[0])
     opt = torch.optim.AdamW([p for p in probe.parameters() if p.requires_grad], lr=1e-2)

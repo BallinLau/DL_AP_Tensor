@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 from config import Config  # noqa: E402
 from experiments.export_bp_deep_diagnostics import make_episode_batches  # noqa: E402
 from experiments.run_utils import build_hyperparams, build_models  # noqa: E402
+from losses.q_loss import compute_q_survival_recovery_components  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -115,21 +116,15 @@ def main() -> None:
         p_child = equity["P"]
         survival = equity["survival_prob"]
         default = equity["bar_z"].clamp(0.0, 1.0)
-        q_child = target_model._q_output(surface_states)
-        q_issue = target_model._q_output(surface_states)
-        recovery = b_candidate.clamp_min(0.0) * Config.PHI * (
-            1.0 - Config.DELTA + torch.exp(surface_states[:, 4:5] + surface_states[:, 1:2])
-        )
+        parent_out = target_model(parent)
+        if isinstance(parent_out, dict):
+            bar_i_parent = parent_out["bar_i"]
+        else:
+            bar_i_parent = parent_out.bar_i
 
     rows = []
-    q_rows = []
     for branch, multiplier in [("p0", 1.0), ("pi", Config.G)]:
         continuation = multiplier * m_used * p_child
-        q_target_survival = m_used * (b_candidate + multiplier * q_child) * (1.0 - default)
-        q_target_recovery = m_used * recovery * multiplier * default
-        q_target_total = q_target_survival + q_target_recovery
-        q_residual = q_issue - q_target_total
-        recovery_share = q_target_recovery / q_target_total.clamp_min(1e-12)
         for i in range(surface_states.shape[0]):
             rows.append(
                 {
@@ -147,21 +142,72 @@ def main() -> None:
                     "continuation_pi": float((Config.G * m_used[i] * p_child[i]).item()),
                 }
             )
+
+    q_rows = []
+    b_values = torch.linspace(0.0, 1.0, steps=args.b_grid_size, device=device, dtype=parent.dtype).reshape(-1, 1)
+    with torch.no_grad():
+        issue_states = parent.expand(b_values.shape[0], -1).clone()
+        issue_states[:, 0:1] = b_values
+        q_issue = target_model._q_output(issue_states)
+        bar_i_issue = bar_i_parent.expand_as(b_values)
+        multiplier = bar_i_issue * (Config.G - 1.0) + 1.0
+        q_target_survival_sum = torch.zeros_like(b_values)
+        q_target_recovery_sum = torch.zeros_like(b_values)
+        default_sum = torch.zeros_like(b_values)
+        m_sum = torch.zeros_like(b_values)
+        for child_idx, child in enumerate(children):
+            child_state = child.expand(b_values.shape[0], -1).clone()
+            b_sp = b_values / multiplier.clamp_min(1e-6)
+            child_state[:, 0:1] = b_sp
+            child_q = target_model._q_output(child_state)
+            child_equity = target_model.forward_equity(child_state)
+            child_default = child_equity["bar_z"].clamp(0.0, 1.0)
+            child_m = (
+                torch.full_like(b_values, float(args.m_fixed))
+                if args.m_mode == "fixed"
+                else tensors[f"child{child_idx}"][torch.where(tensors["source_index"].detach().cpu().to(torch.long) == int(args.base_state_source_index))[0][0], 7].to(device=device, dtype=parent.dtype).reshape(1, 1).expand_as(b_values)
+            )
+            components = compute_q_survival_recovery_components(
+                Q=q_issue,
+                b=b_values,
+                bar_i=bar_i_issue,
+                M=child_m,
+                Qsp=child_q,
+                bar_z=child_default,
+                x_child=child_state[:, 4:5],
+                z_child=child_state[:, 1:2],
+                g=Config.G,
+                delta=Config.DELTA,
+                phi=Config.PHI,
+            )
+            q_target_survival_sum = q_target_survival_sum + components["q_target_survival"]
+            q_target_recovery_sum = q_target_recovery_sum + components["q_target_recovery"]
+            default_sum = default_sum + child_default
+            m_sum = m_sum + child_m
+        n_children = float(len(children))
+        q_target_survival = q_target_survival_sum / n_children
+        q_target_recovery = q_target_recovery_sum / n_children
+        q_target_total = q_target_survival + q_target_recovery
+        q_residual = q_issue - q_target_total
+        recovery_share = q_target_recovery / q_target_total.clamp_min(1e-12)
+        default_mean = default_sum / n_children
+        m_mean = m_sum / n_children
+        for i in range(b_values.shape[0]):
             q_rows.append(
                 {
                     "episode": args.episode,
                     "source_index": args.base_state_source_index,
-                    "branch": branch,
-                    "b_candidate": float(b_candidate[i].item()),
-                    "z_child": float(z_child[i].item()),
+                    "branch": "formal_q",
+                    "b_candidate": float(b_values[i].item()),
                     "q_issue": float(q_issue[i].item()),
                     "q_target_survival": float(q_target_survival[i].item()),
                     "q_target_recovery": float(q_target_recovery[i].item()),
                     "q_target_total": float(q_target_total[i].item()),
                     "q_pricing_residual": float(q_residual[i].item()),
                     "recovery_share": float(recovery_share[i].item()),
-                    "default_child": float(default[i].item()),
-                    "m_used": float(m_used[i].item()),
+                    "default_child_mean": float(default_mean[i].item()),
+                    "m_used_mean": float(m_mean[i].item()),
+                    "bar_i_multiplier": float(multiplier[i].item()),
                 }
             )
 
@@ -170,12 +216,14 @@ def main() -> None:
     boundary_rows = []
     for b_val, group in surface[surface["branch"] == "p0"].groupby("b_candidate"):
         survived = group[group["survival_child"] >= 0.5].sort_values("z_child")
+        boundary_found = not survived.empty
         boundary_rows.append(
             {
                 "episode": args.episode,
                 "source_index": args.base_state_source_index,
                 "b_candidate": b_val,
-                "z_survival_boundary": float(survived["z_child"].iloc[0]) if not survived.empty else float("nan"),
+                "z_survival_boundary": float(survived["z_child"].iloc[0]) if boundary_found else float(args.z_max),
+                "boundary_found": boundary_found,
             }
         )
     boundary = pd.DataFrame(boundary_rows)

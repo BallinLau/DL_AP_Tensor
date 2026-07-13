@@ -221,7 +221,7 @@ def export_logits_and_gradients(
     branches = {
         "p0": (out.bp0, float(getattr(build_hyperparams(), "bp_grid_policy_weight", 1.0)), None),
         "pi": (out.bpI, float(getattr(build_hyperparams(), "bp_grid_policy_weight", 1.0)), None),
-        "mix": (bp_mix, float(getattr(build_hyperparams(), "bp_grid_mix_policy_weight", 1.0)), None),
+        "mix": (bp_mix, float(getattr(build_hyperparams(), "bp_grid_mix_policy_weight", 1.0)), "mix_survival_weight"),
     }
     policy_delta = float(getattr(build_hyperparams(), "bp_grid_policy_huber_delta", 0.05))
     for branch, (pred, branch_weight, sample_weight) in branches.items():
@@ -232,6 +232,13 @@ def export_logits_and_gradients(
             device=parent_state.device,
             dtype=pred.dtype,
         ).reshape_as(pred)
+        sample_weight_tensor = None
+        if sample_weight is not None:
+            sample_weight_tensor = torch.as_tensor(
+                branch_summary[sample_weight].to_numpy(dtype=np.float64),
+                device=parent_state.device,
+                dtype=pred.dtype,
+            ).reshape_as(pred)
         model.zero_grad(set_to_none=True)
         posthoc_loss = F.mse_loss(pred, target)
         posthoc_loss.backward(retain_graph=True)
@@ -246,7 +253,7 @@ def export_logits_and_gradients(
             confidence,
             huber_delta=policy_delta,
             branch_weight=branch_weight,
-            sample_weight=sample_weight,
+            sample_weight=sample_weight_tensor,
         )
         training_loss.backward(retain_graph=True)
         gradient_rows.append(
@@ -309,6 +316,7 @@ def export_cashflow_components(
     parent_state: torch.Tensor,
     children: List[torch.Tensor],
     long_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
     episode: int,
     output_dir: Path,
 ) -> None:
@@ -408,8 +416,10 @@ def export_cashflow_components(
     cashflow_long = cashflow_long[
         [
             "episode",
+            "state_pos",
             "source_index",
             "branch",
+            "grid_index",
             "bp_candidate",
             "cashflow",
             "production_cashflow",
@@ -430,13 +440,30 @@ def export_cashflow_components(
     summary_rows: List[Dict[str, object]] = []
     for (ep, source, branch), group in cashflow_long.groupby(["episode", "source_index", "branch"]):
         group = group.sort_values("bp_candidate").reset_index(drop=True)
+        summary_match = summary_df[
+            (summary_df["source_index"] == source)
+            & (summary_df["branch"] == branch)
+        ]
+        if len(summary_match) != 1:
+            raise RuntimeError(
+                f"Expected one decomposition summary row for source_index={source}, branch={branch}; "
+                f"found {len(summary_match)}"
+            )
+        value_star_grid_index = int(summary_match.iloc[0]["argmax_index"])
         low = group.iloc[0]
-        star = group.loc[group["cashflow"].idxmax()]
-        delta_production = float(star["production_cashflow"] - low["production_cashflow"])
-        delta_debt = float(star["debt_adjustment"] - low["debt_adjustment"])
-        delta_equity = float(star["equity_financing_cost"] - low["equity_financing_cost"])
-        delta_invest = float(star["investment_adjustment"] - low["investment_adjustment"])
-        delta_cashflow = float(star["cashflow"] - low["cashflow"])
+        star_rows = group[group["grid_index"].astype(int) == value_star_grid_index]
+        if len(star_rows) != 1:
+            raise RuntimeError(
+                f"Missing coarse value-star grid_index={value_star_grid_index} "
+                f"for source_index={source}, branch={branch}"
+            )
+        value_star = star_rows.iloc[0]
+        cashflow_star = group.loc[group["cashflow"].idxmax()]
+        delta_production = float(value_star["production_cashflow"] - low["production_cashflow"])
+        delta_debt = float(value_star["debt_adjustment"] - low["debt_adjustment"])
+        delta_equity = float(value_star["equity_financing_cost"] - low["equity_financing_cost"])
+        delta_invest = float(value_star["investment_adjustment"] - low["investment_adjustment"])
+        delta_cashflow = float(value_star["cashflow"] - low["cashflow"])
         delta_identity_error = abs(
             delta_cashflow
             - (delta_production + delta_debt - delta_equity + delta_invest)
@@ -447,28 +474,32 @@ def export_cashflow_components(
                 "source_index": int(source),
                 "branch": branch,
                 "bp_low": float(low["bp_candidate"]),
-                "bp_star": float(star["bp_candidate"]),
+                "bp_coarse_value_star": float(value_star["bp_candidate"]),
+                "bp_cashflow_star": float(cashflow_star["bp_candidate"]),
+                "coarse_value_star_grid_index": value_star_grid_index,
                 "production_low": float(low["production_cashflow"]),
-                "production_star": float(star["production_cashflow"]),
+                "production_star": float(value_star["production_cashflow"]),
                 "delta_production": delta_production,
                 "debt_adjustment_low": float(low["debt_adjustment"]),
-                "debt_adjustment_star": float(star["debt_adjustment"]),
+                "debt_adjustment_star": float(value_star["debt_adjustment"]),
+                "debt_adjustment_at_coarse_value_star": float(value_star["debt_adjustment"]),
                 "delta_debt_adjustment": delta_debt,
                 "equity_cost_low": float(low["equity_financing_cost"]),
-                "equity_cost_star": float(star["equity_financing_cost"]),
+                "equity_cost_star": float(value_star["equity_financing_cost"]),
                 "delta_equity_cost": delta_equity,
                 "investment_adjustment_low": float(low["investment_adjustment"]),
-                "investment_adjustment_star": float(star["investment_adjustment"]),
+                "investment_adjustment_star": float(value_star["investment_adjustment"]),
                 "delta_investment_adjustment": delta_invest,
                 "cashflow_low": float(low["cashflow"]),
-                "cashflow_star": float(star["cashflow"]),
+                "cashflow_star": float(value_star["cashflow"]),
+                "cashflow_at_coarse_value_star": float(value_star["cashflow"]),
                 "delta_cashflow": delta_cashflow,
                 "delta_cashflow_identity_error": float(delta_identity_error),
                 "max_cashflow_identity_error": float(group["cashflow_identity_error"].max()),
                 "q_current_low": float(low["q_current"]),
-                "q_issue_star": float(star["q_issue"]),
-                "recovery_star": float(star["recovery_grid_mean"]),
-                "q_minus_raw_recovery_star": float(star["q_minus_raw_recovery_mean"]),
+                "q_issue_star": float(value_star["q_issue"]),
+                "recovery_star": float(value_star["recovery_grid_mean"]),
+                "q_minus_raw_recovery_star": float(value_star["q_minus_raw_recovery_mean"]),
             }
         )
     cashflow_summary = pd.DataFrame(summary_rows)
@@ -545,6 +576,7 @@ def main() -> None:
         parent_state=selected["parent"],
         children=selected["children"],
         long_df=long_df,
+        summary_df=summary_df,
         episode=args.episode,
         output_dir=output_dir,
     )
