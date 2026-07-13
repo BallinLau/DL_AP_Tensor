@@ -33,10 +33,11 @@ FLIP_THRESHOLD="${FLIP_THRESHOLD:-0.2}"
 B_GRID_SIZE="${B_GRID_SIZE:-21}"
 Z_GRID_SIZE="${Z_GRID_SIZE:-41}"
 BASE_STATE_SOURCE_INDEX="${BASE_STATE_SOURCE_INDEX:-}"
+BAR_I_MODE="${BAR_I_MODE:-fixed_parent}"
 RUN_RELATED_TESTS="${RUN_RELATED_TESTS:-1}"
 ALLOW_DIRTY_WORKTREE="${ALLOW_DIRTY_WORKTREE:-0}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$RUN_ROOT/data/outputs/bp_three_experiments}"
-REQUIRED_COMMIT="${REQUIRED_COMMIT:-c3a6d98}"
+REQUIRED_COMMIT="${REQUIRED_COMMIT:-84dd4e8}"
 
 mkdir -p "$LOG_DIR" "$WORK_ROOT/.mplcache" "$OUTPUT_ROOT"
 cd "$REPO_DIR"
@@ -64,6 +65,7 @@ echo "Episodes: $EPISODES"
 echo "Firm template: $FIRM_TEMPLATE"
 echo "N states: $N_STATES"
 echo "Device: $DEVICE"
+echo "Bar i mode: $BAR_I_MODE"
 echo "Output root: $OUTPUT_ROOT"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "============================================================"
@@ -536,6 +538,7 @@ python3 experiments/export_continuation_surface.py \
     --b-grid-size "$B_GRID_SIZE" \
     --z-grid-size "$Z_GRID_SIZE" \
     --m-mode observed_child_mean \
+    --bar-i-mode "$BAR_I_MODE" \
     --device "$DEVICE" \
     --batch-size "$BATCH_SIZE" \
     --n-branches "$N_BRANCHES" \
