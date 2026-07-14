@@ -160,3 +160,59 @@ def test_policy_value_retry_failure_restores_last_good_and_continues():
     assert episode.optimizers["policy_value"].step_calls == 0
     assert torch.allclose(model.weight.detach(), before_model)
     assert torch.allclose(target.weight.detach(), before_target)
+
+
+def test_new_pv_action_has_priority_over_legacy_gate():
+    episode = _episode(lambda: 1.0)
+    episode._last_policy_value_stage_summary = {
+        "total": 1.0,
+        "policy_value_grad_norm": 3.0,
+    }
+    losses = {
+        "total": 4.15619,
+        "pv_raw_grad_norm": 125.43,
+        "policy_value_grad_norm": 125.43,
+        "pv_batch_action": "soft_clip_step",
+        "pv_batch_reason": "finite_soft_clip",
+        "pv_requires_epoch_rollback": 0.0,
+        "p0_M_clip_low_ratio": 0.90,
+        "pi_M_clip_low_ratio": 0.90,
+    }
+
+    gate = episode._check_policy_value_gate(
+        losses,
+        context="episode=2, epoch=13, batch=4",
+    )
+
+    assert gate["action"] == "soft_clip_step"
+    assert gate["requires_epoch_rollback"] is False
+    assert gate["reason"] == "finite_soft_clip"
+
+
+def test_soft_spike_is_not_reclassified_by_legacy_gate():
+    episode = _episode(lambda: 125.0)
+    episode._last_policy_value_stage_summary = {
+        "total": 1.0,
+        "policy_value_grad_norm": 3.0,
+    }
+    episode._latest_p0_terms = {
+        "p0_M_clip_low_ratio": 0.90,
+        "p0_M_clip_high_ratio": 0.0,
+    }
+    episode._latest_pi_terms = {
+        "pi_M_clip_low_ratio": 0.90,
+        "pi_M_clip_high_ratio": 0.0,
+    }
+
+    result = episode._run_batches(
+        [{}],
+        n_epochs=1,
+        log_interval=1,
+        train_modules=["policy_value"],
+    )
+
+    metadata = result["metadata"]
+    assert metadata["policy_value_stage_status"] == "accepted"
+    assert metadata["policy_value_accepted_epochs"] == 1
+    assert metadata.get("policy_value_epoch_retries", 0) == 0
+    assert episode.optimizers["policy_value"].step_calls == 1

@@ -704,6 +704,8 @@ class Episode:
             "requires_epoch_rollback": requires_rollback,
             "reason": str(losses.get("pv_batch_reason", "")),
         }
+        if "pv_batch_action" in losses:
+            return result
         if not bool(getattr(self.hyperparams, "stage_fail_on_policy_value_explosion", True)):
             return result
         total_v = float(losses.get('total', 0.0))
@@ -5695,10 +5697,10 @@ class Episode:
 
         max_hard = int(getattr(self.hyperparams, "pv_epoch_max_hard_spikes", 3))
         max_soft = int(getattr(self.hyperparams, "pv_epoch_max_consecutive_soft_spikes", 3))
-        if stats["hard_spikes"] > max_hard:
+        if stats["hard_spikes"] >= max_hard:
             stats["rollback_reason"] = "too_many_hard_spikes"
             return True
-        if stats["consecutive_soft_spikes"] > max_soft:
+        if stats["consecutive_soft_spikes"] >= max_soft:
             stats["rollback_reason"] = "too_many_consecutive_soft_spikes"
             return True
         return False
