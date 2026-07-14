@@ -18,8 +18,10 @@ WORK_ROOT="${WORK_ROOT:-/home/fit/zhuyingz/WORK/LiuHao}"
 REPO_DIR="${REPO_DIR:-$WORK_ROOT/DL_AP_Tensor}"
 LOG_DIR="${LOG_DIR:-$WORK_ROOT/logs}"
 STAMP=$(date +%Y%m%d_%H%M%S)
+REQUIRED_COMMIT="${REQUIRED_COMMIT:?REQUIRED_COMMIT must be set}"
 
 RUN_ROOT="${RUN_ROOT:-$WORK_ROOT/cachedir/normalized_sdf_aio_bp_logit_${STAMP}}"
+SEED="${SEED:-12345}"
 N_EPISODES="${N_EPISODES:-3}"
 EPOCHS="${EPOCHS:-20}"
 N_PATHS="${N_PATHS:-400}"
@@ -80,7 +82,19 @@ echo "Job started on $(date)"
 echo "Host: $(hostname)"
 echo "Repo: $REPO_DIR"
 echo "Branch: $(git branch --show-current)"
+ACTUAL_COMMIT="$(git rev-parse HEAD)"
 echo "Commit: $(git rev-parse --short HEAD)"
+echo "Required commit: $REQUIRED_COMMIT"
+if [[ "$ACTUAL_COMMIT" != "$REQUIRED_COMMIT" ]]; then
+  echo "Expected: $REQUIRED_COMMIT"
+  echo "Actual:   $ACTUAL_COMMIT"
+  exit 1
+fi
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "ERROR: working tree is not clean"
+  git status --short
+  exit 1
+fi
 echo "Run root: $RUN_ROOT"
 echo "Python: $(which python3)"
 echo "Torch/CUDA check:"
@@ -130,6 +144,7 @@ else
 fi
 
 echo "Run parameters:"
+echo "  SEED=$SEED"
 echo "  N_EPISODES=$N_EPISODES"
 echo "  EPOCHS=$EPOCHS"
 echo "  N_PATHS=$N_PATHS"
@@ -174,6 +189,7 @@ echo "  MODEB_RESIMULATE_AFTER_PV=$MODEB_RESIMULATE_AFTER_PV"
 python3 -u experiments/run_multi_episode_job.py \
   --run-root "$RUN_ROOT" \
   --device cuda:0 \
+  --seed "$SEED" \
   --n-episodes "$N_EPISODES" \
   --epochs "$EPOCHS" \
   --n-paths "$N_PATHS" \

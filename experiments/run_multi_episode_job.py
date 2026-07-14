@@ -9,12 +9,14 @@ root selection so it can be invoked from a Slurm batch script.
 from __future__ import annotations
 
 import argparse
+import random
 from datetime import datetime
 from pathlib import Path
 import sys
 import json
 import warnings
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +58,7 @@ def validate_sdf_fresh_pair_config(hyperparams):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run staged multi-episode training")
     parser.add_argument("--run-root", type=Path, default=None, help="Override output root; default cachedir/timestamp")
+    parser.add_argument("--seed", type=int, default=12345, help="Global random seed for Python, NumPy, and Torch")
     parser.add_argument("--n-episodes", type=int, default=10, help="Number of episodes to run")
     parser.add_argument("--epochs", type=int, default=None, help="Override epochs per stage")
     parser.add_argument("--n-paths", type=int, default=None, help="Override n_paths for data")
@@ -429,6 +432,11 @@ def make_run_root(arg_path: Path | None) -> Path:
 
 def main():
     args = parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     run_root = make_run_root(args.run_root)
     ensure_dirs(run_root)
 
@@ -436,6 +444,7 @@ def main():
     Config.DEVICE = device
 
     hyperparams = configure_hyperparams(args)
+    print(f"Global random seed: {args.seed}")
     models = build_models(device)
     optimizers = build_optimizers(models, hyperparams)
     post0_n_paths = args.post0_n_paths if args.post0_n_paths is not None else hyperparams.n_paths
