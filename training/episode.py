@@ -436,6 +436,9 @@ class Episode:
                 continue
 
             first = values[0]
+            if key in {"pv_batch_action", "pv_batch_reason"}:
+                metadata[key] = ",".join(sorted({str(value) for value in values}))
+                continue
             if any(value != first for value in values[1:]):
                 raise RuntimeError(
                     f"Non-numeric metric {key!r} changed within one epoch: {values!r}"
@@ -693,11 +696,21 @@ class Episode:
             grad_abs = min(grad_abs, max(rolling_abs, float(prev_grad) * mult))
         return loss_abs, grad_abs
 
-    def _check_policy_value_gate(self, losses: Dict[str, float], context: str) -> None:
+    def _check_policy_value_gate(self, losses: Dict[str, float], context: str) -> Dict[str, Any]:
+        action = str(losses.get("pv_batch_action", "continue"))
+        requires_rollback = bool(losses.get("pv_requires_epoch_rollback", 0.0))
+        result = {
+            "action": action,
+            "requires_epoch_rollback": requires_rollback,
+            "reason": str(losses.get("pv_batch_reason", "")),
+        }
         if not bool(getattr(self.hyperparams, "stage_fail_on_policy_value_explosion", True)):
-            return
+            return result
         total_v = float(losses.get('total', 0.0))
-        grad_v = float(losses.get('policy_value_grad_norm', 0.0))
+        grad_v = float(losses.get(
+            'pv_raw_grad_norm',
+            losses.get('policy_value_grad_norm', 0.0),
+        ))
         loss_thr, grad_thr = self._policy_value_gate_limits()
         clip_gate = float(getattr(self.hyperparams, "pv_sdf_clip_ratio_gate", 0.05))
         clip_high = max(
@@ -708,15 +721,20 @@ class Episode:
             float(losses.get('p0_M_clip_low_ratio', 0.0)),
             float(losses.get('pi_M_clip_low_ratio', 0.0)),
         )
-        failed = (
-            (not np.isfinite(total_v))
-            or (not np.isfinite(grad_v))
-            or total_v > loss_thr
-            or grad_v > grad_thr
-            or clip_high > clip_gate
-            or clip_low > clip_gate
-        )
-        if failed:
+        nonfinite = (not np.isfinite(total_v)) or (not np.isfinite(grad_v))
+        hard_explosion = total_v > loss_thr or grad_v > grad_thr
+        clip_explosion = clip_high > clip_gate or clip_low > clip_gate
+        if nonfinite or hard_explosion or clip_explosion:
+            gate_action = "rollback_epoch" if nonfinite else "skip_batch"
+            result = {
+                "action": gate_action,
+                "requires_epoch_rollback": bool(nonfinite),
+                "reason": (
+                    "nonfinite_policy_value_metric"
+                    if nonfinite
+                    else "finite_policy_value_explosion"
+                ),
+            }
             self._last_policy_value_gate_context = {
                 'total': total_v,
                 'policy_value_grad_norm': grad_v,
@@ -727,14 +745,89 @@ class Episode:
                 'clip_ratio_gate': clip_gate,
                 'context': context,
                 'losses': dict(losses),
+                **result,
             }
-            raise NumericalStageFailure(
-                f"Policy/value stage failed at {context}: "
-                f"total={total_v:.6g} (thr={loss_thr:.6g}), "
-                f"grad_norm={grad_v:.6g} (thr={grad_thr:.6g}), "
-                f"clip_high={clip_high:.6g} (thr={clip_gate:.6g}), "
-                f"clip_low={clip_low:.6g} (thr={clip_gate:.6g})"
+        return result
+
+    def _apply_policy_value_optimizer_control(
+        self,
+        losses: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], bool]:
+        model = self.models.get("policy_value")
+        optimizer = self.optimizers.get("policy_value")
+        if model is None or optimizer is None:
+            return losses, False
+
+        clip_norm = float(getattr(self.hyperparams, "pv_grad_clip_norm", 10.0))
+        soft_threshold = float(getattr(self.hyperparams, "pv_grad_soft_threshold", 100.0))
+        hard_threshold = float(getattr(self.hyperparams, "pv_grad_hard_threshold", 1000.0))
+        loss_hard_threshold = float(getattr(self.hyperparams, "pv_loss_hard_threshold", 1000.0))
+        params = [p for p in model.parameters() if p.grad is not None]
+        if params:
+            raw_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                params,
+                max_norm=clip_norm,
+                error_if_nonfinite=False,
             )
+            raw_grad_norm = float(raw_norm_tensor.detach().cpu().item())
+        else:
+            raw_grad_norm = 0.0
+
+        loss_value = float(losses.get("total", 0.0))
+        clipped_grad_norm = (
+            min(raw_grad_norm, clip_norm)
+            if np.isfinite(raw_grad_norm)
+            else float("nan")
+        )
+        nonfinite = (not np.isfinite(loss_value)) or (not np.isfinite(raw_grad_norm))
+        hard_spike = (
+            (not nonfinite)
+            and (loss_value > loss_hard_threshold or raw_grad_norm > hard_threshold)
+        )
+        soft_spike = (
+            (not nonfinite)
+            and (not hard_spike)
+            and raw_grad_norm > soft_threshold
+        )
+
+        optimizer_step_executed = False
+        if nonfinite:
+            action = "rollback_epoch"
+            reason = "nonfinite_loss_or_grad"
+            self._nonfinite_grad_streak += 1
+            self._nonfinite_grad_total += 1
+            bad = self._nonfinite_gradient_params(model)
+            if bad:
+                self._last_nonfinite_grad_params = {"policy_value": bad}
+            optimizer.zero_grad(set_to_none=True)
+        elif hard_spike:
+            action = "skip_batch"
+            reason = "finite_hard_spike"
+            self._nonfinite_grad_streak = 0
+            optimizer.zero_grad(set_to_none=True)
+        else:
+            action = "soft_clip_step" if soft_spike else "step"
+            reason = "finite_soft_clip" if soft_spike else "finite_step"
+            self._nonfinite_grad_streak = 0
+            optimizer.step()
+            optimizer_step_executed = True
+            self._maybe_update_firm_target(["policy_value"])
+
+        losses.update({
+            "policy_value_grad_norm": raw_grad_norm,
+            "pv_raw_grad_norm": raw_grad_norm,
+            "pv_clipped_grad_norm": clipped_grad_norm,
+            "pv_optimizer_step_executed": float(optimizer_step_executed),
+            "pv_batch_skipped": float(action == "skip_batch"),
+            "pv_soft_spike": float(soft_spike),
+            "pv_hard_spike": float(hard_spike),
+            "pv_requires_epoch_rollback": float(action == "rollback_epoch"),
+            "pv_batch_action": action,
+            "pv_batch_reason": reason,
+        })
+        if optimizer_step_executed:
+            losses.update(self._policy_value_grad_group_norms())
+        return losses, optimizer_step_executed
 
     @staticmethod
     def _nonfinite_gradient_params(model: nn.Module, limit: int = 20) -> List[str]:
@@ -2366,47 +2459,89 @@ class Episode:
             # 反向传播
             if total_loss.requires_grad:
                 total_loss.backward()
+                policy_value_only = (
+                    len(train_modules) == 1
+                    and train_modules[0] == "policy_value"
+                    and "policy_value" in self.models
+                )
 
-                bad_grad_params: Dict[str, List[str]] = {}
-                for name in train_modules:
-                    if name in self.models:
-                        bad = self._nonfinite_gradient_params(self.models[name])
-                        if bad:
-                            bad_grad_params[name] = bad
+                if policy_value_only:
+                    losses, stepped = self._apply_policy_value_optimizer_control(losses)
+                    if stepped:
+                        stepped_modules.add("policy_value")
+                else:
+                    bad_grad_params: Dict[str, List[str]] = {}
+                    for name in train_modules:
+                        if name in self.models:
+                            bad = self._nonfinite_gradient_params(self.models[name])
+                            if bad:
+                                bad_grad_params[name] = bad
 
-                if bad_grad_params:
-                    self._nonfinite_grad_streak += 1
-                    self._nonfinite_grad_total += 1
-                    self._last_nonfinite_grad_params = bad_grad_params
-                    losses['nonfinite_grad'] = 1.0
-                    losses['nonfinite_grad_streak'] = float(self._nonfinite_grad_streak)
-                    logger.warning(
-                        "Non-finite gradient detected at episode=%s step=%s streak=%d modules=%s",
-                        self.episode_id,
-                        self.step_count,
-                        self._nonfinite_grad_streak,
-                        {k: v[:5] for k, v in bad_grad_params.items()}
-                    )
-                    fail_after = int(getattr(self.hyperparams, "nonfinite_grad_fail_after", 3))
-                    if fail_after > 0 and self._nonfinite_grad_streak >= fail_after:
-                        raise NumericalStageFailure(
-                            f"Repeated non-finite gradients for {self._nonfinite_grad_streak} "
-                            f"consecutive steps at episode={self.episode_id}; "
-                            f"bad params={bad_grad_params}"
+                    if bad_grad_params:
+                        self._nonfinite_grad_streak += 1
+                        self._nonfinite_grad_total += 1
+                        self._last_nonfinite_grad_params = bad_grad_params
+                        losses['nonfinite_grad'] = 1.0
+                        losses['nonfinite_grad_streak'] = float(self._nonfinite_grad_streak)
+                        logger.warning(
+                            "Non-finite gradient detected at episode=%s step=%s streak=%d modules=%s",
+                            self.episode_id,
+                            self.step_count,
+                            self._nonfinite_grad_streak,
+                            {k: v[:5] for k, v in bad_grad_params.items()}
                         )
-                    skip_step = bool(getattr(self.hyperparams, "nonfinite_grad_skip_step", True))
-                    if skip_step:
-                        for name in train_modules:
-                            if name in self.optimizers:
-                                self.optimizers[name].zero_grad(set_to_none=True)
+                        fail_after = int(getattr(self.hyperparams, "nonfinite_grad_fail_after", 3))
+                        if fail_after > 0 and self._nonfinite_grad_streak >= fail_after:
+                            raise NumericalStageFailure(
+                                f"Repeated non-finite gradients for {self._nonfinite_grad_streak} "
+                                f"consecutive steps at episode={self.episode_id}; "
+                                f"bad params={bad_grad_params}"
+                            )
+                        skip_step = bool(getattr(self.hyperparams, "nonfinite_grad_skip_step", True))
+                        if skip_step:
+                            for name in train_modules:
+                                if name in self.optimizers:
+                                    self.optimizers[name].zero_grad(set_to_none=True)
+                        else:
+                            for name in train_modules:
+                                if name in self.models:
+                                    gradient_protection(
+                                        self.models[name].parameters(),
+                                        max_norm=self.hyperparams.max_grad_norm,
+                                        nan_to_num=True
+                                    )
+                            for name in train_modules:
+                                if name in self.optimizers:
+                                    if (
+                                        name == "sdf_fc1"
+                                        and getattr(self, "_current_attempt_first_step_lrs", None) is None
+                                    ):
+                                        self._current_attempt_first_step_lrs = self._optimizer_lrs(
+                                            self.optimizers[name]
+                                        )
+                                    self.optimizers[name].step()
+                                    stepped_modules.add(name)
+                            self._maybe_update_firm_target(train_modules)
                     else:
+                        self._nonfinite_grad_streak = 0
+                        losses['nonfinite_grad'] = 0.0
+
+                        # 梯度保护
                         for name in train_modules:
                             if name in self.models:
-                                gradient_protection(
+                                grad_norm, had_nan = gradient_protection(
                                     self.models[name].parameters(),
                                     max_norm=self.hyperparams.max_grad_norm,
-                                    nan_to_num=True
+                                    nan_to_num=False
                                 )
+                                losses[f'{name}_grad_norm'] = grad_norm
+
+                                if had_nan:
+                                    logger.warning(f"NaN gradient detected in {name}")
+                        if 'policy_value' in train_modules and 'policy_value' in self.models:
+                            losses.update(self._policy_value_grad_group_norms())
+
+                        # 优化器步骤
                         for name in train_modules:
                             if name in self.optimizers:
                                 if (
@@ -2419,46 +2554,21 @@ class Episode:
                                 self.optimizers[name].step()
                                 stepped_modules.add(name)
                         self._maybe_update_firm_target(train_modules)
-                else:
-                    self._nonfinite_grad_streak = 0
-                    losses['nonfinite_grad'] = 0.0
-
-                    # 梯度保护
-                    for name in train_modules:
-                        if name in self.models:
-                            grad_norm, had_nan = gradient_protection(
-                                self.models[name].parameters(),
-                                max_norm=self.hyperparams.max_grad_norm,
-                                nan_to_num=False
-                            )
-                            losses[f'{name}_grad_norm'] = grad_norm
-
-                            if had_nan:
-                                logger.warning(f"NaN gradient detected in {name}")
-                    if 'policy_value' in train_modules and 'policy_value' in self.models:
-                        losses.update(self._policy_value_grad_group_norms())
-
-                    # 优化器步骤
-                    for name in train_modules:
-                        if name in self.optimizers:
-                            if (
-                                name == "sdf_fc1"
-                                and getattr(self, "_current_attempt_first_step_lrs", None) is None
-                            ):
-                                self._current_attempt_first_step_lrs = self._optimizer_lrs(
-                                    self.optimizers[name]
-                                )
-                            self.optimizers[name].step()
-                            stepped_modules.add(name)
-                    self._maybe_update_firm_target(train_modules)
         finally:
             self._set_policy_q_only_freeze(False)
             self._set_policy_bp_only_freeze(False)
         
-        # 更新调度器
-        self.weight_scheduler.step(losses)
-        for scheduler in self.lr_schedulers.values():
-            scheduler.step()
+        # 更新调度器。PV fail-soft 的 skip/rollback batch 没有 optimizer step，
+        # 不推进 scheduler，避免 retry 前污染调度状态。
+        pv_controlled_step = "pv_optimizer_step_executed" in losses
+        scheduler_step_allowed = (
+            not pv_controlled_step
+            or bool(losses.get("pv_optimizer_step_executed", 0.0))
+        )
+        if scheduler_step_allowed:
+            self.weight_scheduler.step(losses)
+            for scheduler in self.lr_schedulers.values():
+                scheduler.step()
 
         if 'sdf_fc1' in stepped_modules:
             self.sdf_fc1_step_count = int(getattr(self, "sdf_fc1_step_count", 0)) + 1
@@ -5528,6 +5638,312 @@ class Episode:
         )
         return summary
 
+    def _policy_value_stage_checkpoint(
+        self,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[Any],
+    ) -> Dict[str, Any]:
+        checkpoint = self._stage_checkpoint(
+            self.models["policy_value"],
+            optimizer,
+            scheduler,
+        )
+        if self.firm_target is not None:
+            checkpoint["firm_target_state"] = self._state_dict_to_cpu(self.firm_target)
+        return checkpoint
+
+    def _restore_policy_value_stage_checkpoint(
+        self,
+        optimizer: torch.optim.Optimizer,
+        checkpoint: Dict[str, Any],
+        scheduler: Optional[Any],
+    ) -> None:
+        self._restore_stage_checkpoint(
+            self.models["policy_value"],
+            optimizer,
+            checkpoint,
+            scheduler,
+        )
+        if self.firm_target is not None and "firm_target_state" in checkpoint:
+            self._restore_module_state(self.firm_target, checkpoint["firm_target_state"])
+            self.firm_target.eval()
+            self.firm_target.requires_grad_(False)
+
+    def _update_policy_value_epoch_stats(
+        self,
+        losses: Dict[str, Any],
+        stats: Dict[str, Any],
+    ) -> bool:
+        gate = self._check_policy_value_gate(
+            losses,
+            context=stats.get("context", "policy_value_epoch"),
+        )
+        action = str(gate.get("action") or losses.get("pv_batch_action", "step"))
+        if bool(gate.get("requires_epoch_rollback")):
+            stats["rollback_reason"] = str(gate.get("reason") or action)
+            return True
+
+        if action == "skip_batch":
+            stats["skipped_batches"] += 1
+            stats["hard_spikes"] += 1
+            stats["consecutive_soft_spikes"] = 0
+        elif action == "soft_clip_step":
+            stats["soft_spikes"] += 1
+            stats["consecutive_soft_spikes"] += 1
+        else:
+            stats["consecutive_soft_spikes"] = 0
+
+        max_hard = int(getattr(self.hyperparams, "pv_epoch_max_hard_spikes", 3))
+        max_soft = int(getattr(self.hyperparams, "pv_epoch_max_consecutive_soft_spikes", 3))
+        if stats["hard_spikes"] > max_hard:
+            stats["rollback_reason"] = "too_many_hard_spikes"
+            return True
+        if stats["consecutive_soft_spikes"] > max_soft:
+            stats["rollback_reason"] = "too_many_consecutive_soft_spikes"
+            return True
+        return False
+
+    def _run_policy_value_batches_fail_soft(
+        self,
+        pv_train_batches: List[Dict[str, torch.Tensor]],
+        validation_batches: List[Dict[str, torch.Tensor]],
+        n_epochs: int,
+        log_interval: int,
+        desc_prefix: str,
+        q_only_epochs: int,
+        epoch_offset: int,
+    ) -> Dict[str, Any]:
+        optimizer = self.optimizers.get("policy_value")
+        if optimizer is None:
+            raise RuntimeError("policy_value optimizer is required for fail-soft PV training.")
+        scheduler = self.lr_schedulers.get("policy_value")
+        max_retries = max(0, int(getattr(self.hyperparams, "pv_epoch_max_retries", 1)))
+        retry_lr_decay = float(getattr(self.hyperparams, "pv_retry_lr_decay", 0.3))
+        max_skip_ratio = float(getattr(self.hyperparams, "pv_epoch_max_skip_ratio", 0.05))
+        continue_degraded = bool(
+            getattr(self.hyperparams, "pv_continue_after_degraded_stage", True)
+        )
+
+        accepted_checkpoint = self._policy_value_stage_checkpoint(optimizer, scheduler)
+        accepted_epoch_count = 0
+        stage_records: List[Dict[str, Any]] = []
+        stage_metadata: Dict[str, Any] = {
+            "policy_value_stage_status": "accepted",
+            "policy_value_accepted_epochs": 0,
+            "policy_value_epoch_retries": 0,
+        }
+
+        for epoch in range(n_epochs):
+            effective_epoch = epoch_offset + epoch
+            self._current_epoch_idx = effective_epoch
+            self._prepare_sdf_shock_bank_for_epoch(
+                pv_train_batches,
+                effective_epoch,
+                ["policy_value"],
+            )
+            self._q_only_stage = bool(q_only_epochs > 0 and epoch < q_only_epochs)
+            policy_loss_terms = ['q'] if self._q_only_stage else ['p0', 'pi', 'q']
+            epoch_checkpoint = self._policy_value_stage_checkpoint(optimizer, scheduler)
+            epoch_accepted = False
+            last_epoch_records: List[Dict[str, Any]] = []
+            last_stats: Dict[str, Any] = {}
+
+            for attempt in range(max_retries + 1):
+                stats = {
+                    "context": (
+                        f"episode={self.episode_id}, epoch={epoch + 1}, "
+                        f"attempt={attempt + 1}"
+                    ),
+                    "skipped_batches": 0,
+                    "hard_spikes": 0,
+                    "soft_spikes": 0,
+                    "consecutive_soft_spikes": 0,
+                    "rollback_reason": "",
+                }
+                epoch_records: List[Dict[str, Any]] = []
+                rollback_requested = False
+
+                for batch_idx, batch in enumerate(
+                    tqdm(
+                        pv_train_batches,
+                        desc=(
+                            f"{desc_prefix}Epoch {epoch+1}/{n_epochs} "
+                            f"PV attempt {attempt+1}/{max_retries+1}"
+                        ),
+                    ),
+                    start=1,
+                ):
+                    losses = self.train_step(
+                        batch,
+                        ["policy_value"],
+                        policy_loss_terms=policy_loss_terms,
+                    )
+                    epoch_records.append(losses)
+                    stats["context"] = (
+                        f"episode={self.episode_id}, epoch={epoch + 1}, "
+                        f"attempt={attempt + 1}, batch={batch_idx}"
+                    )
+                    if self._update_policy_value_epoch_stats(losses, stats):
+                        rollback_requested = True
+                        break
+                    if self.step_count % log_interval == 0:
+                        recent = [
+                            float(l.get('total', 0.0))
+                            for l in epoch_records[-log_interval:]
+                            if np.isfinite(float(l.get('total', 0.0)))
+                        ]
+                        avg_loss = float(np.mean(recent)) if recent else float("nan")
+                        logger.info(
+                            "%sStep %s: policy_value loss=%s",
+                            desc_prefix,
+                            self.step_count,
+                            f"{avg_loss:.6f}" if np.isfinite(avg_loss) else "nan",
+                        )
+
+                bp_refine_steps = max(
+                    0,
+                    int(getattr(self.hyperparams, "bp_refine_steps_per_epoch", 0)),
+                )
+                bp_refine_cap = int(getattr(self.hyperparams, "bp_refine_batch_cap", 32))
+                if (
+                    not rollback_requested
+                    and not self._q_only_stage
+                    and bp_refine_steps > 0
+                    and len(pv_train_batches) > 0
+                ):
+                    refine_batches = (
+                        pv_train_batches[:min(bp_refine_cap, len(pv_train_batches))]
+                        if bp_refine_cap > 0
+                        else pv_train_batches
+                    )
+                    self._bp_only_stage = True
+                    try:
+                        for refine_idx in range(bp_refine_steps):
+                            for batch_idx, batch in enumerate(
+                                tqdm(
+                                    refine_batches,
+                                    desc=(
+                                        f"{desc_prefix}BP refine "
+                                        f"{refine_idx+1}/{bp_refine_steps} "
+                                        f"(epoch {epoch+1}, attempt {attempt+1})"
+                                    ),
+                                ),
+                                start=1,
+                            ):
+                                losses = self.train_step(
+                                    batch,
+                                    ["policy_value"],
+                                    policy_loss_terms=['p0', 'pi'],
+                                )
+                                epoch_records.append(losses)
+                                stats["context"] = (
+                                    f"episode={self.episode_id}, epoch={epoch + 1}, "
+                                    f"attempt={attempt + 1}, bp_refine={refine_idx + 1}, "
+                                    f"batch={batch_idx}"
+                                )
+                                if self._update_policy_value_epoch_stats(losses, stats):
+                                    rollback_requested = True
+                                    break
+                            if rollback_requested:
+                                break
+                    finally:
+                        self._bp_only_stage = False
+
+                total_batches = max(1, len(epoch_records))
+                skip_ratio = float(stats["skipped_batches"]) / float(total_batches)
+                if skip_ratio > max_skip_ratio:
+                    rollback_requested = True
+                    stats["rollback_reason"] = "skip_ratio_exceeded"
+
+                last_epoch_records = epoch_records
+                last_stats = dict(stats)
+                if rollback_requested:
+                    self._restore_policy_value_stage_checkpoint(
+                        optimizer,
+                        epoch_checkpoint,
+                        scheduler,
+                    )
+                    if attempt < max_retries:
+                        stage_metadata["policy_value_epoch_retries"] += 1
+                        new_lrs = self._decay_optimizer_and_scheduler_lr(
+                            optimizer,
+                            scheduler,
+                            retry_lr_decay,
+                        )
+                        logger.warning(
+                            "%sPV epoch %d rejected on attempt %d (%s); retrying with lr=%s",
+                            desc_prefix,
+                            epoch + 1,
+                            attempt + 1,
+                            stats.get("rollback_reason", "rollback"),
+                            new_lrs,
+                        )
+                        continue
+                    break
+
+                epoch_accepted = True
+                accepted_epoch_count += 1
+                self._maybe_update_firm_target_epoch(["policy_value"])
+                accepted_checkpoint = self._policy_value_stage_checkpoint(optimizer, scheduler)
+                stage_records.extend(epoch_records)
+                avg_losses, epoch_metadata = self._aggregate_metric_records(epoch_records)
+                epoch_summary = {**avg_losses, **epoch_metadata}
+                epoch_summary.update({
+                    "pv_epoch_attempt": attempt + 1,
+                    "pv_epoch_skip_ratio": skip_ratio,
+                    "pv_epoch_hard_spikes": float(stats["hard_spikes"]),
+                    "pv_epoch_soft_spikes": float(stats["soft_spikes"]),
+                })
+                logger.info(f"{desc_prefix}Epoch {epoch+1} accepted: {epoch_summary}")
+                break
+
+            if not epoch_accepted:
+                self._restore_policy_value_stage_checkpoint(
+                    optimizer,
+                    accepted_checkpoint,
+                    scheduler,
+                )
+                stage_metadata.update({
+                    "policy_value_stage_status": "degraded_recovery",
+                    "policy_value_degraded_epoch": epoch + 1,
+                    "policy_value_rollback_reason": last_stats.get(
+                        "rollback_reason",
+                        "retry_failed",
+                    ),
+                    "policy_value_last_attempt_batches": len(last_epoch_records),
+                })
+                logger.warning(
+                    "%sPV epoch %d could not produce an accepted update after %d retries; "
+                    "restored last-good policy/value state.",
+                    desc_prefix,
+                    epoch + 1,
+                    max_retries,
+                )
+                if not continue_degraded:
+                    raise NumericalStageFailure(
+                        "Policy/value stage degraded and pv_continue_after_degraded_stage=False",
+                        diagnostics=dict(stage_metadata),
+                    )
+                break
+
+        self._q_only_stage = False
+        self._bp_only_stage = False
+        avg_losses, metadata = self._aggregate_metric_records(stage_records)
+        metadata.update(stage_metadata)
+        metadata["policy_value_accepted_epochs"] = accepted_epoch_count
+        convergence = self.evaluate_bellman_convergence(
+            pv_train_batches,
+            validation_batches=validation_batches,
+        )
+        result = {
+            "final_losses": avg_losses,
+            "metadata": metadata,
+            "convergence": convergence,
+            "target_grid_validation_batches": len(validation_batches),
+        }
+        self._last_policy_value_stage_summary = {**avg_losses, **metadata}
+        return result
+
     def _run_batches(
         self,
         batches: List[Dict[str, torch.Tensor]],
@@ -5577,6 +5993,17 @@ class Episode:
         )
 
         epoch_offset = int(getattr(self, "_run_batches_epoch_offset", 0))
+        if train_modules == ['policy_value'] and 'policy_value' in self.models:
+            return self._run_policy_value_batches_fail_soft(
+                pv_train_batches=pv_train_batches,
+                validation_batches=validation_batches,
+                n_epochs=n_epochs,
+                log_interval=log_interval,
+                desc_prefix=desc_prefix,
+                q_only_epochs=q_only_epochs,
+                epoch_offset=epoch_offset,
+            )
+
         for epoch in range(n_epochs):
             effective_epoch = epoch_offset + epoch
             self._current_epoch_idx = effective_epoch

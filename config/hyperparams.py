@@ -139,6 +139,17 @@ class HyperParams:
     policy_value_loss_relative_fail_multiplier: float = 10.0
     policy_value_grad_relative_fail_multiplier: float = 10.0
     policy_value_rolling_grad_fail_threshold: float = 100.0
+    pv_grad_clip_norm: float = 10.0
+    pv_grad_soft_threshold: float = 100.0
+    pv_grad_hard_threshold: float = 1000.0
+    pv_loss_hard_threshold: float = 1000.0
+    pv_epoch_max_hard_spikes: int = 3
+    pv_epoch_max_skip_ratio: float = 0.05
+    pv_epoch_max_consecutive_soft_spikes: int = 3
+    pv_epoch_max_retries: int = 1
+    pv_retry_lr_decay: float = 0.3
+    pv_continue_after_degraded_stage: bool = True
+    pv_max_consecutive_degraded_episodes: int = 3
     
     # NaN/Inf 检测
     nan_recovery: bool = True
