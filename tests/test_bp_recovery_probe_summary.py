@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from experiments.summarize_bp_recovery_probes import (
@@ -120,3 +121,26 @@ def test_decision_table_is_evidence_only_and_deterministic(tmp_path: Path):
     }
     assert decisions["caveat"].str.contains("Bellman regret is not included").any()
     assert not decisions.isna().any().any()
+
+
+def test_slurm_validators_do_not_use_bool_identity_checks():
+    for path in [
+        Path("slurm/run_bp_recovery_probe_smoke.slurm"),
+        Path("slurm/run_bp_recovery_probe_full_array.slurm"),
+    ]:
+        text = path.read_text()
+        assert " is True" not in text
+        assert " is False" not in text
+        assert " is not True" not in text
+        assert " is not False" not in text
+
+    mix_flags = {
+        "baseline_output_loss": np.bool_(True),
+        "bias_recenter_output_loss": np.bool_(True),
+        "branch_only_output_loss": np.bool_(False),
+        "original_init_logit_loss": np.bool_(False),
+    }
+    assert bool(mix_flags["baseline_output_loss"])
+    assert bool(mix_flags["bias_recenter_output_loss"])
+    assert not bool(mix_flags["branch_only_output_loss"])
+    assert not bool(mix_flags["original_init_logit_loss"])

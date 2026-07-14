@@ -214,9 +214,9 @@ if set(history["split"].unique()) != {"train", "holdout"}:
 if not {0, final_step}.issubset(set(history["step"].astype(int).unique())):
     raise SystemExit("history missing step 0 or final step")
 mix_flags = dict(summary.set_index("probe")["mix_training_included"].astype(bool))
-if mix_flags["baseline_output_loss"] is not True or mix_flags["bias_recenter_output_loss"] is not True:
+if not bool(mix_flags["baseline_output_loss"]) or not bool(mix_flags["bias_recenter_output_loss"]):
     raise SystemExit("full probes must include mix training")
-if mix_flags["branch_only_output_loss"] is not False or mix_flags["original_init_logit_loss"] is not False:
+if bool(mix_flags["branch_only_output_loss"]) or bool(mix_flags["original_init_logit_loss"]):
     raise SystemExit("branch probes must exclude mix training")
 probe_b = states.loc[states["probe"] == "bias_recenter_output_loss"]
 median_bp = float(np.median(np.r_[probe_b["bp0_initial"].to_numpy(), probe_b["bpI_initial"].to_numpy()]))
