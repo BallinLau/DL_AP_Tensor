@@ -122,12 +122,16 @@ class PolicyValueModel(nn.Module):
         q_unit = self.q_head(h_q)
         return torch.clamp(b, min=0.0) * q_unit
 
-    def _policy_outputs(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _policy_logits(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         base_state, i, _ = self._split_state(firm_state)
         h_pi = self.policy_encoder(base_state)
-        bp0 = self.bp0_head(h_pi)
-        bpI = self.bpi_head(h_pi, i)
-        return bp0, bpI
+        bp0_logit = self.bp0_head.forward_logits(h_pi)
+        bpI_logit = self.bpi_head.forward_logits(h_pi, i)
+        return bp0_logit, bpI_logit
+
+    def _policy_outputs(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        bp0_logit, bpI_logit = self._policy_logits(firm_state)
+        return torch.sigmoid(bp0_logit), torch.sigmoid(bpI_logit)
     
     def extract_base_state(self, firm_state: torch.Tensor) -> torch.Tensor:
         """提取 base state（不含 i）"""
@@ -144,6 +148,10 @@ class PolicyValueModel(nn.Module):
         internal i-grid used by cal_phats().
         """
         return self._policy_outputs(firm_state)
+
+    def forward_policy_logits(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return pre-sigmoid bp0/bpI logits for policy diagnostics/training."""
+        return self._policy_logits(firm_state)
 
     def forward_equity(self, firm_state: torch.Tensor) -> Dict[str, torch.Tensor]:
         """

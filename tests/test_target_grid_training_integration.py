@@ -9,6 +9,11 @@ sys.path.append(str(ROOT))
 from config import Config  # noqa: E402
 from config.hyperparams import HyperParams  # noqa: E402
 from models.policy_value import PolicyValueModel  # noqa: E402
+from training.bp_policy_loss import (  # noqa: E402
+    compute_target_grid_policy_distillation_loss,
+    compute_target_grid_policy_logit_distillation_loss,
+    stable_logit_target,
+)
 from training.episode import Episode  # noqa: E402
 
 
@@ -109,6 +114,140 @@ def test_target_grid_loss_logs_mix_regret_and_freezes_target_gradients():
     ]
     assert online_grad and sum(online_grad) > 0.0
     assert all(p.grad is None for p in episode.firm_target.parameters())
+
+
+def test_target_grid_output_mode_matches_explicit_default():
+    device = torch.device("cpu")
+    Config.DEVICE = device
+    torch.manual_seed(123)
+    online = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8).to(device)
+    target = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8).to(device)
+    online_explicit = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8).to(device)
+    target_explicit = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8).to(device)
+    online_explicit.load_state_dict(online.state_dict())
+    target_explicit.load_state_dict(target.state_dict())
+
+    hp_default = _small_hyperparams()
+    hp_explicit = _small_hyperparams()
+    hp_explicit.bp_grid_policy_loss_space = "output"
+    episode_default = Episode(
+        models={"policy_value": online},
+        optimizers={"policy_value": torch.optim.Adam(online.parameters(), lr=1e-3)},
+        config=Config,
+        hyperparams=hp_default,
+        device=device,
+        firm_target=target,
+    )
+    episode_explicit = Episode(
+        models={"policy_value": online_explicit},
+        optimizers={"policy_value": torch.optim.Adam(online_explicit.parameters(), lr=1e-3)},
+        config=Config,
+        hyperparams=hp_explicit,
+        device=device,
+        firm_target=target_explicit,
+    )
+
+    batch = _batch(device)
+    loss_default = episode_default._compute_p0_loss(batch) + episode_default._compute_pi_loss(batch)
+    loss_explicit = episode_explicit._compute_p0_loss(batch) + episode_explicit._compute_pi_loss(batch)
+    torch.testing.assert_close(loss_default, loss_explicit, rtol=0, atol=0)
+    assert episode_explicit._latest_p0_terms["p0_grid_policy_loss_space_logit"] == 0.0
+
+
+def test_logit_target_clipping_and_saturated_gradient_recovery():
+    target = torch.tensor([[0.0], [0.4], [1.0]])
+    target_logit = stable_logit_target(target, eps=1e-4)
+    assert torch.isfinite(target_logit).all()
+
+    confidence = torch.ones(1, 1)
+    saturated_logit = torch.tensor([[-30.0]], requires_grad=True)
+    target_prob = torch.tensor([[0.4]])
+    output_loss, _, _ = compute_target_grid_policy_distillation_loss(
+        torch.sigmoid(saturated_logit),
+        target_prob,
+        confidence,
+        huber_delta=0.05,
+    )
+    output_loss.backward()
+    output_grad = abs(float(saturated_logit.grad.item()))
+
+    logit = torch.tensor([[-30.0]], requires_grad=True)
+    logit_loss, _, _, _ = compute_target_grid_policy_logit_distillation_loss(
+        logit,
+        target_prob,
+        confidence,
+        target_eps=1e-4,
+        huber_delta=1.0,
+    )
+    logit_loss.backward()
+    logit_grad = abs(float(logit.grad.item()))
+    assert logit_grad > output_grad * 1e8
+
+
+def test_forward_policy_logits_matches_policy_outputs():
+    device = torch.device("cpu")
+    model = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8).to(device)
+    parent_state = _batch(device)["parent"][:, :7]
+    bp0, bpI = model.forward_policy(parent_state)
+    bp0_logit, bpI_logit = model.forward_policy_logits(parent_state)
+    torch.testing.assert_close(bp0, torch.sigmoid(bp0_logit), rtol=0, atol=0)
+    torch.testing.assert_close(bpI, torch.sigmoid(bpI_logit), rtol=0, atol=0)
+
+
+def test_logit_target_grid_p0_uses_bp0_head_and_pi_keeps_mix_output_path():
+    device = torch.device("cpu")
+    Config.DEVICE = device
+    online = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8).to(device)
+    target = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8).to(device)
+    hp = _small_hyperparams()
+    hp.bp_grid_policy_loss_space = "logit"
+    episode = Episode(
+        models={"policy_value": online},
+        optimizers={"policy_value": torch.optim.Adam(online.parameters(), lr=1e-3)},
+        config=Config,
+        hyperparams=hp,
+        device=device,
+        firm_target=target,
+    )
+    batch = _batch(device)
+
+    online.zero_grad(set_to_none=True)
+    p0_loss = episode._compute_p0_loss(batch)
+    p0_loss.backward()
+    assert _module_grad_sum(online.bp0_head) > 0.0
+    assert _module_grad_sum(online.bpi_head) == 0.0
+    assert episode._latest_p0_terms["p0_grid_policy_loss_space_logit"] == 1.0
+    assert "p0_grid_bp_logit_mean" in episode._latest_p0_terms
+
+    online.zero_grad(set_to_none=True)
+    pi_loss = episode._compute_pi_loss(batch)
+    pi_loss.backward()
+    assert _module_grad_sum(online.bpi_head) > 0.0
+    assert _module_grad_sum(online.bp0_head) > 0.0
+    assert episode._latest_pi_terms["pi_grid_policy_loss_space_logit"] == 1.0
+    assert episode._latest_pi_terms["mix_grid_policy_loss"] > 0.0
+
+
+def test_invalid_logit_policy_config_fails_fast():
+    hp = _small_hyperparams()
+    hp.bp_grid_policy_loss_space = "bad"
+    episode = Episode.__new__(Episode)
+    episode.hyperparams = hp
+    try:
+        episode._bp_grid_policy_loss_space()
+    except ValueError as exc:
+        assert "bp_grid_policy_loss_space" in str(exc)
+    else:
+        raise AssertionError("invalid loss space should fail")
+
+    hp.bp_grid_policy_loss_space = "logit"
+    hp.pv_fixed_policy = True
+    try:
+        episode._bp_grid_policy_loss_space()
+    except ValueError as exc:
+        assert "pv_fixed_policy" in str(exc)
+    else:
+        raise AssertionError("logit mode with fixed policy should fail")
 
 
 def test_masked_grid_diagnostics_ignore_inactive_observations():

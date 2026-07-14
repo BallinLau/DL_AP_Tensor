@@ -329,6 +329,12 @@ class HyperParams:
     bp_grid_policy_huber_delta: float = 0.05
     bp_grid_policy_weight: float = 1.0
     bp_grid_mix_policy_weight: float = 1.0
+    # BP branch policy distillation space:
+    # - "output": legacy Huber(bp_pred, bp_grid_star)
+    # - "logit": Huber(bp_pred_logit, logit(bp_grid_star))
+    bp_grid_policy_loss_space: str = "output"
+    bp_grid_logit_target_eps: float = 1e-4
+    bp_grid_logit_huber_delta: float = 1.0
     # Downweight policy targets when the top-two grid values are nearly tied.
     bp_grid_margin_scale: float = 1e-3
     bp_grid_confidence_relative: bool = True

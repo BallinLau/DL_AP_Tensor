@@ -230,6 +230,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--bp-grid-policy-weight", type=float, default=None, help="Weight on bp policy distillation loss")
     parser.add_argument("--bp-grid-mix-policy-weight", type=float, default=None, help="Weight on simulation-action mixed bp distillation loss")
+    parser.add_argument(
+        "--bp-grid-policy-loss-space",
+        type=str.lower,
+        default=None,
+        choices=["output", "logit"],
+        help="BP branch target-grid distillation space: output probability or pre-sigmoid logit",
+    )
+    parser.add_argument("--bp-grid-logit-target-eps", type=float, default=None, help="Clipping eps for logit-space BP targets")
+    parser.add_argument("--bp-grid-logit-huber-delta", type=float, default=None, help="Huber delta for logit-space BP targets")
     parser.add_argument("--bp-grid-margin-scale", type=float, default=None, help="Top-two value margin scale for policy target confidence")
     parser.add_argument("--bp-grid-parent-chunk-size", type=int, default=None, help="Parent chunk size for bp-grid teacher")
     parser.add_argument("--bp-grid-candidate-chunk-size", type=int, default=None, help="Candidate bp chunk size for bp-grid teacher")
@@ -342,6 +351,12 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.bp_grid_policy_weight = args.bp_grid_policy_weight
     if args.bp_grid_mix_policy_weight is not None:
         hyperparams.bp_grid_mix_policy_weight = args.bp_grid_mix_policy_weight
+    if args.bp_grid_policy_loss_space is not None:
+        hyperparams.bp_grid_policy_loss_space = args.bp_grid_policy_loss_space
+    if args.bp_grid_logit_target_eps is not None:
+        hyperparams.bp_grid_logit_target_eps = float(args.bp_grid_logit_target_eps)
+    if args.bp_grid_logit_huber_delta is not None:
+        hyperparams.bp_grid_logit_huber_delta = float(args.bp_grid_logit_huber_delta)
     if args.bp_grid_margin_scale is not None:
         hyperparams.bp_grid_margin_scale = args.bp_grid_margin_scale
     if args.bp_grid_parent_chunk_size is not None:
@@ -359,6 +374,14 @@ def configure_hyperparams(args: argparse.Namespace):
     hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"
     hyperparams.pv_fixed_sdf = args.ablation_mode == "fixed_sdf"
     hyperparams.pv_fixed_policy = args.ablation_mode == "fixed_policy"
+    if str(getattr(hyperparams, "bp_grid_policy_loss_space", "output")).lower() not in {"output", "logit"}:
+        raise ValueError(f"Unknown bp_grid_policy_loss_space={hyperparams.bp_grid_policy_loss_space!r}")
+    if not 0.0 < float(getattr(hyperparams, "bp_grid_logit_target_eps", 1e-4)) < 0.5:
+        raise ValueError("bp_grid_logit_target_eps must be in (0, 0.5)")
+    if float(getattr(hyperparams, "bp_grid_logit_huber_delta", 1.0)) <= 0.0:
+        raise ValueError("bp_grid_logit_huber_delta must be positive")
+    if hyperparams.bp_grid_policy_loss_space == "logit" and hyperparams.pv_fixed_policy:
+        raise ValueError("bp_grid_policy_loss_space='logit' is incompatible with pv_fixed_policy=True.")
     if args.max_firm_train_units is not None:
         hyperparams.max_firm_train_units = args.max_firm_train_units
     if args.pv_fixed_sdf_value is not None:

@@ -40,6 +40,7 @@ from .sdf_shock_bank import (
 )
 from .bp_grid_teacher import BPGridTeacher
 from .bp_policy_loss import (
+    compute_target_grid_policy_logit_distillation_loss,
     compute_target_grid_policy_distillation_loss,
     huber_element,
 )
@@ -551,6 +552,22 @@ class Episode:
 
     def _pv_use_fixed_policy(self) -> bool:
         return bool(getattr(self.hyperparams, "pv_fixed_policy", False)) or self._ablation_mode() == "fixed_policy"
+
+    def _bp_grid_policy_loss_space(self) -> str:
+        space = str(getattr(self.hyperparams, "bp_grid_policy_loss_space", "output")).lower()
+        if space not in {"output", "logit"}:
+            raise ValueError(f"Unknown bp_grid_policy_loss_space={space!r}")
+        eps = float(getattr(self.hyperparams, "bp_grid_logit_target_eps", 1e-4))
+        if not 0.0 < eps < 0.5:
+            raise ValueError(f"bp_grid_logit_target_eps must be in (0, 0.5), got {eps}")
+        delta = float(getattr(self.hyperparams, "bp_grid_logit_huber_delta", 1.0))
+        if delta <= 0.0:
+            raise ValueError(f"bp_grid_logit_huber_delta must be positive, got {delta}")
+        if space == "logit" and self._pv_use_fixed_policy():
+            raise ValueError(
+                "bp_grid_policy_loss_space='logit' is incompatible with pv_fixed_policy=True."
+            )
+        return space
 
     def _apply_policy_ablation(self, bp: torch.Tensor, parent_b: torch.Tensor) -> torch.Tensor:
         if not self._pv_use_fixed_policy():
@@ -3600,6 +3617,7 @@ class Episode:
         m_lo: float,
         m_hi: float,
         loss_fn,
+        bp_logit_pred: Optional[torch.Tensor] = None,
         mix_weight: Optional[torch.Tensor] = None,
         bp_mix_pred: Optional[torch.Tensor] = None,
         mix_policy_sample_weight: Optional[torch.Tensor] = None,
@@ -3623,6 +3641,7 @@ class Episode:
         value_delta = float(getattr(self.hyperparams, "bp_grid_value_huber_delta", 1.0))
         policy_delta = float(getattr(self.hyperparams, "bp_grid_policy_huber_delta", 0.05))
         policy_weight = float(getattr(self.hyperparams, "bp_grid_policy_weight", 1.0))
+        policy_loss_space = self._bp_grid_policy_loss_space()
 
         value_loss_elem = self._huber_element(value_pred, grid["value_star"], value_delta)
         value_loss = value_loss_elem.mean()
@@ -3633,13 +3652,27 @@ class Episode:
             loss_fn.beta_z,
             loss_fn.z0,
         )
-        policy_total, policy_loss, policy_loss_elem = compute_target_grid_policy_distillation_loss(
-            bp_pred,
-            grid["bp_star"],
-            grid["confidence"],
-            huber_delta=policy_delta,
-            branch_weight=policy_weight,
-        )
+        if policy_loss_space == "output":
+            policy_total, policy_loss, policy_loss_elem = compute_target_grid_policy_distillation_loss(
+                bp_pred,
+                grid["bp_star"],
+                grid["confidence"],
+                huber_delta=policy_delta,
+                branch_weight=policy_weight,
+            )
+        else:
+            if bp_logit_pred is None:
+                raise RuntimeError("Logit-space BP supervision requires bp_logit_pred.")
+            logit_eps = float(getattr(self.hyperparams, "bp_grid_logit_target_eps", 1e-4))
+            logit_delta = float(getattr(self.hyperparams, "bp_grid_logit_huber_delta", 1.0))
+            policy_total, policy_loss, policy_loss_elem, _ = compute_target_grid_policy_logit_distillation_loss(
+                bp_logit_pred,
+                grid["bp_star"],
+                grid["confidence"],
+                target_eps=logit_eps,
+                huber_delta=logit_delta,
+                branch_weight=policy_weight,
+            )
         total_loss = value_loss + penalty_z + policy_total
 
         extra_terms: Dict[str, float] = {}
@@ -3698,6 +3731,23 @@ class Episode:
                 value_loss,
                 penalty_z,
                 extra_terms=extra_terms,
+            )
+            terms.update(
+                {
+                    f'{prefix}_grid_policy_loss_space_logit': float(policy_loss_space == "logit"),
+                    f'{prefix}_grid_policy_training_loss': float(policy_loss.detach().item()),
+                    f'{prefix}_grid_bp_logit_mean': float(
+                        bp_logit_pred.detach().mean().item()
+                        if bp_logit_pred is not None
+                        else 0.0
+                    ),
+                    f'{prefix}_grid_bp_saturation_low_share': float(
+                        (bp_pred.detach() < 1e-6).to(torch.float32).mean().item()
+                    ),
+                    f'{prefix}_grid_bp_saturation_high_share': float(
+                        (bp_pred.detach() > 1.0 - 1e-6).to(torch.float32).mean().item()
+                    ),
+                }
             )
             terms.update(self._m_diagnostics(prefix, raw_m, use_m, m_lo, m_hi))
             if branch == 'p0':
@@ -3814,6 +3864,12 @@ class Episode:
         # P0 分支使用不投资场景的杠杆候选 bp0
         b_parent = parent_state[:, 0:1]
         eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
+        bp0_logit_t = None
+        if self._pv_use_target_grid_bp() and not self._policy_value_bellman_only():
+            if self._bp_grid_policy_loss_space() == "logit":
+                bp0_logit_t, bpI_logit_t = model.forward_policy_logits(parent_state)
+                bp0_t = torch.sigmoid(bp0_logit_t)
+                bpI_t = torch.sigmoid(bpI_logit_t)
         bp_for_p0 = self._apply_policy_ablation(bp0_t, b_parent)
 
         if self._pv_use_target_grid_bp() and not self._policy_value_bellman_only():
@@ -3825,6 +3881,7 @@ class Episode:
                 target_model=target_model,
                 value_pred=_get_out(output_t, 'P0', 3),
                 bp_pred=bp_for_p0,
+                bp_logit_pred=bp0_logit_t,
                 m_list=M_list,
                 raw_m_list=raw_M_list,
                 m_lo=m_lo,
@@ -4040,6 +4097,12 @@ class Episode:
         # PI 分支使用投资场景的杠杆候选 bpI
         b_parent = parent_state[:, 0:1]
         eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
+        bpI_logit_t = None
+        if self._pv_use_target_grid_bp() and not self._policy_value_bellman_only():
+            if self._bp_grid_policy_loss_space() == "logit":
+                bp0_logit_t, bpI_logit_t = model.forward_policy_logits(parent_state)
+                bp0_t = torch.sigmoid(bp0_logit_t)
+                bpI_t = torch.sigmoid(bpI_logit_t)
         bp_for_pi = self._apply_policy_ablation(bpI_t, b_parent)
 
         if self._pv_use_target_grid_bp() and not self._policy_value_bellman_only():
@@ -4074,6 +4137,7 @@ class Episode:
                 target_model=target_model,
                 value_pred=_get_out(output_t, 'PI', 4),
                 bp_pred=bp_for_pi,
+                bp_logit_pred=bpI_logit_t,
                 m_list=M_list,
                 raw_m_list=raw_M_list,
                 m_lo=m_lo,
