@@ -227,3 +227,110 @@ def test_staged_failure_does_not_update_firm_target():
 
     assert result["metadata"]["policy_value_stage_status"] == "failed_pq"
     assert episode._state_dict_hash(episode.firm_target) == before
+
+
+def _patch_stage_loss(episode: Episode, param: torch.nn.Parameter):
+    def _loss(batch, *, component_mode, policy_loss_terms):
+        scale = float(batch.get("scale", 1.0))
+        total = param.sum() * scale
+        return total, {"total": float(total.detach().item())}
+
+    episode._compute_policy_value_component_loss = _loss
+
+
+def test_pq_rejected_epoch_rolls_back_model_state():
+    episode = _episode()
+    param = episode._policy_value_stage_params("pq")[0]
+    _patch_stage_loss(episode, param)
+    episode._evaluate_policy_value_component_score = lambda *args, **kwargs: (1.0, {"total": 1.0})
+    episode.hyperparams.pv_grad_hard_threshold = 100.0
+    episode.hyperparams.pv_epoch_max_skip_ratio = 0.4
+    before = episode._state_dict_hash(episode.models["policy_value"])
+
+    summary = episode._run_policy_value_evaluation_stage(
+        [{"scale": 1.0}, {"scale": 1_000.0}],
+        [{"scale": 1.0}],
+        episode.firm_target,
+        n_epochs=1,
+    )
+
+    assert summary["status"] == "failed_no_valid_checkpoint"
+    assert summary["optimizer_steps"] == 1
+    assert summary["accepted_epochs"] == 0
+    assert episode._state_dict_hash(episode.models["policy_value"]) == before
+
+
+def test_pq_stage_failure_rolls_back_online_model():
+    episode = _episode()
+    param = episode._policy_value_stage_params("pq")[0]
+    _patch_stage_loss(episode, param)
+    episode._evaluate_policy_value_component_score = lambda *args, **kwargs: (float("nan"), {})
+    before = episode._state_dict_hash(episode.models["policy_value"])
+
+    summary = episode._run_policy_value_evaluation_stage(
+        [{"scale": 1.0}],
+        [{"scale": 1.0}],
+        episode.firm_target,
+        n_epochs=1,
+    )
+
+    assert summary["status"] == "failed_no_valid_checkpoint"
+    assert summary["optimizer_steps"] == 1
+    assert episode._state_dict_hash(episode.models["policy_value"]) == before
+
+
+def test_bp_rejected_epoch_rolls_back_bp_heads():
+    episode = _episode()
+    bp_params = episode._policy_value_stage_params("bp")
+    param = bp_params[0]
+    calls = iter([1.0, 1_000.0])
+
+    def _loss(_item):
+        scale = next(calls)
+        total = param.sum() * scale
+        return total, {"total": float(total.detach().item())}
+
+    episode._compute_bp_cache_loss = _loss
+    episode._evaluate_bp_cache_score = lambda *args, **kwargs: (1.0, {"total": 1.0})
+    episode._bp_cache_hash = lambda _cache: "fixed-cache"
+    episode.hyperparams.pv_grad_hard_threshold = 100.0
+    episode.hyperparams.pv_epoch_max_skip_ratio = 0.4
+    before = episode._state_dict_hash(episode.models["policy_value"])
+
+    summary = episode._run_bp_distillation_stage(
+        [{"batch": 0}, {"batch": 1}],
+        [{"batch": 2}],
+        episode.firm_target,
+        n_epochs=1,
+    )
+
+    assert summary["status"] == "failed_no_valid_checkpoint"
+    assert summary["optimizer_steps"] == 1
+    assert summary["accepted_epochs"] == 0
+    assert episode._state_dict_hash(episode.models["policy_value"]) == before
+
+
+def test_staged_bp_failure_rolls_back_full_online_model_and_target():
+    episode = _episode()
+    batch = _batch(episode.device)
+    before_online = episode._state_dict_hash(episode.models["policy_value"])
+    before_target = episode._state_dict_hash(episode.firm_target)
+
+    def _failed_bp(*args, **kwargs):
+        # Mutate online model to prove staged-flow failure restores atomically.
+        with torch.no_grad():
+            next(episode.models["policy_value"].parameters()).add_(1.0)
+        return {"status": "failed_no_valid_checkpoint", "optimizer_steps": 1}
+
+    episode._run_bp_distillation_stage = _failed_bp
+
+    result = episode._run_policy_value_staged(
+        pv_train_batches=[batch],
+        validation_batches=[batch],
+        n_epochs=1,
+    )
+
+    assert result["metadata"]["policy_value_stage_status"] == "failed_bp"
+    assert result["metadata"]["firm_target_stage_update"]["firm_target_update_count"] == 0
+    assert episode._state_dict_hash(episode.models["policy_value"]) == before_online
+    assert episode._state_dict_hash(episode.firm_target) == before_target

@@ -6195,6 +6195,7 @@ class Episode:
                 "target_update_count": 0,
             }
         optimizer = self._make_policy_value_stage_optimizer(params)
+        stage_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
         teacher_hash_before = self._state_dict_hash(teacher)
         previous_teacher = getattr(self, "_policy_value_stage_target_model", None)
         self._policy_value_stage_target_model = teacher
@@ -6216,6 +6217,7 @@ class Episode:
             model.train()
             with self._policy_value_train_scope("pq"):
                 for epoch in range(int(n_epochs)):
+                    epoch_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
                     epoch_optimizer_steps = 0
                     epoch_hard = 0
                     epoch_nonfinite = 0
@@ -6268,6 +6270,11 @@ class Episode:
                         float(epoch_hard + epoch_nonfinite) / float(max(epoch_total_batches, 1))
                     )
                     if epoch_optimizer_steps <= 0:
+                        self._restore_policy_value_stage_checkpoint(
+                            optimizer,
+                            epoch_start_checkpoint,
+                            None,
+                        )
                         rejected_epochs += 1
                         epoch_summaries.append({
                             "epoch": epoch + 1,
@@ -6277,6 +6284,11 @@ class Episode:
                         })
                         continue
                     if skip_ratio > max_skip_ratio:
+                        self._restore_policy_value_stage_checkpoint(
+                            optimizer,
+                            epoch_start_checkpoint,
+                            None,
+                        )
                         rejected_epochs += 1
                         epoch_summaries.append({
                             "epoch": epoch + 1,
@@ -6290,6 +6302,11 @@ class Episode:
                         teacher,
                     )
                     if not np.isfinite(score):
+                        self._restore_policy_value_stage_checkpoint(
+                            optimizer,
+                            epoch_start_checkpoint,
+                            None,
+                        )
                         rejected_epochs += 1
                         epoch_summaries.append({
                             "epoch": epoch + 1,
@@ -6331,6 +6348,12 @@ class Episode:
             status = "failed_no_valid_checkpoint"
         else:
             status = "accepted"
+        if status != "accepted":
+            self._restore_policy_value_stage_checkpoint(
+                optimizer,
+                stage_start_checkpoint,
+                None,
+            )
         return {
             "status": status,
             "epochs_requested": int(n_epochs),
@@ -6606,6 +6629,7 @@ class Episode:
                 "validation_cache_hash": val_hash_before,
             }
         optimizer = self._make_policy_value_stage_optimizer(params)
+        stage_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
         patience = max(0, int(getattr(self.hyperparams, "bp_distill_patience", 3)))
         min_delta = float(getattr(self.hyperparams, "bp_distill_min_delta", 1e-4))
         best_score = float("inf")
@@ -6630,6 +6654,7 @@ class Episode:
             model.train()
             with self._policy_value_train_scope("bp"):
                 for epoch in range(int(n_epochs)):
+                    epoch_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
                     epoch_optimizer_steps = 0
                     epoch_hard = 0
                     epoch_nonfinite = 0
@@ -6671,6 +6696,11 @@ class Episode:
                         records.append(losses)
                     skip_ratio = float(epoch_hard + epoch_nonfinite) / float(max(epoch_total, 1))
                     if epoch_optimizer_steps <= 0:
+                        self._restore_policy_value_stage_checkpoint(
+                            optimizer,
+                            epoch_start_checkpoint,
+                            None,
+                        )
                         epoch_summaries.append({
                             "epoch": epoch + 1,
                             "accepted": False,
@@ -6679,6 +6709,11 @@ class Episode:
                         })
                         continue
                     if skip_ratio > max_skip_ratio:
+                        self._restore_policy_value_stage_checkpoint(
+                            optimizer,
+                            epoch_start_checkpoint,
+                            None,
+                        )
                         epoch_summaries.append({
                             "epoch": epoch + 1,
                             "accepted": False,
@@ -6701,6 +6736,11 @@ class Episode:
                         })
                         break
                     if not np.isfinite(score):
+                        self._restore_policy_value_stage_checkpoint(
+                            optimizer,
+                            epoch_start_checkpoint,
+                            None,
+                        )
                         epoch_summaries.append({
                             "epoch": epoch + 1,
                             "accepted": False,
@@ -6747,6 +6787,12 @@ class Episode:
             status = "failed_no_valid_checkpoint"
         else:
             status = "accepted"
+        if status not in {"accepted", "skipped_no_active_refinancing"}:
+            self._restore_policy_value_stage_checkpoint(
+                optimizer,
+                stage_start_checkpoint,
+                None,
+            )
         return {
             "status": status,
             "epochs_requested": int(n_epochs),
@@ -6789,6 +6835,23 @@ class Episode:
         eval_epochs = getattr(self.hyperparams, "pv_eval_epochs", None)
         eval_epochs = int(n_epochs if eval_epochs is None else eval_epochs)
         bp_epochs = int(getattr(self.hyperparams, "bp_distill_epochs", 20))
+        online_stage_start_state = self._state_dict_to_cpu(self.models["policy_value"])
+        firm_stage_start_state = (
+            self._state_dict_to_cpu(self.firm_target)
+            if self.firm_target is not None
+            else None
+        )
+
+        def _restore_full_staged_start() -> None:
+            self._restore_module_state(
+                self.models["policy_value"],
+                online_stage_start_state,
+            )
+            if self.firm_target is not None and firm_stage_start_state is not None:
+                self._restore_module_state(self.firm_target, firm_stage_start_state)
+                self.firm_target.eval()
+                self.firm_target.requires_grad_(False)
+
         teacher_source = self.firm_target if self.firm_target is not None else self.models["policy_value"]
         episode_teacher = deepcopy(teacher_source).to(self.device)
         episode_teacher.eval()
@@ -6805,6 +6868,7 @@ class Episode:
             eval_epochs,
         )
         if pq_summary.get("status") != "accepted":
+            _restore_full_staged_start()
             self._last_policy_value_stage_summary = {
                 "policy_value_training_flow": "staged",
                 "policy_value_stage_status": "failed_pq",
@@ -6831,6 +6895,8 @@ class Episode:
             pq_summary.get("status") == "accepted"
             and bp_summary.get("status") in {"accepted", "skipped_no_active_refinancing"}
         )
+        if not stages_successful:
+            _restore_full_staged_start()
         target_update_count = 0
         if stages_successful and firm_mode == "stage_hard":
             self._update_firm_target_now("stage_hard")
