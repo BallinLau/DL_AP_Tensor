@@ -283,8 +283,8 @@ def parse_args() -> argparse.Namespace:
         "--pv-mixture-budget-mode",
         type=str.lower,
         default=None,
-        choices=["fixed_total", "append_coverage"],
-        help="PV mixture budget mode; first formal implementation uses fixed_total.",
+        choices=["fixed_total"],
+        help="PV mixture budget mode; current formal implementation uses fixed_total.",
     )
     parser.add_argument(
         "--pv-mixture-sampling-mode",
@@ -306,6 +306,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Restore Python/NumPy/Torch/CUDA RNG state after building coverage Sample data.",
+    )
+    parser.add_argument(
+        "--pv-eta-resample-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable ETA active/inactive resampling for legacy PV batch construction.",
     )
     parser.add_argument(
         "--bp-grid-confidence-relative",
@@ -466,10 +472,12 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.pv_mixture_preserve_rng = bool(args.pv_mixture_preserve_rng)
     if not 0.0 <= float(getattr(hyperparams, "pv_mixture_ratio", 0.0)) <= 1.0:
         raise ValueError("pv_mixture_ratio must be in [0, 1].")
-    if str(getattr(hyperparams, "pv_mixture_budget_mode", "fixed_total")).lower() not in {"fixed_total", "append_coverage"}:
-        raise ValueError("pv_mixture_budget_mode must be fixed_total or append_coverage.")
+    if str(getattr(hyperparams, "pv_mixture_budget_mode", "fixed_total")).lower() != "fixed_total":
+        raise ValueError("pv_mixture_budget_mode must be fixed_total.")
     if int(getattr(hyperparams, "pv_mixture_coverage_group_size", 2)) <= 0:
         raise ValueError("pv_mixture_coverage_group_size must be positive.")
+    if args.pv_eta_resample_enabled is not None:
+        hyperparams.pv_eta_resample_enabled = bool(args.pv_eta_resample_enabled)
     if args.firm_target_update is not None:
         hyperparams.firm_target_update = args.firm_target_update
     hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"
@@ -670,6 +678,7 @@ def main():
                     "pv_mixture_sampling_mode": hyperparams.pv_mixture_sampling_mode,
                     "pv_mixture_coverage_group_size": hyperparams.pv_mixture_coverage_group_size,
                     "pv_mixture_seed": hyperparams.pv_mixture_seed,
+                    "pv_eta_resample_enabled": hyperparams.pv_eta_resample_enabled,
                     "pv_rollback_on_soft_spikes": hyperparams.pv_rollback_on_soft_spikes,
                     "firm_target_update": hyperparams.firm_target_update,
                     "modeb_resimulate_after_pv": args.modeb_resimulate_after_pv,

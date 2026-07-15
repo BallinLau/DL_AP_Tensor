@@ -49,7 +49,9 @@ from .bp_policy_loss import (
 )
 from .pv_mixture import (
     PVParentGroupPool,
-    build_fixed_total_mixture_split,
+    build_selected_mixture_split,
+    fixed_total_source_counts,
+    sample_pool_without_replacement,
     select_parent_groups,
 )
 from .target_utils import hard_update, soft_update
@@ -1561,7 +1563,53 @@ class Episode:
             col = data[:, idx]
             stats[f"{prefix}_{name}_mean"] = float(col.mean().item())
             stats[f"{prefix}_{name}_std"] = float(col.std(unbiased=False).item()) if col.numel() > 1 else 0.0
+        if pool.parent.shape[1] > 7:
+            stats.update(Episode._tensor_distribution_stats(f"{prefix}_parent_M", pool.parent[:, 7]))
+        for child_idx, child in enumerate(pool.children):
+            if child.shape[1] > 7:
+                stats.update(Episode._tensor_distribution_stats(f"{prefix}_child{child_idx}_M", child[:, 7]))
+        if pool.children and pool.children[0].shape[1] > 7:
+            child_m = torch.cat([child[:, 7].reshape(-1) for child in pool.children if child.shape[1] > 7], dim=0)
+            stats.update(Episode._tensor_distribution_stats(f"{prefix}_child_all_M", child_m))
         return stats
+
+    @staticmethod
+    def _tensor_distribution_stats(prefix: str, tensor: torch.Tensor) -> Dict[str, float]:
+        values = tensor.detach().reshape(-1).float().cpu()
+        finite = torch.isfinite(values)
+        stats: Dict[str, float] = {
+            f"{prefix}_finite_ratio": float(finite.float().mean().item()) if values.numel() else 0.0,
+        }
+        finite_values = values[finite]
+        if finite_values.numel() == 0:
+            for key in ["mean", "std", "p01", "p10", "p50", "p90", "p99", "min", "max"]:
+                stats[f"{prefix}_{key}"] = float("nan")
+            return stats
+        qs = torch.quantile(
+            finite_values,
+            torch.tensor([0.01, 0.10, 0.50, 0.90, 0.99], dtype=finite_values.dtype),
+        )
+        stats.update({
+            f"{prefix}_mean": float(finite_values.mean().item()),
+            f"{prefix}_std": float(finite_values.std(unbiased=False).item()) if finite_values.numel() > 1 else 0.0,
+            f"{prefix}_p01": float(qs[0].item()),
+            f"{prefix}_p10": float(qs[1].item()),
+            f"{prefix}_p50": float(qs[2].item()),
+            f"{prefix}_p90": float(qs[3].item()),
+            f"{prefix}_p99": float(qs[4].item()),
+            f"{prefix}_min": float(finite_values.min().item()),
+            f"{prefix}_max": float(finite_values.max().item()),
+        })
+        return stats
+
+    @staticmethod
+    def _empty_pool_like(pool: PVParentGroupPool, source_id: int) -> PVParentGroupPool:
+        return PVParentGroupPool(
+            parent=pool.parent[:0],
+            children=[child[:0] for child in pool.children],
+            source_id=torch.empty(0, device=pool.parent.device, dtype=torch.long).fill_(int(source_id)),
+            source_index=torch.empty(0, device=pool.parent.device, dtype=torch.long),
+        )
 
     def _pv_mixture_enabled_for_episode(self) -> Tuple[bool, str]:
         hp = self.hyperparams
@@ -1634,37 +1682,59 @@ class Episode:
         if not 0.0 <= ratio <= 1.0:
             raise ValueError(f"pv_mixture_ratio must be in [0, 1], got {ratio}.")
         budget_mode = str(getattr(hp, "pv_mixture_budget_mode", "fixed_total")).lower()
-        if budget_mode not in {"fixed_total", "append_coverage"}:
+        if budget_mode not in {"fixed_total"}:
             raise ValueError(f"Unknown pv_mixture_budget_mode={budget_mode!r}.")
-        if budget_mode != "fixed_total":
-            raise NotImplementedError("pv_mixture_budget_mode='append_coverage' is reserved for a later experiment.")
+
+        n_available = len(sim_pool)
+        max_units = int(getattr(hp, "max_firm_train_units", 0))
+        n_total = min(n_available, max_units) if max_units > 0 else n_available
+        n_sim, n_coverage = fixed_total_source_counts(n_total, ratio)
+        summary.update({
+            "sim_parent_groups_available": float(n_available),
+            "max_firm_train_units": float(max_units),
+            "total_parent_budget": float(n_total),
+            "eta_resample_enabled": bool(getattr(hp, "pv_eta_resample_enabled", True)),
+        })
 
         rng_state = self._capture_rng_state() if bool(getattr(hp, "pv_mixture_preserve_rng", True)) else None
         seed = int(getattr(hp, "pv_mixture_seed", 24680)) + int(self.episode_id) * 100003
         generator = torch.Generator(device="cpu")
         generator.manual_seed(seed)
         try:
-            if rng_state is not None:
-                random.seed(seed)
-                np.random.seed(seed % (2 ** 32 - 1))
-                torch.manual_seed(seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(seed)
-            coverage_pool = self._build_pv_coverage_pool(len(sim_pool), n_branches=n_branches)
+            random.seed(seed)
+            np.random.seed(seed % (2 ** 32 - 1))
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            coverage_pool = (
+                self._build_pv_coverage_pool(n_coverage, n_branches=n_branches)
+                if n_coverage > 0
+                else self._empty_pool_like(sim_pool, source_id=1)
+            )
         finally:
             if rng_state is not None:
                 self._restore_rng_state(rng_state)
-        if coverage_pool is None or len(coverage_pool) == 0:
+        if coverage_pool is None:
             raise RuntimeError("PV mixture coverage Sample produced no parent groups.")
+        if len(coverage_pool) < n_coverage:
+            raise RuntimeError(
+                f"PV mixture coverage Sample produced {len(coverage_pool)} parent groups; "
+                f"needed {n_coverage}."
+            )
+
+        sim_selected = sample_pool_without_replacement(sim_pool, n_sim, generator)
+        coverage_selected = sample_pool_without_replacement(coverage_pool, n_coverage, generator)
 
         val_fraction = float(getattr(hp, "pv_target_grid_val_fraction", 0.10))
-        train_pool, val_pool, mix_summary = build_fixed_total_mixture_split(
-            sim_pool=sim_pool,
-            coverage_pool=coverage_pool,
-            coverage_ratio=ratio,
+        train_pool, val_pool, mix_summary = build_selected_mixture_split(
+            sim_selected=sim_selected,
+            coverage_selected=coverage_selected,
             val_fraction=val_fraction,
             generator=generator,
             stratified_validation=bool(getattr(hp, "pv_mixture_stratified_validation", True)),
+            sim_parent_groups_available=n_available,
+            coverage_parent_groups_available=len(coverage_pool),
+            total_parent_budget=n_total,
         )
         train_pool = self._shuffle_pool(train_pool, generator)
         val_pool = self._shuffle_pool(val_pool, generator)
@@ -6679,6 +6749,10 @@ class Episode:
                 item["mix_confidence"],
                 item["mix_sample_weight"],
             ])
+            for key in ("source_id", "source_index"):
+                value = item.get(key)
+                if value is not None:
+                    tensors.append(value)
         return self._tensor_list_hash(tensors)
 
     @staticmethod

@@ -151,3 +151,50 @@ def build_fixed_total_mixture_split(
         "actual_coverage_ratio": float(n_coverage / max(n_sim + n_coverage, 1)),
     }
     return train_pool, val_pool, summary
+
+
+def build_selected_mixture_split(
+    sim_selected: PVParentGroupPool,
+    coverage_selected: PVParentGroupPool,
+    val_fraction: float,
+    generator: torch.Generator,
+    stratified_validation: bool = True,
+    *,
+    sim_parent_groups_available: int,
+    coverage_parent_groups_available: int,
+    total_parent_budget: int,
+) -> Tuple[PVParentGroupPool, PVParentGroupPool, Dict[str, float]]:
+    if stratified_validation:
+        sim_train, sim_val = split_pool(sim_selected, val_fraction, generator)
+        cov_train, cov_val = split_pool(coverage_selected, val_fraction, generator)
+        train_pool = concat_parent_group_pools([sim_train, cov_train])
+        val_pools = [pool for pool in [sim_val, cov_val] if len(pool) > 0]
+        val_pool = (
+            concat_parent_group_pools(val_pools)
+            if val_pools
+            else select_parent_groups(train_pool, torch.empty(0, dtype=torch.long))
+        )
+    else:
+        combined = concat_parent_group_pools([sim_selected, coverage_selected])
+        train_pool, val_pool = split_pool(combined, val_fraction, generator)
+
+    train_counts = source_counts(train_pool)
+    val_counts = source_counts(val_pool)
+    n_sim = len(sim_selected)
+    n_coverage = len(coverage_selected)
+    summary: Dict[str, float] = {
+        "sim_parent_groups_available": float(sim_parent_groups_available),
+        "coverage_parent_groups_available": float(coverage_parent_groups_available),
+        "total_parent_budget": float(total_parent_budget),
+        "sim_parent_groups_selected": float(n_sim),
+        "coverage_parent_groups_selected": float(n_coverage),
+        "mixed_parent_groups_selected": float(n_sim + n_coverage),
+        "train_parent_groups": float(len(train_pool)),
+        "validation_parent_groups": float(len(val_pool)),
+        "train_sim_parent_groups": float(train_counts["source0"]),
+        "train_coverage_parent_groups": float(train_counts["source1"]),
+        "validation_sim_parent_groups": float(val_counts["source0"]),
+        "validation_coverage_parent_groups": float(val_counts["source1"]),
+        "actual_coverage_ratio": float(n_coverage / max(n_sim + n_coverage, 1)),
+    }
+    return train_pool, val_pool, summary
