@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, List, Tuple
 
 import torch
@@ -107,6 +108,78 @@ def split_pool(
     return select_parent_groups(pool, train_idx), select_parent_groups(pool, val_idx)
 
 
+def resolve_val_count(total: int, val_fraction: float) -> int:
+    if total <= 1:
+        return 0
+    val_fraction = min(max(float(val_fraction), 0.0), 0.5)
+    if val_fraction <= 0.0:
+        return 0
+    n_val = max(1, int(round(total * val_fraction)))
+    return min(n_val, total - 1)
+
+
+def allocate_source_val_counts(
+    source_sizes: List[int],
+    val_fraction: float,
+) -> List[int]:
+    total = int(sum(source_sizes))
+    target_total = resolve_val_count(total, val_fraction)
+    if target_total <= 0:
+        return [0 for _ in source_sizes]
+
+    ideals = [float(size) * float(val_fraction) for size in source_sizes]
+    counts = [
+        min(int(math.floor(ideal)), max(int(size) - 1, 0))
+        for size, ideal in zip(source_sizes, ideals)
+    ]
+    remaining = target_total - int(sum(counts))
+    order = sorted(
+        range(len(source_sizes)),
+        key=lambda idx: (ideals[idx] - math.floor(ideals[idx]), source_sizes[idx]),
+        reverse=True,
+    )
+    while remaining > 0:
+        progressed = False
+        for idx in order:
+            cap = max(int(source_sizes[idx]) - 1, 0)
+            if counts[idx] < cap:
+                counts[idx] += 1
+                remaining -= 1
+                progressed = True
+                if remaining == 0:
+                    break
+        if not progressed:
+            break
+    while remaining < 0:
+        progressed = False
+        for idx in reversed(order):
+            if counts[idx] > 0:
+                counts[idx] -= 1
+                remaining += 1
+                progressed = True
+                if remaining == 0:
+                    break
+        if not progressed:
+            break
+    return counts
+
+
+def split_pool_with_val_count(
+    pool: PVParentGroupPool,
+    n_val: int,
+    generator: torch.Generator,
+) -> Tuple[PVParentGroupPool, PVParentGroupPool]:
+    n_val = min(max(int(n_val), 0), max(len(pool) - 1, 0))
+    if len(pool) == 0:
+        return pool, pool
+    if n_val == 0:
+        return pool, select_parent_groups(pool, torch.empty(0, dtype=torch.long))
+    perm = torch.randperm(len(pool), generator=generator)
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+    return select_parent_groups(pool, train_idx), select_parent_groups(pool, val_idx)
+
+
 def build_fixed_total_mixture_split(
     sim_pool: PVParentGroupPool,
     coverage_pool: PVParentGroupPool,
@@ -125,8 +198,12 @@ def build_fixed_total_mixture_split(
     coverage_selected = sample_pool_without_replacement(coverage_pool, n_coverage, generator)
 
     if stratified_validation:
-        sim_train, sim_val = split_pool(sim_selected, val_fraction, generator)
-        cov_train, cov_val = split_pool(coverage_selected, val_fraction, generator)
+        sim_val_count, cov_val_count = allocate_source_val_counts(
+            [len(sim_selected), len(coverage_selected)],
+            val_fraction,
+        )
+        sim_train, sim_val = split_pool_with_val_count(sim_selected, sim_val_count, generator)
+        cov_train, cov_val = split_pool_with_val_count(coverage_selected, cov_val_count, generator)
         train_pool = concat_parent_group_pools([sim_train, cov_train])
         val_pools = [pool for pool in [sim_val, cov_val] if len(pool) > 0]
         val_pool = concat_parent_group_pools(val_pools) if val_pools else select_parent_groups(train_pool, torch.empty(0, dtype=torch.long))
@@ -148,6 +225,9 @@ def build_fixed_total_mixture_split(
         "train_coverage_parent_groups": float(train_counts["source1"]),
         "validation_sim_parent_groups": float(val_counts["source0"]),
         "validation_coverage_parent_groups": float(val_counts["source1"]),
+        "global_validation_target_parent_groups": float(resolve_val_count(n_sim + n_coverage, val_fraction)),
+        "allocated_sim_validation_parent_groups": float(sim_val_count if stratified_validation else val_counts["source0"]),
+        "allocated_coverage_validation_parent_groups": float(cov_val_count if stratified_validation else val_counts["source1"]),
         "actual_coverage_ratio": float(n_coverage / max(n_sim + n_coverage, 1)),
         "train_coverage_ratio": float(train_counts["source1"] / max(len(train_pool), 1)),
         "validation_coverage_ratio": float(val_counts["source1"] / max(len(val_pool), 1)),
@@ -167,8 +247,12 @@ def build_selected_mixture_split(
     total_parent_budget: int,
 ) -> Tuple[PVParentGroupPool, PVParentGroupPool, Dict[str, float]]:
     if stratified_validation:
-        sim_train, sim_val = split_pool(sim_selected, val_fraction, generator)
-        cov_train, cov_val = split_pool(coverage_selected, val_fraction, generator)
+        sim_val_count, cov_val_count = allocate_source_val_counts(
+            [len(sim_selected), len(coverage_selected)],
+            val_fraction,
+        )
+        sim_train, sim_val = split_pool_with_val_count(sim_selected, sim_val_count, generator)
+        cov_train, cov_val = split_pool_with_val_count(coverage_selected, cov_val_count, generator)
         train_pool = concat_parent_group_pools([sim_train, cov_train])
         val_pools = [pool for pool in [sim_val, cov_val] if len(pool) > 0]
         val_pool = (
@@ -197,6 +281,9 @@ def build_selected_mixture_split(
         "train_coverage_parent_groups": float(train_counts["source1"]),
         "validation_sim_parent_groups": float(val_counts["source0"]),
         "validation_coverage_parent_groups": float(val_counts["source1"]),
+        "global_validation_target_parent_groups": float(resolve_val_count(n_sim + n_coverage, val_fraction)),
+        "allocated_sim_validation_parent_groups": float(sim_val_count if stratified_validation else val_counts["source0"]),
+        "allocated_coverage_validation_parent_groups": float(cov_val_count if stratified_validation else val_counts["source1"]),
         "actual_coverage_ratio": float(n_coverage / max(n_sim + n_coverage, 1)),
         "train_coverage_ratio": float(train_counts["source1"] / max(len(train_pool), 1)),
         "validation_coverage_ratio": float(val_counts["source1"] / max(len(val_pool), 1)),

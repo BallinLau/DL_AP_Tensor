@@ -14,7 +14,12 @@ from config.hyperparams import HyperParams  # noqa: E402
 from data.tensor_data import TensorTable  # noqa: E402
 from models.policy_value import PolicyValueModel  # noqa: E402
 from training.episode import Episode  # noqa: E402
-from training.pv_mixture import build_fixed_total_mixture_split  # noqa: E402
+from training.pv_mixture import (  # noqa: E402
+    allocate_source_val_counts,
+    build_fixed_total_mixture_split,
+    fixed_total_source_counts,
+    resolve_val_count,
+)
 
 
 def _episode(hp: HyperParams | None = None, episode_id: int = 1) -> Episode:
@@ -109,6 +114,10 @@ def _source_pairs(batches):
         for sid, sidx in zip(batch["source_id"].cpu().tolist(), batch["source_index"].cpu().tolist()):
             pairs.add((int(sid), int(sidx)))
     return pairs
+
+
+def _parent_count(batches):
+    return sum(int(batch["parent"].shape[0]) for batch in batches)
 
 
 def test_fixed_total_split_preserves_parent_budget_and_source_metadata():
@@ -284,6 +293,54 @@ def test_control_and_treatment_rng_parity():
     assert torch.equal(control_after[2], control_before[2])
     assert torch.equal(treatment_after[2], treatment_before[2])
     assert torch.equal(control_after[2], treatment_after[2])
+
+
+def test_control_and_treatment_exact_split_budget_and_batch_count():
+    sim_table = _firm_table(8)
+    coverage_pool = _episode(_hp_mixture(), episode_id=1)._tensor_to_parent_group_pool(
+        _firm_table(8, source_offset=100, value_offset=1.0),
+        source_id=1,
+    )
+
+    def _run(ratio):
+        hp = _hp_mixture()
+        hp.pv_mixture_ratio = ratio
+        hp.pv_target_grid_val_fraction = 0.25
+        episode = _episode(hp, episode_id=1)
+        if ratio > 0:
+            episode._build_pv_coverage_pool = lambda *args, **kwargs: coverage_pool
+        train, val, summary = episode._prepare_mixed_policy_value_batches(
+            sim_table,
+            batch_size=3,
+            n_branches=2,
+        )
+        return train, val, summary
+
+    control_train, control_val, control_summary = _run(0.0)
+    treatment_train, treatment_val, treatment_summary = _run(0.25)
+
+    assert _parent_count(control_train) == _parent_count(treatment_train) == 6
+    assert _parent_count(control_val) == _parent_count(treatment_val) == 2
+    assert len(control_train) == len(treatment_train)
+    assert len(control_val) == len(treatment_val)
+    assert control_summary["global_validation_target_parent_groups"] == 2.0
+    assert treatment_summary["global_validation_target_parent_groups"] == 2.0
+    assert treatment_summary["allocated_sim_validation_parent_groups"] + treatment_summary["allocated_coverage_validation_parent_groups"] == 2.0
+
+
+def test_validation_allocation_small_sample_boundaries():
+    for total in [4, 8, 10]:
+        for ratio in [0.0, 0.1, 0.2, 0.5, 1.0]:
+            for val_fraction in [0.0, 0.1, 0.25]:
+                n_sim, n_cov = fixed_total_source_counts(total, ratio)
+                sim_val, cov_val = allocate_source_val_counts([n_sim, n_cov], val_fraction)
+                target = resolve_val_count(total, val_fraction)
+                assert sim_val + cov_val == target
+                assert total - target + target == total
+                if n_sim > 0:
+                    assert n_sim - sim_val >= 1
+                if n_cov > 0:
+                    assert n_cov - cov_val >= 1
 
 
 def test_bp_target_cache_preserves_source_metadata(monkeypatch):
