@@ -6482,6 +6482,8 @@ class Episode:
             "bpi_active_count": 0.0,
             "mix_active_count": 0.0,
             "total_active_count": 0.0,
+            "total_active_supervision_entries": 0.0,
+            "unique_parent_active_count": 0.0,
         }
         for item in cache:
             bp0_weight = item["bp0_confidence"].detach().cpu()
@@ -6490,14 +6492,23 @@ class Episode:
                 item["mix_confidence"].detach().cpu()
                 * item["mix_sample_weight"].detach().cpu()
             )
-            counts["bp0_active_count"] += float((bp0_weight > 0).sum().item())
-            counts["bpi_active_count"] += float((bpi_weight > 0).sum().item())
-            counts["mix_active_count"] += float((mix_weight > 0).sum().item())
-        counts["total_active_count"] = (
+            bp0_active = bp0_weight > 0
+            bpi_active = bpi_weight > 0
+            mix_active = mix_weight > 0
+            counts["bp0_active_count"] += float(bp0_active.sum().item())
+            counts["bpi_active_count"] += float(bpi_active.sum().item())
+            counts["mix_active_count"] += float(mix_active.sum().item())
+            counts["unique_parent_active_count"] += float(
+                (bp0_active | bpi_active | mix_active).sum().item()
+            )
+        counts["total_active_supervision_entries"] = (
             counts["bp0_active_count"]
             + counts["bpi_active_count"]
             + counts["mix_active_count"]
         )
+        # Backward-compatible alias: this is an entry count, not a unique
+        # parent-state count.
+        counts["total_active_count"] = counts["total_active_supervision_entries"]
         return counts
 
     def _compute_bp_cache_loss(
@@ -6563,27 +6574,52 @@ class Episode:
         )
         total = bp0_total + bpi_total + mix_total
 
-        def _mae(pred: torch.Tensor, target: torch.Tensor, conf: torch.Tensor) -> Tuple[float, int]:
-            mask = conf > 0
+        def _mae_stats(
+            pred: torch.Tensor,
+            target: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> Dict[str, float]:
+            weight = weight.clamp_min(0.0)
+            mask = weight > 0
             n = int(mask.sum().item())
             if n == 0:
-                return float("nan"), 0
-            return float((pred[mask] - target[mask]).abs().mean().detach().item()), n
+                return {
+                    "mae": float("nan"),
+                    "active_n": 0.0,
+                    "abs_error_sum": 0.0,
+                    "weight_sum": 0.0,
+                }
+            abs_error = (pred - target).abs()
+            weighted_sum = (abs_error * weight).sum()
+            weight_sum = weight.sum()
+            return {
+                "mae": float((weighted_sum / weight_sum.clamp_min(1e-12)).detach().item()),
+                "active_n": float(n),
+                "abs_error_sum": float(weighted_sum.detach().item()),
+                "weight_sum": float(weight_sum.detach().item()),
+            }
 
-        bp0_mae, bp0_n = _mae(bp0, bp0_target, bp0_conf)
-        bpi_mae, bpi_n = _mae(bpi, bpi_target, bpi_conf)
-        mix_mae, mix_n = _mae(bp_mix, mix_target, mix_conf)
+        bp0_stats = _mae_stats(bp0, bp0_target, bp0_conf)
+        bpi_stats = _mae_stats(bpi, bpi_target, bpi_conf)
+        mix_validation_weight = mix_conf * mix_weight
+        mix_stats = _mae_stats(bp_mix, mix_target, mix_validation_weight)
         return total, {
             "total": float(total.detach().item()),
             "bp0_loss": float(bp0_loss.detach().item()),
             "bpi_loss": float(bpi_loss.detach().item()),
             "mix_loss": float(mix_loss.detach().item()),
-            "bp0_active_mae": bp0_mae,
-            "bpi_active_mae": bpi_mae,
-            "mix_active_mae": mix_mae,
-            "bp0_active_n": float(bp0_n),
-            "bpi_active_n": float(bpi_n),
-            "mix_active_n": float(mix_n),
+            "bp0_active_mae": bp0_stats["mae"],
+            "bpi_active_mae": bpi_stats["mae"],
+            "mix_active_mae": mix_stats["mae"],
+            "bp0_active_n": bp0_stats["active_n"],
+            "bpi_active_n": bpi_stats["active_n"],
+            "mix_active_n": mix_stats["active_n"],
+            "bp0_abs_error_sum": bp0_stats["abs_error_sum"],
+            "bpi_abs_error_sum": bpi_stats["abs_error_sum"],
+            "mix_abs_error_sum": mix_stats["abs_error_sum"],
+            "bp0_weight_sum": bp0_stats["weight_sum"],
+            "bpi_weight_sum": bpi_stats["weight_sum"],
+            "mix_weight_sum": mix_stats["weight_sum"],
             "bp0_prediction_std": float(bp0.detach().std(unbiased=False).item()),
             "bpi_prediction_std": float(bpi.detach().std(unbiased=False).item()),
             "mix_prediction_std": float(bp_mix.detach().std(unbiased=False).item()),
@@ -6604,17 +6640,27 @@ class Episode:
         finally:
             model.train(was_training)
         avg, meta = self._aggregate_metric_records(records)
-        active_maes = [
-            value for key, value in avg.items()
-            if key.endswith("_active_mae") and np.isfinite(value)
-        ]
-        active_counts = [
-            value for key, value in avg.items()
-            if key.endswith("_active_n") and value > 0
-        ]
-        if not active_counts:
+        global_maes: Dict[str, float] = {}
+        active_weight_sums: List[float] = []
+        for prefix in ("bp0", "bpi", "mix"):
+            abs_sum = float(sum(record.get(f"{prefix}_abs_error_sum", 0.0) for record in records))
+            weight_sum = float(sum(record.get(f"{prefix}_weight_sum", 0.0) for record in records))
+            active_n = float(sum(record.get(f"{prefix}_active_n", 0.0) for record in records))
+            avg[f"{prefix}_abs_error_sum"] = abs_sum
+            avg[f"{prefix}_weight_sum"] = weight_sum
+            avg[f"{prefix}_active_n"] = active_n
+            if weight_sum > 0.0:
+                global_mae = abs_sum / weight_sum
+                avg[f"{prefix}_active_mae"] = global_mae
+                avg[f"{prefix}_global_weighted_mae"] = global_mae
+                global_maes[prefix] = global_mae
+                active_weight_sums.append(weight_sum)
+            else:
+                avg[f"{prefix}_active_mae"] = float("nan")
+                avg[f"{prefix}_global_weighted_mae"] = float("nan")
+        if not active_weight_sums:
             return float("inf"), {**avg, **meta, "status": "skipped_no_active_refinancing"}
-        score = max(active_maes) if active_maes else float("inf")
+        score = max(global_maes.values()) if global_maes else float("inf")
         return float(score), {**avg, **meta, "validation_batches": len(cache)}
 
     def _run_bp_distillation_stage(

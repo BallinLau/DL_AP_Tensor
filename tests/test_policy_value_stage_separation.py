@@ -163,6 +163,7 @@ def test_bp_stage_uses_fixed_cache_and_keeps_non_bp_params_fixed():
     assert summary["bp_distill_step_count"] > 0
     assert summary["validation_source"] == "holdout"
     assert summary["validation_informative"] is True
+    assert summary["train_active_counts"]["total_active_supervision_entries"] >= summary["train_active_counts"]["unique_parent_active_count"]
 
 
 def test_staged_zero_epoch_statuses():
@@ -230,6 +231,69 @@ def test_bp_train_without_active_states_skips_stage():
     assert summary["train_active_count"] == 0
     assert summary["validation_active_count"] > 0
     assert summary["optimizer_steps"] == 0
+
+
+def test_bp_cache_active_counts_reports_entries_and_unique_parents():
+    episode = _episode()
+    parent = torch.zeros(2, 7)
+    cache = [{
+        "parent": parent,
+        "bp0_target": torch.zeros(2, 1),
+        "bpi_target": torch.zeros(2, 1),
+        "mix_target": torch.zeros(2, 1),
+        "bp0_confidence": torch.tensor([[1.0], [0.0]]),
+        "bpi_confidence": torch.tensor([[1.0], [0.0]]),
+        "mix_confidence": torch.tensor([[1.0], [0.0]]),
+        "mix_sample_weight": torch.tensor([[1.0], [0.0]]),
+    }]
+
+    counts = episode._bp_cache_active_counts(cache)
+
+    assert counts["bp0_active_count"] == 1
+    assert counts["bpi_active_count"] == 1
+    assert counts["mix_active_count"] == 1
+    assert counts["total_active_supervision_entries"] == 3
+    assert counts["total_active_count"] == 3
+    assert counts["unique_parent_active_count"] == 1
+
+
+def test_bp_validation_score_uses_global_weighted_mae_not_batch_average():
+    episode = _episode()
+    records = iter([
+        {
+            "total": 0.0,
+            "bp0_abs_error_sum": 100.0,
+            "bp0_weight_sum": 100.0,
+            "bp0_active_n": 100.0,
+            "bpi_abs_error_sum": 0.0,
+            "bpi_weight_sum": 0.0,
+            "bpi_active_n": 0.0,
+            "mix_abs_error_sum": 0.0,
+            "mix_weight_sum": 0.0,
+            "mix_active_n": 0.0,
+        },
+        {
+            "total": 0.0,
+            "bp0_abs_error_sum": 0.0,
+            "bp0_weight_sum": 1.0,
+            "bp0_active_n": 1.0,
+            "bpi_abs_error_sum": 0.0,
+            "bpi_weight_sum": 0.0,
+            "bpi_active_n": 0.0,
+            "mix_abs_error_sum": 0.0,
+            "mix_weight_sum": 0.0,
+            "mix_active_n": 0.0,
+        },
+    ])
+    episode._compute_bp_cache_loss = lambda _item: (torch.tensor(0.0), next(records))
+
+    score, summary = episode._evaluate_bp_cache_score([{"batch": 0}, {"batch": 1}])
+
+    expected = 100.0 / 101.0
+    assert score == expected
+    assert summary["bp0_active_mae"] == expected
+    assert summary["bp0_global_weighted_mae"] == expected
+    assert summary["bp0_active_n"] == 101.0
 
 
 def test_staged_training_restores_model_mode_after_eval_start():
