@@ -150,6 +150,16 @@ class HyperParams:
     pv_retry_lr_decay: float = 0.3
     pv_continue_after_degraded_stage: bool = True
     pv_max_consecutive_degraded_episodes: int = 3
+    pv_training_flow: str = "joint"
+    pv_eval_epochs: Optional[int] = None
+    bp_distill_epochs: int = 20
+    bp_distill_patience: int = 3
+    bp_distill_min_delta: float = 1e-4
+    pv_eval_grad_clip_norm: float = 10.0
+    bp_distill_grad_clip_norm: float = 10.0
+    pv_rollback_on_soft_spikes: bool = False
+    bp_label_cache_mode: str = "cpu"
+    bp_distill_trainable_scope: str = "heads_only"
     
     # NaN/Inf 检测
     nan_recovery: bool = True

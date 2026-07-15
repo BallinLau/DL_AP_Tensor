@@ -248,6 +248,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bp-grid-max-expanded-states", type=int, default=None, help="Max B*J states per bp-grid teacher forward chunk")
     parser.add_argument("--pv-target-grid-val-fraction", type=float, default=None, help="Tail batch fraction reserved for target-grid policy validation")
     parser.add_argument(
+        "--pv-training-flow",
+        type=str.lower,
+        default=None,
+        choices=["joint", "staged"],
+        help="Policy/value training flow: legacy joint or staged P/Q evaluation plus BP distillation",
+    )
+    parser.add_argument("--pv-eval-epochs", type=int, default=None, help="P/Q evaluation epochs for staged policy/value flow")
+    parser.add_argument("--bp-distill-epochs", type=int, default=None, help="BP distillation epochs for staged policy/value flow")
+    parser.add_argument("--bp-distill-patience", type=int, default=None, help="BP distillation early-stop patience")
+    parser.add_argument("--bp-distill-min-delta", type=float, default=None, help="BP distillation validation min delta")
+    parser.add_argument(
+        "--pv-rollback-on-soft-spikes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Allow consecutive finite soft gradient spikes to rollback a PV epoch",
+    )
+    parser.add_argument(
+        "--bp-distill-trainable-scope",
+        type=str.lower,
+        default=None,
+        choices=["heads_only", "policy_path"],
+        help="Trainable BP distillation parameter scope",
+    )
+    parser.add_argument(
         "--bp-grid-confidence-relative",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -257,7 +281,7 @@ def parse_args() -> argparse.Namespace:
         "--firm-target-update",
         type=str.lower,
         default=None,
-        choices=["soft", "hard", "epoch_hard", "epoch_soft", "none"],
+        choices=["soft", "hard", "epoch_hard", "epoch_soft", "stage_hard", "none"],
         help="Firm target update schedule",
     )
     parser.add_argument(
@@ -372,6 +396,20 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.bp_grid_confidence_relative = bool(args.bp_grid_confidence_relative)
     if args.pv_target_grid_val_fraction is not None:
         hyperparams.pv_target_grid_val_fraction = args.pv_target_grid_val_fraction
+    if args.pv_training_flow is not None:
+        hyperparams.pv_training_flow = args.pv_training_flow
+    if args.pv_eval_epochs is not None:
+        hyperparams.pv_eval_epochs = args.pv_eval_epochs
+    if args.bp_distill_epochs is not None:
+        hyperparams.bp_distill_epochs = args.bp_distill_epochs
+    if args.bp_distill_patience is not None:
+        hyperparams.bp_distill_patience = args.bp_distill_patience
+    if args.bp_distill_min_delta is not None:
+        hyperparams.bp_distill_min_delta = args.bp_distill_min_delta
+    if args.pv_rollback_on_soft_spikes is not None:
+        hyperparams.pv_rollback_on_soft_spikes = bool(args.pv_rollback_on_soft_spikes)
+    if args.bp_distill_trainable_scope is not None:
+        hyperparams.bp_distill_trainable_scope = args.bp_distill_trainable_scope
     if args.firm_target_update is not None:
         hyperparams.firm_target_update = args.firm_target_update
     hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"
@@ -385,6 +423,13 @@ def configure_hyperparams(args: argparse.Namespace):
         raise ValueError("bp_grid_logit_huber_delta must be positive")
     if hyperparams.bp_grid_policy_loss_space == "logit" and hyperparams.pv_fixed_policy:
         raise ValueError("bp_grid_policy_loss_space='logit' is incompatible with pv_fixed_policy=True.")
+    if str(getattr(hyperparams, "pv_training_flow", "joint")).lower() == "staged":
+        firm_mode = str(getattr(hyperparams, "firm_target_update", "epoch_hard")).lower()
+        if firm_mode not in {"stage_hard", "none"}:
+            raise ValueError(
+                "pv_training_flow='staged' requires --firm-target-update stage_hard or none; "
+                f"got {firm_mode!r}."
+            )
     if args.max_firm_train_units is not None:
         hyperparams.max_firm_train_units = args.max_firm_train_units
     if args.pv_fixed_sdf_value is not None:
@@ -554,6 +599,11 @@ def main():
                     "sdf_collapse_log_mean_error": hyperparams.sdf_collapse_log_mean_error,
                     "sdf_collapse_mean_ratio": hyperparams.sdf_collapse_mean_ratio,
                     "pv_bp_training_mode": hyperparams.pv_bp_training_mode,
+                    "pv_training_flow": hyperparams.pv_training_flow,
+                    "pv_eval_epochs": hyperparams.pv_eval_epochs,
+                    "bp_distill_epochs": hyperparams.bp_distill_epochs,
+                    "bp_distill_patience": hyperparams.bp_distill_patience,
+                    "pv_rollback_on_soft_spikes": hyperparams.pv_rollback_on_soft_spikes,
                     "firm_target_update": hyperparams.firm_target_update,
                     "modeb_resimulate_after_pv": args.modeb_resimulate_after_pv,
                     "max_firm_train_units": hyperparams.max_firm_train_units,
@@ -600,6 +650,7 @@ def main():
             "episode_mode": episode_mode,
             "sdf_wealth_loss_mode": hyperparams.sdf_wealth_loss_mode,
             "pv_bp_training_mode": hyperparams.pv_bp_training_mode,
+            "pv_training_flow": hyperparams.pv_training_flow,
             "firm_target_update": hyperparams.firm_target_update,
             "module_summaries": ep_summary,
             "gpu_memory": summary.get("gpu_memory", {})
@@ -614,6 +665,7 @@ def main():
             f"horizon={hyperparams.simulate_horizon} "
             f"sdf_wealth_loss_mode={hyperparams.sdf_wealth_loss_mode} "
             f"pv_bp_training_mode={hyperparams.pv_bp_training_mode} "
+            f"pv_training_flow={hyperparams.pv_training_flow} "
             f"firm_target_update={hyperparams.firm_target_update}"
         )
         log_gpu_stats(f"[Episode {ep}]", device)

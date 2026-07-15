@@ -12,10 +12,12 @@ import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
+import hashlib
+from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
 from numbers import Number
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 from tqdm import tqdm
 import logging
 
@@ -212,6 +214,8 @@ class Episode:
         self._last_nonfinite_grad_params: Dict[str, List[str]] = {}
         self._last_policy_value_stage_summary: Optional[Dict[str, float]] = None
         self._last_policy_value_gate_context: Dict[str, float] = {}
+        self._policy_value_stage_target_model: Optional[nn.Module] = None
+        self._target_grid_loss_component_mode = "joint"
         self._last_partial_module_summaries: Dict[str, Any] = {}
         self._last_failed_stage_diagnostics: Dict[str, Any] = {}
         self._sdf_shock_bank: Optional[SDFShockBank] = None
@@ -447,6 +451,103 @@ class Episode:
 
         return numeric_metrics, metadata
 
+    @staticmethod
+    def _state_dict_hash(module: nn.Module) -> str:
+        digest = hashlib.sha256()
+        for name, tensor in sorted(module.state_dict().items()):
+            digest.update(name.encode("utf-8"))
+            digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _tensor_list_hash(items: List[torch.Tensor]) -> str:
+        digest = hashlib.sha256()
+        for tensor in items:
+            value = tensor.detach().cpu().contiguous()
+            digest.update(str(tuple(value.shape)).encode("utf-8"))
+            digest.update(value.numpy().tobytes())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _unique_params(modules: List[Optional[nn.Module]]) -> List[nn.Parameter]:
+        params: List[nn.Parameter] = []
+        seen = set()
+        for module in modules:
+            if module is None:
+                continue
+            for param in module.parameters():
+                ident = id(param)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                params.append(param)
+        return params
+
+    def _policy_value_stage_modules(
+        self,
+        stage: str,
+    ) -> Tuple[List[Optional[nn.Module]], List[Optional[nn.Module]]]:
+        model = self.models["policy_value"]
+        bp_modules = [
+            getattr(model, "bp0_head", None),
+            getattr(model, "bpi_head", None),
+        ]
+        value_modules = [
+            getattr(model, "q_encoder", None),
+            getattr(model, "value_encoder", None),
+            getattr(model, "q_head", None),
+            getattr(model, "v0_head", None),
+            getattr(model, "vi_head", None),
+            getattr(model, "barz_model", None),
+            getattr(model, "bari_model", None),
+        ]
+        policy_encoder = getattr(model, "policy_encoder", None)
+        if stage == "pq":
+            trainable = value_modules
+        elif stage == "bp":
+            scope = str(getattr(self.hyperparams, "bp_distill_trainable_scope", "heads_only")).lower()
+            trainable = bp_modules if scope == "heads_only" else [policy_encoder, *bp_modules]
+        else:
+            raise ValueError(f"Unknown policy/value train scope: {stage}")
+        all_modules = [*value_modules, policy_encoder, *bp_modules]
+        return trainable, all_modules
+
+    def _policy_value_stage_params(self, stage: str) -> List[nn.Parameter]:
+        trainable, _ = self._policy_value_stage_modules(stage)
+        return self._unique_params(trainable)
+
+    @contextmanager
+    def _policy_value_train_scope(self, stage: str) -> Iterator[None]:
+        model = self.models["policy_value"]
+        original = {name: param.requires_grad for name, param in model.named_parameters()}
+        allowed = {id(param) for param in self._policy_value_stage_params(stage)}
+        try:
+            for param in model.parameters():
+                param.requires_grad = id(param) in allowed
+            yield
+        finally:
+            for name, param in model.named_parameters():
+                if name in original:
+                    param.requires_grad = original[name]
+
+    @staticmethod
+    def _param_max_change_from_snapshot(
+        params: List[nn.Parameter],
+        snapshot: Dict[int, torch.Tensor],
+    ) -> float:
+        max_change = 0.0
+        for param in params:
+            before = snapshot.get(id(param))
+            if before is None:
+                continue
+            delta = (param.detach().cpu() - before).abs().max().item()
+            max_change = max(max_change, float(delta))
+        return max_change
+
+    @staticmethod
+    def _snapshot_params(params: List[nn.Parameter]) -> Dict[int, torch.Tensor]:
+        return {id(param): param.detach().cpu().clone() for param in params}
+
     def reset_sdf_shock_bank(self) -> None:
         """Drop cached fresh-pair shock bank when episode/data stage changes."""
         self._sdf_shock_bank = None
@@ -495,7 +596,7 @@ class Episode:
         if self.firm_target is None or self.models.get('policy_value') is None:
             return
         mode = mode.lower()
-        if mode in {"hard", "epoch_hard"}:
+        if mode in {"hard", "epoch_hard", "stage_hard"}:
             hard_update(self.firm_target, self.models['policy_value'])
         elif mode in {"soft", "epoch_soft"}:
             tau = float(getattr(self.hyperparams, "firm_target_tau", 0.005))
@@ -516,7 +617,7 @@ class Episode:
         mode = str(getattr(self.hyperparams, "firm_target_update", "soft")).lower()
         if mode in {"none", "off", "disabled"}:
             return
-        if mode in {"epoch_hard", "epoch_soft"}:
+        if mode in {"epoch_hard", "epoch_soft", "stage_hard"}:
             return
         interval = max(1, int(getattr(self.hyperparams, "firm_target_update_interval_steps", 1)))
         if interval > 1 and (self.step_count + 1) % interval != 0:
@@ -531,6 +632,10 @@ class Episode:
             self._update_firm_target_now(mode)
 
     def _target_policy_value(self) -> nn.Module:
+        override = getattr(self, "_policy_value_stage_target_model", None)
+        if override is not None:
+            override.eval()
+            return override
         target = self.firm_target
         if target is None:
             target = self.models['policy_value']
@@ -3714,7 +3819,7 @@ class Episode:
         bar_i_policy = bar_i_cond.detach()
         return bar_i_policy * bpI_for_mix + (1.0 - bar_i_policy) * bp0_for_mix
 
-    def _compute_target_grid_pv_loss(
+    def _compute_target_grid_pv_components(
         self,
         *,
         branch: str,
@@ -3733,7 +3838,7 @@ class Episode:
         mix_weight: Optional[torch.Tensor] = None,
         bp_mix_pred: Optional[torch.Tensor] = None,
         mix_policy_sample_weight: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Dict[str, Any]:
         branch = branch.lower()
         prefix = 'p0' if branch == 'p0' else 'pi'
         teacher = BPGridTeacher.from_hyperparams(
@@ -3785,15 +3890,19 @@ class Episode:
                 huber_delta=logit_delta,
                 branch_weight=policy_weight,
             )
-        total_loss = value_loss + penalty_z + policy_total
+        penalty_loss = penalty_z
+        total_loss = value_loss + penalty_loss + policy_total
 
         extra_terms: Dict[str, float] = {}
         if branch == 'pi':
             penalty_b = loss_fn.b_penalty_weight * loss_fn.compute_b_penalty(value_pred, parent_state[:, 0:1]).mean()
+            penalty_loss = penalty_loss + penalty_b
             total_loss = total_loss + penalty_b
             extra_terms['pi_penalty_b'] = float(penalty_b.item())
 
         mix_terms: Dict[str, float] = {}
+        mix_total = torch.tensor(0.0, device=value_pred.device)
+        mix_grid = None
         if branch == 'pi' and mix_weight is not None and bp_mix_pred is not None:
             mix_grid = teacher.compute(
                 parent_state=parent_state,
@@ -3867,7 +3976,27 @@ class Episode:
             else:
                 terms.update(mix_terms)
                 self._latest_pi_terms = terms
-        return total_loss
+        return {
+            "total_loss": total_loss,
+            "value_loss": value_loss,
+            "policy_loss": policy_total,
+            "penalty_loss": penalty_loss,
+            "mix_policy_loss": mix_total,
+            "grid": grid,
+            "mix_grid": mix_grid,
+        }
+
+    def _compute_target_grid_pv_loss(
+        self,
+        **kwargs,
+    ) -> torch.Tensor:
+        components = self._compute_target_grid_pv_components(**kwargs)
+        mode = str(getattr(self, "_target_grid_loss_component_mode", "joint")).lower()
+        if mode == "value":
+            return components["value_loss"] + components["penalty_loss"]
+        if mode == "policy":
+            return components["policy_loss"] + components["mix_policy_loss"]
+        return components["total_loss"]
 
     def _build_vectorized_policy_child_states(
         self,
@@ -5700,7 +5829,8 @@ class Episode:
         if stats["hard_spikes"] >= max_hard:
             stats["rollback_reason"] = "too_many_hard_spikes"
             return True
-        if stats["consecutive_soft_spikes"] >= max_soft:
+        rollback_on_soft = bool(getattr(self.hyperparams, "pv_rollback_on_soft_spikes", False))
+        if rollback_on_soft and stats["consecutive_soft_spikes"] >= max_soft:
             stats["rollback_reason"] = "too_many_consecutive_soft_spikes"
             return True
         return False
@@ -5946,6 +6076,615 @@ class Episode:
         self._last_policy_value_stage_summary = {**avg_losses, **metadata}
         return result
 
+    def _compute_policy_value_component_loss(
+        self,
+        batch: Dict[str, torch.Tensor],
+        *,
+        component_mode: str,
+        policy_loss_terms: List[str],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        previous_mode = getattr(self, "_target_grid_loss_component_mode", "joint")
+        self._target_grid_loss_component_mode = component_mode
+        losses: Dict[str, Any] = {}
+        total = torch.tensor(0.0, device=self.device)
+        try:
+            if "p0" in policy_loss_terms:
+                p0_loss = self._compute_p0_loss(batch)
+                losses["p0"] = float(p0_loss.detach().item())
+                losses.update(self._latest_p0_terms)
+                total = total + self.weight_scheduler["p0"] * p0_loss
+            if "pi" in policy_loss_terms:
+                pi_loss = self._compute_pi_loss(batch)
+                losses["pi"] = float(pi_loss.detach().item())
+                losses.update(self._latest_pi_terms)
+                total = total + self.weight_scheduler["pi"] * pi_loss
+            if "q" in policy_loss_terms:
+                q_loss = self._compute_q_loss(batch)
+                losses["q"] = float(q_loss.detach().item())
+                losses.update(self._latest_q_terms)
+                total = total + self.weight_scheduler["q"] * q_loss
+        finally:
+            self._target_grid_loss_component_mode = previous_mode
+        losses["total"] = float(total.detach().item())
+        return total, losses
+
+    def _make_policy_value_stage_optimizer(
+        self,
+        params: List[nn.Parameter],
+    ) -> torch.optim.Optimizer:
+        if not params:
+            raise RuntimeError("Policy/value staged optimizer received no parameters.")
+        return torch.optim.AdamW(
+            params,
+            lr=float(getattr(self.hyperparams, "policy_lr", 1e-3)),
+            weight_decay=float(getattr(self.hyperparams, "policy_weight_decay", 0.0)),
+        )
+
+    @staticmethod
+    def _clip_params_with_raw_norm(
+        params: List[nn.Parameter],
+        max_norm: float,
+    ) -> Tuple[float, float]:
+        active = [param for param in params if param.grad is not None]
+        if not active:
+            return 0.0, 0.0
+        raw = torch.nn.utils.clip_grad_norm_(
+            active,
+            max_norm=float(max_norm),
+            error_if_nonfinite=False,
+        )
+        raw_norm = float(raw.detach().cpu().item())
+        clipped = min(raw_norm, float(max_norm)) if np.isfinite(raw_norm) else float("nan")
+        return raw_norm, clipped
+
+    def _evaluate_policy_value_component_score(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+        teacher: nn.Module,
+    ) -> Tuple[float, Dict[str, Any]]:
+        if not batches:
+            return float("inf"), {"validation_batches": 0}
+        previous_teacher = getattr(self, "_policy_value_stage_target_model", None)
+        self._policy_value_stage_target_model = teacher
+        records: List[Dict[str, Any]] = []
+        try:
+            for batch in batches:
+                _, losses = self._compute_policy_value_component_loss(
+                    batch,
+                    component_mode="value",
+                    policy_loss_terms=["p0", "pi", "q"],
+                )
+                records.append(losses)
+        finally:
+            self._policy_value_stage_target_model = previous_teacher
+        avg, meta = self._aggregate_metric_records(records)
+        return float(avg.get("total", float("inf"))), {**avg, **meta, "validation_batches": len(batches)}
+
+    def _run_policy_value_evaluation_stage(
+        self,
+        train_batches: List[Dict[str, torch.Tensor]],
+        val_batches: List[Dict[str, torch.Tensor]],
+        teacher: nn.Module,
+        n_epochs: int,
+    ) -> Dict[str, Any]:
+        params = self._policy_value_stage_params("pq")
+        bp_params = self._policy_value_stage_params("bp")
+        bp_snapshot = self._snapshot_params(bp_params)
+        if n_epochs <= 0:
+            return {
+                "status": "skipped_no_epochs",
+                "epochs_requested": int(n_epochs),
+                "accepted_epochs": 0,
+                "optimizer_steps": 0,
+                "best_epoch": None,
+                "target_update_count": 0,
+            }
+        optimizer = self._make_policy_value_stage_optimizer(params)
+        teacher_hash_before = self._state_dict_hash(teacher)
+        previous_teacher = getattr(self, "_policy_value_stage_target_model", None)
+        self._policy_value_stage_target_model = teacher
+        best_score = float("inf")
+        best_epoch: Optional[int] = None
+        best_checkpoint: Optional[Dict[str, Any]] = None
+        records: List[Dict[str, Any]] = []
+        optimizer_steps = 0
+        nonfinite_count = 0
+        hard_spike_count = 0
+        soft_spike_count = 0
+        try:
+            with self._policy_value_train_scope("pq"):
+                for epoch in range(int(n_epochs)):
+                    for batch in tqdm(train_batches, desc=f"PV P/Q eval {epoch+1}/{n_epochs}"):
+                        optimizer.zero_grad(set_to_none=True)
+                        total, losses = self._compute_policy_value_component_loss(
+                            batch,
+                            component_mode="value",
+                            policy_loss_terms=["p0", "pi", "q"],
+                        )
+                        if not torch.isfinite(total):
+                            nonfinite_count += 1
+                            continue
+                        total.backward()
+                        raw_norm, clipped_norm = self._clip_params_with_raw_norm(
+                            params,
+                            float(getattr(self.hyperparams, "pv_eval_grad_clip_norm", 10.0)),
+                        )
+                        losses["pq_raw_grad_norm"] = raw_norm
+                        losses["pq_clipped_grad_norm"] = clipped_norm
+                        losses["pq_grad_clip_factor"] = (
+                            clipped_norm / raw_norm if raw_norm > 0 and np.isfinite(raw_norm) else 1.0
+                        )
+                        if not np.isfinite(raw_norm):
+                            nonfinite_count += 1
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
+                        hard_threshold = float(getattr(self.hyperparams, "pv_grad_hard_threshold", 1000.0))
+                        soft_threshold = float(getattr(self.hyperparams, "pv_grad_soft_threshold", 100.0))
+                        if raw_norm > hard_threshold:
+                            hard_spike_count += 1
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
+                        if raw_norm > soft_threshold:
+                            soft_spike_count += 1
+                        optimizer.step()
+                        optimizer_steps += 1
+                        records.append(losses)
+                    score, val_summary = self._evaluate_policy_value_component_score(
+                        val_batches or train_batches,
+                        teacher,
+                    )
+                    if score < best_score:
+                        best_score = score
+                        best_epoch = epoch + 1
+                        best_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
+                        best_checkpoint["validation_summary"] = val_summary
+        finally:
+            self._policy_value_stage_target_model = previous_teacher
+
+        restored = False
+        if best_checkpoint is not None:
+            self._restore_policy_value_stage_checkpoint(optimizer, best_checkpoint, None)
+            restored = True
+        avg, meta = self._aggregate_metric_records(records)
+        teacher_hash_after = self._state_dict_hash(teacher)
+        bp_head_max_change = self._param_max_change_from_snapshot(bp_params, bp_snapshot)
+        status = "accepted" if best_checkpoint is not None else "failed_no_finite_update"
+        return {
+            "status": status,
+            "epochs_requested": int(n_epochs),
+            "epochs_completed": int(n_epochs),
+            "accepted_epochs": int(n_epochs if best_checkpoint is not None else 0),
+            "rejected_epochs": 0,
+            "optimizer_steps": optimizer_steps,
+            "best_epoch": best_epoch,
+            "best_validation_score": best_score if np.isfinite(best_score) else None,
+            "restored_best_checkpoint": restored,
+            "teacher_hash_before": teacher_hash_before,
+            "teacher_hash_after": teacher_hash_after,
+            "soft_spike_count": soft_spike_count,
+            "hard_spike_count": hard_spike_count,
+            "nonfinite_count": nonfinite_count,
+            "bp_head_parameter_max_change": bp_head_max_change,
+            "train_metrics": {**avg, **meta},
+        }
+
+    def _build_bp_target_cache(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+        teacher_model: nn.Module,
+    ) -> List[Dict[str, Any]]:
+        cache: List[Dict[str, Any]] = []
+        teacher = BPGridTeacher.from_hyperparams(
+            teacher_model,
+            self.loss_fns['p0'],
+            self.loss_fns['pi'],
+            self.hyperparams,
+        )
+        teacher_model.eval()
+        with torch.no_grad():
+            for batch_id, batch in enumerate(batches):
+                parent = batch["parent"]
+                children = batch.get("children", [])
+                if not children and batch.get("child0") is not None and batch.get("child1") is not None:
+                    children = [batch["child0"], batch["child1"]]
+                parent_state = parent[:, :7] if parent.shape[1] > 7 else parent
+                m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
+                m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
+                _, m_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+                out = teacher_model(parent_state)
+                bp0 = getattr(out, "bp0")
+                bpI = getattr(out, "bpI")
+                b_parent = parent_state[:, 0:1]
+                bp0_for_grid = self._apply_policy_ablation(bp0, b_parent)
+                bpI_for_grid = self._apply_policy_ablation(bpI, b_parent)
+                p0_grid = teacher.compute(
+                    parent_state=parent_state,
+                    children=children,
+                    m_list=m_list,
+                    branch="p0",
+                    bp_pred=bp0_for_grid,
+                )
+                pi_grid = teacher.compute(
+                    parent_state=parent_state,
+                    children=children,
+                    m_list=m_list,
+                    branch="pi",
+                    bp_pred=bpI_for_grid,
+                )
+                mix_weight = self._target_investment_conditional(
+                    teacher_model,
+                    parent_state,
+                    fallback=getattr(out, "bar_i_cond", getattr(out, "bar_i")),
+                )
+                mix_survival = self._target_survival_probability(
+                    teacher_model,
+                    parent_state,
+                    fallback=getattr(out, "survival_prob", torch.ones_like(bp0)),
+                )
+                bp_mix = self._mixed_policy_conditional_bp(
+                    out,
+                    bp0,
+                    bpI,
+                    b_parent,
+                    fallback_bar_i=mix_weight,
+                )
+                mix_grid = teacher.compute(
+                    parent_state=parent_state,
+                    children=children,
+                    m_list=m_list,
+                    branch="mix",
+                    bp_pred=bp_mix,
+                    mix_weight=mix_weight,
+                )
+                cache.append({
+                    "batch_id": batch_id,
+                    "parent": parent_state.detach().cpu(),
+                    "bp0_target": p0_grid["bp_star"].detach().cpu(),
+                    "bpi_target": pi_grid["bp_star"].detach().cpu(),
+                    "mix_target": mix_grid["bp_star"].detach().cpu(),
+                    "bp0_confidence": p0_grid["confidence"].detach().cpu(),
+                    "bpi_confidence": pi_grid["confidence"].detach().cpu(),
+                    "mix_confidence": mix_grid["confidence"].detach().cpu(),
+                    "mix_sample_weight": mix_survival.detach().cpu(),
+                    "teacher_snapshot_hash": self._state_dict_hash(teacher_model),
+                })
+        return cache
+
+    def _bp_cache_hash(self, cache: List[Dict[str, Any]]) -> str:
+        tensors: List[torch.Tensor] = []
+        for item in cache:
+            tensors.extend([
+                item["parent"],
+                item["bp0_target"],
+                item["bpi_target"],
+                item["mix_target"],
+                item["bp0_confidence"],
+                item["bpi_confidence"],
+                item["mix_confidence"],
+                item["mix_sample_weight"],
+            ])
+        return self._tensor_list_hash(tensors)
+
+    def _compute_bp_cache_loss(
+        self,
+        item: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        parent = item["parent"].to(self.device)
+        bp0_target = item["bp0_target"].to(self.device)
+        bpi_target = item["bpi_target"].to(self.device)
+        mix_target = item["mix_target"].to(self.device)
+        bp0_conf = item["bp0_confidence"].to(self.device)
+        bpi_conf = item["bpi_confidence"].to(self.device)
+        mix_conf = item["mix_confidence"].to(self.device)
+        mix_weight = item["mix_sample_weight"].to(self.device)
+        model = self.models["policy_value"]
+        output = model(parent)
+        bp0_logit, bpi_logit = model.forward_policy_logits(parent)
+        bp0 = torch.sigmoid(bp0_logit)
+        bpi = torch.sigmoid(bpi_logit)
+        policy_delta = float(getattr(self.hyperparams, "bp_grid_policy_huber_delta", 0.05))
+        policy_weight = float(getattr(self.hyperparams, "bp_grid_policy_weight", 1.0))
+        if self._bp_grid_policy_loss_space() == "logit":
+            logit_eps = float(getattr(self.hyperparams, "bp_grid_logit_target_eps", 1e-4))
+            logit_delta = float(getattr(self.hyperparams, "bp_grid_logit_huber_delta", 1.0))
+            bp0_total, bp0_loss, _, _ = compute_target_grid_policy_logit_distillation_loss(
+                bp0_logit,
+                bp0_target,
+                bp0_conf,
+                target_eps=logit_eps,
+                huber_delta=logit_delta,
+                branch_weight=policy_weight,
+            )
+            bpi_total, bpi_loss, _, _ = compute_target_grid_policy_logit_distillation_loss(
+                bpi_logit,
+                bpi_target,
+                bpi_conf,
+                target_eps=logit_eps,
+                huber_delta=logit_delta,
+                branch_weight=policy_weight,
+            )
+        else:
+            bp0_total, bp0_loss, _ = compute_target_grid_policy_distillation_loss(
+                bp0, bp0_target, bp0_conf, huber_delta=policy_delta, branch_weight=policy_weight
+            )
+            bpi_total, bpi_loss, _ = compute_target_grid_policy_distillation_loss(
+                bpi, bpi_target, bpi_conf, huber_delta=policy_delta, branch_weight=policy_weight
+            )
+        b_parent = parent[:, 0:1]
+        bp_mix = self._mixed_policy_conditional_bp(
+            output,
+            bp0,
+            bpi,
+            b_parent,
+            fallback_bar_i=getattr(output, "bar_i_cond", getattr(output, "bar_i")),
+        )
+        mix_total, mix_loss, _ = compute_target_grid_policy_distillation_loss(
+            bp_mix,
+            mix_target,
+            mix_conf,
+            huber_delta=policy_delta,
+            branch_weight=float(getattr(self.hyperparams, "bp_grid_mix_policy_weight", 1.0)),
+            sample_weight=mix_weight,
+        )
+        total = bp0_total + bpi_total + mix_total
+
+        def _mae(pred: torch.Tensor, target: torch.Tensor, conf: torch.Tensor) -> Tuple[float, int]:
+            mask = conf > 0
+            n = int(mask.sum().item())
+            if n == 0:
+                return float("nan"), 0
+            return float((pred[mask] - target[mask]).abs().mean().detach().item()), n
+
+        bp0_mae, bp0_n = _mae(bp0, bp0_target, bp0_conf)
+        bpi_mae, bpi_n = _mae(bpi, bpi_target, bpi_conf)
+        mix_mae, mix_n = _mae(bp_mix, mix_target, mix_conf)
+        return total, {
+            "total": float(total.detach().item()),
+            "bp0_loss": float(bp0_loss.detach().item()),
+            "bpi_loss": float(bpi_loss.detach().item()),
+            "mix_loss": float(mix_loss.detach().item()),
+            "bp0_active_mae": bp0_mae,
+            "bpi_active_mae": bpi_mae,
+            "mix_active_mae": mix_mae,
+            "bp0_active_n": float(bp0_n),
+            "bpi_active_n": float(bpi_n),
+            "mix_active_n": float(mix_n),
+            "bp0_prediction_std": float(bp0.detach().std(unbiased=False).item()),
+            "bpi_prediction_std": float(bpi.detach().std(unbiased=False).item()),
+            "mix_prediction_std": float(bp_mix.detach().std(unbiased=False).item()),
+        }
+
+    def _evaluate_bp_cache_score(self, cache: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any]]:
+        if not cache:
+            return float("inf"), {"validation_batches": 0}
+        records: List[Dict[str, Any]] = []
+        with torch.no_grad():
+            for item in cache:
+                _, losses = self._compute_bp_cache_loss(item)
+                records.append(losses)
+        avg, meta = self._aggregate_metric_records(records)
+        active_maes = [
+            value for key, value in avg.items()
+            if key.endswith("_active_mae") and np.isfinite(value)
+        ]
+        active_counts = [
+            value for key, value in avg.items()
+            if key.endswith("_active_n") and value > 0
+        ]
+        if not active_counts:
+            return float("inf"), {**avg, **meta, "status": "skipped_no_active_refinancing"}
+        score = max(active_maes) if active_maes else float("inf")
+        return float(score), {**avg, **meta, "validation_batches": len(cache)}
+
+    def _run_bp_distillation_stage(
+        self,
+        train_cache: List[Dict[str, Any]],
+        val_cache: List[Dict[str, Any]],
+        teacher_snapshot: nn.Module,
+        n_epochs: int,
+    ) -> Dict[str, Any]:
+        params = self._policy_value_stage_params("bp")
+        _, all_modules = self._policy_value_stage_modules("bp")
+        non_bp_params = [
+            param
+            for module in all_modules
+            if module is not None
+            for param in module.parameters()
+            if id(param) not in {id(p) for p in params}
+        ]
+        non_bp_snapshot = self._snapshot_params(non_bp_params)
+        train_hash_before = self._bp_cache_hash(train_cache)
+        val_hash_before = self._bp_cache_hash(val_cache)
+        if n_epochs <= 0:
+            return {
+                "status": "skipped_no_epochs",
+                "epochs_requested": int(n_epochs),
+                "optimizer_steps": 0,
+                "best_epoch": None,
+                "target_update_count": 0,
+                "train_cache_hash": train_hash_before,
+                "validation_cache_hash": val_hash_before,
+            }
+        if not train_cache:
+            return {
+                "status": "skipped_no_active_refinancing",
+                "epochs_requested": int(n_epochs),
+                "optimizer_steps": 0,
+                "best_epoch": None,
+                "target_update_count": 0,
+                "train_cache_hash": train_hash_before,
+                "validation_cache_hash": val_hash_before,
+            }
+        optimizer = self._make_policy_value_stage_optimizer(params)
+        patience = max(0, int(getattr(self.hyperparams, "bp_distill_patience", 3)))
+        min_delta = float(getattr(self.hyperparams, "bp_distill_min_delta", 1e-4))
+        best_score = float("inf")
+        best_epoch: Optional[int] = None
+        best_checkpoint: Optional[Dict[str, Any]] = None
+        wait = 0
+        optimizer_steps = 0
+        records: List[Dict[str, Any]] = []
+        teacher_hash = self._state_dict_hash(teacher_snapshot)
+        skipped_no_active = False
+        with self._policy_value_train_scope("bp"):
+            for epoch in range(int(n_epochs)):
+                for item in tqdm(train_cache, desc=f"BP distill {epoch+1}/{n_epochs}"):
+                    optimizer.zero_grad(set_to_none=True)
+                    total, losses = self._compute_bp_cache_loss(item)
+                    if not torch.isfinite(total):
+                        continue
+                    total.backward()
+                    raw_norm, clipped_norm = self._clip_params_with_raw_norm(
+                        params,
+                        float(getattr(self.hyperparams, "bp_distill_grad_clip_norm", 10.0)),
+                    )
+                    losses["bp_raw_grad_norm"] = raw_norm
+                    losses["bp_clipped_grad_norm"] = clipped_norm
+                    if not np.isfinite(raw_norm):
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    optimizer.step()
+                    optimizer_steps += 1
+                    records.append(losses)
+                score, val_summary = self._evaluate_bp_cache_score(val_cache or train_cache)
+                if val_summary.get("status") == "skipped_no_active_refinancing":
+                    skipped_no_active = True
+                    best_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
+                    best_epoch = epoch + 1
+                    break
+                if score < best_score - min_delta:
+                    best_score = score
+                    best_epoch = epoch + 1
+                    wait = 0
+                    best_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
+                    best_checkpoint["validation_summary"] = val_summary
+                else:
+                    wait += 1
+                    if wait >= patience:
+                        break
+        restored = False
+        if best_checkpoint is not None:
+            self._restore_policy_value_stage_checkpoint(optimizer, best_checkpoint, None)
+            restored = True
+        avg, meta = self._aggregate_metric_records(records)
+        train_hash_after = self._bp_cache_hash(train_cache)
+        val_hash_after = self._bp_cache_hash(val_cache)
+        non_bp_max_change = self._param_max_change_from_snapshot(non_bp_params, non_bp_snapshot)
+        if skipped_no_active:
+            status = "skipped_no_active_refinancing"
+        else:
+            status = "accepted" if best_checkpoint is not None else "failed_no_finite_update"
+        return {
+            "status": status,
+            "epochs_requested": int(n_epochs),
+            "epochs_completed": int(best_epoch or 0),
+            "optimizer_steps": optimizer_steps,
+            "best_epoch": best_epoch,
+            "best_validation_score": best_score if np.isfinite(best_score) else None,
+            "patience": patience,
+            "restored_best_checkpoint": restored,
+            "teacher_snapshot_hash": teacher_hash,
+            "train_cache_hash": train_hash_before,
+            "train_cache_hash_after": train_hash_after,
+            "validation_cache_hash": val_hash_before,
+            "validation_cache_hash_after": val_hash_after,
+            "non_bp_parameter_max_change": non_bp_max_change,
+            "train_metrics": {**avg, **meta},
+        }
+
+    def _run_policy_value_staged(
+        self,
+        pv_train_batches: List[Dict[str, torch.Tensor]],
+        validation_batches: List[Dict[str, torch.Tensor]],
+        n_epochs: int,
+    ) -> Dict[str, Any]:
+        flow = str(getattr(self.hyperparams, "pv_training_flow", "joint")).lower()
+        if flow != "staged":
+            raise RuntimeError("_run_policy_value_staged called when pv_training_flow is not staged")
+        firm_mode = str(getattr(self.hyperparams, "firm_target_update", "epoch_hard")).lower()
+        if firm_mode not in {"stage_hard", "none", "off", "disabled"}:
+            raise ValueError(
+                "pv_training_flow='staged' requires firm_target_update='stage_hard' or 'none'; "
+                f"got {firm_mode!r}."
+            )
+        eval_epochs = getattr(self.hyperparams, "pv_eval_epochs", None)
+        eval_epochs = int(n_epochs if eval_epochs is None else eval_epochs)
+        bp_epochs = int(getattr(self.hyperparams, "bp_distill_epochs", 20))
+        teacher_source = self.firm_target if self.firm_target is not None else self.models["policy_value"]
+        episode_teacher = deepcopy(teacher_source).to(self.device)
+        episode_teacher.eval()
+        episode_teacher.requires_grad_(False)
+        firm_hash_before = (
+            self._state_dict_hash(self.firm_target)
+            if self.firm_target is not None
+            else None
+        )
+        pq_summary = self._run_policy_value_evaluation_stage(
+            pv_train_batches,
+            validation_batches,
+            episode_teacher,
+            eval_epochs,
+        )
+        if pq_summary.get("status") not in {"accepted", "skipped_no_epochs"}:
+            self._last_policy_value_stage_summary = {
+                "policy_value_training_flow": "staged",
+                "policy_value_stage_status": "failed_pq",
+                "policy_value_evaluation_stage": pq_summary,
+            }
+            return {
+                "final_losses": {},
+                "metadata": self._last_policy_value_stage_summary,
+                "target_grid_validation_batches": len(validation_batches),
+            }
+
+        bp_teacher = deepcopy(self.models["policy_value"]).to(self.device)
+        bp_teacher.eval()
+        bp_teacher.requires_grad_(False)
+        train_cache = self._build_bp_target_cache(pv_train_batches, bp_teacher)
+        val_cache = self._build_bp_target_cache(validation_batches or pv_train_batches, bp_teacher)
+        bp_summary = self._run_bp_distillation_stage(
+            train_cache,
+            val_cache,
+            bp_teacher,
+            bp_epochs,
+        )
+        stages_successful = (
+            pq_summary.get("status") in {"accepted", "skipped_no_epochs"}
+            and bp_summary.get("status") in {"accepted", "skipped_no_epochs", "skipped_no_active_refinancing"}
+        )
+        target_update_count = 0
+        if stages_successful and firm_mode == "stage_hard":
+            self._update_firm_target_now("stage_hard")
+            target_update_count = 1
+        firm_hash_after = (
+            self._state_dict_hash(self.firm_target)
+            if self.firm_target is not None
+            else None
+        )
+        convergence = self.evaluate_bellman_convergence(
+            pv_train_batches,
+            validation_batches=validation_batches,
+        )
+        metadata = {
+            "policy_value_training_flow": "staged",
+            "policy_value_stage_status": "accepted" if stages_successful else "failed_bp",
+            "policy_value_evaluation_stage": pq_summary,
+            "bp_distillation_stage": bp_summary,
+            "firm_target_stage_update": {
+                "firm_target_update_mode": firm_mode,
+                "firm_target_update_count": target_update_count,
+                "firm_target_hash_before": firm_hash_before,
+                "firm_target_hash_after": firm_hash_after,
+            },
+        }
+        self._last_policy_value_stage_summary = metadata
+        return {
+            "final_losses": {},
+            "metadata": metadata,
+            "convergence": convergence,
+            "target_grid_validation_batches": len(validation_batches),
+        }
+
     def _run_batches(
         self,
         batches: List[Dict[str, torch.Tensor]],
@@ -5996,6 +6735,12 @@ class Episode:
 
         epoch_offset = int(getattr(self, "_run_batches_epoch_offset", 0))
         if train_modules == ['policy_value'] and 'policy_value' in self.models:
+            if str(getattr(self.hyperparams, "pv_training_flow", "joint")).lower() == "staged":
+                return self._run_policy_value_staged(
+                    pv_train_batches=pv_train_batches,
+                    validation_batches=validation_batches,
+                    n_epochs=n_epochs,
+                )
             return self._run_policy_value_batches_fail_soft(
                 pv_train_batches=pv_train_batches,
                 validation_batches=validation_batches,

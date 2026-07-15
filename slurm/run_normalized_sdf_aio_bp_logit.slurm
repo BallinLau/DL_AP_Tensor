@@ -64,6 +64,14 @@ FC1_JACOBIAN_PENALTY_INTERVAL="${FC1_JACOBIAN_PENALTY_INTERVAL:-10}"
 BP_GRID_POLICY_LOSS_SPACE="${BP_GRID_POLICY_LOSS_SPACE:-logit}"
 BP_GRID_LOGIT_TARGET_EPS="${BP_GRID_LOGIT_TARGET_EPS:-1e-4}"
 BP_GRID_LOGIT_HUBER_DELTA="${BP_GRID_LOGIT_HUBER_DELTA:-1.0}"
+PV_TRAINING_FLOW="${PV_TRAINING_FLOW:-staged}"
+PV_EVAL_EPOCHS="${PV_EVAL_EPOCHS:-$EPOCHS}"
+BP_DISTILL_EPOCHS="${BP_DISTILL_EPOCHS:-20}"
+BP_DISTILL_PATIENCE="${BP_DISTILL_PATIENCE:-3}"
+BP_DISTILL_MIN_DELTA="${BP_DISTILL_MIN_DELTA:-1e-4}"
+PV_ROLLBACK_ON_SOFT_SPIKES="${PV_ROLLBACK_ON_SOFT_SPIKES:-0}"
+BP_DISTILL_TRAINABLE_SCOPE="${BP_DISTILL_TRAINABLE_SCOPE:-heads_only}"
+FIRM_TARGET_UPDATE="${FIRM_TARGET_UPDATE:-stage_hard}"
 # Full normalized residual run: Treatment B by default.
 MODEB_RESIMULATE_AFTER_PV="${MODEB_RESIMULATE_AFTER_PV:-1}"
 
@@ -142,6 +150,11 @@ if [[ "$SDF_RESTORE_BEST_CHECKPOINT" == "1" ]]; then
 else
   EXTRA_ARGS+=(--no-sdf-restore-best-checkpoint)
 fi
+if [[ "$PV_ROLLBACK_ON_SOFT_SPIKES" == "1" ]]; then
+  EXTRA_ARGS+=(--pv-rollback-on-soft-spikes)
+else
+  EXTRA_ARGS+=(--no-pv-rollback-on-soft-spikes)
+fi
 
 echo "Run parameters:"
 echo "  SEED=$SEED"
@@ -184,6 +197,14 @@ echo "  FC1_JACOBIAN_PENALTY_INTERVAL=$FC1_JACOBIAN_PENALTY_INTERVAL"
 echo "  BP_GRID_POLICY_LOSS_SPACE=$BP_GRID_POLICY_LOSS_SPACE"
 echo "  BP_GRID_LOGIT_TARGET_EPS=$BP_GRID_LOGIT_TARGET_EPS"
 echo "  BP_GRID_LOGIT_HUBER_DELTA=$BP_GRID_LOGIT_HUBER_DELTA"
+echo "  PV_TRAINING_FLOW=$PV_TRAINING_FLOW"
+echo "  PV_EVAL_EPOCHS=$PV_EVAL_EPOCHS"
+echo "  BP_DISTILL_EPOCHS=$BP_DISTILL_EPOCHS"
+echo "  BP_DISTILL_PATIENCE=$BP_DISTILL_PATIENCE"
+echo "  BP_DISTILL_MIN_DELTA=$BP_DISTILL_MIN_DELTA"
+echo "  PV_ROLLBACK_ON_SOFT_SPIKES=$PV_ROLLBACK_ON_SOFT_SPIKES"
+echo "  BP_DISTILL_TRAINABLE_SCOPE=$BP_DISTILL_TRAINABLE_SCOPE"
+echo "  FIRM_TARGET_UPDATE=$FIRM_TARGET_UPDATE"
 echo "  MODEB_RESIMULATE_AFTER_PV=$MODEB_RESIMULATE_AFTER_PV"
 
 python3 -u experiments/run_multi_episode_job.py \
@@ -224,6 +245,13 @@ python3 -u experiments/run_multi_episode_job.py \
   --bp-grid-policy-loss-space "$BP_GRID_POLICY_LOSS_SPACE" \
   --bp-grid-logit-target-eps "$BP_GRID_LOGIT_TARGET_EPS" \
   --bp-grid-logit-huber-delta "$BP_GRID_LOGIT_HUBER_DELTA" \
+  --pv-training-flow "$PV_TRAINING_FLOW" \
+  --pv-eval-epochs "$PV_EVAL_EPOCHS" \
+  --bp-distill-epochs "$BP_DISTILL_EPOCHS" \
+  --bp-distill-patience "$BP_DISTILL_PATIENCE" \
+  --bp-distill-min-delta "$BP_DISTILL_MIN_DELTA" \
+  --bp-distill-trainable-scope "$BP_DISTILL_TRAINABLE_SCOPE" \
+  --firm-target-update "$FIRM_TARGET_UPDATE" \
   "${EXTRA_ARGS[@]}"
 
 echo "Job finished on $(date)"
