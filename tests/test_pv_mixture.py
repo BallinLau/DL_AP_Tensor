@@ -3,6 +3,7 @@ import random
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +97,7 @@ def _hp_mixture() -> HyperParams:
     hp.pv_mixture_preserve_rng = True
     hp.pv_mixture_stratified_validation = True
     hp.pv_target_grid_val_fraction = 0.25
+    hp.pv_training_flow = "staged"
     hp.max_firm_train_units = 0
     hp.pv_eta_resample_enabled = False
     return hp
@@ -218,23 +220,70 @@ def test_same_seed_is_reproducible_and_episode_seed_changes_selection():
     assert _run(1) != _run(2)
 
 
-def test_episode0_and_zero_ratio_keep_mixture_disabled():
+def test_episode0_disabled_but_zero_ratio_uses_experiment_control_pipeline():
     hp = _hp_mixture()
     hp.pv_mixture_ratio = 0.0
     episode = _episode(hp, episode_id=1)
+    coverage_calls = []
+    episode._build_pv_coverage_pool = lambda n, n_branches: coverage_calls.append(n) or None
     train_batches, val_batches, summary = episode._prepare_mixed_policy_value_batches(
         _firm_table(4),
         batch_size=2,
         n_branches=2,
     )
-    assert summary["enabled"] is False
-    assert summary["reason"] == "zero_ratio"
-    assert val_batches == []
-    assert sum(batch["parent"].shape[0] for batch in train_batches) == 4
+    assert summary["enabled"] is True
+    assert summary["reason"] == "enabled_experiment_control"
+    assert coverage_calls == []
+    assert summary["coverage_parent_groups_selected"] == 0.0
+    assert summary["actual_coverage_ratio"] == 0.0
+    assert summary["train_coverage_ratio"] == 0.0
+    assert summary["validation_coverage_ratio"] == 0.0
+    assert sum(batch["parent"].shape[0] for batch in train_batches + val_batches) == 4
 
     hp.pv_mixture_ratio = 0.25
     episode0 = _episode(hp, episode_id=0)
     assert episode0._pv_mixture_enabled_for_episode() == (False, "episode0_unchanged")
+
+
+def test_control_and_treatment_rng_parity():
+    sim_table = _firm_table(8)
+    coverage_pool = _episode(_hp_mixture(), episode_id=1)._tensor_to_parent_group_pool(
+        _firm_table(8, source_offset=100, value_offset=1.0),
+        source_id=1,
+    )
+
+    def _run(ratio):
+        hp = _hp_mixture()
+        hp.pv_mixture_ratio = ratio
+        episode = _episode(hp, episode_id=1)
+        if ratio > 0:
+            episode._build_pv_coverage_pool = lambda *args, **kwargs: coverage_pool
+        random.seed(333)
+        np.random.seed(333)
+        torch.manual_seed(333)
+        before = (
+            random.getstate(),
+            np.random.get_state(),
+            torch.get_rng_state(),
+        )
+        episode._prepare_mixed_policy_value_batches(sim_table, batch_size=4, n_branches=2)
+        after = (
+            random.getstate(),
+            np.random.get_state(),
+            torch.get_rng_state(),
+        )
+        return before, after
+
+    control_before, control_after = _run(0.0)
+    treatment_before, treatment_after = _run(0.25)
+
+    assert control_after[0] == control_before[0] == treatment_before[0] == treatment_after[0]
+    assert np.array_equal(control_after[1][1], control_before[1][1])
+    assert np.array_equal(treatment_after[1][1], treatment_before[1][1])
+    assert np.array_equal(control_after[1][1], treatment_after[1][1])
+    assert torch.equal(control_after[2], control_before[2])
+    assert torch.equal(treatment_after[2], treatment_before[2])
+    assert torch.equal(control_after[2], treatment_after[2])
 
 
 def test_bp_target_cache_preserves_source_metadata(monkeypatch):
@@ -322,3 +371,46 @@ def test_real_coverage_sample_child_m_is_finite():
     child_m = torch.cat([child[:, 7] for child in pool.children])
     assert torch.isfinite(child_m).all()
     assert torch.allclose(child_m, torch.full_like(child_m, 0.99))
+
+
+def test_mixture_rejects_eta_resampling_and_joint_flow():
+    hp = _hp_mixture()
+    hp.pv_eta_resample_enabled = True
+    episode = _episode(hp, episode_id=1)
+    with pytest.raises(ValueError, match="pv_eta_resample_enabled=False"):
+        episode._prepare_mixed_policy_value_batches(_firm_table(4), batch_size=2, n_branches=2)
+
+    hp = _hp_mixture()
+    hp.pv_training_flow = "joint"
+    episode = _episode(hp, episode_id=1)
+    with pytest.raises(ValueError, match="pv_training_flow='staged'"):
+        episode._prepare_mixed_policy_value_batches(_firm_table(4), batch_size=2, n_branches=2)
+
+
+def test_coverage_generation_restores_model_modes():
+    hp = _hp_mixture()
+    episode = _episode(hp, episode_id=1)
+
+    class _SDFModule(torch.nn.Module):
+        def forward_step(self, x_prev, x_curr, hatcf_prev, lnkf_prev, return_physical=False):
+            assert self.training is False
+            n = x_prev.shape[0]
+            m = torch.ones(n, dtype=x_prev.dtype, device=x_prev.device)
+            return (
+                torch.zeros_like(m),
+                torch.zeros_like(m),
+                m,
+                hatcf_prev,
+                lnkf_prev,
+            )
+
+    sdf = _SDFModule()
+    sdf.train(True)
+    episode.models["sdf_fc1"] = sdf
+    episode.models["policy_value"].train(True)
+
+    pool = episode._build_pv_coverage_pool(n_parent_groups=2, n_branches=2)
+
+    assert pool is not None
+    assert episode.models["policy_value"].training is True
+    assert episode.models["sdf_fc1"].training is True

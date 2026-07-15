@@ -1620,8 +1620,10 @@ class Episode:
         if int(self.episode_id) < int(getattr(hp, "pv_mixture_start_episode", 1)):
             return False, "before_start_episode"
         ratio = float(getattr(hp, "pv_mixture_ratio", 0.0))
-        if ratio <= 0.0:
-            return False, "zero_ratio"
+        if ratio < 0.0 or ratio > 1.0:
+            raise ValueError(f"pv_mixture_ratio must be in [0, 1], got {ratio}.")
+        if ratio == 0.0:
+            return True, "enabled_experiment_control"
         return True, "enabled"
 
     def _build_pv_coverage_pool(self, n_parent_groups: int, n_branches: int) -> Optional[PVParentGroupPool]:
@@ -1640,7 +1642,21 @@ class Episode:
             enable_entry=False,
             device=self.device,
         )
-        table = sampler.build_policy_value_tensor()
+        model_modes = {
+            name: model.training
+            for name, model in self.models.items()
+            if isinstance(model, nn.Module)
+        }
+        try:
+            for model in self.models.values():
+                if isinstance(model, nn.Module):
+                    model.eval()
+            table = sampler.build_policy_value_tensor()
+        finally:
+            for name, was_training in model_modes.items():
+                model = self.models.get(name)
+                if isinstance(model, nn.Module):
+                    model.train(was_training)
         pool = self._tensor_to_parent_group_pool(table, n_branches=n_branches, source_id=1)
         if pool is None:
             return None
@@ -1684,6 +1700,10 @@ class Episode:
         budget_mode = str(getattr(hp, "pv_mixture_budget_mode", "fixed_total")).lower()
         if budget_mode not in {"fixed_total"}:
             raise ValueError(f"Unknown pv_mixture_budget_mode={budget_mode!r}.")
+        if bool(getattr(hp, "pv_eta_resample_enabled", True)):
+            raise ValueError("PV mixture currently requires pv_eta_resample_enabled=False.")
+        if str(getattr(hp, "pv_training_flow", "joint")).lower() != "staged":
+            raise ValueError("PV mixture currently requires pv_training_flow='staged'.")
 
         n_available = len(sim_pool)
         max_units = int(getattr(hp, "max_firm_train_units", 0))
@@ -1760,6 +1780,8 @@ class Episode:
             "validation_batches": int(len(val_batches)),
             **mix_summary,
             **self._pool_feature_stats("coverage", coverage_pool),
+            **self._pool_feature_stats("selected_sim", sim_selected),
+            **self._pool_feature_stats("selected_coverage", coverage_selected),
             **self._pool_feature_stats("mixed_train", train_pool),
             **self._pool_feature_stats("mixed_validation", val_pool),
         })

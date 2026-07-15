@@ -149,6 +149,8 @@ def build_fixed_total_mixture_split(
         "validation_sim_parent_groups": float(val_counts["source0"]),
         "validation_coverage_parent_groups": float(val_counts["source1"]),
         "actual_coverage_ratio": float(n_coverage / max(n_sim + n_coverage, 1)),
+        "train_coverage_ratio": float(train_counts["source1"] / max(len(train_pool), 1)),
+        "validation_coverage_ratio": float(val_counts["source1"] / max(len(val_pool), 1)),
     }
     return train_pool, val_pool, summary
 
@@ -196,5 +198,7 @@ def build_selected_mixture_split(
         "validation_sim_parent_groups": float(val_counts["source0"]),
         "validation_coverage_parent_groups": float(val_counts["source1"]),
         "actual_coverage_ratio": float(n_coverage / max(n_sim + n_coverage, 1)),
+        "train_coverage_ratio": float(train_counts["source1"] / max(len(train_pool), 1)),
+        "validation_coverage_ratio": float(val_counts["source1"] / max(len(val_pool), 1)),
     }
     return train_pool, val_pool, summary

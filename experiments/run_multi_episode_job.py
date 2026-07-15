@@ -478,6 +478,11 @@ def configure_hyperparams(args: argparse.Namespace):
         raise ValueError("pv_mixture_coverage_group_size must be positive.")
     if args.pv_eta_resample_enabled is not None:
         hyperparams.pv_eta_resample_enabled = bool(args.pv_eta_resample_enabled)
+    if bool(getattr(hyperparams, "pv_mixture_enabled", False)):
+        if bool(getattr(hyperparams, "pv_eta_resample_enabled", True)):
+            raise ValueError("PV mixture currently requires --no-pv-eta-resample-enabled.")
+        if str(getattr(hyperparams, "pv_training_flow", "joint")).lower() != "staged":
+            raise ValueError("PV mixture currently requires --pv-training-flow staged.")
     if args.firm_target_update is not None:
         hyperparams.firm_target_update = args.firm_target_update
     hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"
