@@ -272,6 +272,82 @@ class BPGridTeacher:
             mix_weight=mix_weight,
         )
 
+    def compute_value_target(
+        self,
+        parent_state: torch.Tensor,
+        children: List[torch.Tensor],
+        m_list: List[torch.Tensor],
+        *,
+        branch: str,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute only value targets needed by cached P/Q training."""
+        branch = branch.lower()
+        if branch not in {"p0", "pi"}:
+            raise ValueError(f"compute_value_target only supports p0/pi, got {branch!r}")
+        if self.parent_chunk_size > 0 and parent_state.shape[0] > self.parent_chunk_size:
+            chunks = []
+            for start in range(0, parent_state.shape[0], self.parent_chunk_size):
+                stop = min(start + self.parent_chunk_size, parent_state.shape[0])
+                chunks.append(
+                    self._compute_value_target_no_parent_chunk(
+                        parent_state[start:stop],
+                        [child[start:stop] for child in children],
+                        [m[start:stop] for m in m_list],
+                        branch=branch,
+                    )
+                )
+            return _concat_chunk_outputs(chunks)
+        return self._compute_value_target_no_parent_chunk(
+            parent_state,
+            children,
+            m_list,
+            branch=branch,
+        )
+
+    def _compute_value_target_no_parent_chunk(
+        self,
+        parent_state: torch.Tensor,
+        children: List[torch.Tensor],
+        m_list: List[torch.Tensor],
+        *,
+        branch: str,
+    ) -> Dict[str, torch.Tensor]:
+        with torch.no_grad():
+            coarse_grid = self._uniform_grid(parent_state, self.coarse_size)
+            coarse = self._evaluate_grid(parent_state, children, m_list, coarse_grid, branch=branch)
+            if self.refine:
+                fine_grid = self._local_fine_grid(coarse_grid, coarse["argmax_index"])
+                result = self._evaluate_grid(parent_state, children, m_list, fine_grid, branch=branch)
+            else:
+                result = coarse
+            argmax_index = result["argmax_index"]
+            bp_star_grid = _gather_by_index(result["bp_grid"], argmax_index)
+            bp_star = _quadratic_refine(
+                result["bp_grid"],
+                result["value_grid"],
+                argmax_index,
+                bp_star_grid,
+                self.quadratic_refine,
+            ).clamp(self.grid_min, self.grid_max)
+            if self.quadratic_refine:
+                refined_eval = self._evaluate_grid(
+                    parent_state,
+                    children,
+                    m_list,
+                    bp_star,
+                    branch=branch,
+                )
+                value_star = refined_eval["value_grid"][:, 0:1]
+            else:
+                value_star = _gather_by_index(result["value_grid"], argmax_index)
+            eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
+            bp_star = torch.where(eta_current > 0.5, bp_star, parent_state[:, 0:1])
+            return {
+                "value_star": value_star.detach(),
+                "bp_star": bp_star.detach(),
+                "bp_star_grid": bp_star_grid.detach(),
+            }
+
     def _compute_no_parent_chunk(
         self,
         parent_state: torch.Tensor,

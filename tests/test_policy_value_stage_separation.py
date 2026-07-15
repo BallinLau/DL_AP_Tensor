@@ -9,6 +9,7 @@ sys.path.append(str(ROOT))
 from config import Config  # noqa: E402
 from config.hyperparams import HyperParams  # noqa: E402
 from models.policy_value import PolicyValueModel  # noqa: E402
+from training.bp_grid_teacher import BPGridTeacher  # noqa: E402
 from training.episode import Episode  # noqa: E402
 
 
@@ -164,6 +165,81 @@ def test_bp_stage_uses_fixed_cache_and_keeps_non_bp_params_fixed():
     assert summary["validation_source"] == "holdout"
     assert summary["validation_informative"] is True
     assert summary["train_active_counts"]["total_active_supervision_entries"] >= summary["train_active_counts"]["unique_parent_active_count"]
+
+
+def test_pq_value_cache_matches_old_teacher_value_star():
+    episode = _episode()
+    batch = _batch(episode.device)
+    cache, summary = episode._build_pq_value_target_cache([batch], episode.firm_target)
+    teacher = BPGridTeacher.from_hyperparams(
+        episode.firm_target,
+        episode.loss_fns["p0"],
+        episode.loss_fns["pi"],
+        episode.hyperparams,
+    )
+    parent_state, children, m_list, *_ = episode._policy_batch_hash_components(batch)
+    p0_old = teacher.compute(parent_state, children, m_list, branch="p0")
+    pi_old = teacher.compute(parent_state, children, m_list, branch="pi")
+
+    assert summary["cache_batches"] == 1
+    assert torch.allclose(cache[0].p0_value_target, p0_old["value_star"].cpu(), atol=1e-6, rtol=1e-5)
+    assert torch.allclose(cache[0].pi_value_target, pi_old["value_star"].cpu(), atol=1e-6, rtol=1e-5)
+
+
+def test_pq_cache_builds_once_and_skips_mix_grid(monkeypatch):
+    episode = _episode()
+    batch = _batch(episode.device)
+    calls = {"p0": 0, "pi": 0, "mix": 0}
+    original_value_target = BPGridTeacher.compute_value_target
+    original_compute = BPGridTeacher.compute
+
+    def _counting_value_target(self, *args, branch, **kwargs):
+        calls[branch] += 1
+        return original_value_target(self, *args, branch=branch, **kwargs)
+
+    def _fail_on_mix(self, *args, branch, **kwargs):
+        if branch == "mix":
+            calls["mix"] += 1
+            raise AssertionError("P/Q cache must not build mix grid")
+        return original_compute(self, *args, branch=branch, **kwargs)
+
+    monkeypatch.setattr(BPGridTeacher, "compute_value_target", _counting_value_target)
+    monkeypatch.setattr(BPGridTeacher, "compute", _fail_on_mix)
+    summary = episode._run_policy_value_evaluation_stage(
+        [batch],
+        [batch],
+        episode.firm_target,
+        n_epochs=2,
+    )
+
+    assert summary["status"] == "accepted"
+    assert calls["p0"] == 2
+    assert calls["pi"] == 2
+    assert calls["mix"] == 0
+    assert summary["pq_train_cache_hash"] == summary["pq_train_cache_hash_after"]
+    assert summary["pq_validation_cache_hash"] == summary["pq_validation_cache_hash_after"]
+
+
+def test_cached_pq_validation_uses_first_order_q_graph(monkeypatch):
+    episode = _episode()
+    batch = _batch(episode.device)
+    cache, _ = episode._build_pq_value_target_cache([batch], episode.firm_target)
+    flags = []
+    original_grad = torch.autograd.grad
+
+    def _recording_grad(*args, **kwargs):
+        flags.append(bool(kwargs.get("create_graph", False)))
+        return original_grad(*args, **kwargs)
+
+    monkeypatch.setattr(torch.autograd, "grad", _recording_grad)
+    episode._evaluate_cached_pq_score([batch], cache)
+
+    assert flags
+    assert all(flag is False for flag in flags)
+
+    flags.clear()
+    episode._compute_cached_pq_loss(batch, cache[0], q_create_graph=True)
+    assert any(flag is True for flag in flags)
 
 
 def test_staged_zero_epoch_statuses():
@@ -347,12 +423,12 @@ def test_staged_failure_does_not_update_firm_target():
 
 
 def _patch_stage_loss(episode: Episode, param: torch.nn.Parameter):
-    def _loss(batch, *, component_mode, policy_loss_terms):
+    def _loss(batch, cache_item=None, *, q_create_graph=True, include_q=True):
         scale = float(batch.get("scale", 1.0))
         total = param.sum() * scale
         return total, {"total": float(total.detach().item())}
 
-    episode._compute_policy_value_component_loss = _loss
+    episode._compute_cached_pq_loss = _loss
 
 
 def test_pq_rejected_epoch_rolls_back_model_state():
@@ -360,13 +436,18 @@ def test_pq_rejected_epoch_rolls_back_model_state():
     param = episode._policy_value_stage_params("pq")[0]
     _patch_stage_loss(episode, param)
     episode._evaluate_policy_value_component_score = lambda *args, **kwargs: (1.0, {"total": 1.0})
+    episode._evaluate_cached_pq_score = lambda *args, **kwargs: (1.0, {"total": 1.0})
     episode.hyperparams.pv_grad_hard_threshold = 100.0
     episode.hyperparams.pv_epoch_max_skip_ratio = 0.4
     before = episode._state_dict_hash(episode.models["policy_value"])
+    batch_ok = _batch(episode.device)
+    batch_hard = _batch(episode.device)
+    batch_ok["scale"] = 1.0
+    batch_hard["scale"] = 1_000.0
 
     summary = episode._run_policy_value_evaluation_stage(
-        [{"scale": 1.0}, {"scale": 1_000.0}],
-        [{"scale": 1.0}],
+        [batch_ok, batch_hard],
+        [batch_ok],
         episode.firm_target,
         n_epochs=1,
     )
@@ -382,11 +463,14 @@ def test_pq_stage_failure_rolls_back_online_model():
     param = episode._policy_value_stage_params("pq")[0]
     _patch_stage_loss(episode, param)
     episode._evaluate_policy_value_component_score = lambda *args, **kwargs: (float("nan"), {})
+    episode._evaluate_cached_pq_score = lambda *args, **kwargs: (float("nan"), {})
     before = episode._state_dict_hash(episode.models["policy_value"])
+    batch = _batch(episode.device)
+    batch["scale"] = 1.0
 
     summary = episode._run_policy_value_evaluation_stage(
-        [{"scale": 1.0}],
-        [{"scale": 1.0}],
+        [batch],
+        [batch],
         episode.firm_target,
         n_epochs=1,
     )

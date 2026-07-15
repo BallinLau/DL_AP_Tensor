@@ -14,6 +14,7 @@ import pandas as pd
 import numpy as np
 import hashlib
 import random
+import json
 from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
@@ -54,6 +55,7 @@ from .pv_mixture import (
     sample_pool_without_replacement,
     select_parent_groups,
 )
+from .pq_value_cache import PQValueTargetBatch
 from .target_utils import hard_update, soft_update
 from utils.gpu_monitor import GPUMonitor, print_memory_summary
 from utils.firm_transition import apply_refinancing_policy
@@ -4856,7 +4858,7 @@ class Episode:
             self._latest_pi_terms.update(getattr(loss_fn, 'latest_foc_diag', {}))
         return total_loss
     
-    def _compute_q_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _compute_q_loss(self, batch: Dict[str, torch.Tensor], *, create_graph: bool = True) -> torch.Tensor:
         """
         计算 Q 损失（支持任意 N 分支）
         """
@@ -4979,8 +4981,8 @@ class Episode:
         q_grads = torch.autograd.grad(
             outputs=Q.sum(),
             inputs=parent_state,
-            create_graph=True,
-            retain_graph=True
+            create_graph=bool(create_graph),
+            retain_graph=bool(create_graph)
         )[0]
         dQ_db = q_grads[:, 0:1]
         dQ_dz = q_grads[:, 1:2]
@@ -6498,6 +6500,11 @@ class Episode:
         teacher_hash_before = self._state_dict_hash(teacher)
         previous_teacher = getattr(self, "_policy_value_stage_target_model", None)
         self._policy_value_stage_target_model = teacher
+        val_source = val_batches or train_batches
+        train_cache, train_cache_summary = self._build_pq_value_target_cache(train_batches, teacher)
+        val_cache, val_cache_summary = self._build_pq_value_target_cache(val_source, teacher)
+        train_cache_hash_before = self._pq_value_cache_hash(train_cache)
+        val_cache_hash_before = self._pq_value_cache_hash(val_cache)
         best_score = float("inf")
         best_epoch: Optional[int] = None
         best_checkpoint: Optional[Dict[str, Any]] = None
@@ -6522,13 +6529,26 @@ class Episode:
                     epoch_nonfinite = 0
                     epoch_soft = 0
                     epoch_total_batches = 0
-                    for batch in tqdm(train_batches, desc=f"PV P/Q eval {epoch+1}/{n_epochs}"):
+                    for batch_id, (batch, cache_item) in enumerate(
+                        tqdm(
+                            zip(train_batches, train_cache),
+                            desc=f"PV P/Q eval {epoch+1}/{n_epochs}",
+                            total=len(train_batches),
+                        )
+                    ):
+                        self._validate_pq_cache_item(
+                            batch,
+                            cache_item,
+                            teacher,
+                            batch_id=batch_id,
+                        )
                         epoch_total_batches += 1
                         optimizer.zero_grad(set_to_none=True)
-                        total, losses = self._compute_policy_value_component_loss(
+                        total, losses = self._compute_cached_pq_loss(
                             batch,
-                            component_mode="value",
-                            policy_loss_terms=["p0", "pi", "q"],
+                            cache_item,
+                            q_create_graph=True,
+                            include_q=True,
                         )
                         if not torch.isfinite(total):
                             nonfinite_count += 1
@@ -6596,10 +6616,7 @@ class Episode:
                             "skip_ratio": skip_ratio,
                         })
                         continue
-                    score, val_summary = self._evaluate_policy_value_component_score(
-                        val_batches or train_batches,
-                        teacher,
-                    )
+                    score, val_summary = self._evaluate_cached_pq_score(val_source, val_cache)
                     if not np.isfinite(score):
                         self._restore_policy_value_stage_checkpoint(
                             optimizer,
@@ -6640,6 +6657,8 @@ class Episode:
             restored = True
         avg, meta = self._aggregate_metric_records(records)
         teacher_hash_after = self._state_dict_hash(teacher)
+        train_cache_hash_after = self._pq_value_cache_hash(train_cache)
+        val_cache_hash_after = self._pq_value_cache_hash(val_cache)
         bp_head_max_change = self._param_max_change_from_snapshot(bp_params, bp_snapshot)
         if optimizer_steps == 0:
             status = "failed_no_finite_update"
@@ -6666,6 +6685,12 @@ class Episode:
             "restored_best_checkpoint": restored,
             "teacher_hash_before": teacher_hash_before,
             "teacher_hash_after": teacher_hash_after,
+            "pq_train_cache_summary": train_cache_summary,
+            "pq_validation_cache_summary": val_cache_summary,
+            "pq_train_cache_hash": train_cache_hash_before,
+            "pq_train_cache_hash_after": train_cache_hash_after,
+            "pq_validation_cache_hash": val_cache_hash_before,
+            "pq_validation_cache_hash_after": val_cache_hash_after,
             "soft_spike_count": soft_spike_count,
             "hard_spike_count": hard_spike_count,
             "nonfinite_count": nonfinite_count,
@@ -6757,6 +6782,248 @@ class Episode:
                     "teacher_snapshot_hash": self._state_dict_hash(teacher_model),
                 })
         return cache
+
+    @staticmethod
+    def _policy_output_value(output: Any, name: str, idx: int) -> torch.Tensor:
+        if isinstance(output, dict):
+            return output[name]
+        if hasattr(output, name):
+            return getattr(output, name)
+        return output[:, idx:idx + 1]
+
+    def _pq_grid_config_hash(self) -> str:
+        hp = self.hyperparams
+        keys = [
+            "bp_grid_min",
+            "bp_grid_max",
+            "bp_grid_coarse_size",
+            "bp_grid_fine_size",
+            "bp_grid_refine_enabled",
+            "bp_grid_quadratic_refine",
+            "bp_grid_parent_chunk_size",
+            "bp_grid_candidate_chunk_size",
+            "bp_grid_max_expanded_states",
+            "pv_m_clamp_min",
+            "pv_m_clamp_max",
+            "bp_grid_value_huber_delta",
+        ]
+        payload: Dict[str, Any] = {
+            key: getattr(hp, key, None)
+            for key in keys
+        }
+        payload.update({
+            "G": getattr(self.config, "G", None),
+            "DELTA": getattr(self.config, "DELTA", None),
+            "TAX_RATE": getattr(self.config, "TAX_RATE", None),
+            "RECOVERY_RATE": getattr(self.config, "RECOVERY_RATE", None),
+            "I_THRESHOLD": getattr(self.config, "I_THRESHOLD", None),
+        })
+        encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _policy_batch_hash_components(
+        self,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], str, str, str]:
+        parent = batch["parent"]
+        children = batch.get("children", [])
+        if not children and batch.get("child0") is not None and batch.get("child1") is not None:
+            children = [batch["child0"], batch["child1"]]
+        parent_state = parent[:, :7] if parent.shape[1] > 7 else parent
+        m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
+        m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
+        _, m_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+        return (
+            parent_state,
+            children,
+            m_list,
+            self._tensor_list_hash([parent_state]),
+            self._tensor_list_hash(children),
+            self._tensor_list_hash(m_list),
+        )
+
+    def _build_pq_value_target_cache(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+        teacher_model: nn.Module,
+    ) -> Tuple[List[PQValueTargetBatch], Dict[str, Any]]:
+        cache: List[PQValueTargetBatch] = []
+        grid_teacher = BPGridTeacher.from_hyperparams(
+            teacher_model,
+            self.loss_fns["p0"],
+            self.loss_fns["pi"],
+            self.hyperparams,
+        )
+        teacher_hash = self._state_dict_hash(teacher_model)
+        grid_config_hash = self._pq_grid_config_hash()
+        was_training = teacher_model.training
+        teacher_model.eval()
+        try:
+            for batch_id, batch in enumerate(batches):
+                parent_state, children, m_list, parent_hash, children_hash, m_hash = (
+                    self._policy_batch_hash_components(batch)
+                )
+                p0_target = grid_teacher.compute_value_target(
+                    parent_state=parent_state,
+                    children=children,
+                    m_list=m_list,
+                    branch="p0",
+                )
+                pi_target = grid_teacher.compute_value_target(
+                    parent_state=parent_state,
+                    children=children,
+                    m_list=m_list,
+                    branch="pi",
+                )
+                cache.append(
+                    PQValueTargetBatch(
+                        batch_id=int(batch_id),
+                        p0_value_target=p0_target["value_star"].detach().cpu(),
+                        pi_value_target=pi_target["value_star"].detach().cpu(),
+                        teacher_hash=teacher_hash,
+                        parent_hash=parent_hash,
+                        children_hash=children_hash,
+                        m_hash=m_hash,
+                        grid_config_hash=grid_config_hash,
+                        source_id=batch["source_id"].detach().cpu() if "source_id" in batch else None,
+                        source_index=batch["source_index"].detach().cpu() if "source_index" in batch else None,
+                    )
+                )
+        finally:
+            teacher_model.train(was_training)
+        return cache, {
+            "cache_batches": int(len(cache)),
+            "teacher_hash": teacher_hash,
+            "grid_config_hash": grid_config_hash,
+        }
+
+    def _validate_pq_cache_item(
+        self,
+        batch: Dict[str, torch.Tensor],
+        cache_item: PQValueTargetBatch,
+        teacher_model: nn.Module,
+        *,
+        batch_id: int,
+    ) -> None:
+        if int(cache_item.batch_id) != int(batch_id):
+            raise RuntimeError(f"P/Q cache batch_id mismatch: cache={cache_item.batch_id}, current={batch_id}")
+        if cache_item.teacher_hash != self._state_dict_hash(teacher_model):
+            raise RuntimeError("P/Q cache teacher hash mismatch.")
+        parent_state, children, m_list, parent_hash, children_hash, m_hash = self._policy_batch_hash_components(batch)
+        if cache_item.parent_hash != parent_hash:
+            raise RuntimeError("P/Q cache parent hash mismatch.")
+        if cache_item.children_hash != children_hash:
+            raise RuntimeError("P/Q cache children hash mismatch.")
+        if cache_item.m_hash != m_hash:
+            raise RuntimeError("P/Q cache M hash mismatch.")
+        if cache_item.grid_config_hash != self._pq_grid_config_hash():
+            raise RuntimeError("P/Q cache grid config hash mismatch.")
+        if cache_item.source_id is not None and "source_id" in batch:
+            if not torch.equal(cache_item.source_id, batch["source_id"].detach().cpu()):
+                raise RuntimeError("P/Q cache source_id mismatch.")
+        if cache_item.source_index is not None and "source_index" in batch:
+            if not torch.equal(cache_item.source_index, batch["source_index"].detach().cpu()):
+                raise RuntimeError("P/Q cache source_index mismatch.")
+
+    def _pq_value_cache_hash(self, cache: List[PQValueTargetBatch]) -> str:
+        tensors: List[torch.Tensor] = []
+        for item in cache:
+            tensors.extend([item.p0_value_target, item.pi_value_target])
+            if item.source_id is not None:
+                tensors.append(item.source_id)
+            if item.source_index is not None:
+                tensors.append(item.source_index)
+        return self._tensor_list_hash(tensors)
+
+    def _compute_cached_pq_loss(
+        self,
+        batch: Dict[str, torch.Tensor],
+        cache_item: PQValueTargetBatch,
+        *,
+        q_create_graph: bool,
+        include_q: bool = True,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        parent = batch["parent"]
+        parent_state = parent[:, :7] if parent.shape[1] > 7 else parent
+        output = self.models["policy_value"](parent_state)
+        p0_pred = self._policy_output_value(output, "P0", 3)
+        pi_pred = self._policy_output_value(output, "PI", 4)
+        p0_target = cache_item.p0_value_target.to(self.device)
+        pi_target = cache_item.pi_value_target.to(self.device)
+        value_delta = float(getattr(self.hyperparams, "bp_grid_value_huber_delta", 1.0))
+        p0_elem = self._huber_element(p0_pred, p0_target, value_delta)
+        pi_elem = self._huber_element(pi_pred, pi_target, value_delta)
+        p0_value_loss = p0_elem.mean()
+        pi_value_loss = pi_elem.mean()
+        p0_penalty_z = compute_z_penalty(
+            p0_elem,
+            parent_state[:, 1:2],
+            self.loss_fns["p0"].alpha_z,
+            self.loss_fns["p0"].beta_z,
+            self.loss_fns["p0"].z0,
+        )
+        pi_penalty_z = compute_z_penalty(
+            pi_elem,
+            parent_state[:, 1:2],
+            self.loss_fns["pi"].alpha_z,
+            self.loss_fns["pi"].beta_z,
+            self.loss_fns["pi"].z0,
+        )
+        pi_penalty_b = (
+            self.loss_fns["pi"].b_penalty_weight
+            * self.loss_fns["pi"].compute_b_penalty(pi_pred, parent_state[:, 0:1]).mean()
+        )
+        p0_total = p0_value_loss + p0_penalty_z
+        pi_total = pi_value_loss + pi_penalty_z + pi_penalty_b
+        q_loss = (
+            self._compute_q_loss(batch, create_graph=q_create_graph)
+            if include_q
+            else torch.tensor(0.0, device=self.device)
+        )
+        total = (
+            self.weight_scheduler["p0"] * p0_total
+            + self.weight_scheduler["pi"] * pi_total
+            + self.weight_scheduler["q"] * q_loss
+        )
+        losses = {
+            "p0": float(p0_total.detach().item()),
+            "pi": float(pi_total.detach().item()),
+            "q": float(q_loss.detach().item()),
+            "total": float(total.detach().item()),
+            "p0_cached_value_loss": float(p0_value_loss.detach().item()),
+            "pi_cached_value_loss": float(pi_value_loss.detach().item()),
+            "p0_cached_penalty_z": float(p0_penalty_z.detach().item()),
+            "pi_cached_penalty_z": float(pi_penalty_z.detach().item()),
+            "pi_cached_penalty_b": float(pi_penalty_b.detach().item()),
+        }
+        losses.update(getattr(self, "_latest_q_terms", {}))
+        return total, losses
+
+    def _evaluate_cached_pq_score(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+        cache: List[PQValueTargetBatch],
+    ) -> Tuple[float, Dict[str, Any]]:
+        if not batches:
+            return float("inf"), {"validation_batches": 0}
+        model = self.models["policy_value"]
+        was_training = model.training
+        records: List[Dict[str, Any]] = []
+        try:
+            model.eval()
+            for batch, cache_item in zip(batches, cache):
+                with torch.enable_grad():
+                    _, losses = self._compute_cached_pq_loss(
+                        batch,
+                        cache_item,
+                        q_create_graph=False,
+                        include_q=True,
+                    )
+                records.append(losses)
+        finally:
+            model.train(was_training)
+        avg, meta = self._aggregate_metric_records(records)
+        return float(avg.get("total", float("inf"))), {**avg, **meta, "validation_batches": len(batches)}
 
     def _bp_cache_hash(self, cache: List[Dict[str, Any]]) -> str:
         tensors: List[torch.Tensor] = []
