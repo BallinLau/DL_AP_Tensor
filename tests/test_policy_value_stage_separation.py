@@ -1,6 +1,8 @@
 from pathlib import Path
+from dataclasses import replace
 import sys
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -186,6 +188,33 @@ def test_pq_value_cache_matches_old_teacher_value_star():
     assert torch.allclose(cache[0].pi_value_target, pi_old["value_star"].cpu(), atol=1e-6, rtol=1e-5)
 
 
+def test_cached_pq_value_loss_matches_legacy_value_mode():
+    episode = _episode()
+    batch = _batch(episode.device)
+    cache, _ = episode._build_pq_value_target_cache([batch], episode.firm_target)
+    previous_teacher = getattr(episode, "_policy_value_stage_target_model", None)
+    episode._policy_value_stage_target_model = episode.firm_target
+    try:
+        legacy_total, legacy_losses = episode._compute_policy_value_component_loss(
+            batch,
+            component_mode="value",
+            policy_loss_terms=["p0", "pi"],
+        )
+        cached_total, cached_losses = episode._compute_cached_pq_loss(
+            batch,
+            cache[0],
+            q_create_graph=False,
+            include_q=False,
+        )
+    finally:
+        episode._policy_value_stage_target_model = previous_teacher
+
+    assert torch.allclose(cached_total, legacy_total, atol=1e-6, rtol=1e-5)
+    assert cached_losses["q"] == 0.0
+    assert cached_losses["p0"] == pytest.approx(legacy_losses["p0"], abs=1e-6, rel=1e-5)
+    assert cached_losses["pi"] == pytest.approx(legacy_losses["pi"], abs=1e-6, rel=1e-5)
+
+
 def test_pq_cache_builds_once_and_skips_mix_grid(monkeypatch):
     episode = _episode()
     batch = _batch(episode.device)
@@ -218,6 +247,73 @@ def test_pq_cache_builds_once_and_skips_mix_grid(monkeypatch):
     assert calls["mix"] == 0
     assert summary["pq_train_cache_hash"] == summary["pq_train_cache_hash_after"]
     assert summary["pq_validation_cache_hash"] == summary["pq_validation_cache_hash_after"]
+
+
+def test_pq_train_fallback_reuses_train_cache_without_rebuild(monkeypatch):
+    episode = _episode()
+    batch = _batch(episode.device)
+    calls = {"p0": 0, "pi": 0}
+    original_value_target = BPGridTeacher.compute_value_target
+
+    def _counting_value_target(self, *args, branch, **kwargs):
+        calls[branch] += 1
+        return original_value_target(self, *args, branch=branch, **kwargs)
+
+    monkeypatch.setattr(BPGridTeacher, "compute_value_target", _counting_value_target)
+    summary = episode._run_policy_value_evaluation_stage(
+        [batch],
+        [],
+        episode.firm_target,
+        n_epochs=2,
+    )
+
+    assert summary["status"] == "accepted"
+    assert calls["p0"] == 1
+    assert calls["pi"] == 1
+    assert summary["pq_validation_source"] == "train_fallback"
+    assert summary["pq_validation_cache_summary"]["reused_train_cache"] is True
+    assert summary["pq_train_cache_hash"] == summary["pq_validation_cache_hash"]
+
+
+def test_pq_cache_validation_rejects_length_mismatch():
+    episode = _episode()
+    batch = _batch(episode.device)
+
+    with pytest.raises(RuntimeError, match="length mismatch"):
+        episode._evaluate_cached_pq_score([batch], [])
+
+
+def test_pq_cache_validation_rejects_source_metadata_presence_mismatch():
+    episode = _episode()
+    batch = _batch(episode.device)
+    batch_with_source = {
+        **batch,
+        "source_id": torch.tensor([[11], [12]], dtype=torch.long),
+        "source_index": torch.tensor([[0], [1]], dtype=torch.long),
+    }
+    cache, _ = episode._build_pq_value_target_cache([batch_with_source], episode.firm_target)
+
+    with pytest.raises(RuntimeError, match="source_id presence mismatch"):
+        episode._validate_pq_cache_item(
+            batch,
+            cache[0],
+            episode.firm_target,
+            batch_id=0,
+        )
+
+
+def test_pq_cache_hash_includes_metadata():
+    episode = _episode()
+    batch = _batch(episode.device)
+    cache, _ = episode._build_pq_value_target_cache([batch], episode.firm_target)
+    base_hash = episode._pq_value_cache_hash(cache)
+
+    assert episode._pq_value_cache_hash([replace(cache[0], batch_id=99)]) != base_hash
+    assert episode._pq_value_cache_hash([replace(cache[0], teacher_hash="different")]) != base_hash
+    assert episode._pq_value_cache_hash([replace(cache[0], parent_hash="different")]) != base_hash
+    assert episode._pq_value_cache_hash([
+        replace(cache[0], source_id=torch.tensor([[1], [2]], dtype=torch.long))
+    ]) != base_hash
 
 
 def test_cached_pq_validation_uses_first_order_q_graph(monkeypatch):

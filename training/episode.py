@@ -4906,9 +4906,6 @@ class Episode:
         # 前向传播（Q 形状正则需要对输入求梯度）
         parent_state = strip_extra(parent).clone().detach().requires_grad_(True)
         target_model = self._target_policy_value()
-        output_t = model(parent_state)
-        with torch.no_grad():
-            output_t_target = target_model(parent_state.detach())
 
         def _get_out(out, name: str, idx: int) -> torch.Tensor:
             if isinstance(out, dict):
@@ -4916,6 +4913,15 @@ class Episode:
             if hasattr(out, name):
                 return getattr(out, name)
             return out[:, idx:idx + 1]
+
+        q_fn = getattr(model, "_q_output", None)
+        if callable(q_fn):
+            Q = q_fn(parent_state)
+        else:
+            output_t = model(parent_state)
+            Q = _get_out(output_t, 'Q', 0)
+        with torch.no_grad():
+            output_t_target = target_model(parent_state.detach())
 
         bp0_t = _get_out(output_t_target, 'bp0', 1).detach()
         bpI_t = _get_out(output_t_target, 'bpI', 2).detach()
@@ -4944,7 +4950,6 @@ class Episode:
                 outputsp_children.append(target_model(childsp_state.detach()))
 
         # 提取 Q 和所需变量
-        Q = _get_out(output_t, 'Q', 0)
         Qsp_children = [_get_out(out, 'Q', 0).detach() for out in outputsp_children]
         bar_zsp_children = [_get_out(out, 'bar_z', 6).detach() for out in outputsp_children]
         x_children = [child[:, 4:5] for child in children]
@@ -6500,9 +6505,21 @@ class Episode:
         teacher_hash_before = self._state_dict_hash(teacher)
         previous_teacher = getattr(self, "_policy_value_stage_target_model", None)
         self._policy_value_stage_target_model = teacher
-        val_source = val_batches or train_batches
         train_cache, train_cache_summary = self._build_pq_value_target_cache(train_batches, teacher)
-        val_cache, val_cache_summary = self._build_pq_value_target_cache(val_source, teacher)
+        validation_source = "holdout" if val_batches else "train_fallback"
+        if val_batches:
+            val_source = val_batches
+            val_cache, val_cache_summary = self._build_pq_value_target_cache(val_source, teacher)
+        else:
+            val_source = train_batches
+            val_cache = train_cache
+            val_cache_summary = {
+                **train_cache_summary,
+                "reused_train_cache": True,
+            }
+        self._validate_pq_cache_once(train_batches, train_cache, teacher, label="train")
+        if val_cache is not train_cache:
+            self._validate_pq_cache_once(val_source, val_cache, teacher, label="validation")
         train_cache_hash_before = self._pq_value_cache_hash(train_cache)
         val_cache_hash_before = self._pq_value_cache_hash(val_cache)
         best_score = float("inf")
@@ -6536,12 +6553,6 @@ class Episode:
                             total=len(train_batches),
                         )
                     ):
-                        self._validate_pq_cache_item(
-                            batch,
-                            cache_item,
-                            teacher,
-                            batch_id=batch_id,
-                        )
                         epoch_total_batches += 1
                         optimizer.zero_grad(set_to_none=True)
                         total, losses = self._compute_cached_pq_loss(
@@ -6691,6 +6702,7 @@ class Episode:
             "pq_train_cache_hash_after": train_cache_hash_after,
             "pq_validation_cache_hash": val_cache_hash_before,
             "pq_validation_cache_hash_after": val_cache_hash_after,
+            "pq_validation_source": validation_source,
             "soft_spike_count": soft_spike_count,
             "hard_spike_count": hard_spike_count,
             "nonfinite_count": nonfinite_count,
@@ -6918,22 +6930,67 @@ class Episode:
             raise RuntimeError("P/Q cache M hash mismatch.")
         if cache_item.grid_config_hash != self._pq_grid_config_hash():
             raise RuntimeError("P/Q cache grid config hash mismatch.")
-        if cache_item.source_id is not None and "source_id" in batch:
+        cache_has_source_id = cache_item.source_id is not None
+        batch_has_source_id = "source_id" in batch
+        if cache_has_source_id != batch_has_source_id:
+            raise RuntimeError("P/Q cache source_id presence mismatch.")
+        cache_has_source_index = cache_item.source_index is not None
+        batch_has_source_index = "source_index" in batch
+        if cache_has_source_index != batch_has_source_index:
+            raise RuntimeError("P/Q cache source_index presence mismatch.")
+        if cache_item.source_id is not None:
             if not torch.equal(cache_item.source_id, batch["source_id"].detach().cpu()):
                 raise RuntimeError("P/Q cache source_id mismatch.")
-        if cache_item.source_index is not None and "source_index" in batch:
+        if cache_item.source_index is not None:
             if not torch.equal(cache_item.source_index, batch["source_index"].detach().cpu()):
                 raise RuntimeError("P/Q cache source_index mismatch.")
 
     def _pq_value_cache_hash(self, cache: List[PQValueTargetBatch]) -> str:
-        tensors: List[torch.Tensor] = []
+        digest = hashlib.sha256()
         for item in cache:
-            tensors.extend([item.p0_value_target, item.pi_value_target])
-            if item.source_id is not None:
-                tensors.append(item.source_id)
-            if item.source_index is not None:
-                tensors.append(item.source_index)
-        return self._tensor_list_hash(tensors)
+            for value in (
+                str(item.batch_id),
+                item.teacher_hash,
+                item.parent_hash,
+                item.children_hash,
+                item.m_hash,
+                item.grid_config_hash,
+            ):
+                digest.update(value.encode("utf-8"))
+            for tensor in (
+                item.p0_value_target,
+                item.pi_value_target,
+                item.source_id,
+                item.source_index,
+            ):
+                if tensor is None:
+                    digest.update(b"<none>")
+                    continue
+                value = tensor.detach().cpu().contiguous()
+                digest.update(str(tuple(value.shape)).encode("utf-8"))
+                digest.update(value.numpy().tobytes())
+        return digest.hexdigest()
+
+    def _validate_pq_cache_once(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+        cache: List[PQValueTargetBatch],
+        teacher_model: nn.Module,
+        *,
+        label: str,
+    ) -> None:
+        if len(batches) != len(cache):
+            raise RuntimeError(
+                f"P/Q {label} batches and cache length mismatch: "
+                f"{len(batches)} != {len(cache)}"
+            )
+        for batch_id, (batch, item) in enumerate(zip(batches, cache)):
+            self._validate_pq_cache_item(
+                batch,
+                item,
+                teacher_model,
+                batch_id=batch_id,
+            )
 
     def _compute_cached_pq_loss(
         self,
@@ -6945,9 +7002,13 @@ class Episode:
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         parent = batch["parent"]
         parent_state = parent[:, :7] if parent.shape[1] > 7 else parent
-        output = self.models["policy_value"](parent_state)
-        p0_pred = self._policy_output_value(output, "P0", 3)
-        pi_pred = self._policy_output_value(output, "PI", 4)
+        value_fn = getattr(self.models["policy_value"], "_value_outputs", None)
+        if callable(value_fn):
+            p0_pred, pi_pred = value_fn(parent_state)
+        else:
+            output = self.models["policy_value"](parent_state)
+            p0_pred = self._policy_output_value(output, "P0", 3)
+            pi_pred = self._policy_output_value(output, "PI", 4)
         p0_target = cache_item.p0_value_target.to(self.device)
         pi_target = cache_item.pi_value_target.to(self.device)
         value_delta = float(getattr(self.hyperparams, "bp_grid_value_huber_delta", 1.0))
@@ -7006,6 +7067,11 @@ class Episode:
     ) -> Tuple[float, Dict[str, Any]]:
         if not batches:
             return float("inf"), {"validation_batches": 0}
+        if len(batches) != len(cache):
+            raise RuntimeError(
+                f"P/Q validation batches and cache length mismatch: "
+                f"{len(batches)} != {len(cache)}"
+            )
         model = self.models["policy_value"]
         was_training = model.training
         records: List[Dict[str, Any]] = []
