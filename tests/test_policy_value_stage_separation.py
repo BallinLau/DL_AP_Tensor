@@ -128,6 +128,9 @@ def test_pq_stage_keeps_bp_heads_fixed():
     assert episode._param_max_change_from_snapshot(bp_params, bp_snapshot) == 0.0
     assert episode._param_max_change_from_snapshot(pq_params, pq_snapshot) > 0.0
     assert summary["teacher_hash_before"] == summary["teacher_hash_after"]
+    assert summary["optimizer_steps"] > 0
+    assert summary["accepted_epochs"] == 1
+    assert summary["policy_value_eval_step_count"] > 0
 
 
 def test_bp_stage_uses_fixed_cache_and_keeps_non_bp_params_fixed():
@@ -155,6 +158,9 @@ def test_bp_stage_uses_fixed_cache_and_keeps_non_bp_params_fixed():
     assert summary["train_cache_hash_after"] == cache_hash_before
     assert episode._param_max_change_from_snapshot(non_bp, non_bp_snapshot) == 0.0
     assert episode._param_max_change_from_snapshot(bp_params, bp_snapshot) > 0.0
+    assert summary["optimizer_steps"] > 0
+    assert summary["accepted_epochs"] == 1
+    assert summary["bp_distill_step_count"] > 0
 
 
 def test_staged_zero_epoch_statuses():
@@ -171,3 +177,53 @@ def test_staged_zero_epoch_statuses():
     assert pq["optimizer_steps"] == 0
     assert bp["status"] == "skipped_no_epochs"
     assert bp["optimizer_steps"] == 0
+
+
+def test_staged_training_restores_model_mode_after_eval_start():
+    episode = _episode()
+    batch = _batch(episode.device)
+    model = episode.models["policy_value"]
+    model.eval()
+
+    summary = episode._run_policy_value_evaluation_stage(
+        [batch],
+        [batch],
+        episode.firm_target,
+        n_epochs=1,
+    )
+
+    assert summary["status"] == "accepted"
+    assert model.training is False
+
+
+def test_pq_stage_zero_optimizer_steps_is_not_accepted():
+    episode = _episode()
+    batch = _batch(episode.device)
+    episode.hyperparams.pv_grad_hard_threshold = 0.0
+
+    summary = episode._run_policy_value_evaluation_stage(
+        [batch],
+        [batch],
+        episode.firm_target,
+        n_epochs=1,
+    )
+
+    assert summary["status"] == "failed_no_finite_update"
+    assert summary["optimizer_steps"] == 0
+    assert summary["accepted_epochs"] == 0
+
+
+def test_staged_failure_does_not_update_firm_target():
+    episode = _episode()
+    batch = _batch(episode.device)
+    episode.hyperparams.pv_grad_hard_threshold = 0.0
+    before = episode._state_dict_hash(episode.firm_target)
+
+    result = episode._run_policy_value_staged(
+        pv_train_batches=[batch],
+        validation_batches=[batch],
+        n_epochs=1,
+    )
+
+    assert result["metadata"]["policy_value_stage_status"] == "failed_pq"
+    assert episode._state_dict_hash(episode.firm_target) == before

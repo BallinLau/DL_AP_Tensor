@@ -185,6 +185,8 @@ class Episode:
         # 训练状态
         self.step_count = 0
         self.sdf_fc1_step_count = 0
+        self.policy_value_eval_step_count = 0
+        self.bp_distill_step_count = 0
         self.sdf_training_phase = (
             SDFTrainingPhase.EPISODE0_BOOTSTRAP
             if int(self.episode_id) == 0
@@ -6144,10 +6146,13 @@ class Episode:
     ) -> Tuple[float, Dict[str, Any]]:
         if not batches:
             return float("inf"), {"validation_batches": 0}
+        model = self.models["policy_value"]
+        was_training = model.training
         previous_teacher = getattr(self, "_policy_value_stage_target_model", None)
         self._policy_value_stage_target_model = teacher
         records: List[Dict[str, Any]] = []
         try:
+            model.eval()
             for batch in batches:
                 _, losses = self._compute_policy_value_component_loss(
                     batch,
@@ -6157,6 +6162,7 @@ class Episode:
                 records.append(losses)
         finally:
             self._policy_value_stage_target_model = previous_teacher
+            model.train(was_training)
         avg, meta = self._aggregate_metric_records(records)
         return float(avg.get("total", float("inf"))), {**avg, **meta, "validation_batches": len(batches)}
 
@@ -6170,6 +6176,15 @@ class Episode:
         params = self._policy_value_stage_params("pq")
         bp_params = self._policy_value_stage_params("bp")
         bp_snapshot = self._snapshot_params(bp_params)
+        if not train_batches:
+            return {
+                "status": "skipped_no_training_batches",
+                "epochs_requested": int(n_epochs),
+                "accepted_epochs": 0,
+                "optimizer_steps": 0,
+                "best_epoch": None,
+                "target_update_count": 0,
+            }
         if n_epochs <= 0:
             return {
                 "status": "skipped_no_epochs",
@@ -6188,13 +6203,26 @@ class Episode:
         best_checkpoint: Optional[Dict[str, Any]] = None
         records: List[Dict[str, Any]] = []
         optimizer_steps = 0
+        accepted_epochs = 0
+        rejected_epochs = 0
         nonfinite_count = 0
         hard_spike_count = 0
         soft_spike_count = 0
+        epoch_summaries: List[Dict[str, Any]] = []
+        max_skip_ratio = float(getattr(self.hyperparams, "pv_epoch_max_skip_ratio", 0.05))
+        model = self.models["policy_value"]
+        was_training = model.training
         try:
+            model.train()
             with self._policy_value_train_scope("pq"):
                 for epoch in range(int(n_epochs)):
+                    epoch_optimizer_steps = 0
+                    epoch_hard = 0
+                    epoch_nonfinite = 0
+                    epoch_soft = 0
+                    epoch_total_batches = 0
                     for batch in tqdm(train_batches, desc=f"PV P/Q eval {epoch+1}/{n_epochs}"):
+                        epoch_total_batches += 1
                         optimizer.zero_grad(set_to_none=True)
                         total, losses = self._compute_policy_value_component_loss(
                             batch,
@@ -6203,6 +6231,7 @@ class Episode:
                         )
                         if not torch.isfinite(total):
                             nonfinite_count += 1
+                            epoch_nonfinite += 1
                             continue
                         total.backward()
                         raw_norm, clipped_norm = self._clip_params_with_raw_norm(
@@ -6216,23 +6245,70 @@ class Episode:
                         )
                         if not np.isfinite(raw_norm):
                             nonfinite_count += 1
+                            epoch_nonfinite += 1
                             optimizer.zero_grad(set_to_none=True)
                             continue
                         hard_threshold = float(getattr(self.hyperparams, "pv_grad_hard_threshold", 1000.0))
                         soft_threshold = float(getattr(self.hyperparams, "pv_grad_soft_threshold", 100.0))
                         if raw_norm > hard_threshold:
                             hard_spike_count += 1
+                            epoch_hard += 1
                             optimizer.zero_grad(set_to_none=True)
                             continue
                         if raw_norm > soft_threshold:
                             soft_spike_count += 1
+                            epoch_soft += 1
                         optimizer.step()
+                        self.step_count += 1
+                        self.policy_value_eval_step_count += 1
                         optimizer_steps += 1
+                        epoch_optimizer_steps += 1
                         records.append(losses)
+                    skip_ratio = (
+                        float(epoch_hard + epoch_nonfinite) / float(max(epoch_total_batches, 1))
+                    )
+                    if epoch_optimizer_steps <= 0:
+                        rejected_epochs += 1
+                        epoch_summaries.append({
+                            "epoch": epoch + 1,
+                            "accepted": False,
+                            "reason": "no_optimizer_steps",
+                            "skip_ratio": skip_ratio,
+                        })
+                        continue
+                    if skip_ratio > max_skip_ratio:
+                        rejected_epochs += 1
+                        epoch_summaries.append({
+                            "epoch": epoch + 1,
+                            "accepted": False,
+                            "reason": "skip_ratio_exceeded",
+                            "skip_ratio": skip_ratio,
+                        })
+                        continue
                     score, val_summary = self._evaluate_policy_value_component_score(
                         val_batches or train_batches,
                         teacher,
                     )
+                    if not np.isfinite(score):
+                        rejected_epochs += 1
+                        epoch_summaries.append({
+                            "epoch": epoch + 1,
+                            "accepted": False,
+                            "reason": "nonfinite_validation_score",
+                            "skip_ratio": skip_ratio,
+                        })
+                        continue
+                    accepted_epochs += 1
+                    epoch_summaries.append({
+                        "epoch": epoch + 1,
+                        "accepted": True,
+                        "optimizer_steps": epoch_optimizer_steps,
+                        "skip_ratio": skip_ratio,
+                        "validation_score": score,
+                        "soft_spikes": epoch_soft,
+                        "hard_spikes": epoch_hard,
+                        "nonfinite_batches": epoch_nonfinite,
+                    })
                     if score < best_score:
                         best_score = score
                         best_epoch = epoch + 1
@@ -6240,6 +6316,7 @@ class Episode:
                         best_checkpoint["validation_summary"] = val_summary
         finally:
             self._policy_value_stage_target_model = previous_teacher
+            model.train(was_training)
 
         restored = False
         if best_checkpoint is not None:
@@ -6248,14 +6325,20 @@ class Episode:
         avg, meta = self._aggregate_metric_records(records)
         teacher_hash_after = self._state_dict_hash(teacher)
         bp_head_max_change = self._param_max_change_from_snapshot(bp_params, bp_snapshot)
-        status = "accepted" if best_checkpoint is not None else "failed_no_finite_update"
+        if optimizer_steps == 0:
+            status = "failed_no_finite_update"
+        elif best_checkpoint is None:
+            status = "failed_no_valid_checkpoint"
+        else:
+            status = "accepted"
         return {
             "status": status,
             "epochs_requested": int(n_epochs),
             "epochs_completed": int(n_epochs),
-            "accepted_epochs": int(n_epochs if best_checkpoint is not None else 0),
-            "rejected_epochs": 0,
+            "accepted_epochs": int(accepted_epochs),
+            "rejected_epochs": int(rejected_epochs),
             "optimizer_steps": optimizer_steps,
+            "policy_value_eval_step_count": int(self.policy_value_eval_step_count),
             "best_epoch": best_epoch,
             "best_validation_score": best_score if np.isfinite(best_score) else None,
             "restored_best_checkpoint": restored,
@@ -6265,6 +6348,7 @@ class Episode:
             "hard_spike_count": hard_spike_count,
             "nonfinite_count": nonfinite_count,
             "bp_head_parameter_max_change": bp_head_max_change,
+            "epoch_summaries": epoch_summaries,
             "train_metrics": {**avg, **meta},
         }
 
@@ -6457,11 +6541,17 @@ class Episode:
     def _evaluate_bp_cache_score(self, cache: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any]]:
         if not cache:
             return float("inf"), {"validation_batches": 0}
+        model = self.models["policy_value"]
+        was_training = model.training
         records: List[Dict[str, Any]] = []
-        with torch.no_grad():
-            for item in cache:
-                _, losses = self._compute_bp_cache_loss(item)
-                records.append(losses)
+        try:
+            model.eval()
+            with torch.no_grad():
+                for item in cache:
+                    _, losses = self._compute_bp_cache_loss(item)
+                    records.append(losses)
+        finally:
+            model.train(was_training)
         avg, meta = self._aggregate_metric_records(records)
         active_maes = [
             value for key, value in avg.items()
@@ -6523,45 +6613,124 @@ class Episode:
         best_checkpoint: Optional[Dict[str, Any]] = None
         wait = 0
         optimizer_steps = 0
+        accepted_epochs = 0
+        hard_spike_count = 0
+        nonfinite_count = 0
+        soft_spike_count = 0
+        epoch_summaries: List[Dict[str, Any]] = []
         records: List[Dict[str, Any]] = []
         teacher_hash = self._state_dict_hash(teacher_snapshot)
         skipped_no_active = False
-        with self._policy_value_train_scope("bp"):
-            for epoch in range(int(n_epochs)):
-                for item in tqdm(train_cache, desc=f"BP distill {epoch+1}/{n_epochs}"):
-                    optimizer.zero_grad(set_to_none=True)
-                    total, losses = self._compute_bp_cache_loss(item)
-                    if not torch.isfinite(total):
-                        continue
-                    total.backward()
-                    raw_norm, clipped_norm = self._clip_params_with_raw_norm(
-                        params,
-                        float(getattr(self.hyperparams, "bp_distill_grad_clip_norm", 10.0)),
-                    )
-                    losses["bp_raw_grad_norm"] = raw_norm
-                    losses["bp_clipped_grad_norm"] = clipped_norm
-                    if not np.isfinite(raw_norm):
+        max_skip_ratio = float(getattr(self.hyperparams, "pv_epoch_max_skip_ratio", 0.05))
+        hard_threshold = float(getattr(self.hyperparams, "pv_grad_hard_threshold", 1000.0))
+        soft_threshold = float(getattr(self.hyperparams, "pv_grad_soft_threshold", 100.0))
+        model = self.models["policy_value"]
+        was_training = model.training
+        try:
+            model.train()
+            with self._policy_value_train_scope("bp"):
+                for epoch in range(int(n_epochs)):
+                    epoch_optimizer_steps = 0
+                    epoch_hard = 0
+                    epoch_nonfinite = 0
+                    epoch_soft = 0
+                    epoch_total = 0
+                    for item in tqdm(train_cache, desc=f"BP distill {epoch+1}/{n_epochs}"):
+                        epoch_total += 1
                         optimizer.zero_grad(set_to_none=True)
+                        total, losses = self._compute_bp_cache_loss(item)
+                        if not torch.isfinite(total):
+                            nonfinite_count += 1
+                            epoch_nonfinite += 1
+                            continue
+                        total.backward()
+                        raw_norm, clipped_norm = self._clip_params_with_raw_norm(
+                            params,
+                            float(getattr(self.hyperparams, "bp_distill_grad_clip_norm", 10.0)),
+                        )
+                        losses["bp_raw_grad_norm"] = raw_norm
+                        losses["bp_clipped_grad_norm"] = clipped_norm
+                        if not np.isfinite(raw_norm):
+                            nonfinite_count += 1
+                            epoch_nonfinite += 1
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
+                        if raw_norm > hard_threshold:
+                            hard_spike_count += 1
+                            epoch_hard += 1
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
+                        if raw_norm > soft_threshold:
+                            soft_spike_count += 1
+                            epoch_soft += 1
+                        optimizer.step()
+                        self.step_count += 1
+                        self.bp_distill_step_count += 1
+                        optimizer_steps += 1
+                        epoch_optimizer_steps += 1
+                        records.append(losses)
+                    skip_ratio = float(epoch_hard + epoch_nonfinite) / float(max(epoch_total, 1))
+                    if epoch_optimizer_steps <= 0:
+                        epoch_summaries.append({
+                            "epoch": epoch + 1,
+                            "accepted": False,
+                            "reason": "no_optimizer_steps",
+                            "skip_ratio": skip_ratio,
+                        })
                         continue
-                    optimizer.step()
-                    optimizer_steps += 1
-                    records.append(losses)
-                score, val_summary = self._evaluate_bp_cache_score(val_cache or train_cache)
-                if val_summary.get("status") == "skipped_no_active_refinancing":
-                    skipped_no_active = True
-                    best_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
-                    best_epoch = epoch + 1
-                    break
-                if score < best_score - min_delta:
-                    best_score = score
-                    best_epoch = epoch + 1
-                    wait = 0
-                    best_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
-                    best_checkpoint["validation_summary"] = val_summary
-                else:
-                    wait += 1
-                    if wait >= patience:
+                    if skip_ratio > max_skip_ratio:
+                        epoch_summaries.append({
+                            "epoch": epoch + 1,
+                            "accepted": False,
+                            "reason": "skip_ratio_exceeded",
+                            "skip_ratio": skip_ratio,
+                        })
+                        continue
+                    score, val_summary = self._evaluate_bp_cache_score(val_cache or train_cache)
+                    if val_summary.get("status") == "skipped_no_active_refinancing":
+                        skipped_no_active = True
+                        best_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
+                        best_epoch = epoch + 1
+                        accepted_epochs += 1
+                        epoch_summaries.append({
+                            "epoch": epoch + 1,
+                            "accepted": True,
+                            "status": "skipped_no_active_refinancing",
+                            "optimizer_steps": epoch_optimizer_steps,
+                            "skip_ratio": skip_ratio,
+                        })
                         break
+                    if not np.isfinite(score):
+                        epoch_summaries.append({
+                            "epoch": epoch + 1,
+                            "accepted": False,
+                            "reason": "nonfinite_validation_score",
+                            "skip_ratio": skip_ratio,
+                        })
+                        continue
+                    accepted_epochs += 1
+                    epoch_summaries.append({
+                        "epoch": epoch + 1,
+                        "accepted": True,
+                        "optimizer_steps": epoch_optimizer_steps,
+                        "skip_ratio": skip_ratio,
+                        "validation_score": score,
+                        "soft_spikes": epoch_soft,
+                        "hard_spikes": epoch_hard,
+                        "nonfinite_batches": epoch_nonfinite,
+                    })
+                    if score < best_score - min_delta:
+                        best_score = score
+                        best_epoch = epoch + 1
+                        wait = 0
+                        best_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
+                        best_checkpoint["validation_summary"] = val_summary
+                    else:
+                        wait += 1
+                        if wait >= patience:
+                            break
+        finally:
+            model.train(was_training)
         restored = False
         if best_checkpoint is not None:
             self._restore_policy_value_stage_checkpoint(optimizer, best_checkpoint, None)
@@ -6570,15 +6739,21 @@ class Episode:
         train_hash_after = self._bp_cache_hash(train_cache)
         val_hash_after = self._bp_cache_hash(val_cache)
         non_bp_max_change = self._param_max_change_from_snapshot(non_bp_params, non_bp_snapshot)
-        if skipped_no_active:
+        if skipped_no_active and optimizer_steps > 0:
             status = "skipped_no_active_refinancing"
+        elif optimizer_steps == 0:
+            status = "failed_no_finite_update"
+        elif best_checkpoint is None:
+            status = "failed_no_valid_checkpoint"
         else:
-            status = "accepted" if best_checkpoint is not None else "failed_no_finite_update"
+            status = "accepted"
         return {
             "status": status,
             "epochs_requested": int(n_epochs),
             "epochs_completed": int(best_epoch or 0),
             "optimizer_steps": optimizer_steps,
+            "accepted_epochs": int(accepted_epochs),
+            "bp_distill_step_count": int(self.bp_distill_step_count),
             "best_epoch": best_epoch,
             "best_validation_score": best_score if np.isfinite(best_score) else None,
             "patience": patience,
@@ -6589,6 +6764,10 @@ class Episode:
             "validation_cache_hash": val_hash_before,
             "validation_cache_hash_after": val_hash_after,
             "non_bp_parameter_max_change": non_bp_max_change,
+            "soft_spike_count": soft_spike_count,
+            "hard_spike_count": hard_spike_count,
+            "nonfinite_count": nonfinite_count,
+            "epoch_summaries": epoch_summaries,
             "train_metrics": {**avg, **meta},
         }
 
@@ -6625,7 +6804,7 @@ class Episode:
             episode_teacher,
             eval_epochs,
         )
-        if pq_summary.get("status") not in {"accepted", "skipped_no_epochs"}:
+        if pq_summary.get("status") != "accepted":
             self._last_policy_value_stage_summary = {
                 "policy_value_training_flow": "staged",
                 "policy_value_stage_status": "failed_pq",
@@ -6649,8 +6828,8 @@ class Episode:
             bp_epochs,
         )
         stages_successful = (
-            pq_summary.get("status") in {"accepted", "skipped_no_epochs"}
-            and bp_summary.get("status") in {"accepted", "skipped_no_epochs", "skipped_no_active_refinancing"}
+            pq_summary.get("status") == "accepted"
+            and bp_summary.get("status") in {"accepted", "skipped_no_active_refinancing"}
         )
         target_update_count = 0
         if stages_successful and firm_mode == "stage_hard":
