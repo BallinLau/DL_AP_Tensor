@@ -161,6 +161,8 @@ def test_bp_stage_uses_fixed_cache_and_keeps_non_bp_params_fixed():
     assert summary["optimizer_steps"] > 0
     assert summary["accepted_epochs"] == 1
     assert summary["bp_distill_step_count"] > 0
+    assert summary["validation_source"] == "holdout"
+    assert summary["validation_informative"] is True
 
 
 def test_staged_zero_epoch_statuses():
@@ -177,6 +179,57 @@ def test_staged_zero_epoch_statuses():
     assert pq["optimizer_steps"] == 0
     assert bp["status"] == "skipped_no_epochs"
     assert bp["optimizer_steps"] == 0
+
+
+def _zero_bp_cache_activity(cache):
+    for item in cache:
+        item["bp0_confidence"] = torch.zeros_like(item["bp0_confidence"])
+        item["bpi_confidence"] = torch.zeros_like(item["bpi_confidence"])
+        item["mix_confidence"] = torch.zeros_like(item["mix_confidence"])
+
+
+def test_bp_validation_without_active_states_uses_train_fallback():
+    episode = _episode()
+    batch = _batch(episode.device)
+    teacher = episode.firm_target
+    train_cache = episode._build_bp_target_cache([batch], teacher)
+    val_cache = episode._build_bp_target_cache([batch], teacher)
+    _zero_bp_cache_activity(val_cache)
+
+    summary = episode._run_bp_distillation_stage(
+        train_cache,
+        val_cache,
+        teacher,
+        n_epochs=1,
+    )
+
+    assert summary["status"] == "accepted"
+    assert summary["train_active_count"] > 0
+    assert summary["validation_active_count"] == 0
+    assert summary["validation_source"] == "train_fallback"
+    assert summary["validation_informative"] is False
+    assert summary["optimizer_steps"] > 0
+
+
+def test_bp_train_without_active_states_skips_stage():
+    episode = _episode()
+    batch = _batch(episode.device)
+    teacher = episode.firm_target
+    train_cache = episode._build_bp_target_cache([batch], teacher)
+    val_cache = episode._build_bp_target_cache([batch], teacher)
+    _zero_bp_cache_activity(train_cache)
+
+    summary = episode._run_bp_distillation_stage(
+        train_cache,
+        val_cache,
+        teacher,
+        n_epochs=1,
+    )
+
+    assert summary["status"] == "skipped_no_active_refinancing"
+    assert summary["train_active_count"] == 0
+    assert summary["validation_active_count"] > 0
+    assert summary["optimizer_steps"] == 0
 
 
 def test_staged_training_restores_model_mode_after_eval_start():
@@ -293,6 +346,12 @@ def test_bp_rejected_epoch_rolls_back_bp_heads():
     episode._compute_bp_cache_loss = _loss
     episode._evaluate_bp_cache_score = lambda *args, **kwargs: (1.0, {"total": 1.0})
     episode._bp_cache_hash = lambda _cache: "fixed-cache"
+    episode._bp_cache_active_counts = lambda _cache: {
+        "bp0_active_count": 1.0,
+        "bpi_active_count": 1.0,
+        "mix_active_count": 1.0,
+        "total_active_count": 3.0,
+    }
     episode.hyperparams.pv_grad_hard_threshold = 100.0
     episode.hyperparams.pv_epoch_max_skip_ratio = 0.4
     before = episode._state_dict_hash(episode.models["policy_value"])

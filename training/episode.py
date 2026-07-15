@@ -6153,6 +6153,9 @@ class Episode:
         records: List[Dict[str, Any]] = []
         try:
             model.eval()
+            # Q validation calls torch.autograd.grad with respect to the
+            # parent state for shape regularization, so this path cannot be
+            # wrapped in torch.no_grad() without changing the Q objective.
             for batch in batches:
                 _, losses = self._compute_policy_value_component_loss(
                     batch,
@@ -6472,6 +6475,31 @@ class Episode:
             ])
         return self._tensor_list_hash(tensors)
 
+    @staticmethod
+    def _bp_cache_active_counts(cache: List[Dict[str, Any]]) -> Dict[str, float]:
+        counts = {
+            "bp0_active_count": 0.0,
+            "bpi_active_count": 0.0,
+            "mix_active_count": 0.0,
+            "total_active_count": 0.0,
+        }
+        for item in cache:
+            bp0_weight = item["bp0_confidence"].detach().cpu()
+            bpi_weight = item["bpi_confidence"].detach().cpu()
+            mix_weight = (
+                item["mix_confidence"].detach().cpu()
+                * item["mix_sample_weight"].detach().cpu()
+            )
+            counts["bp0_active_count"] += float((bp0_weight > 0).sum().item())
+            counts["bpi_active_count"] += float((bpi_weight > 0).sum().item())
+            counts["mix_active_count"] += float((mix_weight > 0).sum().item())
+        counts["total_active_count"] = (
+            counts["bp0_active_count"]
+            + counts["bpi_active_count"]
+            + counts["mix_active_count"]
+        )
+        return counts
+
     def _compute_bp_cache_loss(
         self,
         item: Dict[str, Any],
@@ -6608,6 +6636,8 @@ class Episode:
         non_bp_snapshot = self._snapshot_params(non_bp_params)
         train_hash_before = self._bp_cache_hash(train_cache)
         val_hash_before = self._bp_cache_hash(val_cache)
+        train_active_counts = self._bp_cache_active_counts(train_cache)
+        validation_active_counts = self._bp_cache_active_counts(val_cache)
         if n_epochs <= 0:
             return {
                 "status": "skipped_no_epochs",
@@ -6617,8 +6647,10 @@ class Episode:
                 "target_update_count": 0,
                 "train_cache_hash": train_hash_before,
                 "validation_cache_hash": val_hash_before,
+                "train_active_count": train_active_counts["total_active_count"],
+                "validation_active_count": validation_active_counts["total_active_count"],
             }
-        if not train_cache:
+        if not train_cache or train_active_counts["total_active_count"] <= 0:
             return {
                 "status": "skipped_no_active_refinancing",
                 "epochs_requested": int(n_epochs),
@@ -6627,7 +6659,17 @@ class Episode:
                 "target_update_count": 0,
                 "train_cache_hash": train_hash_before,
                 "validation_cache_hash": val_hash_before,
+                "train_active_count": train_active_counts["total_active_count"],
+                "validation_active_count": validation_active_counts["total_active_count"],
+                "train_active_counts": train_active_counts,
+                "validation_active_counts": validation_active_counts,
+                "validation_source": "none",
+                "validation_informative": False,
             }
+        validation_has_active = validation_active_counts["total_active_count"] > 0
+        score_cache = val_cache if validation_has_active else train_cache
+        validation_source = "holdout" if validation_has_active else "train_fallback"
+        validation_informative = bool(validation_has_active)
         optimizer = self._make_policy_value_stage_optimizer(params)
         stage_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
         patience = max(0, int(getattr(self.hyperparams, "bp_distill_patience", 3)))
@@ -6721,17 +6763,12 @@ class Episode:
                             "skip_ratio": skip_ratio,
                         })
                         continue
-                    score, val_summary = self._evaluate_bp_cache_score(val_cache or train_cache)
+                    score, val_summary = self._evaluate_bp_cache_score(score_cache)
                     if val_summary.get("status") == "skipped_no_active_refinancing":
-                        skipped_no_active = True
-                        best_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
-                        best_epoch = epoch + 1
-                        accepted_epochs += 1
                         epoch_summaries.append({
                             "epoch": epoch + 1,
-                            "accepted": True,
-                            "status": "skipped_no_active_refinancing",
-                            "optimizer_steps": epoch_optimizer_steps,
+                            "accepted": False,
+                            "reason": "score_cache_no_active",
                             "skip_ratio": skip_ratio,
                         })
                         break
@@ -6809,6 +6846,12 @@ class Episode:
             "train_cache_hash_after": train_hash_after,
             "validation_cache_hash": val_hash_before,
             "validation_cache_hash_after": val_hash_after,
+            "train_active_count": train_active_counts["total_active_count"],
+            "validation_active_count": validation_active_counts["total_active_count"],
+            "train_active_counts": train_active_counts,
+            "validation_active_counts": validation_active_counts,
+            "validation_source": validation_source,
+            "validation_informative": validation_informative,
             "non_bp_parameter_max_change": non_bp_max_change,
             "soft_spike_count": soft_spike_count,
             "hard_spike_count": hard_spike_count,
