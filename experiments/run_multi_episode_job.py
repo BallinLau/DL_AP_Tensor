@@ -272,6 +272,42 @@ def parse_args() -> argparse.Namespace:
         help="Trainable BP distillation parameter scope",
     )
     parser.add_argument(
+        "--pv-mixture-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable fixed-total SimulateTS/Sample mixture for episode>0 Policy/Value training.",
+    )
+    parser.add_argument("--pv-mixture-ratio", type=float, default=None, help="Coverage Sample parent-group share in fixed-total PV mixture")
+    parser.add_argument("--pv-mixture-start-episode", type=int, default=None, help="First episode id eligible for PV mixture")
+    parser.add_argument(
+        "--pv-mixture-budget-mode",
+        type=str.lower,
+        default=None,
+        choices=["fixed_total", "append_coverage"],
+        help="PV mixture budget mode; first formal implementation uses fixed_total.",
+    )
+    parser.add_argument(
+        "--pv-mixture-sampling-mode",
+        type=str.lower,
+        default=None,
+        choices=["uniform", "feasible", "realbz"],
+        help="Coverage Sample sampling mode for PV mixture.",
+    )
+    parser.add_argument("--pv-mixture-coverage-group-size", type=int, default=None, help="Coverage Sample firm group size")
+    parser.add_argument("--pv-mixture-seed", type=int, default=None, help="Base seed for deterministic PV mixture coverage data")
+    parser.add_argument(
+        "--pv-mixture-stratified-validation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Split SimulateTS and coverage parent groups separately into train/validation.",
+    )
+    parser.add_argument(
+        "--pv-mixture-preserve-rng",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Restore Python/NumPy/Torch/CUDA RNG state after building coverage Sample data.",
+    )
+    parser.add_argument(
         "--bp-grid-confidence-relative",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -410,6 +446,30 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.pv_rollback_on_soft_spikes = bool(args.pv_rollback_on_soft_spikes)
     if args.bp_distill_trainable_scope is not None:
         hyperparams.bp_distill_trainable_scope = args.bp_distill_trainable_scope
+    if args.pv_mixture_enabled is not None:
+        hyperparams.pv_mixture_enabled = bool(args.pv_mixture_enabled)
+    if args.pv_mixture_ratio is not None:
+        hyperparams.pv_mixture_ratio = float(args.pv_mixture_ratio)
+    if args.pv_mixture_start_episode is not None:
+        hyperparams.pv_mixture_start_episode = int(args.pv_mixture_start_episode)
+    if args.pv_mixture_budget_mode is not None:
+        hyperparams.pv_mixture_budget_mode = args.pv_mixture_budget_mode
+    if args.pv_mixture_sampling_mode is not None:
+        hyperparams.pv_mixture_sampling_mode = args.pv_mixture_sampling_mode
+    if args.pv_mixture_coverage_group_size is not None:
+        hyperparams.pv_mixture_coverage_group_size = int(args.pv_mixture_coverage_group_size)
+    if args.pv_mixture_seed is not None:
+        hyperparams.pv_mixture_seed = int(args.pv_mixture_seed)
+    if args.pv_mixture_stratified_validation is not None:
+        hyperparams.pv_mixture_stratified_validation = bool(args.pv_mixture_stratified_validation)
+    if args.pv_mixture_preserve_rng is not None:
+        hyperparams.pv_mixture_preserve_rng = bool(args.pv_mixture_preserve_rng)
+    if not 0.0 <= float(getattr(hyperparams, "pv_mixture_ratio", 0.0)) <= 1.0:
+        raise ValueError("pv_mixture_ratio must be in [0, 1].")
+    if str(getattr(hyperparams, "pv_mixture_budget_mode", "fixed_total")).lower() not in {"fixed_total", "append_coverage"}:
+        raise ValueError("pv_mixture_budget_mode must be fixed_total or append_coverage.")
+    if int(getattr(hyperparams, "pv_mixture_coverage_group_size", 2)) <= 0:
+        raise ValueError("pv_mixture_coverage_group_size must be positive.")
     if args.firm_target_update is not None:
         hyperparams.firm_target_update = args.firm_target_update
     hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"
@@ -603,6 +663,13 @@ def main():
                     "pv_eval_epochs": hyperparams.pv_eval_epochs,
                     "bp_distill_epochs": hyperparams.bp_distill_epochs,
                     "bp_distill_patience": hyperparams.bp_distill_patience,
+                    "pv_mixture_enabled": hyperparams.pv_mixture_enabled,
+                    "pv_mixture_ratio": hyperparams.pv_mixture_ratio,
+                    "pv_mixture_start_episode": hyperparams.pv_mixture_start_episode,
+                    "pv_mixture_budget_mode": hyperparams.pv_mixture_budget_mode,
+                    "pv_mixture_sampling_mode": hyperparams.pv_mixture_sampling_mode,
+                    "pv_mixture_coverage_group_size": hyperparams.pv_mixture_coverage_group_size,
+                    "pv_mixture_seed": hyperparams.pv_mixture_seed,
                     "pv_rollback_on_soft_spikes": hyperparams.pv_rollback_on_soft_spikes,
                     "firm_target_update": hyperparams.firm_target_update,
                     "modeb_resimulate_after_pv": args.modeb_resimulate_after_pv,

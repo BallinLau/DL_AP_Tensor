@@ -160,6 +160,19 @@ class HyperParams:
     pv_rollback_on_soft_spikes: bool = False
     bp_label_cache_mode: str = "cpu"
     bp_distill_trainable_scope: str = "heads_only"
+    # Optional Policy/Value mixture sampling for episode e>0.  When enabled,
+    # refreshed SimulateTS parent groups are mixed with coverage Sample parent
+    # groups after the post-refresh SDF/FC1 safety gate and before P/Q-BP
+    # staged training.  Disabled by default to preserve the legacy path.
+    pv_mixture_enabled: bool = False
+    pv_mixture_ratio: float = 0.20
+    pv_mixture_start_episode: int = 1
+    pv_mixture_budget_mode: str = "fixed_total"
+    pv_mixture_sampling_mode: str = "uniform"
+    pv_mixture_coverage_group_size: int = 2
+    pv_mixture_seed: int = 24680
+    pv_mixture_stratified_validation: bool = True
+    pv_mixture_preserve_rng: bool = True
     
     # NaN/Inf 检测
     nan_recovery: bool = True

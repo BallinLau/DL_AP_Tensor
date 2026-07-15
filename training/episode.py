@@ -13,6 +13,7 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 import hashlib
+import random
 from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
@@ -45,6 +46,11 @@ from .bp_policy_loss import (
     compute_target_grid_policy_logit_distillation_loss,
     compute_target_grid_policy_distillation_loss,
     huber_element,
+)
+from .pv_mixture import (
+    PVParentGroupPool,
+    build_fixed_total_mixture_split,
+    select_parent_groups,
 )
 from .target_utils import hard_update, soft_update
 from utils.gpu_monitor import GPUMonitor, print_memory_summary
@@ -1109,6 +1115,7 @@ class Episode:
         state: Dict[str, Any] = {
             'torch': torch.get_rng_state(),
             'numpy': np.random.get_state(),
+            'python': random.getstate(),
         }
         if torch.cuda.is_available():
             state['cuda'] = torch.cuda.get_rng_state_all()
@@ -1121,6 +1128,8 @@ class Episode:
             torch.set_rng_state(state['torch'])
         if 'numpy' in state:
             np.random.set_state(state['numpy'])
+        if 'python' in state:
+            random.setstate(state['python'])
         if 'cuda' in state and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state['cuda'])
 
@@ -1341,7 +1350,8 @@ class Episode:
         children: List[torch.Tensor],
         batch_size: int,
         eta_resample: bool = True,
-        extra_tensors: Optional[Dict[str, torch.Tensor]] = None
+        extra_tensors: Optional[Dict[str, torch.Tensor]] = None,
+        shuffle: bool = True,
     ) -> List[Dict[str, torch.Tensor]]:
         if parent is None or parent.numel() == 0:
             return []
@@ -1353,7 +1363,7 @@ class Episode:
 
         # eta 稀疏时，对 Policy/Value 批次进行条件重采样，增强 eta=1 信号。
         resample_enabled = bool(getattr(self.hyperparams, "pv_eta_resample_enabled", True))
-        if eta_resample and resample_enabled and n_units > 1 and len(children) > 0:
+        if shuffle and eta_resample and resample_enabled and n_units > 1 and len(children) > 0:
             eta_current = parent[:, 2:3].clamp(0.0, 1.0)
             active_mask = eta_current.squeeze(-1) > 0.5
             active_idx = torch.where(active_mask)[0]
@@ -1372,7 +1382,7 @@ class Episode:
                 indices = indices[torch.randperm(indices.numel(), device=indices.device)]
             else:
                 indices = indices[torch.randperm(n_units, device=indices.device)]
-        else:
+        elif shuffle:
             indices = indices[torch.randperm(n_units, device=indices.device)]
 
         max_units = int(getattr(self.hyperparams, "max_firm_train_units", 0))
@@ -1406,19 +1416,18 @@ class Episode:
             batches.append(batch)
         return batches
 
-    def _create_firm_batches_from_tensor(
+    def _tensor_to_parent_group_pool(
         self,
         table: TensorTable,
-        batch_size: int = 1024,
         n_branches: int = 2,
-        eta_resample: bool = True
-    ) -> List[Dict[str, torch.Tensor]]:
+        source_id: int = 0,
+    ) -> Optional[PVParentGroupPool]:
         """
-        从 firm-level TensorTable 创建训练批次（兼容 Sample/SimulateTS tensor 输出）。
+        从 firm-level TensorTable 解析 parent/children parent-group pool。
         """
         data = table.data
         if data.numel() == 0:
-            return []
+            return None
         col = {name: i for i, name in enumerate(table.columns)}
         required = ['path', 'branch', 'b', 'z', 'ETA', 'i', 'x', 'Hatcf', 'LnKF']
         missing = [k for k in required if k not in col]
@@ -1440,7 +1449,7 @@ class Episode:
         parent_mask = (branch == parent_branch)
         parent_idx = torch.nonzero(parent_mask, as_tuple=False).squeeze(-1)
         if parent_idx.numel() == 0:
-            return []
+            return None
         parent_path = path[parent_idx]
         parent_id = ident[parent_idx]
         parent_t = t[parent_idx] if (has_t and parent_branch < 0) else torch.zeros_like(parent_path)
@@ -1466,7 +1475,7 @@ class Episode:
             child_selected.append(matched_idx)
 
         if active.sum().item() == 0:
-            return []
+            return None
 
         parent_take = parent_idx[active]
         child_take = [idx[active] for idx in child_selected]
@@ -1483,13 +1492,208 @@ class Episode:
             children_m = [torch.ones(c.shape[0], 1, device=data.device, dtype=data.dtype) for c in children_feat]
         parent = torch.cat([parent_feat, parent_m], dim=1).to(torch.float32)
         children = [torch.cat([c, m], dim=1).to(torch.float32) for c, m in zip(children_feat, children_m)]
-
-        return self._build_batches_from_parent_children(
+        source_tensor = torch.full(
+            (parent.shape[0],),
+            int(source_id),
+            device=parent.device,
+            dtype=torch.long,
+        )
+        source_index = parent_take.to(device=parent.device, dtype=torch.long)
+        return PVParentGroupPool(
             parent=parent,
             children=children,
-            batch_size=batch_size,
-            eta_resample=eta_resample
+            source_id=source_tensor,
+            source_index=source_index,
         )
+
+    def _parent_group_pool_to_batches(
+        self,
+        pool: Optional[PVParentGroupPool],
+        batch_size: int = 1024,
+        eta_resample: bool = True,
+        shuffle: bool = True,
+    ) -> List[Dict[str, torch.Tensor]]:
+        if pool is None or len(pool) == 0:
+            return []
+        return self._build_batches_from_parent_children(
+            parent=pool.parent,
+            children=pool.children,
+            batch_size=batch_size,
+            eta_resample=eta_resample,
+            extra_tensors={
+                "source_id": pool.source_id,
+                "source_index": pool.source_index,
+            },
+            shuffle=shuffle,
+        )
+
+    def _create_firm_batches_from_tensor(
+        self,
+        table: TensorTable,
+        batch_size: int = 1024,
+        n_branches: int = 2,
+        eta_resample: bool = True
+    ) -> List[Dict[str, torch.Tensor]]:
+        """
+        从 firm-level TensorTable 创建训练批次（兼容 Sample/SimulateTS tensor 输出）。
+        """
+        pool = self._tensor_to_parent_group_pool(table, n_branches=n_branches, source_id=0)
+        return self._parent_group_pool_to_batches(
+            pool,
+            batch_size=batch_size,
+            eta_resample=eta_resample,
+        )
+
+    @staticmethod
+    def _shuffle_pool(pool: PVParentGroupPool, generator: torch.Generator) -> PVParentGroupPool:
+        if len(pool) <= 1:
+            return pool
+        return select_parent_groups(pool, torch.randperm(len(pool), generator=generator))
+
+    @staticmethod
+    def _pool_feature_stats(prefix: str, pool: Optional[PVParentGroupPool]) -> Dict[str, float]:
+        if pool is None or len(pool) == 0:
+            return {f"{prefix}_parent_groups": 0.0}
+        names = ["b", "z", "ETA", "i", "x", "Hatcf", "LnKF", "M"]
+        data = pool.parent.detach().float().cpu()
+        stats: Dict[str, float] = {f"{prefix}_parent_groups": float(data.shape[0])}
+        for idx, name in enumerate(names[: data.shape[1]]):
+            col = data[:, idx]
+            stats[f"{prefix}_{name}_mean"] = float(col.mean().item())
+            stats[f"{prefix}_{name}_std"] = float(col.std(unbiased=False).item()) if col.numel() > 1 else 0.0
+        return stats
+
+    def _pv_mixture_enabled_for_episode(self) -> Tuple[bool, str]:
+        hp = self.hyperparams
+        if not bool(getattr(hp, "pv_mixture_enabled", False)):
+            return False, "disabled"
+        if int(self.episode_id) == 0:
+            return False, "episode0_unchanged"
+        if int(self.episode_id) < int(getattr(hp, "pv_mixture_start_episode", 1)):
+            return False, "before_start_episode"
+        ratio = float(getattr(hp, "pv_mixture_ratio", 0.0))
+        if ratio <= 0.0:
+            return False, "zero_ratio"
+        return True, "enabled"
+
+    def _build_pv_coverage_pool(self, n_parent_groups: int, n_branches: int) -> Optional[PVParentGroupPool]:
+        hp = self.hyperparams
+        group_size = max(1, int(getattr(hp, "pv_mixture_coverage_group_size", 2)))
+        n_paths = max(1, int(np.ceil(max(int(n_parent_groups), 1) / group_size)))
+        sampler = Sample(
+            models=self.models,
+            config=self.config,
+            n_samples=None,
+            n_paths=n_paths,
+            group_size=group_size,
+            branch_num=n_branches,
+            data_mode="sample",
+            sampling_mode=str(getattr(hp, "pv_mixture_sampling_mode", "uniform")).lower(),
+            enable_entry=False,
+            device=self.device,
+        )
+        table = sampler.build_policy_value_tensor()
+        pool = self._tensor_to_parent_group_pool(table, n_branches=n_branches, source_id=1)
+        if pool is None:
+            return None
+        if len(pool) > n_parent_groups:
+            pool = select_parent_groups(pool, torch.arange(n_parent_groups, dtype=torch.long))
+        return pool
+
+    def _prepare_mixed_policy_value_batches(
+        self,
+        table: TensorTable,
+        batch_size: int,
+        n_branches: int,
+    ) -> Tuple[List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]], Dict[str, Any]]:
+        hp = self.hyperparams
+        enabled, reason = self._pv_mixture_enabled_for_episode()
+        summary: Dict[str, Any] = {
+            "enabled": bool(enabled),
+            "reason": reason,
+            "episode_id": int(self.episode_id),
+            "budget_mode": str(getattr(hp, "pv_mixture_budget_mode", "fixed_total")),
+            "requested_ratio": float(getattr(hp, "pv_mixture_ratio", 0.0)),
+            "start_episode": int(getattr(hp, "pv_mixture_start_episode", 1)),
+        }
+        sim_pool = self._tensor_to_parent_group_pool(table, n_branches=n_branches, source_id=0)
+        if sim_pool is None or len(sim_pool) == 0:
+            summary["reason"] = "empty_simulate_pool"
+            return [], [], summary
+        summary.update(self._pool_feature_stats("simulate", sim_pool))
+
+        if not enabled:
+            train_batches = self._parent_group_pool_to_batches(
+                sim_pool,
+                batch_size=batch_size,
+                eta_resample=True,
+            )
+            return train_batches, [], summary
+
+        ratio = float(getattr(hp, "pv_mixture_ratio", 0.20))
+        if not 0.0 <= ratio <= 1.0:
+            raise ValueError(f"pv_mixture_ratio must be in [0, 1], got {ratio}.")
+        budget_mode = str(getattr(hp, "pv_mixture_budget_mode", "fixed_total")).lower()
+        if budget_mode not in {"fixed_total", "append_coverage"}:
+            raise ValueError(f"Unknown pv_mixture_budget_mode={budget_mode!r}.")
+        if budget_mode != "fixed_total":
+            raise NotImplementedError("pv_mixture_budget_mode='append_coverage' is reserved for a later experiment.")
+
+        rng_state = self._capture_rng_state() if bool(getattr(hp, "pv_mixture_preserve_rng", True)) else None
+        seed = int(getattr(hp, "pv_mixture_seed", 24680)) + int(self.episode_id) * 100003
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        try:
+            if rng_state is not None:
+                random.seed(seed)
+                np.random.seed(seed % (2 ** 32 - 1))
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+            coverage_pool = self._build_pv_coverage_pool(len(sim_pool), n_branches=n_branches)
+        finally:
+            if rng_state is not None:
+                self._restore_rng_state(rng_state)
+        if coverage_pool is None or len(coverage_pool) == 0:
+            raise RuntimeError("PV mixture coverage Sample produced no parent groups.")
+
+        val_fraction = float(getattr(hp, "pv_target_grid_val_fraction", 0.10))
+        train_pool, val_pool, mix_summary = build_fixed_total_mixture_split(
+            sim_pool=sim_pool,
+            coverage_pool=coverage_pool,
+            coverage_ratio=ratio,
+            val_fraction=val_fraction,
+            generator=generator,
+            stratified_validation=bool(getattr(hp, "pv_mixture_stratified_validation", True)),
+        )
+        train_pool = self._shuffle_pool(train_pool, generator)
+        val_pool = self._shuffle_pool(val_pool, generator)
+        train_batches = self._parent_group_pool_to_batches(
+            train_pool,
+            batch_size=batch_size,
+            eta_resample=False,
+            shuffle=False,
+        )
+        val_batches = self._parent_group_pool_to_batches(
+            val_pool,
+            batch_size=batch_size,
+            eta_resample=False,
+            shuffle=False,
+        )
+        summary.update({
+            "seed": int(seed),
+            "sampling_mode": str(getattr(hp, "pv_mixture_sampling_mode", "uniform")).lower(),
+            "coverage_group_size": int(getattr(hp, "pv_mixture_coverage_group_size", 2)),
+            "stratified_validation": bool(getattr(hp, "pv_mixture_stratified_validation", True)),
+            "preserve_rng": bool(getattr(hp, "pv_mixture_preserve_rng", True)),
+            "train_batches": int(len(train_batches)),
+            "validation_batches": int(len(val_batches)),
+            **mix_summary,
+            **self._pool_feature_stats("coverage", coverage_pool),
+            **self._pool_feature_stats("mixed_train", train_pool),
+            **self._pool_feature_stats("mixed_validation", val_pool),
+        })
+        return train_batches, val_batches, summary
 
     def _build_sdf_pairs_from_macro_tensor(self, macro_table: TensorTable) -> TensorTable:
         """
@@ -6449,6 +6653,8 @@ class Episode:
                 cache.append({
                     "batch_id": batch_id,
                     "parent": parent_state.detach().cpu(),
+                    "source_id": batch["source_id"].detach().cpu() if "source_id" in batch else None,
+                    "source_index": batch["source_index"].detach().cpu() if "source_index" in batch else None,
                     "bp0_target": p0_grid["bp_star"].detach().cpu(),
                     "bpi_target": pi_grid["bp_star"].detach().cpu(),
                     "mix_target": mix_grid["bp_star"].detach().cpu(),
@@ -10061,18 +10267,56 @@ class Episode:
 
                 if use_policy_value:
                     if tensor_pipeline and self.tensor_firm is not None:
-                        pv_batches = self._create_firm_batches_from_tensor(
-                            self.tensor_firm, batch_size=resolved_pv_batch_size, n_branches=n_branches
-                        )
+                        mixture_enabled, mixture_reason = self._pv_mixture_enabled_for_episode()
+                        if mixture_enabled:
+                            pv_batches, pv_validation_batches, pv_mixture_summary = self._prepare_mixed_policy_value_batches(
+                                self.tensor_firm,
+                                batch_size=resolved_pv_batch_size,
+                                n_branches=n_branches,
+                            )
+                            module_summaries['policy_value_mixture'] = pv_mixture_summary
+                        else:
+                            pv_batches = self._create_firm_batches_from_tensor(
+                                self.tensor_firm, batch_size=resolved_pv_batch_size, n_branches=n_branches
+                            )
+                            pv_validation_batches = []
+                            module_summaries['policy_value_mixture'] = {
+                                "enabled": False,
+                                "reason": mixture_reason,
+                                "episode_id": int(self.episode_id),
+                                "budget_mode": str(getattr(self.hyperparams, "pv_mixture_budget_mode", "fixed_total")),
+                                "requested_ratio": float(getattr(self.hyperparams, "pv_mixture_ratio", 0.0)),
+                            }
                     else:
                         pv_batches = self._create_firm_batches_from_df(
                             self.df, batch_size=resolved_pv_batch_size, n_branches=n_branches
                         )
+                        pv_validation_batches = []
+                        enabled, reason = self._pv_mixture_enabled_for_episode()
+                        module_summaries['policy_value_mixture'] = {
+                            "enabled": False,
+                            "requested_enabled": bool(enabled),
+                            "reason": "non_tensor_pipeline" if enabled else reason,
+                            "episode_id": int(self.episode_id),
+                        }
                     if pv_batches:
                         _record_policy_value_batching("modeb", pv_batches)
-                        module_summaries['policy_value'] = self._run_batches(
-                            pv_batches, n_epochs, log_interval, ['policy_value'], desc_prefix='Policy/Value '
-                        )
+                        if (
+                            module_summaries.get('policy_value_mixture', {}).get("enabled", False)
+                            and str(getattr(self.hyperparams, "pv_training_flow", "joint")).lower() == "staged"
+                        ):
+                            module_summaries['policy_value_validation_batching_modeb'] = self._parent_batching_summary(
+                                pv_validation_batches
+                            )
+                            module_summaries['policy_value'] = self._run_policy_value_staged(
+                                pv_train_batches=pv_batches,
+                                validation_batches=pv_validation_batches,
+                                n_epochs=n_epochs,
+                            )
+                        else:
+                            module_summaries['policy_value'] = self._run_batches(
+                                pv_batches, n_epochs, log_interval, ['policy_value'], desc_prefix='Policy/Value '
+                            )
 
                 if modeb_resimulate_after_pv and use_policy_value:
                     rng_after_pv_training = self._capture_rng_state()
