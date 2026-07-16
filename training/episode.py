@@ -6195,52 +6195,67 @@ class Episode:
             n_batches_total = len(batches)
             coverage: Dict[str, Dict[str, Any]] = {
                 eq: {
-                    "n_batches_evaluated": 0,
-                    "n_batches_failed": 0,
-                    "n_parents_evaluated": 0,
-                    "error_count": 0,
-                    "errors": [],
+                    "train": {
+                        "n_batches_evaluated": 0,
+                        "n_batches_failed": 0,
+                        "n_parents_evaluated": 0,
+                        "error_count": 0,
+                        "errors": [],
+                    },
+                    "raw": {
+                        "n_batches_evaluated": 0,
+                        "n_batches_failed": 0,
+                        "n_parents_evaluated": 0,
+                        "error_count": 0,
+                        "errors": [],
+                    },
                 }
                 for eq in required_equations
             }
 
-            def _update_equation(eq: str, signed_train: torch.Tensor, signed_raw: torch.Tensor) -> None:
-                if signed_train.shape != signed_raw.shape:
-                    raise ValueError(
-                        f"{eq} train/raw signed residual shapes differ: "
-                        f"{tuple(signed_train.shape)} vs {tuple(signed_raw.shape)}"
-                    )
-                if signed_train.ndim != 2:
-                    raise ValueError(f"{eq} signed residuals must have shape [B, J]")
-                if signed_train.shape[1] == 0:
+            def _validate_signed_equation(eq: str, m_mode: str, signed: torch.Tensor) -> bool:
+                if signed.ndim != 2:
+                    raise ValueError(f"{eq} {m_mode} signed residuals must have shape [B, J]")
+                return signed.shape[1] > 0
+
+            def _update_train_equation(eq: str, signed_train: torch.Tensor) -> None:
+                if not _validate_signed_equation(eq, "train", signed_train):
                     return
                 reduced_train = self._reduce_signed_branch_residuals(signed_train)
-                reduced_raw = self._reduce_signed_branch_residuals(signed_raw)
                 metric_accs[eq]["conditional_train_m"].update(reduced_train["conditional_abs"])
-                metric_accs[eq]["conditional_raw_m"].update(reduced_raw["conditional_abs"])
                 metric_accs[eq]["realized_abs_train_m"].update(reduced_train["realized_abs"])
-                metric_accs[eq]["realized_abs_raw_m"].update(reduced_raw["realized_abs"])
                 metric_accs[eq]["child_dispersion_train_m"].update(reduced_train["child_std"])
-                metric_accs[eq]["child_dispersion_raw_m"].update(reduced_raw["child_std"])
                 metric_accs[eq]["mc_standard_error_train_m"].update(reduced_train["mc_standard_error"])
-                metric_accs[eq]["mc_standard_error_raw_m"].update(reduced_raw["mc_standard_error"])
-                if report_legacy:
-                    legacy_signed = signed_raw if eq in {"p0", "pi"} else signed_train
-                    legacy_accs[eq].update(self._flatten_abs_residuals(legacy_signed))
+                if report_legacy and eq == "q":
+                    legacy_accs[eq].update(self._flatten_abs_residuals(signed_train))
 
-            def _record_equation_error(eq: str, batch_index: int, exc: Exception) -> None:
-                entry = coverage[eq]
+            def _update_raw_equation(eq: str, signed_raw: torch.Tensor) -> None:
+                if not _validate_signed_equation(eq, "raw", signed_raw):
+                    return
+                reduced_raw = self._reduce_signed_branch_residuals(signed_raw)
+                metric_accs[eq]["conditional_raw_m"].update(reduced_raw["conditional_abs"])
+                metric_accs[eq]["realized_abs_raw_m"].update(reduced_raw["realized_abs"])
+                metric_accs[eq]["child_dispersion_raw_m"].update(reduced_raw["child_std"])
+                metric_accs[eq]["mc_standard_error_raw_m"].update(reduced_raw["mc_standard_error"])
+                if report_legacy and eq in {"p0", "pi"}:
+                    legacy_accs[eq].update(self._flatten_abs_residuals(signed_raw))
+
+            def _record_equation_error(eq: str, m_mode: str, batch_index: int, exc: Exception) -> None:
+                entry = coverage[eq][m_mode]
                 entry["n_batches_failed"] += 1
                 entry["error_count"] += 1
                 if len(entry["errors"]) < 10:
                     entry["errors"].append({
+                        "equation": eq,
+                        "m_mode": m_mode,
                         "batch_index": int(batch_index),
                         "error_type": type(exc).__name__,
                         "message": str(exc),
                     })
                 logger.warning(
-                    "Bellman convergence eval skip %s batch %d due to error: %s",
+                    "Bellman convergence eval skip %s %s batch %d due to error: %s",
                     eq,
+                    m_mode,
                     batch_index,
                     exc,
                 )
@@ -6254,18 +6269,25 @@ class Episode:
                     ):
                         try:
                             signed_train = compute_fn(batch, m_mode="train")
-                            signed_raw = compute_fn(batch, m_mode="raw")
-                            _update_equation(eq, signed_train, signed_raw)
+                            _update_train_equation(eq, signed_train)
                         except Exception as exc:
-                            _record_equation_error(eq, idx, exc)
-                            continue
-                        coverage[eq]["n_batches_evaluated"] += 1
-                        coverage[eq]["n_parents_evaluated"] += int(signed_train.shape[0])
+                            _record_equation_error(eq, "train", idx, exc)
+                        else:
+                            coverage[eq]["train"]["n_batches_evaluated"] += 1
+                            coverage[eq]["train"]["n_parents_evaluated"] += int(signed_train.shape[0])
+
+                        try:
+                            signed_raw = compute_fn(batch, m_mode="raw")
+                            _update_raw_equation(eq, signed_raw)
+                        except Exception as exc:
+                            _record_equation_error(eq, "raw", idx, exc)
+                        else:
+                            coverage[eq]["raw"]["n_batches_evaluated"] += 1
+                            coverage[eq]["raw"]["n_parents_evaluated"] += int(signed_raw.shape[0])
 
             equations: Dict[str, Dict[str, Any]] = {}
             for eq, accs in metric_accs.items():
                 eq_summary: Dict[str, Any] = {}
-                n_parent = accs["conditional_train_m"].n_total
                 for metric_name, acc in accs.items():
                     primary = metric_name == "conditional_train_m"
                     eq_summary[metric_name] = acc.summarize(
@@ -6273,30 +6295,45 @@ class Episode:
                         mean_thr=conditional_mean_thr if primary else None,
                         p90_thr=conditional_p90_thr if primary else None,
                         primary=primary,
-                        n_parent=n_parent,
+                        n_parent=acc.n_total,
                     )
                 eq_summary["passed"] = eq_summary["conditional_train_m"]["passed"]
                 eq_coverage = coverage[eq]
-                eq_coverage["batch_coverage_ratio"] = (
-                    float(eq_coverage["n_batches_evaluated"]) / float(n_batches_total)
-                    if n_batches_total > 0
-                    else 0.0
-                )
-                eq_valid = bool(
-                    eq_coverage["n_batches_failed"] == 0
-                    and eq_coverage["n_batches_evaluated"] == n_batches_total
+                for m_mode in ("train", "raw"):
+                    mode_coverage = eq_coverage[m_mode]
+                    mode_coverage["batch_coverage_ratio"] = (
+                        float(mode_coverage["n_batches_evaluated"]) / float(n_batches_total)
+                        if n_batches_total > 0
+                        else 0.0
+                    )
+                train_valid = bool(
+                    eq_coverage["train"]["n_batches_failed"] == 0
+                    and eq_coverage["train"]["n_batches_evaluated"] == n_batches_total
                     and eq_summary["conditional_train_m"].get("enabled", False) is True
                 )
-                eq_coverage["evaluation_valid"] = eq_valid
-                eq_summary["evaluation_valid"] = eq_valid
+                raw_valid = bool(
+                    eq_coverage["raw"]["n_batches_failed"] == 0
+                    and eq_coverage["raw"]["n_batches_evaluated"] == n_batches_total
+                    and eq_summary["conditional_raw_m"].get("enabled", False) is True
+                )
+                eq_coverage["train_evaluation_valid"] = train_valid
+                eq_coverage["raw_evaluation_valid"] = raw_valid
+                eq_summary["evaluation_valid"] = train_valid
                 eq_summary["coverage"] = eq_coverage
                 equations[eq] = eq_summary
 
+            primary_evaluation_valid = all(
+                equations[eq]["coverage"]["train_evaluation_valid"] for eq in required_equations
+            )
+            raw_diagnostics_valid = all(
+                equations[eq]["coverage"]["raw_evaluation_valid"] for eq in required_equations
+            )
             evaluation_coverage = {
                 "n_batches_total": int(n_batches_total),
-                "evaluation_valid": all(
-                    equations[eq]["evaluation_valid"] for eq in required_equations
-                ),
+                "primary_evaluation_valid": primary_evaluation_valid,
+                "raw_diagnostics_valid": raw_diagnostics_valid,
+                # Backward-compatible alias: this is primary train-M coverage.
+                "evaluation_valid": primary_evaluation_valid,
                 "equations": {eq: equations[eq]["coverage"] for eq in required_equations},
             }
 
@@ -6335,8 +6372,7 @@ class Episode:
                 bellman_passed = all(
                     equations[eq]["conditional_train_m"].get("enabled", False) is True
                     and equations[eq]["conditional_train_m"].get("passed") is True
-                    and equations[eq]["coverage"]["n_batches_failed"] == 0
-                    and equations[eq]["coverage"]["n_batches_evaluated"] == n_batches_total
+                    and equations[eq]["coverage"]["train_evaluation_valid"] is True
                     for eq in required_equations
                 )
             policy_passed = bool(policy_convergence.get('passed', False))
