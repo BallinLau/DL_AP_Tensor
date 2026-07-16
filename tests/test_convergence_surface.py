@@ -515,6 +515,46 @@ def test_dataframe_aliases_and_firm_macro_bundle(tmp_path):
     assert not result.long_table.empty
 
 
+def test_reference_path_auto_joins_sibling_macro_pickle(tmp_path):
+    ckpt = tmp_path / "combined.pt"
+    _write_combined_checkpoint(ckpt)
+    firm = pd.DataFrame({
+        "path": [0, 0],
+        "ID": [10, 10],
+        "t": [0, 1],
+        "branch": [-1, 0],
+        "B": [0.1, 0.2],
+        "Z": [0.0, 0.1],
+        "ETA": [1.0, 0.0],
+        "I": [0.1, 0.2],
+        "X": [0.0, 0.1],
+        "Hatcf": [-2.0, -9.0],
+        "LnKF": [4.0, 9.0],
+    })
+    # Latest episode pkl writes true macro state in the sibling macro file as
+    # Hatc/LnK. Some runs do not have a branch=-1 macro row, so the adapter must
+    # fall back from (path,t,branch) to (path,t).
+    macro = pd.DataFrame({"path": [0], "t": [0], "branch": [0], "Hatc": [-2.1], "LnK": [4.1]})
+    firm_path = tmp_path / "ep1_stage_modeb.pkl"
+    macro_path = tmp_path / "ep1_stage_modeb_macro.pkl"
+    firm.to_pickle(firm_path)
+    macro.to_pickle(macro_path)
+
+    result = evaluate_checkpoint_convergence_surfaces(
+        [ckpt],
+        b_grid=[0.0],
+        z_grid=[0.0],
+        state_mode="reference_distribution",
+        reference_data=firm_path,
+        n_reference_states=1,
+        n_child_shocks=2,
+        device="cpu",
+    )
+
+    assert not result.long_table.empty
+    assert result.manifests["context_metadata"]["n_reference"] == 1
+
+
 def test_workload_guard_blocks_large_run(tmp_path):
     ckpt = tmp_path / "combined.pt"
     _write_combined_checkpoint(ckpt)

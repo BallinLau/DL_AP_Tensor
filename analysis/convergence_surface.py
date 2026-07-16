@@ -384,9 +384,9 @@ def _load_reference_dataframe(reference_data: Any) -> pd.DataFrame:
         return _normalize_reference_columns(pd.concat(frames, ignore_index=True))
     path = Path(reference_data)
     if path.suffix in {".pkl", ".pickle"}:
-        return _normalize_reference_columns(pd.read_pickle(path))
+        return _attach_sibling_macro_if_available(_normalize_reference_columns(pd.read_pickle(path)), path)
     if path.suffix == ".csv":
-        return _normalize_reference_columns(pd.read_csv(path))
+        return _attach_sibling_macro_if_available(_normalize_reference_columns(pd.read_csv(path)), path)
     payload = torch.load(path, map_location="cpu")
     return _load_reference_dataframe(payload)
     raise ValueError(f"unsupported reference_data format: {type(payload)!r}")
@@ -405,19 +405,50 @@ def _normalize_reference_columns(df: pd.DataFrame) -> pd.DataFrame:
         "LNKF": "lnkf",
         "Hatc_cal": "hatc_cal",
         "HATC_CAL": "hatc_cal",
+        "Hatc": "hatc_cal",
+        "HATC": "hatc_cal",
         "LnK_cal": "lnk_cal",
         "LNK_CAL": "lnk_cal",
+        "LnK": "lnk_cal",
+        "LNK": "lnk_cal",
     }
     return df.rename(columns={k: v for k, v in aliases.items() if k in df.columns})
+
+
+def _attach_sibling_macro_if_available(df: pd.DataFrame, path: Path) -> pd.DataFrame:
+    df = _normalize_reference_columns(df)
+    if {"hatc_cal", "lnk_cal"}.issubset(df.columns):
+        return df
+    candidates = [
+        path.with_name(path.stem + "_macro" + path.suffix),
+        path.with_name(path.name.replace(".pkl", "_macro.pkl")),
+    ]
+    if "_macro" not in path.stem:
+        stem = path.stem
+        if stem.startswith("ep") and "_stage_" in stem:
+            parts = stem.split("_stage_", 1)
+            candidates.append(path.with_name(f"{parts[0]}_stage_{parts[1]}_macro{path.suffix}"))
+    for macro_path in dict.fromkeys(candidates):
+        if not macro_path.exists() or macro_path == path:
+            continue
+        macro_df = _normalize_reference_columns(pd.read_pickle(macro_path) if macro_path.suffix in {".pkl", ".pickle"} else pd.read_csv(macro_path))
+        joined = _join_firm_macro_reference(df, macro_df)
+        if {"hatc_cal", "lnk_cal"}.issubset(joined.columns):
+            joined.attrs["macro_source_path"] = str(macro_path)
+            return joined
+    return df
 
 
 def _join_firm_macro_reference(firm: Any, macro: Any) -> pd.DataFrame:
     firm_df = _normalize_reference_columns(firm.copy() if isinstance(firm, pd.DataFrame) else pd.DataFrame(firm))
     macro_df = _normalize_reference_columns(macro.copy() if isinstance(macro, pd.DataFrame) else pd.DataFrame(macro))
-    keys = [key for key in ("path", "t", "branch", "ID") if key in firm_df.columns and key in macro_df.columns]
-    if not keys:
-        keys = [key for key in ("path", "t") if key in firm_df.columns and key in macro_df.columns]
-    if not keys:
+    key_candidates = [
+        [key for key in ("path", "t", "branch", "ID") if key in firm_df.columns and key in macro_df.columns],
+        [key for key in ("path", "t", "branch") if key in firm_df.columns and key in macro_df.columns],
+        [key for key in ("path", "t") if key in firm_df.columns and key in macro_df.columns],
+    ]
+    key_candidates = [keys for keys in key_candidates if keys]
+    if not key_candidates:
         if len(macro_df) == len(firm_df):
             out = firm_df.copy()
             for col in ("hatc_cal", "lnk_cal"):
@@ -425,8 +456,38 @@ def _join_firm_macro_reference(firm: Any, macro: Any) -> pd.DataFrame:
                     out[col] = macro_df[col].to_numpy()
             return _normalize_reference_columns(out)
         raise ValueError("firm/macro reference bundle requires join keys or matching row counts")
-    joined = firm_df.merge(macro_df[keys + [c for c in ("hatc_cal", "lnk_cal") if c in macro_df.columns]], on=keys, how="left")
-    return _normalize_reference_columns(joined)
+    cal_cols = [c for c in ("hatc_cal", "lnk_cal") if c in macro_df.columns]
+    best = None
+    best_nonmissing = -1
+    for keys in key_candidates:
+        macro_cols = keys + cal_cols
+        joined = firm_df.merge(macro_df[macro_cols].drop_duplicates(keys), on=keys, how="left")
+        nonmissing = int(joined[cal_cols].notna().all(axis=1).sum()) if cal_cols else 0
+        if nonmissing > best_nonmissing:
+            best = joined
+            best_nonmissing = nonmissing
+        if cal_cols and nonmissing == len(joined):
+            break
+    if best is None:
+        raise ValueError("could not join firm and macro reference data")
+    return _normalize_reference_columns(best)
+
+
+def _select_parent_reference_rows(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "t" in df.columns:
+        non_null_t = df["t"].dropna()
+        first_t = non_null_t.iloc[0] if len(non_null_t) else None
+        if pd.api.types.is_string_dtype(df["t"]) or isinstance(first_t, str):
+            parent = df[df["t"] == "t"].copy()
+            if not parent.empty:
+                return parent
+    if "branch" in df.columns:
+        branch_num = pd.to_numeric(df["branch"], errors="coerce")
+        parent = df[branch_num == -1].copy()
+        if not parent.empty:
+            return parent
+    return df
 
 
 def _contexts_from_reference_distribution(
@@ -441,6 +502,9 @@ def _contexts_from_reference_distribution(
     df = _load_reference_dataframe(reference_data)
     if df.empty:
         raise ValueError("reference dataframe is empty")
+    df = _select_parent_reference_rows(df)
+    if df.empty:
+        raise ValueError("reference dataframe has no usable parent rows")
     required = ["eta", "i", "x", "hatcf", "lnkf", "hatc_cal", "lnk_cal"]
     missing = [c for c in required if c not in df.columns]
     if missing:
