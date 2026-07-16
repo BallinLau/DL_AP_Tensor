@@ -6510,6 +6510,7 @@ class Episode:
         best_checkpoint: Optional[Dict[str, Any]] = None
         records: List[Dict[str, Any]] = []
         optimizer_steps = 0
+        attempted_optimizer_steps = 0
         accepted_epochs = 0
         rejected_epochs = 0
         nonfinite_count = 0
@@ -6548,6 +6549,7 @@ class Episode:
                 train_cache,
                 current_teacher_hash=teacher_hash_before,
                 current_grid_hash=grid_config_hash,
+                integrity_mode=str(getattr(self.hyperparams, "pq_cache_integrity_check", "metadata")),
                 label="train",
             )
             if val_cache is not train_cache:
@@ -6556,6 +6558,7 @@ class Episode:
                     val_cache,
                     current_teacher_hash=teacher_hash_before,
                     current_grid_hash=grid_config_hash,
+                    integrity_mode=str(getattr(self.hyperparams, "pq_cache_integrity_check", "metadata")),
                     label="validation",
                 )
             train_cache_hash_before = self._pq_value_cache_hash(train_cache)
@@ -6564,6 +6567,10 @@ class Episode:
             with self._policy_value_train_scope("pq"):
                 for epoch in range(int(n_epochs)):
                     epoch_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
+                    step_count_before_epoch = int(self.step_count)
+                    pv_eval_step_count_before_epoch = int(self.policy_value_eval_step_count)
+                    optimizer_steps_before_epoch = int(optimizer_steps)
+                    records_len_before_epoch = len(records)
                     epoch_optimizer_steps = 0
                     epoch_hard = 0
                     epoch_nonfinite = 0
@@ -6614,6 +6621,7 @@ class Episode:
                             soft_spike_count += 1
                             epoch_soft += 1
                         optimizer.step()
+                        attempted_optimizer_steps += 1
                         self.step_count += 1
                         self.policy_value_eval_step_count += 1
                         optimizer_steps += 1
@@ -6628,6 +6636,10 @@ class Episode:
                             epoch_start_checkpoint,
                             None,
                         )
+                        self.step_count = step_count_before_epoch
+                        self.policy_value_eval_step_count = pv_eval_step_count_before_epoch
+                        optimizer_steps = optimizer_steps_before_epoch
+                        del records[records_len_before_epoch:]
                         rejected_epochs += 1
                         epoch_summaries.append({
                             "epoch": epoch + 1,
@@ -6642,6 +6654,10 @@ class Episode:
                             epoch_start_checkpoint,
                             None,
                         )
+                        self.step_count = step_count_before_epoch
+                        self.policy_value_eval_step_count = pv_eval_step_count_before_epoch
+                        optimizer_steps = optimizer_steps_before_epoch
+                        del records[records_len_before_epoch:]
                         rejected_epochs += 1
                         epoch_summaries.append({
                             "epoch": epoch + 1,
@@ -6657,6 +6673,10 @@ class Episode:
                             epoch_start_checkpoint,
                             None,
                         )
+                        self.step_count = step_count_before_epoch
+                        self.policy_value_eval_step_count = pv_eval_step_count_before_epoch
+                        optimizer_steps = optimizer_steps_before_epoch
+                        del records[records_len_before_epoch:]
                         rejected_epochs += 1
                         epoch_summaries.append({
                             "epoch": epoch + 1,
@@ -6694,7 +6714,7 @@ class Episode:
         train_cache_hash_after = self._pq_value_cache_hash(train_cache)
         val_cache_hash_after = self._pq_value_cache_hash(val_cache)
         bp_head_max_change = self._param_max_change_from_snapshot(bp_params, bp_snapshot)
-        if optimizer_steps == 0:
+        if attempted_optimizer_steps == 0:
             status = "failed_no_finite_update"
         elif best_checkpoint is None:
             status = "failed_no_valid_checkpoint"
@@ -6713,6 +6733,7 @@ class Episode:
             "accepted_epochs": int(accepted_epochs),
             "rejected_epochs": int(rejected_epochs),
             "optimizer_steps": optimizer_steps,
+            "attempted_optimizer_steps": attempted_optimizer_steps,
             "policy_value_eval_step_count": int(self.policy_value_eval_step_count),
             "best_epoch": best_epoch,
             "best_validation_score": best_score if np.isfinite(best_score) else None,
@@ -6943,18 +6964,32 @@ class Episode:
         batch_id: int,
         current_teacher_hash: str,
         current_grid_hash: str,
+        integrity_mode: str,
     ) -> None:
         if int(cache_item.batch_id) != int(batch_id):
             raise RuntimeError(f"P/Q cache batch_id mismatch: cache={cache_item.batch_id}, current={batch_id}")
+        parent = batch["parent"]
+        parent_state = parent[:, :7] if parent.shape[1] > 7 else parent
+        expected_shape = (int(parent_state.shape[0]), 1)
+        if tuple(cache_item.p0_value_target.shape) != expected_shape:
+            raise RuntimeError(
+                f"P/Q cache P0 target shape mismatch: "
+                f"{tuple(cache_item.p0_value_target.shape)} != {expected_shape}"
+            )
+        if tuple(cache_item.pi_value_target.shape) != expected_shape:
+            raise RuntimeError(
+                f"P/Q cache PI target shape mismatch: "
+                f"{tuple(cache_item.pi_value_target.shape)} != {expected_shape}"
+            )
+        mode = integrity_mode.lower()
+        if mode not in {"off", "metadata", "full"}:
+            raise ValueError(
+                "pq_cache_integrity_check must be one of: off, metadata, full"
+            )
+        if mode == "off":
+            return
         if cache_item.teacher_hash != current_teacher_hash:
             raise RuntimeError("P/Q cache teacher hash mismatch.")
-        parent_state, children, m_list, parent_hash, children_hash, m_hash = self._policy_batch_hash_components(batch)
-        if cache_item.parent_hash != parent_hash:
-            raise RuntimeError("P/Q cache parent hash mismatch.")
-        if cache_item.children_hash != children_hash:
-            raise RuntimeError("P/Q cache children hash mismatch.")
-        if cache_item.m_hash != m_hash:
-            raise RuntimeError("P/Q cache M hash mismatch.")
         if cache_item.grid_config_hash != current_grid_hash:
             raise RuntimeError("P/Q cache grid config hash mismatch.")
         cache_has_source_id = cache_item.source_id is not None
@@ -6971,6 +7006,14 @@ class Episode:
         if cache_item.source_index is not None:
             if not torch.equal(cache_item.source_index, batch["source_index"].detach().cpu()):
                 raise RuntimeError("P/Q cache source_index mismatch.")
+        if mode == "full":
+            _, _, _, parent_hash, children_hash, m_hash = self._policy_batch_hash_components(batch)
+            if cache_item.parent_hash != parent_hash:
+                raise RuntimeError("P/Q cache parent hash mismatch.")
+            if cache_item.children_hash != children_hash:
+                raise RuntimeError("P/Q cache children hash mismatch.")
+            if cache_item.m_hash != m_hash:
+                raise RuntimeError("P/Q cache M hash mismatch.")
 
     def _pq_value_cache_hash(self, cache: List[PQValueTargetBatch]) -> str:
         digest = hashlib.sha256()
@@ -7005,6 +7048,7 @@ class Episode:
         *,
         current_teacher_hash: str,
         current_grid_hash: str,
+        integrity_mode: str,
         label: str,
     ) -> None:
         if len(batches) != len(cache):
@@ -7019,15 +7063,13 @@ class Episode:
                 batch_id=batch_id,
                 current_teacher_hash=current_teacher_hash,
                 current_grid_hash=current_grid_hash,
+                integrity_mode=integrity_mode,
             )
 
-    def _compute_cached_pq_loss(
+    def _compute_cached_value_loss(
         self,
         batch: Dict[str, torch.Tensor],
         cache_item: PQValueTargetBatch,
-        *,
-        q_create_graph: bool,
-        include_q: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         parent = batch["parent"]
         parent_state = parent[:, :7] if parent.shape[1] > 7 else parent
@@ -7065,20 +7107,13 @@ class Episode:
         )
         p0_total = p0_value_loss + p0_penalty_z
         pi_total = pi_value_loss + pi_penalty_z + pi_penalty_b
-        q_loss = (
-            self._compute_q_loss(batch, create_graph=q_create_graph)
-            if include_q
-            else torch.tensor(0.0, device=self.device)
-        )
         total = (
             self.weight_scheduler["p0"] * p0_total
             + self.weight_scheduler["pi"] * pi_total
-            + self.weight_scheduler["q"] * q_loss
         )
         losses = {
             "p0": float(p0_total.detach().item()),
             "pi": float(pi_total.detach().item()),
-            "q": float(q_loss.detach().item()),
             "total": float(total.detach().item()),
             "p0_cached_value_loss": float(p0_value_loss.detach().item()),
             "pi_cached_value_loss": float(pi_value_loss.detach().item()),
@@ -7086,6 +7121,27 @@ class Episode:
             "pi_cached_penalty_z": float(pi_penalty_z.detach().item()),
             "pi_cached_penalty_b": float(pi_penalty_b.detach().item()),
         }
+        return total, losses
+
+    def _compute_cached_pq_loss(
+        self,
+        batch: Dict[str, torch.Tensor],
+        cache_item: PQValueTargetBatch,
+        *,
+        q_create_graph: bool,
+        include_q: bool = True,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        value_total, losses = self._compute_cached_value_loss(batch, cache_item)
+        q_loss = (
+            self._compute_q_loss(batch, create_graph=q_create_graph)
+            if include_q
+            else torch.tensor(0.0, device=self.device)
+        )
+        total = value_total + self.weight_scheduler["q"] * q_loss
+        losses.update({
+            "q": float(q_loss.detach().item()),
+            "total": float(total.detach().item()),
+        })
         losses.update(getattr(self, "_latest_q_terms", {}))
         return total, losses
 
@@ -7107,13 +7163,16 @@ class Episode:
         try:
             model.eval()
             for batch, cache_item in zip(batches, cache):
+                with torch.no_grad():
+                    value_total, losses = self._compute_cached_value_loss(batch, cache_item)
                 with torch.enable_grad():
-                    _, losses = self._compute_cached_pq_loss(
-                        batch,
-                        cache_item,
-                        q_create_graph=False,
-                        include_q=True,
-                    )
+                    q_loss = self._compute_q_loss(batch, create_graph=False)
+                total = value_total + self.weight_scheduler["q"] * q_loss
+                losses.update({
+                    "q": float(q_loss.detach().item()),
+                    "total": float(total.detach().item()),
+                })
+                losses.update(getattr(self, "_latest_q_terms", {}))
                 records.append(losses)
         finally:
             model.train(was_training)

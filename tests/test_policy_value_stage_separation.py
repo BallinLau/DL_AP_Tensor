@@ -300,6 +300,7 @@ def test_pq_cache_validation_rejects_source_metadata_presence_mismatch():
             batch_id=0,
             current_teacher_hash=cache[0].teacher_hash,
             current_grid_hash=cache[0].grid_config_hash,
+            integrity_mode="metadata",
         )
 
 
@@ -315,6 +316,45 @@ def test_pq_cache_hash_includes_metadata():
     assert episode._pq_value_cache_hash([
         replace(cache[0], source_id=torch.tensor([[1], [2]], dtype=torch.long))
     ]) != base_hash
+
+
+def test_pq_cache_metadata_validation_skips_full_data_rehash(monkeypatch):
+    episode = _episode()
+    batch = _batch(episode.device)
+    cache, _ = episode._build_pq_value_target_cache([batch], episode.firm_target)
+
+    def _fail_rehash(_batch):
+        raise AssertionError("metadata validation must not recompute parent/child/M hashes")
+
+    monkeypatch.setattr(episode, "_policy_batch_hash_components", _fail_rehash)
+    episode._validate_pq_cache_once(
+        [batch],
+        cache,
+        current_teacher_hash=cache[0].teacher_hash,
+        current_grid_hash=cache[0].grid_config_hash,
+        integrity_mode="metadata",
+        label="train",
+    )
+
+
+def test_pq_cache_full_validation_recomputes_data_hash(monkeypatch):
+    episode = _episode()
+    batch = _batch(episode.device)
+    cache, _ = episode._build_pq_value_target_cache([batch], episode.firm_target)
+
+    def _fail_rehash(_batch):
+        raise AssertionError("full validation recomputes parent/child/M hashes")
+
+    monkeypatch.setattr(episode, "_policy_batch_hash_components", _fail_rehash)
+    with pytest.raises(AssertionError, match="full validation"):
+        episode._validate_pq_cache_once(
+            [batch],
+            cache,
+            current_teacher_hash=cache[0].teacher_hash,
+            current_grid_hash=cache[0].grid_config_hash,
+            integrity_mode="full",
+            label="train",
+        )
 
 
 def test_pq_cache_targets_stay_on_episode_device():
@@ -392,6 +432,25 @@ def test_cached_pq_validation_uses_first_order_q_graph(monkeypatch):
     flags.clear()
     episode._compute_cached_pq_loss(batch, cache[0], q_create_graph=True)
     assert any(flag is True for flag in flags)
+
+
+def test_cached_pq_validation_value_path_uses_no_grad(monkeypatch):
+    episode = _episode()
+    batch = _batch(episode.device)
+    cache, _ = episode._build_pq_value_target_cache([batch], episode.firm_target)
+    model = episode.models["policy_value"]
+    original_value_outputs = model._value_outputs
+    grad_enabled = []
+
+    def _wrapped_value_outputs(parent_state):
+        grad_enabled.append(torch.is_grad_enabled())
+        return original_value_outputs(parent_state)
+
+    monkeypatch.setattr(model, "_value_outputs", _wrapped_value_outputs)
+    episode._evaluate_cached_pq_score([batch], cache)
+
+    assert grad_enabled
+    assert all(flag is False for flag in grad_enabled)
 
 
 def test_staged_zero_epoch_statuses():
@@ -605,7 +664,8 @@ def test_pq_rejected_epoch_rolls_back_model_state():
     )
 
     assert summary["status"] == "failed_no_valid_checkpoint"
-    assert summary["optimizer_steps"] == 1
+    assert summary["optimizer_steps"] == 0
+    assert summary["attempted_optimizer_steps"] == 1
     assert summary["accepted_epochs"] == 0
     assert episode._state_dict_hash(episode.models["policy_value"]) == before
 
@@ -628,7 +688,8 @@ def test_pq_stage_failure_rolls_back_online_model():
     )
 
     assert summary["status"] == "failed_no_valid_checkpoint"
-    assert summary["optimizer_steps"] == 1
+    assert summary["optimizer_steps"] == 0
+    assert summary["attempted_optimizer_steps"] == 1
     assert episode._state_dict_hash(episode.models["policy_value"]) == before
 
 

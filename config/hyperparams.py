@@ -159,6 +159,12 @@ class HyperParams:
     bp_distill_grad_clip_norm: float = 10.0
     pv_rollback_on_soft_spikes: bool = False
     bp_label_cache_mode: str = "cpu"
+    # P/Q value target cache validation.  "metadata" is the formal fast path:
+    # validate cache length, batch ids, target/source shapes, teacher hash and
+    # grid config hash without re-hashing full parent/child/M tensors.  Use
+    # "full" for debug/tests when parent/child/M hashes should be recomputed.
+    # "off" keeps only the cache length check.
+    pq_cache_integrity_check: str = "metadata"
     bp_distill_trainable_scope: str = "heads_only"
     # Optional Policy/Value mixture sampling for episode e>0.  When enabled,
     # refreshed SimulateTS parent groups are mixed with coverage Sample parent
