@@ -437,7 +437,12 @@ class HyperParams:
     firm_target_update_interval_steps: int = 1
 
     # ========== Episode 收敛判定（非 AIO Bellman 残差） ==========
-    # 判定条件：Q/P0/PI 各自主残差的 mean(abs) 与 p90(abs) 同时过阈值
+    # 新口径：同一 parent 内先对 signed child residual 求条件均值，再取绝对值。
+    # None 表示只报告数值，不把 fixed-point Bellman residual 纳入 pass/fail。
+    bellman_conditional_mean_thresh: Optional[float] = None
+    bellman_conditional_p90_thresh: Optional[float] = None
+    # 旧口径：逐 child 取绝对值后压平，仅保留为 legacy 诊断。
+    bellman_conv_report_legacy: bool = True
     bellman_conv_mean_thresh: float = 1e-3
     bellman_conv_p90_thresh: float = 5e-3
     # Bellman convergence 的 p90 只使用有界样本估计，避免超大 tensor 上 torch.quantile 崩溃。

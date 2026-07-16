@@ -5399,19 +5399,106 @@ class Episode:
             return torch.empty(0, device='cpu', dtype=torch.float32)
         return torch.cat(chunks, dim=0)
 
-    def _compute_p0_bellman_abs_residual(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    @staticmethod
+    def _stack_signed_branch_residuals(
+        residuals: List[torch.Tensor],
+        *,
+        expected_batch: int,
+        device: torch.device,
+        label: str,
+    ) -> torch.Tensor:
+        if not residuals:
+            return torch.empty((expected_batch, 0), device=device)
+        cols: List[torch.Tensor] = []
+        for idx, residual in enumerate(residuals):
+            if residual is None:
+                raise ValueError(f"{label} branch {idx} residual is None")
+            rr = residual.reshape(expected_batch, -1)
+            if rr.shape[1] != 1:
+                raise ValueError(
+                    f"{label} branch {idx} residual must have one column, got shape {tuple(residual.shape)}"
+                )
+            cols.append(rr)
+        return torch.cat(cols, dim=1)
+
+    @staticmethod
+    def _validate_bellman_m_mode(m_mode: str) -> str:
+        mode = str(m_mode).lower()
+        if mode not in {"train", "raw"}:
+            raise ValueError(f"m_mode must be 'train' or 'raw', got {m_mode!r}")
+        return mode
+
+    @staticmethod
+    def _reduce_signed_branch_residuals(
+        signed: torch.Tensor,
+        branch_weights: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if not torch.is_tensor(signed):
+            raise ValueError("signed residuals must be a torch.Tensor")
+        if signed.ndim != 2:
+            raise ValueError(f"signed residuals must have shape [B, J], got {tuple(signed.shape)}")
+        batch_size, branch_count = signed.shape
+        if branch_count <= 0:
+            raise ValueError("signed residuals must contain at least one child branch")
+        if branch_weights is None:
+            weights = torch.full_like(signed, 1.0 / float(branch_count))
+        else:
+            weights = branch_weights.to(device=signed.device, dtype=signed.dtype)
+            if weights.ndim == 1:
+                if weights.shape[0] != branch_count:
+                    raise ValueError(
+                        f"branch weights shape {tuple(weights.shape)} does not match J={branch_count}"
+                    )
+                weights = weights.unsqueeze(0).expand(batch_size, branch_count)
+            elif weights.ndim == 2:
+                if weights.shape != signed.shape:
+                    raise ValueError(
+                        f"branch weights shape {tuple(weights.shape)} must match signed shape {tuple(signed.shape)}"
+                    )
+            else:
+                raise ValueError(
+                    f"branch weights must have shape [J] or [B, J], got {tuple(weights.shape)}"
+                )
+        if torch.any(weights < 0):
+            raise ValueError("branch weights must be nonnegative")
+        row_sums = weights.sum(dim=1)
+        ones = torch.ones_like(row_sums)
+        if not torch.allclose(row_sums, ones, atol=1e-5, rtol=1e-5):
+            raise ValueError("branch weights must sum to one within each parent")
+
+        conditional_signed = (weights * signed).sum(dim=1)
+        conditional_abs = conditional_signed.abs()
+        realized_abs = (weights * signed.abs()).sum(dim=1)
+        centered = signed - conditional_signed.unsqueeze(1)
+        child_std = torch.sqrt((weights * centered.pow(2)).sum(dim=1).clamp_min(0.0))
+        mc_standard_error = child_std / float(branch_count) ** 0.5
+        return {
+            "conditional_signed": conditional_signed,
+            "conditional_abs": conditional_abs,
+            "realized_abs": realized_abs,
+            "child_std": child_std,
+            "mc_standard_error": mc_standard_error,
+        }
+
+    def _compute_p0_bellman_signed_residuals(
+        self,
+        batch: Dict[str, torch.Tensor],
+        *,
+        m_mode: str,
+    ) -> torch.Tensor:
+        mode = self._validate_bellman_m_mode(m_mode)
         model = self.models['policy_value']
         loss_fn = self.loss_fns['p0']
 
         parent = batch['parent']
         children = self._get_policy_children(batch)
         if not children:
-            return torch.empty(0, device=self.device)
+            return torch.empty((parent.shape[0], 0), device=self.device)
 
-        if parent.shape[1] > 7:
-            M_list = [child[:, 7:8] for child in children]
-        else:
-            M_list = [torch.ones(parent.shape[0], 1, device=self.device) for _ in children]
+        m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
+        m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
+        raw_M_list, train_M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+        M_list = train_M_list if mode == "train" else raw_M_list
 
         parent_state = self._policy_strip_extra(parent)
         output_t = model(parent_state)
@@ -5460,21 +5547,32 @@ class Episode:
             for _ in children
         ]
         residuals = loss_fn.compute_bellman_residual(P0, CF0p, M_list, P_children, bar_z_children)
-        return self._flatten_abs_residuals(residuals)
+        return self._stack_signed_branch_residuals(
+            residuals,
+            expected_batch=parent.shape[0],
+            device=self.device,
+            label="p0",
+        )
 
-    def _compute_pi_bellman_abs_residual(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _compute_pi_bellman_signed_residuals(
+        self,
+        batch: Dict[str, torch.Tensor],
+        *,
+        m_mode: str,
+    ) -> torch.Tensor:
+        mode = self._validate_bellman_m_mode(m_mode)
         model = self.models['policy_value']
         loss_fn = self.loss_fns['pi']
 
         parent = batch['parent']
         children = self._get_policy_children(batch)
         if not children:
-            return torch.empty(0, device=self.device)
+            return torch.empty((parent.shape[0], 0), device=self.device)
 
-        if parent.shape[1] > 7:
-            M_list = [child[:, 7:8] for child in children]
-        else:
-            M_list = [torch.ones(parent.shape[0], 1, device=self.device) for _ in children]
+        m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
+        m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
+        raw_M_list, train_M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+        M_list = train_M_list if mode == "train" else raw_M_list
 
         parent_state = self._policy_strip_extra(parent)
         output_t = model(parent_state)
@@ -5524,25 +5622,36 @@ class Episode:
             for _ in children
         ]
         residuals = loss_fn.compute_bellman_residual(PI, CFip, M_list, P_children, bar_z_children)
-        return self._flatten_abs_residuals(residuals)
+        return self._stack_signed_branch_residuals(
+            residuals,
+            expected_batch=parent.shape[0],
+            device=self.device,
+            label="pi",
+        )
 
-    def _compute_q_bellman_abs_residual(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _compute_q_bellman_signed_residuals(
+        self,
+        batch: Dict[str, torch.Tensor],
+        *,
+        m_mode: str,
+    ) -> torch.Tensor:
+        mode = self._validate_bellman_m_mode(m_mode)
         model = self.models['policy_value']
         loss_fn = self.loss_fns['q']
 
         parent = batch['parent']
         children = self._get_policy_children(batch)
         if not children:
-            return torch.empty(0, device=self.device)
+            return torch.empty((parent.shape[0], 0), device=self.device)
 
         if parent.shape[1] > 7:
             raw_M_list = [child[:, 7:8] for child in children]
         else:
             raw_M_list = [torch.ones(parent.shape[0], 1, device=self.device) for _ in children]
-        if getattr(self.hyperparams, "q_use_detached_m", True):
+        if mode == "train" and getattr(self.hyperparams, "q_use_detached_m", True):
             m_lo = float(getattr(self.hyperparams, "q_m_clamp_min", 0.5))
             m_hi = float(getattr(self.hyperparams, "q_m_clamp_max", 1.5))
-            M_list = [m.clamp(m_lo, m_hi) for m in raw_M_list]
+            M_list = [m.detach().clamp(m_lo, m_hi) for m in raw_M_list]
         else:
             M_list = raw_M_list
 
@@ -5579,7 +5688,27 @@ class Episode:
             Q, b_parent, bar_i_use, M_list, Qsp_children,
             bar_zsp_children, x_children, z_children
         )
-        return self._flatten_abs_residuals(residuals)
+        return self._stack_signed_branch_residuals(
+            residuals,
+            expected_batch=parent.shape[0],
+            device=self.device,
+            label="q",
+        )
+
+    def _compute_p0_bellman_abs_residual(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return self._flatten_abs_residuals(
+            self._compute_p0_bellman_signed_residuals(batch, m_mode="train")
+        )
+
+    def _compute_pi_bellman_abs_residual(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return self._flatten_abs_residuals(
+            self._compute_pi_bellman_signed_residuals(batch, m_mode="train")
+        )
+
+    def _compute_q_bellman_abs_residual(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return self._flatten_abs_residuals(
+            self._compute_q_bellman_signed_residuals(batch, m_mode="train")
+        )
 
     def evaluate_target_grid_policy_convergence(self, batches: List[Dict[str, torch.Tensor]]) -> Dict:
         if not self._pv_use_target_grid_bp():
@@ -5890,24 +6019,37 @@ class Episode:
         p90_threshold: Optional[float] = None
     ) -> Dict:
         """
-        评估 P0/PI/Q 的 Bellman 主残差收敛（非 AIO 口径）。
+        评估 P0/PI/Q 的在线 fixed-point Bellman residual。
+
+        主口径为 conditional_mean_v1：先在同一 parent 内对 signed child
+        residual 求条件均值，再取绝对值。旧的逐 child 绝对残差压平口径只作
+        legacy 诊断，不参与主 pass/fail。
         """
-        mean_thr = float(
+        conditional_mean_thr = (
             mean_threshold
             if mean_threshold is not None
-            else getattr(self.hyperparams, "bellman_conv_mean_thresh", 1e-3)
+            else getattr(self.hyperparams, "bellman_conditional_mean_thresh", None)
         )
-        p90_thr = float(
+        conditional_p90_thr = (
             p90_threshold
             if p90_threshold is not None
-            else getattr(self.hyperparams, "bellman_conv_p90_thresh", 5e-3)
+            else getattr(self.hyperparams, "bellman_conditional_p90_thresh", None)
         )
+        legacy_mean_thr = float(getattr(self.hyperparams, "bellman_conv_mean_thresh", 1e-3))
+        legacy_p90_thr = float(getattr(self.hyperparams, "bellman_conv_p90_thresh", 5e-3))
 
         if not batches or 'policy_value' not in self.models or self.models['policy_value'] is None:
             return {
                 'enabled': False,
+                'definition_version': 'conditional_mean_v1',
+                'primary_metric': 'conditional_train_m',
                 'passed': False,
-                'thresholds': {'mean': mean_thr, 'p90': p90_thr},
+                'thresholds': {
+                    'conditional_mean': conditional_mean_thr,
+                    'conditional_p90': conditional_p90_thr,
+                    'legacy_mean': legacy_mean_thr,
+                    'legacy_p90': legacy_p90_thr,
+                },
                 'equations': {}
             }
 
@@ -5918,12 +6060,12 @@ class Episode:
             max_q_samples = int(getattr(self.hyperparams, "bellman_conv_max_samples", 1_000_000))
             max_q_samples = max(1, max_q_samples)
 
-            class _ResidualAccumulator:
+            class _MetricAccumulator:
                 def __init__(self, max_samples: int):
                     self.max_samples = max_samples
                     self.n_total = 0
                     self.n_finite = 0
-                    self.abs_sum = 0.0
+                    self.value_sum = 0.0
                     self.samples: List[torch.Tensor] = []
                     self.n_sampled = 0
 
@@ -5936,8 +6078,8 @@ class Episode:
                     self.n_finite += int(vals.numel())
                     if vals.numel() == 0:
                         return
-                    vals = vals.abs().to(torch.float32)
-                    self.abs_sum += float(vals.sum().item())
+                    vals = vals.to(torch.float32)
+                    self.value_sum += float(vals.sum().item())
                     remaining = self.max_samples - self.n_sampled
                     if remaining <= 0:
                         return
@@ -5947,33 +6089,55 @@ class Episode:
                     self.samples.append(vals.cpu())
                     self.n_sampled += int(vals.numel())
 
-                def summarize(self, name: str, mean_thr: float, p90_thr: float) -> Dict:
+                def summarize(
+                    self,
+                    *,
+                    name: str,
+                    mean_thr: Optional[float],
+                    p90_thr: Optional[float],
+                    primary: bool,
+                    n_parent: Optional[int] = None,
+                ) -> Dict:
                     if self.n_finite == 0:
                         return {
                             'enabled': False,
                             'n': 0,
+                            'n_parent': int(n_parent or 0),
                             'n_total': self.n_total,
                             'n_finite': 0,
                             'n_used_for_p90': 0,
                             'nonfinite_ratio': 1.0 if self.n_total > 0 else 0.0,
                             'mean': float('nan'),
+                            'p50': float('nan'),
                             'p90': float('nan'),
-                            'passed': False
+                            'p99': float('nan'),
+                            'max': float('nan'),
+                            'passed': None if primary and (mean_thr is None or p90_thr is None) else False
                         }
-                    mean_v = self.abs_sum / max(self.n_finite, 1)
+                    mean_v = self.value_sum / max(self.n_finite, 1)
                     if self.samples:
                         sample = torch.cat(self.samples, dim=0)
+                        p50_v = float(torch.quantile(sample, 0.5).item())
                         p90_v = float(torch.quantile(sample, 0.9).item())
+                        p99_v = float(torch.quantile(sample, 0.99).item())
+                        max_v = float(sample.max().item())
                     else:
+                        p50_v = float('nan')
                         p90_v = float('nan')
+                        p99_v = float('nan')
+                        max_v = float('nan')
                     nonfinite_ratio = 1.0 - (self.n_finite / max(self.n_total, 1))
-                    passed = bool(mean_v < mean_thr and p90_v < p90_thr and nonfinite_ratio == 0.0)
+                    if mean_thr is None or p90_thr is None:
+                        passed = None if primary else False
+                    else:
+                        passed = bool(mean_v < float(mean_thr) and p90_v < float(p90_thr) and nonfinite_ratio == 0.0)
                     logger.info(
-                        "Bellman convergence [%s] | mean(abs)=%.6e, p90(abs)=%.6e, "
-                        "n_total=%d, n_used=%d, nonfinite=%.3e, pass=%s",
+                        "Bellman fixed-point [%s] | mean=%.6e, p90=%.6e, "
+                        "n_parent=%d, n_total=%d, n_used=%d, nonfinite=%.3e, pass=%s",
                         name,
                         mean_v,
                         p90_v,
+                        int(n_parent if n_parent is not None else self.n_total),
                         self.n_total,
                         self.n_sampled,
                         nonfinite_ratio,
@@ -5982,40 +6146,103 @@ class Episode:
                     return {
                         'enabled': True,
                         'n': self.n_finite,
+                        'n_parent': int(n_parent if n_parent is not None else self.n_total),
                         'n_total': self.n_total,
                         'n_finite': self.n_finite,
                         'n_used_for_p90': self.n_sampled,
                         'nonfinite_ratio': nonfinite_ratio,
                         'mean': mean_v,
+                        'p50': p50_v,
                         'p90': p90_v,
+                        'p99': p99_v,
+                        'max': max_v,
                         'passed': passed
                     }
 
-            p0_acc = _ResidualAccumulator(max_q_samples)
-            pi_acc = _ResidualAccumulator(max_q_samples)
-            q_acc = _ResidualAccumulator(max_q_samples)
+            metric_names = (
+                "conditional_train_m",
+                "conditional_raw_m",
+                "realized_abs_train_m",
+                "realized_abs_raw_m",
+                "child_dispersion_train_m",
+                "child_dispersion_raw_m",
+                "mc_standard_error_train_m",
+                "mc_standard_error_raw_m",
+            )
+
+            metric_accs: Dict[str, Dict[str, _MetricAccumulator]] = {
+                eq: {name: _MetricAccumulator(max_q_samples) for name in metric_names}
+                for eq in ("p0", "pi", "q")
+            }
+            legacy_accs: Dict[str, _MetricAccumulator] = {
+                eq: _MetricAccumulator(max_q_samples) for eq in ("p0", "pi", "q")
+            }
+            report_legacy = bool(getattr(self.hyperparams, "bellman_conv_report_legacy", True))
+
+            def _update_equation(eq: str, signed_train: torch.Tensor, signed_raw: torch.Tensor) -> None:
+                if signed_train.shape != signed_raw.shape:
+                    raise ValueError(
+                        f"{eq} train/raw signed residual shapes differ: "
+                        f"{tuple(signed_train.shape)} vs {tuple(signed_raw.shape)}"
+                    )
+                if signed_train.ndim != 2:
+                    raise ValueError(f"{eq} signed residuals must have shape [B, J]")
+                if signed_train.shape[1] == 0:
+                    return
+                reduced_train = self._reduce_signed_branch_residuals(signed_train)
+                reduced_raw = self._reduce_signed_branch_residuals(signed_raw)
+                metric_accs[eq]["conditional_train_m"].update(reduced_train["conditional_abs"])
+                metric_accs[eq]["conditional_raw_m"].update(reduced_raw["conditional_abs"])
+                metric_accs[eq]["realized_abs_train_m"].update(reduced_train["realized_abs"])
+                metric_accs[eq]["realized_abs_raw_m"].update(reduced_raw["realized_abs"])
+                metric_accs[eq]["child_dispersion_train_m"].update(reduced_train["child_std"])
+                metric_accs[eq]["child_dispersion_raw_m"].update(reduced_raw["child_std"])
+                metric_accs[eq]["mc_standard_error_train_m"].update(reduced_train["mc_standard_error"])
+                metric_accs[eq]["mc_standard_error_raw_m"].update(reduced_raw["mc_standard_error"])
+                if report_legacy:
+                    legacy_accs[eq].update(self._flatten_abs_residuals(signed_train))
 
             with torch.no_grad():
                 for idx, batch in enumerate(batches):
                     try:
-                        p0_abs = self._compute_p0_bellman_abs_residual(batch)
-                        pi_abs = self._compute_pi_bellman_abs_residual(batch)
-                        q_abs = self._compute_q_bellman_abs_residual(batch)
+                        p0_train = self._compute_p0_bellman_signed_residuals(batch, m_mode="train")
+                        p0_raw = self._compute_p0_bellman_signed_residuals(batch, m_mode="raw")
+                        pi_train = self._compute_pi_bellman_signed_residuals(batch, m_mode="train")
+                        pi_raw = self._compute_pi_bellman_signed_residuals(batch, m_mode="raw")
+                        q_train = self._compute_q_bellman_signed_residuals(batch, m_mode="train")
+                        q_raw = self._compute_q_bellman_signed_residuals(batch, m_mode="raw")
                     except Exception as exc:
                         logger.warning("Bellman convergence eval skip batch %d due to error: %s", idx, exc)
                         continue
-                    if p0_abs.numel() > 0:
-                        p0_acc.update(p0_abs)
-                    if pi_abs.numel() > 0:
-                        pi_acc.update(pi_abs)
-                    if q_abs.numel() > 0:
-                        q_acc.update(q_abs)
+                    _update_equation("p0", p0_train, p0_raw)
+                    _update_equation("pi", pi_train, pi_raw)
+                    _update_equation("q", q_train, q_raw)
 
-            equations = {
-                'p0': p0_acc.summarize('p0', mean_thr, p90_thr),
-                'pi': pi_acc.summarize('pi', mean_thr, p90_thr),
-                'q': q_acc.summarize('q', mean_thr, p90_thr)
-            }
+            equations: Dict[str, Dict[str, Any]] = {}
+            for eq, accs in metric_accs.items():
+                eq_summary: Dict[str, Any] = {}
+                n_parent = accs["conditional_train_m"].n_total
+                for metric_name, acc in accs.items():
+                    primary = metric_name == "conditional_train_m"
+                    eq_summary[metric_name] = acc.summarize(
+                        name=f"{eq}.{metric_name}",
+                        mean_thr=conditional_mean_thr if primary else None,
+                        p90_thr=conditional_p90_thr if primary else None,
+                        primary=primary,
+                        n_parent=n_parent,
+                    )
+                eq_summary["passed"] = eq_summary["conditional_train_m"]["passed"]
+                equations[eq] = eq_summary
+
+            legacy_equations: Dict[str, Dict[str, Any]] = {}
+            if report_legacy:
+                for eq, acc in legacy_accs.items():
+                    legacy_equations[eq] = acc.summarize(
+                        name=f"{eq}.legacy_flattened_abs",
+                        mean_thr=legacy_mean_thr,
+                        p90_thr=legacy_p90_thr,
+                        primary=False,
+                    )
             policy_train = self.evaluate_target_grid_policy_convergence(batches)
             policy_val = (
                 self.evaluate_target_grid_policy_convergence(validation_batches)
@@ -6036,15 +6263,40 @@ class Episode:
                 )
             )
 
-            enabled_eq = [m for m in equations.values() if m.get('enabled', False)]
-            bellman_passed = bool(enabled_eq) and all(m.get('passed', False) for m in enabled_eq)
+            enabled_primary = [
+                m["conditional_train_m"]
+                for m in equations.values()
+                if m["conditional_train_m"].get('enabled', False)
+            ]
+            if conditional_mean_thr is None or conditional_p90_thr is None:
+                bellman_passed = None
+            else:
+                bellman_passed = bool(enabled_primary) and all(
+                    m.get('passed', False) for m in enabled_primary
+                )
             policy_passed = bool(policy_convergence.get('passed', False))
-            all_passed = bool(bellman_passed and policy_passed)
+            all_passed = None if bellman_passed is None else bool(bellman_passed and policy_passed)
             summary = {
                 'enabled': True,
-                'thresholds': {'mean': mean_thr, 'p90': p90_thr},
+                'definition_version': 'conditional_mean_v1',
+                'primary_metric': 'conditional_train_m',
+                'thresholds': {
+                    'conditional_mean': conditional_mean_thr,
+                    'conditional_p90': conditional_p90_thr,
+                    'legacy_mean': legacy_mean_thr,
+                    'legacy_p90': legacy_p90_thr,
+                },
                 'max_quantile_samples': max_q_samples,
+                'fixed_point': {
+                    'definition': 'parent_conditional_signed_mean_absolute',
+                    'primary_metric': 'conditional_train_m',
+                    'equations': equations,
+                },
                 'equations': equations,
+                'legacy': {
+                    'definition': 'flattened_child_absolute',
+                    'equations': legacy_equations,
+                },
                 'policy': policy_convergence,
                 'policy_train': policy_train,
                 'policy_val': policy_val,
@@ -6057,12 +6309,12 @@ class Episode:
             }
             logger.info(
                 (
-                    "Bellman convergence summary | mean<%.3e, p90<%.3e, "
+                    "Bellman fixed-point summary | conditional_mean<%s, conditional_p90<%s, "
                     "bellman_passed=%s, policy_passed=%s, policy_source=%s, "
                     "policy_informative=%s, passed=%s"
                 ),
-                mean_thr,
-                p90_thr,
+                str(conditional_mean_thr),
+                str(conditional_p90_thr),
                 str(bellman_passed),
                 str(policy_passed),
                 policy_source,
