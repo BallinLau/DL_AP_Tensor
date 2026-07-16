@@ -6513,7 +6513,7 @@ class Episode:
         best_score = float("inf")
         best_epoch: Optional[int] = None
         best_checkpoint: Optional[Dict[str, Any]] = None
-        best_runtime_state: Optional[Dict[str, int]] = None
+        best_runtime_state: Optional[Dict[str, Any]] = None
         records: List[Dict[str, Any]] = []
         optimizer_steps = 0
         attempted_optimizer_steps = 0
@@ -6577,6 +6577,7 @@ class Episode:
                     pv_eval_step_count_before_epoch = int(self.policy_value_eval_step_count)
                     optimizer_steps_before_epoch = int(optimizer_steps)
                     records_len_before_epoch = len(records)
+                    rng_state_before_epoch = self._capture_rng_state()
                     epoch_optimizer_steps = 0
                     epoch_hard = 0
                     epoch_nonfinite = 0
@@ -6646,6 +6647,7 @@ class Episode:
                         self.policy_value_eval_step_count = pv_eval_step_count_before_epoch
                         optimizer_steps = optimizer_steps_before_epoch
                         del records[records_len_before_epoch:]
+                        self._restore_rng_state(rng_state_before_epoch)
                         rejected_epochs += 1
                         epoch_summaries.append({
                             "epoch": epoch + 1,
@@ -6664,6 +6666,7 @@ class Episode:
                         self.policy_value_eval_step_count = pv_eval_step_count_before_epoch
                         optimizer_steps = optimizer_steps_before_epoch
                         del records[records_len_before_epoch:]
+                        self._restore_rng_state(rng_state_before_epoch)
                         rejected_epochs += 1
                         epoch_summaries.append({
                             "epoch": epoch + 1,
@@ -6683,6 +6686,7 @@ class Episode:
                         self.policy_value_eval_step_count = pv_eval_step_count_before_epoch
                         optimizer_steps = optimizer_steps_before_epoch
                         del records[records_len_before_epoch:]
+                        self._restore_rng_state(rng_state_before_epoch)
                         rejected_epochs += 1
                         epoch_summaries.append({
                             "epoch": epoch + 1,
@@ -6713,6 +6717,7 @@ class Episode:
                             "optimizer_steps": int(optimizer_steps),
                             "records_len": int(len(records)),
                             "accepted_epochs": int(accepted_epochs),
+                            "rng_state": self._capture_rng_state(),
                         }
         finally:
             self._policy_value_stage_target_model = previous_teacher
@@ -6729,6 +6734,7 @@ class Episode:
                 )
                 optimizer_steps = int(best_runtime_state["optimizer_steps"])
                 del records[int(best_runtime_state["records_len"]):]
+                self._restore_rng_state(best_runtime_state.get("rng_state"))
             restored = True
         avg, meta = self._aggregate_metric_records(records)
         teacher_hash_after = self._state_dict_hash(teacher)

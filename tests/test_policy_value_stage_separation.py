@@ -1,7 +1,9 @@
 from pathlib import Path
 from dataclasses import replace
 import sys
+import random
 
+import numpy as np
 import pytest
 import torch
 
@@ -761,6 +763,93 @@ def test_pq_best_checkpoint_restore_aligns_counters_and_records():
     assert episode.step_count == best_snapshot["step_count"]
     assert episode.policy_value_eval_step_count == best_snapshot["pv_eval_step_count"]
     assert episode._state_dict_hash(episode.models["policy_value"]) == best_snapshot["model_hash"]
+
+
+def test_pq_best_checkpoint_restore_aligns_rng_state():
+    episode = _episode()
+    param = episode._policy_value_stage_params("pq")[0]
+    _patch_stage_loss(episode, param)
+    score_iter = iter([1.0, 2.0])
+    expected_next = {}
+
+    random.seed(2024)
+    np.random.seed(2024)
+    torch.manual_seed(2024)
+
+    def _score(*args, **kwargs):
+        score = next(score_iter)
+        if score == 1.0:
+            state = episode._capture_rng_state()
+            expected_next["python"] = random.random()
+            expected_next["numpy"] = float(np.random.rand())
+            expected_next["torch"] = float(torch.rand(1).item())
+            episode._restore_rng_state(state)
+        else:
+            random.random()
+            np.random.rand()
+            torch.rand(1)
+        return score, {"total": score}
+
+    episode._evaluate_cached_pq_score = _score
+    batch = _batch(episode.device)
+    batch["scale"] = 1.0
+
+    summary = episode._run_policy_value_evaluation_stage(
+        [batch],
+        [batch],
+        episode.firm_target,
+        n_epochs=2,
+    )
+
+    assert summary["status"] == "accepted"
+    assert summary["best_epoch"] == 1
+    assert random.random() == expected_next["python"]
+    assert float(np.random.rand()) == expected_next["numpy"]
+    assert float(torch.rand(1).item()) == expected_next["torch"]
+
+
+def test_pq_rejected_epoch_restores_rng_state():
+    episode = _episode()
+    param = episode._policy_value_stage_params("pq")[0]
+    _patch_stage_loss(episode, param)
+    episode._evaluate_cached_pq_score = lambda *args, **kwargs: (1.0, {"total": 1.0})
+    episode.hyperparams.pv_grad_hard_threshold = 100.0
+    episode.hyperparams.pv_epoch_max_skip_ratio = 0.4
+
+    random.seed(3030)
+    np.random.seed(3030)
+    torch.manual_seed(3030)
+    expected_state = episode._capture_rng_state()
+    expected_python = random.random()
+    expected_numpy = float(np.random.rand())
+    expected_torch = float(torch.rand(1).item())
+    episode._restore_rng_state(expected_state)
+    norm_iter = iter([1.0, 1_000.0])
+
+    def _advance_rng_after_step(params, max_norm):
+        random.random()
+        np.random.rand()
+        torch.rand(1)
+        value = next(norm_iter)
+        return value, min(value, max_norm)
+
+    episode._clip_params_with_raw_norm = _advance_rng_after_step
+    batch_ok = _batch(episode.device)
+    batch_hard = _batch(episode.device)
+    batch_ok["scale"] = 1.0
+    batch_hard["scale"] = 1_000.0
+
+    summary = episode._run_policy_value_evaluation_stage(
+        [batch_ok, batch_hard],
+        [batch_ok],
+        episode.firm_target,
+        n_epochs=1,
+    )
+
+    assert summary["status"] == "failed_no_valid_checkpoint"
+    assert random.random() == expected_python
+    assert float(np.random.rand()) == expected_numpy
+    assert float(torch.rand(1).item()) == expected_torch
 
 
 def test_bp_rejected_epoch_rolls_back_bp_heads():
