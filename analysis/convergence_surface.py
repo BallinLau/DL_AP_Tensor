@@ -743,12 +743,12 @@ def _validate_surface_inputs(
         raise ValueError(f"unsupported m_modes: {sorted(bad_modes)}")
 
 
-def _fixed_boundary_status(phat: np.ndarray) -> str:
-    finite_mask = np.isfinite(phat)
-    finite = phat[finite_mask]
+def _fixed_boundary_status(boundary_surface: np.ndarray) -> str:
+    finite_mask = np.isfinite(boundary_surface)
+    finite = boundary_surface[finite_mask]
     if finite.size == 0:
         return "all_nonfinite"
-    if finite.size < phat.size:
+    if finite.size < boundary_surface.size:
         return "partial_nonfinite"
     if np.all(finite > 0):
         return "all_survival"
@@ -762,16 +762,16 @@ def _extract_default_boundary_rows(
     checkpoint: str,
     b_values: np.ndarray,
     z_values: np.ndarray,
-    phat_grid: np.ndarray,
+    boundary_grid: np.ndarray,
 ) -> List[Dict[str, Any]]:
     import matplotlib.pyplot as plt
 
-    status = _fixed_boundary_status(phat_grid)
+    status = _fixed_boundary_status(boundary_grid)
     if status not in {"observed", "partial_nonfinite"}:
         return []
     fig, ax = plt.subplots()
     try:
-        contour = ax.contour(b_values, z_values, phat_grid, levels=[0.0])
+        contour = ax.contour(b_values, z_values, boundary_grid, levels=[0.0])
         rows: List[Dict[str, Any]] = []
         component_id = 0
         for segs in contour.allsegs:
@@ -1084,16 +1084,18 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
                 phat_np = torch.cat(parent_diag_chunks["Phat"], dim=0).reshape(-1).numpy()
                 default_np = torch.cat(parent_diag_chunks["default_probability"], dim=0).reshape(-1).numpy()
                 survival_np = torch.cat(parent_diag_chunks["survival_probability"], dim=0).reshape(-1).numpy()
-                phat_grid = phat_np.reshape(len(z_grid_t), len(b_grid_t))
-                status = _fixed_boundary_status(phat_grid)
+                default_boundary_grid = 0.5 - default_np.reshape(len(z_grid_t), len(b_grid_t))
+                status = _fixed_boundary_status(default_boundary_grid)
                 default_boundary_status[checkpoint_label] = status
-                default_boundary_status[f"{checkpoint_label}_nonfinite_ratio"] = float(1.0 - np.isfinite(phat_grid).mean())
+                default_boundary_status[f"{checkpoint_label}_nonfinite_ratio"] = float(
+                    1.0 - np.isfinite(default_boundary_grid).mean()
+                )
                 boundary_rows.extend(
                     _extract_default_boundary_rows(
                         checkpoint=checkpoint_label,
                         b_values=b_grid_t.detach().cpu().numpy(),
                         z_values=z_grid_t.detach().cpu().numpy(),
-                        phat_grid=phat_grid,
+                        boundary_grid=default_boundary_grid,
                     )
                 )
             support_distance = support.get("distance")
@@ -1303,7 +1305,8 @@ def _write_fixed_grid_pngs(
         for checkpoint, sub in eq_all.groupby("checkpoint"):
             piv_abs = sub.pivot_table(index="z", columns="b", values="conditional_abs", aggfunc="first").sort_index()
             piv_signed = sub.pivot_table(index="z", columns="b", values="conditional_signed", aggfunc="first").sort_index()
-            piv_phat = sub.pivot_table(index="z", columns="b", values="phat", aggfunc="first").sort_index()
+            piv_default = sub.pivot_table(index="z", columns="b", values="default_probability", aggfunc="first").sort_index()
+            default_boundary_grid = 0.5 - piv_default.values
             values = piv_abs.values
             color_label = "conditional_abs"
             if log_residual_scale:
@@ -1322,10 +1325,12 @@ def _write_fixed_grid_pngs(
                 ax,
                 b_values,
                 z_values,
-                piv_phat.values,
+                default_boundary_grid,
                 piv_abs.values,
                 residual_threshold=residual_threshold,
             )
+            ax.set_xlim(float(b_values.min()), float(b_values.max()))
+            ax.set_ylim(float(z_values.min()), float(z_values.max()))
             ax.set_xlabel("b")
             ax.set_ylabel("z")
             ax.set_title(f"{checkpoint} {equation} conditional_abs")
@@ -1349,10 +1354,12 @@ def _write_fixed_grid_pngs(
                     ax,
                     b_values,
                     z_values,
-                    piv_phat.values,
+                    default_boundary_grid,
                     piv_abs.values,
                     residual_threshold=residual_threshold,
                 )
+                ax.set_xlim(float(b_values.min()), float(b_values.max()))
+                ax.set_ylim(float(z_values.min()), float(z_values.max()))
                 ax.set_xlabel("b")
                 ax.set_ylabel("z")
                 ax.set_title(f"{checkpoint} {equation} conditional_signed")
@@ -1366,19 +1373,24 @@ def _overlay_default_and_threshold(
     ax: Any,
     b_values: np.ndarray,
     z_values: np.ndarray,
-    phat_grid: np.ndarray,
+    default_boundary_grid: np.ndarray,
     abs_grid: np.ndarray,
     *,
     residual_threshold: Optional[float],
 ) -> None:
     handles = []
     labels = []
-    if _fixed_boundary_status(phat_grid) == "observed":
-        cs = ax.contour(b_values, z_values, phat_grid, levels=[0.0], colors="black", linewidths=1.3)
+    if _fixed_boundary_status(default_boundary_grid) == "observed":
+        cs = ax.contour(b_values, z_values, default_boundary_grid, levels=[0.0], colors="black", linewidths=1.3)
         if cs.collections:
             handles.append(cs.collections[0])
-            labels.append("default boundary: Phat=0")
-    if residual_threshold is not None and np.nanmin(abs_grid) <= float(residual_threshold) <= np.nanmax(abs_grid):
+            labels.append("default boundary: default_prob=0.5")
+    finite_abs = abs_grid[np.isfinite(abs_grid)]
+    if (
+        residual_threshold is not None
+        and finite_abs.size > 0
+        and finite_abs.min() <= float(residual_threshold) <= finite_abs.max()
+    ):
         cs_thr = ax.contour(
             b_values,
             z_values,

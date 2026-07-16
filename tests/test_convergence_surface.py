@@ -713,16 +713,30 @@ def test_fixed_grid_real_parent_and_child_chunking_records_forward_sizes(tmp_pat
 def test_default_boundary_helpers_export_all_components():
     b = np.linspace(0.0, 1.0, 5)
     z = np.linspace(-1.0, 1.0, 5)
-    bb, zz = np.meshgrid(b, z)
-    phat = zz * zz - 0.25
+    _, zz = np.meshgrid(b, z)
+    boundary_grid = zz * zz - 0.25
 
-    rows = _extract_default_boundary_rows(checkpoint="ck", b_values=b, z_values=z, phat_grid=phat)
+    rows = _extract_default_boundary_rows(checkpoint="ck", b_values=b, z_values=z, boundary_grid=boundary_grid)
 
     assert _fixed_boundary_status(np.ones((2, 2))) == "all_survival"
     assert _fixed_boundary_status(-np.ones((2, 2))) == "all_default"
-    assert _fixed_boundary_status(phat) == "observed"
+    assert _fixed_boundary_status(boundary_grid) == "observed"
     assert rows
     assert len({row["component_id"] for row in rows}) >= 2
+
+
+def test_default_boundary_uses_default_probability_half_surface():
+    b = np.linspace(0.0, 1.0, 5)
+    z = np.linspace(-1.0, 1.0, 5)
+    _, zz = np.meshgrid(b, z)
+    default_probability = 0.5 + zz
+    boundary_grid = 0.5 - default_probability
+
+    rows = _extract_default_boundary_rows(checkpoint="ck", b_values=b, z_values=z, boundary_grid=boundary_grid)
+
+    assert _fixed_boundary_status(boundary_grid) == "observed"
+    assert rows
+    assert max(abs(row["z"]) for row in rows) < 1e-6
 
 
 def test_boundary_status_reports_partial_nonfinite():
@@ -752,6 +766,8 @@ def test_fixed_grid_slurm_uses_fixed_grid_not_reference_distribution():
     assert "--state-mode fixed_grid" in script
     assert "--reference-data" not in script
     assert "--n-reference-states" not in script
+    assert 'Z_MIN="${Z_MIN:--2.0}"' in script
+    assert 'Z_MAX="${Z_MAX:-2.0}"' in script
     assert "support_mask.png" not in script
     assert "FIXED_ETA" in script
     assert '"$PNG_COUNT" -lt 3' in script
