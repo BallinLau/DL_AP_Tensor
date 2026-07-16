@@ -7849,28 +7849,64 @@ class Episode:
                 bp_teacher,
                 bp_epochs,
             )
-        except Exception:
-            _restore_full_staged_start()
-            raise
-        stages_successful = (
-            pq_summary.get("status") == "accepted"
-            and bp_summary.get("status") in {"accepted", "skipped_no_active_refinancing"}
-        )
-        if not stages_successful:
-            _restore_full_staged_start()
+            stages_successful = (
+                pq_summary.get("status") == "accepted"
+                and bp_summary.get("status") in {"accepted", "skipped_no_active_refinancing"}
+            )
+            if not stages_successful:
+                _restore_full_staged_start()
+                firm_hash_after = (
+                    self._state_dict_hash(self.firm_target)
+                    if self.firm_target is not None
+                    else None
+                )
+                metadata = {
+                    "policy_value_training_flow": "staged",
+                    "policy_value_stage_status": "failed_bp",
+                    "policy_value_evaluation_stage": pq_summary,
+                    "bp_distillation_stage": bp_summary,
+                    "firm_target_stage_update": {
+                        "firm_target_update_mode": firm_mode,
+                        "firm_target_update_count": 0,
+                        "firm_target_hash_before": firm_hash_before,
+                        "firm_target_hash_after": firm_hash_after,
+                    },
+                }
+                self._last_policy_value_stage_summary = metadata
+                return {
+                    "final_losses": {},
+                    "metadata": metadata,
+                    "convergence": {
+                        "enabled": False,
+                        "skip_reason": "staged_training_failed",
+                    },
+                    "target_grid_validation_batches": len(validation_batches),
+                }
+            target_update_count = 0
+            if firm_mode == "stage_hard":
+                self._update_firm_target_now("stage_hard")
+                target_update_count = 1
             firm_hash_after = (
                 self._state_dict_hash(self.firm_target)
                 if self.firm_target is not None
                 else None
             )
+            diagnostic_rng_state = self._capture_rng_state()
+            try:
+                convergence = self.evaluate_bellman_convergence(
+                    pv_train_batches,
+                    validation_batches=validation_batches,
+                )
+            finally:
+                self._restore_rng_state(diagnostic_rng_state)
             metadata = {
                 "policy_value_training_flow": "staged",
-                "policy_value_stage_status": "failed_bp",
+                "policy_value_stage_status": "accepted",
                 "policy_value_evaluation_stage": pq_summary,
                 "bp_distillation_stage": bp_summary,
                 "firm_target_stage_update": {
                     "firm_target_update_mode": firm_mode,
-                    "firm_target_update_count": 0,
+                    "firm_target_update_count": target_update_count,
                     "firm_target_hash_before": firm_hash_before,
                     "firm_target_hash_after": firm_hash_after,
                 },
@@ -7879,44 +7915,12 @@ class Episode:
             return {
                 "final_losses": {},
                 "metadata": metadata,
-                "convergence": {
-                    "enabled": False,
-                    "skip_reason": "staged_training_failed",
-                },
+                "convergence": convergence,
                 "target_grid_validation_batches": len(validation_batches),
             }
-        target_update_count = 0
-        if stages_successful and firm_mode == "stage_hard":
-            self._update_firm_target_now("stage_hard")
-            target_update_count = 1
-        firm_hash_after = (
-            self._state_dict_hash(self.firm_target)
-            if self.firm_target is not None
-            else None
-        )
-        convergence = self.evaluate_bellman_convergence(
-            pv_train_batches,
-            validation_batches=validation_batches,
-        )
-        metadata = {
-            "policy_value_training_flow": "staged",
-            "policy_value_stage_status": "accepted" if stages_successful else "failed_bp",
-            "policy_value_evaluation_stage": pq_summary,
-            "bp_distillation_stage": bp_summary,
-            "firm_target_stage_update": {
-                "firm_target_update_mode": firm_mode,
-                "firm_target_update_count": target_update_count,
-                "firm_target_hash_before": firm_hash_before,
-                "firm_target_hash_after": firm_hash_after,
-            },
-        }
-        self._last_policy_value_stage_summary = metadata
-        return {
-            "final_losses": {},
-            "metadata": metadata,
-            "convergence": convergence,
-            "target_grid_validation_batches": len(validation_batches),
-        }
+        except Exception:
+            _restore_full_staged_start()
+            raise
 
     def _run_batches(
         self,

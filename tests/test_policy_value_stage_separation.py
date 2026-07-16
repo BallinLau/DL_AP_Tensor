@@ -1133,3 +1133,129 @@ def test_staged_exception_restores_full_runtime_state():
     assert random.random() == expected_python
     assert float(np.random.rand()) == expected_numpy
     assert float(torch.rand(1).item()) == expected_torch
+
+
+def test_staged_firm_target_update_exception_restores_full_state():
+    episode = _episode()
+    batch = _batch(episode.device)
+    episode.step_count = 31
+    episode.policy_value_eval_step_count = 9
+    episode.bp_distill_step_count = 6
+    random.seed(7070)
+    np.random.seed(7070)
+    torch.manual_seed(7070)
+    start_rng = episode._capture_rng_state()
+    expected_python = random.random()
+    expected_numpy = float(np.random.rand())
+    expected_torch = float(torch.rand(1).item())
+    episode._restore_rng_state(start_rng)
+    before_online = episode._state_dict_hash(episode.models["policy_value"])
+    before_target = episode._state_dict_hash(episode.firm_target)
+
+    def _raise_update_error(*args, **kwargs):
+        with torch.no_grad():
+            next(episode.firm_target.parameters()).add_(1.0)
+        episode.step_count += 5
+        episode.policy_value_eval_step_count += 6
+        episode.bp_distill_step_count += 7
+        random.random()
+        np.random.rand()
+        torch.rand(1)
+        raise RuntimeError("firm target update failed")
+
+    episode._update_firm_target_now = _raise_update_error
+
+    with pytest.raises(RuntimeError, match="firm target update failed"):
+        episode._run_policy_value_staged(
+            pv_train_batches=[batch],
+            validation_batches=[batch],
+            n_epochs=1,
+        )
+
+    assert episode._state_dict_hash(episode.models["policy_value"]) == before_online
+    assert episode._state_dict_hash(episode.firm_target) == before_target
+    assert episode.step_count == 31
+    assert episode.policy_value_eval_step_count == 9
+    assert episode.bp_distill_step_count == 6
+    assert random.random() == expected_python
+    assert float(np.random.rand()) == expected_numpy
+    assert float(torch.rand(1).item()) == expected_torch
+
+
+def test_staged_convergence_exception_restores_after_firm_update():
+    episode = _episode()
+    batch = _batch(episode.device)
+    episode.step_count = 41
+    episode.policy_value_eval_step_count = 10
+    episode.bp_distill_step_count = 7
+    random.seed(8080)
+    np.random.seed(8080)
+    torch.manual_seed(8080)
+    start_rng = episode._capture_rng_state()
+    expected_python = random.random()
+    expected_numpy = float(np.random.rand())
+    expected_torch = float(torch.rand(1).item())
+    episode._restore_rng_state(start_rng)
+    before_online = episode._state_dict_hash(episode.models["policy_value"])
+    before_target = episode._state_dict_hash(episode.firm_target)
+
+    def _raise_convergence(*args, **kwargs):
+        random.random()
+        np.random.rand()
+        torch.rand(1)
+        raise RuntimeError("convergence failed")
+
+    episode.evaluate_bellman_convergence = _raise_convergence
+
+    with pytest.raises(RuntimeError, match="convergence failed"):
+        episode._run_policy_value_staged(
+            pv_train_batches=[batch],
+            validation_batches=[batch],
+            n_epochs=1,
+        )
+
+    assert episode._state_dict_hash(episode.models["policy_value"]) == before_online
+    assert episode._state_dict_hash(episode.firm_target) == before_target
+    assert episode.step_count == 41
+    assert episode.policy_value_eval_step_count == 10
+    assert episode.bp_distill_step_count == 7
+    assert random.random() == expected_python
+    assert float(np.random.rand()) == expected_numpy
+    assert float(torch.rand(1).item()) == expected_torch
+
+
+def test_staged_success_convergence_is_rng_neutral():
+    episode = _episode()
+    batch = _batch(episode.device)
+    random.seed(9090)
+    np.random.seed(9090)
+    torch.manual_seed(9090)
+    expected_next = {}
+
+    def _convergence(*args, **kwargs):
+        state = episode._capture_rng_state()
+        expected_next["python"] = random.random()
+        expected_next["numpy"] = float(np.random.rand())
+        expected_next["torch"] = float(torch.rand(1).item())
+        episode._restore_rng_state(state)
+        random.random()
+        np.random.rand()
+        torch.rand(1)
+        return {"passed": True, "diagnostic": "rng_neutral"}
+
+    episode.evaluate_bellman_convergence = _convergence
+    before_target = episode._state_dict_hash(episode.firm_target)
+
+    result = episode._run_policy_value_staged(
+        pv_train_batches=[batch],
+        validation_batches=[batch],
+        n_epochs=1,
+    )
+
+    assert result["metadata"]["policy_value_stage_status"] == "accepted"
+    assert result["metadata"]["firm_target_stage_update"]["firm_target_update_count"] == 1
+    assert episode._state_dict_hash(episode.firm_target) != before_target
+    assert result["convergence"]["passed"] is True
+    assert random.random() == expected_next["python"]
+    assert float(np.random.rand()) == expected_next["numpy"]
+    assert float(torch.rand(1).item()) == expected_next["torch"]
