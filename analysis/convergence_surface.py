@@ -412,7 +412,31 @@ def _normalize_reference_columns(df: pd.DataFrame) -> pd.DataFrame:
         "LnK": "lnk_cal",
         "LNK": "lnk_cal",
     }
-    return df.rename(columns={k: v for k, v in aliases.items() if k in df.columns})
+    renamed = df.rename(columns={k: v for k, v in aliases.items() if k in df.columns})
+    return _coalesce_duplicate_columns(renamed)
+
+
+def _coalesce_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if not df.columns.has_duplicates:
+        return df
+    out = pd.DataFrame(index=df.index)
+    for col in dict.fromkeys(df.columns):
+        subset = df.loc[:, df.columns == col]
+        if subset.shape[1] == 1:
+            out[col] = subset.iloc[:, 0]
+        else:
+            out[col] = subset.bfill(axis=1).iloc[:, 0]
+    return out
+
+
+def _row_float(row: pd.Series, key: str) -> float:
+    value = row[key]
+    if isinstance(value, pd.Series):
+        non_null = value.dropna()
+        if non_null.empty:
+            raise ValueError(f"reference row field {key!r} is all NaN")
+        value = non_null.iloc[0]
+    return float(value)
 
 
 def _attach_sibling_macro_if_available(df: pd.DataFrame, path: Path) -> pd.DataFrame:
@@ -522,14 +546,14 @@ def _contexts_from_reference_distribution(
         states.append(torch.stack([
             bb.reshape(-1),
             zz.reshape(-1),
-            torch.full((n,), float(row["eta"]), device=device),
-            torch.full((n,), float(row["i"]), device=device),
-            torch.full((n,), float(row["x"]), device=device),
-            torch.full((n,), float(row["hatcf"]), device=device),
-            torch.full((n,), float(row["lnkf"]), device=device),
+            torch.full((n,), _row_float(row, "eta"), device=device),
+            torch.full((n,), _row_float(row, "i"), device=device),
+            torch.full((n,), _row_float(row, "x"), device=device),
+            torch.full((n,), _row_float(row, "hatcf"), device=device),
+            torch.full((n,), _row_float(row, "lnkf"), device=device),
         ], dim=1))
-        hatc.append(torch.full((n, 1), float(row["hatc_cal"]), device=device))
-        lnk.append(torch.full((n, 1), float(row["lnk_cal"]), device=device))
+        hatc.append(torch.full((n, 1), _row_float(row, "hatc_cal"), device=device))
+        lnk.append(torch.full((n, 1), _row_float(row, "lnk_cal"), device=device))
     parent_states = torch.cat(states, dim=0)
     macro = MacroTransitionContext(hatc_cal=torch.cat(hatc, dim=0), lnk_cal=torch.cat(lnk, dim=0))
     reference_index = torch.arange(take, device=device, dtype=torch.long).repeat_interleave(n)

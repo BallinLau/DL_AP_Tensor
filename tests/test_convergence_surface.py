@@ -555,6 +555,42 @@ def test_reference_path_auto_joins_sibling_macro_pickle(tmp_path):
     assert result.manifests["context_metadata"]["n_reference"] == 1
 
 
+def test_reference_adapter_coalesces_duplicate_columns_after_aliasing(tmp_path):
+    ckpt = tmp_path / "combined.pt"
+    _write_combined_checkpoint(ckpt)
+    firm = pd.DataFrame({
+        "path": [0],
+        "t": [0],
+        "branch": [-1],
+        "b": [0.1],
+        "z": [0.0],
+        "ETA": [1.0],
+        "i": [0.1],
+        "I": [0.2],
+        "x": [0.0],
+        "Hatcf": [-2.0],
+        "LnKF": [4.0],
+    })
+    macro = pd.DataFrame({"path": [0], "t": [0], "Hatc": [-2.1], "LnK": [4.1]})
+    firm_path = tmp_path / "ep1_stage_modeb.pkl"
+    macro_path = tmp_path / "ep1_stage_modeb_macro.pkl"
+    firm.to_pickle(firm_path)
+    macro.to_pickle(macro_path)
+
+    result = evaluate_checkpoint_convergence_surfaces(
+        [ckpt],
+        b_grid=[0.0],
+        z_grid=[0.0],
+        state_mode="reference_distribution",
+        reference_data=firm_path,
+        n_reference_states=1,
+        n_child_shocks=2,
+        device="cpu",
+    )
+
+    assert not result.long_table.empty
+
+
 def test_workload_guard_blocks_large_run(tmp_path):
     ckpt = tmp_path / "combined.pt"
     _write_combined_checkpoint(ckpt)
