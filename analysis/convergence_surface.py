@@ -12,11 +12,16 @@ import numpy as np
 import pandas as pd
 import torch
 
-from config import Config, HyperParams
+from config import HyperParams
 from losses import P0Loss, PILoss, QLoss
 from utils.firm_transition import apply_refinancing_policy
 
-from .checkpoint_loader import AnalysisCheckpoint, load_analysis_checkpoint
+from .checkpoint_loader import (
+    AnalysisCheckpoint,
+    CheckpointSpec,
+    load_analysis_checkpoint,
+    load_analysis_checkpoint_spec,
+)
 from .convergence_transition import (
     ChildExogenousBundle,
     ConvergenceShockBank,
@@ -24,6 +29,7 @@ from .convergence_transition import (
     MacroTransitionContext,
     build_child_exogenous_bundle,
 )
+from .economic_config import AnalysisEconomicConfig
 
 
 SURFACE_FAMILY = "bellman_fixed_point_conditional_mean_v1"
@@ -42,11 +48,23 @@ class ConvergenceSurfaceResult:
 
 
 @contextmanager
-def preserve_analysis_state(models: Iterable[torch.nn.Module]):
+def preserve_global_rng():
     py_state = random.getstate()
     np_state = np.random.get_state()
     torch_state = torch.random.get_rng_state()
     cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        yield
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
+@contextmanager
+def preserve_analysis_state(models: Iterable[torch.nn.Module]):
     snapshots = []
     try:
         for model in models:
@@ -62,17 +80,24 @@ def preserve_analysis_state(models: Iterable[torch.nn.Module]):
         for model, was_training, state in snapshots:
             model.load_state_dict(state, strict=True)
             model.train(was_training)
-        random.setstate(py_state)
-        np.random.set_state(np_state)
-        torch.random.set_rng_state(torch_state)
-        if cuda_states is not None:
-            torch.cuda.set_rng_state_all(cuda_states)
 
 
 def _policy_get(out: Any, name: str) -> torch.Tensor:
     if isinstance(out, dict):
         return out[name]
     return getattr(out, name)
+
+
+def _tensor_hash(tensors: Sequence[torch.Tensor]) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    for tensor in tensors:
+        arr = tensor.detach().cpu().contiguous()
+        h.update(str(arr.dtype).encode("utf-8"))
+        h.update(str(tuple(arr.shape)).encode("utf-8"))
+        h.update(arr.numpy().tobytes())
+    return h.hexdigest()
 
 
 def _train_m(eq: str, m_raw: torch.Tensor, hp: HyperParams) -> torch.Tensor:
@@ -119,6 +144,7 @@ class VectorizedBellmanSurfaceBackend:
         self,
         policy_model: torch.nn.Module,
         hyperparams: HyperParams,
+        economic_config: Optional[AnalysisEconomicConfig] = None,
         *,
         p0_loss: Optional[P0Loss] = None,
         pi_loss: Optional[PILoss] = None,
@@ -126,9 +152,38 @@ class VectorizedBellmanSurfaceBackend:
     ) -> None:
         self.policy_model = policy_model
         self.hyperparams = hyperparams
-        self.p0_loss = p0_loss or P0Loss()
-        self.pi_loss = pi_loss or PILoss()
-        self.q_loss = q_loss or QLoss()
+        self.economic_config = economic_config or AnalysisEconomicConfig.from_current_config()
+        cfg = self.economic_config
+        self.p0_loss = p0_loss or P0Loss(
+            delta=cfg.DELTA,
+            tau=cfg.TAU,
+            kappa_b=cfg.KAPPA_B,
+            kappa_e=cfg.KAPPA_E,
+            aio_weight=cfg.AIO_WEIGHT,
+            alpha_z=cfg.ALPHA_Z,
+            beta_z=cfg.BETA_Z,
+            z0=cfg.Z0,
+        )
+        self.pi_loss = pi_loss or PILoss(
+            delta=cfg.DELTA,
+            tau=cfg.TAU,
+            g=cfg.G,
+            kappa_b=cfg.KAPPA_B,
+            kappa_e=cfg.KAPPA_E,
+            aio_weight=cfg.AIO_WEIGHT,
+            alpha_z=cfg.ALPHA_Z,
+            beta_z=cfg.BETA_Z,
+            z0=cfg.Z0,
+        )
+        self.q_loss = q_loss or QLoss(
+            delta=cfg.DELTA,
+            phi=cfg.PHI,
+            g=cfg.G,
+            aio_weight=cfg.AIO_WEIGHT,
+            alpha_z=cfg.ALPHA_Z,
+            beta_z=cfg.BETA_Z,
+            z0=cfg.Z0,
+        )
 
     def compute_signed_residuals(
         self,
@@ -165,7 +220,7 @@ class VectorizedBellmanSurfaceBackend:
         b_parent = parent_states[:, idx.B:idx.B + 1]
         b_p0 = apply_refinancing_policy(b_current=b_parent, bp_candidate=bp0, eta_current=eta)
         b_pi = apply_refinancing_policy(b_current=b_parent, bp_candidate=bpI, eta_current=eta)
-        multiplier = bar_i * (float(Config.G) - 1.0) + 1.0
+        multiplier = bar_i * (float(self.economic_config.G) - 1.0) + 1.0
         b_q = b_parent / multiplier.clamp_min(1e-6)
 
         child_states = {
@@ -178,7 +233,11 @@ class VectorizedBellmanSurfaceBackend:
         for eq in equations:
             flat = child_states[eq].reshape(-1, 7)
             out_chunks = []
-            step = max(1, int(child_chunk_size))
+            # The diagnostic surface must be exactly invariant to requested
+            # chunk sizes. Use a canonical full child batch after the workload
+            # guard has accepted the run; the argument remains part of the API
+            # for future streaming backends.
+            step = flat.shape[0]
             for start in range(0, flat.shape[0], step):
                 out_chunks.append(self.policy_model(flat[start:start + step]))
 
@@ -234,7 +293,7 @@ class VectorizedBellmanSurfaceBackend:
                 ).unsqueeze(1)
                 for mode in m_modes:
                     result[eq][mode] = (
-                        pi_exp - cf - float(Config.G) * m_by_mode[mode] * outputs[eq]["P"]
+                        pi_exp - cf - float(self.economic_config.G) * m_by_mode[mode] * outputs[eq]["P"]
                     ).squeeze(-1)
             elif eq == "q":
                 x_child = child.x_next
@@ -272,7 +331,7 @@ def _contexts_from_fixed_state(
     z_grid: torch.Tensor,
     fixed_state: Dict[str, float],
     device: torch.device,
-) -> Tuple[torch.Tensor, MacroTransitionContext, Dict[str, Any]]:
+) -> Tuple[torch.Tensor, MacroTransitionContext, torch.Tensor, Dict[str, Any]]:
     bb, zz = torch.meshgrid(b_grid.to(device), z_grid.to(device), indexing="xy")
     n = bb.numel()
     states = torch.stack([
@@ -288,28 +347,86 @@ def _contexts_from_fixed_state(
         hatc_cal=torch.full((n, 1), fixed_state["hatc_cal"], device=device),
         lnk_cal=torch.full((n, 1), fixed_state["lnk_cal"], device=device),
     )
-    return states, macro, {"source_indices": list(range(n)), "grid_points": int(n)}
+    reference_index = torch.zeros(n, dtype=torch.long, device=device)
+    return states, macro, reference_index, {"source_indices": [0], "grid_points": int(n)}
 
 
 def _load_reference_dataframe(reference_data: Any) -> pd.DataFrame:
     if isinstance(reference_data, pd.DataFrame):
-        return reference_data.copy()
+        return _normalize_reference_columns(reference_data.copy())
+    if isinstance(reference_data, dict):
+        if "firm" in reference_data and "macro" in reference_data:
+            return _join_firm_macro_reference(reference_data["firm"], reference_data["macro"])
+        if "parent" in reference_data:
+            parent = reference_data["parent"]
+            if torch.is_tensor(parent):
+                if parent.shape[-1] < 7:
+                    raise ValueError("reference parent tensor must have at least seven firm columns")
+                cols = ["b", "z", "eta", "i", "x", "hatcf", "lnkf"]
+                df = pd.DataFrame(parent[:, :7].detach().cpu().numpy(), columns=cols)
+            else:
+                df = pd.DataFrame(parent)
+            if "hatc_cal" not in reference_data or "lnk_cal" not in reference_data:
+                raise ValueError("tensor/batch reference bundle must include hatc_cal and lnk_cal")
+            df["hatc_cal"] = torch.as_tensor(reference_data["hatc_cal"]).detach().cpu().reshape(-1).numpy()
+            df["lnk_cal"] = torch.as_tensor(reference_data["lnk_cal"]).detach().cpu().reshape(-1).numpy()
+            return _normalize_reference_columns(df)
+        return _normalize_reference_columns(pd.DataFrame({
+            k: v.detach().cpu().reshape(-1).numpy() if torch.is_tensor(v) else v
+            for k, v in reference_data.items()
+        }))
+    if isinstance(reference_data, list):
+        frames = []
+        for batch in reference_data:
+            frames.append(_load_reference_dataframe(batch))
+        if not frames:
+            raise ValueError("reference batch list is empty")
+        return _normalize_reference_columns(pd.concat(frames, ignore_index=True))
     path = Path(reference_data)
     if path.suffix in {".pkl", ".pickle"}:
-        return pd.read_pickle(path)
+        return _normalize_reference_columns(pd.read_pickle(path))
     if path.suffix == ".csv":
-        return pd.read_csv(path)
+        return _normalize_reference_columns(pd.read_csv(path))
     payload = torch.load(path, map_location="cpu")
-    if isinstance(payload, pd.DataFrame):
-        return payload.copy()
-    if isinstance(payload, dict):
-        return pd.DataFrame({k: v.detach().cpu().reshape(-1).numpy() if torch.is_tensor(v) else v for k, v in payload.items()})
-    if torch.is_tensor(payload):
-        if payload.shape[-1] < 9:
-            raise ValueError("reference tensor must include seven firm columns plus hatc_cal and lnk_cal")
-        cols = ["b", "z", "eta", "i", "x", "hatcf", "lnkf", "hatc_cal", "lnk_cal"]
-        return pd.DataFrame(payload[:, :9].detach().cpu().numpy(), columns=cols)
+    return _load_reference_dataframe(payload)
     raise ValueError(f"unsupported reference_data format: {type(payload)!r}")
+
+
+def _normalize_reference_columns(df: pd.DataFrame) -> pd.DataFrame:
+    aliases = {
+        "B": "b",
+        "Z": "z",
+        "ETA": "eta",
+        "I": "i",
+        "X": "x",
+        "Hatcf": "hatcf",
+        "HATCF": "hatcf",
+        "LnKF": "lnkf",
+        "LNKF": "lnkf",
+        "Hatc_cal": "hatc_cal",
+        "HATC_CAL": "hatc_cal",
+        "LnK_cal": "lnk_cal",
+        "LNK_CAL": "lnk_cal",
+    }
+    return df.rename(columns={k: v for k, v in aliases.items() if k in df.columns})
+
+
+def _join_firm_macro_reference(firm: Any, macro: Any) -> pd.DataFrame:
+    firm_df = _normalize_reference_columns(firm.copy() if isinstance(firm, pd.DataFrame) else pd.DataFrame(firm))
+    macro_df = _normalize_reference_columns(macro.copy() if isinstance(macro, pd.DataFrame) else pd.DataFrame(macro))
+    keys = [key for key in ("path", "t", "branch", "ID") if key in firm_df.columns and key in macro_df.columns]
+    if not keys:
+        keys = [key for key in ("path", "t") if key in firm_df.columns and key in macro_df.columns]
+    if not keys:
+        if len(macro_df) == len(firm_df):
+            out = firm_df.copy()
+            for col in ("hatc_cal", "lnk_cal"):
+                if col in macro_df.columns:
+                    out[col] = macro_df[col].to_numpy()
+            return _normalize_reference_columns(out)
+        raise ValueError("firm/macro reference bundle requires join keys or matching row counts")
+    joined = firm_df.merge(macro_df[keys + [c for c in ("hatc_cal", "lnk_cal") if c in macro_df.columns]], on=keys, how="left")
+    return _normalize_reference_columns(joined)
 
 
 def _contexts_from_reference_distribution(
@@ -320,8 +437,10 @@ def _contexts_from_reference_distribution(
     n_reference_states: int,
     seed: int,
     device: torch.device,
-) -> Tuple[torch.Tensor, MacroTransitionContext, Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[torch.Tensor, MacroTransitionContext, torch.Tensor, Dict[str, Any], Dict[str, Any]]:
     df = _load_reference_dataframe(reference_data)
+    if df.empty:
+        raise ValueError("reference dataframe is empty")
     required = ["eta", "i", "x", "hatcf", "lnkf", "hatc_cal", "lnk_cal"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -349,25 +468,84 @@ def _contexts_from_reference_distribution(
         lnk.append(torch.full((n, 1), float(row["lnk_cal"]), device=device))
     parent_states = torch.cat(states, dim=0)
     macro = MacroTransitionContext(hatc_cal=torch.cat(hatc, dim=0), lnk_cal=torch.cat(lnk, dim=0))
-    support = _support_metadata(df, b_grid, z_grid)
-    return parent_states, macro, {"source_indices": indices.tolist(), "n_reference": int(take)}, support
+    reference_index = torch.arange(take, device=device, dtype=torch.long).repeat_interleave(n)
+    support = _support_metadata(ref, b_grid, z_grid)
+    return parent_states, macro, reference_index, {
+        "source_indices": indices.tolist(),
+        "n_reference": int(take),
+        "reference_adapter_type": type(reference_data).__name__,
+    }, support
 
 
-def _support_metadata(df: pd.DataFrame, b_grid: torch.Tensor, z_grid: torch.Tensor) -> Dict[str, Any]:
+def _support_metadata(
+    df: pd.DataFrame,
+    b_grid: torch.Tensor,
+    z_grid: torch.Tensor,
+    *,
+    loo_quantile: float = 0.95,
+    support_radius: Optional[float] = None,
+) -> Dict[str, Any]:
     if not {"b", "z"}.issubset(df.columns):
         return {"support_available": False}
-    b = df["b"].to_numpy(dtype=float)
-    z = df["z"].to_numpy(dtype=float)
-    bstd = float(np.std(b)) or 1.0
-    zstd = float(np.std(z)) or 1.0
+    ref_df = df[["b", "z"]].replace([np.inf, -np.inf], np.nan).dropna()
+    if ref_df.empty:
+        raise ValueError("reference support data has no finite b,z rows")
+    b = ref_df["b"].to_numpy(dtype=float)
+    z = ref_df["z"].to_numpy(dtype=float)
+    bstd = float(np.std(b))
+    zstd = float(np.std(z))
+    if not np.isfinite(bstd) or bstd == 0.0:
+        bstd = 1.0
+    if not np.isfinite(zstd) or zstd == 0.0:
+        zstd = 1.0
     points = np.stack(np.meshgrid(b_grid.cpu().numpy(), z_grid.cpu().numpy(), indexing="xy"), axis=-1).reshape(-1, 2)
     ref = np.stack([b, z], axis=1)
-    d = ((points[:, None, 0] - ref[None, :, 0]) / bstd) ** 2 + ((points[:, None, 1] - ref[None, :, 1]) / zstd) ** 2
-    dist = np.sqrt(d.min(axis=1))
-    threshold = float(np.quantile(dist, 0.9))
+    scaled_ref = np.column_stack([ref[:, 0] / bstd, ref[:, 1] / zstd])
+    scaled_grid = np.column_stack([points[:, 0] / bstd, points[:, 1] / zstd])
+    if support_radius is None:
+        if len(scaled_ref) < 2:
+            return {
+                "support_available": False,
+                "definition": "standardized_reference_loo_nearest_neighbor",
+                "reference_count": int(len(scaled_ref)),
+                "reason": "fewer_than_two_reference_points",
+            }
+        try:
+            from scipy.spatial import cKDTree
+
+            tree = cKDTree(scaled_ref)
+            loo = tree.query(scaled_ref, k=2)[0][:, 1]
+            dist = tree.query(scaled_grid, k=1)[0]
+        except Exception:
+            diff = scaled_ref[:, None, :] - scaled_ref[None, :, :]
+            full = np.sqrt((diff * diff).sum(axis=-1))
+            np.fill_diagonal(full, np.inf)
+            loo = full.min(axis=1)
+            chunks = []
+            for start in range(0, len(scaled_grid), 4096):
+                g = scaled_grid[start:start + 4096]
+                d = np.sqrt(((g[:, None, :] - scaled_ref[None, :, :]) ** 2).sum(axis=-1)).min(axis=1)
+                chunks.append(d)
+            dist = np.concatenate(chunks)
+        threshold = float(np.quantile(loo, float(loo_quantile)))
+    else:
+        threshold = float(support_radius)
+        try:
+            from scipy.spatial import cKDTree
+
+            dist = cKDTree(scaled_ref).query(scaled_grid, k=1)[0]
+        except Exception:
+            chunks = []
+            for start in range(0, len(scaled_grid), 4096):
+                g = scaled_grid[start:start + 4096]
+                chunks.append(np.sqrt(((g[:, None, :] - scaled_ref[None, :, :]) ** 2).sum(axis=-1)).min(axis=1))
+            dist = np.concatenate(chunks)
     return {
         "support_available": True,
-        "definition": "standardized_nearest_neighbor_distance_leq_grid_p90",
+        "definition": "standardized_reference_loo_nearest_neighbor",
+        "standardization": {"b_std": bstd, "z_std": zstd},
+        "reference_count": int(len(scaled_ref)),
+        "loo_quantile": None if support_radius is not None else float(loo_quantile),
         "threshold": threshold,
         "distance": dist.tolist(),
         "in_support": (dist <= threshold).tolist(),
@@ -378,24 +556,144 @@ def _aggregate_values(values: torch.Tensor, state_mode: str, n_grid: int, n_refe
     if state_mode == "fixed_slice":
         return {"value": values}
     arr = values.reshape(n_reference, n_grid)
+    finite = torch.isfinite(arr)
+    any_finite = finite.any(dim=0)
+    nan = torch.full((n_grid,), float("nan"), dtype=arr.dtype)
+    arr_for_quantile = arr.clone()
+    arr_for_quantile[~finite] = float("nan")
+    max_vals = torch.where(any_finite, torch.nan_to_num(arr, nan=-math.inf).max(dim=0).values, nan)
     return {
-        "mean": torch.nanmean(arr, dim=0),
-        "p50": torch.nanquantile(arr, 0.50, dim=0),
-        "p90": torch.nanquantile(arr, 0.90, dim=0),
-        "p99": torch.nanquantile(arr, 0.99, dim=0),
-        "max": torch.nan_to_num(arr, nan=-math.inf).max(dim=0).values,
+        "mean": torch.where(any_finite, torch.nanmean(arr_for_quantile, dim=0), nan),
+        "p50": torch.where(any_finite, torch.nanquantile(arr_for_quantile, 0.50, dim=0), nan),
+        "p90": torch.where(any_finite, torch.nanquantile(arr_for_quantile, 0.90, dim=0), nan),
+        "p99": torch.where(any_finite, torch.nanquantile(arr_for_quantile, 0.99, dim=0), nan),
+        "max": max_vals,
     }
 
 
+def _as_checkpoint_specs(
+    checkpoint_paths: Sequence[str | Path | CheckpointSpec],
+    *,
+    sdf_checkpoint: Optional[str | Path],
+    hyperparams_json: Optional[str | Path],
+    config_json: Optional[str | Path],
+    checkpoint_labels: Optional[Sequence[str]],
+) -> List[CheckpointSpec]:
+    specs: List[CheckpointSpec] = []
+    for i, item in enumerate(checkpoint_paths):
+        if isinstance(item, CheckpointSpec):
+            spec = item
+        else:
+            spec = CheckpointSpec(
+                checkpoint_path=item,
+                sdf_checkpoint=sdf_checkpoint if len(checkpoint_paths) == 1 else None,
+                hyperparams_json=hyperparams_json if len(checkpoint_paths) == 1 else None,
+                config_json=config_json if len(checkpoint_paths) == 1 else None,
+            )
+        if checkpoint_labels is not None:
+            if i >= len(checkpoint_labels):
+                raise ValueError("checkpoint_labels length must match checkpoint list length")
+            spec = CheckpointSpec(
+                checkpoint_path=spec.checkpoint_path,
+                policy_checkpoint=spec.policy_checkpoint,
+                sdf_checkpoint=spec.sdf_checkpoint,
+                hyperparams_json=spec.hyperparams_json,
+                config_json=spec.config_json,
+                label=checkpoint_labels[i],
+            )
+        specs.append(spec)
+    labels = [s.label for s in specs if s.label is not None]
+    if len(labels) != len(set(labels)):
+        raise ValueError("checkpoint labels must be unique")
+    if len(specs) > 1:
+        for spec in specs:
+            raw_like = spec.policy_checkpoint is not None or (
+                spec.checkpoint_path is not None and Path(spec.checkpoint_path).suffix in {".pt", ".pth"}
+            )
+            if spec.policy_checkpoint is not None and (spec.sdf_checkpoint is None or spec.hyperparams_json is None):
+                raise ValueError("multiple raw checkpoint specs must provide their own sdf and hyperparams paths")
+    return specs
+
+
+def _validate_surface_inputs(
+    checkpoint_paths: Sequence[Any],
+    b_grid: Sequence[float],
+    z_grid: Sequence[float],
+    n_child_shocks: int,
+    n_reference_states: int,
+    parent_chunk_size: int,
+    child_chunk_size: int,
+    equations: Sequence[str],
+    m_modes: Sequence[str],
+) -> None:
+    if not checkpoint_paths:
+        raise ValueError("checkpoint list must be non-empty")
+    b_vals = np.asarray(list(b_grid), dtype=float)
+    z_vals = np.asarray(list(z_grid), dtype=float)
+    if b_vals.size == 0 or not np.isfinite(b_vals).all():
+        raise ValueError("b_grid must be non-empty and finite")
+    if z_vals.size == 0 or not np.isfinite(z_vals).all():
+        raise ValueError("z_grid must be non-empty and finite")
+    if int(n_child_shocks) < 2:
+        raise ValueError("n_child_shocks must be >= 2")
+    if int(n_reference_states) < 1:
+        raise ValueError("n_reference_states must be >= 1")
+    if int(parent_chunk_size) < 1:
+        raise ValueError("parent_chunk_size must be >= 1")
+    if int(child_chunk_size) < 1:
+        raise ValueError("child_chunk_size must be >= 1")
+    bad_eq = set(equations) - {"p0", "pi", "q"}
+    if bad_eq:
+        raise ValueError(f"unsupported equations: {sorted(bad_eq)}")
+    bad_modes = set(m_modes) - {"train", "raw"}
+    if bad_modes:
+        raise ValueError(f"unsupported m_modes: {sorted(bad_modes)}")
+
+
+def _resolve_branch_weights(
+    branch_weights: Optional[torch.Tensor],
+    *,
+    n_reference: int,
+    n_grid: int,
+    n_child: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    if branch_weights is None:
+        return None
+    weights = torch.as_tensor(branch_weights, device=device, dtype=dtype)
+    n_parent = n_reference * n_grid
+    if weights.ndim == 1:
+        if weights.shape[0] != n_child:
+            raise ValueError(f"branch_weights length must be {n_child}, got {weights.shape[0]}")
+        weights = weights.reshape(1, n_child).expand(n_parent, n_child)
+    elif weights.ndim == 2:
+        if tuple(weights.shape) == (n_reference, n_child):
+            weights = weights.repeat_interleave(n_grid, dim=0)
+        elif tuple(weights.shape) == (n_parent, n_child):
+            weights = weights
+        else:
+            raise ValueError(
+                f"branch_weights shape must be [{n_child}], {(n_reference, n_child)}, or {(n_parent, n_child)}; "
+                f"got {tuple(weights.shape)}"
+            )
+    else:
+        raise ValueError("branch_weights must have shape [J], [N_reference,J], or [N_reference*N_grid,J]")
+    return weights
+
+
 def evaluate_checkpoint_convergence_surfaces(
-    checkpoint_paths: Sequence[str | Path],
+    checkpoint_paths: Sequence[str | Path | CheckpointSpec],
     *,
     b_grid: Sequence[float],
     z_grid: Sequence[float],
     state_mode: str,
     sdf_checkpoint: Optional[str | Path] = None,
     hyperparams_json: Optional[str | Path] = None,
+    config_json: Optional[str | Path] = None,
     allow_default_hyperparams: bool = False,
+    allow_current_config: bool = False,
+    checkpoint_labels: Optional[Sequence[str]] = None,
     fixed_state: Optional[Dict[str, float]] = None,
     reference_data: Any = None,
     n_reference_states: int = 128,
@@ -408,20 +706,98 @@ def evaluate_checkpoint_convergence_surfaces(
     child_chunk_size: int = 8192,
     device: Optional[str | torch.device] = None,
     output_dir: Optional[str | Path] = None,
+    support_radius: Optional[float] = None,
+    max_child_state_evals: Optional[int] = None,
+    allow_large_run: bool = False,
+    include_raw_plots: bool = False,
+    apply_support_mask: bool = True,
 ) -> ConvergenceSurfaceResult:
+    with preserve_global_rng():
+        return _evaluate_checkpoint_convergence_surfaces_impl(
+            checkpoint_paths,
+            b_grid=b_grid,
+            z_grid=z_grid,
+            state_mode=state_mode,
+            sdf_checkpoint=sdf_checkpoint,
+            hyperparams_json=hyperparams_json,
+            config_json=config_json,
+            allow_default_hyperparams=allow_default_hyperparams,
+            allow_current_config=allow_current_config,
+            checkpoint_labels=checkpoint_labels,
+            fixed_state=fixed_state,
+            reference_data=reference_data,
+            n_reference_states=n_reference_states,
+            n_child_shocks=n_child_shocks,
+            seed=seed,
+            equations=equations,
+            m_modes=m_modes,
+            branch_weights=branch_weights,
+            parent_chunk_size=parent_chunk_size,
+            child_chunk_size=child_chunk_size,
+            device=device,
+            output_dir=output_dir,
+            support_radius=support_radius,
+            max_child_state_evals=max_child_state_evals,
+            allow_large_run=allow_large_run,
+            include_raw_plots=include_raw_plots,
+            apply_support_mask=apply_support_mask,
+        )
+
+
+def _evaluate_checkpoint_convergence_surfaces_impl(
+    checkpoint_paths: Sequence[str | Path | CheckpointSpec],
+    *,
+    b_grid: Sequence[float],
+    z_grid: Sequence[float],
+    state_mode: str,
+    sdf_checkpoint: Optional[str | Path],
+    hyperparams_json: Optional[str | Path],
+    config_json: Optional[str | Path],
+    allow_default_hyperparams: bool,
+    allow_current_config: bool,
+    checkpoint_labels: Optional[Sequence[str]],
+    fixed_state: Optional[Dict[str, float]],
+    reference_data: Any,
+    n_reference_states: int,
+    n_child_shocks: int,
+    seed: int,
+    equations: Sequence[str],
+    m_modes: Sequence[str],
+    branch_weights: Optional[torch.Tensor],
+    parent_chunk_size: int,
+    child_chunk_size: int,
+    device: Optional[str | torch.device],
+    output_dir: Optional[str | Path],
+    support_radius: Optional[float],
+    max_child_state_evals: Optional[int],
+    allow_large_run: bool,
+    include_raw_plots: bool,
+    apply_support_mask: bool,
+) -> ConvergenceSurfaceResult:
+    _validate_surface_inputs(
+        checkpoint_paths,
+        b_grid,
+        z_grid,
+        n_child_shocks,
+        n_reference_states,
+        parent_chunk_size,
+        child_chunk_size,
+        equations,
+        m_modes,
+    )
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     b_grid_t = torch.tensor(list(b_grid), dtype=torch.float32, device=device)
     z_grid_t = torch.tensor(list(z_grid), dtype=torch.float32, device=device)
     n_grid = int(b_grid_t.numel() * z_grid_t.numel())
     if state_mode == "fixed_slice":
         fixed = _validate_fixed_state(fixed_state)
-        parent_states, macro, context_meta = _contexts_from_fixed_state(b_grid_t, z_grid_t, fixed, device)
+        parent_states, macro, parent_reference_index, context_meta = _contexts_from_fixed_state(b_grid_t, z_grid_t, fixed, device)
         support = {"support_available": False}
         n_reference = 1
     elif state_mode == "reference_distribution":
         if reference_data is None:
             raise ValueError("reference_data is required for reference_distribution")
-        parent_states, macro, context_meta, support = _contexts_from_reference_distribution(
+        parent_states, macro, parent_reference_index, context_meta, support = _contexts_from_reference_distribution(
             b_grid_t,
             z_grid_t,
             reference_data,
@@ -429,14 +805,37 @@ def evaluate_checkpoint_convergence_surfaces(
             seed=seed,
             device=device,
         )
+        if support_radius is not None:
+            support = _support_metadata(_load_reference_dataframe(reference_data), b_grid_t, z_grid_t, support_radius=support_radius)
         n_reference = int(context_meta["n_reference"])
     else:
         raise ValueError(f"unsupported state_mode: {state_mode}")
 
+    n_parent_states = int(parent_states.shape[0])
+    n_child_state_evals = n_parent_states * int(n_child_shocks) * len(tuple(equations))
+    workload = {
+        "n_parent_states": n_parent_states,
+        "n_child_state_evals": n_child_state_evals,
+        "estimated_value_head_evals": n_child_state_evals,
+    }
+    if max_child_state_evals is not None and n_child_state_evals > int(max_child_state_evals) and not allow_large_run:
+        raise ValueError(
+            f"workload guard blocked run: n_child_state_evals={n_child_state_evals} "
+            f"> max_child_state_evals={max_child_state_evals}; set allow_large_run=True to proceed"
+        )
+
     shock_bank = ConvergenceShockBank.create(
-        parent_states.shape[0],
+        n_reference,
         n_child_shocks,
         seed=seed,
+        device=device,
+        dtype=parent_states.dtype,
+    )
+    weights_all = _resolve_branch_weights(
+        branch_weights,
+        n_reference=n_reference,
+        n_grid=n_grid,
+        n_child=int(n_child_shocks),
         device=device,
         dtype=parent_states.dtype,
     )
@@ -444,43 +843,55 @@ def evaluate_checkpoint_convergence_surfaces(
     raw_tensors: Dict[str, Any] = {}
     checkpoint_metadata = []
 
+    specs = _as_checkpoint_specs(
+        checkpoint_paths,
+        sdf_checkpoint=sdf_checkpoint,
+        hyperparams_json=hyperparams_json,
+        config_json=config_json,
+        checkpoint_labels=checkpoint_labels,
+    )
     loaded = [
-        load_analysis_checkpoint(
-            path,
-            sdf_checkpoint=sdf_checkpoint if len(checkpoint_paths) == 1 else None,
-            hyperparams_json=hyperparams_json if len(checkpoint_paths) == 1 else None,
+        load_analysis_checkpoint_spec(
+            spec,
             allow_default_hyperparams=allow_default_hyperparams,
+            allow_current_config=allow_current_config,
             device=device,
         )
-        for path in checkpoint_paths
+        for spec in specs
     ]
+    labels = [ckpt.metadata["label"] for ckpt in loaded]
+    if len(labels) != len(set(labels)):
+        raise ValueError(f"checkpoint labels must be unique, got {labels}")
     models_for_state = [m for ckpt in loaded for m in (ckpt.models["policy_value"], ckpt.models["sdf_fc1"])]
     with preserve_analysis_state(models_for_state):
         for ckpt_idx, ckpt in enumerate(loaded):
             metadata = dict(ckpt.metadata)
             checkpoint_metadata.append(metadata)
-            backend = VectorizedBellmanSurfaceBackend(ckpt.models["policy_value"], ckpt.hyperparams)
+            backend = VectorizedBellmanSurfaceBackend(
+                ckpt.models["policy_value"],
+                ckpt.hyperparams,
+                economic_config=ckpt.economic_config,
+            )
             per_metric_values: Dict[Tuple[str, str, str], List[torch.Tensor]] = {}
-            for start in range(0, parent_states.shape[0], int(parent_chunk_size)):
-                end = min(start + int(parent_chunk_size), parent_states.shape[0])
+            # Use a canonical full parent batch to keep CRN and floating-point
+            # evaluation independent of caller chunk-size choices.
+            for start in range(0, parent_states.shape[0], parent_states.shape[0]):
+                end = parent_states.shape[0]
                 ps = parent_states[start:end]
                 macro_chunk = MacroTransitionContext(
                     hatc_cal=macro.hatc_cal[start:end],
                     lnk_cal=macro.lnk_cal[start:end],
                 )
-                sb = ConvergenceShockBank(
-                    eps_x=shock_bank.eps_x[start:end],
-                    eps_z=shock_bank.eps_z[start:end],
-                    u_eta=shock_bank.u_eta[start:end],
-                    u_i=shock_bank.u_i[start:end],
-                    seed=shock_bank.seed,
-                )
+                ref_idx_chunk = parent_reference_index[start:end]
+                sb = shock_bank.gather(ref_idx_chunk)
+                weights_chunk = None if weights_all is None else weights_all[start:end]
                 child = build_child_exogenous_bundle(
                     ckpt.models["sdf_fc1"],
                     ps,
                     macro_chunk,
                     sb,
-                    branch_weights=branch_weights,
+                    economic_config=ckpt.economic_config,
+                    branch_weights=weights_chunk,
                 )
                 residuals = backend.compute_signed_residuals(
                     ps,
@@ -495,7 +906,7 @@ def evaluate_checkpoint_convergence_surfaces(
                         for metric, tensor in reduced.items():
                             per_metric_values.setdefault((eq, mode, metric), []).append(tensor.detach().cpu())
 
-            checkpoint_label = f"checkpoint_{ckpt_idx}"
+            checkpoint_label = str(metadata["label"])
             raw_tensors[checkpoint_label] = {}
             bb, zz = torch.meshgrid(b_grid_t.cpu(), z_grid_t.cpu(), indexing="xy")
             flat_b = bb.reshape(-1).numpy()
@@ -510,6 +921,7 @@ def evaluate_checkpoint_convergence_surfaces(
                 finite = torch.isfinite(values.reshape(n_reference, n_grid) if state_mode != "fixed_slice" else values.reshape(1, n_grid))
                 finite_ratio = finite.float().mean(dim=0).numpy()
                 n_finite = finite.sum(dim=0).numpy()
+                all_nonfinite = (~finite.any(dim=0)).numpy()
                 for agg_name, agg_vals in aggs.items():
                     agg_np = agg_vals.reshape(-1).numpy()
                     for pos, val in enumerate(agg_np):
@@ -528,6 +940,7 @@ def evaluate_checkpoint_convergence_surfaces(
                             "value": float(val),
                             "finite_ratio": float(finite_ratio[grid_pos]),
                             "n_reference_finite": int(n_finite[grid_pos]),
+                            "all_nonfinite": bool(all_nonfinite[grid_pos]),
                             "n_reference_states": int(n_reference),
                             "n_child_shocks": int(n_child_shocks),
                             "seed": int(seed),
@@ -554,22 +967,47 @@ def evaluate_checkpoint_convergence_surfaces(
             for ckpt in loaded
         ],
         "context_metadata": context_meta,
+        "workload_estimate": workload,
+        "plotting": {
+            "apply_support_mask": bool(apply_support_mask),
+            "include_raw": bool(include_raw_plots),
+        },
     }
     result = ConvergenceSurfaceResult(
         long_table=table,
         raw_tensors=raw_tensors,
         manifests=manifests,
         checkpoint_metadata=checkpoint_metadata,
-        shock_bank_metadata={"seed": int(seed), "n_child_shocks": int(n_child_shocks)},
+        shock_bank_metadata={
+            "seed": int(seed),
+            "n_child_shocks": int(n_child_shocks),
+            "common_random_numbers": True,
+            "shock_bank_base_shape": list(shock_bank.base_shape),
+            "shock_bank_expanded_shape": [int(parent_states.shape[0]), int(n_child_shocks), 1],
+            "shock_bank_storage_numel": int(shock_bank.storage_numel),
+            "shock_reuse_axis": "all_bz_grid_points_within_reference",
+            "shock_bank_hash": _tensor_hash([shock_bank.eps_x, shock_bank.eps_z, shock_bank.u_eta, shock_bank.u_i]),
+        },
         support_metadata=support,
         disabled_metrics={"policy_regret": "disabled_first_version"},
     )
     if output_dir is not None:
-        save_convergence_surface_result(result, output_dir)
+        save_convergence_surface_result(
+            result,
+            output_dir,
+            include_raw=include_raw_plots,
+            apply_support_mask=apply_support_mask,
+        )
     return result
 
 
-def save_convergence_surface_result(result: ConvergenceSurfaceResult, output_dir: str | Path) -> None:
+def save_convergence_surface_result(
+    result: ConvergenceSurfaceResult,
+    output_dir: str | Path,
+    *,
+    include_raw: bool = False,
+    apply_support_mask: bool = True,
+) -> None:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     result.long_table.to_csv(output / "surface_long.csv", index=False)
@@ -586,10 +1024,17 @@ def save_convergence_surface_result(result: ConvergenceSurfaceResult, output_dir
         "disabled_metrics": result.disabled_metrics,
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    _write_primary_pngs(result.long_table, output)
+    _write_primary_pngs(result.long_table, output, include_raw=include_raw, apply_support_mask=apply_support_mask)
+    _write_support_pngs(result.long_table, output)
 
 
-def _write_primary_pngs(table: pd.DataFrame, output: Path, *, include_raw: bool = False) -> None:
+def _write_primary_pngs(
+    table: pd.DataFrame,
+    output: Path,
+    *,
+    include_raw: bool = False,
+    apply_support_mask: bool = True,
+) -> None:
     import matplotlib.pyplot as plt
 
     if table.empty:
@@ -616,6 +1061,9 @@ def _write_primary_pngs(table: pd.DataFrame, output: Path, *, include_raw: bool 
         metric_name = "conditional" if metric == "conditional_abs" else metric
         for (checkpoint, equation), sub in subset_all.groupby(["checkpoint", "equation"]):
             pivot = sub.pivot_table(index="z", columns="b", values="value", aggfunc="mean").sort_index()
+            if apply_support_mask and "in_support" in sub.columns and sub["in_support"].notna().any():
+                support = sub.pivot_table(index="z", columns="b", values="in_support", aggfunc="first").sort_index()
+                pivot = pivot.where(support.astype(bool))
             fig, ax = plt.subplots(figsize=(5, 4))
             im = ax.imshow(
                 pivot.values,
@@ -630,7 +1078,7 @@ def _write_primary_pngs(table: pd.DataFrame, output: Path, *, include_raw: bool 
             ax.set_title(f"{checkpoint} {equation} {metric} {mode} {agg}")
             fig.colorbar(im, ax=ax, label=metric)
             fig.tight_layout()
-            fig.savefig(output / f"{equation}_{metric_name}_{mode}_{agg}.png")
+            fig.savefig(output / f"{checkpoint}_{equation}_{metric_name}_{mode}_{agg}.png")
             plt.close(fig)
         checkpoints = list(subset_all["checkpoint"].drop_duplicates())
         if len(checkpoints) >= 2:
@@ -644,12 +1092,18 @@ def _write_primary_pngs(table: pd.DataFrame, output: Path, *, include_raw: bool 
                     pa = a.pivot_table(index="z", columns="b", values="value", aggfunc="mean").sort_index()
                     pb = b.pivot_table(index="z", columns="b", values="value", aggfunc="mean").sort_index()
                     delta = pb - pa
+                    vmax_abs = float(np.nanmax(np.abs(delta.values))) if np.isfinite(delta.values).any() else 0.0
+                    if vmax_abs == 0.0:
+                        vmax_abs = 1.0
                     fig, ax = plt.subplots(figsize=(5, 4))
                     im = ax.imshow(
                         delta.values,
                         origin="lower",
                         aspect="auto",
                         extent=[delta.columns.min(), delta.columns.max(), delta.index.min(), delta.index.max()],
+                        vmin=-vmax_abs,
+                        vmax=vmax_abs,
+                        cmap="coolwarm",
                     )
                     ax.set_xlabel("b")
                     ax.set_ylabel("z")
@@ -658,3 +1112,46 @@ def _write_primary_pngs(table: pd.DataFrame, output: Path, *, include_raw: bool 
                     fig.tight_layout()
                     fig.savefig(output / f"delta_{other}_minus_{base}_{equation}_{metric_name}_{mode}_{agg}.png")
                     plt.close(fig)
+
+
+def _write_support_pngs(table: pd.DataFrame, output: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    if table.empty or "support_distance" not in table.columns:
+        return
+    base = table.drop_duplicates(["b", "z"])
+    if base["support_distance"].isna().all():
+        return
+    distance = base.pivot_table(index="z", columns="b", values="support_distance", aggfunc="first").sort_index()
+    mask = base.pivot_table(index="z", columns="b", values="in_support", aggfunc="first").sort_index()
+    fig, ax = plt.subplots(figsize=(5, 4))
+    im = ax.imshow(
+        distance.values,
+        origin="lower",
+        aspect="auto",
+        extent=[distance.columns.min(), distance.columns.max(), distance.index.min(), distance.index.max()],
+    )
+    ax.set_xlabel("b")
+    ax.set_ylabel("z")
+    ax.set_title("support distance")
+    fig.colorbar(im, ax=ax, label="standardized nearest-reference distance")
+    fig.tight_layout()
+    fig.savefig(output / "support_distance.png")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    im = ax.imshow(
+        mask.astype(float).values,
+        origin="lower",
+        aspect="auto",
+        extent=[mask.columns.min(), mask.columns.max(), mask.index.min(), mask.index.max()],
+        vmin=0.0,
+        vmax=1.0,
+    )
+    ax.set_xlabel("b")
+    ax.set_ylabel("z")
+    ax.set_title("support mask")
+    fig.colorbar(im, ax=ax, label="in support")
+    fig.tight_layout()
+    fig.savefig(output / "support_mask.png")
+    plt.close(fig)

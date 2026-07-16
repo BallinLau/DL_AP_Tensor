@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from config import Config
+from .economic_config import AnalysisEconomicConfig
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,14 @@ class ConvergenceShockBank:
     u_i: torch.Tensor
     seed: int
 
+    @property
+    def storage_numel(self) -> int:
+        return int(self.eps_x.numel() + self.eps_z.numel() + self.u_eta.numel() + self.u_i.numel())
+
+    @property
+    def base_shape(self) -> tuple[int, int, int]:
+        return tuple(self.eps_x.shape)
+
     @classmethod
     def create(
         cls,
@@ -69,6 +77,16 @@ class ConvergenceShockBank:
             u_eta=u_eta.to(device),
             u_i=u_i.to(device),
             seed=int(seed),
+        )
+
+    def gather(self, reference_index: torch.Tensor) -> "ConvergenceShockBank":
+        idx = reference_index.to(device=self.eps_x.device, dtype=torch.long).reshape(-1)
+        return ConvergenceShockBank(
+            eps_x=self.eps_x.index_select(0, idx),
+            eps_z=self.eps_z.index_select(0, idx),
+            u_eta=self.u_eta.index_select(0, idx),
+            u_i=self.u_i.index_select(0, idx),
+            seed=self.seed,
         )
 
 
@@ -105,6 +123,7 @@ def build_child_exogenous_bundle(
     macro_context: MacroTransitionContext,
     shock_bank: ConvergenceShockBank,
     *,
+    economic_config: AnalysisEconomicConfig,
     branch_weights: Optional[torch.Tensor] = None,
     return_physical: bool = True,
 ) -> ChildExogenousBundle:
@@ -121,17 +140,17 @@ def build_child_exogenous_bundle(
     x = parent_states[:, idx.X:idx.X + 1]
     z = parent_states[:, idx.Z:idx.Z + 1]
     x_next = (
-        (1.0 - Config.RHO_X) * Config.XBAR
-        + Config.RHO_X * x.unsqueeze(1)
-        + Config.SIGMA_X * shock_bank.eps_x.to(device=device, dtype=dtype)
+        (1.0 - economic_config.RHO_X) * economic_config.XBAR
+        + economic_config.RHO_X * x.unsqueeze(1)
+        + economic_config.SIGMA_X * shock_bank.eps_x.to(device=device, dtype=dtype)
     )
     z_next = (
-        (1.0 - Config.RHO_Z) * Config.ZBAR
-        + Config.RHO_Z * z.unsqueeze(1)
-        + Config.SIGMA_Z * shock_bank.eps_z.to(device=device, dtype=dtype)
+        (1.0 - economic_config.RHO_Z) * economic_config.ZBAR
+        + economic_config.RHO_Z * z.unsqueeze(1)
+        + economic_config.SIGMA_Z * shock_bank.eps_z.to(device=device, dtype=dtype)
     )
-    eta_next = (shock_bank.u_eta.to(device=device, dtype=dtype) < float(Config.ZETA)).to(dtype)
-    i_next = float(Config.I_THRESHOLD) * shock_bank.u_i.to(device=device, dtype=dtype)
+    eta_next = (shock_bank.u_eta.to(device=device, dtype=dtype) < float(economic_config.ZETA)).to(dtype)
+    i_next = float(economic_config.I_THRESHOLD) * shock_bank.u_i.to(device=device, dtype=dtype)
 
     hatc_cal = macro_context.hatc_cal.to(device=device, dtype=dtype)
     lnk_cal = macro_context.lnk_cal.to(device=device, dtype=dtype)
@@ -164,4 +183,3 @@ def build_child_exogenous_bundle(
         m_raw=m_raw,
         branch_weights=weights,
     )
-

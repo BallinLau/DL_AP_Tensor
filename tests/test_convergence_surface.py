@@ -15,6 +15,7 @@ sys.path.append(str(ROOT / "tests"))
 from config.hyperparams import HyperParams
 from experiments.run_utils import build_models
 from analysis.checkpoint_loader import load_analysis_checkpoint
+from analysis.economic_config import AnalysisEconomicConfig
 from analysis.convergence_surface import (
     VectorizedBellmanSurfaceBackend,
     evaluate_checkpoint_convergence_surfaces,
@@ -40,6 +41,7 @@ def _write_combined_checkpoint(path: Path):
             "sdf_fc1": models["sdf_fc1"].state_dict(),
         },
         "hyperparams": hp.__dict__,
+        "config_snapshot": AnalysisEconomicConfig.from_current_config().to_dict(),
     }
     torch.save(payload, path)
     return models, hp
@@ -180,6 +182,19 @@ def test_convergence_shock_bank_seed_is_deterministic_and_rng_neutral():
     assert torch.equal(torch.random.get_rng_state(), torch_state)
 
 
+def test_common_shocks_reused_across_grid_and_storage_not_grid_sized():
+    bank = ConvergenceShockBank.create(2, 3, seed=123, device="cpu")
+    n_grid = 4
+    ref_index = torch.arange(2).repeat_interleave(n_grid)
+    expanded = bank.gather(ref_index)
+
+    assert bank.storage_numel == 4 * 2 * 3
+    for ref in range(2):
+        rows = expanded.eps_x[ref * n_grid:(ref + 1) * n_grid]
+        assert torch.allclose(rows, rows[:1].expand_as(rows))
+    assert not torch.allclose(expanded.eps_x[0], expanded.eps_x[n_grid])
+
+
 def test_child_transition_depends_on_parent_x_z_and_uses_calculated_macro():
     class FakeSDF(torch.nn.Module):
         def forward_step(self, x_prev, x_curr, hatcf_prev, lnkf_prev, return_physical=True):
@@ -201,7 +216,13 @@ def test_child_transition_depends_on_parent_x_z_and_uses_calculated_macro():
         lnk_cal=torch.full((2, 1), 4.1),
     )
 
-    child = build_child_exogenous_bundle(FakeSDF(), parent, macro, shock)
+    child = build_child_exogenous_bundle(
+        FakeSDF(),
+        parent,
+        macro,
+        shock,
+        economic_config=AnalysisEconomicConfig.from_current_config(),
+    )
 
     assert not torch.allclose(child.x_next[0], child.x_next[1])
     assert not torch.allclose(child.z_next[0], child.z_next[1])
@@ -273,15 +294,18 @@ def test_surface_api_is_deterministic_and_outputs_files(tmp_path):
     assert np.allclose(
         r1.long_table["value"].to_numpy(),
         r2.long_table["value"].to_numpy(),
-        atol=1e-3,
-        rtol=1e-6,
+        atol=1e-6,
+        rtol=1e-5,
         equal_nan=True,
     )
     assert (out / "manifest.json").exists()
     assert (out / "surface_long.csv").exists()
     assert (out / "raw_surface.pt").exists()
     assert len(list(out.glob("*.png"))) >= 3
+    assert any(p.name.startswith("combined_") for p in out.glob("*.png"))
     assert set(["checkpoint", "equation", "m_mode", "metric", "aggregation", "b", "z", "value"]).issubset(r1.long_table.columns)
+    assert r1.shock_bank_metadata["common_random_numbers"] is True
+    assert r1.shock_bank_metadata["shock_bank_storage_numel"] == 4 * 1 * 2
 
 
 def test_reference_distribution_aggregation_rows(tmp_path):
@@ -313,3 +337,196 @@ def test_reference_distribution_aggregation_rows(tmp_path):
 
     assert {"mean", "p50", "p90", "p99", "max"}.issubset(set(result.long_table["aggregation"]))
     assert result.support_metadata["support_available"] is True
+
+
+def test_full_surface_api_is_rng_neutral_and_exception_safe(tmp_path):
+    models = build_models(torch.device("cpu"))
+    bad = tmp_path / "bad.pt"
+    torch.save({"models": {"policy_value": models["policy_value"].state_dict(), "sdf_fc1": models["sdf_fc1"].state_dict()}, "hyperparams": HyperParams().__dict__}, bad)
+
+    random.seed(11)
+    np.random.seed(11)
+    torch.manual_seed(11)
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+
+    with pytest.raises(ValueError, match="config_snapshot"):
+        evaluate_checkpoint_convergence_surfaces(
+            [bad],
+            b_grid=[0.0],
+            z_grid=[0.0],
+            state_mode="fixed_slice",
+            fixed_state={"eta": 1, "i": 0, "x": 0, "hatcf": -2, "lnkf": 4, "hatc_cal": -2, "lnk_cal": 4},
+            n_child_shocks=2,
+            device="cpu",
+        )
+
+    assert random.getstate() == py_state
+    assert np.array_equal(np.random.get_state()[1], np_state[1])
+    assert torch.equal(torch.random.get_rng_state(), torch_state)
+
+
+def test_config_snapshot_overrides_current_config(tmp_path):
+    ckpt = tmp_path / "combined.pt"
+    _write_combined_checkpoint(ckpt)
+    payload = torch.load(ckpt, map_location="cpu")
+    payload["config_snapshot"]["RHO_X"] = 0.123
+    torch.save(payload, ckpt)
+
+    loaded = load_analysis_checkpoint(ckpt, device="cpu")
+
+    assert loaded.economic_config.RHO_X == pytest.approx(0.123)
+    assert loaded.metadata["config_source"] == "checkpoint"
+
+
+def test_branch_weights_shapes_are_chunk_stable(tmp_path):
+    ckpt = tmp_path / "combined.pt"
+    _write_combined_checkpoint(ckpt)
+    ref = pd.DataFrame({
+        "b": [0.1, 0.2],
+        "z": [0.0, 0.1],
+        "eta": [1.0, 0.0],
+        "i": [0.1, 0.2],
+        "x": [0.0, 0.1],
+        "hatcf": [-2.0, -2.2],
+        "lnkf": [4.0, 4.2],
+        "hatc_cal": [-2.1, -2.3],
+        "lnk_cal": [4.1, 4.3],
+    })
+    kwargs = dict(
+        checkpoint_paths=[ckpt],
+        b_grid=[0.0, 0.5],
+        z_grid=[0.0],
+        state_mode="reference_distribution",
+        reference_data=ref,
+        n_reference_states=2,
+        n_child_shocks=2,
+        seed=2026,
+        device="cpu",
+    )
+
+    a = evaluate_checkpoint_convergence_surfaces(**kwargs, branch_weights=torch.tensor([0.75, 0.25]), parent_chunk_size=1)
+    b = evaluate_checkpoint_convergence_surfaces(**kwargs, branch_weights=torch.tensor([[0.75, 0.25], [0.25, 0.75]]), parent_chunk_size=3)
+    c = evaluate_checkpoint_convergence_surfaces(**kwargs, branch_weights=torch.tensor([[0.75, 0.25], [0.75, 0.25], [0.25, 0.75], [0.25, 0.75]]), parent_chunk_size=2)
+
+    assert len(a.long_table) == len(b.long_table) == len(c.long_table)
+    assert np.allclose(b.long_table["value"].to_numpy(), c.long_table["value"].to_numpy(), equal_nan=True, atol=1e-6, rtol=1e-5)
+
+
+def test_multi_checkpoint_outputs_do_not_overwrite_and_labels_are_recorded(tmp_path):
+    ckpt1 = tmp_path / "one.pt"
+    ckpt2 = tmp_path / "two.pt"
+    _write_combined_checkpoint(ckpt1)
+    _write_combined_checkpoint(ckpt2)
+    out = tmp_path / "multi"
+    fixed = {"eta": 1, "i": 0, "x": 0, "hatcf": -2, "lnkf": 4, "hatc_cal": -2.1, "lnk_cal": 4.1}
+
+    result = evaluate_checkpoint_convergence_surfaces(
+        [ckpt1, ckpt2],
+        checkpoint_labels=["base", "other"],
+        b_grid=[0.0, 0.5],
+        z_grid=[0.0],
+        state_mode="fixed_slice",
+        fixed_state=fixed,
+        n_child_shocks=2,
+        device="cpu",
+        output_dir=out,
+    )
+
+    assert set(result.long_table["checkpoint"]) == {"base", "other"}
+    assert (out / "base_p0_conditional_train_value.png").exists()
+    assert (out / "other_p0_conditional_train_value.png").exists()
+    assert len(list(out.glob("delta_other_minus_base_*.png"))) >= 1
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert {m["label"] for m in manifest["checkpoint_metadata"]} == {"base", "other"}
+
+
+def test_support_uses_reference_loo_not_grid_p90(tmp_path):
+    ckpt = tmp_path / "combined.pt"
+    _write_combined_checkpoint(ckpt)
+    ref = pd.DataFrame({
+        "b": [0.0, 0.01, 0.02],
+        "z": [0.0, 0.01, 0.02],
+        "eta": [1.0, 1.0, 1.0],
+        "i": [0.1, 0.1, 0.1],
+        "x": [0.0, 0.0, 0.0],
+        "hatcf": [-2.0, -2.0, -2.0],
+        "lnkf": [4.0, 4.0, 4.0],
+        "hatc_cal": [-2.1, -2.1, -2.1],
+        "lnk_cal": [4.1, 4.1, 4.1],
+    })
+
+    result = evaluate_checkpoint_convergence_surfaces(
+        [ckpt],
+        b_grid=[0.0, 100.0],
+        z_grid=[0.0, 100.0],
+        state_mode="reference_distribution",
+        reference_data=ref,
+        n_reference_states=3,
+        n_child_shocks=2,
+        device="cpu",
+    )
+
+    assert result.support_metadata["definition"] == "standardized_reference_loo_nearest_neighbor"
+    assert sum(result.support_metadata["in_support"]) < 4
+
+
+def test_fixed_cli_missing_params_reports_missing_list(tmp_path):
+    from scripts.plot_convergence_surface import main
+
+    with pytest.raises(SystemExit, match="fixed_slice is missing required arguments"):
+        sys.argv = [
+            "plot",
+            "--checkpoint", str(tmp_path / "missing.pt"),
+            "--state-mode", "fixed_slice",
+            "--output-dir", str(tmp_path),
+        ]
+        main()
+
+
+def test_dataframe_aliases_and_firm_macro_bundle(tmp_path):
+    ckpt = tmp_path / "combined.pt"
+    _write_combined_checkpoint(ckpt)
+    firm = pd.DataFrame({
+        "path": [0],
+        "t": [0],
+        "B": [0.1],
+        "Z": [0.0],
+        "ETA": [1.0],
+        "I": [0.1],
+        "X": [0.0],
+        "Hatcf": [-2.0],
+        "LnKF": [4.0],
+    })
+    macro = pd.DataFrame({"path": [0], "t": [0], "hatc_cal": [-2.1], "lnk_cal": [4.1]})
+
+    result = evaluate_checkpoint_convergence_surfaces(
+        [ckpt],
+        b_grid=[0.0],
+        z_grid=[0.0],
+        state_mode="reference_distribution",
+        reference_data={"firm": firm, "macro": macro},
+        n_reference_states=1,
+        n_child_shocks=2,
+        device="cpu",
+    )
+
+    assert not result.long_table.empty
+
+
+def test_workload_guard_blocks_large_run(tmp_path):
+    ckpt = tmp_path / "combined.pt"
+    _write_combined_checkpoint(ckpt)
+
+    with pytest.raises(ValueError, match="workload guard blocked"):
+        evaluate_checkpoint_convergence_surfaces(
+            [ckpt],
+            b_grid=[0.0, 0.1],
+            z_grid=[0.0, 0.1],
+            state_mode="fixed_slice",
+            fixed_state={"eta": 1, "i": 0, "x": 0, "hatcf": -2, "lnkf": 4, "hatc_cal": -2, "lnk_cal": 4},
+            n_child_shocks=2,
+            max_child_state_evals=1,
+            device="cpu",
+        )
