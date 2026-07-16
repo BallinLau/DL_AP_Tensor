@@ -6191,6 +6191,18 @@ class Episode:
                 eq: _MetricAccumulator(max_q_samples) for eq in ("p0", "pi", "q")
             }
             report_legacy = bool(getattr(self.hyperparams, "bellman_conv_report_legacy", True))
+            required_equations = ("p0", "pi", "q")
+            n_batches_total = len(batches)
+            coverage: Dict[str, Dict[str, Any]] = {
+                eq: {
+                    "n_batches_evaluated": 0,
+                    "n_batches_failed": 0,
+                    "n_parents_evaluated": 0,
+                    "error_count": 0,
+                    "errors": [],
+                }
+                for eq in required_equations
+            }
 
             def _update_equation(eq: str, signed_train: torch.Tensor, signed_raw: torch.Tensor) -> None:
                 if signed_train.shape != signed_raw.shape:
@@ -6216,21 +6228,39 @@ class Episode:
                     legacy_signed = signed_raw if eq in {"p0", "pi"} else signed_train
                     legacy_accs[eq].update(self._flatten_abs_residuals(legacy_signed))
 
+            def _record_equation_error(eq: str, batch_index: int, exc: Exception) -> None:
+                entry = coverage[eq]
+                entry["n_batches_failed"] += 1
+                entry["error_count"] += 1
+                if len(entry["errors"]) < 10:
+                    entry["errors"].append({
+                        "batch_index": int(batch_index),
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                    })
+                logger.warning(
+                    "Bellman convergence eval skip %s batch %d due to error: %s",
+                    eq,
+                    batch_index,
+                    exc,
+                )
+
             with torch.no_grad():
                 for idx, batch in enumerate(batches):
-                    try:
-                        p0_train = self._compute_p0_bellman_signed_residuals(batch, m_mode="train")
-                        p0_raw = self._compute_p0_bellman_signed_residuals(batch, m_mode="raw")
-                        pi_train = self._compute_pi_bellman_signed_residuals(batch, m_mode="train")
-                        pi_raw = self._compute_pi_bellman_signed_residuals(batch, m_mode="raw")
-                        q_train = self._compute_q_bellman_signed_residuals(batch, m_mode="train")
-                        q_raw = self._compute_q_bellman_signed_residuals(batch, m_mode="raw")
-                    except Exception as exc:
-                        logger.warning("Bellman convergence eval skip batch %d due to error: %s", idx, exc)
-                        continue
-                    _update_equation("p0", p0_train, p0_raw)
-                    _update_equation("pi", pi_train, pi_raw)
-                    _update_equation("q", q_train, q_raw)
+                    for eq, compute_fn in (
+                        ("p0", self._compute_p0_bellman_signed_residuals),
+                        ("pi", self._compute_pi_bellman_signed_residuals),
+                        ("q", self._compute_q_bellman_signed_residuals),
+                    ):
+                        try:
+                            signed_train = compute_fn(batch, m_mode="train")
+                            signed_raw = compute_fn(batch, m_mode="raw")
+                            _update_equation(eq, signed_train, signed_raw)
+                        except Exception as exc:
+                            _record_equation_error(eq, idx, exc)
+                            continue
+                        coverage[eq]["n_batches_evaluated"] += 1
+                        coverage[eq]["n_parents_evaluated"] += int(signed_train.shape[0])
 
             equations: Dict[str, Dict[str, Any]] = {}
             for eq, accs in metric_accs.items():
@@ -6246,7 +6276,29 @@ class Episode:
                         n_parent=n_parent,
                     )
                 eq_summary["passed"] = eq_summary["conditional_train_m"]["passed"]
+                eq_coverage = coverage[eq]
+                eq_coverage["batch_coverage_ratio"] = (
+                    float(eq_coverage["n_batches_evaluated"]) / float(n_batches_total)
+                    if n_batches_total > 0
+                    else 0.0
+                )
+                eq_valid = bool(
+                    eq_coverage["n_batches_failed"] == 0
+                    and eq_coverage["n_batches_evaluated"] == n_batches_total
+                    and eq_summary["conditional_train_m"].get("enabled", False) is True
+                )
+                eq_coverage["evaluation_valid"] = eq_valid
+                eq_summary["evaluation_valid"] = eq_valid
+                eq_summary["coverage"] = eq_coverage
                 equations[eq] = eq_summary
+
+            evaluation_coverage = {
+                "n_batches_total": int(n_batches_total),
+                "evaluation_valid": all(
+                    equations[eq]["evaluation_valid"] for eq in required_equations
+                ),
+                "equations": {eq: equations[eq]["coverage"] for eq in required_equations},
+            }
 
             legacy_equations: Dict[str, Dict[str, Any]] = {}
             if report_legacy:
@@ -6277,16 +6329,15 @@ class Episode:
                 )
             )
 
-            enabled_primary = [
-                m["conditional_train_m"]
-                for m in equations.values()
-                if m["conditional_train_m"].get('enabled', False)
-            ]
             if conditional_mean_thr is None or conditional_p90_thr is None:
                 bellman_passed = None
             else:
-                bellman_passed = bool(enabled_primary) and all(
-                    m.get('passed', False) for m in enabled_primary
+                bellman_passed = all(
+                    equations[eq]["conditional_train_m"].get("enabled", False) is True
+                    and equations[eq]["conditional_train_m"].get("passed") is True
+                    and equations[eq]["coverage"]["n_batches_failed"] == 0
+                    and equations[eq]["coverage"]["n_batches_evaluated"] == n_batches_total
+                    for eq in required_equations
                 )
             policy_passed = bool(policy_convergence.get('passed', False))
             if not policy_passed:
@@ -6306,6 +6357,7 @@ class Episode:
                     'legacy_p90': legacy_p90_thr,
                 },
                 'max_quantile_samples': max_q_samples,
+                'evaluation_coverage': evaluation_coverage,
                 'fixed_point': {
                     'definition': 'parent_conditional_signed_mean_absolute',
                     'primary_metric': 'conditional_train_m',

@@ -841,6 +841,193 @@ def test_bellman_convergence_primary_uses_conditional_not_legacy_abs():
     assert result["legacy"]["equations"]["p0"]["passed"] is False
 
 
+def test_bellman_convergence_requires_all_equations_enabled_for_gate():
+    episode = _episode()
+    episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
+    episode.hyperparams.bellman_conditional_mean_thresh = 1e-3
+    episode.hyperparams.bellman_conditional_p90_thresh = 1e-3
+    batch = _batch(episode.device)
+    empty = torch.empty((2, 0), dtype=torch.float32)
+    ok = torch.zeros((2, 2), dtype=torch.float32)
+
+    episode._compute_p0_bellman_signed_residuals = lambda _batch, *, m_mode: empty
+    episode._compute_pi_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode._compute_q_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode.evaluate_target_grid_policy_convergence = lambda _batches: {
+        "enabled": True,
+        "informative": True,
+        "all_skipped": False,
+        "passed": True,
+        "policies": {},
+    }
+
+    result = episode.evaluate_bellman_convergence([batch], validation_batches=[batch])
+
+    assert result["equations"]["p0"]["conditional_train_m"]["enabled"] is False
+    assert result["equations"]["pi"]["conditional_train_m"]["passed"] is True
+    assert result["equations"]["q"]["conditional_train_m"]["passed"] is True
+    assert result["evaluation_coverage"]["evaluation_valid"] is False
+    assert result["bellman_passed"] is False
+
+
+def test_bellman_convergence_isolates_equation_batch_errors():
+    episode = _episode()
+    episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
+    episode.hyperparams.bellman_conditional_mean_thresh = 1e-3
+    episode.hyperparams.bellman_conditional_p90_thresh = 1e-3
+    batch = _batch(episode.device)
+    ok = torch.zeros((2, 2), dtype=torch.float32)
+
+    def _raise_p0(_batch, *, m_mode):
+        raise RuntimeError("p0 failed")
+
+    episode._compute_p0_bellman_signed_residuals = _raise_p0
+    episode._compute_pi_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode._compute_q_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode.evaluate_target_grid_policy_convergence = lambda _batches: {
+        "enabled": True,
+        "informative": True,
+        "all_skipped": False,
+        "passed": True,
+        "policies": {},
+    }
+
+    result = episode.evaluate_bellman_convergence([batch], validation_batches=[batch])
+    coverage = result["evaluation_coverage"]["equations"]
+
+    assert coverage["p0"]["n_batches_failed"] == 1
+    assert coverage["p0"]["error_count"] == 1
+    assert coverage["p0"]["errors"][0]["error_type"] == "RuntimeError"
+    assert coverage["pi"]["n_batches_evaluated"] == 1
+    assert coverage["q"]["n_batches_evaluated"] == 1
+    assert result["bellman_passed"] is False
+
+
+def test_bellman_convergence_fails_when_one_required_equation_misses_one_batch():
+    episode = _episode()
+    episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
+    episode.hyperparams.bellman_conditional_mean_thresh = 1e-3
+    episode.hyperparams.bellman_conditional_p90_thresh = 1e-3
+    batch0 = {**_batch(episode.device), "marker": "ok"}
+    batch1 = {**_batch(episode.device), "marker": "fail"}
+    ok = torch.zeros((2, 2), dtype=torch.float32)
+
+    def _p0(batch, *, m_mode):
+        if batch["marker"] == "fail":
+            raise RuntimeError("p0 batch failed")
+        return ok
+
+    episode._compute_p0_bellman_signed_residuals = _p0
+    episode._compute_pi_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode._compute_q_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode.evaluate_target_grid_policy_convergence = lambda _batches: {
+        "enabled": True,
+        "informative": True,
+        "all_skipped": False,
+        "passed": True,
+        "policies": {},
+    }
+
+    result = episode.evaluate_bellman_convergence([batch0, batch1], validation_batches=[batch0])
+    p0_coverage = result["evaluation_coverage"]["equations"]["p0"]
+
+    assert p0_coverage["n_batches_evaluated"] == 1
+    assert p0_coverage["n_batches_failed"] == 1
+    assert p0_coverage["batch_coverage_ratio"] == pytest.approx(0.5, abs=1e-7)
+    assert result["equations"]["p0"]["conditional_train_m"]["passed"] is True
+    assert result["bellman_passed"] is False
+
+
+def test_bellman_convergence_complete_coverage_passes_when_all_equations_pass():
+    episode = _episode()
+    episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
+    episode.hyperparams.bellman_conditional_mean_thresh = 1e-3
+    episode.hyperparams.bellman_conditional_p90_thresh = 1e-3
+    batch = _batch(episode.device)
+    ok = torch.zeros((2, 2), dtype=torch.float32)
+
+    episode._compute_p0_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode._compute_pi_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode._compute_q_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode.evaluate_target_grid_policy_convergence = lambda _batches: {
+        "enabled": True,
+        "informative": True,
+        "all_skipped": False,
+        "passed": True,
+        "policies": {},
+    }
+
+    result = episode.evaluate_bellman_convergence([batch], validation_batches=[batch])
+
+    assert result["evaluation_coverage"]["evaluation_valid"] is True
+    for eq in ("p0", "pi", "q"):
+        assert result["equations"][eq]["evaluation_valid"] is True
+        assert result["equations"][eq]["coverage"]["n_batches_evaluated"] == 1
+    assert result["bellman_passed"] is True
+
+
+def test_bellman_convergence_threshold_none_reports_invalid_coverage_without_gate():
+    episode = _episode()
+    episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
+    episode.hyperparams.bellman_conditional_mean_thresh = None
+    episode.hyperparams.bellman_conditional_p90_thresh = None
+    batch = _batch(episode.device)
+    ok = torch.zeros((2, 2), dtype=torch.float32)
+
+    def _raise_p0(_batch, *, m_mode):
+        raise RuntimeError("p0 failed")
+
+    episode._compute_p0_bellman_signed_residuals = _raise_p0
+    episode._compute_pi_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode._compute_q_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode.evaluate_target_grid_policy_convergence = lambda _batches: {
+        "enabled": True,
+        "informative": True,
+        "all_skipped": False,
+        "passed": True,
+        "policies": {},
+    }
+
+    result = episode.evaluate_bellman_convergence([batch], validation_batches=[batch])
+
+    assert result["bellman_passed"] is None
+    assert result["evaluation_coverage"]["evaluation_valid"] is False
+    assert result["evaluation_coverage"]["equations"]["p0"]["error_count"] == 1
+    assert result["passed"] is None
+
+
+def test_bellman_convergence_error_list_is_capped_but_count_is_complete():
+    episode = _episode()
+    episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
+    episode.hyperparams.bellman_conditional_mean_thresh = None
+    episode.hyperparams.bellman_conditional_p90_thresh = None
+    batches = [{**_batch(episode.device), "marker": idx} for idx in range(12)]
+    ok = torch.zeros((2, 2), dtype=torch.float32)
+
+    def _raise_p0(batch, *, m_mode):
+        raise RuntimeError(f"p0 failed {batch['marker']}")
+
+    episode._compute_p0_bellman_signed_residuals = _raise_p0
+    episode._compute_pi_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode._compute_q_bellman_signed_residuals = lambda _batch, *, m_mode: ok
+    episode.evaluate_target_grid_policy_convergence = lambda _batches: {
+        "enabled": True,
+        "informative": True,
+        "all_skipped": False,
+        "passed": True,
+        "policies": {},
+    }
+
+    result = episode.evaluate_bellman_convergence(batches, validation_batches=[batches[0]])
+    p0_coverage = result["evaluation_coverage"]["equations"]["p0"]
+
+    assert p0_coverage["error_count"] == 12
+    assert p0_coverage["n_batches_failed"] == 12
+    assert len(p0_coverage["errors"]) == 10
+    assert p0_coverage["errors"][0]["batch_index"] == 0
+    assert p0_coverage["errors"][-1]["batch_index"] == 9
+
+
 def test_bellman_convergence_none_thresholds_report_without_pass_fail():
     episode = _episode()
     episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
@@ -865,7 +1052,7 @@ def test_bellman_convergence_none_thresholds_report_without_pass_fail():
     assert result["bellman_passed"] is None
     assert result["passed"] is None
     for metric_name, metric in result["equations"]["p0"].items():
-        if isinstance(metric, dict):
+        if isinstance(metric, dict) and "passed" in metric:
             assert metric["passed"] is None
     assert result["legacy"]["definition"] == "flattened_child_absolute"
     assert result["legacy"]["equations"]["p0"]["passed"] is False
