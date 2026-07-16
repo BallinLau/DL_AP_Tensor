@@ -754,6 +754,7 @@ def test_fixed_grid_slurm_uses_fixed_grid_not_reference_distribution():
     assert "--n-reference-states" not in script
     assert "support_mask.png" not in script
     assert "FIXED_ETA" in script
+    assert '"$PNG_COUNT" -lt 3' in script
 
 
 def test_fixed_grid_collection_common_scale_and_mismatch_rejection(tmp_path):

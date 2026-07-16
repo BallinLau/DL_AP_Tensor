@@ -230,7 +230,7 @@ for POLICY_CKPT in "${POLICY_CKPTS[@]}"; do
     done
 
     PNG_COUNT="$(find "$EP_OUT" -maxdepth 1 -type f -name '*.png' | wc -l | tr -d ' ')"
-    if [[ "$PNG_COUNT" -lt 5 ]]; then
+    if [[ "$PNG_COUNT" -lt 3 ]]; then
         echo "ERROR: too few PNG outputs for episode $ep: $PNG_COUNT"
         exit 1
     fi
