@@ -5471,7 +5471,11 @@ class Episode:
         realized_abs = (weights * signed.abs()).sum(dim=1)
         centered = signed - conditional_signed.unsqueeze(1)
         child_std = torch.sqrt((weights * centered.pow(2)).sum(dim=1).clamp_min(0.0))
-        mc_standard_error = child_std / float(branch_count) ** 0.5
+        if branch_count == 1:
+            mc_standard_error = torch.full_like(child_std, float("nan"))
+        else:
+            n_eff = 1.0 / weights.pow(2).sum(dim=1).clamp_min(torch.finfo(weights.dtype).eps)
+            mc_standard_error = child_std / torch.sqrt(n_eff)
         return {
             "conditional_signed": conditional_signed,
             "conditional_abs": conditional_abs,
@@ -5697,12 +5701,12 @@ class Episode:
 
     def _compute_p0_bellman_abs_residual(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         return self._flatten_abs_residuals(
-            self._compute_p0_bellman_signed_residuals(batch, m_mode="train")
+            self._compute_p0_bellman_signed_residuals(batch, m_mode="raw")
         )
 
     def _compute_pi_bellman_abs_residual(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         return self._flatten_abs_residuals(
-            self._compute_pi_bellman_signed_residuals(batch, m_mode="train")
+            self._compute_pi_bellman_signed_residuals(batch, m_mode="raw")
         )
 
     def _compute_q_bellman_abs_residual(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -6066,6 +6070,7 @@ class Episode:
                     self.n_total = 0
                     self.n_finite = 0
                     self.value_sum = 0.0
+                    self.value_max = float('-inf')
                     self.samples: List[torch.Tensor] = []
                     self.n_sampled = 0
 
@@ -6080,6 +6085,7 @@ class Episode:
                         return
                     vals = vals.to(torch.float32)
                     self.value_sum += float(vals.sum().item())
+                    self.value_max = max(self.value_max, float(vals.max().item()))
                     remaining = self.max_samples - self.n_sampled
                     if remaining <= 0:
                         return
@@ -6112,7 +6118,7 @@ class Episode:
                             'p90': float('nan'),
                             'p99': float('nan'),
                             'max': float('nan'),
-                            'passed': None if primary and (mean_thr is None or p90_thr is None) else False
+                            'passed': None if mean_thr is None or p90_thr is None else False
                         }
                     mean_v = self.value_sum / max(self.n_finite, 1)
                     if self.samples:
@@ -6120,15 +6126,14 @@ class Episode:
                         p50_v = float(torch.quantile(sample, 0.5).item())
                         p90_v = float(torch.quantile(sample, 0.9).item())
                         p99_v = float(torch.quantile(sample, 0.99).item())
-                        max_v = float(sample.max().item())
                     else:
                         p50_v = float('nan')
                         p90_v = float('nan')
                         p99_v = float('nan')
-                        max_v = float('nan')
+                    max_v = self.value_max
                     nonfinite_ratio = 1.0 - (self.n_finite / max(self.n_total, 1))
                     if mean_thr is None or p90_thr is None:
-                        passed = None if primary else False
+                        passed = None
                     else:
                         passed = bool(mean_v < float(mean_thr) and p90_v < float(p90_thr) and nonfinite_ratio == 0.0)
                     logger.info(
@@ -6200,7 +6205,8 @@ class Episode:
                 metric_accs[eq]["mc_standard_error_train_m"].update(reduced_train["mc_standard_error"])
                 metric_accs[eq]["mc_standard_error_raw_m"].update(reduced_raw["mc_standard_error"])
                 if report_legacy:
-                    legacy_accs[eq].update(self._flatten_abs_residuals(signed_train))
+                    legacy_signed = signed_raw if eq in {"p0", "pi"} else signed_train
+                    legacy_accs[eq].update(self._flatten_abs_residuals(legacy_signed))
 
             with torch.no_grad():
                 for idx, batch in enumerate(batches):
@@ -6295,6 +6301,11 @@ class Episode:
                 'equations': equations,
                 'legacy': {
                     'definition': 'flattened_child_absolute',
+                    'm_mode_by_equation': {
+                        'p0': 'raw',
+                        'pi': 'raw',
+                        'q': 'train',
+                    },
                     'equations': legacy_equations,
                 },
                 'policy': policy_convergence,

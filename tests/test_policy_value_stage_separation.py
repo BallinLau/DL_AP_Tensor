@@ -518,6 +518,8 @@ def test_bp_train_without_active_states_skips_stage():
 
     assert summary["status"] == "skipped_no_active_refinancing"
     assert summary["train_active_count"] == 0
+    assert summary["validation_active_count"] > 0
+    assert summary["optimizer_steps"] == 0
 
 
 def test_reduce_signed_branch_residuals_cancellation_and_realized_abs():
@@ -547,6 +549,26 @@ def test_reduce_signed_branch_residuals_weighted_branches():
 
     assert reduced["conditional_signed"].item() == pytest.approx(0.15, abs=1e-7)
     assert reduced["conditional_abs"].item() == pytest.approx(0.15, abs=1e-7)
+    n_eff = 1.0 / (0.75 ** 2 + 0.25 ** 2)
+    assert reduced["mc_standard_error"].item() == pytest.approx(
+        reduced["child_std"].item() / np.sqrt(n_eff),
+        abs=1e-7,
+    )
+
+
+def test_reduce_signed_branch_residuals_equal_weight_mc_se_uses_branch_count():
+    signed = torch.tensor([[1.0, -1.0, 1.0, -1.0]], dtype=torch.float32)
+    reduced = Episode._reduce_signed_branch_residuals(signed)
+
+    assert reduced["child_std"].item() == pytest.approx(1.0, abs=1e-7)
+    assert reduced["mc_standard_error"].item() == pytest.approx(0.5, abs=1e-7)
+
+
+def test_reduce_signed_branch_residuals_single_branch_mc_se_is_nan():
+    signed = torch.tensor([[1.0]], dtype=torch.float32)
+    reduced = Episode._reduce_signed_branch_residuals(signed)
+
+    assert torch.isnan(reduced["mc_standard_error"]).item()
 
 
 @pytest.mark.parametrize("branch_count", [1, 2, 4])
@@ -613,6 +635,27 @@ def test_p0_signed_residual_train_m_uses_pv_clamp_and_raw_does_not():
     assert not torch.allclose(raw, raw_clamped, atol=1e-6, rtol=1e-5)
 
 
+def test_p0_legacy_abs_residual_uses_raw_m_not_clipped_m():
+    episode = _episode()
+    episode.models["policy_value"] = _ConstantPolicyValue()
+    episode.hyperparams.pv_use_clipped_m = True
+    episode.hyperparams.pv_m_clamp_min = 0.7
+    episode.hyperparams.pv_m_clamp_max = 1.3
+    batch = _batch_with_child_m(_batch(episode.device), [0.1, 9.0])
+
+    with torch.no_grad():
+        legacy = episode._compute_p0_bellman_abs_residual(batch)
+        raw = episode._flatten_abs_residuals(
+            episode._compute_p0_bellman_signed_residuals(batch, m_mode="raw")
+        )
+        train = episode._flatten_abs_residuals(
+            episode._compute_p0_bellman_signed_residuals(batch, m_mode="train")
+        )
+
+    assert torch.allclose(legacy, raw, atol=1e-6, rtol=1e-5)
+    assert not torch.allclose(legacy, train, atol=1e-6, rtol=1e-5)
+
+
 def test_pi_signed_residual_train_m_uses_pv_clamp():
     episode = _episode()
     episode.models["policy_value"] = _ConstantPolicyValue()
@@ -627,6 +670,27 @@ def test_pi_signed_residual_train_m_uses_pv_clamp():
         raw_clamped = episode._compute_pi_bellman_signed_residuals(batch_clamped, m_mode="raw")
 
     assert torch.allclose(train, raw_clamped, atol=1e-6, rtol=1e-5)
+
+
+def test_pi_legacy_abs_residual_uses_raw_m_not_clipped_m():
+    episode = _episode()
+    episode.models["policy_value"] = _ConstantPolicyValue()
+    episode.hyperparams.pv_use_clipped_m = True
+    episode.hyperparams.pv_m_clamp_min = 0.7
+    episode.hyperparams.pv_m_clamp_max = 1.3
+    batch = _batch_with_child_m(_batch(episode.device), [0.1, 9.0])
+
+    with torch.no_grad():
+        legacy = episode._compute_pi_bellman_abs_residual(batch)
+        raw = episode._flatten_abs_residuals(
+            episode._compute_pi_bellman_signed_residuals(batch, m_mode="raw")
+        )
+        train = episode._flatten_abs_residuals(
+            episode._compute_pi_bellman_signed_residuals(batch, m_mode="train")
+        )
+
+    assert torch.allclose(legacy, raw, atol=1e-6, rtol=1e-5)
+    assert not torch.allclose(legacy, train, atol=1e-6, rtol=1e-5)
 
 
 def test_q_signed_residual_train_m_matches_q_clamp_semantics():
@@ -645,6 +709,96 @@ def test_q_signed_residual_train_m_matches_q_clamp_semantics():
 
     assert torch.allclose(train, raw_clamped, atol=1e-6, rtol=1e-5)
     assert not torch.allclose(raw, raw_clamped, atol=1e-6, rtol=1e-5)
+
+
+def test_q_legacy_abs_residual_uses_train_m_semantics():
+    episode = _episode()
+    episode.models["policy_value"] = _ConstantPolicyValue()
+    episode.hyperparams.q_use_detached_m = True
+    episode.hyperparams.q_m_clamp_min = 0.5
+    episode.hyperparams.q_m_clamp_max = 1.5
+    batch = _batch_with_child_m(_batch(episode.device), [0.1, 9.0])
+
+    with torch.no_grad():
+        legacy = episode._compute_q_bellman_abs_residual(batch)
+        train = episode._flatten_abs_residuals(
+            episode._compute_q_bellman_signed_residuals(batch, m_mode="train")
+        )
+        raw = episode._flatten_abs_residuals(
+            episode._compute_q_bellman_signed_residuals(batch, m_mode="raw")
+        )
+
+    assert torch.allclose(legacy, train, atol=1e-6, rtol=1e-5)
+    assert not torch.allclose(legacy, raw, atol=1e-6, rtol=1e-5)
+
+
+def test_bellman_convergence_legacy_m_modes_and_conditional_train_m_are_separate():
+    episode = _episode()
+    episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
+    episode.hyperparams.bellman_conditional_mean_thresh = 1e-3
+    episode.hyperparams.bellman_conditional_p90_thresh = 1e-3
+    batch = _batch(episode.device)
+
+    train_signed = torch.tensor([[0.2, -0.2], [0.1, -0.1]], dtype=torch.float32)
+    raw_signed = torch.tensor([[2.0, 2.0], [3.0, 3.0]], dtype=torch.float32)
+    q_raw_signed = torch.tensor([[5.0, 5.0], [6.0, 6.0]], dtype=torch.float32)
+
+    episode._compute_p0_bellman_signed_residuals = (
+        lambda _batch, *, m_mode: train_signed if m_mode == "train" else raw_signed
+    )
+    episode._compute_pi_bellman_signed_residuals = (
+        lambda _batch, *, m_mode: train_signed if m_mode == "train" else raw_signed
+    )
+    episode._compute_q_bellman_signed_residuals = (
+        lambda _batch, *, m_mode: train_signed if m_mode == "train" else q_raw_signed
+    )
+    episode.evaluate_target_grid_policy_convergence = lambda _batches: {
+        "enabled": True,
+        "informative": True,
+        "all_skipped": False,
+        "passed": True,
+        "policies": {},
+    }
+
+    result = episode.evaluate_bellman_convergence([batch], validation_batches=[batch])
+
+    assert result["legacy"]["m_mode_by_equation"] == {"p0": "raw", "pi": "raw", "q": "train"}
+    assert result["equations"]["p0"]["conditional_train_m"]["mean"] == pytest.approx(0.0, abs=1e-7)
+    assert result["legacy"]["equations"]["p0"]["mean"] == pytest.approx(2.5, abs=1e-7)
+    assert result["legacy"]["equations"]["pi"]["mean"] == pytest.approx(2.5, abs=1e-7)
+    assert result["legacy"]["equations"]["q"]["mean"] == pytest.approx(0.15, abs=1e-7)
+
+
+def test_bellman_convergence_max_is_exact_not_bounded_sample():
+    episode = _episode()
+    episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
+    episode.hyperparams.bellman_conv_max_samples = 2
+    episode.hyperparams.bellman_conditional_mean_thresh = 200.0
+    episode.hyperparams.bellman_conditional_p90_thresh = 200.0
+    batch_a = {**_batch(episode.device), "marker": "a"}
+    batch_b = {**_batch(episode.device), "marker": "b"}
+
+    def _signed(batch, *, m_mode):
+        if batch["marker"] == "a":
+            return torch.tensor([[1.0], [2.0]], dtype=torch.float32)
+        return torch.tensor([[100.0]], dtype=torch.float32)
+
+    episode._compute_p0_bellman_signed_residuals = _signed
+    episode._compute_pi_bellman_signed_residuals = _signed
+    episode._compute_q_bellman_signed_residuals = _signed
+    episode.evaluate_target_grid_policy_convergence = lambda _batches: {
+        "enabled": True,
+        "informative": True,
+        "all_skipped": False,
+        "passed": True,
+        "policies": {},
+    }
+
+    result = episode.evaluate_bellman_convergence([batch_a, batch_b], validation_batches=[batch_a])
+
+    metric = result["equations"]["p0"]["conditional_train_m"]
+    assert metric["n_used_for_p90"] == 2
+    assert metric["max"] == pytest.approx(100.0, abs=1e-7)
 
 
 def test_bellman_convergence_primary_uses_conditional_not_legacy_abs():
@@ -702,8 +856,11 @@ def test_bellman_convergence_none_thresholds_report_without_pass_fail():
 
     assert result["bellman_passed"] is None
     assert result["passed"] is None
-    assert result["equations"]["p0"]["conditional_train_m"]["passed"] is None
+    for metric_name, metric in result["equations"]["p0"].items():
+        if isinstance(metric, dict):
+            assert metric["passed"] is None
     assert result["legacy"]["definition"] == "flattened_child_absolute"
+    assert result["legacy"]["equations"]["p0"]["passed"] is False
 
 
 def test_bp_cache_active_counts_reports_entries_and_unique_parents():
