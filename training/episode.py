@@ -5914,165 +5914,164 @@ class Episode:
         model = self.models['policy_value']
         was_training = model.training
         model.eval()
+        try:
+            max_q_samples = int(getattr(self.hyperparams, "bellman_conv_max_samples", 1_000_000))
+            max_q_samples = max(1, max_q_samples)
 
-        max_q_samples = int(getattr(self.hyperparams, "bellman_conv_max_samples", 1_000_000))
-        max_q_samples = max(1, max_q_samples)
+            class _ResidualAccumulator:
+                def __init__(self, max_samples: int):
+                    self.max_samples = max_samples
+                    self.n_total = 0
+                    self.n_finite = 0
+                    self.abs_sum = 0.0
+                    self.samples: List[torch.Tensor] = []
+                    self.n_sampled = 0
 
-        class _ResidualAccumulator:
-            def __init__(self, max_samples: int):
-                self.max_samples = max_samples
-                self.n_total = 0
-                self.n_finite = 0
-                self.abs_sum = 0.0
-                self.samples: List[torch.Tensor] = []
-                self.n_sampled = 0
+                def update(self, values: torch.Tensor) -> None:
+                    vals = values.detach().reshape(-1)
+                    self.n_total += int(vals.numel())
+                    if vals.numel() == 0:
+                        return
+                    vals = vals[torch.isfinite(vals)]
+                    self.n_finite += int(vals.numel())
+                    if vals.numel() == 0:
+                        return
+                    vals = vals.abs().to(torch.float32)
+                    self.abs_sum += float(vals.sum().item())
+                    remaining = self.max_samples - self.n_sampled
+                    if remaining <= 0:
+                        return
+                    if vals.numel() > remaining:
+                        idx = torch.randperm(vals.numel(), device=vals.device)[:remaining]
+                        vals = vals[idx]
+                    self.samples.append(vals.cpu())
+                    self.n_sampled += int(vals.numel())
 
-            def update(self, values: torch.Tensor) -> None:
-                vals = values.detach().reshape(-1)
-                self.n_total += int(vals.numel())
-                if vals.numel() == 0:
-                    return
-                vals = vals[torch.isfinite(vals)]
-                self.n_finite += int(vals.numel())
-                if vals.numel() == 0:
-                    return
-                vals = vals.abs().to(torch.float32)
-                self.abs_sum += float(vals.sum().item())
-                remaining = self.max_samples - self.n_sampled
-                if remaining <= 0:
-                    return
-                if vals.numel() > remaining:
-                    idx = torch.randperm(vals.numel(), device=vals.device)[:remaining]
-                    vals = vals[idx]
-                self.samples.append(vals.cpu())
-                self.n_sampled += int(vals.numel())
-
-            def summarize(self, name: str, mean_thr: float, p90_thr: float) -> Dict:
-                if self.n_finite == 0:
+                def summarize(self, name: str, mean_thr: float, p90_thr: float) -> Dict:
+                    if self.n_finite == 0:
+                        return {
+                            'enabled': False,
+                            'n': 0,
+                            'n_total': self.n_total,
+                            'n_finite': 0,
+                            'n_used_for_p90': 0,
+                            'nonfinite_ratio': 1.0 if self.n_total > 0 else 0.0,
+                            'mean': float('nan'),
+                            'p90': float('nan'),
+                            'passed': False
+                        }
+                    mean_v = self.abs_sum / max(self.n_finite, 1)
+                    if self.samples:
+                        sample = torch.cat(self.samples, dim=0)
+                        p90_v = float(torch.quantile(sample, 0.9).item())
+                    else:
+                        p90_v = float('nan')
+                    nonfinite_ratio = 1.0 - (self.n_finite / max(self.n_total, 1))
+                    passed = bool(mean_v < mean_thr and p90_v < p90_thr and nonfinite_ratio == 0.0)
+                    logger.info(
+                        "Bellman convergence [%s] | mean(abs)=%.6e, p90(abs)=%.6e, "
+                        "n_total=%d, n_used=%d, nonfinite=%.3e, pass=%s",
+                        name,
+                        mean_v,
+                        p90_v,
+                        self.n_total,
+                        self.n_sampled,
+                        nonfinite_ratio,
+                        str(passed)
+                    )
                     return {
-                        'enabled': False,
-                        'n': 0,
+                        'enabled': True,
+                        'n': self.n_finite,
                         'n_total': self.n_total,
-                        'n_finite': 0,
-                        'n_used_for_p90': 0,
-                        'nonfinite_ratio': 1.0 if self.n_total > 0 else 0.0,
-                        'mean': float('nan'),
-                        'p90': float('nan'),
-                        'passed': False
+                        'n_finite': self.n_finite,
+                        'n_used_for_p90': self.n_sampled,
+                        'nonfinite_ratio': nonfinite_ratio,
+                        'mean': mean_v,
+                        'p90': p90_v,
+                        'passed': passed
                     }
-                mean_v = self.abs_sum / max(self.n_finite, 1)
-                if self.samples:
-                    sample = torch.cat(self.samples, dim=0)
-                    p90_v = float(torch.quantile(sample, 0.9).item())
-                else:
-                    p90_v = float('nan')
-                nonfinite_ratio = 1.0 - (self.n_finite / max(self.n_total, 1))
-                passed = bool(mean_v < mean_thr and p90_v < p90_thr and nonfinite_ratio == 0.0)
-                logger.info(
-                    "Bellman convergence [%s] | mean(abs)=%.6e, p90(abs)=%.6e, "
-                    "n_total=%d, n_used=%d, nonfinite=%.3e, pass=%s",
-                    name,
-                    mean_v,
-                    p90_v,
-                    self.n_total,
-                    self.n_sampled,
-                    nonfinite_ratio,
-                    str(passed)
-                )
-                return {
-                    'enabled': True,
-                    'n': self.n_finite,
-                    'n_total': self.n_total,
-                    'n_finite': self.n_finite,
-                    'n_used_for_p90': self.n_sampled,
-                    'nonfinite_ratio': nonfinite_ratio,
-                    'mean': mean_v,
-                    'p90': p90_v,
-                    'passed': passed
-                }
 
-        p0_acc = _ResidualAccumulator(max_q_samples)
-        pi_acc = _ResidualAccumulator(max_q_samples)
-        q_acc = _ResidualAccumulator(max_q_samples)
+            p0_acc = _ResidualAccumulator(max_q_samples)
+            pi_acc = _ResidualAccumulator(max_q_samples)
+            q_acc = _ResidualAccumulator(max_q_samples)
 
-        with torch.no_grad():
-            for idx, batch in enumerate(batches):
-                try:
-                    p0_abs = self._compute_p0_bellman_abs_residual(batch)
-                    pi_abs = self._compute_pi_bellman_abs_residual(batch)
-                    q_abs = self._compute_q_bellman_abs_residual(batch)
-                except Exception as exc:
-                    logger.warning("Bellman convergence eval skip batch %d due to error: %s", idx, exc)
-                    continue
-                if p0_abs.numel() > 0:
-                    p0_acc.update(p0_abs)
-                if pi_abs.numel() > 0:
-                    pi_acc.update(pi_abs)
-                if q_abs.numel() > 0:
-                    q_acc.update(q_abs)
+            with torch.no_grad():
+                for idx, batch in enumerate(batches):
+                    try:
+                        p0_abs = self._compute_p0_bellman_abs_residual(batch)
+                        pi_abs = self._compute_pi_bellman_abs_residual(batch)
+                        q_abs = self._compute_q_bellman_abs_residual(batch)
+                    except Exception as exc:
+                        logger.warning("Bellman convergence eval skip batch %d due to error: %s", idx, exc)
+                        continue
+                    if p0_abs.numel() > 0:
+                        p0_acc.update(p0_abs)
+                    if pi_abs.numel() > 0:
+                        pi_acc.update(pi_abs)
+                    if q_abs.numel() > 0:
+                        q_acc.update(q_abs)
 
-        if was_training:
-            model.train()
-
-        equations = {
-            'p0': p0_acc.summarize('p0', mean_thr, p90_thr),
-            'pi': pi_acc.summarize('pi', mean_thr, p90_thr),
-            'q': q_acc.summarize('q', mean_thr, p90_thr)
-        }
-        policy_train = self.evaluate_target_grid_policy_convergence(batches)
-        policy_val = (
-            self.evaluate_target_grid_policy_convergence(validation_batches)
-            if validation_batches
-            else {
-                'enabled': False,
-                'informative': False,
-                'all_skipped': False,
-                'passed': True,
-                'skip_reason': 'no_validation_batches',
-                'policies': {},
+            equations = {
+                'p0': p0_acc.summarize('p0', mean_thr, p90_thr),
+                'pi': pi_acc.summarize('pi', mean_thr, p90_thr),
+                'q': q_acc.summarize('q', mean_thr, p90_thr)
             }
-        )
-        policy_convergence, policy_source = (
-            self._select_policy_convergence_result(
-                policy_train=policy_train,
-                policy_val=policy_val,
+            policy_train = self.evaluate_target_grid_policy_convergence(batches)
+            policy_val = (
+                self.evaluate_target_grid_policy_convergence(validation_batches)
+                if validation_batches
+                else {
+                    'enabled': False,
+                    'informative': False,
+                    'all_skipped': False,
+                    'passed': True,
+                    'skip_reason': 'no_validation_batches',
+                    'policies': {},
+                }
             )
-        )
+            policy_convergence, policy_source = (
+                self._select_policy_convergence_result(
+                    policy_train=policy_train,
+                    policy_val=policy_val,
+                )
+            )
 
-        enabled_eq = [m for m in equations.values() if m.get('enabled', False)]
-        bellman_passed = bool(enabled_eq) and all(m.get('passed', False) for m in enabled_eq)
-        policy_passed = bool(policy_convergence.get('passed', False))
-        all_passed = bool(bellman_passed and policy_passed)
-        summary = {
-            'enabled': True,
-            'thresholds': {'mean': mean_thr, 'p90': p90_thr},
-            'max_quantile_samples': max_q_samples,
-            'equations': equations,
-            'policy': policy_convergence,
-            'policy_train': policy_train,
-            'policy_val': policy_val,
-            'policy_source': policy_source,
-            'policy_informative': bool(policy_convergence.get('informative', False)),
-            'policy_all_skipped': bool(policy_convergence.get('all_skipped', False)),
-            'bellman_passed': bellman_passed,
-            'policy_passed': policy_passed,
-            'passed': all_passed
-        }
-        logger.info(
-            (
-                "Bellman convergence summary | mean<%.3e, p90<%.3e, "
-                "bellman_passed=%s, policy_passed=%s, policy_source=%s, "
-                "policy_informative=%s, passed=%s"
-            ),
-            mean_thr,
-            p90_thr,
-            str(bellman_passed),
-            str(policy_passed),
-            policy_source,
-            str(policy_convergence.get('informative', False)),
-            str(all_passed)
-        )
-        return summary
+            enabled_eq = [m for m in equations.values() if m.get('enabled', False)]
+            bellman_passed = bool(enabled_eq) and all(m.get('passed', False) for m in enabled_eq)
+            policy_passed = bool(policy_convergence.get('passed', False))
+            all_passed = bool(bellman_passed and policy_passed)
+            summary = {
+                'enabled': True,
+                'thresholds': {'mean': mean_thr, 'p90': p90_thr},
+                'max_quantile_samples': max_q_samples,
+                'equations': equations,
+                'policy': policy_convergence,
+                'policy_train': policy_train,
+                'policy_val': policy_val,
+                'policy_source': policy_source,
+                'policy_informative': bool(policy_convergence.get('informative', False)),
+                'policy_all_skipped': bool(policy_convergence.get('all_skipped', False)),
+                'bellman_passed': bellman_passed,
+                'policy_passed': policy_passed,
+                'passed': all_passed
+            }
+            logger.info(
+                (
+                    "Bellman convergence summary | mean<%.3e, p90<%.3e, "
+                    "bellman_passed=%s, policy_passed=%s, policy_source=%s, "
+                    "policy_informative=%s, passed=%s"
+                ),
+                mean_thr,
+                p90_thr,
+                str(bellman_passed),
+                str(policy_passed),
+                policy_source,
+                str(policy_convergence.get('informative', False)),
+                str(all_passed)
+            )
+            return summary
+        finally:
+            model.train(was_training)
 
     def _policy_value_stage_checkpoint(
         self,
@@ -7776,6 +7775,7 @@ class Episode:
         eval_epochs = getattr(self.hyperparams, "pv_eval_epochs", None)
         eval_epochs = int(n_epochs if eval_epochs is None else eval_epochs)
         bp_epochs = int(getattr(self.hyperparams, "bp_distill_epochs", 20))
+        online_stage_start_training = bool(self.models["policy_value"].training)
         online_stage_start_state = self._state_dict_to_cpu(self.models["policy_value"])
         firm_stage_start_state = (
             self._state_dict_to_cpu(self.firm_target)
@@ -7794,6 +7794,7 @@ class Episode:
                 self.models["policy_value"],
                 online_stage_start_state,
             )
+            self.models["policy_value"].train(online_stage_start_training)
             if self.firm_target is not None and firm_stage_start_state is not None:
                 self._restore_module_state(self.firm_target, firm_stage_start_state)
                 self.firm_target.eval()

@@ -1259,3 +1259,104 @@ def test_staged_success_convergence_is_rng_neutral():
     assert random.random() == expected_next["python"]
     assert float(np.random.rand()) == expected_next["numpy"]
     assert float(torch.rand(1).item()) == expected_next["torch"]
+
+
+def _patch_simple_bellman_residuals(episode: Episode):
+    episode._compute_p0_bellman_abs_residual = lambda _batch: torch.tensor([0.0])
+    episode._compute_pi_bellman_abs_residual = lambda _batch: torch.tensor([0.0])
+    episode._compute_q_bellman_abs_residual = lambda _batch: torch.tensor([0.0])
+
+
+def test_bellman_convergence_keeps_policy_diagnostics_in_eval_mode():
+    episode = _episode()
+    episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
+    batch = _batch(episode.device)
+    model = episode.models["policy_value"]
+    model.train()
+    _patch_simple_bellman_residuals(episode)
+    calls = {"n": 0}
+
+    def _policy_convergence(_batches):
+        calls["n"] += 1
+        assert model.training is False
+        return {
+            "enabled": True,
+            "informative": True,
+            "all_skipped": False,
+            "passed": True,
+            "policies": {},
+        }
+
+    episode.evaluate_target_grid_policy_convergence = _policy_convergence
+
+    result = episode.evaluate_bellman_convergence([batch], validation_batches=[batch])
+
+    assert result["enabled"] is True
+    assert calls["n"] == 2
+    assert model.training is True
+
+
+def test_bellman_convergence_exception_restores_train_mode():
+    episode = _episode()
+    episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
+    batch = _batch(episode.device)
+    model = episode.models["policy_value"]
+    model.train()
+    _patch_simple_bellman_residuals(episode)
+
+    def _raise_policy_convergence(_batches):
+        assert model.training is False
+        raise RuntimeError("policy convergence failed")
+
+    episode.evaluate_target_grid_policy_convergence = _raise_policy_convergence
+
+    with pytest.raises(RuntimeError, match="policy convergence failed"):
+        episode.evaluate_bellman_convergence([batch], validation_batches=[batch])
+
+    assert model.training is True
+
+
+def test_bellman_convergence_exception_preserves_eval_mode():
+    episode = _episode()
+    episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
+    batch = _batch(episode.device)
+    model = episode.models["policy_value"]
+    model.eval()
+    _patch_simple_bellman_residuals(episode)
+
+    def _raise_policy_convergence(_batches):
+        assert model.training is False
+        raise RuntimeError("policy convergence failed")
+
+    episode.evaluate_target_grid_policy_convergence = _raise_policy_convergence
+
+    with pytest.raises(RuntimeError, match="policy convergence failed"):
+        episode.evaluate_bellman_convergence([batch], validation_batches=[batch])
+
+    assert model.training is False
+
+
+def test_staged_exception_restores_online_model_mode():
+    episode = _episode()
+    batch = _batch(episode.device)
+    model = episode.models["policy_value"]
+    model.train()
+    before_online = episode._state_dict_hash(model)
+    before_target = episode._state_dict_hash(episode.firm_target)
+
+    def _raise_convergence(*args, **kwargs):
+        model.eval()
+        raise RuntimeError("convergence mode failure")
+
+    episode.evaluate_bellman_convergence = _raise_convergence
+
+    with pytest.raises(RuntimeError, match="convergence mode failure"):
+        episode._run_policy_value_staged(
+            pv_train_batches=[batch],
+            validation_batches=[batch],
+            n_epochs=1,
+        )
+
+    assert episode._state_dict_hash(model) == before_online
+    assert episode._state_dict_hash(episode.firm_target) == before_target
+    assert model.training is True
