@@ -19,6 +19,7 @@ from analysis.economic_config import AnalysisEconomicConfig
 from analysis.convergence_surface import (
     VectorizedBellmanSurfaceBackend,
     evaluate_checkpoint_convergence_surfaces,
+    plot_fixed_grid_collection,
     reduce_signed_surface,
     _extract_default_boundary_rows,
     _fixed_boundary_status,
@@ -290,7 +291,7 @@ def test_surface_api_is_deterministic_and_outputs_files(tmp_path):
         seed=2026,
         device="cpu",
         parent_chunk_size=2,
-        child_chunk_size=1,
+        child_chunk_size=2,
     )
 
     assert np.allclose(
@@ -409,7 +410,7 @@ def test_branch_weights_shapes_are_chunk_stable(tmp_path):
     )
 
     a = evaluate_checkpoint_convergence_surfaces(**kwargs, branch_weights=torch.tensor([0.75, 0.25]), parent_chunk_size=1)
-    b = evaluate_checkpoint_convergence_surfaces(**kwargs, branch_weights=torch.tensor([[0.75, 0.25], [0.25, 0.75]]), parent_chunk_size=3)
+    b = evaluate_checkpoint_convergence_surfaces(**kwargs, branch_weights=torch.tensor([[0.75, 0.25], [0.25, 0.75]]), parent_chunk_size=2)
     c = evaluate_checkpoint_convergence_surfaces(**kwargs, branch_weights=torch.tensor([[0.75, 0.25], [0.75, 0.25], [0.25, 0.75], [0.25, 0.75]]), parent_chunk_size=2)
 
     assert len(a.long_table) == len(b.long_table) == len(c.long_table)
@@ -674,6 +675,41 @@ def test_fixed_grid_chunk_size_invariance(tmp_path):
     )
 
 
+def test_fixed_grid_real_parent_and_child_chunking_records_forward_sizes(tmp_path, monkeypatch):
+    ckpt = tmp_path / "combined.pt"
+    _write_combined_checkpoint(ckpt)
+    fixed = {"eta": 1, "i": 0.1, "x": 0.0, "hatcf": -2.0, "lnkf": 4.0, "hatc_cal": -2.1, "lnk_cal": 4.1}
+    from models.policy_value import PolicyValueModel
+
+    calls = []
+    original = PolicyValueModel.forward
+
+    def spy_forward(self, firm_state):
+        calls.append(int(firm_state.shape[0]))
+        return original(self, firm_state)
+
+    monkeypatch.setattr(PolicyValueModel, "forward", spy_forward)
+
+    evaluate_checkpoint_convergence_surfaces(
+        [ckpt],
+        b_grid=[0.0, 0.5],
+        z_grid=[-0.5, 0.5],
+        state_mode="fixed_grid",
+        fixed_state=fixed,
+        n_child_shocks=2,
+        parent_chunk_size=2,
+        child_chunk_size=3,
+        seed=2026,
+        device="cpu",
+    )
+
+    assert calls
+    assert max(calls) <= 3
+    assert 2 in calls
+    assert 3 in calls
+    assert len(calls) > 10
+
+
 def test_default_boundary_helpers_export_all_components():
     b = np.linspace(0.0, 1.0, 5)
     z = np.linspace(-1.0, 1.0, 5)
@@ -687,3 +723,72 @@ def test_default_boundary_helpers_export_all_components():
     assert _fixed_boundary_status(phat) == "observed"
     assert rows
     assert len({row["component_id"] for row in rows}) >= 2
+
+
+def test_boundary_status_reports_partial_nonfinite():
+    phat = np.array([[1.0, np.nan], [-1.0, 0.5]])
+    assert _fixed_boundary_status(phat) == "partial_nonfinite"
+
+
+def test_fixed_grid_workload_guard_reports_dimensions(tmp_path):
+    ckpt = tmp_path / "combined.pt"
+    _write_combined_checkpoint(ckpt)
+
+    with pytest.raises(ValueError, match="n_b=3.*n_z=3.*n_child_shocks=4.*n_equations=3"):
+        evaluate_checkpoint_convergence_surfaces(
+            [ckpt],
+            b_grid=[0.0, 0.5, 1.0],
+            z_grid=[-1.0, 0.0, 1.0],
+            state_mode="fixed_grid",
+            fixed_state={"eta": 1, "i": 0.1, "x": 0.0, "hatcf": -2.0, "lnkf": 4.0, "hatc_cal": -2.1, "lnk_cal": 4.1},
+            n_child_shocks=4,
+            max_child_state_evals=1,
+            device="cpu",
+        )
+
+
+def test_fixed_grid_slurm_uses_fixed_grid_not_reference_distribution():
+    script = (ROOT / "slurm" / "run_convergence_surfaces_all_episodes_gpu.slurm").read_text()
+    assert "--state-mode fixed_grid" in script
+    assert "--reference-data" not in script
+    assert "--n-reference-states" not in script
+    assert "support_mask.png" not in script
+    assert "FIXED_ETA" in script
+
+
+def test_fixed_grid_collection_common_scale_and_mismatch_rejection(tmp_path):
+    ckpt = tmp_path / "combined.pt"
+    _write_combined_checkpoint(ckpt)
+    fixed = {"eta": 1, "i": 0.1, "x": 0.0, "hatcf": -2.0, "lnkf": 4.0, "hatc_cal": -2.1, "lnk_cal": 4.1}
+    dirs = []
+    for label in ("ep0", "ep1"):
+        out = tmp_path / label
+        evaluate_checkpoint_convergence_surfaces(
+            [ckpt],
+            checkpoint_labels=[label],
+            b_grid=[0.0, 0.5],
+            z_grid=[-0.5, 0.5],
+            state_mode="fixed_grid",
+            fixed_state=fixed,
+            n_child_shocks=2,
+            seed=2026,
+            device="cpu",
+            output_dir=out,
+        )
+        dirs.append(out)
+
+    common = tmp_path / "common"
+    manifest = plot_fixed_grid_collection(dirs, common)
+
+    assert "common_scale" in manifest
+    assert (common / "ep0_p0_conditional_abs_common_scale.png").exists()
+    assert (common / "ep1_q_conditional_abs_common_scale.png").exists()
+    log_manifest = plot_fixed_grid_collection(dirs, tmp_path / "common_log", log_residual_scale=True)
+    assert log_manifest["log_residual_scale"] is True
+    assert (tmp_path / "common_log" / "ep0_p0_conditional_abs_common_scale.png").exists()
+
+    bad_manifest = json.loads((dirs[1] / "manifest.json").read_text())
+    bad_manifest["b_grid"] = [0.0, 0.1]
+    (dirs[1] / "manifest.json").write_text(json.dumps(bad_manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="not comparable"):
+        plot_fixed_grid_collection(dirs, tmp_path / "bad")

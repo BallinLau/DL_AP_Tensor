@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--parent-chunk-size", type=int, default=512)
     p.add_argument("--child-chunk-size", type=int, default=8192)
-    p.add_argument("--max-child-state-evals", type=int)
+    p.add_argument("--max-child-state-evals", type=int, default=2_000_000)
     p.add_argument("--allow-large-run", action="store_true")
     p.add_argument("--include-raw", action="store_true")
     p.add_argument("--include-signed", action="store_true")
@@ -72,7 +72,7 @@ def main() -> None:
         }
         missing = [key for key, value in fixed_args.items() if value is None]
         if missing:
-            raise SystemExit(f"fixed_slice is missing required arguments: {missing}")
+            raise SystemExit(f"{args.state_mode} is missing required arguments: {missing}")
         fixed_state = {
             key: float(value) for key, value in fixed_args.items()
         }

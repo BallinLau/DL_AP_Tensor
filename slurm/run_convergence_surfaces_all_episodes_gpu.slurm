@@ -31,12 +31,11 @@ B_POINTS="${B_POINTS:-41}"
 Z_MIN="${Z_MIN:--4.0}"
 Z_MAX="${Z_MAX:-4.0}"
 Z_POINTS="${Z_POINTS:-41}"
-N_REFERENCE_STATES="${N_REFERENCE_STATES:-100}"
 N_CHILD_SHOCKS="${N_CHILD_SHOCKS:-32}"
 SEED="${SEED:-2026}"
 PARENT_CHUNK_SIZE="${PARENT_CHUNK_SIZE:-512}"
 CHILD_CHUNK_SIZE="${CHILD_CHUNK_SIZE:-8192}"
-MAX_CHILD_STATE_EVALS="${MAX_CHILD_STATE_EVALS:-100000000}"
+MAX_CHILD_STATE_EVALS="${MAX_CHILD_STATE_EVALS:-2000000}"
 ALLOW_LARGE_RUN="${ALLOW_LARGE_RUN:-0}"
 INCLUDE_RAW="${INCLUDE_RAW:-0}"
 ALLOW_CURRENT_CONFIG="${ALLOW_CURRENT_CONFIG:-1}"
@@ -44,7 +43,15 @@ ALLOW_DEFAULT_HYPERPARAMS="${ALLOW_DEFAULT_HYPERPARAMS:-1}"
 HYPERPARAMS_JSON="${HYPERPARAMS_JSON:-}"
 CONFIG_JSON="${CONFIG_JSON:-}"
 EPISODES="${EPISODES:-}"
-REQUIRED_COMMIT="${REQUIRED_COMMIT:-6d81881}"
+REQUIRED_COMMIT="${REQUIRED_COMMIT:-be4500d}"
+FIXED_ETA="${FIXED_ETA:-}"
+FIXED_I="${FIXED_I:-}"
+FIXED_X="${FIXED_X:-}"
+FIXED_HATCF="${FIXED_HATCF:-}"
+FIXED_LNKF="${FIXED_LNKF:-}"
+FIXED_HATC_CAL="${FIXED_HATC_CAL:-}"
+FIXED_LNK_CAL="${FIXED_LNK_CAL:-}"
+LOG_RESIDUAL_SCALE="${LOG_RESIDUAL_SCALE:-0}"
 
 mkdir -p "$LOG_DIR" "$OUTPUT_ROOT" "$WORK_ROOT/.mplcache"
 cd "$REPO_DIR"
@@ -76,7 +83,6 @@ echo "Output root: $OUTPUT_ROOT"
 echo "Device: $DEVICE"
 echo "B grid: [$B_MIN, $B_MAX] x $B_POINTS"
 echo "Z grid: [$Z_MIN, $Z_MAX] x $Z_POINTS"
-echo "N_REFERENCE_STATES=$N_REFERENCE_STATES"
 echo "N_CHILD_SHOCKS=$N_CHILD_SHOCKS"
 echo "PARENT_CHUNK_SIZE=$PARENT_CHUNK_SIZE"
 echo "CHILD_CHUNK_SIZE=$CHILD_CHUNK_SIZE"
@@ -86,7 +92,20 @@ echo "INCLUDE_RAW=$INCLUDE_RAW"
 echo "ALLOW_CURRENT_CONFIG=$ALLOW_CURRENT_CONFIG"
 echo "ALLOW_DEFAULT_HYPERPARAMS=$ALLOW_DEFAULT_HYPERPARAMS"
 echo "EPISODES=${EPISODES:-auto}"
+echo "LOG_RESIDUAL_SCALE=$LOG_RESIDUAL_SCALE"
 echo "============================================================"
+
+missing_fixed=()
+for name in FIXED_ETA FIXED_I FIXED_X FIXED_HATCF FIXED_LNKF FIXED_HATC_CAL FIXED_LNK_CAL; do
+    if [[ -z "${!name}" ]]; then
+        missing_fixed+=("$name")
+    fi
+done
+if [[ "${#missing_fixed[@]}" -gt 0 ]]; then
+    echo "ERROR: fixed_grid requires these environment variables:"
+    printf '  %s\n' "${missing_fixed[@]}"
+    exit 1
+fi
 
 python3 - <<'PY'
 import torch
@@ -141,23 +160,11 @@ for POLICY_CKPT in "${POLICY_CKPTS[@]}"; do
     ep="${ep%%_*}"
     SDF_CKPT="$CHECKPOINT_DIR/ep${ep}_sdf_fc1.pt"
 
-    if [[ "$ep" == "0" ]]; then
-        FIRM_PKL="$DATA_OUTPUT_DIR/ep0_stage_mode0.pkl"
-    else
-        FIRM_PKL="$DATA_OUTPUT_DIR/ep${ep}_stage_modeb.pkl"
-    fi
-
     if [[ ! -f "$SDF_CKPT" ]]; then
         echo "ERROR: missing SDF/FC1 checkpoint for episode $ep:"
         echo "  $SDF_CKPT"
         exit 1
     fi
-    if [[ ! -f "$FIRM_PKL" ]]; then
-        echo "ERROR: missing reference firm data for episode $ep:"
-        echo "  $FIRM_PKL"
-        exit 1
-    fi
-
     EP_OUT="$OUTPUT_ROOT/ep${ep}"
     mkdir -p "$EP_OUT"
 
@@ -165,9 +172,14 @@ for POLICY_CKPT in "${POLICY_CKPTS[@]}"; do
         --policy-checkpoint "$POLICY_CKPT"
         --sdf-checkpoint "$SDF_CKPT"
         --checkpoint-label "ep${ep}"
-        --state-mode reference_distribution
-        --reference-data "$FIRM_PKL"
-        --n-reference-states "$N_REFERENCE_STATES"
+        --state-mode fixed_grid
+        --eta "$FIXED_ETA"
+        --i "$FIXED_I"
+        --x "$FIXED_X"
+        --hatcf "$FIXED_HATCF"
+        --lnkf "$FIXED_LNKF"
+        --hatc-cal "$FIXED_HATC_CAL"
+        --lnk-cal "$FIXED_LNK_CAL"
         --b-min "$B_MIN"
         --b-max "$B_MAX"
         --b-points "$B_POINTS"
@@ -204,13 +216,13 @@ for POLICY_CKPT in "${POLICY_CKPTS[@]}"; do
     echo "Episode $ep"
     echo "Policy checkpoint: $POLICY_CKPT"
     echo "SDF/FC1 checkpoint: $SDF_CKPT"
-    echo "Reference data: $FIRM_PKL"
+    echo "Fixed context: eta=$FIXED_ETA i=$FIXED_I x=$FIXED_X hatcf=$FIXED_HATCF lnkf=$FIXED_LNKF hatc_cal=$FIXED_HATC_CAL lnk_cal=$FIXED_LNK_CAL"
     echo "Episode output: $EP_OUT"
     echo "------------------------------------------------------------"
 
     python3 -m scripts.plot_convergence_surface "${ARGS[@]}" 2>&1 | tee "$EP_OUT/plot_convergence_surface.log"
 
-    for required in manifest.json surface_long.csv raw_surface.pt support_mask.png support_distance.png; do
+    for required in manifest.json surface_long.csv raw_surface.pt default_boundary.csv "ep${ep}_p0_conditional_abs.png" "ep${ep}_pi_conditional_abs.png" "ep${ep}_q_conditional_abs.png"; do
         if [[ ! -f "$EP_OUT/$required" ]]; then
             echo "ERROR: missing expected output for episode $ep: $EP_OUT/$required"
             exit 1
@@ -224,6 +236,37 @@ for POLICY_CKPT in "${POLICY_CKPTS[@]}"; do
     fi
     echo "Episode $ep done. PNG count: $PNG_COUNT"
 done
+
+COMMON_OUT="$OUTPUT_ROOT/common_scale"
+mkdir -p "$COMMON_OUT"
+echo "------------------------------------------------------------"
+echo "Post-processing common-scale fixed-grid plots"
+echo "Common output: $COMMON_OUT"
+echo "------------------------------------------------------------"
+
+COMMON_ARGS=()
+for d in "$OUTPUT_ROOT"/ep*; do
+    if [[ -d "$d" ]]; then
+        COMMON_ARGS+=("$d")
+    fi
+done
+export COMMON_OUT
+export LOG_RESIDUAL_SCALE
+python3 - "${COMMON_ARGS[@]}" <<'PY'
+import os
+import sys
+from analysis.convergence_surface import plot_fixed_grid_collection
+
+episode_dirs = sys.argv[1:]
+if not episode_dirs:
+    raise SystemExit("No episode output directories found for common-scale post-processing.")
+manifest = plot_fixed_grid_collection(
+    episode_dirs,
+    os.environ["COMMON_OUT"],
+    log_residual_scale=os.environ.get("LOG_RESIDUAL_SCALE", "0") == "1",
+)
+print("Common scale manifest:", manifest)
+PY
 
 echo "============================================================"
 echo "All convergence surface plots completed"

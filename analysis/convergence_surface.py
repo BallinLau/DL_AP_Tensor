@@ -185,6 +185,7 @@ class VectorizedBellmanSurfaceBackend:
             beta_z=cfg.BETA_Z,
             z0=cfg.Z0,
         )
+        self.last_parent_diagnostics: Dict[str, torch.Tensor] = {}
 
     def compute_signed_residuals(
         self,
@@ -205,6 +206,13 @@ class VectorizedBellmanSurfaceBackend:
         p0_parent = _policy_get(parent_out, "P0")
         pi_parent = _policy_get(parent_out, "PI")
         bar_i = _policy_get(parent_out, "bar_i")
+        phat_parent = _policy_get(parent_out, "Phat")
+        default_probability = _policy_get(parent_out, "bar_z")
+        self.last_parent_diagnostics = {
+            "Phat": phat_parent.detach(),
+            "default_probability": default_probability.detach(),
+            "survival_probability": (1.0 - default_probability).detach(),
+        }
 
         def make_child_states(b_child: torch.Tensor) -> torch.Tensor:
             return torch.stack([
@@ -234,11 +242,7 @@ class VectorizedBellmanSurfaceBackend:
         for eq in equations:
             flat = child_states[eq].reshape(-1, 7)
             out_chunks = []
-            # The diagnostic surface must be exactly invariant to requested
-            # chunk sizes. Use a canonical full child batch after the workload
-            # guard has accepted the run; the argument remains part of the API
-            # for future streaming backends.
-            step = flat.shape[0]
+            step = max(1, int(child_chunk_size))
             for start in range(0, flat.shape[0], step):
                 out_chunks.append(self.policy_model(flat[start:start + step]))
 
@@ -740,9 +744,12 @@ def _validate_surface_inputs(
 
 
 def _fixed_boundary_status(phat: np.ndarray) -> str:
-    finite = phat[np.isfinite(phat)]
+    finite_mask = np.isfinite(phat)
+    finite = phat[finite_mask]
     if finite.size == 0:
-        return "unknown_nonfinite"
+        return "all_nonfinite"
+    if finite.size < phat.size:
+        return "partial_nonfinite"
     if np.all(finite > 0):
         return "all_survival"
     if np.all(finite < 0):
@@ -759,7 +766,8 @@ def _extract_default_boundary_rows(
 ) -> List[Dict[str, Any]]:
     import matplotlib.pyplot as plt
 
-    if _fixed_boundary_status(phat_grid) != "observed":
+    status = _fixed_boundary_status(phat_grid)
+    if status not in {"observed", "partial_nonfinite"}:
         return []
     fig, ax = plt.subplots()
     try:
@@ -841,7 +849,7 @@ def evaluate_checkpoint_convergence_surfaces(
     device: Optional[str | torch.device] = None,
     output_dir: Optional[str | Path] = None,
     support_radius: Optional[float] = None,
-    max_child_state_evals: Optional[int] = None,
+    max_child_state_evals: Optional[int] = 2_000_000,
     allow_large_run: bool = False,
     include_raw_plots: bool = False,
     apply_support_mask: bool = True,
@@ -966,8 +974,14 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
     }
     if max_child_state_evals is not None and n_child_state_evals > int(max_child_state_evals) and not allow_large_run:
         raise ValueError(
-            f"workload guard blocked run: n_child_state_evals={n_child_state_evals} "
-            f"> max_child_state_evals={max_child_state_evals}; set allow_large_run=True to proceed"
+            "workload guard blocked run: "
+            f"n_b={int(b_grid_t.numel())}, "
+            f"n_z={int(z_grid_t.numel())}, "
+            f"n_child_shocks={int(n_child_shocks)}, "
+            f"n_equations={len(tuple(equations))}, "
+            f"n_child_state_evals={n_child_state_evals}, "
+            f"max_child_state_evals={max_child_state_evals}; "
+            "set allow_large_run=True to proceed"
         )
 
     shock_bank = ConvergenceShockBank.create(
@@ -1021,10 +1035,13 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
                 economic_config=ckpt.economic_config,
             )
             per_metric_values: Dict[Tuple[str, str, str], List[torch.Tensor]] = {}
-            # Use a canonical full parent batch to keep CRN and floating-point
-            # evaluation independent of caller chunk-size choices.
-            for start in range(0, parent_states.shape[0], parent_states.shape[0]):
-                end = parent_states.shape[0]
+            parent_diag_chunks: Dict[str, List[torch.Tensor]] = {
+                "Phat": [],
+                "default_probability": [],
+                "survival_probability": [],
+            }
+            for start in range(0, parent_states.shape[0], int(parent_chunk_size)):
+                end = min(start + int(parent_chunk_size), parent_states.shape[0])
                 ps = parent_states[start:end]
                 macro_chunk = MacroTransitionContext(
                     hatc_cal=macro.hatc_cal[start:end],
@@ -1053,6 +1070,9 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
                         reduced = reduce_signed_surface(residuals[eq][mode], child.branch_weights)
                         for metric, tensor in reduced.items():
                             per_metric_values.setdefault((eq, mode, metric), []).append(tensor.detach().cpu())
+                if state_mode == FIXED_GRID_MODE:
+                    for name, tensor in backend.last_parent_diagnostics.items():
+                        parent_diag_chunks[name].append(tensor.detach().cpu())
 
             checkpoint_label = str(metadata["label"])
             raw_tensors[checkpoint_label] = {}
@@ -1061,17 +1081,13 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
             flat_z = zz.reshape(-1).numpy()
             phat_np = default_np = survival_np = None
             if state_mode == FIXED_GRID_MODE:
-                with torch.no_grad():
-                    parent_out = ckpt.models["policy_value"](parent_states)
-                    phat = _policy_get(parent_out, "Phat").detach().cpu().reshape(-1)
-                    default_probability = _policy_get(parent_out, "bar_z").detach().cpu().reshape(-1)
-                    survival_probability = (1.0 - default_probability).reshape(-1)
-                phat_np = phat.numpy()
-                default_np = default_probability.numpy()
-                survival_np = survival_probability.numpy()
+                phat_np = torch.cat(parent_diag_chunks["Phat"], dim=0).reshape(-1).numpy()
+                default_np = torch.cat(parent_diag_chunks["default_probability"], dim=0).reshape(-1).numpy()
+                survival_np = torch.cat(parent_diag_chunks["survival_probability"], dim=0).reshape(-1).numpy()
                 phat_grid = phat_np.reshape(len(z_grid_t), len(b_grid_t))
                 status = _fixed_boundary_status(phat_grid)
                 default_boundary_status[checkpoint_label] = status
+                default_boundary_status[f"{checkpoint_label}_nonfinite_ratio"] = float(1.0 - np.isfinite(phat_grid).mean())
                 boundary_rows.extend(
                     _extract_default_boundary_rows(
                         checkpoint=checkpoint_label,
@@ -1265,6 +1281,9 @@ def _write_fixed_grid_pngs(
 
     if table.empty:
         return
+    scale = None
+    if "fixed_grid_common_scale" in table.attrs:
+        scale = table.attrs["fixed_grid_common_scale"]
     b_values = np.array(sorted(table["b"].unique()), dtype=float)
     z_values = np.array(sorted(table["z"].unique()), dtype=float)
     for equation in ("p0", "pi", "q"):
@@ -1274,6 +1293,10 @@ def _write_fixed_grid_pngs(
         abs_vmax = np.nanmax(eq_all["conditional_abs"].to_numpy(dtype=float))
         if not np.isfinite(abs_vmax) or abs_vmax <= 0.0:
             abs_vmax = 1.0
+        scale_vmin = None
+        if scale and equation in scale:
+            scale_vmin = float(scale[equation].get("vmin", 0.0))
+            abs_vmax = float(scale[equation]["vmax"])
         signed_vmax = np.nanmax(np.abs(eq_all["conditional_signed"].to_numpy(dtype=float)))
         if not np.isfinite(signed_vmax) or signed_vmax <= 0.0:
             signed_vmax = 1.0
@@ -1292,8 +1315,8 @@ def _write_fixed_grid_pngs(
                 origin="lower",
                 aspect="auto",
                 extent=[b_values.min(), b_values.max(), z_values.min(), z_values.max()],
-                vmin=None if log_residual_scale else 0.0,
-                vmax=None if log_residual_scale else abs_vmax,
+                vmin=scale_vmin if log_residual_scale else 0.0,
+                vmax=abs_vmax,
             )
             _overlay_default_and_threshold(
                 ax,
@@ -1370,6 +1393,94 @@ def _overlay_default_and_threshold(
             labels.append(f"conditional_abs={float(residual_threshold):g}")
     if handles:
         ax.legend(handles, labels, loc="best", fontsize=8)
+
+
+def plot_fixed_grid_collection(
+    episode_output_dirs: Sequence[str | Path],
+    output_dir: str | Path,
+    *,
+    log_residual_scale: bool = False,
+) -> Dict[str, Any]:
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    tables = []
+    manifests = []
+    for directory in episode_output_dirs:
+        d = Path(directory)
+        csv_path = d / "surface_long.csv"
+        manifest_path = d / "manifest.json"
+        if not csv_path.exists() or not manifest_path.exists():
+            raise ValueError(f"missing fixed-grid surface output in {d}")
+        table = pd.read_csv(csv_path)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("state_mode") != FIXED_GRID_MODE:
+            raise ValueError(f"not a fixed_grid manifest: {manifest_path}")
+        table["source_output_dir"] = str(d)
+        tables.append(table)
+        manifests.append(manifest)
+
+    def comparable_key(manifest: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "b_grid": manifest.get("b_grid"),
+            "z_grid": manifest.get("z_grid"),
+            "fixed_state": manifest.get("context_metadata", {}).get("fixed_state"),
+            "seed": manifest.get("shock_bank_metadata", {}).get("seed"),
+            "n_child_shocks": manifest.get("shock_bank_metadata", {}).get("n_child_shocks"),
+            "shock_bank_hash": manifest.get("shock_bank_metadata", {}).get("shock_bank_hash"),
+        }
+
+    base_key = comparable_key(manifests[0])
+    for manifest in manifests[1:]:
+        key = comparable_key(manifest)
+        if key != base_key:
+            raise ValueError(f"fixed-grid collection inputs are not comparable: {base_key} != {key}")
+
+    all_table = pd.concat(tables, ignore_index=True)
+    common_scale: Dict[str, Dict[str, float]] = {}
+    for eq in ("p0", "pi", "q"):
+        vals = all_table.loc[all_table["equation"] == eq, "conditional_abs"].to_numpy(dtype=float)
+        if log_residual_scale:
+            vals = np.log10(vals + 1e-12)
+        finite = vals[np.isfinite(vals)]
+        vmax = float(finite.max()) if finite.size else 1.0
+        vmin = float(finite.min()) if (finite.size and log_residual_scale) else 0.0
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        common_scale[eq] = {"vmin": vmin, "vmax": vmax}
+
+    for table in tables:
+        label = str(table["checkpoint"].iloc[0])
+        table = table.copy()
+        table.attrs["fixed_grid_common_scale"] = common_scale
+        tmp_out = output / label
+        tmp_out.mkdir(parents=True, exist_ok=True)
+        _write_fixed_grid_pngs(table, tmp_out, log_residual_scale=log_residual_scale)
+        for png in tmp_out.glob("*_conditional_abs.png"):
+            png.rename(output / png.name.replace("_conditional_abs.png", "_conditional_abs_common_scale.png"))
+        try:
+            tmp_out.rmdir()
+        except OSError:
+            pass
+
+    manifest = {
+        "state_mode": FIXED_GRID_MODE,
+        "common_scale": common_scale,
+        "comparison_key": base_key,
+        "episode_output_dirs": [str(Path(d)) for d in episode_output_dirs],
+        "log_residual_scale": bool(log_residual_scale),
+    }
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def _first_nonnull(series: pd.Series) -> Any:
+    vals = series.dropna()
+    if vals.empty:
+        return None
+    value = vals.iloc[0]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 def _write_primary_pngs(
