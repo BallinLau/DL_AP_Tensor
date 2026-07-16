@@ -549,19 +549,27 @@ def test_reduce_signed_branch_residuals_weighted_branches():
 
     assert reduced["conditional_signed"].item() == pytest.approx(0.15, abs=1e-7)
     assert reduced["conditional_abs"].item() == pytest.approx(0.15, abs=1e-7)
-    n_eff = 1.0 / (0.75 ** 2 + 0.25 ** 2)
+    sum_w2 = 0.75 ** 2 + 0.25 ** 2
     assert reduced["mc_standard_error"].item() == pytest.approx(
-        reduced["child_std"].item() / np.sqrt(n_eff),
+        reduced["child_std"].item() * np.sqrt(sum_w2 / (1.0 - sum_w2)),
         abs=1e-7,
     )
 
 
-def test_reduce_signed_branch_residuals_equal_weight_mc_se_uses_branch_count():
+def test_reduce_signed_branch_residuals_equal_weight_j2_mc_se_uses_finite_sample_correction():
+    signed = torch.tensor([[1.0, -1.0]], dtype=torch.float32)
+    reduced = Episode._reduce_signed_branch_residuals(signed)
+
+    assert reduced["child_std"].item() == pytest.approx(1.0, abs=1e-7)
+    assert reduced["mc_standard_error"].item() == pytest.approx(1.0, abs=1e-7)
+
+
+def test_reduce_signed_branch_residuals_equal_weight_j4_mc_se_uses_finite_sample_correction():
     signed = torch.tensor([[1.0, -1.0, 1.0, -1.0]], dtype=torch.float32)
     reduced = Episode._reduce_signed_branch_residuals(signed)
 
     assert reduced["child_std"].item() == pytest.approx(1.0, abs=1e-7)
-    assert reduced["mc_standard_error"].item() == pytest.approx(0.5, abs=1e-7)
+    assert reduced["mc_standard_error"].item() == pytest.approx(1.0 / np.sqrt(3.0), abs=1e-7)
 
 
 def test_reduce_signed_branch_residuals_single_branch_mc_se_is_nan():
@@ -861,6 +869,55 @@ def test_bellman_convergence_none_thresholds_report_without_pass_fail():
             assert metric["passed"] is None
     assert result["legacy"]["definition"] == "flattened_child_absolute"
     assert result["legacy"]["equations"]["p0"]["passed"] is False
+
+
+@pytest.mark.parametrize(
+    ("bellman_state", "policy_state", "expected"),
+    [
+        (None, False, False),
+        (None, True, None),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
+)
+def test_bellman_convergence_top_level_passed_uses_three_valued_logic(
+    bellman_state,
+    policy_state,
+    expected,
+):
+    episode = _episode()
+    episode.evaluate_bellman_convergence = Episode.evaluate_bellman_convergence.__get__(episode, Episode)
+    batch = _batch(episode.device)
+    if bellman_state is None:
+        episode.hyperparams.bellman_conditional_mean_thresh = None
+        episode.hyperparams.bellman_conditional_p90_thresh = None
+        signed = torch.tensor([[1.0, -1.0], [0.5, -0.5]], dtype=torch.float32)
+    elif bellman_state is True:
+        episode.hyperparams.bellman_conditional_mean_thresh = 1e-3
+        episode.hyperparams.bellman_conditional_p90_thresh = 1e-3
+        signed = torch.zeros((2, 2), dtype=torch.float32)
+    else:
+        episode.hyperparams.bellman_conditional_mean_thresh = 1e-3
+        episode.hyperparams.bellman_conditional_p90_thresh = 1e-3
+        signed = torch.ones((2, 2), dtype=torch.float32)
+
+    episode._compute_p0_bellman_signed_residuals = lambda _batch, *, m_mode: signed
+    episode._compute_pi_bellman_signed_residuals = lambda _batch, *, m_mode: signed
+    episode._compute_q_bellman_signed_residuals = lambda _batch, *, m_mode: signed
+    episode.evaluate_target_grid_policy_convergence = lambda _batches: {
+        "enabled": True,
+        "informative": True,
+        "all_skipped": False,
+        "passed": policy_state,
+        "policies": {},
+    }
+
+    result = episode.evaluate_bellman_convergence([batch], validation_batches=[batch])
+
+    assert result["bellman_passed"] is bellman_state
+    assert result["policy_passed"] is policy_state
+    assert result["passed"] is expected
 
 
 def test_bp_cache_active_counts_reports_entries_and_unique_parents():

@@ -5471,11 +5471,19 @@ class Episode:
         realized_abs = (weights * signed.abs()).sum(dim=1)
         centered = signed - conditional_signed.unsqueeze(1)
         child_std = torch.sqrt((weights * centered.pow(2)).sum(dim=1).clamp_min(0.0))
+        sum_w2 = weights.pow(2).sum(dim=1)
+        denom = 1.0 - sum_w2
+        eps = torch.finfo(weights.dtype).eps
         if branch_count == 1:
             mc_standard_error = torch.full_like(child_std, float("nan"))
         else:
-            n_eff = 1.0 / weights.pow(2).sum(dim=1).clamp_min(torch.finfo(weights.dtype).eps)
-            mc_standard_error = child_std / torch.sqrt(n_eff)
+            se_factor = torch.sqrt(sum_w2 / denom.clamp_min(eps))
+            mc_standard_error = child_std * se_factor
+            mc_standard_error = torch.where(
+                denom > eps,
+                mc_standard_error,
+                torch.full_like(mc_standard_error, float("nan")),
+            )
         return {
             "conditional_signed": conditional_signed,
             "conditional_abs": conditional_abs,
@@ -6281,7 +6289,12 @@ class Episode:
                     m.get('passed', False) for m in enabled_primary
                 )
             policy_passed = bool(policy_convergence.get('passed', False))
-            all_passed = None if bellman_passed is None else bool(bellman_passed and policy_passed)
+            if not policy_passed:
+                all_passed = False
+            elif bellman_passed is None:
+                all_passed = None
+            else:
+                all_passed = bool(bellman_passed)
             summary = {
                 'enabled': True,
                 'definition_version': 'conditional_mean_v1',
