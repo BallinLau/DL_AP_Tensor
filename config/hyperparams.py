@@ -163,7 +163,8 @@ class HyperParams:
     # validate cache length, batch ids, target/source shapes, teacher hash and
     # grid config hash without re-hashing full parent/child/M tensors.  Use
     # "full" for debug/tests when parent/child/M hashes should be recomputed.
-    # "off" keeps only the cache length check.
+    # "off" keeps structural checks only: cache length, batch ids, and target
+    # shapes.
     pq_cache_integrity_check: str = "metadata"
     bp_distill_trainable_scope: str = "heads_only"
     # Optional Policy/Value mixture sampling for episode e>0.  When enabled,

@@ -617,6 +617,29 @@ def test_pq_stage_zero_optimizer_steps_is_not_accepted():
     assert summary["accepted_epochs"] == 0
 
 
+def test_pq_integrity_mode_invalid_value_fails_before_cache_build(monkeypatch):
+    episode = _episode()
+    batch = _batch(episode.device)
+    episode.hyperparams.pq_cache_integrity_check = "bad_mode"
+    called = {"build_cache": False}
+
+    def _unexpected_cache_build(*args, **kwargs):
+        called["build_cache"] = True
+        raise AssertionError("cache build should not run for invalid integrity mode")
+
+    monkeypatch.setattr(episode, "_build_pq_value_target_cache", _unexpected_cache_build)
+
+    with pytest.raises(ValueError, match="pq_cache_integrity_check"):
+        episode._run_policy_value_evaluation_stage(
+            [batch],
+            [batch],
+            episode.firm_target,
+            n_epochs=1,
+        )
+
+    assert called["build_cache"] is False
+
+
 def test_staged_failure_does_not_update_firm_target():
     episode = _episode()
     batch = _batch(episode.device)
@@ -691,6 +714,53 @@ def test_pq_stage_failure_rolls_back_online_model():
     assert summary["optimizer_steps"] == 0
     assert summary["attempted_optimizer_steps"] == 1
     assert episode._state_dict_hash(episode.models["policy_value"]) == before
+
+
+def test_pq_best_checkpoint_restore_aligns_counters_and_records():
+    episode = _episode()
+    param = episode._policy_value_stage_params("pq")[0]
+    _patch_stage_loss(episode, param)
+    score_iter = iter([1.0, 2.0])
+    best_snapshot = {}
+
+    def _score(*args, **kwargs):
+        score = next(score_iter)
+        if score == 1.0:
+            best_snapshot["model_hash"] = episode._state_dict_hash(
+                episode.models["policy_value"]
+            )
+            best_snapshot["step_count"] = int(episode.step_count)
+            best_snapshot["pv_eval_step_count"] = int(
+                episode.policy_value_eval_step_count
+            )
+        return score, {"total": score}
+
+    episode._evaluate_cached_pq_score = _score
+    before_step_count = int(episode.step_count)
+    before_pv_eval_steps = int(episode.policy_value_eval_step_count)
+    batch = _batch(episode.device)
+    batch["scale"] = 1.0
+
+    summary = episode._run_policy_value_evaluation_stage(
+        [batch],
+        [batch],
+        episode.firm_target,
+        n_epochs=2,
+    )
+
+    assert summary["status"] == "accepted"
+    assert summary["best_epoch"] == 1
+    assert summary["attempted_optimizer_steps"] == 2
+    assert summary["accepted_optimizer_steps_total"] == 2
+    assert summary["optimizer_steps"] == 1
+    assert summary["best_checkpoint_optimizer_steps"] == 1
+    assert summary["accepted_epochs_total"] == 2
+    assert summary["best_checkpoint_accepted_epochs"] == 1
+    assert episode.step_count == before_step_count + 1
+    assert episode.policy_value_eval_step_count == before_pv_eval_steps + 1
+    assert episode.step_count == best_snapshot["step_count"]
+    assert episode.policy_value_eval_step_count == best_snapshot["pv_eval_step_count"]
+    assert episode._state_dict_hash(episode.models["policy_value"]) == best_snapshot["model_hash"]
 
 
 def test_bp_rejected_epoch_rolls_back_bp_heads():

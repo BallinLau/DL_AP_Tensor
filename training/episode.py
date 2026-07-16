@@ -6504,10 +6504,16 @@ class Episode:
         stage_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
         teacher_hash_before = self._state_dict_hash(teacher)
         grid_config_hash = self._pq_grid_config_hash()
+        integrity_mode = str(getattr(self.hyperparams, "pq_cache_integrity_check", "metadata")).lower()
+        if integrity_mode not in {"off", "metadata", "full"}:
+            raise ValueError(
+                "pq_cache_integrity_check must be one of: off, metadata, full"
+            )
         previous_teacher = getattr(self, "_policy_value_stage_target_model", None)
         best_score = float("inf")
         best_epoch: Optional[int] = None
         best_checkpoint: Optional[Dict[str, Any]] = None
+        best_runtime_state: Optional[Dict[str, int]] = None
         records: List[Dict[str, Any]] = []
         optimizer_steps = 0
         attempted_optimizer_steps = 0
@@ -6549,7 +6555,7 @@ class Episode:
                 train_cache,
                 current_teacher_hash=teacher_hash_before,
                 current_grid_hash=grid_config_hash,
-                integrity_mode=str(getattr(self.hyperparams, "pq_cache_integrity_check", "metadata")),
+                integrity_mode=integrity_mode,
                 label="train",
             )
             if val_cache is not train_cache:
@@ -6558,7 +6564,7 @@ class Episode:
                     val_cache,
                     current_teacher_hash=teacher_hash_before,
                     current_grid_hash=grid_config_hash,
-                    integrity_mode=str(getattr(self.hyperparams, "pq_cache_integrity_check", "metadata")),
+                    integrity_mode=integrity_mode,
                     label="validation",
                 )
             train_cache_hash_before = self._pq_value_cache_hash(train_cache)
@@ -6701,13 +6707,28 @@ class Episode:
                         best_epoch = epoch + 1
                         best_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
                         best_checkpoint["validation_summary"] = val_summary
+                        best_runtime_state = {
+                            "step_count": int(self.step_count),
+                            "policy_value_eval_step_count": int(self.policy_value_eval_step_count),
+                            "optimizer_steps": int(optimizer_steps),
+                            "records_len": int(len(records)),
+                            "accepted_epochs": int(accepted_epochs),
+                        }
         finally:
             self._policy_value_stage_target_model = previous_teacher
             model.train(was_training)
 
         restored = False
+        accepted_optimizer_steps_total = int(optimizer_steps)
         if best_checkpoint is not None:
             self._restore_policy_value_stage_checkpoint(optimizer, best_checkpoint, None)
+            if best_runtime_state is not None:
+                self.step_count = int(best_runtime_state["step_count"])
+                self.policy_value_eval_step_count = int(
+                    best_runtime_state["policy_value_eval_step_count"]
+                )
+                optimizer_steps = int(best_runtime_state["optimizer_steps"])
+                del records[int(best_runtime_state["records_len"]):]
             restored = True
         avg, meta = self._aggregate_metric_records(records)
         teacher_hash_after = self._state_dict_hash(teacher)
@@ -6731,9 +6752,19 @@ class Episode:
             "epochs_requested": int(n_epochs),
             "epochs_completed": int(n_epochs),
             "accepted_epochs": int(accepted_epochs),
+            "accepted_epochs_total": int(accepted_epochs),
+            "best_checkpoint_accepted_epochs": (
+                int(best_runtime_state["accepted_epochs"])
+                if best_runtime_state is not None else None
+            ),
             "rejected_epochs": int(rejected_epochs),
             "optimizer_steps": optimizer_steps,
             "attempted_optimizer_steps": attempted_optimizer_steps,
+            "accepted_optimizer_steps_total": accepted_optimizer_steps_total,
+            "best_checkpoint_optimizer_steps": (
+                int(best_runtime_state["optimizer_steps"])
+                if best_runtime_state is not None else None
+            ),
             "policy_value_eval_step_count": int(self.policy_value_eval_step_count),
             "best_epoch": best_epoch,
             "best_validation_score": best_score if np.isfinite(best_score) else None,
