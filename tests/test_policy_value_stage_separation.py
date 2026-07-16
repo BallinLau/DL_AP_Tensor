@@ -875,6 +875,8 @@ def test_bp_rejected_epoch_rolls_back_bp_heads():
     episode.hyperparams.pv_grad_hard_threshold = 100.0
     episode.hyperparams.pv_epoch_max_skip_ratio = 0.4
     before = episode._state_dict_hash(episode.models["policy_value"])
+    before_step_count = int(episode.step_count)
+    before_bp_steps = int(episode.bp_distill_step_count)
 
     summary = episode._run_bp_distillation_stage(
         [{"batch": 0}, {"batch": 1}],
@@ -884,14 +886,94 @@ def test_bp_rejected_epoch_rolls_back_bp_heads():
     )
 
     assert summary["status"] == "failed_no_valid_checkpoint"
-    assert summary["optimizer_steps"] == 1
+    assert summary["optimizer_steps"] == 0
+    assert summary["attempted_optimizer_steps"] == 1
     assert summary["accepted_epochs"] == 0
+    assert episode.step_count == before_step_count
+    assert episode.bp_distill_step_count == before_bp_steps
     assert episode._state_dict_hash(episode.models["policy_value"]) == before
+
+
+def test_bp_best_checkpoint_restore_aligns_counters_records_and_rng():
+    episode = _episode()
+    bp_params = episode._policy_value_stage_params("bp")
+    param = bp_params[0]
+    score_iter = iter([1.0, 2.0])
+    best_snapshot = {}
+    random.seed(4040)
+    np.random.seed(4040)
+    torch.manual_seed(4040)
+
+    def _loss(_item):
+        total = param.sum()
+        return total, {"total": float(total.detach().item())}
+
+    def _score(_cache):
+        score = next(score_iter)
+        if score == 1.0:
+            best_snapshot["model_hash"] = episode._state_dict_hash(
+                episode.models["policy_value"]
+            )
+            best_snapshot["step_count"] = int(episode.step_count)
+            best_snapshot["bp_steps"] = int(episode.bp_distill_step_count)
+            state = episode._capture_rng_state()
+            best_snapshot["next_python"] = random.random()
+            best_snapshot["next_numpy"] = float(np.random.rand())
+            best_snapshot["next_torch"] = float(torch.rand(1).item())
+            episode._restore_rng_state(state)
+        else:
+            random.random()
+            np.random.rand()
+            torch.rand(1)
+        return score, {"total": score}
+
+    episode._compute_bp_cache_loss = _loss
+    episode._evaluate_bp_cache_score = _score
+    episode._bp_cache_hash = lambda _cache: "fixed-cache"
+    episode._bp_cache_active_counts = lambda _cache: {
+        "bp0_active_count": 1.0,
+        "bpi_active_count": 1.0,
+        "mix_active_count": 1.0,
+        "total_active_count": 3.0,
+    }
+
+    summary = episode._run_bp_distillation_stage(
+        [{"batch": 0}],
+        [{"batch": 1}],
+        episode.firm_target,
+        n_epochs=2,
+    )
+
+    assert summary["status"] == "accepted"
+    assert summary["best_epoch"] == 1
+    assert summary["attempted_optimizer_steps"] == 2
+    assert summary["accepted_optimizer_steps_total"] == 2
+    assert summary["optimizer_steps"] == 1
+    assert summary["best_checkpoint_optimizer_steps"] == 1
+    assert summary["accepted_epochs_total"] == 2
+    assert summary["best_checkpoint_accepted_epochs"] == 1
+    assert episode.step_count == best_snapshot["step_count"]
+    assert episode.bp_distill_step_count == best_snapshot["bp_steps"]
+    assert episode._state_dict_hash(episode.models["policy_value"]) == best_snapshot["model_hash"]
+    assert random.random() == best_snapshot["next_python"]
+    assert float(np.random.rand()) == best_snapshot["next_numpy"]
+    assert float(torch.rand(1).item()) == best_snapshot["next_torch"]
 
 
 def test_staged_bp_failure_rolls_back_full_online_model_and_target():
     episode = _episode()
     batch = _batch(episode.device)
+    episode.step_count = 17
+    episode.policy_value_eval_step_count = 5
+    episode.bp_distill_step_count = 3
+    random.seed(5050)
+    np.random.seed(5050)
+    torch.manual_seed(5050)
+    start_rng = episode._capture_rng_state()
+    expected_python = random.random()
+    expected_numpy = float(np.random.rand())
+    expected_torch = float(torch.rand(1).item())
+    episode._restore_rng_state(start_rng)
     before_online = episode._state_dict_hash(episode.models["policy_value"])
     before_target = episode._state_dict_hash(episode.firm_target)
 
@@ -899,6 +981,12 @@ def test_staged_bp_failure_rolls_back_full_online_model_and_target():
         # Mutate online model to prove staged-flow failure restores atomically.
         with torch.no_grad():
             next(episode.models["policy_value"].parameters()).add_(1.0)
+        episode.step_count += 11
+        episode.policy_value_eval_step_count += 7
+        episode.bp_distill_step_count += 13
+        random.random()
+        np.random.rand()
+        torch.rand(1)
         return {"status": "failed_no_valid_checkpoint", "optimizer_steps": 1}
 
     episode._run_bp_distillation_stage = _failed_bp
@@ -913,3 +1001,9 @@ def test_staged_bp_failure_rolls_back_full_online_model_and_target():
     assert result["metadata"]["firm_target_stage_update"]["firm_target_update_count"] == 0
     assert episode._state_dict_hash(episode.models["policy_value"]) == before_online
     assert episode._state_dict_hash(episode.firm_target) == before_target
+    assert episode.step_count == 17
+    assert episode.policy_value_eval_step_count == 5
+    assert episode.bp_distill_step_count == 3
+    assert random.random() == expected_python
+    assert float(np.random.rand()) == expected_numpy
+    assert float(torch.rand(1).item()) == expected_torch

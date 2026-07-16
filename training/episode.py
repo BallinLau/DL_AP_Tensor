@@ -7478,13 +7478,20 @@ class Episode:
         validation_informative = bool(validation_has_active)
         optimizer = self._make_policy_value_stage_optimizer(params)
         stage_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
+        stage_start_runtime = {
+            "step_count": int(self.step_count),
+            "bp_distill_step_count": int(self.bp_distill_step_count),
+            "rng_state": self._capture_rng_state(),
+        }
         patience = max(0, int(getattr(self.hyperparams, "bp_distill_patience", 3)))
         min_delta = float(getattr(self.hyperparams, "bp_distill_min_delta", 1e-4))
         best_score = float("inf")
         best_epoch: Optional[int] = None
         best_checkpoint: Optional[Dict[str, Any]] = None
+        best_runtime_state: Optional[Dict[str, Any]] = None
         wait = 0
         optimizer_steps = 0
+        attempted_optimizer_steps = 0
         accepted_epochs = 0
         hard_spike_count = 0
         nonfinite_count = 0
@@ -7503,6 +7510,11 @@ class Episode:
             with self._policy_value_train_scope("bp"):
                 for epoch in range(int(n_epochs)):
                     epoch_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
+                    step_count_before_epoch = int(self.step_count)
+                    bp_step_count_before_epoch = int(self.bp_distill_step_count)
+                    optimizer_steps_before_epoch = int(optimizer_steps)
+                    records_len_before_epoch = len(records)
+                    rng_state_before_epoch = self._capture_rng_state()
                     epoch_optimizer_steps = 0
                     epoch_hard = 0
                     epoch_nonfinite = 0
@@ -7537,6 +7549,7 @@ class Episode:
                             soft_spike_count += 1
                             epoch_soft += 1
                         optimizer.step()
+                        attempted_optimizer_steps += 1
                         self.step_count += 1
                         self.bp_distill_step_count += 1
                         optimizer_steps += 1
@@ -7549,6 +7562,11 @@ class Episode:
                             epoch_start_checkpoint,
                             None,
                         )
+                        self.step_count = step_count_before_epoch
+                        self.bp_distill_step_count = bp_step_count_before_epoch
+                        optimizer_steps = optimizer_steps_before_epoch
+                        del records[records_len_before_epoch:]
+                        self._restore_rng_state(rng_state_before_epoch)
                         epoch_summaries.append({
                             "epoch": epoch + 1,
                             "accepted": False,
@@ -7562,6 +7580,11 @@ class Episode:
                             epoch_start_checkpoint,
                             None,
                         )
+                        self.step_count = step_count_before_epoch
+                        self.bp_distill_step_count = bp_step_count_before_epoch
+                        optimizer_steps = optimizer_steps_before_epoch
+                        del records[records_len_before_epoch:]
+                        self._restore_rng_state(rng_state_before_epoch)
                         epoch_summaries.append({
                             "epoch": epoch + 1,
                             "accepted": False,
@@ -7571,6 +7594,16 @@ class Episode:
                         continue
                     score, val_summary = self._evaluate_bp_cache_score(score_cache)
                     if val_summary.get("status") == "skipped_no_active_refinancing":
+                        self._restore_policy_value_stage_checkpoint(
+                            optimizer,
+                            epoch_start_checkpoint,
+                            None,
+                        )
+                        self.step_count = step_count_before_epoch
+                        self.bp_distill_step_count = bp_step_count_before_epoch
+                        optimizer_steps = optimizer_steps_before_epoch
+                        del records[records_len_before_epoch:]
+                        self._restore_rng_state(rng_state_before_epoch)
                         epoch_summaries.append({
                             "epoch": epoch + 1,
                             "accepted": False,
@@ -7584,6 +7617,11 @@ class Episode:
                             epoch_start_checkpoint,
                             None,
                         )
+                        self.step_count = step_count_before_epoch
+                        self.bp_distill_step_count = bp_step_count_before_epoch
+                        optimizer_steps = optimizer_steps_before_epoch
+                        del records[records_len_before_epoch:]
+                        self._restore_rng_state(rng_state_before_epoch)
                         epoch_summaries.append({
                             "epoch": epoch + 1,
                             "accepted": False,
@@ -7608,6 +7646,14 @@ class Episode:
                         wait = 0
                         best_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
                         best_checkpoint["validation_summary"] = val_summary
+                        best_runtime_state = {
+                            "step_count": int(self.step_count),
+                            "bp_distill_step_count": int(self.bp_distill_step_count),
+                            "optimizer_steps": int(optimizer_steps),
+                            "records_len": int(len(records)),
+                            "accepted_epochs": int(accepted_epochs),
+                            "rng_state": self._capture_rng_state(),
+                        }
                     else:
                         wait += 1
                         if wait >= patience:
@@ -7615,8 +7661,15 @@ class Episode:
         finally:
             model.train(was_training)
         restored = False
+        accepted_optimizer_steps_total = int(optimizer_steps)
         if best_checkpoint is not None:
             self._restore_policy_value_stage_checkpoint(optimizer, best_checkpoint, None)
+            if best_runtime_state is not None:
+                self.step_count = int(best_runtime_state["step_count"])
+                self.bp_distill_step_count = int(best_runtime_state["bp_distill_step_count"])
+                optimizer_steps = int(best_runtime_state["optimizer_steps"])
+                del records[int(best_runtime_state["records_len"]):]
+                self._restore_rng_state(best_runtime_state.get("rng_state"))
             restored = True
         avg, meta = self._aggregate_metric_records(records)
         train_hash_after = self._bp_cache_hash(train_cache)
@@ -7624,7 +7677,7 @@ class Episode:
         non_bp_max_change = self._param_max_change_from_snapshot(non_bp_params, non_bp_snapshot)
         if skipped_no_active and optimizer_steps > 0:
             status = "skipped_no_active_refinancing"
-        elif optimizer_steps == 0:
+        elif attempted_optimizer_steps == 0:
             status = "failed_no_finite_update"
         elif best_checkpoint is None:
             status = "failed_no_valid_checkpoint"
@@ -7636,12 +7689,27 @@ class Episode:
                 stage_start_checkpoint,
                 None,
             )
+            self.step_count = int(stage_start_runtime["step_count"])
+            self.bp_distill_step_count = int(stage_start_runtime["bp_distill_step_count"])
+            optimizer_steps = 0
+            self._restore_rng_state(stage_start_runtime.get("rng_state"))
         return {
             "status": status,
             "epochs_requested": int(n_epochs),
             "epochs_completed": int(best_epoch or 0),
             "optimizer_steps": optimizer_steps,
+            "attempted_optimizer_steps": attempted_optimizer_steps,
+            "accepted_optimizer_steps_total": accepted_optimizer_steps_total,
+            "best_checkpoint_optimizer_steps": (
+                int(best_runtime_state["optimizer_steps"])
+                if best_runtime_state is not None else None
+            ),
             "accepted_epochs": int(accepted_epochs),
+            "accepted_epochs_total": int(accepted_epochs),
+            "best_checkpoint_accepted_epochs": (
+                int(best_runtime_state["accepted_epochs"])
+                if best_runtime_state is not None else None
+            ),
             "bp_distill_step_count": int(self.bp_distill_step_count),
             "best_epoch": best_epoch,
             "best_validation_score": best_score if np.isfinite(best_score) else None,
@@ -7690,6 +7758,12 @@ class Episode:
             if self.firm_target is not None
             else None
         )
+        staged_runtime_start = {
+            "step_count": int(self.step_count),
+            "policy_value_eval_step_count": int(self.policy_value_eval_step_count),
+            "bp_distill_step_count": int(self.bp_distill_step_count),
+            "rng_state": self._capture_rng_state(),
+        }
 
         def _restore_full_staged_start() -> None:
             self._restore_module_state(
@@ -7700,6 +7774,12 @@ class Episode:
                 self._restore_module_state(self.firm_target, firm_stage_start_state)
                 self.firm_target.eval()
                 self.firm_target.requires_grad_(False)
+            self.step_count = int(staged_runtime_start["step_count"])
+            self.policy_value_eval_step_count = int(
+                staged_runtime_start["policy_value_eval_step_count"]
+            )
+            self.bp_distill_step_count = int(staged_runtime_start["bp_distill_step_count"])
+            self._restore_rng_state(staged_runtime_start.get("rng_state"))
 
         teacher_source = self.firm_target if self.firm_target is not None else self.models["policy_value"]
         episode_teacher = deepcopy(teacher_source).to(self.device)
