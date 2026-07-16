@@ -960,6 +960,58 @@ def test_bp_best_checkpoint_restore_aligns_counters_records_and_rng():
     assert float(torch.rand(1).item()) == best_snapshot["next_torch"]
 
 
+def test_bp_exception_restores_stage_start_runtime():
+    episode = _episode()
+    bp_params = episode._policy_value_stage_params("bp")
+    param = bp_params[0]
+    first_call = {"done": False}
+    random.seed(4545)
+    np.random.seed(4545)
+    torch.manual_seed(4545)
+    start_rng = episode._capture_rng_state()
+    expected_python = random.random()
+    expected_numpy = float(np.random.rand())
+    expected_torch = float(torch.rand(1).item())
+    episode._restore_rng_state(start_rng)
+    before = episode._state_dict_hash(episode.models["policy_value"])
+    before_step_count = int(episode.step_count)
+    before_bp_steps = int(episode.bp_distill_step_count)
+
+    def _loss(_item):
+        if not first_call["done"]:
+            first_call["done"] = True
+            total = param.sum()
+            return total, {"total": float(total.detach().item())}
+        random.random()
+        np.random.rand()
+        torch.rand(1)
+        raise RuntimeError("bp loss exploded")
+
+    episode._compute_bp_cache_loss = _loss
+    episode._bp_cache_hash = lambda _cache: "fixed-cache"
+    episode._bp_cache_active_counts = lambda _cache: {
+        "bp0_active_count": 1.0,
+        "bpi_active_count": 1.0,
+        "mix_active_count": 1.0,
+        "total_active_count": 3.0,
+    }
+
+    with pytest.raises(RuntimeError, match="bp loss exploded"):
+        episode._run_bp_distillation_stage(
+            [{"batch": 0}, {"batch": 1}],
+            [{"batch": 2}],
+            episode.firm_target,
+            n_epochs=1,
+        )
+
+    assert episode._state_dict_hash(episode.models["policy_value"]) == before
+    assert episode.step_count == before_step_count
+    assert episode.bp_distill_step_count == before_bp_steps
+    assert random.random() == expected_python
+    assert float(np.random.rand()) == expected_numpy
+    assert float(torch.rand(1).item()) == expected_torch
+
+
 def test_staged_bp_failure_rolls_back_full_online_model_and_target():
     episode = _episode()
     batch = _batch(episode.device)
@@ -1004,6 +1056,80 @@ def test_staged_bp_failure_rolls_back_full_online_model_and_target():
     assert episode.step_count == 17
     assert episode.policy_value_eval_step_count == 5
     assert episode.bp_distill_step_count == 3
+    assert random.random() == expected_python
+    assert float(np.random.rand()) == expected_numpy
+    assert float(torch.rand(1).item()) == expected_torch
+
+
+def test_staged_bp_failure_skips_convergence_after_restore():
+    episode = _episode()
+    batch = _batch(episode.device)
+    called = {"convergence": False}
+
+    episode._run_bp_distillation_stage = lambda *args, **kwargs: {
+        "status": "failed_no_valid_checkpoint",
+        "optimizer_steps": 1,
+    }
+
+    def _fail_if_called(*args, **kwargs):
+        called["convergence"] = True
+        raise AssertionError("convergence should be skipped after staged failure")
+
+    episode.evaluate_bellman_convergence = _fail_if_called
+
+    result = episode._run_policy_value_staged(
+        pv_train_batches=[batch],
+        validation_batches=[batch],
+        n_epochs=1,
+    )
+
+    assert result["metadata"]["policy_value_stage_status"] == "failed_bp"
+    assert result["convergence"]["enabled"] is False
+    assert result["convergence"]["skip_reason"] == "staged_training_failed"
+    assert called["convergence"] is False
+
+
+def test_staged_exception_restores_full_runtime_state():
+    episode = _episode()
+    batch = _batch(episode.device)
+    episode.step_count = 21
+    episode.policy_value_eval_step_count = 8
+    episode.bp_distill_step_count = 4
+    random.seed(6060)
+    np.random.seed(6060)
+    torch.manual_seed(6060)
+    start_rng = episode._capture_rng_state()
+    expected_python = random.random()
+    expected_numpy = float(np.random.rand())
+    expected_torch = float(torch.rand(1).item())
+    episode._restore_rng_state(start_rng)
+    before_online = episode._state_dict_hash(episode.models["policy_value"])
+    before_target = episode._state_dict_hash(episode.firm_target)
+
+    def _raise_cache_error(*args, **kwargs):
+        with torch.no_grad():
+            next(episode.models["policy_value"].parameters()).add_(1.0)
+        episode.step_count += 5
+        episode.policy_value_eval_step_count += 6
+        random.random()
+        np.random.rand()
+        torch.rand(1)
+        raise RuntimeError("bp cache build failed")
+
+    episode._build_bp_target_cache = _raise_cache_error
+
+    with pytest.raises(RuntimeError, match="bp cache build failed"):
+        episode._run_policy_value_staged(
+            pv_train_batches=[batch],
+            validation_batches=[batch],
+            n_epochs=1,
+        )
+
+    assert episode._state_dict_hash(episode.models["policy_value"]) == before_online
+    assert episode._state_dict_hash(episode.firm_target) == before_target
+    assert episode.step_count == 21
+    assert episode.policy_value_eval_step_count == 8
+    assert episode.bp_distill_step_count == 4
     assert random.random() == expected_python
     assert float(np.random.rand()) == expected_numpy
     assert float(torch.rand(1).item()) == expected_torch

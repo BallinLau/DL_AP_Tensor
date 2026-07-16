@@ -7505,159 +7505,183 @@ class Episode:
         soft_threshold = float(getattr(self.hyperparams, "pv_grad_soft_threshold", 100.0))
         model = self.models["policy_value"]
         was_training = model.training
+
+        def _restore_bp_epoch_start(
+            checkpoint: Dict[str, Any],
+            *,
+            step_count: int,
+            bp_step_count: int,
+            optimizer_step_count: int,
+            records_len: int,
+            rng_state: Dict[str, Any],
+        ) -> int:
+            self._restore_policy_value_stage_checkpoint(optimizer, checkpoint, None)
+            self.step_count = int(step_count)
+            self.bp_distill_step_count = int(bp_step_count)
+            del records[int(records_len):]
+            self._restore_rng_state(rng_state)
+            return int(optimizer_step_count)
+
+        def _restore_bp_stage_start() -> None:
+            self._restore_policy_value_stage_checkpoint(
+                optimizer,
+                stage_start_checkpoint,
+                None,
+            )
+            self.step_count = int(stage_start_runtime["step_count"])
+            self.bp_distill_step_count = int(stage_start_runtime["bp_distill_step_count"])
+            self._restore_rng_state(stage_start_runtime.get("rng_state"))
+
         try:
-            model.train()
-            with self._policy_value_train_scope("bp"):
-                for epoch in range(int(n_epochs)):
-                    epoch_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
-                    step_count_before_epoch = int(self.step_count)
-                    bp_step_count_before_epoch = int(self.bp_distill_step_count)
-                    optimizer_steps_before_epoch = int(optimizer_steps)
-                    records_len_before_epoch = len(records)
-                    rng_state_before_epoch = self._capture_rng_state()
-                    epoch_optimizer_steps = 0
-                    epoch_hard = 0
-                    epoch_nonfinite = 0
-                    epoch_soft = 0
-                    epoch_total = 0
-                    for item in tqdm(train_cache, desc=f"BP distill {epoch+1}/{n_epochs}"):
-                        epoch_total += 1
-                        optimizer.zero_grad(set_to_none=True)
-                        total, losses = self._compute_bp_cache_loss(item)
-                        if not torch.isfinite(total):
-                            nonfinite_count += 1
-                            epoch_nonfinite += 1
-                            continue
-                        total.backward()
-                        raw_norm, clipped_norm = self._clip_params_with_raw_norm(
-                            params,
-                            float(getattr(self.hyperparams, "bp_distill_grad_clip_norm", 10.0)),
-                        )
-                        losses["bp_raw_grad_norm"] = raw_norm
-                        losses["bp_clipped_grad_norm"] = clipped_norm
-                        if not np.isfinite(raw_norm):
-                            nonfinite_count += 1
-                            epoch_nonfinite += 1
+            try:
+                model.train()
+                with self._policy_value_train_scope("bp"):
+                    for epoch in range(int(n_epochs)):
+                        epoch_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
+                        step_count_before_epoch = int(self.step_count)
+                        bp_step_count_before_epoch = int(self.bp_distill_step_count)
+                        optimizer_steps_before_epoch = int(optimizer_steps)
+                        records_len_before_epoch = len(records)
+                        rng_state_before_epoch = self._capture_rng_state()
+                        epoch_optimizer_steps = 0
+                        epoch_hard = 0
+                        epoch_nonfinite = 0
+                        epoch_soft = 0
+                        epoch_total = 0
+                        for item in tqdm(train_cache, desc=f"BP distill {epoch+1}/{n_epochs}"):
+                            epoch_total += 1
                             optimizer.zero_grad(set_to_none=True)
+                            total, losses = self._compute_bp_cache_loss(item)
+                            if not torch.isfinite(total):
+                                nonfinite_count += 1
+                                epoch_nonfinite += 1
+                                continue
+                            total.backward()
+                            raw_norm, clipped_norm = self._clip_params_with_raw_norm(
+                                params,
+                                float(getattr(self.hyperparams, "bp_distill_grad_clip_norm", 10.0)),
+                            )
+                            losses["bp_raw_grad_norm"] = raw_norm
+                            losses["bp_clipped_grad_norm"] = clipped_norm
+                            if not np.isfinite(raw_norm):
+                                nonfinite_count += 1
+                                epoch_nonfinite += 1
+                                optimizer.zero_grad(set_to_none=True)
+                                continue
+                            if raw_norm > hard_threshold:
+                                hard_spike_count += 1
+                                epoch_hard += 1
+                                optimizer.zero_grad(set_to_none=True)
+                                continue
+                            if raw_norm > soft_threshold:
+                                soft_spike_count += 1
+                                epoch_soft += 1
+                            optimizer.step()
+                            attempted_optimizer_steps += 1
+                            self.step_count += 1
+                            self.bp_distill_step_count += 1
+                            optimizer_steps += 1
+                            epoch_optimizer_steps += 1
+                            records.append(losses)
+                        skip_ratio = float(epoch_hard + epoch_nonfinite) / float(max(epoch_total, 1))
+                        if epoch_optimizer_steps <= 0:
+                            optimizer_steps = _restore_bp_epoch_start(
+                                epoch_start_checkpoint,
+                                step_count=step_count_before_epoch,
+                                bp_step_count=bp_step_count_before_epoch,
+                                optimizer_step_count=optimizer_steps_before_epoch,
+                                records_len=records_len_before_epoch,
+                                rng_state=rng_state_before_epoch,
+                            )
+                            epoch_summaries.append({
+                                "epoch": epoch + 1,
+                                "accepted": False,
+                                "reason": "no_optimizer_steps",
+                                "skip_ratio": skip_ratio,
+                            })
                             continue
-                        if raw_norm > hard_threshold:
-                            hard_spike_count += 1
-                            epoch_hard += 1
-                            optimizer.zero_grad(set_to_none=True)
+                        if skip_ratio > max_skip_ratio:
+                            optimizer_steps = _restore_bp_epoch_start(
+                                epoch_start_checkpoint,
+                                step_count=step_count_before_epoch,
+                                bp_step_count=bp_step_count_before_epoch,
+                                optimizer_step_count=optimizer_steps_before_epoch,
+                                records_len=records_len_before_epoch,
+                                rng_state=rng_state_before_epoch,
+                            )
+                            epoch_summaries.append({
+                                "epoch": epoch + 1,
+                                "accepted": False,
+                                "reason": "skip_ratio_exceeded",
+                                "skip_ratio": skip_ratio,
+                            })
                             continue
-                        if raw_norm > soft_threshold:
-                            soft_spike_count += 1
-                            epoch_soft += 1
-                        optimizer.step()
-                        attempted_optimizer_steps += 1
-                        self.step_count += 1
-                        self.bp_distill_step_count += 1
-                        optimizer_steps += 1
-                        epoch_optimizer_steps += 1
-                        records.append(losses)
-                    skip_ratio = float(epoch_hard + epoch_nonfinite) / float(max(epoch_total, 1))
-                    if epoch_optimizer_steps <= 0:
-                        self._restore_policy_value_stage_checkpoint(
-                            optimizer,
-                            epoch_start_checkpoint,
-                            None,
-                        )
-                        self.step_count = step_count_before_epoch
-                        self.bp_distill_step_count = bp_step_count_before_epoch
-                        optimizer_steps = optimizer_steps_before_epoch
-                        del records[records_len_before_epoch:]
-                        self._restore_rng_state(rng_state_before_epoch)
-                        epoch_summaries.append({
-                            "epoch": epoch + 1,
-                            "accepted": False,
-                            "reason": "no_optimizer_steps",
-                            "skip_ratio": skip_ratio,
-                        })
-                        continue
-                    if skip_ratio > max_skip_ratio:
-                        self._restore_policy_value_stage_checkpoint(
-                            optimizer,
-                            epoch_start_checkpoint,
-                            None,
-                        )
-                        self.step_count = step_count_before_epoch
-                        self.bp_distill_step_count = bp_step_count_before_epoch
-                        optimizer_steps = optimizer_steps_before_epoch
-                        del records[records_len_before_epoch:]
-                        self._restore_rng_state(rng_state_before_epoch)
-                        epoch_summaries.append({
-                            "epoch": epoch + 1,
-                            "accepted": False,
-                            "reason": "skip_ratio_exceeded",
-                            "skip_ratio": skip_ratio,
-                        })
-                        continue
-                    score, val_summary = self._evaluate_bp_cache_score(score_cache)
-                    if val_summary.get("status") == "skipped_no_active_refinancing":
-                        self._restore_policy_value_stage_checkpoint(
-                            optimizer,
-                            epoch_start_checkpoint,
-                            None,
-                        )
-                        self.step_count = step_count_before_epoch
-                        self.bp_distill_step_count = bp_step_count_before_epoch
-                        optimizer_steps = optimizer_steps_before_epoch
-                        del records[records_len_before_epoch:]
-                        self._restore_rng_state(rng_state_before_epoch)
-                        epoch_summaries.append({
-                            "epoch": epoch + 1,
-                            "accepted": False,
-                            "reason": "score_cache_no_active",
-                            "skip_ratio": skip_ratio,
-                        })
-                        break
-                    if not np.isfinite(score):
-                        self._restore_policy_value_stage_checkpoint(
-                            optimizer,
-                            epoch_start_checkpoint,
-                            None,
-                        )
-                        self.step_count = step_count_before_epoch
-                        self.bp_distill_step_count = bp_step_count_before_epoch
-                        optimizer_steps = optimizer_steps_before_epoch
-                        del records[records_len_before_epoch:]
-                        self._restore_rng_state(rng_state_before_epoch)
-                        epoch_summaries.append({
-                            "epoch": epoch + 1,
-                            "accepted": False,
-                            "reason": "nonfinite_validation_score",
-                            "skip_ratio": skip_ratio,
-                        })
-                        continue
-                    accepted_epochs += 1
-                    epoch_summaries.append({
-                        "epoch": epoch + 1,
-                        "accepted": True,
-                        "optimizer_steps": epoch_optimizer_steps,
-                        "skip_ratio": skip_ratio,
-                        "validation_score": score,
-                        "soft_spikes": epoch_soft,
-                        "hard_spikes": epoch_hard,
-                        "nonfinite_batches": epoch_nonfinite,
-                    })
-                    if score < best_score - min_delta:
-                        best_score = score
-                        best_epoch = epoch + 1
-                        wait = 0
-                        best_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
-                        best_checkpoint["validation_summary"] = val_summary
-                        best_runtime_state = {
-                            "step_count": int(self.step_count),
-                            "bp_distill_step_count": int(self.bp_distill_step_count),
-                            "optimizer_steps": int(optimizer_steps),
-                            "records_len": int(len(records)),
-                            "accepted_epochs": int(accepted_epochs),
-                            "rng_state": self._capture_rng_state(),
-                        }
-                    else:
-                        wait += 1
-                        if wait >= patience:
+                        score, val_summary = self._evaluate_bp_cache_score(score_cache)
+                        if val_summary.get("status") == "skipped_no_active_refinancing":
+                            skipped_no_active = True
+                            optimizer_steps = _restore_bp_epoch_start(
+                                epoch_start_checkpoint,
+                                step_count=step_count_before_epoch,
+                                bp_step_count=bp_step_count_before_epoch,
+                                optimizer_step_count=optimizer_steps_before_epoch,
+                                records_len=records_len_before_epoch,
+                                rng_state=rng_state_before_epoch,
+                            )
+                            epoch_summaries.append({
+                                "epoch": epoch + 1,
+                                "accepted": False,
+                                "reason": "score_cache_no_active",
+                                "skip_ratio": skip_ratio,
+                            })
                             break
+                        if not np.isfinite(score):
+                            optimizer_steps = _restore_bp_epoch_start(
+                                epoch_start_checkpoint,
+                                step_count=step_count_before_epoch,
+                                bp_step_count=bp_step_count_before_epoch,
+                                optimizer_step_count=optimizer_steps_before_epoch,
+                                records_len=records_len_before_epoch,
+                                rng_state=rng_state_before_epoch,
+                            )
+                            epoch_summaries.append({
+                                "epoch": epoch + 1,
+                                "accepted": False,
+                                "reason": "nonfinite_validation_score",
+                                "skip_ratio": skip_ratio,
+                            })
+                            continue
+                        accepted_epochs += 1
+                        epoch_summaries.append({
+                            "epoch": epoch + 1,
+                            "accepted": True,
+                            "optimizer_steps": epoch_optimizer_steps,
+                            "skip_ratio": skip_ratio,
+                            "validation_score": score,
+                            "soft_spikes": epoch_soft,
+                            "hard_spikes": epoch_hard,
+                            "nonfinite_batches": epoch_nonfinite,
+                        })
+                        if score < best_score - min_delta:
+                            best_score = score
+                            best_epoch = epoch + 1
+                            wait = 0
+                            best_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
+                            best_checkpoint["validation_summary"] = val_summary
+                            best_runtime_state = {
+                                "step_count": int(self.step_count),
+                                "bp_distill_step_count": int(self.bp_distill_step_count),
+                                "optimizer_steps": int(optimizer_steps),
+                                "records_len": int(len(records)),
+                                "accepted_epochs": int(accepted_epochs),
+                                "rng_state": self._capture_rng_state(),
+                            }
+                        else:
+                            wait += 1
+                            if wait >= patience:
+                                break
+            except Exception:
+                _restore_bp_stage_start()
+                raise
         finally:
             model.train(was_training)
         restored = False
@@ -7790,42 +7814,77 @@ class Episode:
             if self.firm_target is not None
             else None
         )
-        pq_summary = self._run_policy_value_evaluation_stage(
-            pv_train_batches,
-            validation_batches,
-            episode_teacher,
-            eval_epochs,
-        )
-        if pq_summary.get("status") != "accepted":
-            _restore_full_staged_start()
-            self._last_policy_value_stage_summary = {
-                "policy_value_training_flow": "staged",
-                "policy_value_stage_status": "failed_pq",
-                "policy_value_evaluation_stage": pq_summary,
-            }
-            return {
-                "final_losses": {},
-                "metadata": self._last_policy_value_stage_summary,
-                "target_grid_validation_batches": len(validation_batches),
-            }
+        try:
+            pq_summary = self._run_policy_value_evaluation_stage(
+                pv_train_batches,
+                validation_batches,
+                episode_teacher,
+                eval_epochs,
+            )
+            if pq_summary.get("status") != "accepted":
+                _restore_full_staged_start()
+                self._last_policy_value_stage_summary = {
+                    "policy_value_training_flow": "staged",
+                    "policy_value_stage_status": "failed_pq",
+                    "policy_value_evaluation_stage": pq_summary,
+                }
+                return {
+                    "final_losses": {},
+                    "metadata": self._last_policy_value_stage_summary,
+                    "convergence": {
+                        "enabled": False,
+                        "skip_reason": "staged_training_failed",
+                    },
+                    "target_grid_validation_batches": len(validation_batches),
+                }
 
-        bp_teacher = deepcopy(self.models["policy_value"]).to(self.device)
-        bp_teacher.eval()
-        bp_teacher.requires_grad_(False)
-        train_cache = self._build_bp_target_cache(pv_train_batches, bp_teacher)
-        val_cache = self._build_bp_target_cache(validation_batches or pv_train_batches, bp_teacher)
-        bp_summary = self._run_bp_distillation_stage(
-            train_cache,
-            val_cache,
-            bp_teacher,
-            bp_epochs,
-        )
+            bp_teacher = deepcopy(self.models["policy_value"]).to(self.device)
+            bp_teacher.eval()
+            bp_teacher.requires_grad_(False)
+            train_cache = self._build_bp_target_cache(pv_train_batches, bp_teacher)
+            val_cache = self._build_bp_target_cache(validation_batches or pv_train_batches, bp_teacher)
+            bp_summary = self._run_bp_distillation_stage(
+                train_cache,
+                val_cache,
+                bp_teacher,
+                bp_epochs,
+            )
+        except Exception:
+            _restore_full_staged_start()
+            raise
         stages_successful = (
             pq_summary.get("status") == "accepted"
             and bp_summary.get("status") in {"accepted", "skipped_no_active_refinancing"}
         )
         if not stages_successful:
             _restore_full_staged_start()
+            firm_hash_after = (
+                self._state_dict_hash(self.firm_target)
+                if self.firm_target is not None
+                else None
+            )
+            metadata = {
+                "policy_value_training_flow": "staged",
+                "policy_value_stage_status": "failed_bp",
+                "policy_value_evaluation_stage": pq_summary,
+                "bp_distillation_stage": bp_summary,
+                "firm_target_stage_update": {
+                    "firm_target_update_mode": firm_mode,
+                    "firm_target_update_count": 0,
+                    "firm_target_hash_before": firm_hash_before,
+                    "firm_target_hash_after": firm_hash_after,
+                },
+            }
+            self._last_policy_value_stage_summary = metadata
+            return {
+                "final_losses": {},
+                "metadata": metadata,
+                "convergence": {
+                    "enabled": False,
+                    "skip_reason": "staged_training_failed",
+                },
+                "target_grid_validation_batches": len(validation_batches),
+            }
         target_update_count = 0
         if stages_successful and firm_mode == "stage_hard":
             self._update_firm_target_now("stage_hard")
