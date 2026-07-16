@@ -6503,25 +6503,8 @@ class Episode:
         optimizer = self._make_policy_value_stage_optimizer(params)
         stage_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
         teacher_hash_before = self._state_dict_hash(teacher)
+        grid_config_hash = self._pq_grid_config_hash()
         previous_teacher = getattr(self, "_policy_value_stage_target_model", None)
-        self._policy_value_stage_target_model = teacher
-        train_cache, train_cache_summary = self._build_pq_value_target_cache(train_batches, teacher)
-        validation_source = "holdout" if val_batches else "train_fallback"
-        if val_batches:
-            val_source = val_batches
-            val_cache, val_cache_summary = self._build_pq_value_target_cache(val_source, teacher)
-        else:
-            val_source = train_batches
-            val_cache = train_cache
-            val_cache_summary = {
-                **train_cache_summary,
-                "reused_train_cache": True,
-            }
-        self._validate_pq_cache_once(train_batches, train_cache, teacher, label="train")
-        if val_cache is not train_cache:
-            self._validate_pq_cache_once(val_source, val_cache, teacher, label="validation")
-        train_cache_hash_before = self._pq_value_cache_hash(train_cache)
-        val_cache_hash_before = self._pq_value_cache_hash(val_cache)
         best_score = float("inf")
         best_epoch: Optional[int] = None
         best_checkpoint: Optional[Dict[str, Any]] = None
@@ -6537,6 +6520,46 @@ class Episode:
         model = self.models["policy_value"]
         was_training = model.training
         try:
+            self._policy_value_stage_target_model = teacher
+            train_cache, train_cache_summary = self._build_pq_value_target_cache(
+                train_batches,
+                teacher,
+                teacher_hash=teacher_hash_before,
+                grid_config_hash=grid_config_hash,
+            )
+            validation_source = "holdout" if val_batches else "train_fallback"
+            if val_batches:
+                val_source = val_batches
+                val_cache, val_cache_summary = self._build_pq_value_target_cache(
+                    val_source,
+                    teacher,
+                    teacher_hash=teacher_hash_before,
+                    grid_config_hash=grid_config_hash,
+                )
+            else:
+                val_source = train_batches
+                val_cache = train_cache
+                val_cache_summary = {
+                    **train_cache_summary,
+                    "reused_train_cache": True,
+                }
+            self._validate_pq_cache_once(
+                train_batches,
+                train_cache,
+                current_teacher_hash=teacher_hash_before,
+                current_grid_hash=grid_config_hash,
+                label="train",
+            )
+            if val_cache is not train_cache:
+                self._validate_pq_cache_once(
+                    val_source,
+                    val_cache,
+                    current_teacher_hash=teacher_hash_before,
+                    current_grid_hash=grid_config_hash,
+                    label="validation",
+                )
+            train_cache_hash_before = self._pq_value_cache_hash(train_cache)
+            val_cache_hash_before = self._pq_value_cache_hash(val_cache)
             model.train()
             with self._policy_value_train_scope("pq"):
                 for epoch in range(int(n_epochs)):
@@ -6858,6 +6881,9 @@ class Episode:
         self,
         batches: List[Dict[str, torch.Tensor]],
         teacher_model: nn.Module,
+        *,
+        teacher_hash: Optional[str] = None,
+        grid_config_hash: Optional[str] = None,
     ) -> Tuple[List[PQValueTargetBatch], Dict[str, Any]]:
         cache: List[PQValueTargetBatch] = []
         grid_teacher = BPGridTeacher.from_hyperparams(
@@ -6866,8 +6892,8 @@ class Episode:
             self.loss_fns["pi"],
             self.hyperparams,
         )
-        teacher_hash = self._state_dict_hash(teacher_model)
-        grid_config_hash = self._pq_grid_config_hash()
+        teacher_hash = teacher_hash or self._state_dict_hash(teacher_model)
+        grid_config_hash = grid_config_hash or self._pq_grid_config_hash()
         was_training = teacher_model.training
         teacher_model.eval()
         try:
@@ -6890,8 +6916,8 @@ class Episode:
                 cache.append(
                     PQValueTargetBatch(
                         batch_id=int(batch_id),
-                        p0_value_target=p0_target["value_star"].detach().cpu(),
-                        pi_value_target=pi_target["value_star"].detach().cpu(),
+                        p0_value_target=p0_target["value_star"].detach(),
+                        pi_value_target=pi_target["value_star"].detach(),
                         teacher_hash=teacher_hash,
                         parent_hash=parent_hash,
                         children_hash=children_hash,
@@ -6913,13 +6939,14 @@ class Episode:
         self,
         batch: Dict[str, torch.Tensor],
         cache_item: PQValueTargetBatch,
-        teacher_model: nn.Module,
         *,
         batch_id: int,
+        current_teacher_hash: str,
+        current_grid_hash: str,
     ) -> None:
         if int(cache_item.batch_id) != int(batch_id):
             raise RuntimeError(f"P/Q cache batch_id mismatch: cache={cache_item.batch_id}, current={batch_id}")
-        if cache_item.teacher_hash != self._state_dict_hash(teacher_model):
+        if cache_item.teacher_hash != current_teacher_hash:
             raise RuntimeError("P/Q cache teacher hash mismatch.")
         parent_state, children, m_list, parent_hash, children_hash, m_hash = self._policy_batch_hash_components(batch)
         if cache_item.parent_hash != parent_hash:
@@ -6928,7 +6955,7 @@ class Episode:
             raise RuntimeError("P/Q cache children hash mismatch.")
         if cache_item.m_hash != m_hash:
             raise RuntimeError("P/Q cache M hash mismatch.")
-        if cache_item.grid_config_hash != self._pq_grid_config_hash():
+        if cache_item.grid_config_hash != current_grid_hash:
             raise RuntimeError("P/Q cache grid config hash mismatch.")
         cache_has_source_id = cache_item.source_id is not None
         batch_has_source_id = "source_id" in batch
@@ -6975,8 +7002,9 @@ class Episode:
         self,
         batches: List[Dict[str, torch.Tensor]],
         cache: List[PQValueTargetBatch],
-        teacher_model: nn.Module,
         *,
+        current_teacher_hash: str,
+        current_grid_hash: str,
         label: str,
     ) -> None:
         if len(batches) != len(cache):
@@ -6988,8 +7016,9 @@ class Episode:
             self._validate_pq_cache_item(
                 batch,
                 item,
-                teacher_model,
                 batch_id=batch_id,
+                current_teacher_hash=current_teacher_hash,
+                current_grid_hash=current_grid_hash,
             )
 
     def _compute_cached_pq_loss(

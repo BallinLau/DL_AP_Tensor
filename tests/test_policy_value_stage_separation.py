@@ -297,8 +297,9 @@ def test_pq_cache_validation_rejects_source_metadata_presence_mismatch():
         episode._validate_pq_cache_item(
             batch,
             cache[0],
-            episode.firm_target,
             batch_id=0,
+            current_teacher_hash=cache[0].teacher_hash,
+            current_grid_hash=cache[0].grid_config_hash,
         )
 
 
@@ -314,6 +315,61 @@ def test_pq_cache_hash_includes_metadata():
     assert episode._pq_value_cache_hash([
         replace(cache[0], source_id=torch.tensor([[1], [2]], dtype=torch.long))
     ]) != base_hash
+
+
+def test_pq_cache_targets_stay_on_episode_device():
+    episode = _episode()
+    batch = _batch(episode.device)
+    cache, _ = episode._build_pq_value_target_cache([batch], episode.firm_target)
+
+    assert cache[0].p0_value_target.device == episode.device
+    assert cache[0].pi_value_target.device == episode.device
+
+
+def test_pq_stage_restores_target_pointer_after_cache_build_error(monkeypatch):
+    episode = _episode()
+    batch = _batch(episode.device)
+    original_teacher = object()
+    episode._policy_value_stage_target_model = original_teacher
+
+    def _raise_cache_error(*args, **kwargs):
+        raise RuntimeError("cache build failed")
+
+    monkeypatch.setattr(episode, "_build_pq_value_target_cache", _raise_cache_error)
+
+    with pytest.raises(RuntimeError, match="cache build failed"):
+        episode._run_policy_value_evaluation_stage(
+            [batch],
+            [batch],
+            episode.firm_target,
+            n_epochs=1,
+        )
+
+    assert episode._policy_value_stage_target_model is original_teacher
+
+
+def test_pq_stage_teacher_hash_not_recomputed_per_batch(monkeypatch):
+    episode = _episode()
+    batch_a = _batch(episode.device)
+    batch_b = _batch(episode.device)
+    calls = {"teacher": 0}
+    original_hash = episode._state_dict_hash
+
+    def _counting_hash(model):
+        if model is episode.firm_target:
+            calls["teacher"] += 1
+        return original_hash(model)
+
+    monkeypatch.setattr(episode, "_state_dict_hash", _counting_hash)
+    summary = episode._run_policy_value_evaluation_stage(
+        [batch_a, batch_b],
+        [batch_a, batch_b],
+        episode.firm_target,
+        n_epochs=1,
+    )
+
+    assert summary["status"] == "accepted"
+    assert calls["teacher"] == 2
 
 
 def test_cached_pq_validation_uses_first_order_q_graph(monkeypatch):
