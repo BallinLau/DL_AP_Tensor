@@ -34,6 +34,7 @@ from .economic_config import AnalysisEconomicConfig
 
 SURFACE_FAMILY = "bellman_fixed_point_conditional_mean_v1"
 REQUIRED_FIXED_STATE = ("eta", "i", "x", "hatcf", "lnkf", "hatc_cal", "lnk_cal")
+FIXED_GRID_MODE = "fixed_grid"
 
 
 @dataclass
@@ -738,6 +739,51 @@ def _validate_surface_inputs(
         raise ValueError(f"unsupported m_modes: {sorted(bad_modes)}")
 
 
+def _fixed_boundary_status(phat: np.ndarray) -> str:
+    finite = phat[np.isfinite(phat)]
+    if finite.size == 0:
+        return "unknown_nonfinite"
+    if np.all(finite > 0):
+        return "all_survival"
+    if np.all(finite < 0):
+        return "all_default"
+    return "observed"
+
+
+def _extract_default_boundary_rows(
+    *,
+    checkpoint: str,
+    b_values: np.ndarray,
+    z_values: np.ndarray,
+    phat_grid: np.ndarray,
+) -> List[Dict[str, Any]]:
+    import matplotlib.pyplot as plt
+
+    if _fixed_boundary_status(phat_grid) != "observed":
+        return []
+    fig, ax = plt.subplots()
+    try:
+        contour = ax.contour(b_values, z_values, phat_grid, levels=[0.0])
+        rows: List[Dict[str, Any]] = []
+        component_id = 0
+        for segs in contour.allsegs:
+            for seg in segs:
+                if seg.size == 0:
+                    continue
+                for point_index, (b, z) in enumerate(seg):
+                    rows.append({
+                        "checkpoint": checkpoint,
+                        "component_id": int(component_id),
+                        "point_index": int(point_index),
+                        "b": float(b),
+                        "z": float(z),
+                    })
+                component_id += 1
+        return rows
+    finally:
+        plt.close(fig)
+
+
 def _resolve_branch_weights(
     branch_weights: Optional[torch.Tensor],
     *,
@@ -799,6 +845,9 @@ def evaluate_checkpoint_convergence_surfaces(
     allow_large_run: bool = False,
     include_raw_plots: bool = False,
     apply_support_mask: bool = True,
+    include_signed: bool = False,
+    residual_threshold: Optional[float] = None,
+    log_residual_scale: bool = False,
 ) -> ConvergenceSurfaceResult:
     with preserve_global_rng():
         return _evaluate_checkpoint_convergence_surfaces_impl(
@@ -829,6 +878,9 @@ def evaluate_checkpoint_convergence_surfaces(
             allow_large_run=allow_large_run,
             include_raw_plots=include_raw_plots,
             apply_support_mask=apply_support_mask,
+            include_signed=include_signed,
+            residual_threshold=residual_threshold,
+            log_residual_scale=log_residual_scale,
         )
 
 
@@ -861,6 +913,9 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
     allow_large_run: bool,
     include_raw_plots: bool,
     apply_support_mask: bool,
+    include_signed: bool,
+    residual_threshold: Optional[float],
+    log_residual_scale: bool,
 ) -> ConvergenceSurfaceResult:
     _validate_surface_inputs(
         checkpoint_paths,
@@ -877,9 +932,10 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
     b_grid_t = torch.tensor(list(b_grid), dtype=torch.float32, device=device)
     z_grid_t = torch.tensor(list(z_grid), dtype=torch.float32, device=device)
     n_grid = int(b_grid_t.numel() * z_grid_t.numel())
-    if state_mode == "fixed_slice":
+    if state_mode in {"fixed_slice", FIXED_GRID_MODE}:
         fixed = _validate_fixed_state(fixed_state)
         parent_states, macro, parent_reference_index, context_meta = _contexts_from_fixed_state(b_grid_t, z_grid_t, fixed, device)
+        context_meta["fixed_state"] = dict(fixed)
         support = {"support_available": False}
         n_reference = 1
     elif state_mode == "reference_distribution":
@@ -898,6 +954,8 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
         n_reference = int(context_meta["n_reference"])
     else:
         raise ValueError(f"unsupported state_mode: {state_mode}")
+    if state_mode == FIXED_GRID_MODE:
+        m_modes = ("train",)
 
     n_parent_states = int(parent_states.shape[0])
     n_child_state_evals = n_parent_states * int(n_child_shocks) * len(tuple(equations))
@@ -928,6 +986,8 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
         dtype=parent_states.dtype,
     )
     rows: List[Dict[str, Any]] = []
+    boundary_rows: List[Dict[str, Any]] = []
+    default_boundary_status: Dict[str, str] = {}
     raw_tensors: Dict[str, Any] = {}
     checkpoint_metadata = []
 
@@ -999,12 +1059,67 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
             bb, zz = torch.meshgrid(b_grid_t.cpu(), z_grid_t.cpu(), indexing="xy")
             flat_b = bb.reshape(-1).numpy()
             flat_z = zz.reshape(-1).numpy()
+            phat_np = default_np = survival_np = None
+            if state_mode == FIXED_GRID_MODE:
+                with torch.no_grad():
+                    parent_out = ckpt.models["policy_value"](parent_states)
+                    phat = _policy_get(parent_out, "Phat").detach().cpu().reshape(-1)
+                    default_probability = _policy_get(parent_out, "bar_z").detach().cpu().reshape(-1)
+                    survival_probability = (1.0 - default_probability).reshape(-1)
+                phat_np = phat.numpy()
+                default_np = default_probability.numpy()
+                survival_np = survival_probability.numpy()
+                phat_grid = phat_np.reshape(len(z_grid_t), len(b_grid_t))
+                status = _fixed_boundary_status(phat_grid)
+                default_boundary_status[checkpoint_label] = status
+                boundary_rows.extend(
+                    _extract_default_boundary_rows(
+                        checkpoint=checkpoint_label,
+                        b_values=b_grid_t.detach().cpu().numpy(),
+                        z_values=z_grid_t.detach().cpu().numpy(),
+                        phat_grid=phat_grid,
+                    )
+                )
             support_distance = support.get("distance")
             in_support = support.get("in_support")
             for key, chunks in per_metric_values.items():
                 eq, mode, metric = key
                 values = torch.cat(chunks, dim=0)
                 raw_tensors[checkpoint_label][f"{eq}.{mode}.{metric}"] = values
+                if state_mode == FIXED_GRID_MODE:
+                    if metric != "conditional_signed" or mode != "train":
+                        continue
+                    signed_np = values.reshape(-1).numpy()
+                    abs_np = np.abs(signed_np)
+                    raw_tensors[checkpoint_label][f"{eq}.train.conditional_abs"] = torch.from_numpy(abs_np)
+                    for pos, signed_val in enumerate(signed_np):
+                        rows.append({
+                            "checkpoint": checkpoint_label,
+                            "checkpoint_hash": metadata.get("checkpoint_sha256"),
+                            "policy_state_hash": metadata.get("policy_state_hash"),
+                            "sdf_state_hash": metadata.get("sdf_state_hash"),
+                            "equation": eq,
+                            "m_mode": "train",
+                            "aggregation": "none",
+                            "b": float(flat_b[pos]),
+                            "z": float(flat_z[pos]),
+                            "conditional_signed": float(signed_val),
+                            "conditional_abs": float(abs_np[pos]),
+                            "phat": float(phat_np[pos]),
+                            "default_probability": float(default_np[pos]),
+                            "survival_probability": float(survival_np[pos]),
+                            "n_child_shocks": int(n_child_shocks),
+                            "seed": int(seed),
+                            "eta": float(fixed_state["eta"]),
+                            "i": float(fixed_state["i"]),
+                            "x": float(fixed_state["x"]),
+                            "hatcf": float(fixed_state["hatcf"]),
+                            "lnkf": float(fixed_state["lnkf"]),
+                            "hatc_cal": float(fixed_state["hatc_cal"]),
+                            "lnk_cal": float(fixed_state["lnk_cal"]),
+                            "state_mode": state_mode,
+                        })
+                    continue
                 aggs = _aggregate_values(values, state_mode, n_grid, n_reference)
                 finite = torch.isfinite(values.reshape(n_reference, n_grid) if state_mode != "fixed_slice" else values.reshape(1, n_grid))
                 finite_ratio = finite.float().mean(dim=0).numpy()
@@ -1055,10 +1170,14 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
             for ckpt in loaded
         ],
         "context_metadata": context_meta,
+        "default_boundary_status": default_boundary_status,
         "workload_estimate": workload,
         "plotting": {
             "apply_support_mask": bool(apply_support_mask),
             "include_raw": bool(include_raw_plots),
+            "include_signed": bool(include_signed),
+            "residual_threshold": None if residual_threshold is None else float(residual_threshold),
+            "log_residual_scale": bool(log_residual_scale),
         },
     }
     result = ConvergenceSurfaceResult(
@@ -1079,6 +1198,7 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
         support_metadata=support,
         disabled_metrics={"policy_regret": "disabled_first_version"},
     )
+    result.raw_tensors["default_boundary_rows"] = boundary_rows
     if output_dir is not None:
         save_convergence_surface_result(
             result,
@@ -1112,8 +1232,144 @@ def save_convergence_surface_result(
         "disabled_metrics": result.disabled_metrics,
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    _write_primary_pngs(result.long_table, output, include_raw=include_raw, apply_support_mask=apply_support_mask)
-    _write_support_pngs(result.long_table, output)
+    boundary_rows = result.raw_tensors.get("default_boundary_rows", [])
+    if boundary_rows:
+        pd.DataFrame(boundary_rows).to_csv(output / "default_boundary.csv", index=False)
+    else:
+        pd.DataFrame(columns=["checkpoint", "component_id", "point_index", "b", "z"]).to_csv(
+            output / "default_boundary.csv",
+            index=False,
+        )
+    if result.manifests.get("state_mode") == FIXED_GRID_MODE:
+        _write_fixed_grid_pngs(
+            result.long_table,
+            output,
+            include_signed=bool(result.manifests.get("plotting", {}).get("include_signed", False)),
+            residual_threshold=result.manifests.get("plotting", {}).get("residual_threshold"),
+            log_residual_scale=bool(result.manifests.get("plotting", {}).get("log_residual_scale", False)),
+        )
+    else:
+        _write_primary_pngs(result.long_table, output, include_raw=include_raw, apply_support_mask=apply_support_mask)
+        _write_support_pngs(result.long_table, output)
+
+
+def _write_fixed_grid_pngs(
+    table: pd.DataFrame,
+    output: Path,
+    *,
+    include_signed: bool = False,
+    residual_threshold: Optional[float] = None,
+    log_residual_scale: bool = False,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    if table.empty:
+        return
+    b_values = np.array(sorted(table["b"].unique()), dtype=float)
+    z_values = np.array(sorted(table["z"].unique()), dtype=float)
+    for equation in ("p0", "pi", "q"):
+        eq_all = table[table["equation"] == equation]
+        if eq_all.empty:
+            continue
+        abs_vmax = np.nanmax(eq_all["conditional_abs"].to_numpy(dtype=float))
+        if not np.isfinite(abs_vmax) or abs_vmax <= 0.0:
+            abs_vmax = 1.0
+        signed_vmax = np.nanmax(np.abs(eq_all["conditional_signed"].to_numpy(dtype=float)))
+        if not np.isfinite(signed_vmax) or signed_vmax <= 0.0:
+            signed_vmax = 1.0
+        for checkpoint, sub in eq_all.groupby("checkpoint"):
+            piv_abs = sub.pivot_table(index="z", columns="b", values="conditional_abs", aggfunc="first").sort_index()
+            piv_signed = sub.pivot_table(index="z", columns="b", values="conditional_signed", aggfunc="first").sort_index()
+            piv_phat = sub.pivot_table(index="z", columns="b", values="phat", aggfunc="first").sort_index()
+            values = piv_abs.values
+            color_label = "conditional_abs"
+            if log_residual_scale:
+                values = np.log10(values + 1e-12)
+                color_label = "log10(conditional_abs + 1e-12)"
+            fig, ax = plt.subplots(figsize=(6, 4.8))
+            im = ax.imshow(
+                values,
+                origin="lower",
+                aspect="auto",
+                extent=[b_values.min(), b_values.max(), z_values.min(), z_values.max()],
+                vmin=None if log_residual_scale else 0.0,
+                vmax=None if log_residual_scale else abs_vmax,
+            )
+            _overlay_default_and_threshold(
+                ax,
+                b_values,
+                z_values,
+                piv_phat.values,
+                piv_abs.values,
+                residual_threshold=residual_threshold,
+            )
+            ax.set_xlabel("b")
+            ax.set_ylabel("z")
+            ax.set_title(f"{checkpoint} {equation} conditional_abs")
+            fig.colorbar(im, ax=ax, label=color_label)
+            fig.tight_layout()
+            fig.savefig(output / f"{checkpoint}_{equation}_conditional_abs.png")
+            plt.close(fig)
+
+            if include_signed:
+                fig, ax = plt.subplots(figsize=(6, 4.8))
+                im = ax.imshow(
+                    piv_signed.values,
+                    origin="lower",
+                    aspect="auto",
+                    extent=[b_values.min(), b_values.max(), z_values.min(), z_values.max()],
+                    vmin=-signed_vmax,
+                    vmax=signed_vmax,
+                    cmap="coolwarm",
+                )
+                _overlay_default_and_threshold(
+                    ax,
+                    b_values,
+                    z_values,
+                    piv_phat.values,
+                    piv_abs.values,
+                    residual_threshold=residual_threshold,
+                )
+                ax.set_xlabel("b")
+                ax.set_ylabel("z")
+                ax.set_title(f"{checkpoint} {equation} conditional_signed")
+                fig.colorbar(im, ax=ax, label="conditional_signed")
+                fig.tight_layout()
+                fig.savefig(output / f"{checkpoint}_{equation}_conditional_signed.png")
+                plt.close(fig)
+
+
+def _overlay_default_and_threshold(
+    ax: Any,
+    b_values: np.ndarray,
+    z_values: np.ndarray,
+    phat_grid: np.ndarray,
+    abs_grid: np.ndarray,
+    *,
+    residual_threshold: Optional[float],
+) -> None:
+    handles = []
+    labels = []
+    if _fixed_boundary_status(phat_grid) == "observed":
+        cs = ax.contour(b_values, z_values, phat_grid, levels=[0.0], colors="black", linewidths=1.3)
+        if cs.collections:
+            handles.append(cs.collections[0])
+            labels.append("default boundary: Phat=0")
+    if residual_threshold is not None and np.nanmin(abs_grid) <= float(residual_threshold) <= np.nanmax(abs_grid):
+        cs_thr = ax.contour(
+            b_values,
+            z_values,
+            abs_grid,
+            levels=[float(residual_threshold)],
+            colors="white",
+            linewidths=1.0,
+            linestyles="dashed",
+        )
+        if cs_thr.collections:
+            handles.append(cs_thr.collections[0])
+            labels.append(f"conditional_abs={float(residual_threshold):g}")
+    if handles:
+        ax.legend(handles, labels, loc="best", fontsize=8)
 
 
 def _write_primary_pngs(

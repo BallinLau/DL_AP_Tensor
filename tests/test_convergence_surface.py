@@ -20,6 +20,8 @@ from analysis.convergence_surface import (
     VectorizedBellmanSurfaceBackend,
     evaluate_checkpoint_convergence_surfaces,
     reduce_signed_surface,
+    _extract_default_boundary_rows,
+    _fixed_boundary_status,
 )
 from analysis.convergence_transition import (
     ChildExogenousBundle,
@@ -606,3 +608,82 @@ def test_workload_guard_blocks_large_run(tmp_path):
             max_child_state_evals=1,
             device="cpu",
         )
+
+
+def test_fixed_grid_outputs_full_domain_without_reference_or_support(tmp_path):
+    ckpt = tmp_path / "combined.pt"
+    _write_combined_checkpoint(ckpt)
+    fixed = {"eta": 1, "i": 0.1, "x": 0.0, "hatcf": -2.0, "lnkf": 4.0, "hatc_cal": -2.1, "lnk_cal": 4.1}
+    out = tmp_path / "fixed_grid"
+
+    result = evaluate_checkpoint_convergence_surfaces(
+        [ckpt],
+        checkpoint_labels=["fg"],
+        b_grid=[0.0, 0.5, 1.0],
+        z_grid=[-1.0, 1.0],
+        state_mode="fixed_grid",
+        fixed_state=fixed,
+        n_child_shocks=2,
+        seed=2026,
+        device="cpu",
+        output_dir=out,
+        include_signed=True,
+        residual_threshold=0.001,
+    )
+
+    assert result.support_metadata["support_available"] is False
+    assert len(result.long_table) == 1 * 3 * 3 * 2
+    assert set(result.long_table["aggregation"]) == {"none"}
+    assert {"conditional_signed", "conditional_abs", "phat", "default_probability", "survival_probability"}.issubset(result.long_table.columns)
+    assert "mean" not in set(result.long_table["aggregation"])
+    assert "p90" not in set(result.long_table["aggregation"])
+    assert (out / "fg_p0_conditional_abs.png").exists()
+    assert (out / "fg_pi_conditional_abs.png").exists()
+    assert (out / "fg_q_conditional_abs.png").exists()
+    assert (out / "fg_p0_conditional_signed.png").exists()
+    assert (out / "default_boundary.csv").exists()
+    assert not (out / "support_mask.png").exists()
+    assert result.shock_bank_metadata["shock_bank_base_shape"] == [1, 2, 1]
+    assert result.shock_bank_metadata["shock_bank_storage_numel"] == 4 * 1 * 2
+
+
+def test_fixed_grid_chunk_size_invariance(tmp_path):
+    ckpt = tmp_path / "combined.pt"
+    _write_combined_checkpoint(ckpt)
+    fixed = {"eta": 1, "i": 0.1, "x": 0.0, "hatcf": -2.0, "lnkf": 4.0, "hatc_cal": -2.1, "lnk_cal": 4.1}
+    kwargs = dict(
+        checkpoint_paths=[ckpt],
+        b_grid=[0.0, 0.5],
+        z_grid=[-0.5, 0.5],
+        state_mode="fixed_grid",
+        fixed_state=fixed,
+        n_child_shocks=2,
+        seed=2026,
+        device="cpu",
+    )
+
+    a = evaluate_checkpoint_convergence_surfaces(**kwargs, parent_chunk_size=1, child_chunk_size=1)
+    b = evaluate_checkpoint_convergence_surfaces(**kwargs, parent_chunk_size=8, child_chunk_size=8)
+
+    assert np.allclose(
+        a.long_table["conditional_signed"].to_numpy(),
+        b.long_table["conditional_signed"].to_numpy(),
+        atol=1e-6,
+        rtol=1e-5,
+        equal_nan=True,
+    )
+
+
+def test_default_boundary_helpers_export_all_components():
+    b = np.linspace(0.0, 1.0, 5)
+    z = np.linspace(-1.0, 1.0, 5)
+    bb, zz = np.meshgrid(b, z)
+    phat = zz * zz - 0.25
+
+    rows = _extract_default_boundary_rows(checkpoint="ck", b_values=b, z_values=z, phat_grid=phat)
+
+    assert _fixed_boundary_status(np.ones((2, 2))) == "all_survival"
+    assert _fixed_boundary_status(-np.ones((2, 2))) == "all_default"
+    assert _fixed_boundary_status(phat) == "observed"
+    assert rows
+    assert len({row["component_id"] for row in rows}) >= 2

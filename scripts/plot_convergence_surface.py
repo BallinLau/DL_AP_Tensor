@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--allow-default-hyperparams", action="store_true")
     p.add_argument("--allow-current-config", action="store_true")
     p.add_argument("--checkpoint-label", action="append", default=[])
-    p.add_argument("--state-mode", choices=["fixed_slice", "reference_distribution"], required=True)
+    p.add_argument("--state-mode", choices=["fixed_slice", "fixed_grid", "reference_distribution"], required=True)
     p.add_argument("--reference-data")
     p.add_argument("--eta", type=float)
     p.add_argument("--i", type=float)
@@ -41,6 +41,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-child-state-evals", type=int)
     p.add_argument("--allow-large-run", action="store_true")
     p.add_argument("--include-raw", action="store_true")
+    p.add_argument("--include-signed", action="store_true")
+    p.add_argument("--residual-threshold", type=float)
+    p.add_argument("--log-residual-scale", action="store_true")
     p.add_argument("--no-support-mask", action="store_true")
     p.add_argument("--support-radius", type=float)
     p.add_argument("--device")
@@ -57,7 +60,7 @@ def main() -> None:
     if not checkpoints:
         raise SystemExit("At least one --checkpoint or --policy-checkpoint is required.")
     fixed_state = None
-    if args.state_mode == "fixed_slice":
+    if args.state_mode in {"fixed_slice", "fixed_grid"}:
         fixed_args = {
             "eta": args.eta,
             "i": args.i,
@@ -97,6 +100,9 @@ def main() -> None:
         allow_large_run=args.allow_large_run,
         include_raw_plots=args.include_raw,
         apply_support_mask=not args.no_support_mask,
+        include_signed=args.include_signed,
+        residual_threshold=args.residual_threshold,
+        log_residual_scale=args.log_residual_scale,
         support_radius=args.support_radius,
         device=args.device,
         output_dir=Path(args.output_dir),
