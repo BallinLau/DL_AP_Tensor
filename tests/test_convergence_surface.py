@@ -23,6 +23,7 @@ from analysis.convergence_surface import (
     reduce_signed_surface,
     _extract_default_boundary_rows,
     _fixed_boundary_status,
+    _grid_center_extent,
 )
 from analysis.convergence_transition import (
     ChildExogenousBundle,
@@ -725,18 +726,22 @@ def test_default_boundary_helpers_export_all_components():
     assert len({row["component_id"] for row in rows}) >= 2
 
 
-def test_default_boundary_uses_default_probability_half_surface():
+def test_default_boundary_uses_phat_zero_surface():
     b = np.linspace(0.0, 1.0, 5)
     z = np.linspace(-1.0, 1.0, 5)
     _, zz = np.meshgrid(b, z)
-    default_probability = 0.5 + zz
-    boundary_grid = 0.5 - default_probability
+    phat = zz
 
-    rows = _extract_default_boundary_rows(checkpoint="ck", b_values=b, z_values=z, boundary_grid=boundary_grid)
+    rows = _extract_default_boundary_rows(checkpoint="ck", b_values=b, z_values=z, boundary_grid=phat)
 
-    assert _fixed_boundary_status(boundary_grid) == "observed"
+    assert _fixed_boundary_status(phat) == "observed"
     assert rows
     assert max(abs(row["z"]) for row in rows) < 1e-6
+
+
+def test_grid_center_extent_aligns_image_cells_to_contour_centers():
+    extent = _grid_center_extent(np.array([0.0, 0.5, 1.0]), np.array([-2.0, 0.0, 2.0]))
+    assert extent == [-0.25, 1.25, -3.0, 3.0]
 
 
 def test_boundary_status_reports_partial_nonfinite():

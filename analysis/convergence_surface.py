@@ -792,6 +792,19 @@ def _extract_default_boundary_rows(
         plt.close(fig)
 
 
+def _grid_center_extent(x_values: np.ndarray, y_values: np.ndarray) -> List[float]:
+    def _edges(values: np.ndarray) -> Tuple[float, float]:
+        values = np.asarray(values, dtype=float)
+        if values.size == 1:
+            return float(values[0] - 0.5), float(values[0] + 0.5)
+        diffs = np.diff(values)
+        return float(values[0] - 0.5 * diffs[0]), float(values[-1] + 0.5 * diffs[-1])
+
+    x_left, x_right = _edges(x_values)
+    y_bottom, y_top = _edges(y_values)
+    return [x_left, x_right, y_bottom, y_top]
+
+
 def _resolve_branch_weights(
     branch_weights: Optional[torch.Tensor],
     *,
@@ -1084,18 +1097,18 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
                 phat_np = torch.cat(parent_diag_chunks["Phat"], dim=0).reshape(-1).numpy()
                 default_np = torch.cat(parent_diag_chunks["default_probability"], dim=0).reshape(-1).numpy()
                 survival_np = torch.cat(parent_diag_chunks["survival_probability"], dim=0).reshape(-1).numpy()
-                default_boundary_grid = 0.5 - default_np.reshape(len(z_grid_t), len(b_grid_t))
-                status = _fixed_boundary_status(default_boundary_grid)
+                phat_grid = phat_np.reshape(len(z_grid_t), len(b_grid_t))
+                status = _fixed_boundary_status(phat_grid)
                 default_boundary_status[checkpoint_label] = status
                 default_boundary_status[f"{checkpoint_label}_nonfinite_ratio"] = float(
-                    1.0 - np.isfinite(default_boundary_grid).mean()
+                    1.0 - np.isfinite(phat_grid).mean()
                 )
                 boundary_rows.extend(
                     _extract_default_boundary_rows(
                         checkpoint=checkpoint_label,
                         b_values=b_grid_t.detach().cpu().numpy(),
                         z_values=z_grid_t.detach().cpu().numpy(),
-                        boundary_grid=default_boundary_grid,
+                        boundary_grid=phat_grid,
                     )
                 )
             support_distance = support.get("distance")
@@ -1302,11 +1315,11 @@ def _write_fixed_grid_pngs(
         signed_vmax = np.nanmax(np.abs(eq_all["conditional_signed"].to_numpy(dtype=float)))
         if not np.isfinite(signed_vmax) or signed_vmax <= 0.0:
             signed_vmax = 1.0
+        image_extent = _grid_center_extent(b_values, z_values)
         for checkpoint, sub in eq_all.groupby("checkpoint"):
             piv_abs = sub.pivot_table(index="z", columns="b", values="conditional_abs", aggfunc="first").sort_index()
             piv_signed = sub.pivot_table(index="z", columns="b", values="conditional_signed", aggfunc="first").sort_index()
-            piv_default = sub.pivot_table(index="z", columns="b", values="default_probability", aggfunc="first").sort_index()
-            default_boundary_grid = 0.5 - piv_default.values
+            piv_phat = sub.pivot_table(index="z", columns="b", values="phat", aggfunc="first").sort_index()
             values = piv_abs.values
             color_label = "conditional_abs"
             if log_residual_scale:
@@ -1317,7 +1330,7 @@ def _write_fixed_grid_pngs(
                 values,
                 origin="lower",
                 aspect="auto",
-                extent=[b_values.min(), b_values.max(), z_values.min(), z_values.max()],
+                extent=image_extent,
                 vmin=scale_vmin if log_residual_scale else 0.0,
                 vmax=abs_vmax,
             )
@@ -1325,7 +1338,7 @@ def _write_fixed_grid_pngs(
                 ax,
                 b_values,
                 z_values,
-                default_boundary_grid,
+                piv_phat.values,
                 piv_abs.values,
                 residual_threshold=residual_threshold,
             )
@@ -1345,7 +1358,7 @@ def _write_fixed_grid_pngs(
                     piv_signed.values,
                     origin="lower",
                     aspect="auto",
-                    extent=[b_values.min(), b_values.max(), z_values.min(), z_values.max()],
+                    extent=image_extent,
                     vmin=-signed_vmax,
                     vmax=signed_vmax,
                     cmap="coolwarm",
@@ -1354,7 +1367,7 @@ def _write_fixed_grid_pngs(
                     ax,
                     b_values,
                     z_values,
-                    default_boundary_grid,
+                    piv_phat.values,
                     piv_abs.values,
                     residual_threshold=residual_threshold,
                 )
@@ -1373,18 +1386,18 @@ def _overlay_default_and_threshold(
     ax: Any,
     b_values: np.ndarray,
     z_values: np.ndarray,
-    default_boundary_grid: np.ndarray,
+    phat_grid: np.ndarray,
     abs_grid: np.ndarray,
     *,
     residual_threshold: Optional[float],
 ) -> None:
     handles = []
     labels = []
-    if _fixed_boundary_status(default_boundary_grid) == "observed":
-        cs = ax.contour(b_values, z_values, default_boundary_grid, levels=[0.0], colors="black", linewidths=1.3)
+    if _fixed_boundary_status(phat_grid) == "observed":
+        cs = ax.contour(b_values, z_values, phat_grid, levels=[0.0], colors="black", linewidths=1.3)
         if cs.collections:
             handles.append(cs.collections[0])
-            labels.append("default boundary: default_prob=0.5")
+            labels.append("default boundary: Phat=0")
     finite_abs = abs_grid[np.isfinite(abs_grid)]
     if (
         residual_threshold is not None
