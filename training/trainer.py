@@ -329,6 +329,14 @@ class Trainer:
                 checkpoint['models'][model_name] = model.state_dict()
         if self.firm_target is not None:
             checkpoint['models']['firm_target'] = self.firm_target.state_dict()
+        pv_model = self.models.get('policy_value') if isinstance(self.models, dict) else None
+        pv_metadata = getattr(pv_model, "value_parameterization_metadata", None)
+        if callable(pv_metadata):
+            metadata = dict(pv_metadata())
+            metadata["bellman_normalization"] = bool(
+                getattr(self.hyperparams, "pv_bellman_normalize_by_value_scale", False)
+            )
+            checkpoint["value_parameterization"] = metadata
         
         for opt_name, opt in self.optimizers.items():
             checkpoint['optimizers'][opt_name] = opt.state_dict()

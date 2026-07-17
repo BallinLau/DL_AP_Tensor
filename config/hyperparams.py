@@ -48,6 +48,11 @@ class HyperParams:
     pv_fixed_sdf_value: float = 0.98
     pv_fixed_policy: bool = False
     pv_fixed_policy_mode: str = 'parent_b'
+    pv_value_scale_mode: str = "none"
+    pv_value_scale_log_max: float = 20.0
+    pv_bellman_normalize_by_value_scale: bool = False
+    allow_value_parameterization_migration: bool = False
+    pv_scaled_value_coverage_ratio: float = 0.20
     
     # FC2
     fc2_lr: float = 1e-4

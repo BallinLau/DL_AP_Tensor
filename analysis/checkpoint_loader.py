@@ -107,6 +107,7 @@ def load_analysis_checkpoint(
     allow_current_config: bool = False,
     m_source: str = "sdf_fc1",
     label: Optional[str] = None,
+    allow_value_parameterization_migration: bool = False,
 ) -> AnalysisCheckpoint:
     if m_source != "sdf_fc1":
         raise ValueError("Only m_source='sdf_fc1' is supported by convergence surface analysis")
@@ -119,6 +120,7 @@ def load_analysis_checkpoint(
     sdf_state = None
     firm_target_state = None
     payload_for_config: Optional[Dict[str, Any]] = None
+    checkpoint_value_parameterization: Optional[Dict[str, Any]] = None
     policy_path_for_meta = policy_checkpoint
     sdf_path_for_meta = sdf_checkpoint
 
@@ -138,6 +140,7 @@ def load_analysis_checkpoint(
             policy_state = model_states["policy_value"]
             sdf_state = model_states.get("sdf_fc1")
             firm_target_state = model_states.get("firm_target")
+            checkpoint_value_parameterization = payload.get("value_parameterization")
             if firm_target_state is None:
                 missing_optional_fields.append("models.firm_target")
             hp_payload = payload.get("hyperparams")
@@ -157,6 +160,7 @@ def load_analysis_checkpoint(
         else:
             checkpoint_format = "raw_policy_state_dict"
             policy_state = payload
+            checkpoint_value_parameterization = None
             if m_source == "sdf_fc1" and sdf_checkpoint is None:
                 raise ValueError("raw policy state_dict requires sdf_checkpoint when m_source='sdf_fc1'")
             if hyperparams_json is None and not allow_default_hyperparams:
@@ -177,6 +181,7 @@ def load_analysis_checkpoint(
         policy_checkpoint = Path(policy_checkpoint)
         checkpoint_hash = _sha256_file(policy_checkpoint)
         policy_state = torch.load(policy_checkpoint, map_location=device)
+        checkpoint_value_parameterization = None
         if m_source == "sdf_fc1" and sdf_checkpoint is None:
             raise ValueError("raw policy state_dict requires sdf_checkpoint when m_source='sdf_fc1'")
         if hyperparams_json is None and not allow_default_hyperparams:
@@ -192,6 +197,23 @@ def load_analysis_checkpoint(
             hyperparams = HyperParams()
             hp_source = "default"
 
+    current_mode = str(getattr(hyperparams, "pv_value_scale_mode", "none")).lower()
+    current_log_max = float(getattr(hyperparams, "pv_value_scale_log_max", 20.0))
+    checkpoint_mode = "none"
+    if isinstance(checkpoint_value_parameterization, dict):
+        checkpoint_mode = str(checkpoint_value_parameterization.get("mode", "none")).lower()
+    if checkpoint_mode != current_mode and not allow_value_parameterization_migration and not bool(
+        getattr(hyperparams, "allow_value_parameterization_migration", False)
+    ):
+        raise ValueError(
+            "Refusing to load policy_value checkpoint with value_parameterization "
+            f"mode={checkpoint_mode!r} into current mode={current_mode!r}; "
+            "use an explicit warm-start migration."
+        )
+    configure_policy = getattr(models["policy_value"], "configure_value_parameterization", None)
+    if callable(configure_policy):
+        configure_policy(mode=current_mode, log_max=current_log_max)
+
     try:
         models["policy_value"].load_state_dict(policy_state, strict=True)
     except RuntimeError as exc:
@@ -206,6 +228,9 @@ def load_analysis_checkpoint(
 
     if firm_target_state is not None:
         firm_target = build_models(device)["policy_value"]
+        configure_target = getattr(firm_target, "configure_value_parameterization", None)
+        if callable(configure_target):
+            configure_target(mode=current_mode, log_max=current_log_max)
         try:
             firm_target.load_state_dict(firm_target_state, strict=True)
         except RuntimeError as exc:
@@ -239,6 +264,19 @@ def load_analysis_checkpoint(
         "config_source": config_source,
         "config_snapshot": economic_config.to_dict(),
         "missing_optional_fields": missing_optional_fields,
+        "value_parameterization": {
+            "checkpoint": checkpoint_value_parameterization or {"mode": "none"},
+            "current": {
+                "mode": current_mode,
+                "scale_formula": (
+                    f"1+exp(clamp(x+z,max={current_log_max:g}))"
+                    if current_mode == "exp_xz"
+                    else "1"
+                ),
+                "bellman_normalization": bool(getattr(hyperparams, "pv_bellman_normalize_by_value_scale", False)),
+                "log_max": current_log_max,
+            },
+        },
     }
     return AnalysisCheckpoint(
         models=models,

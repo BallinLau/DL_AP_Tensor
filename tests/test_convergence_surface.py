@@ -636,7 +636,26 @@ def test_fixed_grid_outputs_full_domain_without_reference_or_support(tmp_path):
     assert result.support_metadata["support_available"] is False
     assert len(result.long_table) == 1 * 3 * 3 * 2
     assert set(result.long_table["aggregation"]) == {"none"}
-    assert {"conditional_signed", "conditional_abs", "phat", "default_probability", "survival_probability"}.issubset(result.long_table.columns)
+    assert {
+        "conditional_signed",
+        "conditional_abs",
+        "conditional_signed_physical",
+        "conditional_abs_physical",
+        "conditional_signed_normalized",
+        "conditional_abs_normalized",
+        "value_scale",
+        "V0_physical",
+        "VI_physical",
+        "V0_normalized",
+        "VI_normalized",
+        "CF0",
+        "CFI",
+        "continuation_P0",
+        "continuation_PI",
+        "phat",
+        "default_probability",
+        "survival_probability",
+    }.issubset(result.long_table.columns)
     assert "mean" not in set(result.long_table["aggregation"])
     assert "p90" not in set(result.long_table["aggregation"])
     assert (out / "fg_p0_conditional_abs.png").exists()

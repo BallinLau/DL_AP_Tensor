@@ -166,10 +166,12 @@ class Episode:
         self.optimizers = optimizers
         self.config = config
         self.hyperparams = hyperparams or HyperParams()
+        self._configure_policy_value_parameterization()
         self._validate_sdf_fresh_pair_config()
         self.device = device or config.DEVICE
         self.episode_id = episode_id
         self.firm_target = self._init_firm_target(firm_target)
+        self._configure_policy_value_parameterization()
         
         # GPU 监控器（使用外部传入的或创建新的）
         self.gpu_monitor = gpu_monitor if gpu_monitor is not None else GPUMonitor(self.device, log_interval=10)
@@ -236,6 +238,45 @@ class Episode:
         self._sdf_shock_bank_episode_id: Optional[int] = None
         self._sdf_shock_bank_key: Optional[Tuple[Any, ...]] = None
         self._sdf_pair_generator: Optional[torch.Generator] = None
+
+    def _configure_policy_value_parameterization(self) -> None:
+        mode = str(getattr(self.hyperparams, "pv_value_scale_mode", "none")).lower()
+        log_max = float(getattr(self.hyperparams, "pv_value_scale_log_max", 20.0))
+        for model in (self.models or {}).values():
+            configure = getattr(model, "configure_value_parameterization", None)
+            if callable(configure):
+                configure(mode=mode, log_max=log_max)
+        configure_target = getattr(getattr(self, "firm_target", None), "configure_value_parameterization", None)
+        if callable(configure_target):
+            configure_target(mode=mode, log_max=log_max)
+
+    def _pv_value_scale(self, model: nn.Module, parent_state: torch.Tensor) -> torch.Tensor:
+        scale_fn = getattr(model, "equity_value_scale", None)
+        if callable(scale_fn):
+            return scale_fn(parent_state)
+        return torch.ones((parent_state.shape[0], 1), dtype=parent_state.dtype, device=parent_state.device)
+
+    def _pv_bellman_residual_scale(self, model: nn.Module, parent_state: torch.Tensor) -> Optional[torch.Tensor]:
+        if not bool(getattr(self.hyperparams, "pv_bellman_normalize_by_value_scale", False)):
+            return None
+        return self._pv_value_scale(model, parent_state)
+
+    def _pv_value_scale_diag(self, prefix: str, model: nn.Module, parent_state: torch.Tensor) -> Dict[str, float]:
+        scale = self._pv_value_scale(model, parent_state)
+        with torch.no_grad():
+            finite = torch.isfinite(scale)
+            diag = {
+                f"{prefix}_value_scale_mode_exp_xz": float(str(getattr(model, "value_scale_mode", "none")).lower() == "exp_xz"),
+                f"{prefix}_bellman_residual_training_scale_parent_exp_xz_normalized": float(
+                    bool(getattr(self.hyperparams, "pv_bellman_normalize_by_value_scale", False))
+                ),
+                f"{prefix}_value_scale_mean": float(scale[finite].mean().item()) if finite.any() else float("nan"),
+                f"{prefix}_value_scale_max": float(scale[finite].max().item()) if finite.any() else float("nan"),
+            }
+            model_diag = getattr(model, "equity_value_scale_diagnostics", None)
+            if callable(model_diag):
+                diag.update({f"{prefix}_{k}": v for k, v in model_diag(parent_state).items()})
+            return diag
 
     def set_sdf_training_phase(self, phase: str | SDFTrainingPhase) -> None:
         self.sdf_training_phase = SDFTrainingPhase(phase)
@@ -4160,7 +4201,14 @@ class Episode:
         policy_weight = float(getattr(self.hyperparams, "bp_grid_policy_weight", 1.0))
         policy_loss_space = self._bp_grid_policy_loss_space()
 
-        value_loss_elem = self._huber_element(value_pred, grid["value_star"], value_delta)
+        value_scale = self._pv_bellman_residual_scale(self.models['policy_value'], parent_state)
+        if value_scale is not None:
+            value_pred_train = value_pred / value_scale.clamp_min(1e-12)
+            value_star_train = grid["value_star"] / value_scale.clamp_min(1e-12)
+        else:
+            value_pred_train = value_pred
+            value_star_train = grid["value_star"]
+        value_loss_elem = self._huber_element(value_pred_train, value_star_train, value_delta)
         value_loss = value_loss_elem.mean()
         penalty_z = compute_z_penalty(
             value_loss_elem,
@@ -4255,6 +4303,9 @@ class Episode:
             )
             terms.update(
                 {
+                    f'{prefix}_grid_value_loss_training_scale_parent_exp_xz_normalized': float(value_scale is not None),
+                    f'{prefix}_grid_value_pred_train_mean': float(value_pred_train.detach().mean().item()),
+                    f'{prefix}_grid_value_star_train_mean': float(value_star_train.detach().mean().item()),
                     f'{prefix}_grid_policy_loss_space_logit': float(policy_loss_space == "logit"),
                     f'{prefix}_grid_policy_training_loss': float(policy_loss.detach().item()),
                     f'{prefix}_grid_bp_logit_mean': float(
@@ -4501,9 +4552,14 @@ class Episode:
             )
             for _ in range(N)
         ]
-        residuals = loss_fn.compute_bellman_residual(
+        residuals_physical = loss_fn.compute_bellman_residual(
             P0, CF0p, M_list, P_children, bar_z_children
         )
+        residual_scale = self._pv_bellman_residual_scale(model, parent_state)
+        residuals = [
+            r / residual_scale.clamp_min(1e-12)
+            for r in residuals_physical
+        ] if residual_scale is not None else residuals_physical
         bellman_residual = compute_aio_residual(residuals, loss_fn.aio_weight)
         main_loss = bellman_residual.mean()
 
@@ -4560,6 +4616,8 @@ class Episode:
                 [(cf + m * p).reshape(-1) for cf, m, p in zip(CF0p, M_list, P_children)],
                 dim=0,
             )
+            residual_physical_flat = torch.cat([r.reshape(-1) for r in residuals_physical], dim=0)
+            residual_train_flat = torch.cat([r.reshape(-1) for r in residuals], dim=0)
             self._latest_p0_terms = {
                 'p0_main': float(main_loss.item()),
                 'p0_foc': float(loss_foc.item()),
@@ -4585,7 +4643,12 @@ class Episode:
                 'p0_bellman_only': float(1.0 if bellman_only else 0.0),
                 'p0_fixed_sdf': float(1.0 if self._pv_use_fixed_sdf() else 0.0),
                 'p0_fixed_policy': float(1.0 if self._pv_use_fixed_policy() else 0.0),
+                'p0_physical_signed_mean': float(residual_physical_flat.mean().item()),
+                'p0_physical_abs_mean': float(residual_physical_flat.abs().mean().item()),
+                'p0_normalized_signed_mean': float(residual_train_flat.mean().item()),
+                'p0_normalized_abs_mean': float(residual_train_flat.abs().mean().item()),
             }
+            self._latest_p0_terms.update(self._pv_value_scale_diag('p0', model, parent_state))
             self._latest_p0_terms.update(self._m_diagnostics('p0', raw_m, use_m, m_lo, m_hi))
             self._latest_p0_terms.update(self._tensor_tail_diagnostics('p0_target_y', target_y))
             self._latest_p0_terms.update(getattr(loss_fn, 'latest_foc_diag', {}))
@@ -4766,9 +4829,14 @@ class Episode:
             )
             for _ in range(N)
         ]
-        residuals = loss_fn.compute_bellman_residual(
+        residuals_physical = loss_fn.compute_bellman_residual(
             PI, CFip, M_list, P_children, bar_z_children
         )  # List[(batch,1)]
+        residual_scale = self._pv_bellman_residual_scale(model, parent_state)
+        residuals = [
+            r / residual_scale.clamp_min(1e-12)
+            for r in residuals_physical
+        ] if residual_scale is not None else residuals_physical
         bellman_residual = compute_aio_residual(residuals, loss_fn.aio_weight)
         main_loss = bellman_residual.mean()
 
@@ -4826,6 +4894,8 @@ class Episode:
                 [(cf + m * p).reshape(-1) for cf, m, p in zip(CFip, M_list, P_children)],
                 dim=0,
             )
+            residual_physical_flat = torch.cat([r.reshape(-1) for r in residuals_physical], dim=0)
+            residual_train_flat = torch.cat([r.reshape(-1) for r in residuals], dim=0)
             self._latest_pi_terms = {
                 'pi_main': float(main_loss.item()),
                 'pi_foc': float(loss_foc.item()),
@@ -4852,7 +4922,12 @@ class Episode:
                 'pi_bellman_only': float(1.0 if bellman_only else 0.0),
                 'pi_fixed_sdf': float(1.0 if self._pv_use_fixed_sdf() else 0.0),
                 'pi_fixed_policy': float(1.0 if self._pv_use_fixed_policy() else 0.0),
+                'pi_physical_signed_mean': float(residual_physical_flat.mean().item()),
+                'pi_physical_abs_mean': float(residual_physical_flat.abs().mean().item()),
+                'pi_normalized_signed_mean': float(residual_train_flat.mean().item()),
+                'pi_normalized_abs_mean': float(residual_train_flat.abs().mean().item()),
             }
+            self._latest_pi_terms.update(self._pv_value_scale_diag('pi', model, parent_state))
             self._latest_pi_terms.update(self._m_diagnostics('pi', raw_m, use_m, m_lo, m_hi))
             self._latest_pi_terms.update(self._tensor_tail_diagnostics('pi_target_y', target_y))
             self._latest_pi_terms.update(getattr(loss_fn, 'latest_foc_diag', {}))

@@ -208,10 +208,25 @@ class VectorizedBellmanSurfaceBackend:
         bar_i = _policy_get(parent_out, "bar_i")
         phat_parent = _policy_get(parent_out, "Phat")
         default_probability = _policy_get(parent_out, "bar_z")
+        value_components_fn = getattr(self.policy_model, "forward_value_components", None)
+        if callable(value_components_fn):
+            value_components = value_components_fn(parent_states)
+            value_scale = value_components["value_scale"]
+            v0_normalized = value_components["V0_normalized"]
+            vi_normalized = value_components["VI_normalized"]
+        else:
+            value_scale = torch.ones_like(p0_parent)
+            v0_normalized = p0_parent
+            vi_normalized = pi_parent
         self.last_parent_diagnostics = {
             "Phat": phat_parent.detach(),
             "default_probability": default_probability.detach(),
             "survival_probability": (1.0 - default_probability).detach(),
+            "value_scale": value_scale.detach(),
+            "V0_physical": p0_parent.detach(),
+            "VI_physical": pi_parent.detach(),
+            "V0_normalized": v0_normalized.detach(),
+            "VI_normalized": vi_normalized.detach(),
         }
 
         def make_child_states(b_child: torch.Tensor) -> torch.Tensor:
@@ -279,10 +294,12 @@ class VectorizedBellmanSurfaceBackend:
                     q_p0,
                     eta,
                 ).unsqueeze(1)
+                self.last_parent_diagnostics["CF0"] = cf.squeeze(1).detach()
                 for mode in m_modes:
-                    result[eq][mode] = (
-                        p0_exp - cf - m_by_mode[mode] * outputs[eq]["P"]
-                    ).squeeze(-1)
+                    continuation = m_by_mode[mode] * outputs[eq]["P"]
+                    if mode == "train":
+                        self.last_parent_diagnostics["continuation_P0"] = continuation.mean(dim=1).detach()
+                    result[eq][mode] = (p0_exp - cf - continuation).squeeze(-1)
             elif eq == "pi":
                 childpi_state = parent_states.clone()
                 childpi_state[:, idx.B:idx.B + 1] = b_pi
@@ -296,10 +313,12 @@ class VectorizedBellmanSurfaceBackend:
                     q_pi,
                     eta,
                 ).unsqueeze(1)
+                self.last_parent_diagnostics["CFI"] = cf.squeeze(1).detach()
                 for mode in m_modes:
-                    result[eq][mode] = (
-                        pi_exp - cf - float(self.economic_config.G) * m_by_mode[mode] * outputs[eq]["P"]
-                    ).squeeze(-1)
+                    continuation = float(self.economic_config.G) * m_by_mode[mode] * outputs[eq]["P"]
+                    if mode == "train":
+                        self.last_parent_diagnostics["continuation_PI"] = continuation.mean(dim=1).detach()
+                    result[eq][mode] = (pi_exp - cf - continuation).squeeze(-1)
             elif eq == "q":
                 x_child = child.x_next
                 z_child = child.z_next
@@ -1052,6 +1071,15 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
                 "Phat": [],
                 "default_probability": [],
                 "survival_probability": [],
+                "value_scale": [],
+                "V0_physical": [],
+                "VI_physical": [],
+                "V0_normalized": [],
+                "VI_normalized": [],
+                "CF0": [],
+                "CFI": [],
+                "continuation_P0": [],
+                "continuation_PI": [],
             }
             for start in range(0, parent_states.shape[0], int(parent_chunk_size)):
                 end = min(start + int(parent_chunk_size), parent_states.shape[0])
@@ -1092,11 +1120,22 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
             bb, zz = torch.meshgrid(b_grid_t.cpu(), z_grid_t.cpu(), indexing="xy")
             flat_b = bb.reshape(-1).numpy()
             flat_z = zz.reshape(-1).numpy()
-            phat_np = default_np = survival_np = None
+            phat_np = default_np = survival_np = value_scale_np = None
+            v0_physical_np = vi_physical_np = v0_normalized_np = vi_normalized_np = None
+            cf0_np = cfi_np = cont_p0_np = cont_pi_np = None
             if state_mode == FIXED_GRID_MODE:
                 phat_np = torch.cat(parent_diag_chunks["Phat"], dim=0).reshape(-1).numpy()
                 default_np = torch.cat(parent_diag_chunks["default_probability"], dim=0).reshape(-1).numpy()
                 survival_np = torch.cat(parent_diag_chunks["survival_probability"], dim=0).reshape(-1).numpy()
+                value_scale_np = torch.cat(parent_diag_chunks["value_scale"], dim=0).reshape(-1).numpy()
+                v0_physical_np = torch.cat(parent_diag_chunks["V0_physical"], dim=0).reshape(-1).numpy()
+                vi_physical_np = torch.cat(parent_diag_chunks["VI_physical"], dim=0).reshape(-1).numpy()
+                v0_normalized_np = torch.cat(parent_diag_chunks["V0_normalized"], dim=0).reshape(-1).numpy()
+                vi_normalized_np = torch.cat(parent_diag_chunks["VI_normalized"], dim=0).reshape(-1).numpy()
+                cf0_np = torch.cat(parent_diag_chunks["CF0"], dim=0).reshape(-1).numpy()
+                cfi_np = torch.cat(parent_diag_chunks["CFI"], dim=0).reshape(-1).numpy()
+                cont_p0_np = torch.cat(parent_diag_chunks["continuation_P0"], dim=0).reshape(-1).numpy()
+                cont_pi_np = torch.cat(parent_diag_chunks["continuation_PI"], dim=0).reshape(-1).numpy()
                 phat_grid = phat_np.reshape(len(z_grid_t), len(b_grid_t))
                 status = _fixed_boundary_status(phat_grid)
                 default_boundary_status[checkpoint_label] = status
@@ -1122,6 +1161,12 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
                         continue
                     signed_np = values.reshape(-1).numpy()
                     abs_np = np.abs(signed_np)
+                    scale_np = np.asarray(value_scale_np, dtype=float)
+                    normalized_np = (
+                        signed_np / np.maximum(scale_np, 1e-12)
+                        if eq in {"p0", "pi"}
+                        else signed_np
+                    )
                     raw_tensors[checkpoint_label][f"{eq}.train.conditional_abs"] = torch.from_numpy(abs_np)
                     for pos, signed_val in enumerate(signed_np):
                         rows.append({
@@ -1136,6 +1181,19 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
                             "z": float(flat_z[pos]),
                             "conditional_signed": float(signed_val),
                             "conditional_abs": float(abs_np[pos]),
+                            "value_scale": float(value_scale_np[pos]),
+                            "conditional_signed_physical": float(signed_val),
+                            "conditional_abs_physical": float(abs_np[pos]),
+                            "conditional_signed_normalized": float(normalized_np[pos]),
+                            "conditional_abs_normalized": float(abs(normalized_np[pos])),
+                            "V0_physical": float(v0_physical_np[pos]),
+                            "VI_physical": float(vi_physical_np[pos]),
+                            "V0_normalized": float(v0_normalized_np[pos]),
+                            "VI_normalized": float(vi_normalized_np[pos]),
+                            "CF0": float(cf0_np[pos]),
+                            "CFI": float(cfi_np[pos]),
+                            "continuation_P0": float(cont_p0_np[pos]),
+                            "continuation_PI": float(cont_pi_np[pos]),
                             "phat": float(phat_np[pos]),
                             "default_probability": float(default_np[pos]),
                             "survival_probability": float(survival_np[pos]),

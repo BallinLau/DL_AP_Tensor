@@ -254,6 +254,20 @@ def parse_args() -> argparse.Namespace:
         choices=["joint", "staged"],
         help="Policy/value training flow: legacy joint or staged P/Q evaluation plus BP distillation",
     )
+    parser.add_argument(
+        "--pv-value-scale-mode",
+        type=str.lower,
+        default=None,
+        choices=["none", "exp_xz"],
+        help="Equity value parameterization: physical values or exp(x+z)-scaled latent values",
+    )
+    parser.add_argument("--pv-value-scale-log-max", type=float, default=None, help="Clamp max for exp_xz value scale log component")
+    parser.add_argument(
+        "--pv-bellman-normalize-by-value-scale",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Train P0/PI Bellman value residuals divided by parent equity value scale",
+    )
     parser.add_argument("--pv-eval-epochs", type=int, default=None, help="P/Q evaluation epochs for staged policy/value flow")
     parser.add_argument("--bp-distill-epochs", type=int, default=None, help="BP distillation epochs for staged policy/value flow")
     parser.add_argument("--bp-distill-patience", type=int, default=None, help="BP distillation early-stop patience")
@@ -440,6 +454,12 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.pv_target_grid_val_fraction = args.pv_target_grid_val_fraction
     if args.pv_training_flow is not None:
         hyperparams.pv_training_flow = args.pv_training_flow
+    if args.pv_value_scale_mode is not None:
+        hyperparams.pv_value_scale_mode = args.pv_value_scale_mode
+    if args.pv_value_scale_log_max is not None:
+        hyperparams.pv_value_scale_log_max = float(args.pv_value_scale_log_max)
+    if args.pv_bellman_normalize_by_value_scale is not None:
+        hyperparams.pv_bellman_normalize_by_value_scale = bool(args.pv_bellman_normalize_by_value_scale)
     if args.pv_eval_epochs is not None:
         hyperparams.pv_eval_epochs = args.pv_eval_epochs
     if args.bp_distill_epochs is not None:

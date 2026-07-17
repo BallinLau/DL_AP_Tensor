@@ -75,6 +75,9 @@ class Config:
     PV_TAU_I = 0.1
     PV_TAU_Z = 0.1
     PV_I_GRID_SIZE = 11
+    PV_VALUE_SCALE_MODE = "none"
+    PV_VALUE_SCALE_LOG_MAX = 20.0
+    PV_BELLMAN_NORMALIZE_BY_VALUE_SCALE = False
     
     # ========== 模型架构参数 ==========
     # 共享层维度 (INCREASED for higher memory usage)

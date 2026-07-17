@@ -54,9 +54,16 @@ class PolicyValueModel(nn.Module):
         base_state_dim: int = 6,
         share_hidden_dims: Optional[list] = None,
         share_output_dim: int = 64,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        value_scale_mode: Optional[str] = None,
+        value_scale_log_max: Optional[float] = None,
     ):
         super().__init__()
+        self.value_scale_mode = str(value_scale_mode if value_scale_mode is not None else getattr(Config, "PV_VALUE_SCALE_MODE", "none")).lower()
+        self.value_scale_log_max = float(
+            value_scale_log_max if value_scale_log_max is not None else getattr(Config, "PV_VALUE_SCALE_LOG_MAX", 20.0)
+        )
+        self._validate_value_scale_mode()
         
         self.q_encoder = ShareLayer(
             input_dim=base_state_dim,
@@ -103,18 +110,79 @@ class PolicyValueModel(nn.Module):
         self.register_buffer('phi', torch.tensor(Config.PHI))
         self.register_buffer('g', torch.tensor(Config.G))
 
+    def _validate_value_scale_mode(self) -> None:
+        if self.value_scale_mode not in {"none", "exp_xz"}:
+            raise ValueError(f"Unsupported value_scale_mode: {self.value_scale_mode}")
+
+    def configure_value_parameterization(
+        self,
+        *,
+        mode: str = "none",
+        log_max: float = 20.0,
+    ) -> None:
+        self.value_scale_mode = str(mode).lower()
+        self.value_scale_log_max = float(log_max)
+        self._validate_value_scale_mode()
+
+    def value_parameterization_metadata(self) -> Dict[str, object]:
+        return {
+            "mode": self.value_scale_mode,
+            "scale_formula": f"1+exp(clamp(x+z,max={self.value_scale_log_max:g}))" if self.value_scale_mode == "exp_xz" else "1",
+            "bellman_normalization": bool(getattr(Config, "PV_BELLMAN_NORMALIZE_BY_VALUE_SCALE", False)),
+            "log_max": float(self.value_scale_log_max),
+        }
+
+    def equity_value_scale(self, firm_state: torch.Tensor) -> torch.Tensor:
+        if self.value_scale_mode == "none":
+            return torch.ones((firm_state.shape[0], 1), dtype=firm_state.dtype, device=firm_state.device)
+        log_component_raw = firm_state[:, SIMMODEL.X:SIMMODEL.X + 1] + firm_state[:, SIMMODEL.Z:SIMMODEL.Z + 1]
+        log_component = torch.clamp(log_component_raw, max=float(self.value_scale_log_max))
+        return 1.0 + torch.exp(log_component)
+
+    def equity_value_scale_diagnostics(self, firm_state: torch.Tensor) -> Dict[str, float]:
+        with torch.no_grad():
+            if self.value_scale_mode == "none":
+                return {"value_scale_clamp_ratio": 0.0}
+            raw = firm_state[:, SIMMODEL.X:SIMMODEL.X + 1] + firm_state[:, SIMMODEL.Z:SIMMODEL.Z + 1]
+            return {
+                "value_scale_clamp_ratio": float((raw > float(self.value_scale_log_max)).to(torch.float32).mean().item())
+            }
+
     def _split_state(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         base_state = self.extract_base_state(firm_state)
         i = firm_state[:, SIMMODEL.I:SIMMODEL.I + 1]
         b = firm_state[:, SIMMODEL.B:SIMMODEL.B + 1]
         return base_state, i, b
 
-    def _value_outputs(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _raw_value_outputs(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         base_state, i, _ = self._split_state(firm_state)
         h_v = self.value_encoder(base_state)
-        V0 = self.v0_head(h_v)
-        VI = self.vi_head(h_v, i)
-        return V0, VI
+        return self.v0_head(h_v), self.vi_head(h_v, i)
+
+    def forward_value_components(self, firm_state: torch.Tensor) -> Dict[str, torch.Tensor]:
+        V0_raw, VI_raw = self._raw_value_outputs(firm_state)
+        scale = self.equity_value_scale(firm_state)
+        if self.value_scale_mode == "exp_xz":
+            V0_normalized = V0_raw
+            VI_normalized = VI_raw
+            V0_physical = scale * V0_normalized
+            VI_physical = scale * VI_normalized
+        else:
+            V0_physical = V0_raw
+            VI_physical = VI_raw
+            V0_normalized = V0_raw
+            VI_normalized = VI_raw
+        return {
+            "V0_physical": V0_physical,
+            "VI_physical": VI_physical,
+            "V0_normalized": V0_normalized,
+            "VI_normalized": VI_normalized,
+            "value_scale": scale,
+        }
+
+    def _value_outputs(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        components = self.forward_value_components(firm_state)
+        return components["V0_physical"], components["VI_physical"]
 
     def _q_output(self, firm_state: torch.Tensor) -> torch.Tensor:
         base_state, _, b = self._split_state(firm_state)

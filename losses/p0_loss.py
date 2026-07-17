@@ -105,7 +105,8 @@ class P0Loss(nn.Module):
         CF0p: Union[torch.Tensor, List[torch.Tensor]],
         M_list: List[torch.Tensor],
         P_children: List[torch.Tensor],
-        bar_z_children: List[torch.Tensor]
+        bar_z_children: List[torch.Tensor],
+        residual_scale: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         """
         计算 Bellman 残差（支持任意分支数）
@@ -136,6 +137,8 @@ class P0Loss(nn.Module):
         residuals = []
         for cf_j, M, P_child, _bar_z in zip(cf_list, M_list, P_children, bar_z_children):
             residual = P0 - cf_j - M * P_child
+            if residual_scale is not None:
+                residual = residual / residual_scale.clamp_min(1e-12)
             residuals.append(residual)
         
         return residuals
