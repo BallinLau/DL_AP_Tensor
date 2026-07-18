@@ -7,7 +7,7 @@ from analysis.checkpoint_loader import load_analysis_checkpoint
 from analysis.economic_config import AnalysisEconomicConfig
 from config import HyperParams, SIMMODEL
 from experiments.run_utils import build_models
-from experiments.run_scaled_value_ablation import _bellman_loss_and_metrics, _split_value_state
+from experiments.run_scaled_value_ablation import _bellman_loss_and_metrics, _load_batches, _split_value_state
 from losses import P0Loss, PILoss
 from models import PolicyValueModel
 from training.trainer import Trainer
@@ -53,6 +53,32 @@ def test_exp_xz_physical_output_equals_scale_times_normalized():
     assert torch.allclose(comp["VI_physical"], comp["value_scale"] * comp["VI_normalized"])
     assert torch.allclose(out.P0, comp["V0_physical"])
     assert torch.allclose(out.PI, comp["VI_physical"])
+
+
+def test_cal_phats_uses_instance_i_grid_not_global_config(monkeypatch):
+    model = PolicyValueModel(
+        share_hidden_dims=[8],
+        share_output_dim=8,
+        i_grid_size=3,
+        i_threshold=0.3,
+    )
+    states = _states()
+    seen_i = []
+
+    def fake_value_outputs(firm_state):
+        seen_i.append(firm_state[:, SIMMODEL.I].detach().clone())
+        value = firm_state[:, SIMMODEL.I:SIMMODEL.I + 1]
+        return value, value
+
+    monkeypatch.setattr(model, "_value_outputs", fake_value_outputs)
+    monkeypatch.setattr("models.policy_value.Config.PV_I_GRID_SIZE", 99, raising=False)
+    monkeypatch.setattr("models.policy_value.Config.I_THRESHOLD", 9.0, raising=False)
+
+    model.cal_phats(states)
+
+    assert len(seen_i) == 3
+    grid = torch.stack([x[0] for x in seen_i]).reshape(-1)
+    assert torch.allclose(grid, torch.tensor([0.0, 0.15, 0.3]))
 
 
 def test_bellman_residual_scale_preserves_zero_and_normalizes():
@@ -166,8 +192,10 @@ def _combined_checkpoint(path: Path, *, mode: str = "none") -> None:
                 "sdf_fc1": models["sdf_fc1"].state_dict(),
                 "firm_target": pv.state_dict(),
             },
+            "optimizers": {"policy_value": {"legacy": True}, "sdf_fc1": {"keep": True}},
             "hyperparams": hp.__dict__,
             "config_snapshot": AnalysisEconomicConfig.from_current_config().to_dict(),
+            "policy_value_model_spec": pv.model_spec(),
             "value_parameterization": {
                 "mode": mode,
                 "scale_formula": "1+exp(clamp(x+z,max=20))" if mode == "exp_xz" else "1",
@@ -205,6 +233,11 @@ def test_warmstart_scaled_full_checkpoint_reload(tmp_path: Path):
     payload = torch.load(output, map_location="cpu")
     assert {"policy_value", "sdf_fc1", "firm_target"}.issubset(payload["models"])
     assert payload["value_parameterization"]["mode"] == "exp_xz"
+    assert payload["warmstart"]["resume_optimizer_compatible"] is False
+    assert "policy_value" not in payload.get("optimizers", {})
+    assert "sdf_fc1" in payload.get("optimizers", {})
+    for key in payload["models"]["policy_value"]:
+        assert torch.equal(payload["models"]["policy_value"][key], payload["models"]["firm_target"][key])
     load_analysis_checkpoint(output, allow_current_config=True, device="cpu")
 
 
@@ -217,7 +250,12 @@ def test_bellman_ablation_only_value_params_change_and_teacher_fixed():
     _, non_value_before = _split_value_state(student)
     teacher_before = {k: v.detach().clone() for k, v in teacher.state_dict().items()}
     parent = _states()
-    batch = {"parent": parent, "children": [parent.clone(), parent.clone()], "m_list": [torch.ones(3, 1), torch.ones(3, 1)]}
+    batch = {
+        "parent": parent,
+        "children": [parent.clone(), parent.clone()],
+        "m_list": [torch.ones(3, 1), torch.ones(3, 1)],
+        "branch_weights": torch.full((3, 2), 0.5),
+    }
     opt = torch.optim.AdamW(
         [p for n, p in student.named_parameters() if n.startswith(("value_encoder", "v0_head", "vi_head"))],
         lr=1e-4,
@@ -228,6 +266,63 @@ def test_bellman_ablation_only_value_params_change_and_teacher_fixed():
     opt.step()
     _, non_value_after = _split_value_state(student)
 
-    assert set(metrics).issuperset({"p0_physical_mean_abs", "pi_physical_mean_abs", "p0_normalized_mean_abs", "pi_normalized_mean_abs"})
+    assert set(metrics).issuperset({
+        "p0_physical_conditional_mean_abs",
+        "pi_physical_conditional_mean_abs",
+        "p0_normalized_conditional_mean_abs",
+        "pi_normalized_conditional_mean_abs",
+    })
+    assert "regions" in metrics
     assert all(torch.equal(non_value_before[k], non_value_after[k]) for k in non_value_before)
     assert all(torch.equal(teacher_before[k], v) for k, v in teacher.state_dict().items())
+
+
+def test_scaled_ablation_batch_loader_requires_explicit_m_and_weights(tmp_path: Path):
+    parent = _states()
+    batch = {
+        "parent": parent,
+        "children": [parent.clone(), parent.clone()],
+        "m_list": [torch.ones(3, 1), torch.ones(3, 1)],
+        "branch_weights": torch.full((3, 2), 0.5),
+    }
+    path = tmp_path / "batches.pt"
+    torch.save(
+        {
+            "train": [batch],
+            "validation": [batch],
+            "metadata": {"m_semantics": "raw", "shock_bank_hash": "abc"},
+        },
+        path,
+    )
+    train, val, meta = _load_batches(path, torch.device("cpu"))
+    assert len(train) == 1
+    assert len(val) == 1
+    assert meta["m_semantics"] == "raw"
+
+    missing_m = dict(batch)
+    missing_m.pop("m_list")
+    torch.save(
+        {
+            "train": [missing_m],
+            "validation": [batch],
+            "metadata": {"m_semantics": "raw", "shock_bank_hash": "abc"},
+        },
+        path,
+    )
+    with pytest.raises(ValueError, match="m_list|M_list|M"):
+        _load_batches(path, torch.device("cpu"))
+
+    missing_w = dict(batch)
+    missing_w.pop("branch_weights")
+    torch.save(
+        {
+            "train": [missing_w],
+            "validation": [batch],
+            "metadata": {"m_semantics": "raw", "shock_bank_hash": "abc"},
+        },
+        path,
+    )
+    with pytest.raises(ValueError, match="branch_weights"):
+        _load_batches(path, torch.device("cpu"))
+    train, _, _ = _load_batches(path, torch.device("cpu"), assume_equal_branch_weights=True)
+    assert torch.allclose(train[0]["branch_weights"], torch.full((3, 2), 0.5))

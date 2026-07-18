@@ -46,6 +46,13 @@ def _write_combined_checkpoint(path: Path):
         },
         "hyperparams": hp.__dict__,
         "config_snapshot": AnalysisEconomicConfig.from_current_config().to_dict(),
+        "policy_value_model_spec": models["policy_value"].model_spec(),
+        "value_parameterization": {
+            "mode": "none",
+            "scale_formula": "1",
+            "bellman_normalization": False,
+            "log_max": 20.0,
+        },
     }
     torch.save(payload, path)
     return models, hp
@@ -346,7 +353,20 @@ def test_reference_distribution_aggregation_rows(tmp_path):
 def test_full_surface_api_is_rng_neutral_and_exception_safe(tmp_path):
     models = build_models(torch.device("cpu"))
     bad = tmp_path / "bad.pt"
-    torch.save({"models": {"policy_value": models["policy_value"].state_dict(), "sdf_fc1": models["sdf_fc1"].state_dict()}, "hyperparams": HyperParams().__dict__}, bad)
+    torch.save(
+        {
+            "models": {"policy_value": models["policy_value"].state_dict(), "sdf_fc1": models["sdf_fc1"].state_dict()},
+            "hyperparams": HyperParams().__dict__,
+            "policy_value_model_spec": models["policy_value"].model_spec(),
+            "value_parameterization": {
+                "mode": "none",
+                "scale_formula": "1",
+                "bellman_normalization": False,
+                "log_max": 20.0,
+            },
+        },
+        bad,
+    )
 
     random.seed(11)
     np.random.seed(11)

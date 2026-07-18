@@ -10,6 +10,7 @@ import torch
 
 from config import HyperParams
 from experiments.run_utils import build_models
+from models import build_policy_value_from_checkpoint_spec
 from .economic_config import AnalysisEconomicConfig
 
 
@@ -198,6 +199,7 @@ def load_analysis_checkpoint(
 
     current_mode = str(getattr(hyperparams, "pv_value_scale_mode", "none")).lower()
     current_log_max = float(getattr(hyperparams, "pv_value_scale_log_max", 20.0))
+    allow_current_model_spec = bool(getattr(hyperparams, "allow_current_model_spec", False))
     checkpoint_mode = "none"
     if isinstance(checkpoint_value_parameterization, dict):
         checkpoint_mode = str(checkpoint_value_parameterization.get("mode", "none")).lower()
@@ -215,6 +217,19 @@ def load_analysis_checkpoint(
             f"into current ({current_mode!r}, {current_log_max}, {current_formula!r}); "
             "use warmstart_scaled_equity_value.py to create a migrated checkpoint."
         )
+    if payload_for_config is None:
+        payload_for_model_spec = {}
+    else:
+        payload_for_model_spec = payload_for_config
+    models["policy_value"] = build_policy_value_from_checkpoint_spec(
+        payload_for_model_spec,
+        value_scale_mode=current_mode,
+        value_scale_log_max=current_log_max,
+        allow_current_model_spec=allow_current_model_spec or payload_for_config is None,
+    ).to(device)
+    checkpoint_spec = payload_for_model_spec.get("policy_value_model_spec") if isinstance(payload_for_model_spec, dict) else None
+    if checkpoint_spec is None and (allow_current_model_spec or payload_for_config is None):
+        missing_optional_fields.append("policy_value_model_spec.current_explicit_fallback")
     configure_policy = getattr(models["policy_value"], "configure_value_parameterization", None)
     if callable(configure_policy):
         configure_policy(mode=current_mode, log_max=current_log_max)
@@ -232,7 +247,12 @@ def load_analysis_checkpoint(
         raise ValueError("checkpoint is missing sdf_fc1 but m_source='sdf_fc1'")
 
     if firm_target_state is not None:
-        firm_target = build_models(device)["policy_value"]
+        firm_target = build_policy_value_from_checkpoint_spec(
+            payload_for_model_spec,
+            value_scale_mode=current_mode,
+            value_scale_log_max=current_log_max,
+            allow_current_model_spec=allow_current_model_spec or payload_for_config is None,
+        ).to(device)
         configure_target = getattr(firm_target, "configure_value_parameterization", None)
         if callable(configure_target):
             configure_target(mode=current_mode, log_max=current_log_max)

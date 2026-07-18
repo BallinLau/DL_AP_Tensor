@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config import HyperParams
-from models import PolicyValueModel
+from models import PolicyValueModel, build_policy_value_from_checkpoint_spec
 from analysis.economic_config import AnalysisEconomicConfig
 
 
@@ -61,7 +61,7 @@ def _load_parent_states(path: str | None, n_states: int, seed: int) -> torch.Ten
 
 
 def _copy_non_value_modules(student: PolicyValueModel, teacher: PolicyValueModel) -> None:
-    for name in ("q_encoder", "q_head", "policy_encoder", "bp0_head", "bpi_head"):
+    for name in ("q_encoder", "q_head", "policy_encoder", "bp0_head", "bpi_head", "barz_model", "bari_model"):
         getattr(student, name).load_state_dict(getattr(teacher, name).state_dict())
 
 
@@ -104,12 +104,16 @@ def main() -> None:
     if "config_snapshot" not in payload:
         raise ValueError("combined baseline checkpoint is missing config_snapshot")
 
-    teacher = PolicyValueModel(value_scale_mode="none").to(device)
+    teacher = build_policy_value_from_checkpoint_spec(payload, value_scale_mode="none").to(device)
     state = payload["models"]["policy_value"]
     teacher.load_state_dict(state, strict=True)
     teacher.eval().requires_grad_(False)
 
-    student = PolicyValueModel(value_scale_mode="exp_xz", value_scale_log_max=args.value_scale_log_max).to(device)
+    student = build_policy_value_from_checkpoint_spec(
+        payload,
+        value_scale_mode="exp_xz",
+        value_scale_log_max=args.value_scale_log_max,
+    ).to(device)
     _copy_non_value_modules(student, teacher)
     _set_value_trainable(student)
     student.train()
@@ -149,36 +153,43 @@ def main() -> None:
     print(f"physical_parity_vi_mae={float(vi_mae):.6g}")
     print(f"value_scale_clamp_ratio={float(clamp_ratio):.6g}")
 
-    hp = HyperParams()
-    hp.pv_value_scale_mode = "exp_xz"
-    hp.pv_value_scale_log_max = float(args.value_scale_log_max)
-    hp.pv_bellman_normalize_by_value_scale = True
     out = Path(args.output_checkpoint)
     out.parent.mkdir(parents=True, exist_ok=True)
     models_payload = dict(payload["models"])
     models_payload["policy_value"] = student.state_dict()
-    if "firm_target" not in models_payload:
-        models_payload["firm_target"] = student.state_dict()
-    torch.save(
-        {
-            **{k: v for k, v in payload.items() if k not in {"models", "hyperparams", "value_parameterization"}},
-            "models": models_payload,
-            "hyperparams": {**_as_hp_dict(payload.get("hyperparams")), **hp.__dict__},
-            "config_snapshot": payload.get("config_snapshot", AnalysisEconomicConfig.from_current_config().to_dict()),
-            "value_parameterization": {
-                "mode": "exp_xz",
-                "scale_formula": f"1+exp(clamp(x+z,max={float(args.value_scale_log_max):g}))",
-                "bellman_normalization": True,
-                "log_max": float(args.value_scale_log_max),
-            },
-            "warmstart": {
-                "source": str(baseline_path),
-                "source_sha256": _sha256(baseline_path),
-                "seed": int(args.seed),
-                "copied_modules": ["q_encoder", "q_head", "policy_encoder", "bp0_head", "bpi_head"],
-                "trained_modules": ["value_encoder", "v0_head", "vi_head"],
-            },
+    models_payload["firm_target"] = student.state_dict()
+    optimizers_payload = dict(payload.get("optimizers") or {})
+    optimizers_payload.pop("policy_value", None)
+    hyperparams_payload = _as_hp_dict(payload.get("hyperparams"))
+    hyperparams_payload["pv_value_scale_mode"] = "exp_xz"
+    hyperparams_payload["pv_value_scale_log_max"] = float(args.value_scale_log_max)
+    hyperparams_payload["pv_bellman_normalize_by_value_scale"] = True
+    output_payload = {
+        **{k: v for k, v in payload.items() if k not in {"models", "hyperparams", "value_parameterization", "optimizers"}},
+        "models": models_payload,
+        "hyperparams": hyperparams_payload,
+        "config_snapshot": payload.get("config_snapshot", AnalysisEconomicConfig.from_current_config().to_dict()),
+        "policy_value_model_spec": student.model_spec(),
+        "value_parameterization": {
+            "mode": "exp_xz",
+            "scale_formula": f"1+exp(clamp(x+z,max={float(args.value_scale_log_max):g}))",
+            "bellman_normalization": True,
+            "log_max": float(args.value_scale_log_max),
         },
+        "warmstart": {
+            "source": str(baseline_path),
+            "source_sha256": _sha256(baseline_path),
+            "seed": int(args.seed),
+            "copied_modules": ["q_encoder", "q_head", "policy_encoder", "bp0_head", "bpi_head", "barz_model", "bari_model"],
+            "trained_modules": ["value_encoder", "v0_head", "vi_head"],
+            "resume_optimizer_compatible": False,
+            "resume_optimizer_incompatibility_reason": "value_parameterization_migration_or_value_only_training",
+        },
+    }
+    if optimizers_payload:
+        output_payload["optimizers"] = optimizers_payload
+    torch.save(
+        output_payload,
         out,
     )
     print(f"saved={out}")

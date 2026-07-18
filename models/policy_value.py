@@ -16,6 +16,55 @@ sys.path.append('..')
 from config import Config, SIMMODEL
 
 
+def default_policy_value_model_spec() -> Dict[str, object]:
+    tau_i = float(getattr(Config, "PV_TAU_I", getattr(Config, "BARI_TAU", 0.1)))
+    tau_z = float(getattr(Config, "PV_TAU_Z", 1.0 / max(float(getattr(Config, "BARZ_LOGIT_TEMP", 10.0)), 1e-8)))
+    return {
+        "base_state_dim": int(Config.base_state_dim()),
+        "share_hidden_dims": list(getattr(Config, "SHARE_LAYER_HIDDEN_DIMS", []) or []),
+        "share_output_dim": 64,
+        "dropout": 0.0,
+        "tau_i": tau_i,
+        "tau_z": tau_z,
+        "i_grid_size": int(getattr(Config, "PV_I_GRID_SIZE", 11)),
+        "i_threshold": float(getattr(Config, "I_THRESHOLD", 0.5)),
+        "delta": float(Config.DELTA),
+        "phi": float(Config.PHI),
+        "g": float(Config.G),
+    }
+
+
+def build_policy_value_from_checkpoint_spec(
+    payload: Dict[str, object],
+    *,
+    value_scale_mode: Optional[str] = None,
+    value_scale_log_max: Optional[float] = None,
+    allow_current_model_spec: bool = False,
+) -> "PolicyValueModel":
+    spec = payload.get("policy_value_model_spec") if isinstance(payload, dict) else None
+    if spec is None:
+        if not allow_current_model_spec:
+            raise ValueError("checkpoint is missing policy_value_model_spec")
+        spec = default_policy_value_model_spec()
+    if not isinstance(spec, dict):
+        raise ValueError("policy_value_model_spec must be a dictionary")
+    return PolicyValueModel(
+        base_state_dim=int(spec["base_state_dim"]),
+        share_hidden_dims=list(spec.get("share_hidden_dims") or []),
+        share_output_dim=int(spec["share_output_dim"]),
+        dropout=float(spec.get("dropout", 0.0)),
+        tau_i=float(spec["tau_i"]),
+        tau_z=float(spec["tau_z"]),
+        i_grid_size=int(spec["i_grid_size"]),
+        i_threshold=float(spec["i_threshold"]),
+        delta=float(spec["delta"]),
+        phi=float(spec["phi"]),
+        g=float(spec["g"]),
+        value_scale_mode=value_scale_mode,
+        value_scale_log_max=value_scale_log_max,
+    )
+
+
 class PolicyValueOutput(NamedTuple):
     """Policy & Value 模型的输出"""
     Q: torch.Tensor          # 债券价值
@@ -57,8 +106,28 @@ class PolicyValueModel(nn.Module):
         dropout: float = 0.0,
         value_scale_mode: Optional[str] = None,
         value_scale_log_max: Optional[float] = None,
+        tau_i: Optional[float] = None,
+        tau_z: Optional[float] = None,
+        i_grid_size: Optional[int] = None,
+        i_threshold: Optional[float] = None,
+        delta: Optional[float] = None,
+        phi: Optional[float] = None,
+        g: Optional[float] = None,
     ):
         super().__init__()
+        self.base_state_dim = int(base_state_dim)
+        resolved_share_hidden_dims = list(
+            share_hidden_dims if share_hidden_dims is not None else getattr(Config, "SHARE_LAYER_HIDDEN_DIMS", [])
+        )
+        self.share_hidden_dims = resolved_share_hidden_dims
+        self.share_output_dim = int(share_output_dim)
+        self.dropout = float(dropout)
+        self.i_grid_size = int(i_grid_size if i_grid_size is not None else getattr(Config, "PV_I_GRID_SIZE", 11))
+        self.i_threshold = float(i_threshold if i_threshold is not None else getattr(Config, "I_THRESHOLD", 0.5))
+        tau_i = float(tau_i if tau_i is not None else getattr(Config, "PV_TAU_I", getattr(Config, "BARI_TAU", 0.1)))
+        tau_z = float(tau_z if tau_z is not None else getattr(Config, "PV_TAU_Z", 1.0 / max(float(getattr(Config, "BARZ_LOGIT_TEMP", 10.0)), 1e-8)))
+        self.tau_i = tau_i
+        self.tau_z = tau_z
         self.value_scale_mode = str(value_scale_mode if value_scale_mode is not None else getattr(Config, "PV_VALUE_SCALE_MODE", "none")).lower()
         self.value_scale_log_max = float(
             value_scale_log_max if value_scale_log_max is not None else getattr(Config, "PV_VALUE_SCALE_LOG_MAX", 20.0)
@@ -67,19 +136,19 @@ class PolicyValueModel(nn.Module):
         
         self.q_encoder = ShareLayer(
             input_dim=base_state_dim,
-            hidden_dims=share_hidden_dims,
+            hidden_dims=resolved_share_hidden_dims,
             output_dim=share_output_dim,
             dropout=dropout
         )
         self.value_encoder = ShareLayer(
             input_dim=base_state_dim,
-            hidden_dims=share_hidden_dims,
+            hidden_dims=resolved_share_hidden_dims,
             output_dim=share_output_dim,
             dropout=dropout
         )
         self.policy_encoder = ShareLayer(
             input_dim=base_state_dim,
-            hidden_dims=share_hidden_dims,
+            hidden_dims=resolved_share_hidden_dims,
             output_dim=share_output_dim,
             dropout=dropout
         )
@@ -101,14 +170,27 @@ class PolicyValueModel(nn.Module):
             dropout=dropout
         )
 
-        tau_i = float(getattr(Config, "PV_TAU_I", getattr(Config, "BARI_TAU", 0.1)))
-        tau_z = float(getattr(Config, "PV_TAU_Z", 1.0 / max(float(getattr(Config, "BARZ_LOGIT_TEMP", 10.0)), 1e-8)))
         self.derived = FirmDerivedObjects(tau_i=tau_i, tau_z=tau_z)
         
         # 经济参数
-        self.register_buffer('delta', torch.tensor(Config.DELTA))
-        self.register_buffer('phi', torch.tensor(Config.PHI))
-        self.register_buffer('g', torch.tensor(Config.G))
+        self.register_buffer('delta', torch.tensor(float(delta if delta is not None else Config.DELTA)))
+        self.register_buffer('phi', torch.tensor(float(phi if phi is not None else Config.PHI)))
+        self.register_buffer('g', torch.tensor(float(g if g is not None else Config.G)))
+
+    def model_spec(self) -> Dict[str, object]:
+        return {
+            "base_state_dim": int(self.base_state_dim),
+            "share_hidden_dims": list(self.share_hidden_dims),
+            "share_output_dim": int(self.share_output_dim),
+            "dropout": float(self.dropout),
+            "tau_i": float(self.tau_i),
+            "tau_z": float(self.tau_z),
+            "i_grid_size": int(self.i_grid_size),
+            "i_threshold": float(self.i_threshold),
+            "delta": float(self.delta.detach().cpu().item()),
+            "phi": float(self.phi.detach().cpu().item()),
+            "g": float(self.g.detach().cpu().item()),
+        }
 
     def _validate_value_scale_mode(self) -> None:
         if self.value_scale_mode not in {"none", "exp_xz"}:
@@ -307,11 +389,10 @@ class PolicyValueModel(nn.Module):
         batch_size = firm_state.size(0)
 
         if simulated_i is None:
-            grid_size = int(getattr(Config, "PV_I_GRID_SIZE", 11))
             simulated_i = torch.linspace(
                 0.0,
-                Config.I_THRESHOLD,
-                steps=max(grid_size, 2),
+                self.i_threshold,
+                steps=max(int(self.i_grid_size), 2),
                 device=device
             ).unsqueeze(-1)
 

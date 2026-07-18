@@ -116,6 +116,13 @@ class Trainer:
                 "checkpoint value_parameterization log_max mismatch: "
                 f"{actual.get('log_max')!r} != {expected['log_max']!r}"
             )
+        expected_spec = getattr(self.models.get("policy_value"), "model_spec", lambda: None)()
+        actual_spec = checkpoint.get("policy_value_model_spec")
+        if expected_spec is not None:
+            if actual_spec is None:
+                raise ValueError("checkpoint is missing policy_value_model_spec")
+            if actual_spec != expected_spec:
+                raise ValueError("checkpoint policy_value_model_spec mismatch")
 
     def _init_firm_target(self) -> Optional[nn.Module]:
         """
@@ -373,6 +380,14 @@ class Trainer:
                 getattr(self.hyperparams, "pv_bellman_normalize_by_value_scale", False)
             )
             checkpoint["value_parameterization"] = metadata
+        pv_spec = getattr(pv_model, "model_spec", None)
+        if callable(pv_spec):
+            checkpoint["policy_value_model_spec"] = pv_spec()
+        checkpoint["config_snapshot"] = {
+            key: getattr(self.config, key)
+            for key in ("DELTA", "PHI", "G", "I_THRESHOLD", "PV_I_GRID_SIZE", "PV_TAU_I", "PV_TAU_Z")
+            if hasattr(self.config, key)
+        }
         
         for opt_name, opt in self.optimizers.items():
             checkpoint['optimizers'][opt_name] = opt.state_dict()
