@@ -19,6 +19,7 @@ from copy import deepcopy
 import sys
 sys.path.append('..')
 from config import Config, HyperParams
+from analysis.economic_config import AnalysisEconomicConfig
 
 from .episode import Episode
 from .scheduler import EpisodeScheduler
@@ -115,6 +116,11 @@ class Trainer:
             raise ValueError(
                 "checkpoint value_parameterization log_max mismatch: "
                 f"{actual.get('log_max')!r} != {expected['log_max']!r}"
+            )
+        if bool(actual.get("bellman_normalization", False)) != bool(expected.get("bellman_normalization", False)):
+            raise ValueError(
+                "checkpoint value_parameterization bellman_normalization mismatch: "
+                f"{actual.get('bellman_normalization')!r} != {expected['bellman_normalization']!r}"
             )
         expected_spec = getattr(self.models.get("policy_value"), "model_spec", lambda: None)()
         actual_spec = checkpoint.get("policy_value_model_spec")
@@ -383,11 +389,7 @@ class Trainer:
         pv_spec = getattr(pv_model, "model_spec", None)
         if callable(pv_spec):
             checkpoint["policy_value_model_spec"] = pv_spec()
-        checkpoint["config_snapshot"] = {
-            key: getattr(self.config, key)
-            for key in ("DELTA", "PHI", "G", "I_THRESHOLD", "PV_I_GRID_SIZE", "PV_TAU_I", "PV_TAU_Z")
-            if hasattr(self.config, key)
-        }
+        checkpoint["config_snapshot"] = AnalysisEconomicConfig.from_current_config().to_dict()
         
         for opt_name, opt in self.optimizers.items():
             checkpoint['optimizers'][opt_name] = opt.state_dict()
@@ -419,7 +421,15 @@ class Trainer:
         if self.firm_target is not None and 'firm_target' not in checkpoint.get('models', {}):
             hard_update(self.firm_target, self.models['policy_value'])
         
-        for opt_name, state_dict in checkpoint['optimizers'].items():
+        optimizer_compatible = bool(checkpoint.get("resume_optimizer_compatible", True))
+        for container in ("warmstart", "scaled_value_ablation"):
+            meta = checkpoint.get(container)
+            if isinstance(meta, dict) and meta.get("resume_optimizer_compatible") is False:
+                optimizer_compatible = False
+        for opt_name, state_dict in checkpoint.get('optimizers', {}).items():
+            if not optimizer_compatible and opt_name == "policy_value":
+                logger.warning("Skipping policy_value optimizer restore because checkpoint marks it incompatible")
+                continue
             if opt_name in self.optimizers:
                 self.optimizers[opt_name].load_state_dict(state_dict)
         

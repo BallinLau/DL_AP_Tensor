@@ -23,6 +23,13 @@ def default_policy_value_model_spec() -> Dict[str, object]:
         "base_state_dim": int(Config.base_state_dim()),
         "share_hidden_dims": list(getattr(Config, "SHARE_LAYER_HIDDEN_DIMS", []) or []),
         "share_output_dim": 64,
+        "q_head_dims": list(getattr(Config, "Q_HEAD_DIMS", []) or []),
+        "p0_head_dims": list(getattr(Config, "P0_HEAD_DIMS", []) or []),
+        "pi_head_dims": list(getattr(Config, "PI_HEAD_DIMS", []) or []),
+        "bp0_head_dims": list(getattr(Config, "BP0_HEAD_DIMS", []) or []),
+        "bpi_head_dims": list(getattr(Config, "BPI_HEAD_DIMS", []) or []),
+        "barz_hidden_dims": [64, 32, 16],
+        "bari_hidden_dims": [64, 32, 16],
         "dropout": 0.0,
         "tau_i": tau_i,
         "tau_z": tau_z,
@@ -52,6 +59,13 @@ def build_policy_value_from_checkpoint_spec(
         base_state_dim=int(spec["base_state_dim"]),
         share_hidden_dims=list(spec.get("share_hidden_dims") or []),
         share_output_dim=int(spec["share_output_dim"]),
+        q_head_dims=list(spec.get("q_head_dims") or []),
+        p0_head_dims=list(spec.get("p0_head_dims") or []),
+        pi_head_dims=list(spec.get("pi_head_dims") or []),
+        bp0_head_dims=list(spec.get("bp0_head_dims") or []),
+        bpi_head_dims=list(spec.get("bpi_head_dims") or []),
+        barz_hidden_dims=list(spec.get("barz_hidden_dims") or [64, 32, 16]),
+        bari_hidden_dims=list(spec.get("bari_hidden_dims") or [64, 32, 16]),
         dropout=float(spec.get("dropout", 0.0)),
         tau_i=float(spec["tau_i"]),
         tau_z=float(spec["tau_z"]),
@@ -103,6 +117,13 @@ class PolicyValueModel(nn.Module):
         base_state_dim: int = 6,
         share_hidden_dims: Optional[list] = None,
         share_output_dim: int = 64,
+        q_head_dims: Optional[list] = None,
+        p0_head_dims: Optional[list] = None,
+        pi_head_dims: Optional[list] = None,
+        bp0_head_dims: Optional[list] = None,
+        bpi_head_dims: Optional[list] = None,
+        barz_hidden_dims: Optional[list] = None,
+        bari_hidden_dims: Optional[list] = None,
         dropout: float = 0.0,
         value_scale_mode: Optional[str] = None,
         value_scale_log_max: Optional[float] = None,
@@ -121,6 +142,13 @@ class PolicyValueModel(nn.Module):
         )
         self.share_hidden_dims = resolved_share_hidden_dims
         self.share_output_dim = int(share_output_dim)
+        self.q_head_dims = list(q_head_dims if q_head_dims is not None else getattr(Config, "Q_HEAD_DIMS", []))
+        self.p0_head_dims = list(p0_head_dims if p0_head_dims is not None else getattr(Config, "P0_HEAD_DIMS", []))
+        self.pi_head_dims = list(pi_head_dims if pi_head_dims is not None else getattr(Config, "PI_HEAD_DIMS", []))
+        self.bp0_head_dims = list(bp0_head_dims if bp0_head_dims is not None else getattr(Config, "BP0_HEAD_DIMS", []))
+        self.bpi_head_dims = list(bpi_head_dims if bpi_head_dims is not None else getattr(Config, "BPI_HEAD_DIMS", []))
+        self.barz_hidden_dims = list(barz_hidden_dims if barz_hidden_dims is not None else [64, 32, 16])
+        self.bari_hidden_dims = list(bari_hidden_dims if bari_hidden_dims is not None else [64, 32, 16])
         self.dropout = float(dropout)
         self.i_grid_size = int(i_grid_size if i_grid_size is not None else getattr(Config, "PV_I_GRID_SIZE", 11))
         self.i_threshold = float(i_threshold if i_threshold is not None else getattr(Config, "I_THRESHOLD", 0.5))
@@ -153,20 +181,22 @@ class PolicyValueModel(nn.Module):
             dropout=dropout
         )
 
-        self.q_head = QHead(input_dim=share_output_dim)
-        self.v0_head = PHead(input_dim=share_output_dim, requires_i=False)
-        self.vi_head = PHead(input_dim=share_output_dim, requires_i=True)
-        self.bp0_head = BpHead(input_dim=share_output_dim, requires_i=False)
-        self.bpi_head = BpHead(input_dim=share_output_dim, requires_i=True)
+        self.q_head = QHead(input_dim=share_output_dim, hidden_dims=self.q_head_dims)
+        self.v0_head = PHead(input_dim=share_output_dim, hidden_dims=self.p0_head_dims, requires_i=False)
+        self.vi_head = PHead(input_dim=share_output_dim, hidden_dims=self.pi_head_dims, requires_i=True)
+        self.bp0_head = BpHead(input_dim=share_output_dim, hidden_dims=self.bp0_head_dims, requires_i=False)
+        self.bpi_head = BpHead(input_dim=share_output_dim, hidden_dims=self.bpi_head_dims, requires_i=True)
         
         # 辅助模型
         self.barz_model = BarzModel(
             input_dim=base_state_dim,
+            hidden_dims=self.barz_hidden_dims,
             dropout=dropout
         )
         
         self.bari_model = BariModel(
             input_dim=base_state_dim,
+            hidden_dims=self.bari_hidden_dims,
             dropout=dropout
         )
 
@@ -182,6 +212,13 @@ class PolicyValueModel(nn.Module):
             "base_state_dim": int(self.base_state_dim),
             "share_hidden_dims": list(self.share_hidden_dims),
             "share_output_dim": int(self.share_output_dim),
+            "q_head_dims": list(self.q_head_dims),
+            "p0_head_dims": list(self.p0_head_dims),
+            "pi_head_dims": list(self.pi_head_dims),
+            "bp0_head_dims": list(self.bp0_head_dims),
+            "bpi_head_dims": list(self.bpi_head_dims),
+            "barz_hidden_dims": list(self.barz_hidden_dims),
+            "bari_hidden_dims": list(self.bari_hidden_dims),
             "dropout": float(self.dropout),
             "tau_i": float(self.tau_i),
             "tau_z": float(self.tau_z),

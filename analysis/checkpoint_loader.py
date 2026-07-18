@@ -72,6 +72,7 @@ class CheckpointSpec:
     sdf_checkpoint: Optional[str | Path] = None
     hyperparams_json: Optional[str | Path] = None
     config_json: Optional[str | Path] = None
+    model_spec_json: Optional[str | Path] = None
     label: Optional[str] = None
 
 
@@ -96,6 +97,18 @@ def _load_config_payload(
     )
 
 
+def _load_model_spec_json(path: Optional[str | Path]) -> Optional[Dict[str, Any]]:
+    if path is None:
+        return None
+    with Path(path).open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if isinstance(payload, dict) and "policy_value_model_spec" in payload:
+        payload = payload["policy_value_model_spec"]
+    if not isinstance(payload, dict):
+        raise ValueError(f"model_spec_json must contain a JSON object: {path}")
+    return payload
+
+
 def load_analysis_checkpoint(
     checkpoint_path: Optional[str | Path] = None,
     *,
@@ -103,6 +116,7 @@ def load_analysis_checkpoint(
     sdf_checkpoint: Optional[str | Path] = None,
     hyperparams_json: Optional[str | Path] = None,
     config_json: Optional[str | Path] = None,
+    model_spec_json: Optional[str | Path] = None,
     device: torch.device | str = "cpu",
     allow_default_hyperparams: bool = False,
     allow_current_config: bool = False,
@@ -114,6 +128,7 @@ def load_analysis_checkpoint(
     device = torch.device(device)
     models = build_models(device)
     missing_optional_fields = []
+    explicit_model_spec = _load_model_spec_json(model_spec_json)
     checkpoint_format = None
     checkpoint_hash = None
     policy_state = None
@@ -218,17 +233,21 @@ def load_analysis_checkpoint(
             "use warmstart_scaled_equity_value.py to create a migrated checkpoint."
         )
     if payload_for_config is None:
-        payload_for_model_spec = {}
+        if explicit_model_spec is None:
+            raise ValueError("raw policy state_dict requires model_spec_json for strict model reconstruction")
+        payload_for_model_spec = {"policy_value_model_spec": explicit_model_spec}
     else:
-        payload_for_model_spec = payload_for_config
+        payload_for_model_spec = dict(payload_for_config)
+        if explicit_model_spec is not None:
+            payload_for_model_spec["policy_value_model_spec"] = explicit_model_spec
     models["policy_value"] = build_policy_value_from_checkpoint_spec(
         payload_for_model_spec,
         value_scale_mode=current_mode,
         value_scale_log_max=current_log_max,
-        allow_current_model_spec=allow_current_model_spec or payload_for_config is None,
+        allow_current_model_spec=allow_current_model_spec,
     ).to(device)
     checkpoint_spec = payload_for_model_spec.get("policy_value_model_spec") if isinstance(payload_for_model_spec, dict) else None
-    if checkpoint_spec is None and (allow_current_model_spec or payload_for_config is None):
+    if checkpoint_spec is None and allow_current_model_spec:
         missing_optional_fields.append("policy_value_model_spec.current_explicit_fallback")
     configure_policy = getattr(models["policy_value"], "configure_value_parameterization", None)
     if callable(configure_policy):
@@ -251,7 +270,7 @@ def load_analysis_checkpoint(
             payload_for_model_spec,
             value_scale_mode=current_mode,
             value_scale_log_max=current_log_max,
-            allow_current_model_spec=allow_current_model_spec or payload_for_config is None,
+            allow_current_model_spec=allow_current_model_spec,
         ).to(device)
         configure_target = getattr(firm_target, "configure_value_parameterization", None)
         if callable(configure_target):
@@ -302,6 +321,7 @@ def load_analysis_checkpoint(
                 "log_max": current_log_max,
             },
         },
+        "policy_value_model_spec": checkpoint_spec,
     }
     return AnalysisCheckpoint(
         models=models,
@@ -324,6 +344,7 @@ def load_analysis_checkpoint_spec(
         sdf_checkpoint=spec.sdf_checkpoint,
         hyperparams_json=spec.hyperparams_json,
         config_json=spec.config_json,
+        model_spec_json=spec.model_spec_json,
         device=device,
         allow_default_hyperparams=allow_default_hyperparams,
         allow_current_config=allow_current_config,

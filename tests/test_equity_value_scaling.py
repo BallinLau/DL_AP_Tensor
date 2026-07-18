@@ -1,3 +1,5 @@
+import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -5,12 +7,31 @@ import torch
 
 from analysis.checkpoint_loader import load_analysis_checkpoint
 from analysis.economic_config import AnalysisEconomicConfig
-from config import HyperParams, SIMMODEL
+from config import Config, HyperParams, SIMMODEL
 from experiments.run_utils import build_models
-from experiments.run_scaled_value_ablation import _bellman_loss_and_metrics, _load_batches, _split_value_state
+from experiments.run_scaled_value_ablation import (
+    _accept_round,
+    _bellman_economic_spec,
+    _bellman_loss_and_metrics,
+    _load_batches,
+    _split_value_state,
+)
 from losses import P0Loss, PILoss
-from models import PolicyValueModel
+from models import PolicyValueModel, build_policy_value_from_checkpoint_spec
 from training.trainer import Trainer
+
+
+def _econ(**overrides) -> dict:
+    spec = {
+        "DELTA": 0.02,
+        "TAU": 0.2,
+        "KAPPA_B": 0.004,
+        "KAPPA_E": 0.025,
+        "AIO_WEIGHT": 0.5,
+        "G": 1.14,
+    }
+    spec.update(overrides)
+    return spec
 
 
 def _states() -> torch.Tensor:
@@ -260,7 +281,7 @@ def test_bellman_ablation_only_value_params_change_and_teacher_fixed():
         [p for n, p in student.named_parameters() if n.startswith(("value_encoder", "v0_head", "vi_head"))],
         lr=1e-4,
     )
-    loss, metrics = _bellman_loss_and_metrics(student, teacher, [batch], normalize=True)
+    loss, metrics = _bellman_loss_and_metrics(student, teacher, [batch], normalize=True, economic_spec=_econ())
     opt.zero_grad(set_to_none=True)
     loss.backward()
     opt.step()
@@ -326,3 +347,339 @@ def test_scaled_ablation_batch_loader_requires_explicit_m_and_weights(tmp_path: 
         _load_batches(path, torch.device("cpu"))
     train, _, _ = _load_batches(path, torch.device("cpu"), assume_equal_branch_weights=True)
     assert torch.allclose(train[0]["branch_weights"], torch.full((3, 2), 0.5))
+
+
+def test_checkpoint_economic_parameters_override_runtime_config(monkeypatch):
+    parent = _states()
+    batch = {
+        "parent": parent,
+        "children": [parent.clone(), parent.clone()],
+        "m_list": [torch.ones(3, 1), torch.ones(3, 1)],
+        "branch_weights": torch.full((3, 2), 0.5),
+    }
+    model = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8, value_scale_mode="none")
+    model.eval()
+    spec = _econ(DELTA=0.123, TAU=0.456, KAPPA_B=0.078, KAPPA_E=0.091, AIO_WEIGHT=0.3, G=1.07)
+    _, before = _bellman_loss_and_metrics(model, model, [batch], normalize=False, economic_spec=spec)
+    monkeypatch.setattr(Config, "DELTA", 9.0, raising=False)
+    monkeypatch.setattr(Config, "TAU", 9.0, raising=False)
+    monkeypatch.setattr(Config, "KAPPA_B", 9.0, raising=False)
+    monkeypatch.setattr(Config, "KAPPA_E", 9.0, raising=False)
+    monkeypatch.setattr(Config, "AIO_WEIGHT", 9.0, raising=False)
+    monkeypatch.setattr(Config, "G", 9.0, raising=False)
+    _, after = _bellman_loss_and_metrics(model, model, [batch], normalize=False, economic_spec=spec)
+    for key in ("p0_physical_conditional_mean_abs", "pi_physical_conditional_mean_abs"):
+        assert before[key] == pytest.approx(after[key])
+
+
+def test_z_region_defaults_are_minus_two_and_two():
+    states = torch.tensor(
+        [
+            [0.2, -3.0, 1.0, 0.1, -2.0, 0.0, 4.0],
+            [0.2, 0.0, 1.0, 0.1, -2.0, 0.0, 4.0],
+            [0.2, 3.0, 1.0, 0.1, -2.0, 0.0, 4.0],
+        ],
+        dtype=torch.float32,
+    )
+    model = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8)
+    batch = {
+        "parent": states,
+        "children": [states.clone(), states.clone()],
+        "m_list": [torch.ones(3, 1), torch.ones(3, 1)],
+        "branch_weights": torch.full((3, 2), 0.5),
+    }
+    _, metrics = _bellman_loss_and_metrics(model, model, [batch], normalize=False, economic_spec=_econ())
+    assert metrics["regions"]["p0"]["low_z"]["n_parent"] == 1
+    assert metrics["regions"]["p0"]["mid_z"]["n_parent"] == 1
+    assert metrics["regions"]["p0"]["high_z"]["n_parent"] == 1
+
+
+def test_candidate_improves_current_teacher_even_if_above_historical_best():
+    historical_best = 1.0
+    start_score = 10.0
+    candidate_score = 8.0
+    assert candidate_score > historical_best
+    assert _accept_round(start_score, candidate_score, min_round_improvement=0.0) is True
+
+
+def test_scaled_ablation_rejects_non_double_sampling_and_weighted_aio(tmp_path: Path):
+    parent = _states()
+    base_batch = {
+        "parent": parent,
+        "children": [parent.clone(), parent.clone()],
+        "m_list": [torch.ones(3, 1), torch.ones(3, 1)],
+        "branch_weights": torch.full((3, 2), 0.5),
+    }
+    path = tmp_path / "batches.pt"
+    bad_three = dict(base_batch)
+    bad_three["children"] = [parent.clone(), parent.clone(), parent.clone()]
+    bad_three["m_list"] = [torch.ones(3, 1), torch.ones(3, 1), torch.ones(3, 1)]
+    bad_three["branch_weights"] = torch.full((3, 3), 1.0 / 3.0)
+    torch.save({"train": [bad_three], "validation": [base_batch], "metadata": {"m_semantics": "raw", "shock_bank_hash": "x"}}, path)
+    with pytest.raises(ValueError, match="len\\(children\\) must equal 2"):
+        _load_batches(path, torch.device("cpu"))
+
+    bad_weight = dict(base_batch)
+    bad_weight["branch_weights"] = torch.tensor([[0.75, 0.25], [0.5, 0.5], [0.5, 0.5]])
+    torch.save({"train": [bad_weight], "validation": [base_batch], "metadata": {"m_semantics": "raw", "shock_bank_hash": "x"}}, path)
+    with pytest.raises(ValueError, match="weighted AiO"):
+        _load_batches(path, torch.device("cpu"))
+
+
+def test_policy_value_model_spec_round_trip_covers_all_head_dims():
+    model = PolicyValueModel(
+        share_hidden_dims=[7],
+        share_output_dim=9,
+        q_head_dims=[5],
+        p0_head_dims=[6],
+        pi_head_dims=[4],
+        bp0_head_dims=[3],
+        bpi_head_dims=[2],
+        barz_hidden_dims=[8, 4],
+        bari_hidden_dims=[5, 3],
+        tau_i=0.11,
+        tau_z=0.22,
+        i_grid_size=5,
+        i_threshold=0.4,
+        delta=0.03,
+        phi=0.44,
+        g=1.05,
+    )
+    spec = model.model_spec()
+    rebuilt = build_policy_value_from_checkpoint_spec({"policy_value_model_spec": spec})
+    assert rebuilt.model_spec() == spec
+    for key in (
+        "q_head_dims",
+        "p0_head_dims",
+        "pi_head_dims",
+        "bp0_head_dims",
+        "bpi_head_dims",
+        "barz_hidden_dims",
+        "bari_hidden_dims",
+    ):
+        assert key in spec
+
+
+def _hash_state(state):
+    import hashlib
+
+    h = hashlib.sha256()
+    if state is None:
+        return None
+    for key in sorted(state):
+        value = state[key]
+        h.update(key.encode())
+        if torch.is_tensor(value):
+            h.update(value.detach().cpu().contiguous().numpy().tobytes())
+        else:
+            h.update(repr(value).encode())
+    return h.hexdigest()
+
+
+def test_legacy_annotation_preserves_state_hashes_and_warmstarts(tmp_path: Path):
+    from scripts.annotate_legacy_equity_checkpoint import main as annotate_main
+    from scripts.warmstart_scaled_equity_value import main as warmstart_main
+
+    legacy = tmp_path / "legacy.pt"
+    annotated = tmp_path / "annotated.pt"
+    warmed = tmp_path / "warmed.pt"
+    _combined_checkpoint(legacy, mode="none")
+    legacy_payload = torch.load(legacy, map_location="cpu")
+    legacy_payload.pop("value_parameterization")
+    legacy_payload.pop("policy_value_model_spec")
+    legacy_payload.pop("config_snapshot")
+    torch.save(legacy_payload, legacy)
+
+    model_spec_json = tmp_path / "model_spec.json"
+    config_json = tmp_path / "config.json"
+    model_spec_json.write_text(json.dumps({"policy_value_model_spec": build_models(torch.device("cpu"))["policy_value"].model_spec()}), encoding="utf-8")
+    config_json.write_text(json.dumps({"config_snapshot": AnalysisEconomicConfig.from_current_config().to_dict()}), encoding="utf-8")
+
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "annotate",
+            "--legacy-checkpoint", str(legacy),
+            "--model-spec-json", str(model_spec_json),
+            "--economic-config-json", str(config_json),
+            "--output-checkpoint", str(annotated),
+        ]
+        annotate_main()
+    finally:
+        sys.argv = old_argv
+
+    ann = torch.load(annotated, map_location="cpu")
+    for module_key in ("policy_value", "sdf_fc1", "firm_target"):
+        assert _hash_state(ann["models"].get(module_key)) == _hash_state(legacy_payload["models"].get(module_key))
+    assert _hash_state(ann.get("optimizers")) == _hash_state(legacy_payload.get("optimizers"))
+    assert ann["value_parameterization"]["mode"] == "none"
+
+    try:
+        sys.argv = [
+            "warm",
+            "--baseline-policy-checkpoint", str(annotated),
+            "--output-checkpoint", str(warmed),
+            "--n-states", "16",
+            "--epochs", "1",
+            "--batch-size", "8",
+            "--device", "cpu",
+        ]
+        warmstart_main()
+    finally:
+        sys.argv = old_argv
+    assert warmed.exists()
+
+
+def _write_json_payloads(tmp_path: Path) -> tuple[Path, Path]:
+    model_spec_json = tmp_path / "model_spec.json"
+    config_json = tmp_path / "config.json"
+    model_spec_json.write_text(
+        json.dumps({"policy_value_model_spec": build_models(torch.device("cpu"))["policy_value"].model_spec()}),
+        encoding="utf-8",
+    )
+    config_json.write_text(json.dumps({"config_snapshot": AnalysisEconomicConfig.from_current_config().to_dict()}), encoding="utf-8")
+    return model_spec_json, config_json
+
+
+def _annotate_legacy(tmp_path: Path, legacy: Path, annotated: Path) -> None:
+    from scripts.annotate_legacy_equity_checkpoint import main as annotate_main
+
+    model_spec_json, config_json = _write_json_payloads(tmp_path)
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "annotate",
+            "--legacy-checkpoint", str(legacy),
+            "--model-spec-json", str(model_spec_json),
+            "--economic-config-json", str(config_json),
+            "--output-checkpoint", str(annotated),
+        ]
+        annotate_main()
+    finally:
+        sys.argv = old_argv
+
+
+def _warmstart(tmp_path: Path, baseline: Path, warmed: Path) -> None:
+    from scripts.warmstart_scaled_equity_value import main as warmstart_main
+
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "warm",
+            "--baseline-policy-checkpoint", str(baseline),
+            "--output-checkpoint", str(warmed),
+            "--n-states", "16",
+            "--epochs", "1",
+            "--batch-size", "8",
+            "--device", "cpu",
+        ]
+        warmstart_main()
+    finally:
+        sys.argv = old_argv
+
+
+def test_minimal_scaled_ablation_smoke_and_posttrain_strict_reload(tmp_path: Path):
+    from experiments.run_scaled_value_ablation import main as ablation_main
+
+    legacy = tmp_path / "legacy.pt"
+    annotated = tmp_path / "annotated.pt"
+    warmed = tmp_path / "warmed.pt"
+    _combined_checkpoint(legacy, mode="none")
+    legacy_payload = torch.load(legacy, map_location="cpu")
+    legacy_payload.pop("value_parameterization")
+    legacy_payload.pop("policy_value_model_spec")
+    legacy_payload.pop("config_snapshot")
+    torch.save(legacy_payload, legacy)
+    _annotate_legacy(tmp_path, legacy, annotated)
+    _warmstart(tmp_path, annotated, warmed)
+
+    parent = torch.cat([_states(), _states(), _states(), _states(), _states(), _states()[:1]], dim=0)[:16]
+    branch_weights = torch.full((16, 2), 0.5)
+    batch = {
+        "parent": parent,
+        "children": [parent.clone(), parent.clone()],
+        "m_list": [torch.ones(16, 1), torch.ones(16, 1)],
+        "branch_weights": branch_weights,
+    }
+    batches = tmp_path / "batches.pt"
+    torch.save(
+        {
+            "train": [batch, batch],
+            "validation": [batch],
+            "metadata": {"m_semantics": "fixed", "shock_bank_hash": "smoke-shock"},
+        },
+        batches,
+    )
+    out_dir = tmp_path / "out"
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "ablate",
+            "--baseline-checkpoint", str(annotated),
+            "--scaled-checkpoint", str(warmed),
+            "--batch-data", str(batches),
+            "--output-dir", str(out_dir),
+            "--rounds", "2",
+            "--epochs-per-round", "1",
+            "--lr", "0",
+            "--force-reject-round", "2",
+            "--device", "cpu",
+        ]
+        ablation_main()
+    finally:
+        sys.argv = old_argv
+
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+    rounds = [row for row in summary["history"] if row.get("stage") == "scaled_posttrain_round"]
+    assert [row["accepted"] for row in rounds] == [True, False]
+    assert summary["z_region_cutoffs"] == {"low_z_cutoff": -2.0, "high_z_cutoff": 2.0}
+    assert summary["bellman_economic_spec"]["DELTA"] == pytest.approx(float(AnalysisEconomicConfig.from_current_config().DELTA))
+    loaded = load_analysis_checkpoint(out_dir / "scaled_posttrain_combined.pt", device="cpu")
+    assert loaded.metadata["value_parameterization"]["checkpoint"]["mode"] == "exp_xz"
+
+
+def test_trainer_complete_config_snapshot_and_bellman_normalization_guard(tmp_path: Path):
+    hp = HyperParams()
+    model = PolicyValueModel()
+    trainer = Trainer({"policy_value": model}, hyperparams=hp, save_dir=tmp_path / "ckpt", log_dir=tmp_path / "log", device=torch.device("cpu"))
+    trainer.save_checkpoint("none")
+    payload = torch.load(tmp_path / "ckpt" / "none.pt", map_location="cpu")
+    assert "AIO_WEIGHT" in payload["config_snapshot"]
+    assert "KAPPA_E" in payload["config_snapshot"]
+    payload["value_parameterization"]["bellman_normalization"] = True
+    torch.save(payload, tmp_path / "ckpt" / "bad_norm.pt")
+    with pytest.raises(ValueError, match="bellman_normalization"):
+        trainer.load_checkpoint("bad_norm")
+
+
+def test_raw_analysis_loader_requires_explicit_model_spec_json(tmp_path: Path):
+    models = build_models(torch.device("cpu"))
+    policy_path = tmp_path / "policy.pt"
+    sdf_path = tmp_path / "sdf.pt"
+    hp_path = tmp_path / "hp.json"
+    config_path = tmp_path / "config.json"
+    spec_path = tmp_path / "spec.json"
+    torch.save(models["policy_value"].state_dict(), policy_path)
+    torch.save(models["sdf_fc1"].state_dict(), sdf_path)
+    hp_path.write_text(json.dumps(HyperParams().__dict__, default=str), encoding="utf-8")
+    config_path.write_text(json.dumps(AnalysisEconomicConfig.from_current_config().to_dict()), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="model_spec_json"):
+        load_analysis_checkpoint(
+            policy_checkpoint=policy_path,
+            sdf_checkpoint=sdf_path,
+            hyperparams_json=hp_path,
+            config_json=config_path,
+            device="cpu",
+        )
+
+    spec_path.write_text(json.dumps(models["policy_value"].model_spec()), encoding="utf-8")
+    loaded = load_analysis_checkpoint(
+        policy_checkpoint=policy_path,
+        sdf_checkpoint=sdf_path,
+        hyperparams_json=hp_path,
+        config_json=config_path,
+        model_spec_json=spec_path,
+        device="cpu",
+    )
+    assert loaded.metadata["policy_value_model_spec"] == models["policy_value"].model_spec()

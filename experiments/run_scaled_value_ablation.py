@@ -26,6 +26,7 @@ from utils.firm_transition import apply_refinancing_policy
 
 
 VALUE_KEYS = ("value_encoder", "v0_head", "vi_head")
+BELLMAN_ECONOMIC_KEYS = ("DELTA", "TAU", "KAPPA_B", "KAPPA_E", "AIO_WEIGHT", "G")
 
 
 def _sha256(path: Path) -> str:
@@ -90,6 +91,37 @@ def _require_value_metadata(payload: Dict[str, Any], *, expected_mode: str, expe
             raise ValueError(f"{path} value_parameterization.{key} mismatch: {actual.get(key)!r} != {expected[key]!r}")
     if bool(actual.get("bellman_normalization", expected["bellman_normalization"])) != bool(expected["bellman_normalization"]):
         raise ValueError(f"{path} value_parameterization.bellman_normalization mismatch")
+
+
+def _bellman_economic_spec(payload: Dict[str, Any], *, path: Path) -> Dict[str, float]:
+    snapshot = payload.get("config_snapshot")
+    if not isinstance(snapshot, dict):
+        raise ValueError(f"{path} is missing config_snapshot for Bellman economic parameters")
+    missing = [key for key in BELLMAN_ECONOMIC_KEYS if key not in snapshot]
+    if missing:
+        raise ValueError(f"{path} config_snapshot is missing Bellman economic keys: {missing}")
+    return {key: float(snapshot[key]) for key in BELLMAN_ECONOMIC_KEYS}
+
+
+def _make_bellman_losses(economic_spec: Dict[str, float]) -> Tuple[P0Loss, PILoss]:
+    return (
+        P0Loss(
+            delta=economic_spec["DELTA"],
+            tau=economic_spec["TAU"],
+            kappa_b=economic_spec["KAPPA_B"],
+            kappa_e=economic_spec["KAPPA_E"],
+            aio_weight=economic_spec["AIO_WEIGHT"],
+        ),
+        PILoss(
+            delta=economic_spec["DELTA"],
+            tau=economic_spec["TAU"],
+            g=economic_spec["G"],
+            kappa_b=economic_spec["KAPPA_B"],
+            kappa_e=economic_spec["KAPPA_E"],
+            aio_weight=economic_spec["AIO_WEIGHT"],
+            b_penalty_weight=0.0,
+        ),
+    )
 
 
 def _load_combined_policy(path: Path, *, mode: str, log_max: float, device: torch.device) -> Tuple[PolicyValueModel, Dict[str, Any]]:
@@ -162,6 +194,8 @@ def _load_batches(
         children = [torch.as_tensor(c, dtype=torch.float32, device=device) for c in children]
         if len(children) < 2:
             raise ValueError("each batch must have at least two child branches")
+        if len(children) != 2:
+            raise ValueError("scaled equity pilot requires strict double sampling: len(children) must equal 2")
         for child in children:
             if child.ndim != 2 or child.shape[0] != parent.shape[0] or child.shape[1] < 7 or not torch.isfinite(child).all():
                 raise ValueError("batch children must be finite with shape [B,>=7]")
@@ -188,6 +222,9 @@ def _load_batches(
                 n_child=len(children),
                 device=device,
             )
+        expected = torch.full((parent.shape[0], 2), 0.5, dtype=torch.float32, device=device)
+        if not torch.allclose(weights, expected, atol=1e-6, rtol=1e-6):
+            raise ValueError("scaled equity pilot requires equal branch_weights [0.5, 0.5]; weighted AiO is not defined here")
         return {
             "parent": parent[:, :7],
             "children": [c[:, :7] for c in children],
@@ -229,9 +266,11 @@ def _bellman_loss_and_metrics(
     batches: List[Dict[str, Any]],
     *,
     normalize: bool,
+    economic_spec: Dict[str, float],
+    low_z_cutoff: float = -2.0,
+    high_z_cutoff: float = 2.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    p0_loss = P0Loss()
-    pi_loss = PILoss()
+    p0_loss, pi_loss = _make_bellman_losses(economic_spec)
     losses = []
     p0_phys_cond = []
     pi_phys_cond = []
@@ -334,9 +373,9 @@ def _bellman_loss_and_metrics(
 
     def _region_stats(z: torch.Tensor, values: torch.Tensor, normalized: torch.Tensor, prefix: str) -> Dict[str, Dict[str, float]]:
         regions = {
-            "low_z": z < -1.0,
-            "mid_z": (z >= -1.0) & (z <= 1.0),
-            "high_z": z > 1.0,
+            "low_z": z < float(low_z_cutoff),
+            "mid_z": (z >= float(low_z_cutoff)) & (z <= float(high_z_cutoff)),
+            "high_z": z > float(high_z_cutoff),
             "full": torch.ones_like(z, dtype=torch.bool),
         }
         out: Dict[str, Dict[str, float]] = {}
@@ -396,6 +435,10 @@ def _validate_checkpoint_lineage(
         raise ValueError("scaled warmstart source hash does not match baseline checkpoint")
     if baseline_payload.get("config_snapshot") != scaled_payload.get("config_snapshot"):
         raise ValueError("baseline/scaled config_snapshot mismatch")
+    baseline_economic = _bellman_economic_spec(baseline_payload, path=baseline_path)
+    scaled_economic = _bellman_economic_spec(scaled_payload, path=Path("<scaled-checkpoint>"))
+    if baseline_economic != scaled_economic:
+        raise ValueError("baseline/scaled Bellman economic spec mismatch")
     if baseline_payload.get("policy_value_model_spec") != scaled_payload.get("policy_value_model_spec"):
         raise ValueError("baseline/scaled policy_value_model_spec mismatch")
     baseline_models = baseline_payload.get("models") or {}
@@ -410,6 +453,7 @@ def _validate_checkpoint_lineage(
         raise ValueError("baseline/scaled non-value policy modules differ")
     return {
         "baseline_sha256": expected_source_hash,
+        "bellman_economic_spec": baseline_economic,
         "sdf_fc1_hash": _state_dict_hash(baseline_models.get("sdf_fc1", {})) if "sdf_fc1" in baseline_models else None,
         "non_value_module_hashes": baseline_non_value,
     }
@@ -417,6 +461,10 @@ def _validate_checkpoint_lineage(
 
 def _score(metrics: Dict[str, Any]) -> float:
     return float(metrics["p0_physical_conditional_mean_abs"] + metrics["pi_physical_conditional_mean_abs"])
+
+
+def _accept_round(start_score: float, candidate_score: float, *, min_round_improvement: float = 0.0) -> bool:
+    return bool(float(start_score) - float(candidate_score) >= float(min_round_improvement))
 
 
 def _physical_rmse_and_max(a: PolicyValueModel, b: PolicyValueModel, batches: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -472,6 +520,8 @@ def _save_combined(
     elif "optimizers" in out:
         del out["optimizers"]
     out["policy_value_model_spec"] = student.model_spec()
+    out["resume_optimizer_compatible"] = False
+    out["resume_optimizer_incompatibility_reason"] = "value_parameterization_migration_or_value_only_training"
     out["value_parameterization"] = {
         "mode": "exp_xz",
         "scale_formula": f"1+exp(clamp(x+z,max={float(hp.pv_value_scale_log_max):g}))",
@@ -503,6 +553,9 @@ def main() -> None:
     p.add_argument("--value-scale-log-max", type=float, default=20.0)
     p.add_argument("--assume-equal-branch-weights", action="store_true")
     p.add_argument("--force-reject-round", type=int, default=0)
+    p.add_argument("--min-round-improvement", type=float, default=0.0)
+    p.add_argument("--low-z-cutoff", type=float, default=-2.0)
+    p.add_argument("--high-z-cutoff", type=float, default=2.0)
     args = p.parse_args()
 
     random.seed(args.seed)
@@ -522,6 +575,7 @@ def main() -> None:
         scaled_payload=scaled_payload,
         log_max=args.value_scale_log_max,
     )
+    bellman_economic_spec = dict(lineage["bellman_economic_spec"])
     baseline.eval().requires_grad_(False)
     teacher = copy.deepcopy(student).to(device).eval().requires_grad_(False)
     _freeze_non_value(student)
@@ -533,8 +587,13 @@ def main() -> None:
     opt = torch.optim.AdamW([p for p in student.parameters() if p.requires_grad], lr=args.lr)
 
     eval_batches = val_batches
-    _, metrics_a = _bellman_loss_and_metrics(baseline, baseline, eval_batches, normalize=False)
-    _, metrics_b = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True)
+    metric_kwargs = {
+        "economic_spec": bellman_economic_spec,
+        "low_z_cutoff": float(args.low_z_cutoff),
+        "high_z_cutoff": float(args.high_z_cutoff),
+    }
+    _, metrics_a = _bellman_loss_and_metrics(baseline, baseline, eval_batches, normalize=False, **metric_kwargs)
+    _, metrics_b = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
     metrics_b.update(_physical_rmse_and_max(baseline, student, eval_batches))
     metrics_b.update(_residual_metric_differences(metrics_a, metrics_b, "b_vs_a"))
     value_before, non_value_before = _split_value_state(student)
@@ -550,17 +609,18 @@ def main() -> None:
         torch_rng_state = torch.random.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         teacher_round_hash = _state_hash(teacher)
-        _, start_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True)
+        _, start_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
         start_score = _score(start_metrics)
+        best_score_before_round = best_score
         for _ in range(int(args.epochs_per_round)):
             for batch in train_batches:
-                loss, _ = _bellman_loss_and_metrics(student, teacher, [batch], normalize=True)
+                loss, _ = _bellman_loss_and_metrics(student, teacher, [batch], normalize=True, **metric_kwargs)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
-        _, candidate_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True)
+        _, candidate_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
         score = _score(candidate_metrics)
-        accepted = bool(score <= min(best_score, start_score))
+        accepted = _accept_round(start_score, score, min_round_improvement=float(args.min_round_improvement))
         if int(args.force_reject_round) == round_idx + 1:
             accepted = False
         teacher_unchanged_within_round = _state_hash(teacher) == teacher_round_hash
@@ -568,7 +628,7 @@ def main() -> None:
             best_score = score
             teacher.load_state_dict(student.state_dict(), strict=True)
             teacher.eval().requires_grad_(False)
-            _, self_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True)
+            _, self_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
             restored_metrics = None
         else:
             student.load_state_dict(model_state, strict=True)
@@ -578,7 +638,7 @@ def main() -> None:
             torch.random.set_rng_state(torch_rng_state)
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state_all(cuda_rng_state)
-            _, restored_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True)
+            _, restored_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
             self_metrics = None
         history.append({
             "stage": "scaled_posttrain_round",
@@ -587,13 +647,16 @@ def main() -> None:
             "teacher_hash_unchanged_within_round": teacher_unchanged_within_round,
             "start_score": start_score,
             "candidate_score": score,
+            "best_score_before_round": best_score_before_round,
+            "best_score_after_round": best_score,
+            "min_round_improvement": float(args.min_round_improvement),
             "start_metrics": start_metrics,
             "candidate_metrics": candidate_metrics,
             "restored_metrics": restored_metrics,
             "self_metrics_after_accept": self_metrics,
         })
 
-    _, metrics_c = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True)
+    _, metrics_c = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
     metrics_c.update(_residual_metric_differences(metrics_a, metrics_c, "c_vs_a"))
     for region in ("low_z", "mid_z", "high_z", "full"):
         c_p0 = metrics_c.get("regions", {}).get("p0", {}).get(region, {}).get("conditional_mean_abs", float("nan"))
@@ -625,6 +688,8 @@ def main() -> None:
         "shock_hash": hashlib.sha256(Path(args.batch_data).read_bytes()).hexdigest(),
         "batch_metadata": batch_metadata,
         "lineage": lineage,
+        "bellman_economic_spec": bellman_economic_spec,
+        "z_region_cutoffs": {"low_z_cutoff": float(args.low_z_cutoff), "high_z_cutoff": float(args.high_z_cutoff)},
         "posttrain_checkpoint": str(checkpoint_path),
         "history": history,
     }

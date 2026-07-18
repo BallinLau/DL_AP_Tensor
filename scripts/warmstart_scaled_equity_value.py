@@ -170,6 +170,8 @@ def main() -> None:
         "hyperparams": hyperparams_payload,
         "config_snapshot": payload.get("config_snapshot", AnalysisEconomicConfig.from_current_config().to_dict()),
         "policy_value_model_spec": student.model_spec(),
+        "resume_optimizer_compatible": False,
+        "resume_optimizer_incompatibility_reason": "value_parameterization_migration_or_value_only_training",
         "value_parameterization": {
             "mode": "exp_xz",
             "scale_formula": f"1+exp(clamp(x+z,max={float(args.value_scale_log_max):g}))",
