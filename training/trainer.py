@@ -93,6 +93,65 @@ class Trainer:
             "log_max": log_max,
         }
 
+    def _current_resume_config_snapshot(self) -> Dict[str, float]:
+        snapshot = AnalysisEconomicConfig.from_current_config().to_dict()
+        for key in ("PV_I_GRID_SIZE", "PV_TAU_I", "PV_TAU_Z"):
+            if hasattr(self.config, key):
+                snapshot[key] = float(getattr(self.config, key))
+        return snapshot
+
+    def _assert_checkpoint_config_snapshot(
+        self,
+        checkpoint: Dict,
+        *,
+        evaluation_only: bool = False,
+        allow_config_mismatch: bool = False,
+    ) -> None:
+        required = (
+            "DELTA",
+            "TAU",
+            "G",
+            "PHI",
+            "KAPPA_B",
+            "KAPPA_E",
+            "AIO_WEIGHT",
+            "RHO_X",
+            "SIGMA_X",
+            "XBAR",
+            "RHO_Z",
+            "SIGMA_Z",
+            "ZBAR",
+            "ZETA",
+            "I_THRESHOLD",
+            "PV_I_GRID_SIZE",
+            "PV_TAU_I",
+            "PV_TAU_Z",
+        )
+        current = self._current_resume_config_snapshot()
+        saved = checkpoint.get("config_snapshot")
+        if not isinstance(saved, dict):
+            message = "checkpoint is missing config_snapshot"
+            if evaluation_only and allow_config_mismatch:
+                logger.warning(message)
+                return
+            raise ValueError(message)
+        mismatches = []
+        for key in required:
+            if key not in saved:
+                mismatches.append(f"{key}: missing")
+                continue
+            if key not in current:
+                mismatches.append(f"{key}: current missing")
+                continue
+            if abs(float(saved[key]) - float(current[key])) > 1e-12:
+                mismatches.append(f"{key}: checkpoint={saved[key]!r}, current={current[key]!r}")
+        if mismatches:
+            message = "checkpoint config_snapshot mismatch: " + "; ".join(mismatches)
+            if evaluation_only and allow_config_mismatch:
+                logger.warning(message)
+                return
+            raise ValueError(message)
+
     def _configure_policy_value_parameterization(self) -> None:
         spec = self._current_value_parameterization()
         modules = list(self.models.values())
@@ -389,7 +448,7 @@ class Trainer:
         pv_spec = getattr(pv_model, "model_spec", None)
         if callable(pv_spec):
             checkpoint["policy_value_model_spec"] = pv_spec()
-        checkpoint["config_snapshot"] = AnalysisEconomicConfig.from_current_config().to_dict()
+        checkpoint["config_snapshot"] = self._current_resume_config_snapshot()
         
         for opt_name, opt in self.optimizers.items():
             checkpoint['optimizers'][opt_name] = opt.state_dict()
@@ -398,7 +457,7 @@ class Trainer:
         torch.save(checkpoint, path)
         logger.info(f"Checkpoint saved: {path}")
     
-    def load_checkpoint(self, name: str):
+    def load_checkpoint(self, name: str, *, evaluation_only: bool = False, allow_config_mismatch: bool = False):
         """
         加载检查点
         """
@@ -409,6 +468,11 @@ class Trainer:
         
         checkpoint = torch.load(path, map_location=self.device)
         self._assert_checkpoint_value_parameterization(checkpoint)
+        self._assert_checkpoint_config_snapshot(
+            checkpoint,
+            evaluation_only=bool(evaluation_only),
+            allow_config_mismatch=bool(allow_config_mismatch),
+        )
         self._configure_policy_value_parameterization()
         
         for model_name, state_dict in checkpoint['models'].items():

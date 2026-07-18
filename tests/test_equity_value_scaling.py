@@ -14,7 +14,10 @@ from experiments.run_scaled_value_ablation import (
     _bellman_economic_spec,
     _bellman_loss_and_metrics,
     _load_batches,
+    _set_full_eval_mode,
+    _set_value_training_mode,
     _split_value_state,
+    _validate_cli_args,
 )
 from losses import P0Loss, PILoss
 from models import PolicyValueModel, build_policy_value_from_checkpoint_spec
@@ -298,6 +301,45 @@ def test_bellman_ablation_only_value_params_change_and_teacher_fixed():
     assert all(torch.equal(teacher_before[k], v) for k, v in teacher.state_dict().items())
 
 
+def test_value_training_mode_only_enables_value_modules():
+    model = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8, dropout=0.5)
+    _set_value_training_mode(model)
+    assert model.value_encoder.training is True
+    assert model.v0_head.training is True
+    assert model.vi_head.training is True
+    assert model.q_encoder.training is False
+    assert model.policy_encoder.training is False
+    assert model.q_head.training is False
+    assert model.bp0_head.training is False
+    assert model.bpi_head.training is False
+    assert model.barz_model.training is False
+    assert model.bari_model.training is False
+    _set_full_eval_mode(model)
+    assert model.training is False
+
+
+def test_dropout_validation_metrics_are_repeatable_and_leave_eval_mode():
+    torch.manual_seed(123)
+    student = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8, dropout=0.5, value_scale_mode="exp_xz")
+    teacher = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8, dropout=0.5, value_scale_mode="exp_xz")
+    teacher.load_state_dict(student.state_dict())
+    parent = _states()
+    batch = {
+        "parent": parent,
+        "children": [parent.clone(), parent.clone()],
+        "m_list": [torch.ones(3, 1), torch.ones(3, 1)],
+        "branch_weights": torch.full((3, 2), 0.5),
+    }
+    _set_full_eval_mode(student)
+    _set_full_eval_mode(teacher)
+    with torch.no_grad():
+        _, first = _bellman_loss_and_metrics(student, teacher, [batch], normalize=True, economic_spec=_econ())
+        _, second = _bellman_loss_and_metrics(student, teacher, [batch], normalize=True, economic_spec=_econ())
+    for key in ("p0_physical_conditional_mean_abs", "pi_physical_conditional_mean_abs"):
+        assert first[key] == pytest.approx(second[key])
+    assert student.training is False
+
+
 def test_scaled_ablation_batch_loader_requires_explicit_m_and_weights(tmp_path: Path):
     parent = _states()
     batch = {
@@ -402,6 +444,24 @@ def test_candidate_improves_current_teacher_even_if_above_historical_best():
     assert _accept_round(start_score, candidate_score, min_round_improvement=0.0) is True
 
 
+def test_scaled_ablation_cli_validation_rejects_invalid_inputs():
+    import argparse
+
+    args = argparse.Namespace(min_round_improvement=0.0, low_z_cutoff=-2.0, high_z_cutoff=2.0, rounds=1, epochs_per_round=1, lr=1e-5)
+    _validate_cli_args(args)
+    for field, value, match in [
+        ("min_round_improvement", -1.0, "nonnegative"),
+        ("low_z_cutoff", 3.0, "low-z-cutoff"),
+        ("rounds", 0, "rounds"),
+        ("epochs_per_round", 0, "epochs-per-round"),
+        ("lr", 0.0, "lr"),
+    ]:
+        bad = argparse.Namespace(**vars(args))
+        setattr(bad, field, value)
+        with pytest.raises(ValueError, match=match):
+            _validate_cli_args(bad)
+
+
 def test_scaled_ablation_rejects_non_double_sampling_and_weighted_aio(tmp_path: Path):
     parent = _states()
     base_batch = {
@@ -476,6 +536,16 @@ def _hash_state(state):
     return h.hexdigest()
 
 
+def _file_sha(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def test_legacy_annotation_preserves_state_hashes_and_warmstarts(tmp_path: Path):
     from scripts.annotate_legacy_equity_checkpoint import main as annotate_main
     from scripts.warmstart_scaled_equity_value import main as warmstart_main
@@ -528,6 +598,62 @@ def test_legacy_annotation_preserves_state_hashes_and_warmstarts(tmp_path: Path)
     finally:
         sys.argv = old_argv
     assert warmed.exists()
+
+
+def test_raw_components_legacy_annotation_packaging_smoke(tmp_path: Path):
+    from scripts.annotate_legacy_equity_checkpoint import main as annotate_main
+
+    models = build_models(torch.device("cpu"))
+    policy_path = tmp_path / "policy.pt"
+    sdf_path = tmp_path / "sdf.pt"
+    hp_path = tmp_path / "hp.json"
+    model_spec_json, config_json = _write_json_payloads(tmp_path)
+    output = tmp_path / "raw_annotated.pt"
+    torch.save(models["policy_value"].state_dict(), policy_path)
+    torch.save(models["sdf_fc1"].state_dict(), sdf_path)
+    hp_path.write_text(json.dumps(HyperParams().__dict__, default=str), encoding="utf-8")
+
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "annotate",
+            "--policy-checkpoint", str(policy_path),
+            "--sdf-checkpoint", str(sdf_path),
+            "--hyperparams-json", str(hp_path),
+            "--model-spec-json", str(model_spec_json),
+            "--economic-config-json", str(config_json),
+            "--output-checkpoint", str(output),
+        ]
+        annotate_main()
+    finally:
+        sys.argv = old_argv
+
+    payload = torch.load(output, map_location="cpu")
+    assert payload["legacy_annotation"]["source_format"] == "raw_components"
+    assert _hash_state(payload["models"]["policy_value"]) == _hash_state(torch.load(policy_path, map_location="cpu"))
+    assert _hash_state(payload["models"]["sdf_fc1"]) == _hash_state(torch.load(sdf_path, map_location="cpu"))
+    assert _hash_state(payload["models"]["firm_target"]) == _hash_state(torch.load(policy_path, map_location="cpu"))
+
+
+def test_legacy_annotation_refuses_existing_scaled_checkpoint(tmp_path: Path):
+    from scripts.annotate_legacy_equity_checkpoint import main as annotate_main
+
+    scaled = tmp_path / "scaled.pt"
+    _combined_checkpoint(scaled, mode="exp_xz")
+    model_spec_json, config_json = _write_json_payloads(tmp_path)
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "annotate",
+            "--legacy-checkpoint", str(scaled),
+            "--model-spec-json", str(model_spec_json),
+            "--economic-config-json", str(config_json),
+            "--output-checkpoint", str(tmp_path / "bad.pt"),
+        ]
+        with pytest.raises(ValueError, match="Refusing to annotate"):
+            annotate_main()
+    finally:
+        sys.argv = old_argv
 
 
 def _write_json_payloads(tmp_path: Path) -> tuple[Path, Path]:
@@ -606,7 +732,12 @@ def test_minimal_scaled_ablation_smoke_and_posttrain_strict_reload(tmp_path: Pat
         {
             "train": [batch, batch],
             "validation": [batch],
-            "metadata": {"m_semantics": "fixed", "shock_bank_hash": "smoke-shock"},
+            "metadata": {
+                "m_semantics": "fixed",
+                "shock_bank_hash": "smoke-shock",
+                "source_checkpoint_sha256": _file_sha(annotated),
+                "sdf_state_hash": _hash_state(torch.load(annotated, map_location="cpu")["models"]["sdf_fc1"]),
+            },
         },
         batches,
     )
@@ -621,7 +752,7 @@ def test_minimal_scaled_ablation_smoke_and_posttrain_strict_reload(tmp_path: Pat
             "--output-dir", str(out_dir),
             "--rounds", "2",
             "--epochs-per-round", "1",
-            "--lr", "0",
+            "--lr", "1e-8",
             "--force-reject-round", "2",
             "--device", "cpu",
         ]
@@ -632,10 +763,100 @@ def test_minimal_scaled_ablation_smoke_and_posttrain_strict_reload(tmp_path: Pat
     summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
     rounds = [row for row in summary["history"] if row.get("stage") == "scaled_posttrain_round"]
     assert [row["accepted"] for row in rounds] == [True, False]
+    assert all(rounds[1]["rollback_restore_checks"].values())
+    assert summary["batch_provenance_verified"] is True
     assert summary["z_region_cutoffs"] == {"low_z_cutoff": -2.0, "high_z_cutoff": 2.0}
     assert summary["bellman_economic_spec"]["DELTA"] == pytest.approx(float(AnalysisEconomicConfig.from_current_config().DELTA))
     loaded = load_analysis_checkpoint(out_dir / "scaled_posttrain_combined.pt", device="cpu")
     assert loaded.metadata["value_parameterization"]["checkpoint"]["mode"] == "exp_xz"
+
+
+def test_positive_lr_value_update_smoke_records_hash_invariants(tmp_path: Path):
+    from experiments.run_scaled_value_ablation import main as ablation_main
+
+    torch.manual_seed(7)
+    models = build_models(torch.device("cpu"))
+    pv = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8, dropout=0.25, value_scale_mode="none")
+    legacy = tmp_path / "legacy_dropout.pt"
+    torch.save(
+        {
+            "models": {
+                "policy_value": pv.state_dict(),
+                "sdf_fc1": models["sdf_fc1"].state_dict(),
+                "firm_target": pv.state_dict(),
+            },
+            "hyperparams": HyperParams().__dict__,
+        },
+        legacy,
+    )
+    annotated = tmp_path / "annotated_dropout.pt"
+    warmed = tmp_path / "warmed_dropout.pt"
+    model_spec_json = tmp_path / "dropout_spec.json"
+    config_json = tmp_path / "dropout_config.json"
+    model_spec_json.write_text(json.dumps({"policy_value_model_spec": pv.model_spec()}), encoding="utf-8")
+    config_json.write_text(json.dumps({"config_snapshot": AnalysisEconomicConfig.from_current_config().to_dict()}), encoding="utf-8")
+
+    from scripts.annotate_legacy_equity_checkpoint import main as annotate_main
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "annotate",
+            "--legacy-checkpoint", str(legacy),
+            "--model-spec-json", str(model_spec_json),
+            "--economic-config-json", str(config_json),
+            "--output-checkpoint", str(annotated),
+        ]
+        annotate_main()
+    finally:
+        sys.argv = old_argv
+    _warmstart(tmp_path, annotated, warmed)
+
+    parent = torch.cat([_states(), _states(), _states(), _states(), _states(), _states()[:1]], dim=0)[:16]
+    batch = {
+        "parent": parent,
+        "children": [parent.clone(), parent.clone()],
+        "m_list": [torch.ones(16, 1), torch.ones(16, 1)],
+        "branch_weights": torch.full((16, 2), 0.5),
+    }
+    batches = tmp_path / "positive_lr_batches.pt"
+    torch.save(
+        {
+            "train": [batch, batch],
+            "validation": [batch],
+            "metadata": {
+                "m_semantics": "fixed",
+                "shock_bank_hash": "positive-lr",
+                "source_checkpoint_sha256": _file_sha(annotated),
+                "sdf_state_hash": _hash_state(torch.load(annotated, map_location="cpu")["models"]["sdf_fc1"]),
+            },
+        },
+        batches,
+    )
+    out_dir = tmp_path / "positive_lr"
+    try:
+        sys.argv = [
+            "ablate",
+            "--baseline-checkpoint", str(annotated),
+            "--scaled-checkpoint", str(warmed),
+            "--batch-data", str(batches),
+            "--output-dir", str(out_dir),
+            "--rounds", "1",
+            "--epochs-per-round", "1",
+            "--lr", "1e-5",
+            "--device", "cpu",
+        ]
+        ablation_main()
+    finally:
+        sys.argv = old_argv
+
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+    round1 = [row for row in summary["history"] if row.get("stage") == "scaled_posttrain_round"][0]
+    assert round1["value_hash_candidate"] != round1["value_hash_before"]
+    assert round1["non_value_hash_candidate"] == round1["non_value_hash_before"]
+    assert round1["teacher_hash_after_training_before_acceptance"] == round1["teacher_hash_before"]
+    assert round1["validation_repeat_1"]["p0_physical_conditional_mean_abs"] == pytest.approx(
+        round1["validation_repeat_2"]["p0_physical_conditional_mean_abs"]
+    )
 
 
 def test_trainer_complete_config_snapshot_and_bellman_normalization_guard(tmp_path: Path):
@@ -650,6 +871,19 @@ def test_trainer_complete_config_snapshot_and_bellman_normalization_guard(tmp_pa
     torch.save(payload, tmp_path / "ckpt" / "bad_norm.pt")
     with pytest.raises(ValueError, match="bellman_normalization"):
         trainer.load_checkpoint("bad_norm")
+
+
+def test_trainer_resume_rejects_config_mismatch_unless_evaluation_override(tmp_path: Path):
+    hp = HyperParams()
+    model = PolicyValueModel()
+    trainer = Trainer({"policy_value": model}, hyperparams=hp, save_dir=tmp_path / "ckpt", log_dir=tmp_path / "log", device=torch.device("cpu"))
+    trainer.save_checkpoint("none")
+    payload = torch.load(tmp_path / "ckpt" / "none.pt", map_location="cpu")
+    payload["config_snapshot"]["DELTA"] = float(payload["config_snapshot"]["DELTA"]) + 0.01
+    torch.save(payload, tmp_path / "ckpt" / "bad_config.pt")
+    with pytest.raises(ValueError, match="config_snapshot mismatch"):
+        trainer.load_checkpoint("bad_config")
+    trainer.load_checkpoint("bad_config", evaluation_only=True, allow_config_mismatch=True)
 
 
 def test_raw_analysis_loader_requires_explicit_model_spec_json(tmp_path: Path):

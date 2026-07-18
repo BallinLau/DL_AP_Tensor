@@ -14,7 +14,7 @@ sys.path.append(str(ROOT / "tests"))
 
 from config.hyperparams import HyperParams
 from experiments.run_utils import build_models
-from analysis.checkpoint_loader import load_analysis_checkpoint
+from analysis.checkpoint_loader import CheckpointSpec, load_analysis_checkpoint
 from analysis.economic_config import AnalysisEconomicConfig
 from analysis.convergence_surface import (
     VectorizedBellmanSurfaceBackend,
@@ -58,6 +58,21 @@ def _write_combined_checkpoint(path: Path):
     return models, hp
 
 
+def _write_raw_sidecars(tmp_path: Path):
+    models = build_models(torch.device("cpu"))
+    policy_path = tmp_path / "policy.pt"
+    sdf_path = tmp_path / "sdf.pt"
+    hp_path = tmp_path / "hp.json"
+    config_path = tmp_path / "config.json"
+    spec_path = tmp_path / "model_spec.json"
+    torch.save(models["policy_value"].state_dict(), policy_path)
+    torch.save(models["sdf_fc1"].state_dict(), sdf_path)
+    hp_path.write_text(json.dumps(HyperParams().__dict__, default=str), encoding="utf-8")
+    config_path.write_text(json.dumps(AnalysisEconomicConfig.from_current_config().to_dict()), encoding="utf-8")
+    spec_path.write_text(json.dumps(models["policy_value"].model_spec()), encoding="utf-8")
+    return models, policy_path, sdf_path, hp_path, config_path, spec_path
+
+
 def test_combined_checkpoint_loads_policy_and_sdf(tmp_path):
     ckpt = tmp_path / "combined.pt"
     _write_combined_checkpoint(ckpt)
@@ -91,6 +106,125 @@ def test_raw_state_dict_requires_hyperparams_unless_default_allowed(tmp_path):
 
     with pytest.raises(ValueError, match="requires hyperparams_json"):
         load_analysis_checkpoint(policy_path, sdf_checkpoint=sdf_path, device="cpu")
+
+
+def test_raw_state_dict_requires_model_spec_json_by_default(tmp_path):
+    _models, policy_path, sdf_path, hp_path, config_path, _spec_path = _write_raw_sidecars(tmp_path)
+    with pytest.raises(ValueError, match="model_spec_json"):
+        load_analysis_checkpoint(
+            policy_path,
+            sdf_checkpoint=sdf_path,
+            hyperparams_json=hp_path,
+            config_json=config_path,
+            device="cpu",
+        )
+
+
+def test_raw_checkpoint_api_loads_with_model_spec_json(tmp_path):
+    _models, policy_path, sdf_path, hp_path, config_path, spec_path = _write_raw_sidecars(tmp_path)
+    loaded = load_analysis_checkpoint(
+        policy_path,
+        sdf_checkpoint=sdf_path,
+        hyperparams_json=hp_path,
+        config_json=config_path,
+        model_spec_json=spec_path,
+        device="cpu",
+    )
+    assert loaded.metadata["checkpoint_format"] == "raw_policy_state_dict"
+    assert loaded.metadata["policy_value_model_spec"]
+
+
+def test_raw_convergence_api_preserves_model_spec_json_with_labels(tmp_path):
+    _models, policy_path, sdf_path, hp_path, config_path, spec_path = _write_raw_sidecars(tmp_path)
+    result = evaluate_checkpoint_convergence_surfaces(
+        [policy_path],
+        checkpoint_labels=["raw"],
+        b_grid=[0.0],
+        z_grid=[0.0],
+        state_mode="fixed_slice",
+        fixed_state={"eta": 1, "i": 0, "x": 0, "hatcf": -2, "lnkf": 4, "hatc_cal": -2, "lnk_cal": 4},
+        sdf_checkpoint=sdf_path,
+        hyperparams_json=hp_path,
+        config_json=config_path,
+        model_spec_json=spec_path,
+        n_child_shocks=2,
+        device="cpu",
+    )
+    assert result.checkpoint_metadata[0]["label"] == "raw"
+    assert result.checkpoint_metadata[0]["policy_value_model_spec"]
+
+
+def test_checkpoint_spec_label_preserves_model_spec_json_and_multi_raw_requires_it(tmp_path):
+    _models, policy_path, sdf_path, hp_path, config_path, spec_path = _write_raw_sidecars(tmp_path)
+    spec = CheckpointSpec(
+        policy_checkpoint=policy_path,
+        sdf_checkpoint=sdf_path,
+        hyperparams_json=hp_path,
+        config_json=config_path,
+        model_spec_json=spec_path,
+    )
+    result = evaluate_checkpoint_convergence_surfaces(
+        [spec],
+        checkpoint_labels=["kept"],
+        b_grid=[0.0],
+        z_grid=[0.0],
+        state_mode="fixed_slice",
+        fixed_state={"eta": 1, "i": 0, "x": 0, "hatcf": -2, "lnkf": 4, "hatc_cal": -2, "lnk_cal": 4},
+        n_child_shocks=2,
+        device="cpu",
+    )
+    assert result.checkpoint_metadata[0]["label"] == "kept"
+    assert result.checkpoint_metadata[0]["policy_value_model_spec"]
+
+    bad = CheckpointSpec(
+        policy_checkpoint=policy_path,
+        sdf_checkpoint=sdf_path,
+        hyperparams_json=hp_path,
+        config_json=config_path,
+    )
+    with pytest.raises(ValueError, match="model spec"):
+        evaluate_checkpoint_convergence_surfaces(
+            [bad, bad],
+            b_grid=[0.0],
+            z_grid=[0.0],
+            state_mode="fixed_slice",
+            fixed_state={"eta": 1, "i": 0, "x": 0, "hatcf": -2, "lnkf": 4, "hatc_cal": -2, "lnk_cal": 4},
+            n_child_shocks=2,
+            device="cpu",
+        )
+
+
+def test_raw_convergence_cli_with_model_spec_json_smoke(tmp_path):
+    from scripts.plot_convergence_surface import main
+
+    _models, policy_path, sdf_path, hp_path, config_path, spec_path = _write_raw_sidecars(tmp_path)
+    old = sys.argv
+    try:
+        sys.argv = [
+            "plot",
+            "--policy-checkpoint", str(policy_path),
+            "--sdf-checkpoint", str(sdf_path),
+            "--hyperparams-json", str(hp_path),
+            "--config-json", str(config_path),
+            "--model-spec-json", str(spec_path),
+            "--state-mode", "fixed_slice",
+            "--eta", "1",
+            "--i", "0",
+            "--x", "0",
+            "--hatcf", "-2",
+            "--lnkf", "4",
+            "--hatc-cal", "-2",
+            "--lnk-cal", "4",
+            "--b-points", "1",
+            "--z-points", "1",
+            "--n-child-shocks", "2",
+            "--output-dir", str(tmp_path / "raw_cli"),
+            "--device", "cpu",
+        ]
+        main()
+    finally:
+        sys.argv = old
+    assert (tmp_path / "raw_cli" / "surface_long.csv").exists()
 
 
 def test_fixed_slice_requires_calculated_macro_state(tmp_path):

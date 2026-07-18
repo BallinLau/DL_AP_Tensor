@@ -15,6 +15,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sdf-checkpoint")
     p.add_argument("--hyperparams-json")
     p.add_argument("--config-json")
+    p.add_argument("--model-spec-json")
     p.add_argument("--allow-default-hyperparams", action="store_true")
     p.add_argument("--allow-current-config", action="store_true")
     p.add_argument("--checkpoint-label", action="append", default=[])
@@ -86,6 +87,7 @@ def main() -> None:
         sdf_checkpoint=args.sdf_checkpoint,
         hyperparams_json=args.hyperparams_json,
         config_json=args.config_json,
+        model_spec_json=args.model_spec_json,
         allow_default_hyperparams=args.allow_default_hyperparams,
         allow_current_config=args.allow_current_config,
         checkpoint_labels=args.checkpoint_label or None,

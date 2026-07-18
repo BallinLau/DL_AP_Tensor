@@ -690,6 +690,7 @@ def _as_checkpoint_specs(
     sdf_checkpoint: Optional[str | Path],
     hyperparams_json: Optional[str | Path],
     config_json: Optional[str | Path],
+    model_spec_json: Optional[str | Path],
     checkpoint_labels: Optional[Sequence[str]],
 ) -> List[CheckpointSpec]:
     specs: List[CheckpointSpec] = []
@@ -702,6 +703,7 @@ def _as_checkpoint_specs(
                 sdf_checkpoint=sdf_checkpoint if len(checkpoint_paths) == 1 else None,
                 hyperparams_json=hyperparams_json if len(checkpoint_paths) == 1 else None,
                 config_json=config_json if len(checkpoint_paths) == 1 else None,
+                model_spec_json=model_spec_json if len(checkpoint_paths) == 1 else None,
             )
         if checkpoint_labels is not None:
             if i >= len(checkpoint_labels):
@@ -712,6 +714,7 @@ def _as_checkpoint_specs(
                 sdf_checkpoint=spec.sdf_checkpoint,
                 hyperparams_json=spec.hyperparams_json,
                 config_json=spec.config_json,
+                model_spec_json=spec.model_spec_json,
                 label=checkpoint_labels[i],
             )
         specs.append(spec)
@@ -720,11 +723,13 @@ def _as_checkpoint_specs(
         raise ValueError("checkpoint labels must be unique")
     if len(specs) > 1:
         for spec in specs:
-            raw_like = spec.policy_checkpoint is not None or (
-                spec.checkpoint_path is not None and Path(spec.checkpoint_path).suffix in {".pt", ".pth"}
-            )
-            if spec.policy_checkpoint is not None and (spec.sdf_checkpoint is None or spec.hyperparams_json is None):
-                raise ValueError("multiple raw checkpoint specs must provide their own sdf and hyperparams paths")
+            if spec.policy_checkpoint is not None and (
+                spec.sdf_checkpoint is None
+                or spec.hyperparams_json is None
+                or spec.config_json is None
+                or spec.model_spec_json is None
+            ):
+                raise ValueError("multiple raw checkpoint specs must provide their own sdf, hyperparams, config, and model spec paths")
     return specs
 
 
@@ -866,6 +871,7 @@ def evaluate_checkpoint_convergence_surfaces(
     sdf_checkpoint: Optional[str | Path] = None,
     hyperparams_json: Optional[str | Path] = None,
     config_json: Optional[str | Path] = None,
+    model_spec_json: Optional[str | Path] = None,
     allow_default_hyperparams: bool = False,
     allow_current_config: bool = False,
     checkpoint_labels: Optional[Sequence[str]] = None,
@@ -899,6 +905,7 @@ def evaluate_checkpoint_convergence_surfaces(
             sdf_checkpoint=sdf_checkpoint,
             hyperparams_json=hyperparams_json,
             config_json=config_json,
+            model_spec_json=model_spec_json,
             allow_default_hyperparams=allow_default_hyperparams,
             allow_current_config=allow_current_config,
             checkpoint_labels=checkpoint_labels,
@@ -934,6 +941,7 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
     sdf_checkpoint: Optional[str | Path],
     hyperparams_json: Optional[str | Path],
     config_json: Optional[str | Path],
+    model_spec_json: Optional[str | Path],
     allow_default_hyperparams: bool,
     allow_current_config: bool,
     checkpoint_labels: Optional[Sequence[str]],
@@ -1043,6 +1051,7 @@ def _evaluate_checkpoint_convergence_surfaces_impl(
         sdf_checkpoint=sdf_checkpoint,
         hyperparams_json=hyperparams_json,
         config_json=config_json,
+        model_spec_json=model_spec_json,
         checkpoint_labels=checkpoint_labels,
     )
     loaded = [

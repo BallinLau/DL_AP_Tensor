@@ -243,6 +243,17 @@ def _freeze_non_value(model: PolicyValueModel) -> None:
             p.requires_grad = True
 
 
+def _set_value_training_mode(model: PolicyValueModel) -> None:
+    model.eval()
+    model.value_encoder.train()
+    model.v0_head.train()
+    model.vi_head.train()
+
+
+def _set_full_eval_mode(model: PolicyValueModel) -> None:
+    model.eval()
+
+
 def _state_hash(model: torch.nn.Module) -> str:
     h = hashlib.sha256()
     for key, value in sorted(model.state_dict().items()):
@@ -258,6 +269,26 @@ def _split_value_state(model: PolicyValueModel) -> Tuple[Dict[str, torch.Tensor]
         target = value if key.startswith(VALUE_KEYS) else non_value
         target[key] = value_tensor.detach().cpu().clone()
     return value, non_value
+
+
+def _tensor_state_hash(state: Dict[str, torch.Tensor]) -> str:
+    h = hashlib.sha256()
+    for key, value in sorted(state.items()):
+        h.update(key.encode())
+        h.update(value.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
+def _objects_equal(a: Any, b: Any) -> bool:
+    if torch.is_tensor(a) or torch.is_tensor(b):
+        return torch.is_tensor(a) and torch.is_tensor(b) and torch.equal(a, b)
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        return isinstance(a, np.ndarray) and isinstance(b, np.ndarray) and np.array_equal(a, b)
+    if isinstance(a, dict) and isinstance(b, dict):
+        return set(a.keys()) == set(b.keys()) and all(_objects_equal(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_objects_equal(x, y) for x, y in zip(a, b))
+    return a == b
 
 
 def _bellman_loss_and_metrics(
@@ -470,6 +501,8 @@ def _accept_round(start_score: float, candidate_score: float, *, min_round_impro
 def _physical_rmse_and_max(a: PolicyValueModel, b: PolicyValueModel, batches: List[Dict[str, Any]]) -> Dict[str, float]:
     v0_err = []
     vi_err = []
+    _set_full_eval_mode(a)
+    _set_full_eval_mode(b)
     with torch.no_grad():
         for batch in batches:
             parent = batch["parent"]
@@ -539,6 +572,19 @@ def _save_combined(
     torch.save(out, path)
 
 
+def _validate_cli_args(args: argparse.Namespace) -> None:
+    if float(args.min_round_improvement) < 0:
+        raise ValueError("--min-round-improvement must be nonnegative")
+    if float(args.low_z_cutoff) >= float(args.high_z_cutoff):
+        raise ValueError("--low-z-cutoff must be smaller than --high-z-cutoff")
+    if int(args.rounds) < 1:
+        raise ValueError("--rounds must be >= 1")
+    if int(args.epochs_per_round) < 1:
+        raise ValueError("--epochs-per-round must be >= 1")
+    if float(args.lr) <= 0:
+        raise ValueError("--lr must be > 0")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--baseline-checkpoint", required=True)
@@ -556,7 +602,9 @@ def main() -> None:
     p.add_argument("--min-round-improvement", type=float, default=0.0)
     p.add_argument("--low-z-cutoff", type=float, default=-2.0)
     p.add_argument("--high-z-cutoff", type=float, default=2.0)
+    p.add_argument("--allow-missing-batch-provenance", action="store_true")
     args = p.parse_args()
+    _validate_cli_args(args)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -576,7 +624,8 @@ def main() -> None:
         log_max=args.value_scale_log_max,
     )
     bellman_economic_spec = dict(lineage["bellman_economic_spec"])
-    baseline.eval().requires_grad_(False)
+    _set_full_eval_mode(baseline)
+    baseline.requires_grad_(False)
     teacher = copy.deepcopy(student).to(device).eval().requires_grad_(False)
     _freeze_non_value(student)
     train_batches, val_batches, batch_metadata = _load_batches(
@@ -585,6 +634,16 @@ def main() -> None:
         assume_equal_branch_weights=bool(args.assume_equal_branch_weights),
     )
     opt = torch.optim.AdamW([p for p in student.parameters() if p.requires_grad], lr=args.lr)
+    expected_checkpoint_hash = _sha256(baseline_path)
+    expected_sdf_hash = lineage.get("sdf_fc1_hash")
+    provenance_errors = []
+    if batch_metadata.get("source_checkpoint_sha256") != expected_checkpoint_hash:
+        provenance_errors.append("source_checkpoint_sha256")
+    if batch_metadata.get("sdf_state_hash") != expected_sdf_hash:
+        provenance_errors.append("sdf_state_hash")
+    batch_provenance_verified = not provenance_errors
+    if provenance_errors and not bool(args.allow_missing_batch_provenance):
+        raise ValueError(f"batch metadata provenance mismatch or missing fields: {provenance_errors}")
 
     eval_batches = val_batches
     metric_kwargs = {
@@ -592,10 +651,14 @@ def main() -> None:
         "low_z_cutoff": float(args.low_z_cutoff),
         "high_z_cutoff": float(args.high_z_cutoff),
     }
-    _, metrics_a = _bellman_loss_and_metrics(baseline, baseline, eval_batches, normalize=False, **metric_kwargs)
-    _, metrics_b = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
-    metrics_b.update(_physical_rmse_and_max(baseline, student, eval_batches))
-    metrics_b.update(_residual_metric_differences(metrics_a, metrics_b, "b_vs_a"))
+    _set_full_eval_mode(baseline)
+    _set_full_eval_mode(student)
+    _set_full_eval_mode(teacher)
+    with torch.no_grad():
+        _, metrics_a = _bellman_loss_and_metrics(baseline, baseline, eval_batches, normalize=False, **metric_kwargs)
+        _, metrics_b = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
+        metrics_b.update(_physical_rmse_and_max(baseline, student, eval_batches))
+        metrics_b.update(_residual_metric_differences(metrics_a, metrics_b, "b_vs_a"))
     value_before, non_value_before = _split_value_state(student)
     teacher_hash_before = _state_hash(teacher)
     best_score = _score(metrics_b)
@@ -609,16 +672,32 @@ def main() -> None:
         torch_rng_state = torch.random.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         teacher_round_hash = _state_hash(teacher)
-        _, start_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
+        value_before_round, non_value_before_round = _split_value_state(student)
+        value_hash_before = _tensor_state_hash(value_before_round)
+        non_value_hash_before = _tensor_state_hash(non_value_before_round)
+        _set_full_eval_mode(student)
+        _set_full_eval_mode(teacher)
+        with torch.no_grad():
+            _, start_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
         start_score = _score(start_metrics)
         best_score_before_round = best_score
         for _ in range(int(args.epochs_per_round)):
             for batch in train_batches:
+                _set_value_training_mode(student)
                 loss, _ = _bellman_loss_and_metrics(student, teacher, [batch], normalize=True, **metric_kwargs)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
-        _, candidate_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
+        value_candidate, non_value_candidate = _split_value_state(student)
+        value_hash_candidate = _tensor_state_hash(value_candidate)
+        non_value_hash_candidate = _tensor_state_hash(non_value_candidate)
+        teacher_hash_after_training_before_acceptance = _state_hash(teacher)
+        _set_full_eval_mode(student)
+        _set_full_eval_mode(teacher)
+        with torch.no_grad():
+            _, candidate_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
+            _, validation_repeat_1 = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
+            _, validation_repeat_2 = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
         score = _score(candidate_metrics)
         accepted = _accept_round(start_score, score, min_round_improvement=float(args.min_round_improvement))
         if int(args.force_reject_round) == round_idx + 1:
@@ -628,8 +707,12 @@ def main() -> None:
             best_score = score
             teacher.load_state_dict(student.state_dict(), strict=True)
             teacher.eval().requires_grad_(False)
-            _, self_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
+            _set_full_eval_mode(student)
+            _set_full_eval_mode(teacher)
+            with torch.no_grad():
+                _, self_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
             restored_metrics = None
+            rollback_restore_checks = None
         else:
             student.load_state_dict(model_state, strict=True)
             opt.load_state_dict(opt_state)
@@ -638,8 +721,23 @@ def main() -> None:
             torch.random.set_rng_state(torch_rng_state)
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state_all(cuda_rng_state)
-            _, restored_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
+            _set_full_eval_mode(student)
+            _set_full_eval_mode(teacher)
+            with torch.no_grad():
+                _, restored_metrics = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
             self_metrics = None
+            rollback_restore_checks = {
+                "student_state": all(torch.equal(model_state[k], v) for k, v in student.state_dict().items()),
+                "optimizer_state": _objects_equal(opt_state, opt.state_dict()),
+                "python_rng": _objects_equal(py_rng_state, random.getstate()),
+                "numpy_rng": _objects_equal(np_rng_state, np.random.get_state()),
+                "torch_cpu_rng": torch.equal(torch_rng_state, torch.random.get_rng_state()),
+                "cuda_rng": (
+                    True
+                    if cuda_rng_state is None
+                    else _objects_equal(cuda_rng_state, torch.cuda.get_rng_state_all())
+                ),
+            }
         history.append({
             "stage": "scaled_posttrain_round",
             "round": round_idx + 1,
@@ -654,9 +752,21 @@ def main() -> None:
             "candidate_metrics": candidate_metrics,
             "restored_metrics": restored_metrics,
             "self_metrics_after_accept": self_metrics,
+            "rollback_restore_checks": rollback_restore_checks,
+            "value_hash_before": value_hash_before,
+            "value_hash_candidate": value_hash_candidate,
+            "non_value_hash_before": non_value_hash_before,
+            "non_value_hash_candidate": non_value_hash_candidate,
+            "teacher_hash_before": teacher_round_hash,
+            "teacher_hash_after_training_before_acceptance": teacher_hash_after_training_before_acceptance,
+            "validation_repeat_1": validation_repeat_1,
+            "validation_repeat_2": validation_repeat_2,
         })
 
-    _, metrics_c = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
+    _set_full_eval_mode(student)
+    _set_full_eval_mode(teacher)
+    with torch.no_grad():
+        _, metrics_c = _bellman_loss_and_metrics(student, teacher, eval_batches, normalize=True, **metric_kwargs)
     metrics_c.update(_residual_metric_differences(metrics_a, metrics_c, "c_vs_a"))
     for region in ("low_z", "mid_z", "high_z", "full"):
         c_p0 = metrics_c.get("regions", {}).get("p0", {}).get(region, {}).get("conditional_mean_abs", float("nan"))
@@ -687,6 +797,9 @@ def main() -> None:
         "scaled_posttrain": metrics_c,
         "shock_hash": hashlib.sha256(Path(args.batch_data).read_bytes()).hexdigest(),
         "batch_metadata": batch_metadata,
+        "batch_provenance_verified": bool(batch_provenance_verified),
+        "batch_provenance_override": bool(args.allow_missing_batch_provenance),
+        "batch_provenance_errors": provenance_errors,
         "lineage": lineage,
         "bellman_economic_spec": bellman_economic_spec,
         "z_region_cutoffs": {"low_z_cutoff": float(args.low_z_cutoff), "high_z_cutoff": float(args.high_z_cutoff)},

@@ -174,6 +174,7 @@ def load_analysis_checkpoint(
                 raise ValueError("unsupported hyperparams payload in combined checkpoint")
         else:
             checkpoint_format = "raw_policy_state_dict"
+            payload_for_config = None
             policy_state = payload
             checkpoint_value_parameterization = None
             if m_source == "sdf_fc1" and sdf_checkpoint is None:
