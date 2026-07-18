@@ -107,7 +107,6 @@ def load_analysis_checkpoint(
     allow_current_config: bool = False,
     m_source: str = "sdf_fc1",
     label: Optional[str] = None,
-    allow_value_parameterization_migration: bool = False,
 ) -> AnalysisCheckpoint:
     if m_source != "sdf_fc1":
         raise ValueError("Only m_source='sdf_fc1' is supported by convergence surface analysis")
@@ -202,13 +201,19 @@ def load_analysis_checkpoint(
     checkpoint_mode = "none"
     if isinstance(checkpoint_value_parameterization, dict):
         checkpoint_mode = str(checkpoint_value_parameterization.get("mode", "none")).lower()
-    if checkpoint_mode != current_mode and not allow_value_parameterization_migration and not bool(
-        getattr(hyperparams, "allow_value_parameterization_migration", False)
-    ):
+    checkpoint_log_max = float(checkpoint_value_parameterization.get("log_max", 20.0)) if isinstance(checkpoint_value_parameterization, dict) else 20.0
+    checkpoint_formula = (
+        str(checkpoint_value_parameterization.get("scale_formula", "1"))
+        if isinstance(checkpoint_value_parameterization, dict)
+        else "1"
+    )
+    current_formula = f"1+exp(clamp(x+z,max={current_log_max:g}))" if current_mode == "exp_xz" else "1"
+    if checkpoint_mode != current_mode or abs(checkpoint_log_max - current_log_max) > 1e-12 or checkpoint_formula != current_formula:
         raise ValueError(
             "Refusing to load policy_value checkpoint with value_parameterization "
-            f"mode={checkpoint_mode!r} into current mode={current_mode!r}; "
-            "use an explicit warm-start migration."
+            f"mode/log_max/formula=({checkpoint_mode!r}, {checkpoint_log_max}, {checkpoint_formula!r}) "
+            f"into current ({current_mode!r}, {current_log_max}, {current_formula!r}); "
+            "use warmstart_scaled_equity_value.py to create a migrated checkpoint."
         )
     configure_policy = getattr(models["policy_value"], "configure_value_parameterization", None)
     if callable(configure_policy):

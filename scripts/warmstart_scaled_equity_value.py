@@ -3,15 +3,40 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from config import HyperParams, SIMMODEL
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from config import HyperParams
 from models import PolicyValueModel
+from analysis.economic_config import AnalysisEconomicConfig
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _as_hp_dict(payload: object) -> dict:
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, HyperParams):
+        return dict(payload.__dict__)
+    raise ValueError("combined baseline checkpoint hyperparams must be a dict or HyperParams")
 
 
 def _load_parent_states(path: str | None, n_states: int, seed: int) -> torch.Tensor:
@@ -67,10 +92,20 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
+    baseline_path = Path(args.baseline_policy_checkpoint)
+    payload = torch.load(baseline_path, map_location=device)
+    if not isinstance(payload, dict) or "models" not in payload or "policy_value" not in payload["models"]:
+        raise ValueError("warm-start requires a combined baseline checkpoint with models.policy_value")
+    source_value_meta = payload.get("value_parameterization") or {"mode": "none", "scale_formula": "1", "log_max": 20.0}
+    if str(source_value_meta.get("mode", "none")).lower() != "none":
+        raise ValueError("warm-start baseline must be mode='none'; scaled inputs must not be migrated again")
+    if "hyperparams" not in payload:
+        raise ValueError("combined baseline checkpoint is missing hyperparams")
+    if "config_snapshot" not in payload:
+        raise ValueError("combined baseline checkpoint is missing config_snapshot")
+
     teacher = PolicyValueModel(value_scale_mode="none").to(device)
-    state = torch.load(args.baseline_policy_checkpoint, map_location=device)
-    if isinstance(state, dict) and "models" in state:
-        state = state["models"]["policy_value"]
+    state = payload["models"]["policy_value"]
     teacher.load_state_dict(state, strict=True)
     teacher.eval().requires_grad_(False)
 
@@ -120,18 +155,29 @@ def main() -> None:
     hp.pv_bellman_normalize_by_value_scale = True
     out = Path(args.output_checkpoint)
     out.parent.mkdir(parents=True, exist_ok=True)
+    models_payload = dict(payload["models"])
+    models_payload["policy_value"] = student.state_dict()
+    if "firm_target" not in models_payload:
+        models_payload["firm_target"] = student.state_dict()
     torch.save(
         {
-            "models": {"policy_value": student.state_dict()},
-            "hyperparams": hp.__dict__,
+            **{k: v for k, v in payload.items() if k not in {"models", "hyperparams", "value_parameterization"}},
+            "models": models_payload,
+            "hyperparams": {**_as_hp_dict(payload.get("hyperparams")), **hp.__dict__},
+            "config_snapshot": payload.get("config_snapshot", AnalysisEconomicConfig.from_current_config().to_dict()),
             "value_parameterization": {
                 "mode": "exp_xz",
                 "scale_formula": f"1+exp(clamp(x+z,max={float(args.value_scale_log_max):g}))",
                 "bellman_normalization": True,
                 "log_max": float(args.value_scale_log_max),
             },
-            "warmstart_source": str(args.baseline_policy_checkpoint),
-            "warmstart_seed": int(args.seed),
+            "warmstart": {
+                "source": str(baseline_path),
+                "source_sha256": _sha256(baseline_path),
+                "seed": int(args.seed),
+                "copied_modules": ["q_encoder", "q_head", "policy_encoder", "bp0_head", "bpi_head"],
+                "trained_modules": ["value_encoder", "v0_head", "vi_head"],
+            },
         },
         out,
     )

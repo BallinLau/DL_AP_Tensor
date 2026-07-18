@@ -71,6 +71,7 @@ class Trainer:
         # 优化器
         self.optimizers = self._init_optimizers()
         self.firm_target = self._init_firm_target()
+        self._configure_policy_value_parameterization()
         
         # 训练状态
         self.current_episode = 0
@@ -80,6 +81,41 @@ class Trainer:
         
         # 设置日志
         self._setup_logging()
+
+    def _current_value_parameterization(self) -> Dict[str, object]:
+        mode = str(getattr(self.hyperparams, "pv_value_scale_mode", "none")).lower()
+        log_max = float(getattr(self.hyperparams, "pv_value_scale_log_max", 20.0))
+        return {
+            "mode": mode,
+            "scale_formula": f"1+exp(clamp(x+z,max={log_max:g}))" if mode == "exp_xz" else "1",
+            "bellman_normalization": bool(getattr(self.hyperparams, "pv_bellman_normalize_by_value_scale", False)),
+            "log_max": log_max,
+        }
+
+    def _configure_policy_value_parameterization(self) -> None:
+        spec = self._current_value_parameterization()
+        modules = list(self.models.values())
+        if self.firm_target is not None:
+            modules.append(self.firm_target)
+        for model in modules:
+            configure = getattr(model, "configure_value_parameterization", None)
+            if callable(configure):
+                configure(mode=str(spec["mode"]), log_max=float(spec["log_max"]))
+
+    def _assert_checkpoint_value_parameterization(self, checkpoint: Dict) -> None:
+        expected = self._current_value_parameterization()
+        actual = checkpoint.get("value_parameterization") or {"mode": "none", "scale_formula": "1", "log_max": 20.0}
+        for key in ("mode", "scale_formula"):
+            if str(actual.get(key)) != str(expected.get(key)):
+                raise ValueError(
+                    f"checkpoint value_parameterization {key} mismatch: "
+                    f"{actual.get(key)!r} != {expected.get(key)!r}"
+                )
+        if abs(float(actual.get("log_max", 20.0)) - float(expected["log_max"])) > 1e-12:
+            raise ValueError(
+                "checkpoint value_parameterization log_max mismatch: "
+                f"{actual.get('log_max')!r} != {expected['log_max']!r}"
+            )
 
     def _init_firm_target(self) -> Optional[nn.Module]:
         """
@@ -355,12 +391,15 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         
         checkpoint = torch.load(path, map_location=self.device)
+        self._assert_checkpoint_value_parameterization(checkpoint)
+        self._configure_policy_value_parameterization()
         
         for model_name, state_dict in checkpoint['models'].items():
             if model_name in self.models and self.models[model_name] is not None:
                 self.models[model_name].load_state_dict(state_dict)
             elif model_name == 'firm_target' and self.firm_target is not None:
                 self.firm_target.load_state_dict(state_dict)
+        self._configure_policy_value_parameterization()
 
         if self.firm_target is not None and 'firm_target' not in checkpoint.get('models', {}):
             hard_update(self.firm_target, self.models['policy_value'])
@@ -434,52 +473,64 @@ class Trainer:
         评估模型
         """
         logger.info("Evaluating model...")
+        pv_model = self.models.get('policy_value') if isinstance(self.models, dict) else None
+        pv_mode = getattr(pv_model, "value_scale_mode", None)
+        pv_log_max = getattr(pv_model, "value_scale_log_max", None)
+        was_training = {name: model.training for name, model in self.models.items() if model is not None}
         
-        # 设置为评估模式
-        for model in self.models.values():
-            if model is not None:
-                model.eval()
-        
-        # 生成评估数据
-        if df is None:
-            episode = Episode(
-                models=self.models,
-                optimizers={},
-                config=self.config,
-                device=self.device
-            )
-            df = episode.generate_data(mode='sample', n_samples=n_samples)
-            episode.fill_fc1()
-            episode.fill_policy_value()
-        
-        # 计算各项指标
-        metrics = {}
-        
-        # 杠杆分布
-        b = df['b'].values
-        metrics['b_mean'] = float(np.mean(b))
-        metrics['b_std'] = float(np.std(b))
-        metrics['b_q05'] = float(np.percentile(b, 5))
-        metrics['b_q95'] = float(np.percentile(b, 95))
-        
-        # 如果有 Policy 输出
-        if 'P0' in df.columns:
-            metrics['P0_mean'] = float(df['P0'].mean())
-            metrics['PI_mean'] = float(df['PI'].mean())
-            metrics['bar_z_mean'] = float(df.get('Bar_z', pd.Series([0])).mean())
-        
-        # 资源核算（如果有）
-        if 'Y' in df.columns:
-            K = df['K'].values
-            Y = df['Y'].values
-            C = df['C'].values
+        try:
+            # 设置为评估模式
+            for model in self.models.values():
+                if model is not None:
+                    model.eval()
             
-            metrics['Y_K_ratio'] = float(np.mean(Y) / np.mean(K))
-            metrics['C_Y_ratio'] = float(np.mean(C) / np.mean(Y))
-        
-        logger.info(f"Evaluation metrics: {metrics}")
-        
-        return metrics
+            # 生成评估数据
+            if df is None:
+                episode = Episode(
+                    models=self.models,
+                    optimizers={},
+                    config=self.config,
+                    hyperparams=self.hyperparams,
+                    device=self.device
+                )
+                df = episode.generate_data(mode='sample', n_samples=n_samples)
+                episode.fill_fc1()
+                episode.fill_policy_value()
+            
+            # 计算各项指标
+            metrics = {}
+            
+            # 杠杆分布
+            b = df['b'].values
+            metrics['b_mean'] = float(np.mean(b))
+            metrics['b_std'] = float(np.std(b))
+            metrics['b_q05'] = float(np.percentile(b, 5))
+            metrics['b_q95'] = float(np.percentile(b, 95))
+            
+            # 如果有 Policy 输出
+            if 'P0' in df.columns:
+                metrics['P0_mean'] = float(df['P0'].mean())
+                metrics['PI_mean'] = float(df['PI'].mean())
+                metrics['bar_z_mean'] = float(df.get('Bar_z', pd.Series([0])).mean())
+            # 资源核算（如果有）
+            if 'Y' in df.columns:
+                K = df['K'].values
+                Y = df['Y'].values
+                C = df['C'].values
+                
+                metrics['Y_K_ratio'] = float(np.mean(Y) / np.mean(K))
+                metrics['C_Y_ratio'] = float(np.mean(C) / np.mean(Y))
+            
+            logger.info(f"Evaluation metrics: {metrics}")
+            return metrics
+        finally:
+            for name, model in self.models.items():
+                if model is not None:
+                    model.train(was_training.get(name, False))
+            if pv_model is not None and pv_mode is not None:
+                configure = getattr(pv_model, "configure_value_parameterization", None)
+                if callable(configure):
+                    configure(mode=str(pv_mode), log_max=float(pv_log_max))
     
     def diagnose(self) -> Dict:
         """

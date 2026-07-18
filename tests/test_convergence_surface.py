@@ -666,6 +666,20 @@ def test_fixed_grid_outputs_full_domain_without_reference_or_support(tmp_path):
     assert not (out / "support_mask.png").exists()
     assert result.shock_bank_metadata["shock_bank_base_shape"] == [1, 2, 1]
     assert result.shock_bank_metadata["shock_bank_storage_numel"] == 4 * 1 * 2
+    p0_rows = result.long_table[result.long_table["equation"] == "p0"]
+    pi_rows = result.long_table[result.long_table["equation"] == "pi"]
+    assert np.allclose(
+        p0_rows["V0_physical"].to_numpy() - p0_rows["CF0"].to_numpy() - p0_rows["continuation_P0"].to_numpy(),
+        p0_rows["conditional_signed_physical"].to_numpy(),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert np.allclose(
+        pi_rows["VI_physical"].to_numpy() - pi_rows["CFI"].to_numpy() - pi_rows["continuation_PI"].to_numpy(),
+        pi_rows["conditional_signed_physical"].to_numpy(),
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 def test_fixed_grid_chunk_size_invariance(tmp_path):
