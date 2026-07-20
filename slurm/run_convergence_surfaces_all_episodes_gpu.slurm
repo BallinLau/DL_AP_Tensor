@@ -64,7 +64,7 @@ INCLUDE_SIGNED="${INCLUDE_SIGNED:-1}"
 HYPERPARAMS_JSON="${HYPERPARAMS_JSON:-}"
 CONFIG_JSON="${CONFIG_JSON:-}"
 EPISODES="${EPISODES:-}"
-REQUIRED_COMMIT="${REQUIRED_COMMIT:-06b1f0786462bd443bd18ee458bfc4bdecaa67b8}"
+REQUIRED_COMMIT="${REQUIRED_COMMIT:-84b9d5ed24758124a2cbb21cf81ccd828cae898e}"
 FIXED_ETA="${FIXED_ETA:-}"
 FIXED_I="${FIXED_I:-}"
 FIXED_X="${FIXED_X:-}"
@@ -72,6 +72,10 @@ FIXED_HATCF="${FIXED_HATCF:-}"
 FIXED_LNKF="${FIXED_LNKF:-}"
 FIXED_HATC_CAL="${FIXED_HATC_CAL:-}"
 FIXED_LNK_CAL="${FIXED_LNK_CAL:-}"
+AUTO_FIXED_CONTEXT="${AUTO_FIXED_CONTEXT:-1}"
+FIXED_CONTEXT_EPISODE="${FIXED_CONTEXT_EPISODE:-9}"
+FIXED_CONTEXT_FIRM_PKL="${FIXED_CONTEXT_FIRM_PKL:-$DATA_OUTPUT_DIR/ep${FIXED_CONTEXT_EPISODE}_stage_modeb.pkl}"
+FIXED_CONTEXT_MACRO_PKL="${FIXED_CONTEXT_MACRO_PKL:-$DATA_OUTPUT_DIR/ep${FIXED_CONTEXT_EPISODE}_stage_modeb_macro.pkl}"
 LOG_RESIDUAL_SCALE="${LOG_RESIDUAL_SCALE:-0}"
 
 mkdir -p "$LOG_DIR" "$OUTPUT_ROOT" "$WORK_ROOT/.mplcache"
@@ -116,6 +120,10 @@ echo "PACKAGE_ANALYSIS_CHECKPOINTS=$PACKAGE_ANALYSIS_CHECKPOINTS"
 echo "PACKAGING_TRAINING_COMMIT=$PACKAGING_TRAINING_COMMIT"
 echo "VALUE_SCALE_LOG_MAX=$VALUE_SCALE_LOG_MAX"
 echo "EPISODES=${EPISODES:-auto}"
+echo "AUTO_FIXED_CONTEXT=$AUTO_FIXED_CONTEXT"
+echo "FIXED_CONTEXT_EPISODE=$FIXED_CONTEXT_EPISODE"
+echo "FIXED_CONTEXT_FIRM_PKL=$FIXED_CONTEXT_FIRM_PKL"
+echo "FIXED_CONTEXT_MACRO_PKL=$FIXED_CONTEXT_MACRO_PKL"
 echo "LOG_RESIDUAL_SCALE=$LOG_RESIDUAL_SCALE"
 echo "============================================================"
 
@@ -125,9 +133,91 @@ for name in FIXED_ETA FIXED_I FIXED_X FIXED_HATCF FIXED_LNKF FIXED_HATC_CAL FIXE
         missing_fixed+=("$name")
     fi
 done
+if [[ "${#missing_fixed[@]}" -gt 0 && "$AUTO_FIXED_CONTEXT" == "1" ]]; then
+    if [[ ! -f "$FIXED_CONTEXT_FIRM_PKL" ]]; then
+        echo "ERROR: AUTO_FIXED_CONTEXT cannot find firm pickle: $FIXED_CONTEXT_FIRM_PKL"
+        exit 1
+    fi
+    if [[ ! -f "$FIXED_CONTEXT_MACRO_PKL" ]]; then
+        echo "ERROR: AUTO_FIXED_CONTEXT cannot find macro pickle: $FIXED_CONTEXT_MACRO_PKL"
+        exit 1
+    fi
+
+    FIXED_CONTEXT_ENV="$OUTPUT_ROOT/fixed_context.env"
+    export FIXED_CONTEXT_FIRM_PKL
+    export FIXED_CONTEXT_MACRO_PKL
+    export FIXED_CONTEXT_ENV
+    python3 - <<'PY'
+import os
+from pathlib import Path
+
+import pandas as pd
+
+
+def column(df, *candidates):
+    for name in candidates:
+        if name in df.columns:
+            return name
+    raise KeyError(f"None of {candidates} found. Available={list(df.columns)}")
+
+
+firm = pd.read_pickle(Path(os.environ["FIXED_CONTEXT_FIRM_PKL"]))
+macro = pd.read_pickle(Path(os.environ["FIXED_CONTEXT_MACRO_PKL"]))
+
+if "branch" in firm.columns:
+    branch = pd.to_numeric(firm["branch"], errors="coerce")
+    if (branch == -1).any():
+        firm = firm[branch == -1]
+    else:
+        firm = firm[branch <= 0]
+
+if "branch" in macro.columns:
+    branch = pd.to_numeric(macro["branch"], errors="coerce")
+    if (branch == -1).any():
+        macro = macro[branch == -1]
+
+eta_col = column(firm, "ETA", "eta")
+i_col = column(firm, "i", "I")
+x_col = column(firm, "x", "X")
+hatcf_col = column(firm, "Hatcf", "hatcf", "HatcF")
+lnkf_col = column(firm, "LnKF", "lnkf", "LnKf")
+hatc_col = column(macro, "Hatc", "hatc_cal", "Hatc_cal", "hatc")
+lnk_col = column(macro, "LnK", "lnk_cal", "LnK_cal", "lnk")
+
+values = {
+    "FIXED_ETA": float(firm[eta_col].median()),
+    "FIXED_I": float(firm[i_col].median()),
+    "FIXED_X": float(firm[x_col].median()),
+    "FIXED_HATCF": float(firm[hatcf_col].median()),
+    "FIXED_LNKF": float(firm[lnkf_col].median()),
+    "FIXED_HATC_CAL": float(macro[hatc_col].median()),
+    "FIXED_LNK_CAL": float(macro[lnk_col].median()),
+}
+
+out = Path(os.environ["FIXED_CONTEXT_ENV"])
+out.parent.mkdir(parents=True, exist_ok=True)
+with out.open("w", encoding="utf-8") as f:
+    for key, value in values.items():
+        f.write(f'{key}="{value:.17g}"\n')
+
+print(f"Wrote fixed context: {out}")
+for key, value in values.items():
+    print(f"  {key}={value:.12g}")
+PY
+    # shellcheck disable=SC1090
+    source "$FIXED_CONTEXT_ENV"
+
+    missing_fixed=()
+    for name in FIXED_ETA FIXED_I FIXED_X FIXED_HATCF FIXED_LNKF FIXED_HATC_CAL FIXED_LNK_CAL; do
+        if [[ -z "${!name}" ]]; then
+            missing_fixed+=("$name")
+        fi
+    done
+fi
 if [[ "${#missing_fixed[@]}" -gt 0 ]]; then
     echo "ERROR: fixed_grid requires these environment variables:"
     printf '  %s\n' "${missing_fixed[@]}"
+    echo "Set AUTO_FIXED_CONTEXT=1 with valid FIXED_CONTEXT_FIRM_PKL/FIXED_CONTEXT_MACRO_PKL, or export all FIXED_* variables manually."
     exit 1
 fi
 
