@@ -87,6 +87,11 @@ def _episode() -> Episode:
     return episode
 
 
+def test_episode_pi_b_penalty_disabled_for_normalized_training():
+    episode = _episode()
+    assert episode.loss_fns["pi"].b_penalty_weight == 0.0
+
+
 def test_target_grid_component_decomposition_matches_joint_loss():
     episode = _episode()
     batch = _batch(episode.device)

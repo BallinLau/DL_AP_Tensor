@@ -1013,7 +1013,7 @@ class Episode:
                 wealth_loss_mode=getattr(self.hyperparams, "sdf_wealth_loss_mode", "legacy_abs_log1p")
             ),
             'p0': P0Loss(),
-            'pi': PILoss(),
+            'pi': PILoss(b_penalty_weight=0.0),
             'q': QLoss(),
             'fc2': FC2Loss() if 'fc2' in self.models else None
         }
