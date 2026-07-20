@@ -1462,13 +1462,15 @@ def _overlay_default_and_threshold(
     *,
     residual_threshold: Optional[float],
 ) -> None:
+    from matplotlib.lines import Line2D
+
     handles = []
     labels = []
     if _fixed_boundary_status(phat_grid) == "observed":
         cs = ax.contour(b_values, z_values, phat_grid, levels=[0.0], colors="black", linewidths=1.3)
-        if cs.collections:
-            handles.append(cs.collections[0])
-            labels.append("default boundary: Phat=0")
+        _clip_contour_to_axes(ax, cs)
+        handles.append(Line2D([0], [0], color="black", linewidth=1.3))
+        labels.append("default boundary: Phat=0")
     finite_abs = abs_grid[np.isfinite(abs_grid)]
     if (
         residual_threshold is not None
@@ -1484,11 +1486,32 @@ def _overlay_default_and_threshold(
             linewidths=1.0,
             linestyles="dashed",
         )
-        if cs_thr.collections:
-            handles.append(cs_thr.collections[0])
-            labels.append(f"conditional_abs={float(residual_threshold):g}")
+        _clip_contour_to_axes(ax, cs_thr)
+        handles.append(Line2D([0], [0], color="white", linewidth=1.0, linestyle="dashed"))
+        labels.append(f"conditional_abs={float(residual_threshold):g}")
     if handles:
         ax.legend(handles, labels, loc="best", fontsize=8)
+
+
+def _clip_contour_to_axes(ax: Any, contour: Any) -> None:
+    artists = [contour]
+    if not (hasattr(contour, "legend_elements") or hasattr(contour, "get_paths")):
+        artists.extend(list(getattr(contour, "collections", []) or []))
+    unique_artists = []
+    seen = set()
+    for artist in artists:
+        ident = id(artist)
+        if ident not in seen:
+            seen.add(ident)
+            unique_artists.append(artist)
+    artists = unique_artists
+    for artist in artists:
+        if hasattr(artist, "set_clip_on"):
+            artist.set_clip_on(True)
+        if hasattr(artist, "set_clip_box"):
+            artist.set_clip_box(ax.bbox)
+        if hasattr(artist, "set_clip_path"):
+            artist.set_clip_path(ax.patch.get_path(), ax.patch.get_transform())
 
 
 def plot_fixed_grid_collection(

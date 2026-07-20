@@ -24,6 +24,7 @@ from analysis.convergence_surface import (
     _extract_default_boundary_rows,
     _fixed_boundary_status,
     _grid_center_extent,
+    _overlay_default_and_threshold,
 )
 from analysis.convergence_transition import (
     ChildExogenousBundle,
@@ -934,6 +935,36 @@ def test_grid_center_extent_aligns_image_cells_to_contour_centers():
 def test_boundary_status_reports_partial_nonfinite():
     phat = np.array([[1.0, np.nan], [-1.0, 0.5]])
     assert _fixed_boundary_status(phat) == "partial_nonfinite"
+
+
+def test_default_boundary_overlay_is_clipped_to_axes():
+    import matplotlib.pyplot as plt
+
+    b = np.array([0.0, 0.5, 1.0])
+    z = np.array([-2.0, 0.0, 2.0])
+    phat = np.array([
+        [-1.0, -0.5, -0.2],
+        [-0.5, 0.0, 0.5],
+        [0.2, 0.5, 1.0],
+    ])
+    abs_grid = np.ones_like(phat)
+
+    fig, ax = plt.subplots()
+    try:
+        _overlay_default_and_threshold(
+            ax,
+            b,
+            z,
+            phat,
+            abs_grid,
+            residual_threshold=None,
+        )
+        assert ax.collections
+        for collection in ax.collections:
+            assert collection.get_clip_on() is True
+            assert collection.get_clip_path() is not None or collection.get_clip_box() is not None
+    finally:
+        plt.close(fig)
 
 
 def test_fixed_grid_workload_guard_reports_dimensions(tmp_path):
