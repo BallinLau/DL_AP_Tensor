@@ -123,8 +123,8 @@ def load_analysis_checkpoint(
     m_source: str = "sdf_fc1",
     label: Optional[str] = None,
 ) -> AnalysisCheckpoint:
-    if m_source != "sdf_fc1":
-        raise ValueError("Only m_source='sdf_fc1' is supported by convergence surface analysis")
+    if m_source not in {"sdf_fc1", "none"}:
+        raise ValueError("m_source must be 'sdf_fc1' or 'none'")
     device = torch.device(device)
     models = build_models(device)
     missing_optional_fields = []
@@ -153,7 +153,7 @@ def load_analysis_checkpoint(
             if "sdf_fc1" not in model_states and m_source == "sdf_fc1":
                 raise ValueError("combined checkpoint is missing models['sdf_fc1']")
             policy_state = model_states["policy_value"]
-            sdf_state = model_states.get("sdf_fc1")
+            sdf_state = model_states.get("sdf_fc1") if m_source == "sdf_fc1" else None
             firm_target_state = model_states.get("firm_target")
             checkpoint_value_parameterization = payload.get("value_parameterization")
             if firm_target_state is None:
