@@ -285,6 +285,7 @@ def test_frozen_transition_children_use_state_dependent_ar1_and_sdf_m():
     assert expected_z_difference != pytest.approx(8.0)
     assert not torch.allclose(m_list[0], m_list[1])
     assert metadata["builder"] == "ConvergenceShockBank+build_child_exogenous_bundle"
+    assert 0.0 <= metadata["eta_next_active_share"] <= 1.0
 
 
 def test_bp_consistency_primary_statistics_use_survival_mask():
@@ -390,6 +391,7 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
     assert metadata["grid"]["eta"] == 1.0
     assert metadata["reference_state"]["n_parent_rows"] == 6
     assert metadata["reference_transition_bank"]["m_source"] == "sdf_fc1.forward_step"
+    assert 0.0 <= metadata["reference_transition_bank"]["eta_next_active_share"] <= 1.0
     assert metadata["bp_teacher_model"] == "policy_value"
     assert metadata["reference_transition_bank"]["bp_teacher_model"] == "policy_value"
 
@@ -405,3 +407,10 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
         pd.read_csv(out_b / "objective_slices" / "p0_b_mid_z_mid.csv"),
         check_exact=True,
     )
+    objective = pd.read_csv(out_a / "objective_slices" / "p0_b_mid_z_mid.csv")
+    assert {
+        "eta_next_active_share",
+        "child_b_mean",
+        "child_b_eta0_mean",
+        "child_b_eta1_mean",
+    }.issubset(objective.columns)

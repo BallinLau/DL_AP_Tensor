@@ -110,6 +110,7 @@ def build_frozen_transition_children(
         "m_mode": "clipped_train_m" if use_clipped_m else "raw_sdf_m",
         "m_raw_mean": float(bundle.m_raw.detach().mean().item()),
         "m_raw_std": float(bundle.m_raw.detach().std(unbiased=False).item()),
+        "eta_next_active_share": float(bundle.eta_next.detach().mean().item()),
     }
     return children, m_list, metadata
 
@@ -183,6 +184,10 @@ def _objective_frame(result: Dict[str, torch.Tensor], pos: int) -> pd.DataFrame:
         "q_issue": "coarse_q_issue_grid",
         "p_child_mean": "coarse_p_child_grid_mean",
         "default_mean": "coarse_default_grid_mean",
+        "eta_next_active_share": "coarse_eta_next_active_share",
+        "child_b_mean": "coarse_child_b_mean",
+        "child_b_eta0_mean": "coarse_child_b_eta0_mean",
+        "child_b_eta1_mean": "coarse_child_b_eta1_mean",
     }
     data = {
         name: result[key][pos].detach().cpu().numpy().astype(np.float64)

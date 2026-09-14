@@ -103,9 +103,9 @@ def test_target_grid_loss_logs_mix_regret_and_freezes_target_gradients():
     for key in required_active_diag_keys:
         assert key in episode._latest_pi_terms
         assert torch.isfinite(torch.tensor(episode._latest_pi_terms[key]))
-    assert episode._latest_pi_terms["mix_grid_refi_active_n"] == 1.0
+    assert episode._latest_pi_terms["mix_grid_refi_active_n"] == 2.0
     assert episode._latest_pi_terms["mix_grid_refi_active_available"] == 1.0
-    assert episode._latest_pi_terms["mix_grid_refi_active_share"] == 0.5
+    assert episode._latest_pi_terms["mix_grid_refi_active_share"] == 1.0
 
     online_grad = [
         p.grad.detach().abs().sum().item()
@@ -273,7 +273,7 @@ def test_bp_grid_boundary_low_threshold_is_explicit_hyperparameter():
     assert hp.bp_grid_boundary_low_threshold == 0.05
 
 
-def test_target_grid_policy_convergence_skips_without_active_refinancing():
+def test_parent_eta_zero_does_not_skip_policy_convergence():
     device = torch.device("cpu")
     Config.DEVICE = device
     online = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8).to(device)
@@ -293,13 +293,11 @@ def test_target_grid_policy_convergence_skips_without_active_refinancing():
 
     assert result["enabled"] is True
     assert result["passed"] is True
-    assert result["informative"] is False
-    assert result["all_skipped"] is True
-    assert result["skip_reason"] == "no_active_refinancing_states"
-    assert result["informative_policies"] == []
-    assert result["skipped_policies"] == ["bp0", "bpI", "mix"]
-    assert result["policies"]["bp0"]["skip_reason"] == "no_active_refinancing_states"
-    assert result["policies"]["bpI"]["skip_reason"] == "no_active_refinancing_states"
+    assert result["informative"] is True
+    assert result["all_skipped"] is False
+    assert result["skip_reason"] is None
+    assert result["informative_policies"] == ["bp0", "bpI", "mix"]
+    assert result["skipped_policies"] == []
 
 
 def test_policy_convergence_selector_prefers_informative_validation():

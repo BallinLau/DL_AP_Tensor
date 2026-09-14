@@ -32,6 +32,9 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
         macro_rows.append(parent_macro)
 
         branch_states = _expand_branches_batched(sim, state)
+        _annotate_parent_next_leverage_rows(
+            sim, parent_firm, state, branch_states[sim.main_branch]
+        )
         for branch_k, branch_state in enumerate(branch_states):
             if sim.enable_entry:
                 branch_state = _apply_entry_batched(sim, branch_state, n_potential)
@@ -190,21 +193,9 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         bpI = b.clone()
         bp = b.clone()
 
-    b_next_p0 = apply_refinancing_policy(
-        b_current=b,
-        bp_candidate=bp0,
-        eta_current=eta,
-    )
-    b_next_pi = apply_refinancing_policy(
-        b_current=b,
-        bp_candidate=bpI,
-        eta_current=eta,
-    )
-    b_next_policy = apply_refinancing_policy(
-        b_current=b,
-        bp_candidate=bp,
-        eta_current=eta,
-    )
+    b_next_p0 = torch.full_like(b, float("nan"))
+    b_next_pi = torch.full_like(b, float("nan"))
+    b_next_policy = torch.full_like(b, float("nan"))
 
     Y, I, Phi, C = sim._resource_accounting(K, z, x, bar_i, bar_z, i)
 
@@ -286,19 +277,36 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     return firm_rows, macro_rows
 
 
+def _annotate_parent_next_leverage_rows(
+    sim,
+    parent_rows: torch.Tensor,
+    parent_state: Dict[str, torch.Tensor],
+    main_child_state: Dict[str, torch.Tensor],
+) -> None:
+    """Fill parent diagnostics from the realized main child eta draw."""
+    if parent_rows.numel() == 0:
+        return
+    alive_flat = parent_state["alive"].reshape(-1)
+    eta_next = main_child_state["eta"].reshape(-1)[alive_flat]
+    columns = {name: idx for idx, name in enumerate(sim.FIRM_COLUMNS)}
+    for bp_name, out_name in (
+        ("bp0", "b_next_p0"),
+        ("bpI", "b_next_pi"),
+        ("bp", "b_next_policy"),
+    ):
+        parent_rows[:, columns[out_name]] = apply_refinancing_policy(
+            b_current=parent_rows[:, columns["b"]],
+            bp_candidate=parent_rows[:, columns[bp_name]],
+            eta_next=eta_next,
+        )
+
+
 def _expand_branches_batched(sim, state: Dict[str, torch.Tensor]) -> List[Dict[str, torch.Tensor]]:
     device = sim.device
     alive_any = state["alive"].any(dim=1)
     branches: List[Dict[str, torch.Tensor]] = []
     b_prev = state["b"]
     bp_prev = state.get("bp", b_prev)
-    eta_current = state["eta"].clamp(0.0, 1.0)
-    b_next = apply_refinancing_policy(
-        b_current=b_prev,
-        bp_candidate=bp_prev,
-        eta_current=eta_current,
-    )
-
     for _ in range(sim.branch_num):
         x_next = sample_ar1(state["x"], sim.config.RHO_X, sim.config.SIGMA_X, sim.config.XBAR)
         z_next = sample_ar1(state["z"], sim.config.RHO_Z, sim.config.SIGMA_Z, sim.config.ZBAR)
@@ -329,6 +337,11 @@ def _expand_branches_batched(sim, state: Dict[str, torch.Tensor]) -> List[Dict[s
             M_out = state["M"].clone()
 
         active2d = alive_any.unsqueeze(1)
+        b_next = apply_refinancing_policy(
+            b_current=b_prev,
+            bp_candidate=bp_prev,
+            eta_next=eta_next,
+        )
         branches.append(
             {
                 "x": torch.where(alive_any, x_next, state["x"]),

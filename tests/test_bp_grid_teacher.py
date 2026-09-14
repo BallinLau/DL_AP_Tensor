@@ -124,7 +124,8 @@ def test_grid_teacher_debt_state_semantics():
     assert torch.allclose(issue_b, expected_issue_b, atol=1e-6)
 
     child_b = target.equity_b[0].reshape(-1)
-    assert torch.allclose(child_b, expected_issue_b, atol=1e-6)
+    expected_child_b = torch.tensor([0.15, 0.275, 0.40])
+    assert torch.allclose(child_b, expected_child_b, atol=1e-6)
 
     inactive_target = RecordingTarget()
     inactive_teacher = BPGridTeacher(
@@ -143,9 +144,52 @@ def test_grid_teacher_debt_state_semantics():
     inactive_teacher.compute(inactive_parent, [inactive_child], [torch.ones(1, 1)], branch="p0")
     inactive_issue_b = [x.reshape(-1) for x in inactive_target.q_b if x.numel() == 3][0]
     inactive_child_b = inactive_target.equity_b[0].reshape(-1)
-    expected_inactive_b = torch.full((3,), 0.2)
-    assert torch.allclose(inactive_issue_b, expected_inactive_b, atol=1e-6)
-    assert torch.allclose(inactive_child_b, expected_inactive_b, atol=1e-6)
+    assert torch.allclose(inactive_issue_b, expected_issue_b, atol=1e-6)
+    assert torch.allclose(inactive_child_b, expected_issue_b, atol=1e-6)
+
+
+def test_parent_eta_zero_keeps_cashflow_flat_but_child_continuation_moves():
+    target = RecordingTarget()
+    teacher = BPGridTeacher(
+        target,
+        P0Loss(),
+        PILoss(),
+        coarse_size=3,
+        refine=False,
+        candidate_chunk_size=3,
+        margin_scale=1e-4,
+    )
+    parent = torch.tensor([[0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
+    child_eta0 = parent.clone()
+    child_eta1 = parent.clone()
+    child_eta0[:, 2] = 0.0
+    child_eta1[:, 2] = 1.0
+
+    out = teacher.compute(
+        parent,
+        [child_eta0, child_eta1],
+        [torch.ones(1, 1), torch.ones(1, 1)],
+        branch="p0",
+    )
+
+    torch.testing.assert_close(
+        out["cashflow_grid_mean"],
+        out["cashflow_grid_mean"][:, :1].expand_as(out["cashflow_grid_mean"]),
+    )
+    assert not torch.allclose(
+        out["continuation_grid_mean"],
+        out["continuation_grid_mean"][:, :1].expand_as(out["continuation_grid_mean"]),
+    )
+    torch.testing.assert_close(
+        out["coarse_child_b_eta0_mean"],
+        torch.full((1, 3), 0.4),
+    )
+    torch.testing.assert_close(
+        out["coarse_child_b_eta1_mean"],
+        torch.tensor([[0.0, 0.5, 1.0]]),
+    )
+    assert out["eta_next_active_share"].item() == 0.5
+    assert not torch.allclose(out["bp_star"], parent[:, 0:1])
 
 
 def test_grid_teacher_mix_branch_and_coarse_confidence():

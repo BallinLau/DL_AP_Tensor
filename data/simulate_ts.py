@@ -170,6 +170,7 @@ class SimulateTS:
             
             # 扩展到下一期的多个分支
             branch_states = self._expand_branches(state, t)
+            self._annotate_parent_next_leverage(node_firm, state, branch_states[self.main_branch])
             
             # 为每个分支记录 t+1 期的数据（分支内独立进入）
             for branch_k, branch_state in enumerate(branch_states):
@@ -210,6 +211,9 @@ class SimulateTS:
             macro_rows.append(node_macro)
 
             branch_states = self._expand_branches_tensor(state)
+            self._annotate_parent_next_leverage_tensor(
+                node_firm, state, branch_states[self.main_branch]
+            )
             for branch_k, branch_state in enumerate(branch_states):
                 if self.enable_entry:
                     branch_state = self._apply_entry_tensor(branch_state)
@@ -349,21 +353,11 @@ class SimulateTS:
             bpI = b.clone()
             bp = b.clone()
 
-        b_next_p0 = apply_refinancing_policy(
-            b_current=b,
-            bp_candidate=bp0,
-            eta_current=eta,
-        )
-        b_next_pi = apply_refinancing_policy(
-            b_current=b,
-            bp_candidate=bpI,
-            eta_current=eta,
-        )
-        b_next_policy = apply_refinancing_policy(
-            b_current=b,
-            bp_candidate=bp,
-            eta_current=eta,
-        )
+        # Child eta is not drawn until branch expansion. Parent rows are filled
+        # with the realized main-branch transition immediately afterwards.
+        b_next_p0 = torch.full_like(b, float("nan"))
+        b_next_pi = torch.full_like(b, float("nan"))
+        b_next_policy = torch.full_like(b, float("nan"))
 
         Y, I, Phi, C = self._resource_accounting(K, z, x_scalar, bar_i, bar_z, i)
 
@@ -544,21 +538,9 @@ class SimulateTS:
         bp0 = output.bp0.reshape(-1)
         bpI = output.bpI.reshape(-1)
         bp = output.bp.reshape(-1)
-        b_next_p0 = apply_refinancing_policy(
-            b_current=b,
-            bp_candidate=bp0,
-            eta_current=eta,
-        )
-        b_next_pi = apply_refinancing_policy(
-            b_current=b,
-            bp_candidate=bpI,
-            eta_current=eta,
-        )
-        b_next_policy = apply_refinancing_policy(
-            b_current=b,
-            bp_candidate=bp,
-            eta_current=eta,
-        )
+        b_next_p0 = torch.full_like(b, float("nan"))
+        b_next_pi = torch.full_like(b, float("nan"))
+        b_next_policy = torch.full_like(b, float("nan"))
         
         # 资源核算
         Y, I, Phi, C = self._resource_accounting(
@@ -630,6 +612,52 @@ class SimulateTS:
         state['bp'] = bp
         
         return firm_data, macro_row
+
+    def _annotate_parent_next_leverage(
+        self,
+        parent_rows: List[Dict],
+        parent_state: Dict,
+        main_child_state: Dict,
+    ) -> None:
+        """Record the realized main-child transition on parent output rows."""
+        alive_idx = torch.nonzero(parent_state['alive'], as_tuple=False).squeeze(-1)
+        eta_next = main_child_state['eta'][alive_idx].reshape(-1)
+        for row, eta_j in zip(parent_rows, eta_next):
+            b_current = torch.tensor(float(row['b']), device=self.device)
+            eta_value = eta_j.to(device=self.device, dtype=b_current.dtype)
+            for bp_name, out_name in (
+                ('bp0', 'b_next_p0'),
+                ('bpI', 'b_next_pi'),
+                ('bp', 'b_next_policy'),
+            ):
+                bp_candidate = torch.tensor(float(row[bp_name]), device=self.device)
+                row[out_name] = float(apply_refinancing_policy(
+                    b_current=b_current,
+                    bp_candidate=bp_candidate,
+                    eta_next=eta_value,
+                ).item())
+
+    def _annotate_parent_next_leverage_tensor(
+        self,
+        parent_rows: torch.Tensor,
+        parent_state: Dict,
+        main_child_state: Dict,
+    ) -> None:
+        """Tensor counterpart of :meth:`_annotate_parent_next_leverage`."""
+        if parent_rows.numel() == 0:
+            return
+        eta_next = main_child_state['eta'][parent_state['alive']].reshape(-1)
+        columns = {name: idx for idx, name in enumerate(self.FIRM_COLUMNS)}
+        for bp_name, out_name in (
+            ('bp0', 'b_next_p0'),
+            ('bpI', 'b_next_pi'),
+            ('bp', 'b_next_policy'),
+        ):
+            parent_rows[:, columns[out_name]] = apply_refinancing_policy(
+                b_current=parent_rows[:, columns['b']],
+                bp_candidate=parent_rows[:, columns[bp_name]],
+                eta_next=eta_next,
+            )
     
     def _resource_accounting(
         self,
@@ -687,11 +715,10 @@ class SimulateTS:
                         bp_prev = torch.cat([bp_prev, pad], dim=0)
                     else:
                         bp_prev = bp_prev[: b_prev.numel()]
-                eta_current = state['eta'].reshape(-1)
                 new_state['b'] = apply_refinancing_policy(
                     b_current=b_prev,
                     bp_candidate=bp_prev,
-                    eta_current=eta_current,
+                    eta_next=new_state['eta'].reshape(-1),
                 )
             else:
                 new_state['b'] = b_prev.clone()
@@ -783,12 +810,11 @@ class SimulateTS:
                 else:
                     bp_prev = bp_prev[: b_prev.numel()]
             if bp_prev is not None:
-                # Apply the current-period refinancing shock eta_t to b_{t+1}.
-                eta_current = state['eta'].reshape(-1)
+                # Child eta_{t+1} determines whether bp_t is implemented.
                 new_state['b'] = apply_refinancing_policy(
                     b_current=b_prev,
                     bp_candidate=bp_prev,
-                    eta_current=eta_current,
+                    eta_next=new_state['eta'].reshape(-1),
                 )
             else:
                 new_state['b'] = b_prev.clone()

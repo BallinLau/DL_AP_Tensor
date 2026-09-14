@@ -316,7 +316,7 @@ def _bellman_loss_and_metrics(
         out = model(parent)
         scale = model.equity_value_scale(parent).clamp_min(1e-12)
         b_parent = parent[:, SIMMODEL.B:SIMMODEL.B + 1]
-        eta = parent[:, SIMMODEL.ETA:SIMMODEL.ETA + 1].clamp(0.0, 1.0)
+        eta_current = parent[:, SIMMODEL.ETA:SIMMODEL.ETA + 1].clamp(0.0, 1.0)
         bp0 = out.bp0
         bpI = out.bpI
         q_parent = out.Q
@@ -327,20 +327,25 @@ def _bellman_loss_and_metrics(
         p_children_pi = []
         with torch.no_grad():
             for child in children:
+                eta_next = child[:, SIMMODEL.ETA:SIMMODEL.ETA + 1].clamp(0.0, 1.0)
                 child_p0 = child.clone()
-                child_p0[:, SIMMODEL.B:SIMMODEL.B + 1] = apply_refinancing_policy(b_parent, bp0, eta)
+                child_p0[:, SIMMODEL.B:SIMMODEL.B + 1] = apply_refinancing_policy(
+                    b_parent, bp0, eta_next
+                )
                 child_pi = child.clone()
-                child_pi[:, SIMMODEL.B:SIMMODEL.B + 1] = apply_refinancing_policy(b_parent, bpI, eta)
+                child_pi[:, SIMMODEL.B:SIMMODEL.B + 1] = apply_refinancing_policy(
+                    b_parent, bpI, eta_next
+                )
                 p_children_p0.append(target(child_p0).P.detach())
                 p_children_pi.append(target(child_pi).P.detach())
             p0_q_state = parent.clone()
-            p0_q_state[:, SIMMODEL.B:SIMMODEL.B + 1] = apply_refinancing_policy(b_parent, bp0, eta)
+            p0_q_state[:, SIMMODEL.B:SIMMODEL.B + 1] = bp0
             pi_q_state = parent.clone()
-            pi_q_state[:, SIMMODEL.B:SIMMODEL.B + 1] = apply_refinancing_policy(b_parent, bpI, eta)
+            pi_q_state[:, SIMMODEL.B:SIMMODEL.B + 1] = bpI
             q_p0 = target(p0_q_state).Q.detach()
             q_pi = target(pi_q_state).Q.detach()
 
-        cf0 = p0_loss.compute_cashflow_p0(parent[:, SIMMODEL.X:SIMMODEL.X + 1], parent[:, SIMMODEL.Z:SIMMODEL.Z + 1], b_parent, q_parent, q_p0, eta)
+        cf0 = p0_loss.compute_cashflow_p0(parent[:, SIMMODEL.X:SIMMODEL.X + 1], parent[:, SIMMODEL.Z:SIMMODEL.Z + 1], b_parent, q_parent, q_p0, eta_current)
         cfi = pi_loss.compute_cashflow_pi(
             parent[:, SIMMODEL.X:SIMMODEL.X + 1],
             parent[:, SIMMODEL.Z:SIMMODEL.Z + 1],
@@ -348,7 +353,7 @@ def _bellman_loss_and_metrics(
             parent[:, SIMMODEL.I:SIMMODEL.I + 1],
             q_parent,
             q_pi,
-            eta,
+            eta_current,
         )
         rz = [torch.zeros_like(p0) for _ in children]
         r0_phys = p0_loss.compute_bellman_residual(p0, cf0, m_list, p_children_p0, rz)

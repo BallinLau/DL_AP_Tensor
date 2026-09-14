@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 from config import Config, HyperParams
 from models import SDFFC1Combined, PolicyValueModel, FC2Model
 from losses import P0Loss, PILoss
+from utils.firm_transition import apply_refinancing_policy
 
 
 def resolve_base_dir(run_root: Optional[Path], project_root: Path) -> Path:
@@ -254,9 +255,17 @@ def _compute_policy_diagnostic_surfaces(
     bpI = out.bpI
 
     child_p0_state = base.clone()
-    child_p0_state[:, 0:1] = bp0
+    child_p0_state[:, 0:1] = apply_refinancing_policy(
+        b_current=base[:, 0:1],
+        bp_candidate=bp0,
+        eta_next=child_p0_state[:, 2:3],
+    )
     child_pI_state = base.clone()
-    child_pI_state[:, 0:1] = bpI
+    child_pI_state[:, 0:1] = apply_refinancing_policy(
+        b_current=base[:, 0:1],
+        bp_candidate=bpI,
+        eta_next=child_pI_state[:, 2:3],
+    )
 
     out_p0_child = pv_model(child_p0_state)
     out_pI_child = pv_model(child_pI_state)

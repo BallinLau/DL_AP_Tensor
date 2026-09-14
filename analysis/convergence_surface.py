@@ -240,16 +240,25 @@ class VectorizedBellmanSurfaceBackend:
                 child.lnkf_next.squeeze(-1),
             ], dim=-1)
 
-        eta = parent_states[:, idx.ETA:idx.ETA + 1].clamp(0.0, 1.0)
+        eta_current = parent_states[:, idx.ETA:idx.ETA + 1].clamp(0.0, 1.0)
         b_parent = parent_states[:, idx.B:idx.B + 1]
-        b_p0 = apply_refinancing_policy(b_current=b_parent, bp_candidate=bp0, eta_current=eta)
-        b_pi = apply_refinancing_policy(b_current=b_parent, bp_candidate=bpI, eta_current=eta)
+        eta_next = child.eta_next.clamp(0.0, 1.0)
+        b_p0 = apply_refinancing_policy(
+            b_current=b_parent.unsqueeze(1),
+            bp_candidate=bp0.unsqueeze(1),
+            eta_next=eta_next,
+        ).squeeze(-1)
+        b_pi = apply_refinancing_policy(
+            b_current=b_parent.unsqueeze(1),
+            bp_candidate=bpI.unsqueeze(1),
+            eta_next=eta_next,
+        ).squeeze(-1)
         multiplier = bar_i * (float(self.economic_config.G) - 1.0) + 1.0
         b_q = b_parent / multiplier.clamp_min(1e-6)
 
         child_states = {
-            "p0": make_child_states(b_p0.expand(-1, n_child)),
-            "pi": make_child_states(b_pi.expand(-1, n_child)),
+            "p0": make_child_states(b_p0),
+            "pi": make_child_states(b_pi),
             "q": make_child_states(b_q.expand(-1, n_child)),
         }
 
@@ -285,7 +294,7 @@ class VectorizedBellmanSurfaceBackend:
             result[eq] = {}
             if eq == "p0":
                 childp0_state = parent_states.clone()
-                childp0_state[:, idx.B:idx.B + 1] = b_p0
+                childp0_state[:, idx.B:idx.B + 1] = bp0
                 q_p0 = _policy_get(self.policy_model(childp0_state), "Q")
                 cf = self.p0_loss.compute_cashflow_p0(
                     parent_states[:, idx.X:idx.X + 1],
@@ -293,7 +302,7 @@ class VectorizedBellmanSurfaceBackend:
                     b_parent,
                     q_parent,
                     q_p0,
-                    eta,
+                    eta_current,
                 ).unsqueeze(1)
                 self.last_parent_diagnostics["CF0"] = cf.squeeze(1).detach()
                 for mode in m_modes:
@@ -303,7 +312,7 @@ class VectorizedBellmanSurfaceBackend:
                     result[eq][mode] = (p0_exp - cf - continuation).squeeze(-1)
             elif eq == "pi":
                 childpi_state = parent_states.clone()
-                childpi_state[:, idx.B:idx.B + 1] = b_pi
+                childpi_state[:, idx.B:idx.B + 1] = bpI
                 q_pi = _policy_get(self.policy_model(childpi_state), "Q")
                 cf = self.pi_loss.compute_cashflow_pi(
                     parent_states[:, idx.X:idx.X + 1],
@@ -312,7 +321,7 @@ class VectorizedBellmanSurfaceBackend:
                     parent_states[:, idx.I:idx.I + 1],
                     q_parent,
                     q_pi,
-                    eta,
+                    eta_current,
                 ).unsqueeze(1)
                 self.last_parent_diagnostics["CFI"] = cf.squeeze(1).detach()
                 for mode in m_modes:

@@ -20,7 +20,6 @@ from experiments.run_utils import build_hyperparams, build_models  # noqa: E402
 from losses.utils import compute_cashflow  # noqa: E402
 from training.bp_policy_loss import compute_target_grid_policy_distillation_loss  # noqa: E402
 from training.episode import Episode  # noqa: E402
-from utils.firm_transition import apply_refinancing_policy  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -298,7 +297,7 @@ def export_logits_and_gradients(
 def total_recovery_for_rows(
     children: List[torch.Tensor],
     row_state_pos: torch.Tensor,
-    effective_b: torch.Tensor,
+    issue_b: torch.Tensor,
 ) -> torch.Tensor:
     recovery_terms = []
     for child in children:
@@ -306,7 +305,7 @@ def total_recovery_for_rows(
         x_child = child_rows[:, 4:5]
         z_child = child_rows[:, 1:2]
         recovery_unit = Config.PHI * (1.0 - Config.DELTA + torch.exp(x_child + z_child))
-        recovery_terms.append(effective_b * recovery_unit)
+        recovery_terms.append(issue_b * recovery_unit)
     return torch.stack(recovery_terms, dim=1).mean(dim=1)
 
 
@@ -351,7 +350,7 @@ def export_cashflow_components(
         invest = parent_rows[:, 3:4]
         x = parent_rows[:, 4:5]
         q_current = q_current_all[state_pos]
-        effective_b = apply_refinancing_policy(b, bp_candidate, eta)
+        issue_b = bp_candidate
 
         production = compute_cashflow(x, z, b, Config.DELTA, Config.TAU)
         debt_p0 = ((1.0 - Config.KAPPA_B) * q_issue - q_current) * eta
@@ -388,10 +387,10 @@ def export_cashflow_components(
             device=parent_state.device,
             dtype=parent_state.dtype,
         ).reshape(-1, 1)
-        recovery = total_recovery_for_rows(children, state_pos, effective_b)
+        recovery = total_recovery_for_rows(children, state_pos, issue_b)
         q_unit = torch.where(
-            effective_b.abs() > 1e-12,
-            q_issue / effective_b.clamp_min(1e-12),
+            issue_b.abs() > 1e-12,
+            q_issue / issue_b.clamp_min(1e-12),
             torch.zeros_like(q_issue),
         )
 

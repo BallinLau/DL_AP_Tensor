@@ -122,14 +122,6 @@ missing = sorted(required.difference(df_firm.columns))
 if missing:
     raise SystemExit(f"Missing effective next-debt columns: {missing}")
 
-expected = df_firm["ETA"] * df_firm["bp"] + (1.0 - df_firm["ETA"]) * df_firm["b"]
-max_identity_error = (df_firm["b_next_policy"] - expected).abs().max()
-print(f"max_identity_error={max_identity_error:.12g}")
-if not max_identity_error < tol:
-    raise SystemExit(
-        f"identity check failed: max_identity_error={max_identity_error} >= {tol}"
-    )
-
 parents = df_firm[df_firm["branch"] == -1]
 children = df_firm[df_firm["branch"] == 0]
 merged = parents.merge(
@@ -140,6 +132,17 @@ merged = parents.merge(
 merged = merged[merged["t_child"] == merged["t_parent"] + 1]
 if merged.empty:
     raise SystemExit("transition check failed: no parent/main-child matches found")
+
+expected = (
+    merged["ETA_child"] * merged["bp_parent"]
+    + (1.0 - merged["ETA_child"]) * merged["b_parent"]
+)
+max_identity_error = (merged["b_next_policy_parent"] - expected).abs().max()
+print(f"max_identity_error={max_identity_error:.12g}")
+if not max_identity_error < tol:
+    raise SystemExit(
+        f"child-eta identity check failed: max_identity_error={max_identity_error} >= {tol}"
+    )
 
 max_transition_error = (
     merged["b_next_policy_parent"] - merged["b_child"]
@@ -152,7 +155,7 @@ if not max_transition_error < tol:
 
 print("Tiny simulation smoke passed.")
 print(f"firm_rows={len(df_firm)} macro_rows={len(df_macro)}")
-print("L_new(theta)=L_old(theta); grad_theta L_new(theta)=grad_theta L_old(theta) for this reporting-only change.")
+print("Verified b_child = eta_child * bp_parent + (1 - eta_child) * b_parent.")
 PY
 
 echo "[5/5] Final acceptance summary"

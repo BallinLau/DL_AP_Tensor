@@ -168,22 +168,25 @@ class PILoss(nn.Module):
         M_list: List[torch.Tensor],
         P_grads: List[torch.Tensor],
         bar_z_children: List[torch.Tensor],
-        eta: Union[torch.Tensor, List[torch.Tensor]]
+        eta_child: Union[torch.Tensor, List[torch.Tensor]]
     ) -> List[torch.Tensor]:
         """
         计算 PI 的 FOC 残差（支持任意分支数）
 
-        foc^{(j)} = cf_grad + g * M^{(j)} * P'_grad^{(j)} * (1 - bar_z'^{(j)}) * η
+        ``P_grads`` is dP/db_child, so the child transition derivative enters
+        explicitly as ``eta_child``.
+
+        foc^{(j)} = cf_grad + g * M^{(j)} * dP/db_child * (1 - bar_z'^{(j)}) * eta_child
         """
         n_branches = len(P_grads)
         if isinstance(cfip_grad, (list, tuple)):
             cf_grad_list = list(cfip_grad)
         else:
             cf_grad_list = [cfip_grad for _ in range(n_branches)]
-        if isinstance(eta, (list, tuple)):
-            eta_list = list(eta)
+        if isinstance(eta_child, (list, tuple)):
+            eta_list = list(eta_child)
         else:
-            eta_list = [eta for _ in range(n_branches)]
+            eta_list = [eta_child for _ in range(n_branches)]
         if len(cf_grad_list) != n_branches or len(eta_list) != n_branches:
             raise ValueError(
                 f"FOC branches mismatch: grad={len(cf_grad_list)}, eta={len(eta_list)}, expected={n_branches}"
@@ -204,7 +207,6 @@ class PILoss(nn.Module):
         P_children: List[torch.Tensor],
         bar_z_children: List[torch.Tensor],
         bp: torch.Tensor,
-        eta: Union[torch.Tensor, List[torch.Tensor]]
     ) -> List[torch.Tensor]:
         """
         基于 bp 直接计算 PI 的 FOC 残差（支持任意分支数）
@@ -212,6 +214,9 @@ class PILoss(nn.Module):
         先计算：
         - cfip_grad = ∂CFip/∂bp
         - P'_grad^{(j)} = ∂P_children^{(j)}/∂bp
+
+        ``P'_grad`` already contains db_child/dbp = eta_child, so no separate
+        eta multiplier is applied here.
         """
         n_branches = len(P_children)
         cf_grad_missing = 0
@@ -275,13 +280,16 @@ class PILoss(nn.Module):
                 'pi_pgrad_missing_ratio': float(p_grad_missing / max(1, len(P_children))),
             }
 
-        return self.compute_foc_residual(
-            cfip_grad=cfip_grad,
-            M_list=M_list,
-            P_grads=p_grads,
-            bar_z_children=bar_z_children,
-            eta=eta
-        )
+        if isinstance(cfip_grad, (list, tuple)):
+            cf_grad_list = list(cfip_grad)
+        else:
+            cf_grad_list = [cfip_grad for _ in range(n_branches)]
+        return [
+            cf_grad_j + self.g * M * p_grad * (1 - bar_z)
+            for cf_grad_j, M, p_grad, bar_z in zip(
+                cf_grad_list, M_list, p_grads, bar_z_children
+            )
+        ]
     
     def compute_b_penalty(
         self,

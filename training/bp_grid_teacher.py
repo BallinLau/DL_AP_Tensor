@@ -65,12 +65,12 @@ def _candidate_flat(candidates: torch.Tensor) -> torch.Tensor:
 
 def _expand_grid_children(
     children: List[torch.Tensor],
-    effective_b_grid: torch.Tensor,
-) -> torch.Tensor:
-    """Build child states after the current-period debt decision.
+    bp_grid: torch.Tensor,
+    b_parent: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build candidate child states using each child's eta realization.
 
     Children contain next-period exogenous states, including eta_{t+1}.
-    effective_b_grid is already determined using current eta_t.
     """
     if not children:
         raise ValueError("BP grid evaluation requires at least one child tensor.")
@@ -78,33 +78,36 @@ def _expand_grid_children(
     children_t = torch.stack(children, dim=1)
     child_state_raw = children_t[..., :7] if children_t.shape[-1] > 7 else children_t
     batch_size, n_children, state_dim = child_state_raw.shape
-    n_grid = effective_b_grid.shape[1]
+    n_grid = bp_grid.shape[1]
 
     child_states = (
         child_state_raw.unsqueeze(1)
         .expand(batch_size, n_grid, n_children, state_dim)
         .clone()
     )
-    child_states[..., 0] = (
-        effective_b_grid
-        .unsqueeze(-1)
-        .expand(batch_size, n_grid, n_children)
+    eta_next = child_state_raw[..., 2].clamp(0.0, 1.0)
+    child_b_grid = apply_refinancing_policy(
+        b_current=b_parent.reshape(batch_size, 1, 1),
+        bp_candidate=bp_grid.unsqueeze(-1),
+        eta_next=eta_next.unsqueeze(1),
     )
-    return child_states
+    child_states[..., 0] = child_b_grid
+    return child_states, child_b_grid
 
 
 def _forward_equity_grid_children(
     model: Any,
     children: List[torch.Tensor],
-    effective_b_grid: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    child_states = _expand_grid_children(children, effective_b_grid)
+    bp_grid: torch.Tensor,
+    b_parent: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    child_states, child_b_grid = _expand_grid_children(children, bp_grid, b_parent)
     batch_size, n_grid, n_children, state_dim = child_states.shape
     flat_states = child_states.reshape(batch_size * n_grid * n_children, state_dim)
     p_raw, bar_z_raw = _target_equity(model, flat_states)
     p_child = p_raw.reshape(batch_size, n_grid, n_children)
     bar_z_child = bar_z_raw.reshape(batch_size, n_grid, n_children).clamp(0.0, 1.0)
-    return p_child, bar_z_child
+    return p_child, bar_z_child, child_b_grid
 
 
 def _safe_top2_margin(value_grid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -340,8 +343,6 @@ class BPGridTeacher:
                 value_star = refined_eval["value_grid"][:, 0:1]
             else:
                 value_star = _gather_by_index(result["value_grid"], argmax_index)
-            eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
-            bp_star = torch.where(eta_current > 0.5, bp_star, parent_state[:, 0:1])
             return {
                 "value_star": value_star.detach(),
                 "bp_star": bp_star.detach(),
@@ -376,10 +377,6 @@ class BPGridTeacher:
                 bp_star_grid,
                 self.quadratic_refine,
             ).clamp(self.grid_min, self.grid_max)
-            eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
-            b_parent = parent_state[:, 0:1]
-            active_refi = eta_current > 0.5
-
             if self.quadratic_refine:
                 refined_eval = self._evaluate_grid(
                     parent_state,
@@ -408,8 +405,7 @@ class BPGridTeacher:
                 confidence = (relative_margin / self.margin_scale).clamp(self.confidence_min, 1.0)
             else:
                 confidence = (coarse_top2_margin / self.margin_scale).clamp(self.confidence_min, 1.0)
-            bp_star = torch.where(active_refi, bp_star, b_parent)
-            confidence = confidence * eta_current
+            target_available = torch.ones_like(bp_star)
 
             result.update(
                 {
@@ -421,12 +417,14 @@ class BPGridTeacher:
                     "fine_top2_margin": fine_top2_margin.detach(),
                     "confidence": confidence.detach(),
                     "boundary_low": (
-                        (bp_star_grid <= self.grid_min + 1e-8).to(parent_state.dtype) * eta_current
-                    ).detach(),
+                        bp_star_grid <= self.grid_min + 1e-8
+                    ).to(parent_state.dtype).detach(),
                     "boundary_high": (
-                        (bp_star_grid >= self.grid_max - 1e-8).to(parent_state.dtype) * eta_current
-                    ).detach(),
-                    "refi_active": eta_current.detach(),
+                        bp_star_grid >= self.grid_max - 1e-8
+                    ).to(parent_state.dtype).detach(),
+                    # Compatibility field: every parent now has a meaningful bp target.
+                    "refi_active": target_available.detach(),
+                    "eta_next_active_share": result["eta_next_active_share"][:, 0:1].detach(),
                     "coarse_bp_grid": coarse["bp_grid"].detach(),
                     "coarse_value_grid": coarse["value_grid"].detach(),
                     "coarse_cashflow_grid_mean": coarse["cashflow_grid_mean"].detach(),
@@ -434,6 +432,10 @@ class BPGridTeacher:
                     "coarse_q_issue_grid": coarse["q_issue_grid"].detach(),
                     "coarse_p_child_grid_mean": coarse["p_child_grid_mean"].detach(),
                     "coarse_default_grid_mean": coarse["default_grid_mean"].detach(),
+                    "coarse_eta_next_active_share": coarse["eta_next_active_share"].detach(),
+                    "coarse_child_b_mean": coarse["child_b_mean"].detach(),
+                    "coarse_child_b_eta0_mean": coarse["child_b_eta0_mean"].detach(),
+                    "coarse_child_b_eta1_mean": coarse["child_b_eta1_mean"].detach(),
                     "local_value_left": result["value_grid"][:, 0:1].detach(),
                     "local_value_right": result["value_grid"][:, -1:].detach(),
                     "q_issue_at_star": q_issue_at_star.detach(),
@@ -551,6 +553,10 @@ class BPGridTeacher:
             "q_issue_grid": torch.cat([c["q_issue_grid"] for c in chunks], dim=1),
             "p_child_grid_mean": torch.cat([c["p_child_grid_mean"] for c in chunks], dim=1),
             "default_grid_mean": torch.cat([c["default_grid_mean"] for c in chunks], dim=1),
+            "eta_next_active_share": torch.cat([c["eta_next_active_share"] for c in chunks], dim=1),
+            "child_b_mean": torch.cat([c["child_b_mean"] for c in chunks], dim=1),
+            "child_b_eta0_mean": torch.cat([c["child_b_eta0_mean"] for c in chunks], dim=1),
+            "child_b_eta1_mean": torch.cat([c["child_b_eta1_mean"] for c in chunks], dim=1),
             "argmax_index": torch.cat([c["value_grid"] for c in chunks], dim=1).argmax(dim=1, keepdim=True),
         }
 
@@ -571,14 +577,9 @@ class BPGridTeacher:
 
         b_parent = parent_state[:, 0:1]
         eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
-        effective_b_grid = apply_refinancing_policy(
-            b_current=b_parent,
-            bp_candidate=bp_grid,
-            eta_current=eta_current,
-        )
 
-        issue_state = _expand_candidates(parent_state, effective_b_grid)
-        issue_state[:, 0:1] = _candidate_flat(effective_b_grid)
+        issue_state = _expand_candidates(parent_state, bp_grid)
+        issue_state[:, 0:1] = _candidate_flat(bp_grid)
         q_issue = _target_q(self.target_model, issue_state).reshape(batch_size, n_grid)
 
         mix_w = None
@@ -592,10 +593,11 @@ class BPGridTeacher:
         i_parent = parent_state[:, 3:4]
         q_current_grid = q_current.expand(batch_size, n_grid)
 
-        p_child, bar_z_child = _forward_equity_grid_children(
+        p_child, bar_z_child, child_b_grid = _forward_equity_grid_children(
             self.target_model,
             children,
-            effective_b_grid,
+            bp_grid,
+            b_parent,
         )
         n_children = p_child.shape[2]
         m_grid = torch.stack(m_list, dim=1).reshape(batch_size, 1, n_children).expand(batch_size, n_grid, n_children)
@@ -654,6 +656,21 @@ class BPGridTeacher:
         continuation_grid_mean = branch_continuation.mean(dim=2)
         p_grid_mean = p_child.mean(dim=2)
         default_grid_mean = bar_z_child.mean(dim=2)
+        eta_next = torch.stack(
+            [(_strip_extra(child)[:, 2]).clamp(0.0, 1.0) for child in children],
+            dim=1,
+        )
+        eta_next_active_share = eta_next.mean(dim=1, keepdim=True).expand(batch_size, n_grid)
+        child_b_mean = child_b_grid.mean(dim=2)
+
+        def _conditional_child_b(mask: torch.Tensor) -> torch.Tensor:
+            mask_grid = mask.unsqueeze(1).expand_as(child_b_grid)
+            count = mask_grid.sum(dim=2)
+            mean = (child_b_grid * mask_grid).sum(dim=2) / count.clamp_min(1.0)
+            return torch.where(count > 0, mean, torch.full_like(mean, float("nan")))
+
+        child_b_eta0_mean = _conditional_child_b((eta_next <= 0.5).to(child_b_grid.dtype))
+        child_b_eta1_mean = _conditional_child_b((eta_next > 0.5).to(child_b_grid.dtype))
         argmax_index = value_grid.argmax(dim=1, keepdim=True)
 
         return {
@@ -665,6 +682,10 @@ class BPGridTeacher:
             "q_issue_grid": q_issue,
             "p_child_grid_mean": p_grid_mean,
             "default_grid_mean": default_grid_mean,
+            "eta_next_active_share": eta_next_active_share,
+            "child_b_mean": child_b_mean,
+            "child_b_eta0_mean": child_b_eta0_mean,
+            "child_b_eta1_mean": child_b_eta1_mean,
         }
 
     def _attach_star_diagnostics(self, result: Dict[str, torch.Tensor], argmax_index: torch.Tensor) -> None:

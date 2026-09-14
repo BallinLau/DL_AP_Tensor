@@ -31,6 +31,7 @@ from models import SDFFC1Combined, PolicyValueModel, FC2Model  # noqa: E402
 from losses import P0Loss, PILoss  # noqa: E402
 from training.episode import Episode  # noqa: E402
 from data.simulate_ts import SimulateTS  # noqa: E402
+from utils.firm_transition import apply_refinancing_policy  # noqa: E402
 
 
 def ensure_dirs():
@@ -198,9 +199,17 @@ def _compute_policy_diagnostic_surfaces(
     bpI = out.bpI
 
     child_p0_state = base.clone()
-    child_p0_state[:, 0:1] = bp0
+    child_p0_state[:, 0:1] = apply_refinancing_policy(
+        b_current=base[:, 0:1],
+        bp_candidate=bp0,
+        eta_next=child_p0_state[:, 2:3],
+    )
     child_pI_state = base.clone()
-    child_pI_state[:, 0:1] = bpI
+    child_pI_state[:, 0:1] = apply_refinancing_policy(
+        b_current=base[:, 0:1],
+        bp_candidate=bpI,
+        eta_next=child_pI_state[:, 2:3],
+    )
 
     out_p0_child = pv_model(child_p0_state)
     out_pI_child = pv_model(child_pI_state)

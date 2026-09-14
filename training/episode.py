@@ -2194,7 +2194,6 @@ class Episode:
         self,
         bp: torch.Tensor,
         foc_residuals: List[torch.Tensor],
-        eta_children: Optional[List[torch.Tensor]] = None
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         对有界控制变量 bp ∈ [0,1] 施加 KKT 条件：
@@ -2217,17 +2216,8 @@ class Episode:
             }
 
         foc_stack = torch.stack([r if r.dim() == 2 else r.unsqueeze(-1) for r in foc_residuals], dim=1)  # (B, N, 1)
-        if eta_children is not None and len(eta_children) == foc_stack.shape[1]:
-            eta_stack = torch.stack(
-                [e if e.dim() == 2 else e.unsqueeze(-1) for e in eta_children], dim=1
-            ).to(foc_stack.dtype)
-            eta_stack = eta_stack.clamp(min=0.0, max=1.0)
-            eta_count = eta_stack.sum(dim=1)  # (B,1)
-            active_mask = (eta_count > 0).to(foc_stack.dtype)
-            foc_mean = (eta_stack * foc_stack).sum(dim=1) / (eta_count + 1e-6)  # (B,1), signed
-        else:
-            active_mask = torch.ones_like(bp)
-            foc_mean = foc_stack.mean(dim=1)  # (B, 1), signed
+        active_mask = torch.ones_like(bp)
+        foc_mean = foc_stack.mean(dim=1)  # (B, 1), signed
         active_ratio = float(active_mask.mean().item())
         if active_ratio <= 1e-8:
             z = torch.tensor(0.0, device=self.device)
@@ -2292,19 +2282,19 @@ class Episode:
             }
         return penalty, diag
 
-    def _compute_conditional_signed_foc_terms(
+    def _compute_signed_foc_terms(
         self,
         foc_residuals: List[torch.Tensor],
-        eta_children: List[torch.Tensor],
         z_parent: torch.Tensor,
         alpha_z: float,
         beta_z: float,
         z0: float
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
         """
-        FOC 采用“条件在再融资事件上的 signed moment”：
-            E[FOC | eta=1] = 0
-        其中 FOC 保留符号，再最小化该条件矩的平方。
+        Aggregate branch FOCs as a signed mean over child draws.
+
+        Each P gradient is taken directly with respect to bp, so
+        db_child/dbp = eta_child is already in the autograd graph.
         """
         if not foc_residuals:
             z = torch.tensor(0.0, device=self.device)
@@ -2315,12 +2305,7 @@ class Episode:
             }
 
         foc_stack = torch.stack([r if r.dim() == 2 else r.unsqueeze(-1) for r in foc_residuals], dim=1)  # (B,N,1)
-        eta_stack = torch.stack(
-            [e if e.dim() == 2 else e.unsqueeze(-1) for e in eta_children], dim=1
-        ).to(foc_stack.dtype).clamp(min=0.0, max=1.0)
-
-        eta_count = eta_stack.sum(dim=1)  # (B,1)
-        active_mask = (eta_count > 0).to(foc_stack.dtype)
+        active_mask = torch.ones_like(foc_stack[:, 0, :])
         active_bool = active_mask.squeeze(-1) > 0.5
         active_n = int(active_bool.sum().item())
         if active_n == 0:
@@ -2332,13 +2317,14 @@ class Episode:
                 'foc_active_n': 0.0,
             }
 
-        foc_cond_signed = (eta_stack * foc_stack).sum(dim=1) / (eta_count + 1e-6)  # (B,1), signed
-        foc_cond_abs = (eta_stack * foc_stack.abs()).sum(dim=1) / (eta_count + 1e-6)  # (B,1), non-negative
+        foc_cond_signed = foc_stack.mean(dim=1)
+        foc_cond_abs = foc_stack.abs().mean(dim=1)
 
         foc_signed_moment = foc_cond_signed[active_bool].mean()
         loss_foc = foc_signed_moment.pow(2)
 
-        # 仅在 eta 活跃子样本上评估 z-penalty，避免被 eta=0 样本稀释。
+        # Evaluate the z penalty on every parent because every bp target is
+        # meaningful; child eta effects are already inside each branch FOC.
         penalty_z_foc = compute_z_penalty(
             foc_cond_abs[active_bool],
             z_parent[active_bool],
@@ -4354,7 +4340,6 @@ class Episode:
         children: List[torch.Tensor],
         bp: torch.Tensor,
         b_parent: torch.Tensor,
-        eta_current: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not children:
             raise ValueError(
@@ -4363,13 +4348,12 @@ class Episode:
 
         children_t = torch.stack(children, dim=1)
         child_state_raw = children_t[..., :7] if children_t.shape[-1] > 7 else children_t
-        n_children = child_state_raw.shape[1]
-        b_next = apply_refinancing_policy(
-            b_current=b_parent,
-            bp_candidate=bp,
-            eta_current=eta_current,
+        eta_next = child_state_raw[..., 2:3].clamp(0.0, 1.0)
+        b_children = apply_refinancing_policy(
+            b_current=b_parent.unsqueeze(1),
+            bp_candidate=bp.unsqueeze(1),
+            eta_next=eta_next,
         )
-        b_children = b_next.unsqueeze(1).expand(-1, n_children, -1)
         child_states = torch.cat(
             [
                 b_children,
@@ -4377,7 +4361,6 @@ class Episode:
             ],
             dim=-1,
         )
-        eta_next = children_t[..., 2:3]
         return child_states, eta_next
 
     def _forward_vectorized_policy_children(
@@ -4385,7 +4368,6 @@ class Episode:
         children: List[torch.Tensor],
         bp: torch.Tensor,
         b_parent: torch.Tensor,
-        eta_current: torch.Tensor,
         model,
         target_model,
     ) -> Dict[str, Any]:
@@ -4393,7 +4375,6 @@ class Episode:
             children=children,
             bp=bp,
             b_parent=b_parent,
-            eta_current=eta_current,
         )
         batch_size = int(child_states.shape[0])
         n_children = int(child_states.shape[1])
@@ -4485,7 +4466,6 @@ class Episode:
             children=children,
             bp=bp_for_p0,
             b_parent=b_parent,
-            eta_current=eta_current,
             model=model,
             target_model=target_model,
         )
@@ -4514,16 +4494,12 @@ class Episode:
         P_children_for_foc = list(P_children_for_foc_tensor.unbind(dim=1))
         bar_z_children = list(bar_z_children_tensor.unbind(dim=1))
         bar_z_children_for_foc = list(bar_z_children_for_foc_tensor.unbind(dim=1))
-        eta_current_by_branch = [eta_current for _ in range(N)]
-        b_effective_p0 = apply_refinancing_policy(
-            b_current=b_parent,
-            bp_candidate=bp_for_p0,
-            eta_current=eta_current,
-        )
         
         # Q 值
         Q = _get_out(output_t, 'Q', 0)
-        childp0_state[:, 0:1] = b_effective_p0
+        # Q_issue is evaluated at the actual candidate. eta_t only gates its
+        # contribution inside current-period cash flow.
+        childp0_state[:, 0:1] = bp_for_p0
         outputp0_children = model(childp0_state)
         with torch.no_grad():
             outputp0_children_target = target_model(childp0_state.detach())
@@ -4588,18 +4564,16 @@ class Episode:
                 P_children=P_children_for_foc,
                 bar_z_children=bar_z_children_for_foc,
                 bp=bp_for_p0,
-                eta=eta_current_by_branch
             )
-            loss_foc, penalty_z_foc, foc_diag = self._compute_conditional_signed_foc_terms(
+            loss_foc, penalty_z_foc, foc_diag = self._compute_signed_foc_terms(
                 foc_residuals=foc_residuals,
-                eta_children=eta_current_by_branch,
                 z_parent=parent_state[:, 1:2],
                 alpha_z=loss_fn.alpha_z,
                 beta_z=loss_fn.beta_z,
                 z0=loss_fn.z0
             )
             kkt_penalty_base, kkt_diag = self._compute_bp_kkt_penalty(
-                bp_for_p0, foc_residuals, eta_children=eta_current_by_branch
+                bp_for_p0, foc_residuals
             )
             p0_kkt_w = float(getattr(self.hyperparams, "p0_kkt_weight", 1.0))
             kkt_penalty = p0_kkt_w * kkt_penalty_base
@@ -4756,7 +4730,6 @@ class Episode:
             children=children,
             bp=bp_for_pi,
             b_parent=b_parent,
-            eta_current=eta_current,
             model=model,
             target_model=target_model,
         )
@@ -4786,13 +4759,8 @@ class Episode:
         P_children_for_foc = list(P_children_for_foc_tensor.unbind(dim=1))
         bar_z_children = list(bar_z_children_tensor.unbind(dim=1))
         bar_z_children_for_foc = list(bar_z_children_for_foc_tensor.unbind(dim=1))
-        eta_current_by_branch = [eta_current for _ in range(N)]
-        b_effective_pi = apply_refinancing_policy(
-            b_current=b_parent,
-            bp_candidate=bp_for_pi,
-            eta_current=eta_current,
-        )
-        childpI_state[:, 0:1] = b_effective_pi
+        # Q_issue uses the actual candidate; current eta_t remains in CFip.
+        childpI_state[:, 0:1] = bp_for_pi
         outputpI_children = model(childpI_state)
         with torch.no_grad():
             outputpI_children_target = target_model(childpI_state.detach())
@@ -4866,18 +4834,16 @@ class Episode:
                 P_children=P_children_for_foc,
                 bar_z_children=bar_z_children_for_foc,
                 bp=bp_for_pi,
-                eta=eta_current_by_branch
             )
-            loss_foc, penalty_z_foc, foc_diag = self._compute_conditional_signed_foc_terms(
+            loss_foc, penalty_z_foc, foc_diag = self._compute_signed_foc_terms(
                 foc_residuals=foc_residuals,
-                eta_children=eta_current_by_branch,
                 z_parent=parent_state[:, 1:2],
                 alpha_z=loss_fn.alpha_z,
                 beta_z=loss_fn.beta_z,
                 z0=loss_fn.z0
             )
             kkt_penalty_base, kkt_diag = self._compute_bp_kkt_penalty(
-                bp_for_pi, foc_residuals, eta_children=eta_current_by_branch
+                bp_for_pi, foc_residuals
             )
             pi_kkt_w = float(getattr(self.hyperparams, "pi_kkt_weight", 1.0))
             kkt_penalty = pi_kkt_w * kkt_penalty_base
@@ -5600,20 +5566,19 @@ class Episode:
         bp_for_p0 = bp0_t
         b_parent = parent_state[:, 0:1]
         eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
-        b_effective_p0 = apply_refinancing_policy(
-            b_current=b_parent,
-            bp_candidate=bp_for_p0,
-            eta_current=eta_current,
-        )
         output_children = []
         for child in children:
             child_state_raw = self._policy_strip_extra(child)
             child_state = child_state_raw.clone()
-            child_state[:, 0:1] = b_effective_p0
+            child_state[:, 0:1] = apply_refinancing_policy(
+                b_current=b_parent,
+                bp_candidate=bp_for_p0,
+                eta_next=child_state_raw[:, 2:3],
+            )
             output_children.append(model(child_state))
 
         childp0_state = parent_state.clone()
-        childp0_state[:, 0:1] = b_effective_p0
+        childp0_state[:, 0:1] = bp_for_p0
         outputp0_children = model(childp0_state)
 
         P0 = self._policy_get_out(output_t, 'P0', 3)
@@ -5674,20 +5639,19 @@ class Episode:
         bp_for_pi = bpI_t
         b_parent = parent_state[:, 0:1]
         eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
-        b_effective_pi = apply_refinancing_policy(
-            b_current=b_parent,
-            bp_candidate=bp_for_pi,
-            eta_current=eta_current,
-        )
         output_children = []
         for child in children:
             child_state_raw = self._policy_strip_extra(child)
             child_state = child_state_raw.clone()
-            child_state[:, 0:1] = b_effective_pi
+            child_state[:, 0:1] = apply_refinancing_policy(
+                b_current=b_parent,
+                bp_candidate=bp_for_pi,
+                eta_next=child_state_raw[:, 2:3],
+            )
             output_children.append(model(child_state))
 
         childpI_state = parent_state.clone()
-        childpI_state[:, 0:1] = b_effective_pi
+        childpI_state[:, 0:1] = bp_for_pi
         outputpI_children = model(childpI_state)
 
         Q = self._policy_get_out(output_t, 'Q', 0)

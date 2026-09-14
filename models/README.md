@@ -15,10 +15,12 @@ Firm-state (7D):
 - `Q`, `bp0`, `bpI`, `P0`, `PI`, `bar_i`, `bar_z`, `P`, `Phat`, `bp`
 
 ### Update rule
-`update_leverage(b_old, bp, eta)`:
+`update_leverage(b_old, bp, eta_next)`:
 ```
-b_new = eta * bp + (1 - eta) * b_old
+b_{t+1} = eta_{t+1} * bp_t + (1 - eta_{t+1}) * b_t
 ```
+Current `eta_t` enters current financing cash flow; child `eta_{t+1}` alone
+determines whether the parent policy is implemented in child leverage.
 
 ## sdf_fc1.py
 `SDFFC1Combined` combines SDF, FC1, and value model `W`.

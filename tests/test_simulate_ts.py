@@ -38,12 +38,12 @@ def build_dummy_models(device: torch.device):
 
 def _assert_effective_debt_identity(
     b: torch.Tensor,
-    eta: torch.Tensor,
+    eta_next: torch.Tensor,
     bp: torch.Tensor,
     b_next: torch.Tensor,
     atol: float = 1e-6,
 ) -> None:
-    expected = eta * bp + (1.0 - eta) * b
+    expected = eta_next * bp + (1.0 - eta_next) * b
     torch.testing.assert_close(b_next, expected, atol=atol, rtol=0.0)
 
 
@@ -64,7 +64,7 @@ def _fake_policy_value_output(firm_state: torch.Tensor):
     )
 
 
-def test_effective_next_debt_uses_current_eta():
+def test_effective_next_debt_uses_child_eta():
     b = torch.tensor([0.6, 0.4])
     eta = torch.tensor([1.0, 0.0])
     bp = torch.tensor([0.2, 0.9])
@@ -72,14 +72,14 @@ def test_effective_next_debt_uses_current_eta():
     b_next = apply_refinancing_policy(
         b_current=b,
         bp_candidate=bp,
-        eta_current=eta,
+        eta_next=eta,
     )
 
     torch.testing.assert_close(b_next, torch.tensor([0.2, 0.4]))
     _assert_effective_debt_identity(b, eta, bp, b_next)
 
 
-def test_parallel_simulation_next_eta_does_not_change_branch_leverage(monkeypatch):
+def test_parallel_simulation_child_eta_changes_branch_leverage(monkeypatch):
     device = torch.device("cpu")
     eta_draws = [
         torch.zeros(2, 1, device=device),
@@ -118,13 +118,12 @@ def test_parallel_simulation_next_eta_does_not_change_branch_leverage(monkeypatc
 
     branches = simulate_ts_parallel._expand_branches_batched(sim, state)
 
-    expected_b = torch.tensor([[0.2], [0.4]], device=device)
-    torch.testing.assert_close(branches[0]["b"], expected_b)
-    torch.testing.assert_close(branches[1]["b"], expected_b)
+    torch.testing.assert_close(branches[0]["b"], state["b"])
+    torch.testing.assert_close(branches[1]["b"], state["bp"])
     assert not torch.equal(branches[0]["eta"], branches[1]["eta"])
 
 
-def test_sample_update_child_leverage_uses_parent_eta_not_child_eta():
+def test_sample_update_child_leverage_uses_each_child_eta():
     sample = Sample(models={}, n_samples=0, n_paths=0)
     df = pd.DataFrame(
         [
@@ -141,8 +140,8 @@ def test_sample_update_child_leverage_uses_parent_eta_not_child_eta():
 
     a_children = df[(df["ID"] == "a") & (df["branch"] > 0)]
     b_children = df[(df["ID"] == "b") & (df["branch"] > 0)]
-    assert set(a_children["b"].round(8).tolist()) == {0.6}
-    assert set(b_children["b"].round(8).tolist()) == {0.9}
+    assert a_children["b"].round(8).tolist() == [0.2, 0.6]
+    assert b_children["b"].round(8).tolist() == [0.4, 0.9]
     assert a_children["ETA"].tolist() == [1.0, 0.0]
     assert b_children["ETA"].tolist() == [0.0, 1.0]
 
@@ -185,7 +184,7 @@ def _serial_state(device: torch.device):
     }
 
 
-def test_serial_tensor_expand_branches_uses_parent_eta(monkeypatch):
+def test_serial_tensor_expand_branches_uses_child_eta(monkeypatch):
     device = torch.device("cpu")
     eta_draws = [torch.zeros(2, device=device), torch.ones(2, device=device)]
 
@@ -196,13 +195,12 @@ def test_serial_tensor_expand_branches_uses_parent_eta(monkeypatch):
     sim = _make_serial_sim(device)
     branches = sim._expand_branches_tensor(_serial_state(device))
 
-    expected_b = torch.tensor([0.2, 0.4], device=device)
-    torch.testing.assert_close(branches[0]["b"], expected_b)
-    torch.testing.assert_close(branches[1]["b"], expected_b)
+    torch.testing.assert_close(branches[0]["b"], torch.tensor([0.6, 0.4], device=device))
+    torch.testing.assert_close(branches[1]["b"], torch.tensor([0.2, 0.9], device=device))
     assert not torch.equal(branches[0]["eta"], branches[1]["eta"])
 
 
-def test_serial_tensor_node_reports_effective_next_debt(monkeypatch):
+def test_serial_tensor_node_defers_next_debt_until_child_eta_is_drawn(monkeypatch):
     device = torch.device("cpu")
     sim = _make_serial_sim(device)
     sim.models["policy_value"] = object()
@@ -225,45 +223,11 @@ def test_serial_tensor_node_reports_effective_next_debt(monkeypatch):
     columns = {name: idx for idx, name in enumerate(sim.FIRM_COLUMNS)}
 
     assert firm_rows.shape[1] == len(sim.FIRM_COLUMNS)
-    b = firm_rows[:, columns["b"]]
-    eta = firm_rows[:, columns["ETA"]]
-    bp0 = firm_rows[:, columns["bp0"]]
-    bpI = firm_rows[:, columns["bpI"]]
-    bp = firm_rows[:, columns["bp"]]
-
-    _assert_effective_debt_identity(
-        b,
-        eta,
-        bp0,
-        firm_rows[:, columns["b_next_p0"]],
-    )
-    _assert_effective_debt_identity(
-        b,
-        eta,
-        bpI,
-        firm_rows[:, columns["b_next_pi"]],
-    )
-    _assert_effective_debt_identity(
-        b,
-        eta,
-        bp,
-        firm_rows[:, columns["b_next_policy"]],
-    )
-    torch.testing.assert_close(
-        firm_rows[:, columns["b_next_p0"]],
-        torch.tensor([0.2, 0.4], device=device),
-    )
-    torch.testing.assert_close(
-        firm_rows[:, columns["b_next_pi"]],
-        torch.tensor([0.3, 0.4], device=device),
-    )
-    torch.testing.assert_close(
-        firm_rows[:, columns["b_next_policy"]],
-        torch.tensor([0.25, 0.4], device=device),
-    )
+    for name in ("b_next_p0", "b_next_pi", "b_next_policy"):
+        assert torch.isnan(firm_rows[:, columns[name]]).all()
 
 
-def test_parallel_tensor_node_reports_effective_next_debt(monkeypatch):
+def test_parallel_tensor_node_defers_next_debt_until_child_eta_is_drawn(monkeypatch):
     device = torch.device("cpu")
     sim = _make_serial_sim(device)
     sim.models["policy_value"] = object()
@@ -306,33 +270,11 @@ def test_parallel_tensor_node_reports_effective_next_debt(monkeypatch):
     columns = {name: idx for idx, name in enumerate(sim.FIRM_COLUMNS)}
 
     assert firm_rows.shape[1] == len(sim.FIRM_COLUMNS)
-    b = firm_rows[:, columns["b"]]
-    eta = firm_rows[:, columns["ETA"]]
-    bp0 = firm_rows[:, columns["bp0"]]
-    bpI = firm_rows[:, columns["bpI"]]
-    bp = firm_rows[:, columns["bp"]]
-
-    _assert_effective_debt_identity(
-        b,
-        eta,
-        bp0,
-        firm_rows[:, columns["b_next_p0"]],
-    )
-    _assert_effective_debt_identity(
-        b,
-        eta,
-        bpI,
-        firm_rows[:, columns["b_next_pi"]],
-    )
-    _assert_effective_debt_identity(
-        b,
-        eta,
-        bp,
-        firm_rows[:, columns["b_next_policy"]],
-    )
+    for name in ("b_next_p0", "b_next_pi", "b_next_policy"):
+        assert torch.isnan(firm_rows[:, columns[name]]).all()
 
 
-def test_serial_legacy_expand_branches_uses_parent_eta(monkeypatch):
+def test_serial_legacy_expand_branches_uses_child_eta(monkeypatch):
     device = torch.device("cpu")
     eta_draws = [torch.zeros(2, device=device), torch.ones(2, device=device)]
 
@@ -343,9 +285,8 @@ def test_serial_legacy_expand_branches_uses_parent_eta(monkeypatch):
     sim = _make_serial_sim(device)
     branches = sim._expand_branches(_serial_state(device), t=0)
 
-    expected_b = torch.tensor([0.2, 0.4], device=device)
-    torch.testing.assert_close(branches[0]["b"], expected_b)
-    torch.testing.assert_close(branches[1]["b"], expected_b)
+    torch.testing.assert_close(branches[0]["b"], torch.tensor([0.6, 0.4], device=device))
+    torch.testing.assert_close(branches[1]["b"], torch.tensor([0.2, 0.9], device=device))
     assert not torch.equal(branches[0]["eta"], branches[1]["eta"])
 
 
@@ -369,11 +310,11 @@ def test_simulation_dataframe_reports_effective_next_debt():
 
     required = {"b_next_p0", "b_next_pi", "b_next_policy"}
     assert required.issubset(set(df_firm.columns))
-    expected = df_firm["ETA"] * df_firm["bp"] + (1.0 - df_firm["ETA"]) * df_firm["b"]
-    error = (df_firm["b_next_policy"] - expected).abs()
-    assert error.max() < 1e-6
-
     parents = df_firm[df_firm["branch"] == -1]
+    nonparents = df_firm[df_firm["branch"] >= 0]
+    assert parents["b_next_policy"].notna().all()
+    assert nonparents["b_next_policy"].isna().all()
+
     children = df_firm[df_firm["branch"] == 0]
     merged = parents.merge(
         children,
@@ -383,6 +324,11 @@ def test_simulation_dataframe_reports_effective_next_debt():
     )
     merged = merged[merged["t_child"] == merged["t_parent"] + 1]
     assert not merged.empty
+    expected = (
+        merged["ETA_child"] * merged["bp_parent"]
+        + (1.0 - merged["ETA_child"]) * merged["b_parent"]
+    )
+    assert (merged["b_next_policy_parent"] - expected).abs().max() < 1e-6
     max_transition_error = (
         merged["b_next_policy_parent"] - merged["b_child"]
     ).abs().max()

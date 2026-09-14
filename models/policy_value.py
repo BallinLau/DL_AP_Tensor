@@ -14,6 +14,7 @@ from .share_layer import ShareLayer, QHead, BpHead, PHead, CombinedModel, BarzMo
 import sys
 sys.path.append('..')
 from config import Config, SIMMODEL
+from utils.firm_transition import apply_refinancing_policy
 
 
 def default_policy_value_model_spec() -> Dict[str, object]:
@@ -470,22 +471,26 @@ class PolicyValueModel(nn.Module):
         self,
         b_old: torch.Tensor,
         bp: torch.Tensor,
-        eta: torch.Tensor
+        eta_next: torch.Tensor
     ) -> torch.Tensor:
         """
         更新杠杆
         
-        b_new = η * bp + (1 - η) * b_old
+        b_new = η_{t+1} * bp_t + (1 - η_{t+1}) * b_t
         
         Args:
             b_old: 旧杠杆
             bp: 杠杆候选
-            eta: 再融资开关
+            eta_next: child-state refinancing realization
         
         Returns:
             b_new: 新杠杆
         """
-        return eta * bp + (1 - eta) * b_old
+        return apply_refinancing_policy(
+            b_current=b_old,
+            bp_candidate=bp,
+            eta_next=eta_next,
+        )
     
     def update_capital(
         self,

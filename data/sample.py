@@ -795,7 +795,7 @@ class Sample:
         ]:
             df.loc[parent_mask, col] = val.cpu().numpy()
 
-        # 基于 parent 的 bp 与当前 ETA(eta_t) 更新 child 杠杆；child ETA 是 eta_{t+1}
+        # 基于 parent 的 bp 与各 child 的 ETA (eta_{t+1}) 更新 child 杠杆。
         self._update_child_leverage(df)
 
         # 更新 child 输入后再跑一次模型获取 child 输出
@@ -899,10 +899,9 @@ class Sample:
     
     def _update_child_leverage(self, df: pd.DataFrame):
         """
-        根据 parent 的当前 refinancing shock 和政策更新 child 的杠杆。
+        根据每个 child 的 refinancing realization 和 parent 政策更新杠杆。
 
-        b_{t+1} = η_t * bp_t + (1 - η_t) * b_t
-        child 行的 ETA 保持为 η_{t+1}，不能进入当前杠杆 transition。
+        b_{t+1}^{(j)} = η_{t+1}^{(j)} * bp_t + (1 - η_{t+1}^{(j)}) * b_t
         """
         if 'bp' not in df.columns:
             return
@@ -914,13 +913,17 @@ class Sample:
                     continue
                 bp_parent = parent_rows['bp'].values[0]
                 b_parent = parent_rows['b'].values[0]
-                eta_current = parent_rows['ETA'].values[0]
+                if len(child_rows) == 0:
+                    continue
+                eta_next = torch.tensor(
+                    child_rows['ETA'].to_numpy(), dtype=torch.float64
+                )
                 b_next = apply_refinancing_policy(
-                    b_current=torch.tensor([[b_parent]], dtype=torch.float64),
-                    bp_candidate=torch.tensor([[bp_parent]], dtype=torch.float64),
-                    eta_current=torch.tensor([[eta_current]], dtype=torch.float64),
-                ).item()
-                df.loc[child_rows.index, 'b'] = b_next
+                    b_current=torch.full_like(eta_next, float(b_parent)),
+                    bp_candidate=torch.full_like(eta_next, float(bp_parent)),
+                    eta_next=eta_next,
+                )
+                df.loc[child_rows.index, 'b'] = b_next.numpy()
     
     def diagnose(self, df: pd.DataFrame) -> Dict:
         """
