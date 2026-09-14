@@ -38,6 +38,47 @@ For raw state dicts, use `--pv-ckpt` and provide `--sdf-ckpt`,
 `--hyperparams-json`, `--config-json`, and `--model-spec-json`. Current runtime
 defaults are accepted only when the corresponding explicit opt-in flag is passed.
 
+## GPU Slurm
+
+`slurm/run_firm_checkpoint_evaluator_gpu.slurm` runs the same evaluator on one
+GPU in the `a01` partition. It defaults to a combined checkpoint, final
+simulation firm/macro data, a 101 by 101 `(b,z)` grid, and two common child
+shocks. `RUN_ROOT` and `EPISODE` are mandatory.
+
+```bash
+RUN_ROOT=/home/fit/zhuyingz/WORK/LiuHao/cachedir/<run> \
+EPISODE=9 \
+sbatch DL_AP_Tensor/slurm/run_firm_checkpoint_evaluator_gpu.slurm
+```
+
+Run the robustness version with 32 shocks into a distinct output directory:
+
+```bash
+RUN_ROOT=/home/fit/zhuyingz/WORK/LiuHao/cachedir/<run> \
+EPISODE=9 \
+N_CHILD_SHOCKS=32 \
+OUTPUT_DIR=/home/fit/zhuyingz/WORK/LiuHao/cachedir/<run>/data/outputs/firm_checkpoint_evaluator/ep9_J32 \
+sbatch DL_AP_Tensor/slurm/run_firm_checkpoint_evaluator_gpu.slurm
+```
+
+For an episode-stage reference distribution, explicitly set both files:
+
+```bash
+RUN_ROOT=/home/fit/zhuyingz/WORK/LiuHao/cachedir/<run> \
+EPISODE=2 \
+FIRM_DATA=/home/fit/zhuyingz/WORK/LiuHao/cachedir/<run>/data/outputs/ep2_stage_modeb.pkl \
+MACRO_DATA=/home/fit/zhuyingz/WORK/LiuHao/cachedir/<run>/data/outputs/ep2_stage_modeb_macro.pkl \
+sbatch DL_AP_Tensor/slurm/run_firm_checkpoint_evaluator_gpu.slurm
+```
+
+The script checks that `HEAD` contains the required evaluator commit, rejects
+modified tracked files, verifies CUDA, runs the evaluator unit tests, and
+validates the output schema and objective-slice counts. Untracked files are
+reported but do not block by default; set `STRICT_UNTRACKED_WORKTREE=1` for a
+fully clean-worktree requirement. Set `RUN_EVALUATOR_TESTS=0` only after a
+tested smoke run. `ALLOW_DIRTY_WORKTREE=1` is reserved for intentional local
+diagnostics because it permits modified tracked source files.
+
 ## Output semantics
 
 - `default/default_boundary.csv` defines a boundary only when exactly one
