@@ -418,7 +418,8 @@ class HyperParams:
     eta_active_reweight_enabled: bool = True
     eta_active_target_ratio: float = 0.25
     eta_active_max_reweight: float = 6.0
-    # Policy/Value batch 的 eta=1 条件重采样
+    # 仅对 staged BP distillation train cache 按 child eta active 重采样；
+    # Bellman/P0/PI/Q batches 始终保留原始 future-shock distribution。
     pv_eta_resample_enabled: bool = True
     pv_eta_resample_active_share: float = 0.25
     # bp 项自适应权重：使 (FOC+KKT) 与 Bellman 主项同量级

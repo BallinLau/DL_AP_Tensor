@@ -167,11 +167,20 @@ def _summary(
     pred: np.ndarray,
     star: np.ndarray,
     survival_mask: np.ndarray,
+    identified_mask: np.ndarray,
+    *,
+    margin_tol: float,
 ) -> Dict[str, float]:
-    values = _gap_statistics(pred, star, survival_mask)
+    primary_mask = survival_mask.astype(bool) & identified_mask.astype(bool)
+    values = _gap_statistics(pred, star, primary_mask)
+    survival_values = _gap_statistics(pred, star, survival_mask)
     raw_values = _gap_statistics(pred, star, np.ones_like(survival_mask, dtype=bool))
+    values.update({f"survival_{key}": value for key, value in survival_values.items()})
     values.update({f"raw_{key}": value for key, value in raw_values.items()})
     values["survival_grid_share"] = float(survival_mask.astype(bool).mean())
+    values["teacher_identified_grid_share"] = float(identified_mask.astype(bool).mean())
+    values["survival_identified_grid_share"] = float(primary_mask.mean())
+    values["teacher_margin_tol"] = float(margin_tol)
     return {f"{prefix}_{key}": value for key, value in values.items()}
 
 
@@ -215,7 +224,10 @@ def evaluate_bp_consistency(
     output_dir: str | Path,
     n_child_shocks: int = 2,
     shock_seed: int = 12345,
+    teacher_margin_tol: float = 1e-8,
 ) -> tuple[Dict[str, np.ndarray], Dict[str, float], Dict[str, Any]]:
+    if float(teacher_margin_tol) < 0.0:
+        raise ValueError("teacher_margin_tol must be non-negative")
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     children, m_list, transition_metadata = build_frozen_transition_children(
@@ -256,14 +268,33 @@ def evaluate_bp_consistency(
             star = result["bp_star"].detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
             phat = output_model.Phat.detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
             survival_mask = np.isfinite(phat) & (phat > 0.0)
+            top2_margin = (
+                result["top2_margin"].detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
+            )
+            identified_mask = np.isfinite(top2_margin) & (top2_margin > float(teacher_margin_tol))
+            primary_mask = survival_mask & identified_mask
             gap = np.abs(pred - star)
             surfaces[f"{label}_bp_pred_raw"] = pred
             surfaces[f"{label}_bp_grid_star_raw"] = star
             surfaces[f"{label}_bp_abs_gap_raw"] = gap
+            surfaces[f"{label}_teacher_top2_margin_raw"] = top2_margin
+            surfaces[f"{label}_teacher_identified_raw"] = identified_mask.astype(np.float64)
             surfaces[f"{label}_bp_pred_survival"] = np.where(survival_mask, pred, np.nan)
             surfaces[f"{label}_bp_grid_star_survival"] = np.where(survival_mask, star, np.nan)
             surfaces[f"{label}_bp_abs_gap_survival"] = np.where(survival_mask, gap, np.nan)
-            summary.update(_summary(label, pred, star, survival_mask))
+            surfaces[f"{label}_bp_pred_survival_identified"] = np.where(primary_mask, pred, np.nan)
+            surfaces[f"{label}_bp_grid_star_survival_identified"] = np.where(primary_mask, star, np.nan)
+            surfaces[f"{label}_bp_abs_gap_survival_identified"] = np.where(primary_mask, gap, np.nan)
+            summary.update(
+                _summary(
+                    label,
+                    pred,
+                    star,
+                    survival_mask,
+                    identified_mask,
+                    margin_tol=teacher_margin_tol,
+                )
+            )
 
     positions = {
         "b_low_z_low": 0,
@@ -283,4 +314,6 @@ def evaluate_bp_consistency(
             frame.to_csv(output / f"{stem}.csv", index=False)
             plot_objective_slice(frame, output / f"{stem}.png", title=stem)
 
+    transition_metadata["teacher_margin_tol"] = float(teacher_margin_tol)
+    transition_metadata["primary_bp_mask"] = "finite Phat>0 and top2_margin>teacher_margin_tol"
     return surfaces, summary, transition_metadata

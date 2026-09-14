@@ -288,15 +288,26 @@ def test_frozen_transition_children_use_state_dependent_ar1_and_sdf_m():
     assert 0.0 <= metadata["eta_next_active_share"] <= 1.0
 
 
-def test_bp_consistency_primary_statistics_use_survival_mask():
-    pred = np.array([[0.99, 0.20]])
-    star = np.array([[0.01, 0.20]])
-    mask = np.array([[False, True]])
-    summary = _summary("p0", pred, star, mask)
+def test_bp_consistency_primary_statistics_require_survival_and_identification():
+    pred = np.array([[0.99, 0.80, 0.20]])
+    star = np.array([[0.01, 0.20, 0.20]])
+    survival = np.array([[False, True, True]])
+    identified = np.array([[True, False, True]])
+    summary = _summary(
+        "p0",
+        pred,
+        star,
+        survival,
+        identified,
+        margin_tol=1e-8,
+    )
     assert summary["p0_mae"] == 0.0
-    assert summary["p0_raw_mae"] == pytest.approx(0.49)
+    assert summary["p0_survival_mae"] == pytest.approx(0.3)
+    assert summary["p0_raw_mae"] == pytest.approx((0.98 + 0.60) / 3.0)
     assert summary["p0_predicted_high_boundary_share"] == 0.0
-    assert summary["p0_raw_predicted_high_boundary_share"] == 0.5
+    assert summary["p0_survival_predicted_high_boundary_share"] == 0.0
+    assert summary["p0_raw_predicted_high_boundary_share"] == pytest.approx(1.0 / 3.0)
+    assert summary["p0_survival_identified_grid_share"] == pytest.approx(1.0 / 3.0)
 
 
 def test_investment_status_requires_exactly_one_crossing():
@@ -376,6 +387,8 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
         "bp/bp_raw.csv",
         "bp/bp_survival.csv",
         "bp/p0_bp_abs_gap_survival.png",
+        "bp/p0_bp_abs_gap_survival_identified.png",
+        "bp/p0_teacher_top2_margin_raw.csv",
         "bp/pi_mid_bp_grid_star_survival.csv",
         "objective_slices/p0_b_mid_z_mid.csv",
         "objective_slices/pi_mid_b_mid_z_mid.png",
@@ -394,6 +407,10 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
     assert 0.0 <= metadata["reference_transition_bank"]["eta_next_active_share"] <= 1.0
     assert metadata["bp_teacher_model"] == "policy_value"
     assert metadata["reference_transition_bank"]["bp_teacher_model"] == "policy_value"
+    assert metadata["reference_transition_bank"]["teacher_margin_tol"] == 1e-8
+    assert metadata["reference_transition_bank"]["primary_bp_mask"] == (
+        "finite Phat>0 and top2_margin>teacher_margin_tol"
+    )
 
     q_unit = pd.read_csv(out_a / "q" / "q_unit.csv", index_col=0)
     assert q_unit.iloc[0].isna().all()

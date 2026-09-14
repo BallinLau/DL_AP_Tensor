@@ -208,12 +208,14 @@ def _compute_policy_diagnostic_surfaces(
         bp_candidate=bp0,
         eta_next=eta_next,
     )
+    child_p0_state[:, 2:3] = eta_next
     child_pI_state = base.clone()
     child_pI_state[:, 0:1] = apply_refinancing_policy(
         b_current=base[:, 0:1],
         bp_candidate=bpI,
         eta_next=eta_next,
     )
+    child_pI_state[:, 2:3] = eta_next
 
     out_p0_child = pv_model(child_p0_state)
     out_pI_child = pv_model(child_pI_state)

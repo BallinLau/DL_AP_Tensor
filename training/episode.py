@@ -1406,31 +1406,10 @@ class Episode:
 
         indices = torch.arange(n_units, device=parent.device)
 
-        # Oversample parents whose child bank contains an implementable bp branch.
-        resample_enabled = bool(getattr(self.hyperparams, "pv_eta_resample_enabled", True))
-        if shuffle and eta_resample and resample_enabled and n_units > 1 and len(children) > 0:
-            eta_next = torch.stack(
-                [child[:, 2:3].clamp(0.0, 1.0) for child in children],
-                dim=1,
-            )
-            active_mask = eta_next.amax(dim=1).squeeze(-1) > 0.5
-            active_idx = torch.where(active_mask)[0]
-            inactive_idx = torch.where(~active_mask)[0]
-            if active_idx.numel() > 0 and inactive_idx.numel() > 0:
-                target_active_share = float(getattr(self.hyperparams, "pv_eta_resample_active_share", 0.25))
-                target_active_share = min(max(target_active_share, 1e-3), 1.0 - 1e-3)
-                n_active = int(round(n_units * target_active_share))
-                n_active = min(max(1, n_active), n_units - 1)
-                n_inactive = n_units - n_active
-                active_pick = active_idx[torch.randint(0, active_idx.numel(), (n_active,), device=active_idx.device)]
-                inactive_pick = inactive_idx[
-                    torch.randint(0, inactive_idx.numel(), (n_inactive,), device=inactive_idx.device)
-                ]
-                indices = torch.cat([active_pick, inactive_pick], dim=0)
-                indices = indices[torch.randperm(indices.numel(), device=indices.device)]
-            else:
-                indices = indices[torch.randperm(n_units, device=indices.device)]
-        elif shuffle:
+        # Bellman/value batches must preserve the simulated future-shock
+        # distribution.  eta_resample is retained for call compatibility;
+        # optional child-eta oversampling is applied only to the staged BP cache.
+        if shuffle:
             indices = indices[torch.randperm(n_units, device=indices.device)]
 
         max_units = int(getattr(self.hyperparams, "max_firm_train_units", 0))
@@ -1736,7 +1715,7 @@ class Episode:
             train_batches = self._parent_group_pool_to_batches(
                 sim_pool,
                 batch_size=batch_size,
-                eta_resample=True,
+                eta_resample=False,
             )
             return train_batches, [], summary
 
@@ -5320,31 +5299,9 @@ class Episode:
         n_units = len(parent)
         indices = torch.arange(n_units, device=parent.device)
 
-        # Oversample parents whose child bank contains an implementable bp branch.
-        resample_enabled = bool(getattr(self.hyperparams, "pv_eta_resample_enabled", True))
-        if eta_resample and resample_enabled and n_units > 1 and len(children) > 0:
-            eta_next = torch.stack(
-                [child[:, 2:3].clamp(0.0, 1.0) for child in children],
-                dim=1,
-            )
-            active_mask = eta_next.amax(dim=1).squeeze(-1) > 0.5
-            active_idx = torch.where(active_mask)[0]
-            inactive_idx = torch.where(~active_mask)[0]
-            if active_idx.numel() > 0 and inactive_idx.numel() > 0:
-                target_active_share = float(getattr(self.hyperparams, "pv_eta_resample_active_share", 0.25))
-                target_active_share = min(max(target_active_share, 1e-3), 1.0 - 1e-3)
-                n_active = int(round(n_units * target_active_share))
-                n_active = min(max(1, n_active), n_units - 1)
-                n_inactive = n_units - n_active
-
-                active_pick = active_idx[torch.randint(0, active_idx.numel(), (n_active,), device=active_idx.device)]
-                inactive_pick = inactive_idx[
-                    torch.randint(0, inactive_idx.numel(), (n_inactive,), device=inactive_idx.device)
-                ]
-                indices = torch.cat([active_pick, inactive_pick], dim=0)
-                indices = indices[torch.randperm(indices.numel(), device=indices.device)]
-            else:
-                indices = indices[torch.randperm(n_units, device=indices.device)]
+        # Do not condition shared Bellman/value batches on realized child eta.
+        # Staged BP-only cache resampling is handled after teacher targets exist.
+        indices = indices[torch.randperm(n_units, device=indices.device)]
 
         max_units = int(getattr(self.hyperparams, "max_firm_train_units", 0))
         if max_units > 0 and indices.numel() > max_units:
@@ -7268,6 +7225,10 @@ class Episode:
                     bp_pred=bp_mix,
                     mix_weight=mix_weight,
                 )
+                eta_next_active = torch.stack(
+                    [child[:, 2:3] > 0.5 for child in children],
+                    dim=1,
+                ).any(dim=1)
                 cache.append({
                     "batch_id": batch_id,
                     "parent": parent_state.detach().cpu(),
@@ -7280,9 +7241,108 @@ class Episode:
                     "bpi_confidence": pi_grid["confidence"].detach().cpu(),
                     "mix_confidence": mix_grid["confidence"].detach().cpu(),
                     "mix_sample_weight": mix_survival.detach().cpu(),
+                    "eta_next_active": eta_next_active.detach().cpu(),
                     "teacher_snapshot_hash": self._state_dict_hash(teacher_model),
                 })
         return cache
+
+    def _resample_bp_target_cache(
+        self,
+        cache: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Optionally oversample child-eta-active rows for BP-only distillation."""
+        enabled = bool(getattr(self.hyperparams, "pv_eta_resample_enabled", True))
+        summary: Dict[str, Any] = {
+            "enabled": enabled,
+            "scope": "bp_distillation_train_cache_only",
+            "validation_cache_resampled": False,
+            "applied": False,
+            "reason": "disabled" if not enabled else "empty_cache",
+        }
+        if not enabled or not cache:
+            return cache, summary
+
+        active = torch.cat(
+            [item["eta_next_active"].detach().cpu().reshape(-1).bool() for item in cache],
+            dim=0,
+        )
+        n_total = int(active.numel())
+        summary["n_rows"] = n_total
+        summary["active_share_before"] = float(active.float().mean().item()) if n_total else 0.0
+        active_idx = torch.where(active)[0]
+        inactive_idx = torch.where(~active)[0]
+        if n_total <= 1 or active_idx.numel() == 0 or inactive_idx.numel() == 0:
+            summary["reason"] = "single_eta_stratum"
+            summary["active_share_after"] = summary["active_share_before"]
+            return cache, summary
+
+        target_share = float(getattr(self.hyperparams, "pv_eta_resample_active_share", 0.25))
+        target_share = min(max(target_share, 1e-3), 1.0 - 1e-3)
+        if summary["active_share_before"] >= target_share:
+            summary.update({
+                "reason": "already_at_or_above_target",
+                "target_active_share": target_share,
+                "active_share_after": summary["active_share_before"],
+            })
+            return cache, summary
+        n_active = min(max(1, int(round(n_total * target_share))), n_total - 1)
+        n_inactive = n_total - n_active
+        selected = torch.cat(
+            [
+                active_idx[torch.randint(active_idx.numel(), (n_active,))],
+                inactive_idx[torch.randint(inactive_idx.numel(), (n_inactive,))],
+            ],
+            dim=0,
+        )
+        selected = selected[torch.randperm(selected.numel())]
+
+        required_tensor_keys = (
+            "parent",
+            "bp0_target",
+            "bpi_target",
+            "mix_target",
+            "bp0_confidence",
+            "bpi_confidence",
+            "mix_confidence",
+            "mix_sample_weight",
+            "eta_next_active",
+        )
+        flat = {
+            key: torch.cat([item[key].detach().cpu() for item in cache], dim=0)
+            for key in required_tensor_keys
+        }
+        optional_tensor_keys = []
+        for key in ("source_id", "source_index"):
+            present = [isinstance(item.get(key), torch.Tensor) for item in cache]
+            if any(present) and not all(present):
+                raise ValueError(f"BP cache has inconsistent optional field {key!r}")
+            if all(present):
+                optional_tensor_keys.append(key)
+                flat[key] = torch.cat([item[key].detach().cpu() for item in cache], dim=0)
+
+        resampled: List[Dict[str, Any]] = []
+        cursor = 0
+        for batch_id, template in enumerate(cache):
+            batch_rows = int(template["parent"].shape[0])
+            row_index = selected[cursor:cursor + batch_rows]
+            item = dict(template)
+            for key in (*required_tensor_keys, *optional_tensor_keys):
+                item[key] = flat[key][row_index].clone()
+            item["batch_id"] = batch_id
+            resampled.append(item)
+            cursor += batch_rows
+
+        active_after = torch.cat(
+            [item["eta_next_active"].reshape(-1).float() for item in resampled],
+            dim=0,
+        )
+        summary.update({
+            "applied": True,
+            "reason": "target_share_applied",
+            "target_active_share": target_share,
+            "active_share_after": float(active_after.mean().item()),
+        })
+        return resampled, summary
 
     @staticmethod
     def _policy_output_value(output: Any, name: str, idx: int) -> torch.Tensor:
@@ -7636,6 +7696,7 @@ class Episode:
                 item["bpi_confidence"],
                 item["mix_confidence"],
                 item["mix_sample_weight"],
+                item["eta_next_active"],
             ])
             for key in ("source_id", "source_index"):
                 value = item.get(key)
@@ -8252,6 +8313,7 @@ class Episode:
             bp_teacher.eval()
             bp_teacher.requires_grad_(False)
             train_cache = self._build_bp_target_cache(pv_train_batches, bp_teacher)
+            train_cache, bp_eta_resample_summary = self._resample_bp_target_cache(train_cache)
             val_cache = self._build_bp_target_cache(validation_batches or pv_train_batches, bp_teacher)
             bp_summary = self._run_bp_distillation_stage(
                 train_cache,
@@ -8259,6 +8321,7 @@ class Episode:
                 bp_teacher,
                 bp_epochs,
             )
+            bp_summary["eta_resampling"] = bp_eta_resample_summary
             stages_successful = (
                 pq_summary.get("status") == "accepted"
                 and bp_summary.get("status") in {"accepted", "skipped_no_active_refinancing"}

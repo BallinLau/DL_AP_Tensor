@@ -325,7 +325,7 @@ def parse_args() -> argparse.Namespace:
         "--pv-eta-resample-enabled",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Enable ETA active/inactive resampling for legacy PV batch construction.",
+        help="Enable child-ETA oversampling only for the staged BP distillation train cache.",
     )
     parser.add_argument(
         "--bp-grid-confidence-relative",

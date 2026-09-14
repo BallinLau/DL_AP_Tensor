@@ -70,6 +70,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forward-chunk-size", type=int, default=8192)
     parser.add_argument("--n-child-shocks", "--n-branches", dest="n_child_shocks", type=int, default=2)
     parser.add_argument("--shock-seed", type=int, default=12345)
+    parser.add_argument(
+        "--bp-teacher-margin-tol",
+        type=float,
+        default=1e-8,
+        help="Minimum BPGridTeacher top-two objective margin for an identified bp target.",
+    )
     return parser.parse_args()
 
 
@@ -301,6 +307,7 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         output_dir=output / "objective_slices",
         n_child_shocks=args.n_child_shocks,
         shock_seed=args.shock_seed,
+        teacher_margin_tol=args.bp_teacher_margin_tol,
     )
     save_surface_csvs(output / "bp", bp_surfaces, grid.b_values, grid.z_values)
     for name, values in bp_surfaces.items():
@@ -386,9 +393,9 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
             ),
             "Q": "total debt value",
             "q_unit": "Q/b for b>1e-12; NaN at b=0",
-            "bp_survival": (
-                "BP surfaces and primary statistics restricted to finite Phat(i)>0 states "
-                "for each corresponding investment slice"
+            "bp_consistency_masks": (
+                "Raw statistics use the full finite grid; survival statistics require finite Phat(i)>0; "
+                "primary statistics additionally require BPGridTeacher top2_margin above the configured tolerance"
             ),
             "bp_consistency": (
                 "PolicyValue output versus BPGridTeacher.compute using checkpoint SDF/FC1, "

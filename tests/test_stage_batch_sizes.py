@@ -46,7 +46,9 @@ class StageBatchSizeTest(unittest.TestCase):
             self.assertEqual(len(model.calls), 3)
             torch.testing.assert_close(model.calls[1][:, 0:1], torch.tensor([[0.2]]))
             torch.testing.assert_close(model.calls[2][:, 0:1], torch.tensor([[0.8]]))
-            torch.testing.assert_close(model.calls[1][:, 2:3], base[:, 2:3])
+            torch.testing.assert_close(model.calls[1][:, 2:3], torch.ones_like(base[:, 2:3]))
+            torch.testing.assert_close(model.calls[2][:, 2:3], torch.ones_like(base[:, 2:3]))
+            torch.testing.assert_close(model.calls[0][:, 2:3], base[:, 2:3])
 
     def test_stage_batch_sizes_fallback(self):
         pv, sdf_fc1 = Episode._resolve_stage_batch_sizes(
@@ -118,7 +120,7 @@ class StageBatchSizeTest(unittest.TestCase):
         self.assertEqual(hp.pv_batch_size, 4096)
         self.assertEqual(hp.sdf_fc1_batch_size, 4096)
 
-    def test_pv_eta_resampling_uses_child_eta_not_parent_eta(self):
+    def test_tensor_pv_batches_do_not_resample_realized_child_eta(self):
         episode = Episode.__new__(Episode)
         episode.hyperparams = SimpleNamespace(
             pv_eta_resample_enabled=True,
@@ -139,10 +141,11 @@ class StageBatchSizeTest(unittest.TestCase):
         )
 
         selected = batches[0]["parent_source_index"]
+        self.assertEqual(sorted(selected.tolist()), [0, 1, 2, 3])
         selected_child_active = torch.maximum(child0[selected, 2], child1[selected, 2])
-        self.assertEqual(int((selected_child_active > 0.5).sum().item()), 2)
+        self.assertEqual(int((selected_child_active > 0.5).sum().item()), 1)
 
-    def test_dataframe_pv_eta_resampling_uses_child_eta_not_parent_eta(self):
+    def test_dataframe_pv_batches_do_not_resample_realized_child_eta(self):
         episode = Episode.__new__(Episode)
         episode.device = torch.device("cpu")
         episode.hyperparams = SimpleNamespace(
@@ -205,10 +208,40 @@ class StageBatchSizeTest(unittest.TestCase):
         selected_child_eta = selected_child[:, 2]
 
         self.assertEqual(selected_child.shape[0], 4)
-        self.assertEqual(
-            int((selected_child_eta > 0.5).sum().item()),
-            3,
+        self.assertEqual(int((selected_child_eta > 0.5).sum().item()), 1)
+
+    def test_child_eta_resampling_is_scoped_to_bp_train_cache(self):
+        episode = Episode.__new__(Episode)
+        episode.hyperparams = SimpleNamespace(
+            pv_eta_resample_enabled=True,
+            pv_eta_resample_active_share=0.5,
         )
+        parent = torch.arange(28, dtype=torch.float32).reshape(4, 7)
+        active = torch.tensor([[True], [False], [False], [False]])
+        cache = [{
+            "batch_id": 0,
+            "parent": parent,
+            "source_id": None,
+            "source_index": None,
+            "bp0_target": torch.zeros(4, 1),
+            "bpi_target": torch.zeros(4, 1),
+            "mix_target": torch.zeros(4, 1),
+            "bp0_confidence": torch.ones(4, 1),
+            "bpi_confidence": torch.ones(4, 1),
+            "mix_confidence": torch.ones(4, 1),
+            "mix_sample_weight": torch.ones(4, 1),
+            "eta_next_active": active,
+            "teacher_snapshot_hash": "teacher",
+        }]
+
+        torch.manual_seed(1234)
+        resampled, summary = episode._resample_bp_target_cache(cache)
+
+        self.assertTrue(summary["applied"])
+        self.assertEqual(summary["scope"], "bp_distillation_train_cache_only")
+        self.assertFalse(summary["validation_cache_resampled"])
+        self.assertEqual(int(resampled[0]["eta_next_active"].sum().item()), 2)
+        torch.testing.assert_close(cache[0]["eta_next_active"], active)
 
 
 if __name__ == "__main__":
