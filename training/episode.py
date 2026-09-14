@@ -1406,11 +1406,14 @@ class Episode:
 
         indices = torch.arange(n_units, device=parent.device)
 
-        # eta 稀疏时，对 Policy/Value 批次进行条件重采样，增强 eta=1 信号。
+        # Oversample parents whose child bank contains an implementable bp branch.
         resample_enabled = bool(getattr(self.hyperparams, "pv_eta_resample_enabled", True))
         if shuffle and eta_resample and resample_enabled and n_units > 1 and len(children) > 0:
-            eta_current = parent[:, 2:3].clamp(0.0, 1.0)
-            active_mask = eta_current.squeeze(-1) > 0.5
+            eta_next = torch.stack(
+                [child[:, 2:3].clamp(0.0, 1.0) for child in children],
+                dim=1,
+            )
+            active_mask = eta_next.amax(dim=1).squeeze(-1) > 0.5
             active_idx = torch.where(active_mask)[0]
             inactive_idx = torch.where(~active_mask)[0]
             if active_idx.numel() > 0 and inactive_idx.numel() > 0:
@@ -5317,11 +5320,14 @@ class Episode:
         n_units = len(parent)
         indices = torch.arange(n_units, device=parent.device)
 
-        # eta 稀疏时，对 Policy/Value 批次进行条件重采样，增强 eta=1 信号。
+        # Oversample parents whose child bank contains an implementable bp branch.
         resample_enabled = bool(getattr(self.hyperparams, "pv_eta_resample_enabled", True))
         if eta_resample and resample_enabled and n_units > 1 and len(children) > 0:
-            eta_current = parent[:, 2:3].clamp(0.0, 1.0)
-            active_mask = eta_current.squeeze(-1) > 0.5
+            eta_next = torch.stack(
+                [child[:, 2:3].clamp(0.0, 1.0) for child in children],
+                dim=1,
+            )
+            active_mask = eta_next.amax(dim=1).squeeze(-1) > 0.5
             active_idx = torch.where(active_mask)[0]
             inactive_idx = torch.where(~active_mask)[0]
             if active_idx.numel() > 0 and inactive_idx.numel() > 0:

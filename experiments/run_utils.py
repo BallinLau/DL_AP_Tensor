@@ -246,25 +246,29 @@ def _compute_policy_diagnostic_surfaces(
     pv_model: PolicyValueModel,
     sdf_model: SDFFC1Combined | None,
     base: torch.Tensor,
+    *,
+    eta_next_assumed: float,
 ):
+    """Compute a one-child diagnostic conditional on an explicit child eta."""
     p0_loss = P0Loss()
     pi_loss = PILoss()
 
     out = pv_model(base)
     bp0 = out.bp0
     bpI = out.bpI
+    eta_next = torch.full_like(base[:, 2:3], float(eta_next_assumed))
 
     child_p0_state = base.clone()
     child_p0_state[:, 0:1] = apply_refinancing_policy(
         b_current=base[:, 0:1],
         bp_candidate=bp0,
-        eta_next=child_p0_state[:, 2:3],
+        eta_next=eta_next,
     )
     child_pI_state = base.clone()
     child_pI_state[:, 0:1] = apply_refinancing_policy(
         b_current=base[:, 0:1],
         bp_candidate=bpI,
-        eta_next=child_pI_state[:, 2:3],
+        eta_next=eta_next,
     )
 
     out_p0_child = pv_model(child_p0_state)
@@ -327,7 +331,13 @@ def plot_surfaces(
         dim=1,
     )
     with torch.no_grad():
-        out, diagnostics = _compute_policy_diagnostic_surfaces(pv_model, sdf_model, base)
+        # Legacy surface: continuation is conditional on a refinancing-active child.
+        out, diagnostics = _compute_policy_diagnostic_surfaces(
+            pv_model,
+            sdf_model,
+            base,
+            eta_next_assumed=1.0,
+        )
         P0 = out.P0.reshape(B.shape).cpu().numpy()
         PI = out.PI.reshape(B.shape).cpu().numpy()
         P = out.P.reshape(B.shape).cpu().numpy()

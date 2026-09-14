@@ -117,6 +117,8 @@ def build_policy_value_tables_parallel(sample, include_macro: bool = False) -> T
             firm_child.reshape(-1),
             branch_child.reshape(-1),
             torch.zeros(n_paths * branch_num * group_size, device=device),
+            # Raw shock tables do not yet have bp_t. Keep b_t as a placeholder;
+            # Sample.fill_policy_value() applies child eta after parent policy forward.
             b.unsqueeze(1).expand(n_paths, branch_num, group_size).reshape(-1),
             z_t1.reshape(-1),
             eta_t1.reshape(-1),
