@@ -167,6 +167,34 @@ def test_reference_state_loads_calculated_macro_from_sibling_file(tmp_path):
     assert reference.macro_source == str(macro_path)
 
 
+def test_final_simulate_macro_auto_discovery_and_explicit_override(tmp_path):
+    firm_path = tmp_path / "final_simulate_firm.pkl"
+    auto_macro_path = tmp_path / "final_simulate_macro.pkl"
+    explicit_macro_path = tmp_path / "chosen_macro.pkl"
+    firm = pd.DataFrame(
+        {
+            "path": [0], "t": [0], "branch": [-1], "b": [0.2], "z": [0.1],
+            "ETA": [1.0], "i": [0.2], "x": [-2.0], "Hatcf": [-2.2], "LnKF": [4.0],
+        }
+    )
+    firm.to_pickle(firm_path)
+    pd.DataFrame(
+        {"path": [0], "t": [0], "Hatc": [-2.1], "LnK": [4.1]}
+    ).to_pickle(auto_macro_path)
+    pd.DataFrame(
+        {"path": [0], "t": [0], "Hatc": [-3.1], "LnK": [5.1]}
+    ).to_pickle(explicit_macro_path)
+
+    _, automatic = load_reference_state(firm_path)
+    _, explicit = load_reference_state(firm_path, macro_path=explicit_macro_path)
+
+    assert automatic.macro_source == str(auto_macro_path)
+    assert automatic.hatc_cal == -2.1
+    assert explicit.macro_source == str(explicit_macro_path)
+    assert explicit.hatc_cal == -3.1
+    assert explicit.lnk_cal == 5.1
+
+
 def test_phat_boundary_preserves_missing_crossings_as_nan():
     b = np.array([0.0, 0.5, 1.0])
     z = np.array([-1.0, 0.0, 1.0])
@@ -362,6 +390,8 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
     assert metadata["grid"]["eta"] == 1.0
     assert metadata["reference_state"]["n_parent_rows"] == 6
     assert metadata["reference_transition_bank"]["m_source"] == "sdf_fc1.forward_step"
+    assert metadata["bp_teacher_model"] == "policy_value"
+    assert metadata["reference_transition_bank"]["bp_teacher_model"] == "policy_value"
 
     q_unit = pd.read_csv(out_a / "q" / "q_unit.csv", index_col=0)
     assert q_unit.iloc[0].isna().all()

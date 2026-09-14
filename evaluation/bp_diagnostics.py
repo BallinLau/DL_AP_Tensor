@@ -98,6 +98,7 @@ def build_frozen_transition_children(
         m_list.append(m)
     metadata = {
         "builder": "ConvergenceShockBank+build_child_exogenous_bundle",
+        "bp_teacher_model": "policy_value",
         "shock_seed": int(shock_seed),
         "n_child_shocks": int(n_child_shocks),
         "common_shocks_across_frozen_grid": True,

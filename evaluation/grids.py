@@ -68,16 +68,32 @@ def _read_frame(path: Path) -> pd.DataFrame:
     raise ValueError("--firm-data must be a .pkl, .pickle, or .csv file")
 
 
-def _attach_calculated_macro(df: pd.DataFrame, firm_path: Path) -> tuple[pd.DataFrame, str]:
+def _attach_calculated_macro(
+    df: pd.DataFrame,
+    firm_path: Path,
+    macro_path: str | Path | None = None,
+) -> tuple[pd.DataFrame, str]:
     df = _normalize_columns(df)
     if {"hatc_cal", "lnk_cal"}.issubset(df.columns):
         return df, "embedded_in_firm_data"
-    macro_path = firm_path.with_name(f"{firm_path.stem}_macro{firm_path.suffix}")
-    if not macro_path.exists():
+    if macro_path is not None:
+        candidates = [Path(macro_path).expanduser().resolve()]
+        if not candidates[0].exists():
+            raise FileNotFoundError(f"Explicit macro data not found: {candidates[0]}")
+    else:
+        candidates = [firm_path.with_name(f"{firm_path.stem}_macro{firm_path.suffix}")]
+        if firm_path.stem.endswith("_firm"):
+            prefix = firm_path.stem.removesuffix("_firm")
+            candidates.append(firm_path.with_name(f"{prefix}_macro{firm_path.suffix}"))
+        candidates = list(dict.fromkeys(candidates))
+    existing = [candidate for candidate in candidates if candidate.exists()]
+    if not existing:
+        attempted = ", ".join(str(candidate) for candidate in candidates)
         raise ValueError(
             "Reference firm data is missing calculated macro state Hatc/LnK and "
-            f"no sibling macro file was found at {macro_path}"
+            f"no macro file was found; attempted: {attempted}"
         )
+    macro_path = existing[0]
     macro = _normalize_columns(_read_frame(macro_path))
     calculated = [name for name in ("hatc_cal", "lnk_cal") if name in macro.columns]
     if len(calculated) != 2:
@@ -124,14 +140,18 @@ def select_parent_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df.copy()
 
 
-def load_reference_state(path: str | Path) -> tuple[pd.DataFrame, ReferenceFirmState]:
+def load_reference_state(
+    path: str | Path,
+    *,
+    macro_path: str | Path | None = None,
+) -> tuple[pd.DataFrame, ReferenceFirmState]:
     path = Path(path).resolve()
     if not path.exists():
         raise FileNotFoundError(f"Reference firm dataframe not found: {path}")
     df = _read_frame(path)
     if not isinstance(df, pd.DataFrame) or df.empty:
         raise ValueError("Reference firm dataframe is empty or invalid")
-    df, macro_source = _attach_calculated_macro(df, path)
+    df, macro_source = _attach_calculated_macro(df, path, macro_path)
     parents = select_parent_rows(df)
     required = ["b", "z", "ETA", "i", "x", "Hatcf", "LnKF", "hatc_cal", "lnk_cal"]
     missing = [name for name in required if name not in parents.columns]

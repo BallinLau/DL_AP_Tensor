@@ -51,6 +51,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-default-hyperparams", action="store_true")
     parser.add_argument("--allow-current-config", action="store_true")
     parser.add_argument("--firm-data", type=Path, required=True)
+    parser.add_argument(
+        "--macro-data",
+        type=Path,
+        help="Explicit calculated macro dataframe; takes priority over sibling auto-discovery",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default=None)
     parser.add_argument("--b-min", type=float, default=None)
@@ -181,7 +186,7 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         "sdf_fc1": _state_hash(sdf_fc1_model),
     }
 
-    _, reference = load_reference_state(args.firm_data)
+    _, reference = load_reference_state(args.firm_data, macro_path=args.macro_data)
     b_min = float(Config.SIM_B_INIT_MIN if args.b_min is None else args.b_min)
     b_max = float(Config.SIM_B_INIT_MAX if args.b_max is None else args.b_max)
     grid = build_frozen_grid(
@@ -346,6 +351,8 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         "checkpoint": loaded.metadata,
         "device": str(device),
         "firm_data": str(args.firm_data.resolve()),
+        "macro_data": reference.macro_source,
+        "bp_teacher_model": "policy_value",
         "reference_state": reference.to_dict(),
         "grid": {
             "b_min": b_min,
@@ -383,6 +390,10 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
             "bp_consistency": (
                 "PolicyValue output versus BPGridTeacher.compute using checkpoint SDF/FC1, "
                 "ConvergenceShockBank, and build_child_exogenous_bundle"
+            ),
+            "bp_teacher_model": (
+                "policy_value; this measures current policy consistency with the online value surface, "
+                "not the historical firm_target training teacher"
             ),
         },
     }
