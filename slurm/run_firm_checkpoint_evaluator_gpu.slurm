@@ -40,11 +40,12 @@ MACRO_DATA="${MACRO_DATA:-auto}"
 OUTPUT_DIR="${OUTPUT_DIR:-$RUN_ROOT/data/outputs/firm_checkpoint_evaluator/ep${EPISODE}_J${N_CHILD_SHOCKS:-2}_${STAMP}}"
 
 DEVICE="${DEVICE:-cuda:0}"
+ETA="${ETA:-1.0}"
 B_MIN="${B_MIN:-0.0}"
 B_MAX="${B_MAX:-1.0}"
 B_POINTS="${B_POINTS:-101}"
-Z_MIN="${Z_MIN:--4.0}"
-Z_MAX="${Z_MAX:-4.0}"
+Z_MIN="${Z_MIN:--3.0}"
+Z_MAX="${Z_MAX:-3.0}"
 Z_POINTS="${Z_POINTS:-101}"
 I_POINTS="${I_POINTS:-101}"
 FORWARD_CHUNK_SIZE="${FORWARD_CHUNK_SIZE:-8192}"
@@ -77,6 +78,7 @@ echo "Macro data: $MACRO_DATA"
 echo "Output: $OUTPUT_DIR"
 echo "Device: $DEVICE"
 echo "Grid: b=[$B_MIN,$B_MAX]x$B_POINTS, z=[$Z_MIN,$Z_MAX]x$Z_POINTS, i=$I_POINTS"
+echo "Eta: $ETA"
 echo "Child shocks: $N_CHILD_SHOCKS (seed=$SHOCK_SEED)"
 echo "============================================================"
 
@@ -187,6 +189,7 @@ python3 -u experiments/evaluate_checkpoints.py \
   "${MACRO_ARGS[@]}" \
   --output-dir "$OUTPUT_DIR" \
   --device "$DEVICE" \
+  --eta "$ETA" \
   --b-min "$B_MIN" \
   --b-max "$B_MAX" \
   --b-points "$B_POINTS" \

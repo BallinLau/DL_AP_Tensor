@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import subprocess
@@ -58,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--eta", type=float, default=1.0)
     parser.add_argument("--b-min", type=float, default=None)
     parser.add_argument("--b-max", type=float, default=None)
     parser.add_argument("--b-points", type=int, default=101)
@@ -187,6 +189,7 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     }
 
     _, reference = load_reference_state(args.firm_data, macro_path=args.macro_data)
+    reference = dataclasses.replace(reference, eta=float(args.eta))
     b_min = float(Config.SIM_B_INIT_MIN if args.b_min is None else args.b_min)
     b_max = float(Config.SIM_B_INIT_MAX if args.b_max is None else args.b_max)
     grid = build_frozen_grid(
@@ -361,7 +364,7 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
             "z_min": float(args.z_min),
             "z_max": float(args.z_max),
             "z_points": int(args.z_points),
-            "eta": 1.0,
+            "eta": float(args.eta),
             "i_points": int(args.i_points),
             "i_min": 0.0,
             "i_max": float(loaded.economic_config.I_THRESHOLD),
