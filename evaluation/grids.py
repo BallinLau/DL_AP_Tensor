@@ -18,8 +18,11 @@ class ReferenceFirmState:
     x: float
     hatcf: float
     lnkf: float
+    hatc_cal: float
+    lnk_cal: float
     n_parent_rows: int
     source: str
+    macro_source: str
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -46,9 +49,64 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Eta": "ETA",
         "hatcf": "Hatcf",
         "lnkf": "LnKF",
+        "Hatc": "hatc_cal",
+        "HATC": "hatc_cal",
+        "Hatc_cal": "hatc_cal",
+        "LnK": "lnk_cal",
+        "LNK": "lnk_cal",
+        "LnK_cal": "lnk_cal",
     }
     rename = {old: new for old, new in aliases.items() if old in df.columns and new not in df.columns}
     return df.rename(columns=rename)
+
+
+def _read_frame(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() in {".pkl", ".pickle"}:
+        return pd.read_pickle(path)
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(path)
+    raise ValueError("--firm-data must be a .pkl, .pickle, or .csv file")
+
+
+def _attach_calculated_macro(df: pd.DataFrame, firm_path: Path) -> tuple[pd.DataFrame, str]:
+    df = _normalize_columns(df)
+    if {"hatc_cal", "lnk_cal"}.issubset(df.columns):
+        return df, "embedded_in_firm_data"
+    macro_path = firm_path.with_name(f"{firm_path.stem}_macro{firm_path.suffix}")
+    if not macro_path.exists():
+        raise ValueError(
+            "Reference firm data is missing calculated macro state Hatc/LnK and "
+            f"no sibling macro file was found at {macro_path}"
+        )
+    macro = _normalize_columns(_read_frame(macro_path))
+    calculated = [name for name in ("hatc_cal", "lnk_cal") if name in macro.columns]
+    if len(calculated) != 2:
+        raise ValueError(f"Sibling macro data is missing Hatc/LnK: {macro_path}")
+    key_options = [
+        [name for name in ("path", "t", "branch") if name in df.columns and name in macro.columns],
+        [name for name in ("path", "t") if name in df.columns and name in macro.columns],
+    ]
+    best = None
+    best_complete = -1
+    for keys in key_options:
+        if not keys:
+            continue
+        candidate = df.merge(
+            macro[keys + calculated].drop_duplicates(keys),
+            on=keys,
+            how="left",
+        )
+        complete = int(candidate[calculated].notna().all(axis=1).sum())
+        if complete > best_complete:
+            best = candidate
+            best_complete = complete
+        if complete == len(candidate):
+            break
+    if best is None or best_complete == 0:
+        raise ValueError(
+            "Could not align sibling macro Hatc/LnK with firm data using path/t/branch keys"
+        )
+    return best, str(macro_path)
 
 
 def select_parent_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -70,17 +128,12 @@ def load_reference_state(path: str | Path) -> tuple[pd.DataFrame, ReferenceFirmS
     path = Path(path).resolve()
     if not path.exists():
         raise FileNotFoundError(f"Reference firm dataframe not found: {path}")
-    if path.suffix.lower() in {".pkl", ".pickle"}:
-        df = pd.read_pickle(path)
-    elif path.suffix.lower() == ".csv":
-        df = pd.read_csv(path)
-    else:
-        raise ValueError("--firm-data must be a .pkl, .pickle, or .csv file")
+    df = _read_frame(path)
     if not isinstance(df, pd.DataFrame) or df.empty:
         raise ValueError("Reference firm dataframe is empty or invalid")
-    df = _normalize_columns(df)
+    df, macro_source = _attach_calculated_macro(df, path)
     parents = select_parent_rows(df)
-    required = ["b", "z", "ETA", "i", "x", "Hatcf", "LnKF"]
+    required = ["b", "z", "ETA", "i", "x", "Hatcf", "LnKF", "hatc_cal", "lnk_cal"]
     missing = [name for name in required if name not in parents.columns]
     if missing:
         raise ValueError(f"Reference parent rows are missing required columns: {missing}")
@@ -98,8 +151,11 @@ def load_reference_state(path: str | Path) -> tuple[pd.DataFrame, ReferenceFirmS
         x=float(numeric["x"].median()),
         hatcf=float(numeric["Hatcf"].median()),
         lnkf=float(numeric["LnKF"].median()),
+        hatc_cal=float(numeric["hatc_cal"].median()),
+        lnk_cal=float(numeric["lnk_cal"].median()),
         n_parent_rows=int(len(numeric)),
         source=str(path),
+        macro_source=macro_source,
     )
     return df, reference
 

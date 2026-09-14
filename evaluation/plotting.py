@@ -34,7 +34,7 @@ def plot_default_boundary(
     boundary: pd.DataFrame,
     path: str | Path,
 ) -> None:
-    observed = boundary[boundary["boundary_status"] == "observed"]
+    observed = boundary[boundary["boundary_status"] == "single_crossing"]
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(observed["b"], observed["z_default"], color="black", linewidth=1.5)
     ax.scatter(observed["b"], observed["z_default"], color="black", s=10)

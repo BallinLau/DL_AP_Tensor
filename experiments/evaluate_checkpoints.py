@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     checkpoints = parser.add_mutually_exclusive_group(required=True)
     checkpoints.add_argument("--checkpoint", type=Path, help="Combined analysis/trainer checkpoint")
     checkpoints.add_argument("--pv-ckpt", type=Path, help="Raw PolicyValue state_dict")
+    parser.add_argument("--sdf-ckpt", type=Path, help="Raw SDF/FC1 state_dict paired with --pv-ckpt")
     parser.add_argument("--hyperparams-json", type=Path)
     parser.add_argument("--config-json", type=Path)
     parser.add_argument("--model-spec-json", type=Path)
@@ -60,7 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--z-points", type=int, default=101)
     parser.add_argument("--i-points", type=int, default=101)
     parser.add_argument("--forward-chunk-size", type=int, default=8192)
-    parser.add_argument("--n-branches", type=int, default=2)
+    parser.add_argument("--n-child-shocks", "--n-branches", dest="n_child_shocks", type=int, default=2)
+    parser.add_argument("--shock-seed", type=int, default=12345)
     return parser.parse_args()
 
 
@@ -112,9 +114,13 @@ def _write_selected_surfaces(
         ],
         "q": ["Q", "q_unit"],
         "bp": [
-            "bp0", "bpI", "bpI_low", "bpI_mid", "bpI_high",
-            "bp_cond_low", "bp_cond_mid", "bp_cond_high",
-            "bp_cond", "bp", "bp_low", "bp_mid", "bp_high",
+            "bp0_raw", "bp0_survival",
+            "bpI_raw", "bpI_survival",
+            "bpI_low_raw", "bpI_low_survival",
+            "bpI_mid_raw", "bpI_mid_survival",
+            "bpI_high_raw", "bpI_high_survival",
+            "bp_cond_raw", "bp_cond_survival",
+            "bp_raw", "bp_survival",
         ],
     }
     for group, names in groups.items():
@@ -137,9 +143,17 @@ def _write_selected_surfaces(
 def _bp_boundary_summary(surfaces: Dict[str, np.ndarray]) -> Dict[str, float]:
     summary: Dict[str, float] = {}
     for name in ("bp0", "bpI_low", "bpI_mid", "bpI_high", "bp"):
-        values = surfaces[name]
-        summary[f"{name}_share_lt_0p05"] = float((values < 0.05).mean())
-        summary[f"{name}_share_gt_0p95"] = float((values > 0.95).mean())
+        raw = surfaces[f"{name}_raw"]
+        survival = surfaces[f"{name}_survival"]
+        valid = np.isfinite(survival)
+        summary[f"{name}_raw_share_lt_0p05"] = float((raw < 0.05).mean())
+        summary[f"{name}_raw_share_gt_0p95"] = float((raw > 0.95).mean())
+        summary[f"{name}_share_lt_0p05"] = (
+            float((survival[valid] < 0.05).mean()) if valid.any() else float("nan")
+        )
+        summary[f"{name}_share_gt_0p95"] = (
+            float((survival[valid] > 0.95).mean()) if valid.any() else float("nan")
+        )
     return summary
 
 
@@ -149,19 +163,25 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     output.mkdir(parents=True, exist_ok=True)
     loaded = load_analysis_checkpoint(
         args.checkpoint or args.pv_ckpt,
+        sdf_checkpoint=args.sdf_ckpt,
         hyperparams_json=args.hyperparams_json,
         config_json=args.config_json,
         model_spec_json=args.model_spec_json,
         device=device,
         allow_default_hyperparams=bool(args.allow_default_hyperparams),
         allow_current_config=bool(args.allow_current_config),
-        m_source="none",
+        m_source="sdf_fc1",
     )
     model = loaded.models["policy_value"]
+    sdf_fc1_model = loaded.models["sdf_fc1"]
     model.eval()
-    before_hash = _state_hash(model)
+    sdf_fc1_model.eval()
+    before_hashes = {
+        "policy_value": _state_hash(model),
+        "sdf_fc1": _state_hash(sdf_fc1_model),
+    }
 
-    firm_df, reference = load_reference_state(args.firm_data)
+    _, reference = load_reference_state(args.firm_data)
     b_min = float(Config.SIM_B_INIT_MIN if args.b_min is None else args.b_min)
     b_max = float(Config.SIM_B_INIT_MAX if args.b_max is None else args.b_max)
     grid = build_frozen_grid(
@@ -216,6 +236,17 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         grid.b_values,
         grid.z_values,
     )
+    investment_boundary = pd.DataFrame(
+        {
+            "b": grid.mesh_b.reshape(-1),
+            "z": grid.mesh_z.reshape(-1),
+            "i_star": investment["i_star"].reshape(-1),
+            "investment_status": investment["investment_status"].reshape(-1),
+            "crossing_count": investment["crossing_count"].reshape(-1),
+            "survival_region": investment["survival_mask"].reshape(-1),
+        }
+    )
+    investment_boundary.to_csv(output / "investment" / "investment_boundary.csv", index=False)
     for name, values in investment_surfaces.items():
         plot_heatmap(
             values,
@@ -254,13 +285,14 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
 
     bp_surfaces, bp_summary, transition_meta = evaluate_bp_consistency(
         model,
+        sdf_fc1_model,
         grid,
         reference,
-        firm_df,
         loaded.hyperparams,
         loaded.economic_config,
         output_dir=output / "objective_slices",
-        n_branches=args.n_branches,
+        n_child_shocks=args.n_child_shocks,
+        shock_seed=args.shock_seed,
     )
     save_surface_csvs(output / "bp", bp_surfaces, grid.b_values, grid.z_values)
     for name, values in bp_surfaces.items():
@@ -281,15 +313,32 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     summary_values.update(
         {
             "investment_i_star_observed_share": float(np.isfinite(investment["i_star"]).mean()),
-            "investment_multiple_crossing_share": float((investment["crossing_count"] > 1).mean()),
+            "investment_single_crossing_share": float(
+                (investment["investment_status"] == "single_crossing").mean()
+            ),
+            "investment_multiple_crossing_share": float(
+                (investment["investment_status"] == "multiple_crossings").mean()
+            ),
+            "investment_all_invest_share": float(
+                (investment["investment_status"] == "all_invest").mean()
+            ),
+            "investment_all_no_invest_share": float(
+                (investment["investment_status"] == "all_no_invest").mean()
+            ),
+            "investment_nonfinite_share": float(
+                (investment["investment_status"] == "nonfinite").mean()
+            ),
         }
     )
     summary = pd.DataFrame([summary_values])
     summary.to_csv(output / "summary.csv", index=False)
 
-    after_hash = _state_hash(model)
-    if before_hash != after_hash:
-        raise RuntimeError("PolicyValue model state changed during read-only evaluation")
+    after_hashes = {
+        "policy_value": _state_hash(model),
+        "sdf_fc1": _state_hash(sdf_fc1_model),
+    }
+    if before_hashes != after_hashes:
+        raise RuntimeError("Checkpoint model state changed during read-only evaluation")
     metadata: Dict[str, object] = {
         "evaluator": "firm_side_checkpoint_evaluator_v1",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -311,17 +360,30 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
             "i_max": float(loaded.economic_config.I_THRESHOLD),
         },
         "reference_transition_bank": transition_meta,
-        "model_state_hash_before": before_hash,
-        "model_state_hash_after": after_hash,
+        "model_state_hash_before": before_hashes,
+        "model_state_hash_after": after_hashes,
         "model_state_unchanged": True,
         "semantics": {
-            "default_boundary": "first linearly interpolated Phat=0 crossing in ascending z",
+            "default_boundary": (
+                "linearly interpolated Phat=0 when exactly one crossing exists; "
+                "NaN for zero or multiple crossings"
+            ),
             "bar_i_cond": "conditional investment probability",
             "bar_i_eff": "survival-adjusted executed investment probability",
-            "i_star": "first VI(i)-V0(i)=0 crossing; NaN when unidentified or outside survival region",
+            "i_star": (
+                "VI(i)-V0(i)=0 when exactly one crossing exists; NaN for zero/multiple "
+                "crossings, nonfinite scans, or states outside Phat>0"
+            ),
             "Q": "total debt value",
             "q_unit": "Q/b for b>1e-12; NaN at b=0",
-            "bp_consistency": "PolicyValue policy output versus BPGridTeacher.compute value argmax",
+            "bp_survival": (
+                "BP surfaces and primary statistics restricted to finite Phat(i)>0 states "
+                "for each corresponding investment slice"
+            ),
+            "bp_consistency": (
+                "PolicyValue output versus BPGridTeacher.compute using checkpoint SDF/FC1, "
+                "ConvergenceShockBank, and build_child_exogenous_bundle"
+            ),
         },
     }
     (output / "metadata.json").write_text(

@@ -5,6 +5,7 @@ from typing import Dict, Iterable
 import numpy as np
 import torch
 
+from .boundaries import zero_crossings
 from .grids import FrozenFirmGrid, ReferenceFirmState
 
 
@@ -104,8 +105,21 @@ def evaluate_firm_surfaces(
     q_unit[valid_b] = q[valid_b] / b[valid_b]
     surfaces["q_unit"] = q_unit
     surfaces["default_region"] = (surfaces["Phat"] <= 0.0).astype(np.float64)
-    survival_mask = (surfaces["P"] > 0.0) & (surfaces["bar_z"] < 0.5)
+    slice_masks = {
+        label: np.isfinite(surfaces[f"Phat_{label}"]) & (surfaces[f"Phat_{label}"] > 0.0)
+        for label in i_slices
+    }
+    survival_mask = slice_masks["mid"]
     surfaces["survival_mask"] = survival_mask.astype(np.float64)
+    for label, mask in slice_masks.items():
+        surfaces[f"survival_mask_{label}"] = mask.astype(np.float64)
+    for name in ("bp0", "bpI", "bp_cond", "bp"):
+        surfaces[f"{name}_raw"] = surfaces[name].copy()
+        surfaces[f"{name}_survival"] = np.where(survival_mask, surfaces[name], np.nan)
+        for label, mask in slice_masks.items():
+            slice_name = f"{name}_{label}"
+            surfaces[f"{slice_name}_raw"] = surfaces[slice_name].copy()
+            surfaces[f"{slice_name}_survival"] = np.where(mask, surfaces[slice_name], np.nan)
     return surfaces
 
 
@@ -167,21 +181,28 @@ def evaluate_investment_cutoff(
     delta = torch.cat(deltas, dim=0).reshape(n_state, len(i_values)).numpy().astype(np.float64)
     cutoff = np.full(n_state, np.nan, dtype=np.float64)
     crossing_count = np.zeros(n_state, dtype=np.int64)
+    status = np.full(n_state, "nonfinite", dtype=object)
     for row in range(n_state):
         y = delta[row]
         finite = np.isfinite(y)
-        crossings = np.where(finite[:-1] & finite[1:] & ((y[:-1] == 0.0) | (y[:-1] * y[1:] < 0.0)))[0]
-        crossing_count[row] = len(crossings)
-        if len(crossings) == 0:
+        if not finite.all():
             continue
-        pos = int(crossings[0])
-        y0, y1 = y[pos], y[pos + 1]
-        if y0 == 0.0 or y1 == y0:
-            cutoff[row] = i_values[pos]
+        crossings = zero_crossings(i_values, y)
+        crossing_count[row] = len(crossings)
+        if len(crossings) == 1:
+            cutoff[row] = float(crossings[0])
+            status[row] = "single_crossing"
+        elif len(crossings) > 1:
+            status[row] = "multiple_crossings"
+        elif np.all(y > 0.0):
+            status[row] = "all_invest"
+        elif np.all(y < 0.0):
+            status[row] = "all_no_invest"
         else:
-            cutoff[row] = i_values[pos] - y0 * (i_values[pos + 1] - i_values[pos]) / (y1 - y0)
+            status[row] = "nonfinite"
     cutoff = cutoff.reshape(grid.shape)
     cutoff = np.where(survival_mask.astype(bool), cutoff, np.nan)
+    status = status.reshape(grid.shape)
     mid_pos = int(np.argmin(np.abs(i_values - reference.i_mid)))
     region = (delta[:, mid_pos].reshape(grid.shape) > 0.0) & survival_mask.astype(bool)
     return {
@@ -190,4 +211,6 @@ def evaluate_investment_cutoff(
         "i_star": cutoff,
         "investment_region_mid": region.astype(np.float64),
         "crossing_count": crossing_count.reshape(grid.shape),
+        "investment_status": status,
+        "survival_mask": survival_mask.astype(bool),
     }

@@ -2,17 +2,21 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
 import torch
 
 from analysis.economic_config import AnalysisEconomicConfig
+from analysis.convergence_transition import (
+    ConvergenceShockBank,
+    MacroTransitionContext,
+    build_child_exogenous_bundle,
+)
 from config import Config, HyperParams
 from losses import P0Loss, PILoss
 from training.bp_grid_teacher import BPGridTeacher
-from training.episode import Episode
 
 from .grids import FrozenFirmGrid, ReferenceFirmState
 from .plotting import plot_objective_slice
@@ -30,74 +34,83 @@ def _checkpoint_economic_config(config: AnalysisEconomicConfig):
             setattr(Config, name, value)
 
 
-def _cat_batches(batches: Iterable[Dict[str, Any]], key: str) -> torch.Tensor:
-    values = [batch[key] for batch in batches if batch.get(key) is not None]
-    if not values:
-        raise RuntimeError(f"No values found for batch key {key!r}")
-    return torch.cat(values, dim=0)
-
-
-def build_reference_transition_bank(
-    firm_df: pd.DataFrame,
-    hyperparams: HyperParams,
-    *,
-    device: torch.device,
-    n_branches: int = 2,
-) -> Dict[str, Any]:
-    episode = Episode.__new__(Episode)
-    episode.device = device
-    episode.hyperparams = hyperparams
-    episode.models = {}
-    batches = episode._create_firm_batches_from_df(
-        firm_df,
-        batch_size=max(1, len(firm_df)),
-        n_branches=n_branches,
-        eta_resample=False,
-    )
-    if not batches:
-        raise RuntimeError("Reference firm dataframe contains no matched parent-child transitions")
-    parent = _cat_batches(batches, "parent")
-    children = [_cat_batches(batches, f"child{k}") for k in range(n_branches)]
-    if parent.shape[1] < 7 or any(child.shape[1] < 8 for child in children):
-        raise ValueError(
-            "BP value-objective evaluation requires seven firm-state columns and observed child M"
-        )
-    active = parent[:, 2] > 0.5
-    if bool(active.any()):
-        parent = parent[active]
-        children = [child[active] for child in children]
-    transition_deltas = []
-    m_values = []
-    for child in children:
-        transition_deltas.append((child[:, :7] - parent[:, :7]).median(dim=0).values)
-        m_values.append(child[:, 7:8].median(dim=0).values.reshape(1, 1))
-    return {
-        "transition_deltas": transition_deltas,
-        "m_values": m_values,
-        "n_matched_parent_transitions": int(parent.shape[0]),
-    }
-
-
-def _expand_transition_bank(
+def build_frozen_transition_children(
+    sdf_fc1_model: torch.nn.Module,
     parent_states: torch.Tensor,
-    bank: Dict[str, Any],
+    reference: ReferenceFirmState,
     hyperparams: HyperParams,
-) -> tuple[List[torch.Tensor], List[torch.Tensor]]:
-    children: List[torch.Tensor] = []
-    m_list: List[torch.Tensor] = []
+    economic_config: AnalysisEconomicConfig,
+    *,
+    n_child_shocks: int,
+    shock_seed: int,
+) -> tuple[List[torch.Tensor], List[torch.Tensor], Dict[str, Any]]:
+    if int(n_child_shocks) < 2:
+        raise ValueError("n_child_shocks must be at least 2")
+    device = parent_states.device
+    dtype = parent_states.dtype
+    base_bank = ConvergenceShockBank.create(
+        1,
+        int(n_child_shocks),
+        seed=int(shock_seed),
+        device=device,
+        dtype=dtype,
+    )
+    reference_index = torch.zeros(parent_states.shape[0], dtype=torch.long, device=device)
+    shock_bank = base_bank.gather(reference_index)
+    macro = MacroTransitionContext(
+        hatc_cal=torch.full(
+            (parent_states.shape[0], 1), reference.hatc_cal, device=device, dtype=dtype
+        ),
+        lnk_cal=torch.full(
+            (parent_states.shape[0], 1), reference.lnk_cal, device=device, dtype=dtype
+        ),
+    )
+    bundle = build_child_exogenous_bundle(
+        sdf_fc1_model,
+        parent_states,
+        macro,
+        shock_bank,
+        economic_config=economic_config,
+    )
     use_clipped_m = bool(getattr(hyperparams, "pv_use_clipped_m", True))
     m_lo = float(getattr(hyperparams, "pv_m_clamp_min", 0.7))
     m_hi = float(getattr(hyperparams, "pv_m_clamp_max", 1.3))
-    for delta, m_value in zip(bank["transition_deltas"], bank["m_values"]):
-        child = parent_states + delta.to(parent_states.device, parent_states.dtype)
-        child = child.clone()
-        child[:, 2] = child[:, 2].clamp(0.0, 1.0)
-        children.append(child)
-        m = m_value.to(parent_states.device, parent_states.dtype).expand(parent_states.shape[0], 1)
+    children: List[torch.Tensor] = []
+    m_list: List[torch.Tensor] = []
+    for child_pos in range(int(n_child_shocks)):
+        children.append(
+            torch.stack(
+                [
+                    parent_states[:, 0],
+                    bundle.z_next[:, child_pos, 0],
+                    bundle.eta_next[:, child_pos, 0],
+                    bundle.i_next[:, child_pos, 0],
+                    bundle.x_next[:, child_pos, 0],
+                    bundle.hatcf_next[:, child_pos, 0],
+                    bundle.lnkf_next[:, child_pos, 0],
+                ],
+                dim=1,
+            )
+        )
+        m = bundle.m_raw[:, child_pos, :]
         if use_clipped_m:
             m = m.clamp(m_lo, m_hi)
         m_list.append(m)
-    return children, m_list
+    metadata = {
+        "builder": "ConvergenceShockBank+build_child_exogenous_bundle",
+        "shock_seed": int(shock_seed),
+        "n_child_shocks": int(n_child_shocks),
+        "common_shocks_across_frozen_grid": True,
+        "macro_context": {
+            "hatc_cal": float(reference.hatc_cal),
+            "lnk_cal": float(reference.lnk_cal),
+        },
+        "m_source": "sdf_fc1.forward_step",
+        "m_mode": "clipped_train_m" if use_clipped_m else "raw_sdf_m",
+        "m_raw_mean": float(bundle.m_raw.detach().mean().item()),
+        "m_raw_std": float(bundle.m_raw.detach().std(unbiased=False).item()),
+    }
+    return children, m_list, metadata
 
 
 def _losses(config: AnalysisEconomicConfig) -> tuple[P0Loss, PILoss]:
@@ -126,26 +139,37 @@ def _losses(config: AnalysisEconomicConfig) -> tuple[P0Loss, PILoss]:
     return p0, pi
 
 
-def _summary(prefix: str, pred: np.ndarray, star: np.ndarray) -> Dict[str, float]:
+def _gap_statistics(pred: np.ndarray, star: np.ndarray, mask: np.ndarray) -> Dict[str, float]:
     gap = np.abs(pred - star)
-    finite = np.isfinite(gap)
+    finite = np.isfinite(gap) & mask.astype(bool)
     if not finite.any():
-        values = {"mae": np.nan, "median_abs_gap": np.nan, "p90_abs_gap": np.nan}
-    else:
-        valid = gap[finite]
-        values = {
-            "mae": float(valid.mean()),
-            "median_abs_gap": float(np.median(valid)),
-            "p90_abs_gap": float(np.quantile(valid, 0.90)),
-        }
-    values.update(
-        {
-            "predicted_low_boundary_share": float((pred < 0.05).mean()),
-            "predicted_high_boundary_share": float((pred > 0.95).mean()),
-            "grid_star_low_boundary_share": float((star < 0.05).mean()),
-            "grid_star_high_boundary_share": float((star > 0.95).mean()),
-        }
-    )
+        return {key: np.nan for key in (
+            "mae", "median_abs_gap", "p90_abs_gap",
+            "predicted_low_boundary_share", "predicted_high_boundary_share",
+            "grid_star_low_boundary_share", "grid_star_high_boundary_share",
+        )}
+    valid_gap = gap[finite]
+    return {
+        "mae": float(valid_gap.mean()),
+        "median_abs_gap": float(np.median(valid_gap)),
+        "p90_abs_gap": float(np.quantile(valid_gap, 0.90)),
+        "predicted_low_boundary_share": float((pred[finite] < 0.05).mean()),
+        "predicted_high_boundary_share": float((pred[finite] > 0.95).mean()),
+        "grid_star_low_boundary_share": float((star[finite] < 0.05).mean()),
+        "grid_star_high_boundary_share": float((star[finite] > 0.95).mean()),
+    }
+
+
+def _summary(
+    prefix: str,
+    pred: np.ndarray,
+    star: np.ndarray,
+    survival_mask: np.ndarray,
+) -> Dict[str, float]:
+    values = _gap_statistics(pred, star, survival_mask)
+    raw_values = _gap_statistics(pred, star, np.ones_like(survival_mask, dtype=bool))
+    values.update({f"raw_{key}": value for key, value in raw_values.items()})
+    values["survival_grid_share"] = float(survival_mask.astype(bool).mean())
     return {f"{prefix}_{key}": value for key, value in values.items()}
 
 
@@ -176,22 +200,26 @@ def _objective_frame(result: Dict[str, torch.Tensor], pos: int) -> pd.DataFrame:
 
 def evaluate_bp_consistency(
     model: torch.nn.Module,
+    sdf_fc1_model: torch.nn.Module,
     grid: FrozenFirmGrid,
     reference: ReferenceFirmState,
-    firm_df: pd.DataFrame,
     hyperparams: HyperParams,
     economic_config: AnalysisEconomicConfig,
     *,
     output_dir: str | Path,
-    n_branches: int = 2,
+    n_child_shocks: int = 2,
+    shock_seed: int = 12345,
 ) -> tuple[Dict[str, np.ndarray], Dict[str, float], Dict[str, Any]]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    bank = build_reference_transition_bank(
-        firm_df,
+    children, m_list, transition_metadata = build_frozen_transition_children(
+        sdf_fc1_model,
+        grid.base_states,
+        reference,
         hyperparams,
-        device=grid.base_states.device,
-        n_branches=n_branches,
+        economic_config,
+        n_child_shocks=n_child_shocks,
+        shock_seed=shock_seed,
     )
     p0_loss, pi_loss = _losses(economic_config)
     teacher = BPGridTeacher.from_hyperparams(model, p0_loss, pi_loss, hyperparams)
@@ -208,7 +236,6 @@ def evaluate_bp_consistency(
         for label, (branch, i_value) in branch_specs.items():
             states = grid.base_states.clone()
             states[:, 3] = float(i_value)
-            children, m_list = _expand_transition_bank(states, bank, hyperparams)
             output_model = model(states)
             bp_pred = output_model.bp0 if branch == "p0" else output_model.bpI
             result = teacher.compute(
@@ -221,10 +248,16 @@ def evaluate_bp_consistency(
             results[label] = result
             pred = bp_pred.detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
             star = result["bp_star"].detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
-            surfaces[f"{label}_bp_pred"] = pred
-            surfaces[f"{label}_bp_grid_star"] = star
-            surfaces[f"{label}_bp_abs_gap"] = np.abs(pred - star)
-            summary.update(_summary(label, pred, star))
+            phat = output_model.Phat.detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
+            survival_mask = np.isfinite(phat) & (phat > 0.0)
+            gap = np.abs(pred - star)
+            surfaces[f"{label}_bp_pred_raw"] = pred
+            surfaces[f"{label}_bp_grid_star_raw"] = star
+            surfaces[f"{label}_bp_abs_gap_raw"] = gap
+            surfaces[f"{label}_bp_pred_survival"] = np.where(survival_mask, pred, np.nan)
+            surfaces[f"{label}_bp_grid_star_survival"] = np.where(survival_mask, star, np.nan)
+            surfaces[f"{label}_bp_abs_gap_survival"] = np.where(survival_mask, gap, np.nan)
+            summary.update(_summary(label, pred, star, survival_mask))
 
     positions = {
         "b_low_z_low": 0,
@@ -244,11 +277,4 @@ def evaluate_bp_consistency(
             frame.to_csv(output / f"{stem}.csv", index=False)
             plot_objective_slice(frame, output / f"{stem}.png", title=stem)
 
-    bank_meta = {
-        "n_matched_parent_transitions": bank["n_matched_parent_transitions"],
-        "n_branches": len(bank["transition_deltas"]),
-        "transition_deltas": [delta.detach().cpu().tolist() for delta in bank["transition_deltas"]],
-        "observed_child_m": [float(value.item()) for value in bank["m_values"]],
-        "m_mode": "clipped_train_m" if bool(getattr(hyperparams, "pv_use_clipped_m", True)) else "raw_observed_m",
-    }
-    return surfaces, summary, bank_meta
+    return surfaces, summary, transition_metadata
