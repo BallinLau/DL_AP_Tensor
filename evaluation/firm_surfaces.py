@@ -242,8 +242,14 @@ def investment_margin_diagnostics(
         "high_gt_low": margins["high"] > margins["low"],
     }
     adjacent_violation = violations["mid_gt_low"] | violations["high_gt_mid"]
+    raw_violation_share = float(adjacent_violation.mean())
+    survival_violation_share = (
+        float(adjacent_violation[survival].mean()) if survival.any() else float("nan")
+    )
     summary: Dict[str, float] = {
-        "investment_i_monotonicity_violation_share": float(adjacent_violation.mean()),
+        "investment_i_monotonicity_violation_share": raw_violation_share,
+        "investment_i_monotonicity_violation_share_raw": raw_violation_share,
+        "investment_i_monotonicity_violation_share_survival": survival_violation_share,
     }
     for name, mask in violations.items():
         summary[f"investment_D_{name}_share"] = float(mask.mean())

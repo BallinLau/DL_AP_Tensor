@@ -28,9 +28,14 @@ from evaluation.bellman_diagnostics import (
 from evaluation.bp_diagnostics import (
     FrozenTransitionData,
     _summary,
+    build_frozen_transition_data,
     build_frozen_transition_children,
 )
-from evaluation.firm_surfaces import evaluate_firm_surfaces, evaluate_investment_cutoff
+from evaluation.firm_surfaces import (
+    evaluate_firm_surfaces,
+    evaluate_investment_cutoff,
+    investment_margin_diagnostics,
+)
 from evaluation.grids import ReferenceFirmState, build_frozen_grid, load_reference_state
 from experiments.run_utils import build_models
 from models import PolicyValueModel
@@ -302,6 +307,20 @@ def test_frozen_transition_children_use_state_dependent_ar1_and_sdf_m():
     assert metadata["builder"] == "ConvergenceShockBank+build_child_exogenous_bundle"
     assert 0.0 <= metadata["eta_next_active_share"] <= 1.0
 
+    nested = build_frozen_transition_data(
+        FakeSDF(), parents, reference, hp, config,
+        n_child_shocks=2, shock_seed=12345, shock_bank_max_child_shocks=32,
+    )
+    full = build_frozen_transition_data(
+        FakeSDF(), parents, reference, hp, config,
+        n_child_shocks=32, shock_seed=12345, shock_bank_max_child_shocks=32,
+    )
+    for child_index in range(2):
+        torch.testing.assert_close(nested.children[child_index], full.children[child_index])
+        torch.testing.assert_close(nested.m_raw_list[child_index], full.m_raw_list[child_index])
+    assert nested.metadata["nested_prefix_from_max_J"] is True
+    assert full.metadata["nested_prefix_from_max_J"] is False
+
 
 def test_bp_consistency_primary_statistics_require_survival_and_identification():
     pred = np.array([[0.99, 0.80, 0.20]])
@@ -323,6 +342,9 @@ def test_bp_consistency_primary_statistics_require_survival_and_identification()
     assert summary["p0_survival_predicted_high_boundary_share"] == 0.0
     assert summary["p0_raw_predicted_high_boundary_share"] == pytest.approx(1.0 / 3.0)
     assert summary["p0_survival_identified_grid_share"] == pytest.approx(1.0 / 3.0)
+    assert summary["p0_bp_grid_star_mean"] == pytest.approx(0.2)
+    assert summary["p0_survival_bp_grid_star_mean"] == pytest.approx(0.2)
+    assert summary["p0_raw_bp_grid_star_mean"] == pytest.approx((0.01 + 0.20 + 0.20) / 3.0)
 
 
 def test_flat_bp_objective_is_excluded_from_identified_metric():
@@ -403,6 +425,14 @@ def test_child_audit_uses_eta_next_and_preserves_candidate_bp_for_eta1():
         assert selected.loc[selected["eta_next"] == 1.0, "child_b"].iloc[0] == pytest.approx(candidate)
     continuation = rows.groupby("bp_candidate")["M_times_P_child"].mean()
     assert continuation.loc[0.2] != pytest.approx(continuation.loc[0.8])
+    np.testing.assert_allclose(
+        rows["continuation_contribution"],
+        rows["branch_weight"] * rows["raw_continuation_term"],
+    )
+    np.testing.assert_allclose(
+        rows["weighted_continuation_contribution"],
+        rows["continuation_contribution"],
+    )
     from losses import P0Loss
     loss = P0Loss()
     zeros = torch.zeros(1, 1)
@@ -495,6 +525,23 @@ def test_q_unit_masks_zero_debt_without_epsilon_division():
     surfaces = evaluate_firm_surfaces(QModel(), grid, reference)
     assert np.isnan(surfaces["q_unit"][0]).all()
     assert np.allclose(surfaces["q_unit"][1], 2.0)
+
+
+def test_investment_monotonicity_reports_survival_headline_separately():
+    surfaces = {
+        "P0": np.zeros((2, 2)),
+        "PI_low": np.array([[2.0, 2.0], [2.0, 2.0]]),
+        "PI_mid": np.array([[3.0, 1.0], [3.0, 1.0]]),
+        "PI_high": np.array([[4.0, 0.0], [4.0, 0.0]]),
+    }
+    investment = {
+        "survival_mask": np.array([[False, True], [False, True]]),
+        "investment_status": np.full((2, 2), "single_crossing", dtype=object),
+    }
+    _, summary = investment_margin_diagnostics(surfaces, investment)
+    assert summary["investment_i_monotonicity_violation_share_raw"] == 0.5
+    assert summary["investment_i_monotonicity_violation_share"] == 0.5
+    assert summary["investment_i_monotonicity_violation_share_survival"] == 0.0
 
 
 def test_eta0_eta1_grids_differ_only_in_parent_eta():
@@ -632,8 +679,10 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
         "p0_residual_signed_mean", "p0_residual_abs_p90",
         "pi_residual_signed_mean", "pi_residual_abs_p90",
         "bp_mae_raw", "bp_mae_survival_identified", "bp_regret_mean",
+        "bp_grid_star_mean", "bp_continuation_at_coarse_star_mean",
         "bp_regret_median", "bp_regret_p90", "bp_regret_p99", "bp_regret_max",
         "teacher_identified_share", "investment_i_monotonicity_violation_share",
+        "investment_i_monotonicity_violation_share_survival",
         "hard_default_share", "soft_default_mean", "q_unit_mean_survival",
     }.issubset(summary.columns)
 
@@ -660,7 +709,8 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
     assert audit["child_b_identity_error"].max() < 1e-6
     assert {
         "parent_eta", "eta_next", "child_b", "M_raw", "M_used", "P_child",
-        "Phat_child", "bar_z_child", "M_times_P_child", "continuation_contribution",
+        "Phat_child", "bar_z_child", "M_times_P_child", "raw_continuation_term",
+        "weighted_continuation_contribution", "continuation_contribution",
     }.issubset(audit.columns)
 
 
@@ -698,5 +748,7 @@ def test_eta_and_child_shock_matrix_writes_full_and_compact_cases(tmp_path):
     assert metadata["eta_values"] == [0.0, 1.0]
     assert metadata["robustness_n_child_shocks"] == [2, 3]
     assert metadata["common_random_numbers_scope"] == (
-        "within_each_eta_J_case_same_seed_not_nested_across_J"
+        "within_each_eta_grid_and_nested_prefix_across_J"
     )
+    assert metadata["nested_shock_prefix_across_J"] is True
+    assert metadata["shock_bank_max_child_shocks"] == 3

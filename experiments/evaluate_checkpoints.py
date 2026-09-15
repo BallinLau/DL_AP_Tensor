@@ -91,6 +91,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-child-shocks", "--n-branches", dest="n_child_shocks", type=int, default=2)
     parser.add_argument("--shock-seed", type=int, default=12345)
     parser.add_argument(
+        "--shock-bank-max-child-shocks",
+        type=int,
+        default=None,
+        help=(
+            "Generate this many shocks before taking the first J; matrix mode sets this "
+            "to max(J) so smaller-J cases are nested prefixes."
+        ),
+    )
+    parser.add_argument(
         "--robustness-child-shocks",
         type=int,
         nargs="+",
@@ -348,6 +357,7 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         sdf_fc1_model, grid.base_states, reference, loaded.hyperparams,
         loaded.economic_config, n_child_shocks=args.n_child_shocks,
         shock_seed=args.shock_seed,
+        shock_bank_max_child_shocks=args.shock_bank_max_child_shocks,
     )
     bellman_surfaces, bellman_summary = evaluate_bellman_residuals(
         model, grid, transition_data, loaded.economic_config,
@@ -440,6 +450,13 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         "bp_mae_raw": _mean_summary(["p0_raw_mae", "pi_mid_raw_mae"]),
         "bp_mae_survival": _mean_summary(["p0_survival_mae", "pi_mid_survival_mae"]),
         "bp_mae_survival_identified": _mean_summary(["p0_mae", "pi_mid_mae"]),
+        "bp_grid_star_mean": _mean_summary([
+            "p0_bp_grid_star_mean", "pi_mid_bp_grid_star_mean"
+        ]),
+        "bp_continuation_at_coarse_star_mean": _mean_summary([
+            "p0_coarse_continuation_at_star_mean",
+            "pi_mid_coarse_continuation_at_star_mean",
+        ]),
         "bp_regret_mean": _mean_summary(["p0_regret_mean", "pi_mid_regret_mean"]),
         "bp_regret_median": _mean_summary(["p0_regret_median", "pi_mid_regret_median"]),
         "bp_regret_p90": _mean_summary(["p0_regret_p90", "pi_mid_regret_p90"]),
@@ -479,7 +496,14 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         "n_child_shocks": int(args.n_child_shocks),
         "shock_seed": int(args.shock_seed),
         "common_random_numbers": True,
-        "common_random_numbers_scope": "within_eta_J_frozen_grid",
+        "common_random_numbers_scope": (
+            "within_eta_grid_and_prefix_of_Jmax"
+            if transition_meta.get("nested_prefix_from_max_J")
+            else "within_eta_J_frozen_grid"
+        ),
+        "shock_bank_max_child_shocks": int(
+            transition_meta.get("shock_bank_max_child_shocks", args.n_child_shocks)
+        ),
         "bp_margin_identification_threshold": float(args.bp_teacher_margin_tol),
         "reference_state": reference.to_dict(),
         "grid": {
@@ -580,6 +604,7 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
             case_args.summary_only = not primary
             case_args.eta_values = None
             case_args.robustness_child_shocks = None
+            case_args.shock_bank_max_child_shocks = max(j_values)
             summary, metadata = evaluate(case_args)
             if first_case_metadata is None:
                 first_case_metadata = metadata
@@ -617,7 +642,9 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
         "robustness_n_child_shocks": j_values,
         "shock_seed": int(args.shock_seed),
         "common_random_numbers": True,
-        "common_random_numbers_scope": "within_each_eta_J_case_same_seed_not_nested_across_J",
+        "common_random_numbers_scope": "within_each_eta_grid_and_nested_prefix_across_J",
+        "shock_bank_max_child_shocks": max(j_values),
+        "nested_shock_prefix_across_J": True,
         "bp_margin_identification_threshold": float(args.bp_teacher_margin_tol),
         "grid": first_case_metadata.get("grid"),
         "reference_state": first_case_metadata.get("reference_state"),

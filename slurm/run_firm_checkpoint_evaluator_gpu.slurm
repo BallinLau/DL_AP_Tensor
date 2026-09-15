@@ -22,7 +22,7 @@ EPISODE="${EPISODE:?EPISODE must identify the checkpoint to evaluate}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 
 # The submitted revision may be newer, but it must contain the evaluator fixes.
-REQUIRED_EVALUATOR_COMMIT="${REQUIRED_EVALUATOR_COMMIT:-7e4f788d64ed531b317c64691128d89b8a8cccb5}"
+REQUIRED_EVALUATOR_COMMIT="${REQUIRED_EVALUATOR_COMMIT:-0936c6ae2f25921618bd4c275d99eeb4617bcaf1}"
 ALLOW_DIRTY_WORKTREE="${ALLOW_DIRTY_WORKTREE:-0}"
 STRICT_UNTRACKED_WORKTREE="${STRICT_UNTRACKED_WORKTREE:-0}"
 RUN_EVALUATOR_TESTS="${RUN_EVALUATOR_TESTS:-1}"
@@ -50,10 +50,11 @@ Z_MAX="${Z_MAX:-3.0}"
 Z_POINTS="${Z_POINTS:-101}"
 I_POINTS="${I_POINTS:-101}"
 FORWARD_CHUNK_SIZE="${FORWARD_CHUNK_SIZE:-8192}"
-N_CHILD_SHOCKS="${N_CHILD_SHOCKS:-2}"
+N_CHILD_SHOCKS="${N_CHILD_SHOCKS:-32}"
 ROBUSTNESS_CHILD_SHOCKS="${ROBUSTNESS_CHILD_SHOCKS:-2 32}"
 SHOCK_SEED="${SHOCK_SEED:-12345}"
 BP_TEACHER_MARGIN_TOL="${BP_TEACHER_MARGIN_TOL:-1e-8}"
+REQUIRE_PRIMARY_ETA_NEXT_SUPPORT="${REQUIRE_PRIMARY_ETA_NEXT_SUPPORT:-1}"
 
 mkdir -p "$LOG_DIR" "$OUTPUT_DIR" "$WORK_ROOT/.mplcache"
 cd "$REPO_DIR"
@@ -214,7 +215,7 @@ python3 -u experiments/evaluate_checkpoints.py \
   --shock-seed "$SHOCK_SEED" \
   --bp-teacher-margin-tol "$BP_TEACHER_MARGIN_TOL"
 
-export OUTPUT_DIR N_CHILD_SHOCKS B_POINTS Z_POINTS ETA_VALUES ROBUSTNESS_CHILD_SHOCKS
+export OUTPUT_DIR N_CHILD_SHOCKS B_POINTS Z_POINTS ETA_VALUES ROBUSTNESS_CHILD_SHOCKS REQUIRE_PRIMARY_ETA_NEXT_SUPPORT
 python3 - <<'PY'
 import json
 import os
@@ -234,10 +235,12 @@ if len(summary) < 1 or summary.shape[1] == 0:
 required_summary = {
     "eta_parent", "n_child_shocks", "p0_residual_abs_mean", "p0_residual_abs_p90",
     "pi_residual_abs_mean", "pi_residual_abs_p90", "bp_mae_raw",
-    "bp_mae_survival", "bp_mae_survival_identified", "bp_regret_mean",
+    "bp_mae_survival", "bp_mae_survival_identified", "bp_grid_star_mean",
+    "bp_continuation_at_coarse_star_mean", "bp_regret_mean",
     "bp_regret_median", "bp_regret_p90", "bp_regret_p99", "bp_regret_max",
     "teacher_identified_share", "eta_next_active_share",
-    "investment_i_monotonicity_violation_share", "hard_default_share",
+    "investment_i_monotonicity_violation_share",
+    "investment_i_monotonicity_violation_share_survival", "hard_default_share",
     "soft_default_mean", "q_unit_mean_survival",
 }
 missing_columns = sorted(required_summary - set(summary.columns))
@@ -277,7 +280,13 @@ for case_record in full_cases:
     if audit["child_b_identity_error"].max() > 1e-6:
         raise SystemExit(f"{eta_label}: child leverage identity failed")
     if not {0.0, 1.0}.issubset(set(audit["eta_next"].unique())):
-        print(f"WARNING: {eta_label} J={os.environ['N_CHILD_SHOCKS']} did not draw both eta_next states")
+        message = f"{eta_label} J={os.environ['N_CHILD_SHOCKS']} did not draw both eta_next states"
+        if os.environ["REQUIRE_PRIMARY_ETA_NEXT_SUPPORT"] == "1":
+            raise SystemExit(message)
+        print(f"WARNING: {message}")
+    expected_weighted = audit["branch_weight"] * audit["raw_continuation_term"]
+    if (audit["weighted_continuation_contribution"] - expected_weighted).abs().max() > 1e-8:
+        raise SystemExit(f"{eta_label}: weighted continuation contribution identity failed")
 
 print("Evaluator output validation passed")
 print(f"summary_shape={summary.shape}")

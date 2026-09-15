@@ -220,9 +220,13 @@ def build_child_continuation_audit(
                     "M_times_P_child": m_used * p_child,
                 }
                 for branch, growth in (("p0", 1.0), ("pi", float(economic_config.G))):
+                    raw_term = growth * m_used * p_child
+                    weighted_contribution = base["branch_weight"] * raw_term
                     rows.append({
                         **base,
                         "branch": branch,
-                        "continuation_contribution": growth * m_used * p_child,
+                        "raw_continuation_term": raw_term,
+                        "weighted_continuation_contribution": weighted_contribution,
+                        "continuation_contribution": weighted_contribution,
                     })
     return pd.DataFrame(rows)

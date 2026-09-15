@@ -53,17 +53,30 @@ def build_frozen_transition_data(
     *,
     n_child_shocks: int,
     shock_seed: int,
+    shock_bank_max_child_shocks: int | None = None,
 ) -> FrozenTransitionData:
     if int(n_child_shocks) < 2:
         raise ValueError("n_child_shocks must be at least 2")
+    bank_child_shocks = int(shock_bank_max_child_shocks or n_child_shocks)
+    if bank_child_shocks < int(n_child_shocks):
+        raise ValueError(
+            "shock_bank_max_child_shocks must be at least n_child_shocks"
+        )
     device = parent_states.device
     dtype = parent_states.dtype
     base_bank = ConvergenceShockBank.create(
         1,
-        int(n_child_shocks),
+        bank_child_shocks,
         seed=int(shock_seed),
         device=device,
         dtype=dtype,
+    )
+    base_bank = ConvergenceShockBank(
+        eps_x=base_bank.eps_x[:, :n_child_shocks],
+        eps_z=base_bank.eps_z[:, :n_child_shocks],
+        u_eta=base_bank.u_eta[:, :n_child_shocks],
+        u_i=base_bank.u_i[:, :n_child_shocks],
+        seed=base_bank.seed,
     )
     reference_index = torch.zeros(parent_states.shape[0], dtype=torch.long, device=device)
     shock_bank = base_bank.gather(reference_index)
@@ -114,6 +127,8 @@ def build_frozen_transition_data(
         "bp_teacher_model": "policy_value",
         "shock_seed": int(shock_seed),
         "n_child_shocks": int(n_child_shocks),
+        "shock_bank_max_child_shocks": bank_child_shocks,
+        "nested_prefix_from_max_J": bank_child_shocks > int(n_child_shocks),
         "common_shocks_across_frozen_grid": True,
         "macro_context": {
             "hatc_cal": float(reference.hatc_cal),
@@ -143,6 +158,7 @@ def build_frozen_transition_children(
     *,
     n_child_shocks: int,
     shock_seed: int,
+    shock_bank_max_child_shocks: int | None = None,
 ) -> tuple[List[torch.Tensor], List[torch.Tensor], Dict[str, Any]]:
     """Backward-compatible transition tuple used by existing evaluator callers."""
     data = build_frozen_transition_data(
@@ -153,6 +169,7 @@ def build_frozen_transition_children(
         economic_config,
         n_child_shocks=n_child_shocks,
         shock_seed=shock_seed,
+        shock_bank_max_child_shocks=shock_bank_max_child_shocks,
     )
     return data.children, data.m_used_list, data.metadata
 
@@ -244,6 +261,16 @@ def _summary(
         float(primary_mask.sum()) / float(survival_count) if survival_count else float("nan")
     )
     values["teacher_margin_tol"] = float(margin_tol)
+    for metric_name, metric_values in (("bp_pred", pred), ("bp_grid_star", star)):
+        values[f"{metric_name}_mean"] = _distribution_statistics(
+            metric_values, primary_mask
+        )["mean"]
+        values[f"survival_{metric_name}_mean"] = _distribution_statistics(
+            metric_values, survival_mask
+        )["mean"]
+        values[f"raw_{metric_name}_mean"] = _distribution_statistics(
+            metric_values, np.ones_like(survival_mask, dtype=bool)
+        )["mean"]
     if regret is not None:
         for key, value in _distribution_statistics(regret, primary_mask).items():
             values[f"regret_{key}"] = value
@@ -399,6 +426,13 @@ def evaluate_bp_consistency(
                 summary[f"{label}_{component}_candidate_range_mean"] = float(
                     np.nanmean(candidate_range)
                 )
+            coarse_argmax = result["coarse_value_grid"].argmax(dim=1, keepdim=True)
+            coarse_continuation_at_star = torch.gather(
+                result["coarse_continuation_grid_mean"], 1, coarse_argmax
+            )
+            summary[f"{label}_coarse_continuation_at_star_mean"] = float(
+                coarse_continuation_at_star.detach().float().mean().item()
+            )
             summary[f"{label}_eta_next_active_share"] = float(
                 result["eta_next_active_share"].detach().float().mean().item()
             )
