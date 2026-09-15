@@ -323,9 +323,14 @@ def test_frozen_transition_children_use_state_dependent_ar1_and_sdf_m():
         FakeSDF(), parents, reference, hp, config,
         n_child_shocks=32, shock_seed=12345, shock_bank_max_child_shocks=32,
     )
-    for child_index in range(2):
+    assert len(nested.children) == 2 * nested.metadata["continuous_child_count"]
+    for child_index in range(len(nested.children)):
         torch.testing.assert_close(nested.children[child_index], full.children[child_index])
         torch.testing.assert_close(nested.m_raw_list[child_index], full.m_raw_list[child_index])
+        torch.testing.assert_close(nested.m_used_list[child_index], full.m_used_list[child_index])
+    for pair_start in range(0, len(nested.children), 2):
+        assert nested.children[pair_start][:, 2].eq(0.0).all()
+        assert nested.children[pair_start + 1][:, 2].eq(1.0).all()
     assert nested.metadata["nested_prefix_from_max_J"] is True
     assert full.metadata["nested_prefix_from_max_J"] is False
 
@@ -417,6 +422,35 @@ def test_exact_eta_probability_mass_is_seed_invariant():
         torch.testing.assert_close(
             eta_mass, torch.full_like(eta_mass, float(config.ZETA))
         )
+
+
+def test_formal_evaluator_exact_eta_is_independent_of_training_ablation():
+    class FakeSDF(torch.nn.Module):
+        def forward_step(self, x_prev, x_curr, hatcf_prev, lnkf_prev, return_physical=True):
+            return (
+                torch.ones_like(x_prev), torch.ones_like(x_curr), torch.ones_like(x_curr),
+                hatcf_prev.unsqueeze(1).expand_as(x_curr),
+                lnkf_prev.unsqueeze(1).expand_as(x_curr),
+            )
+
+    reference = ReferenceFirmState(
+        eta=1.0, i_low=0.1, i_mid=0.2, i_high=0.3, x=-2.0,
+        hatcf=-2.2, lnkf=4.0, hatc_cal=-2.1, lnk_cal=4.1,
+        n_parent_rows=1, source="fixture", macro_source="fixture",
+    )
+    hp = HyperParams()
+    hp.pv_exact_eta_integration_enabled = False
+    config = AnalysisEconomicConfig.from_current_config()
+    transition = build_frozen_transition_data(
+        FakeSDF(), torch.tensor([[0.2, 0.0, 1.0, 0.2, -2.0, -2.2, 4.0]]),
+        reference, hp, config, n_child_shocks=2, shock_seed=3,
+    )
+
+    assert transition.metadata["eta_integration_mode"] == "exact"
+    assert transition.metadata["formal_eta_integration_independent_of_training_ablation"] is True
+    assert transition.metadata["training_eta_integration_mode"] == "legacy_sampled_ablation"
+    assert transition.metadata["eta_next_active_share"] == pytest.approx(float(config.ZETA))
+    assert transition.metadata["expanded_child_count"] == 2 * transition.metadata["continuous_child_count"]
 
 
 def test_bp_consistency_primary_statistics_require_survival_and_identification():
@@ -760,6 +794,8 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
     assert metadata["reference_state"]["n_parent_rows"] == 6
     assert metadata["reference_transition_bank"]["m_source"] == "sdf_fc1.forward_step"
     assert metadata["reference_transition_bank"]["eta_integration_mode"] == "exact"
+    assert metadata["formal_evaluator_eta_integration_mode"] == "exact"
+    assert metadata["formal_eta_integration_independent_of_training_ablation"] is True
     assert metadata["reference_transition_bank"]["eta_next_active_share"] == pytest.approx(0.03)
     assert metadata["bp_teacher_model"] == "policy_value"
     assert metadata["reference_transition_bank"]["bp_teacher_model"] == "policy_value"

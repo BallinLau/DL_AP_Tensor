@@ -222,7 +222,7 @@ def test_exact_eta_bellman_residual_is_collapsed_before_aio():
     torch.testing.assert_close(residuals[1], expected1)
 
 
-@pytest.mark.parametrize("equation", ["p0", "q"])
+@pytest.mark.parametrize("equation", ["p0", "pi", "q"])
 def test_training_aio_receives_only_independent_continuous_branches(monkeypatch, equation):
     episode, batch = _training_episode_and_batch()
     branch_counts = []
@@ -234,6 +234,8 @@ def test_training_aio_receives_only_independent_continuous_branches(monkeypatch,
     monkeypatch.setattr(episode_module, "compute_aio_residual", capture)
     if equation == "p0":
         loss = episode._compute_p0_loss(batch)
+    elif equation == "pi":
+        loss = episode._compute_pi_loss(batch)
     else:
         loss = episode._compute_q_loss(batch)
     assert torch.isfinite(loss)

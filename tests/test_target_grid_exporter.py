@@ -10,13 +10,22 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
 from models import PolicyValueModel
+from analysis.economic_config import AnalysisEconomicConfig
 
 
-def _write_policy_checkpoint(run_root: Path) -> None:
+def _write_policy_checkpoint(run_root: Path, *, zeta: float = 0.20) -> None:
     checkpoint_dir = run_root / "checkpoints"
     checkpoint_dir.mkdir(parents=True)
     model = PolicyValueModel()
     torch.save(model.state_dict(), checkpoint_dir / "ep0_policy_value.pt")
+    analysis_dir = run_root / "checkpoints_analysis"
+    analysis_dir.mkdir(parents=True)
+    config_snapshot = AnalysisEconomicConfig.from_current_config().to_dict()
+    config_snapshot["ZETA"] = zeta
+    torch.save(
+        {"config_snapshot": config_snapshot},
+        analysis_dir / "ep0_combined.pt",
+    )
 
 
 def _write_firm_stage_pickle(path: Path) -> None:
@@ -99,3 +108,7 @@ def test_exporter_branch_loop_wires_mix_survival_weight(tmp_path):
     assert "mix_survival_weight" in summary_df.columns
     assert "mix_survival_weight" not in long_df.columns
     assert summary_df["mix_survival_weight"].between(0.0, 1.0).all()
+    assert set(summary_df["eta_integration_mode"]) == {"exact"}
+    assert set(summary_df["eta_probability"]) == {0.20}
+    assert (summary_df["eta_next_active_share"] - 0.20).abs().max() < 1e-7
+    assert set(summary_df["economic_config_source"]) == {"checkpoint"}

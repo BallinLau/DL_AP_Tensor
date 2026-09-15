@@ -495,6 +495,11 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         "parent_eta": float(args.eta),
         "n_child_shocks": int(args.n_child_shocks),
         "eta_integration_mode": transition_meta.get("eta_integration_mode"),
+        "formal_evaluator_eta_integration_mode": "exact",
+        "formal_eta_integration_independent_of_training_ablation": True,
+        "training_eta_integration_mode": transition_meta.get(
+            "training_eta_integration_mode"
+        ),
         "eta_probability": transition_meta.get("eta_probability"),
         "continuous_child_count": transition_meta.get("continuous_child_count"),
         "expanded_child_count": transition_meta.get("expanded_child_count"),
@@ -649,6 +654,11 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
         "common_random_numbers_scope": "within_each_eta_grid_and_nested_prefix_across_J",
         "shock_bank_max_child_shocks": max(j_values),
         "nested_shock_prefix_across_J": True,
+        "formal_evaluator_eta_integration_mode": "exact",
+        "formal_eta_integration_independent_of_training_ablation": True,
+        "training_eta_integration_mode": first_case_metadata.get(
+            "training_eta_integration_mode"
+        ),
         "bp_margin_identification_threshold": float(args.bp_teacher_margin_tol),
         "grid": first_case_metadata.get("grid"),
         "reference_state": first_case_metadata.get("reference_state"),

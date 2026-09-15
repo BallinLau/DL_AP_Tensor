@@ -92,6 +92,7 @@ def test_decomposition_summary_margin_and_confidence_fields_are_finite():
         "default_at_star": torch.tensor([[0.1]], dtype=torch.float64),
         "confidence": torch.tensor([[0.8]], dtype=torch.float64),
         "refi_active": torch.tensor([[1.0]], dtype=torch.float64),
+        "eta_next_active_share": torch.tensor([[0.2]], dtype=torch.float64),
     }
     rows = make_summary_rows(
         result=result,

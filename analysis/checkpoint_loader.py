@@ -97,6 +97,25 @@ def _load_config_payload(
     )
 
 
+def load_analysis_economic_config(
+    checkpoint_path: Optional[str | Path] = None,
+    *,
+    config_json: Optional[str | Path] = None,
+    allow_current_config: bool = False,
+) -> tuple[AnalysisEconomicConfig, str]:
+    """Resolve economic parameters for checkpoint-only diagnostic tools."""
+    payload: Optional[Dict[str, Any]] = None
+    if checkpoint_path is not None:
+        loaded = torch.load(Path(checkpoint_path), map_location="cpu")
+        if isinstance(loaded, dict):
+            payload = loaded
+    return _load_config_payload(
+        payload=payload,
+        config_json=config_json,
+        allow_current_config=allow_current_config,
+    )
+
+
 def _load_model_spec_json(path: Optional[str | Path]) -> Optional[Dict[str, Any]]:
     if path is None:
         return None

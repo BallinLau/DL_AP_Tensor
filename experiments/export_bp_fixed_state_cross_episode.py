@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from config import Config  # noqa: E402
+from analysis.checkpoint_loader import load_analysis_economic_config  # noqa: E402
 from experiments.export_bp_deep_diagnostics import make_episode_batches, stable_logit_with_censoring  # noqa: E402
 from experiments.run_utils import build_hyperparams, build_models  # noqa: E402
 from losses import P0Loss, PILoss  # noqa: E402
@@ -38,7 +39,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flip-threshold", type=float, default=0.2)
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--n-branches", type=int, default=2)
+    parser.add_argument("--analysis-checkpoint-dir", type=Path, default=None)
+    parser.add_argument("--config-json", type=Path, default=None)
+    parser.add_argument("--allow-current-config", action="store_true")
     return parser.parse_args()
+
+
+def resolve_episode_economic_config(
+    run_root: Path,
+    episode: int,
+    *,
+    analysis_checkpoint_dir: Path | None = None,
+    config_json: Path | None = None,
+    allow_current_config: bool = False,
+):
+    checkpoint_dir = analysis_checkpoint_dir or (run_root / "checkpoints_analysis")
+    candidate = checkpoint_dir / f"ep{episode}_combined.pt"
+    checkpoint = candidate if candidate.exists() else None
+    return load_analysis_economic_config(
+        checkpoint,
+        config_json=config_json,
+        allow_current_config=allow_current_config,
+    )
 
 
 def require_file(path: Path, label: str) -> Path:
@@ -120,6 +142,8 @@ def compute_episode_rows(
     m_list: List[torch.Tensor],
     hp,
     device: torch.device,
+    economic_config,
+    economic_config_source: str,
 ) -> List[Dict[str, object]]:
     ckpt_dir = run_root / "checkpoints"
     require_file(ckpt_dir / f"ep{episode}_policy_value.pt", f"EP{episode} policy/value checkpoint")
@@ -129,12 +153,10 @@ def compute_episode_rows(
     for p in target_model.parameters():
         p.requires_grad_(False)
     teacher = BPGridTeacher.from_hyperparams(target_model, P0Loss(), PILoss(), hp)
-    child_weights = None
-    if bool(getattr(hp, "pv_exact_eta_integration_enabled", True)):
-        expansion = expand_children_exact_eta(children, zeta=float(Config.ZETA))
-        children = expansion.children
-        m_list = [m_list[index] for index in expansion.source_child_indices]
-        child_weights = expansion.branch_weights
+    expansion = expand_children_exact_eta(children, zeta=float(economic_config.ZETA))
+    children = expansion.children
+    m_list = [m_list[index] for index in expansion.source_child_indices]
+    child_weights = expansion.branch_weights
     with torch.no_grad():
         out = model(parent)
         mix_weight = out.bar_i_cond.clamp(0.0, 1.0)
@@ -171,6 +193,12 @@ def compute_episode_rows(
                     "probe_group": panel_row["probe_group"],
                     "branch": branch,
                     "teacher_semantics": "checkpoint_online_greedy_proxy",
+                    "eta_integration_mode": "exact",
+                    "eta_probability": float(economic_config.ZETA),
+                    "eta_next_active_share": float(
+                        grids[branch]["eta_next_active_share"][i].item()
+                    ),
+                    "economic_config_source": economic_config_source,
                     "b": float(parent[i, 0].item()),
                     "z": float(parent[i, 1].item()),
                     "eta": float(parent[i, 2].item()),
@@ -301,6 +329,13 @@ def main() -> None:
 
     rows: List[Dict[str, object]] = []
     for ep in args.episodes:
+        economic_config, economic_config_source = resolve_episode_economic_config(
+            run_root,
+            ep,
+            analysis_checkpoint_dir=args.analysis_checkpoint_dir,
+            config_json=args.config_json,
+            allow_current_config=bool(args.allow_current_config),
+        )
         rows.extend(
             compute_episode_rows(
                 run_root=run_root,
@@ -311,6 +346,8 @@ def main() -> None:
                 m_list=fixed["m_list"],
                 hp=hp,
                 device=device,
+                economic_config=economic_config,
+                economic_config_source=economic_config_source,
             )
         )
     long_df = attach_flip_flags(pd.DataFrame(rows), args.flip_threshold)

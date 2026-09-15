@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import pandas as pd
 import torch
+from analysis.economic_config import AnalysisEconomicConfig
+from config import Config
 
 from experiments.export_bp_fixed_state_cross_episode import (
     attach_flip_flags,
     build_fixed_probe_panel,
     make_transition_rows,
+    resolve_episode_economic_config,
 )
 
 
@@ -95,3 +98,18 @@ def test_transition_rows_cover_all_adjacent_episode_pairs():
     assert not bool(ep01["teacher_flip"])
     assert bool(ep12["teacher_flip"])
     assert not bool(ep12["policy_flip"])
+
+
+def test_cross_episode_export_resolves_checkpoint_zeta_not_current_config(tmp_path, monkeypatch):
+    run_root = tmp_path / "run"
+    checkpoint_dir = run_root / "checkpoints_analysis"
+    checkpoint_dir.mkdir(parents=True)
+    config_snapshot = AnalysisEconomicConfig.from_current_config().to_dict()
+    config_snapshot["ZETA"] = 0.20
+    torch.save({"config_snapshot": config_snapshot}, checkpoint_dir / "ep2_combined.pt")
+    monkeypatch.setattr(Config, "ZETA", 0.03)
+
+    economic_config, source = resolve_episode_economic_config(run_root, 2)
+
+    assert source == "checkpoint"
+    assert economic_config.ZETA == 0.20

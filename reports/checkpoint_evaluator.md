@@ -144,6 +144,14 @@ diagnostics because it permits modified tracked source files.
 
 ## Training expectation semantics
 
+The formal checkpoint evaluator always exactly marginalizes the future
+Bernoulli refinancing opportunity `eta_{t+1}` using the checkpoint-resolved
+`ZETA`. This is independent of `pv_exact_eta_integration_enabled`: an older
+checkpoint marked with the legacy sampled-eta training ablation is still
+evaluated using the exact economic conditional expectation. Metadata records
+both `training_eta_integration_mode` and
+`formal_evaluator_eta_integration_mode` so these semantics cannot be confused.
+
 The formal training baseline sets `pv_exact_eta_integration_enabled=True`,
 `pv_eta_resample_enabled=False`, and `eta_active_reweight_enabled=False`.
 P0, PI, Q, BP-grid, and cached P/PI targets evaluate both future eta states for

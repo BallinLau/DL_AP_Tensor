@@ -138,6 +138,13 @@ def build_frozen_transition_data(
         "shock_seed": int(shock_seed),
         "n_child_shocks": int(n_child_shocks),
         "eta_integration_mode": "exact",
+        "formal_eta_integration": "exact",
+        "formal_eta_integration_independent_of_training_ablation": True,
+        "training_eta_integration_mode": (
+            "exact"
+            if bool(getattr(hyperparams, "pv_exact_eta_integration_enabled", True))
+            else "legacy_sampled_ablation"
+        ),
         "eta_probability": float(economic_config.ZETA),
         "continuous_child_count": int(n_child_shocks),
         "expanded_child_count": 2 * int(n_child_shocks),

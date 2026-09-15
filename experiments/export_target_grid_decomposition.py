@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from config import Config  # noqa: E402
+from analysis.checkpoint_loader import load_analysis_economic_config  # noqa: E402
 from experiments.run_utils import build_hyperparams, build_models  # noqa: E402
 from losses import P0Loss, PILoss  # noqa: E402
 from training.bp_grid_teacher import BPGridTeacher  # noqa: E402
@@ -36,7 +37,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--n-branches", type=int, default=2)
+    parser.add_argument("--analysis-checkpoint", type=Path, default=None)
+    parser.add_argument("--config-json", type=Path, default=None)
+    parser.add_argument("--allow-current-config", action="store_true")
     return parser.parse_args()
+
+
+def resolve_export_economic_config(
+    run_root: Path,
+    episode: int,
+    *,
+    analysis_checkpoint: Path | None = None,
+    config_json: Path | None = None,
+    allow_current_config: bool = False,
+):
+    checkpoint = analysis_checkpoint
+    if checkpoint is None:
+        candidate = run_root / "checkpoints_analysis" / f"ep{episode}_combined.pt"
+        checkpoint = candidate if candidate.exists() else None
+    return load_analysis_economic_config(
+        checkpoint,
+        config_json=config_json,
+        allow_current_config=allow_current_config,
+    )
 
 
 def cat_batches(batches: Iterable[Dict[str, torch.Tensor]], key: str) -> torch.Tensor:
@@ -132,6 +155,7 @@ def make_summary_rows(
     relative_value_margin = value_margin / value_best.abs().clamp_min(1e-8)
     confidence_weight = result["confidence"].reshape(-1)
     active_refinancing = result["refi_active"].reshape(-1)
+    eta_next_active_share = result["eta_next_active_share"].reshape(-1)
     mix_survival_weight = mix_survival_weight.reshape(-1)
     bp_pred_flat = bp_pred.reshape(-1)
     rows: List[Dict[str, object]] = []
@@ -182,6 +206,7 @@ def make_summary_rows(
                 "relative_value_margin": float(relative_value_margin[state_pos].item()),
                 "confidence_weight": float(confidence_weight[state_pos].item()),
                 "active_refinancing": float(active_refinancing[state_pos].item()),
+                "eta_next_active_share": float(eta_next_active_share[state_pos].item()),
                 "mix_survival_weight": float(mix_survival_weight[state_pos].item()),
                 "regret_at_pred": float(regret_at_pred[state_pos].item()),
                 "cashflow_low": float(cf_low.item()),
@@ -233,6 +258,17 @@ def main() -> None:
         )
     print(f"Using policy checkpoint: {policy_ckpt}")
     print(f"Using firm data: {firm_pkl}")
+    economic_config, economic_config_source = resolve_export_economic_config(
+        run_root,
+        args.episode,
+        analysis_checkpoint=args.analysis_checkpoint,
+        config_json=args.config_json,
+        allow_current_config=bool(args.allow_current_config),
+    )
+    print(
+        "Future eta integration: exact "
+        f"(ZETA={economic_config.ZETA:g}, source={economic_config_source})"
+    )
 
     models = build_models(
         device=device,
@@ -298,12 +334,10 @@ def main() -> None:
     parent_state = parent_state_full[selected]
     children = [child[selected] for child in children_full]
     m_list = [m[selected] for m in m_full]
-    child_weights = None
-    if bool(getattr(hp, "pv_exact_eta_integration_enabled", True)):
-        expansion = expand_children_exact_eta(children, zeta=float(Config.ZETA))
-        children = expansion.children
-        m_list = [m_list[index] for index in expansion.source_child_indices]
-        child_weights = expansion.branch_weights
+    expansion = expand_children_exact_eta(children, zeta=float(economic_config.ZETA))
+    children = expansion.children
+    m_list = [m_list[index] for index in expansion.source_child_indices]
+    child_weights = expansion.branch_weights
     source_index = source_index_full[selected]
 
     with torch.no_grad():
@@ -361,6 +395,10 @@ def main() -> None:
 
     long_df = pd.DataFrame(long_rows)
     summary_df = pd.DataFrame(summary_rows)
+    for frame in (long_df, summary_df):
+        frame["eta_integration_mode"] = "exact"
+        frame["eta_probability"] = float(economic_config.ZETA)
+        frame["economic_config_source"] = economic_config_source
     if not (summary_df["value_margin"] >= -1e-7).all():
         raise RuntimeError("Target-grid value_margin contains negative values beyond tolerance.")
     if not summary_df["confidence_weight"].between(0.0, 1.0).all():
