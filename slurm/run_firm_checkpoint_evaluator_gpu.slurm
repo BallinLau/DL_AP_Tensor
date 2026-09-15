@@ -22,7 +22,7 @@ EPISODE="${EPISODE:?EPISODE must identify the checkpoint to evaluate}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 
 # The submitted revision may be newer, but it must contain the evaluator fixes.
-REQUIRED_EVALUATOR_COMMIT="${REQUIRED_EVALUATOR_COMMIT:-6fbfc9f47ef8c7f07c9a16c3ec76209295c19d19}"
+REQUIRED_EVALUATOR_COMMIT="${REQUIRED_EVALUATOR_COMMIT:-7e4f788d64ed531b317c64691128d89b8a8cccb5}"
 ALLOW_DIRTY_WORKTREE="${ALLOW_DIRTY_WORKTREE:-0}"
 STRICT_UNTRACKED_WORKTREE="${STRICT_UNTRACKED_WORKTREE:-0}"
 RUN_EVALUATOR_TESTS="${RUN_EVALUATOR_TESTS:-1}"
@@ -37,10 +37,11 @@ MODEL_SPEC_JSON="${MODEL_SPEC_JSON:-}"
 
 FIRM_DATA="${FIRM_DATA:-$RUN_ROOT/data/outputs/final_simulate_firm.pkl}"
 MACRO_DATA="${MACRO_DATA:-auto}"
-OUTPUT_DIR="${OUTPUT_DIR:-$RUN_ROOT/data/outputs/firm_checkpoint_evaluator/ep${EPISODE}_J${N_CHILD_SHOCKS:-2}_${STAMP}}"
+OUTPUT_DIR="${OUTPUT_DIR:-$RUN_ROOT/data/outputs/firm_checkpoint_evaluator/ep${EPISODE}_eta_matrix_${STAMP}}"
 
 DEVICE="${DEVICE:-cuda:0}"
 ETA="${ETA:-1.0}"
+ETA_VALUES="${ETA_VALUES:-0 1}"
 B_MIN="${B_MIN:-0.0}"
 B_MAX="${B_MAX:-1.0}"
 B_POINTS="${B_POINTS:-101}"
@@ -50,7 +51,9 @@ Z_POINTS="${Z_POINTS:-101}"
 I_POINTS="${I_POINTS:-101}"
 FORWARD_CHUNK_SIZE="${FORWARD_CHUNK_SIZE:-8192}"
 N_CHILD_SHOCKS="${N_CHILD_SHOCKS:-2}"
+ROBUSTNESS_CHILD_SHOCKS="${ROBUSTNESS_CHILD_SHOCKS:-2 32}"
 SHOCK_SEED="${SHOCK_SEED:-12345}"
+BP_TEACHER_MARGIN_TOL="${BP_TEACHER_MARGIN_TOL:-1e-8}"
 
 mkdir -p "$LOG_DIR" "$OUTPUT_DIR" "$WORK_ROOT/.mplcache"
 cd "$REPO_DIR"
@@ -78,8 +81,11 @@ echo "Macro data: $MACRO_DATA"
 echo "Output: $OUTPUT_DIR"
 echo "Device: $DEVICE"
 echo "Grid: b=[$B_MIN,$B_MAX]x$B_POINTS, z=[$Z_MIN,$Z_MAX]x$Z_POINTS, i=$I_POINTS"
-echo "Eta: $ETA"
-echo "Child shocks: $N_CHILD_SHOCKS (seed=$SHOCK_SEED)"
+echo "Eta fallback: $ETA"
+echo "Eta matrix: $ETA_VALUES"
+echo "Primary child shocks: $N_CHILD_SHOCKS"
+echo "Robustness child shocks: $ROBUSTNESS_CHILD_SHOCKS (seed=$SHOCK_SEED)"
+echo "BP teacher margin tolerance: $BP_TEACHER_MARGIN_TOL"
 echo "============================================================"
 
 if ! git merge-base --is-ancestor "$REQUIRED_EVALUATOR_COMMIT" HEAD; then
@@ -126,6 +132,7 @@ python3 -m py_compile \
   evaluation/grids.py \
   evaluation/firm_surfaces.py \
   evaluation/boundaries.py \
+  evaluation/bellman_diagnostics.py \
   evaluation/bp_diagnostics.py \
   evaluation/plotting.py
 
@@ -183,6 +190,9 @@ if [[ "$MACRO_DATA" != "auto" ]]; then
   MACRO_ARGS+=(--macro-data "$MACRO_DATA")
 fi
 
+read -r -a ETA_VALUE_ARGS <<< "$ETA_VALUES"
+read -r -a ROBUSTNESS_J_ARGS <<< "$ROBUSTNESS_CHILD_SHOCKS"
+
 python3 -u experiments/evaluate_checkpoints.py \
   "${CHECKPOINT_ARGS[@]}" \
   --firm-data "$FIRM_DATA" \
@@ -190,6 +200,7 @@ python3 -u experiments/evaluate_checkpoints.py \
   --output-dir "$OUTPUT_DIR" \
   --device "$DEVICE" \
   --eta "$ETA" \
+  --eta-values "${ETA_VALUE_ARGS[@]}" \
   --b-min "$B_MIN" \
   --b-max "$B_MAX" \
   --b-points "$B_POINTS" \
@@ -199,9 +210,11 @@ python3 -u experiments/evaluate_checkpoints.py \
   --i-points "$I_POINTS" \
   --forward-chunk-size "$FORWARD_CHUNK_SIZE" \
   --n-child-shocks "$N_CHILD_SHOCKS" \
-  --shock-seed "$SHOCK_SEED"
+  --robustness-child-shocks "${ROBUSTNESS_J_ARGS[@]}" \
+  --shock-seed "$SHOCK_SEED" \
+  --bp-teacher-margin-tol "$BP_TEACHER_MARGIN_TOL"
 
-export OUTPUT_DIR N_CHILD_SHOCKS B_POINTS Z_POINTS
+export OUTPUT_DIR N_CHILD_SHOCKS B_POINTS Z_POINTS ETA_VALUES ROBUSTNESS_CHILD_SHOCKS
 python3 - <<'PY'
 import json
 import os
@@ -210,77 +223,65 @@ from pathlib import Path
 import pandas as pd
 
 root = Path(os.environ["OUTPUT_DIR"])
-required = [
-    "summary.csv",
-    "metadata.json",
-    "default/default_boundary.csv",
-    "default/default_boundary.png",
-    "investment/investment_boundary.csv",
-    "q/Q_b_slices.png",
-    "q/Q_peak_by_z.csv",
-    "q/Q_peak_by_z.png",
-    "q/q_unit_b_slices.png",
-]
-missing = [name for name in required if not (root / name).is_file()]
+required_root = ["summary.csv", "metadata.json", "robustness/j_comparison.csv"]
+missing = [name for name in required_root if not (root / name).is_file()]
 if missing:
-    raise SystemExit(f"Missing required evaluator outputs: {missing}")
+    raise SystemExit(f"Missing required evaluator matrix outputs: {missing}")
 
 summary = pd.read_csv(root / "summary.csv")
-if len(summary) != 1 or summary.shape[1] == 0:
+if len(summary) < 1 or summary.shape[1] == 0:
     raise SystemExit(f"Invalid summary.csv shape: {summary.shape}")
+required_summary = {
+    "eta_parent", "n_child_shocks", "p0_residual_abs_mean", "p0_residual_abs_p90",
+    "pi_residual_abs_mean", "pi_residual_abs_p90", "bp_mae_raw",
+    "bp_mae_survival", "bp_mae_survival_identified", "bp_regret_mean",
+    "bp_regret_median", "bp_regret_p90", "bp_regret_p99", "bp_regret_max",
+    "teacher_identified_share", "eta_next_active_share",
+    "investment_i_monotonicity_violation_share", "hard_default_share",
+    "soft_default_mean", "q_unit_mean_survival",
+}
+missing_columns = sorted(required_summary - set(summary.columns))
+if missing_columns:
+    raise SystemExit(f"summary.csv missing required diagnostics: {missing_columns}")
 
 metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+if metadata.get("evaluator") != "firm_side_checkpoint_evaluator_v2_matrix":
+    raise SystemExit("Unexpected evaluator matrix metadata")
 if metadata.get("model_state_unchanged") is not True:
-    raise SystemExit("Evaluator changed checkpoint model state")
-if metadata.get("model_state_hash_before") != metadata.get("model_state_hash_after"):
-    raise SystemExit("Before/after model hashes differ")
-if metadata.get("bp_teacher_model") != "policy_value":
-    raise SystemExit("Unexpected BP teacher model semantics")
-transition = metadata.get("reference_transition_bank", {})
-if transition.get("builder") != "ConvergenceShockBank+build_child_exogenous_bundle":
-    raise SystemExit(f"Unexpected transition builder: {transition.get('builder')}")
-if int(transition.get("n_child_shocks", -1)) != int(os.environ["N_CHILD_SHOCKS"]):
-    raise SystemExit("Metadata child-shock count does not match the submitted run")
+    raise SystemExit("At least one evaluator case changed checkpoint model state")
 
-boundary = pd.read_csv(root / "default" / "default_boundary.csv")
-valid_default_status = {
-    "all_default", "all_survival", "single_crossing", "multiple_crossings",
-    "no_identified_crossing", "nonfinite"
-}
-if not set(boundary["boundary_status"].dropna().unique()).issubset(valid_default_status):
-    raise SystemExit("default_boundary.csv contains an unknown boundary_status")
-single_default = boundary["boundary_status"].eq("single_crossing")
-if not boundary.loc[single_default, "z_default"].notna().all():
-    raise SystemExit("Single-crossing default rows must have finite z_default")
-if boundary.loc[~single_default, "z_default"].notna().any():
-    raise SystemExit("Non-single-crossing default rows must keep z_default as NaN")
-
-investment = pd.read_csv(root / "investment" / "investment_boundary.csv")
-valid_investment_status = {
-    "all_invest", "all_no_invest", "single_crossing", "multiple_crossings", "nonfinite"
-}
-if not set(investment["investment_status"].dropna().unique()).issubset(valid_investment_status):
-    raise SystemExit("investment_boundary.csv contains an unknown investment_status")
-if investment.loc[investment["investment_status"].ne("single_crossing"), "i_star"].notna().any():
-    raise SystemExit("Non-single-crossing investment rows must keep i_star as NaN")
-
-survival_plots = list((root / "bp").glob("*survival*.png"))
-slice_csvs = list((root / "objective_slices").glob("*.csv"))
-slice_plots = list((root / "objective_slices").glob("*.png"))
-if not survival_plots:
-    raise SystemExit("No survival-region BP plots were generated")
-if len(slice_csvs) != 18 or len(slice_plots) != 18:
-    raise SystemExit(
-        f"Expected 18 objective CSVs and 18 plots, got {len(slice_csvs)} and {len(slice_plots)}"
-    )
+full_cases = [case for case in metadata.get("cases", []) if case.get("full_output")]
+if not full_cases:
+    raise SystemExit("Matrix metadata contains no full-output ETA cases")
+for case_record in full_cases:
+    case = Path(case_record["output"])
+    eta_label = case.name
+    required_case = [
+        "summary.csv", "metadata.json", "default/default_boundary.csv",
+        "default/boundary_comparison.csv", "default/boundary_comparison.png",
+        "investment/investment_boundary.csv", "investment/D_VI_minus_V0_mid.csv",
+        "q/Q_b_slices.png", "q/q_unit.csv", "bellman/R0_signed.csv",
+        "bellman/RI_signed.csv", "bp/p0_bp_regret_survival_identified.csv",
+        "audits/child_continuation_audit.csv",
+    ]
+    missing_case = [name for name in required_case if not (case / name).is_file()]
+    if missing_case:
+        raise SystemExit(f"{eta_label} missing outputs: {missing_case}")
+    case_meta = json.loads((case / "metadata.json").read_text(encoding="utf-8"))
+    if case_meta.get("model_state_unchanged") is not True:
+        raise SystemExit(f"{eta_label}: evaluator changed checkpoint model state")
+    timing = case_meta.get("semantics", {}).get("child_leverage_timing")
+    if timing != "b_next = eta_next * bp_current + (1-eta_next) * b_current":
+        raise SystemExit(f"{eta_label}: leverage timing metadata mismatch")
+    audit = pd.read_csv(case / "audits" / "child_continuation_audit.csv")
+    if audit["child_b_identity_error"].max() > 1e-6:
+        raise SystemExit(f"{eta_label}: child leverage identity failed")
+    if not {0.0, 1.0}.issubset(set(audit["eta_next"].unique())):
+        print(f"WARNING: {eta_label} J={os.environ['N_CHILD_SHOCKS']} did not draw both eta_next states")
 
 print("Evaluator output validation passed")
 print(f"summary_shape={summary.shape}")
-print(f"default_status_counts={boundary['boundary_status'].value_counts(dropna=False).to_dict()}")
-print(f"investment_status_counts={investment['investment_status'].value_counts(dropna=False).to_dict()}")
-print(f"survival_bp_plots={len(survival_plots)}")
-print(f"objective_slice_csvs={len(slice_csvs)}")
-print(f"objective_slice_plots={len(slice_plots)}")
+print(summary[["eta_parent", "n_child_shocks", "eta_next_active_share", "bp_regret_mean"]].to_string(index=False))
 PY
 
 echo "============================================================"

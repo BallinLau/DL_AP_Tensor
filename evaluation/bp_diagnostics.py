@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -22,6 +23,15 @@ from .grids import FrozenFirmGrid, ReferenceFirmState
 from .plotting import plot_objective_slice
 
 
+@dataclass(frozen=True)
+class FrozenTransitionData:
+    children: List[torch.Tensor]
+    m_raw_list: List[torch.Tensor]
+    m_used_list: List[torch.Tensor]
+    branch_weights: torch.Tensor
+    metadata: Dict[str, Any]
+
+
 @contextmanager
 def _checkpoint_economic_config(config: AnalysisEconomicConfig):
     saved = {name: getattr(Config, name) for name in config.field_names()}
@@ -34,7 +44,7 @@ def _checkpoint_economic_config(config: AnalysisEconomicConfig):
             setattr(Config, name, value)
 
 
-def build_frozen_transition_children(
+def build_frozen_transition_data(
     sdf_fc1_model: torch.nn.Module,
     parent_states: torch.Tensor,
     reference: ReferenceFirmState,
@@ -43,7 +53,7 @@ def build_frozen_transition_children(
     *,
     n_child_shocks: int,
     shock_seed: int,
-) -> tuple[List[torch.Tensor], List[torch.Tensor], Dict[str, Any]]:
+) -> FrozenTransitionData:
     if int(n_child_shocks) < 2:
         raise ValueError("n_child_shocks must be at least 2")
     device = parent_states.device
@@ -76,7 +86,8 @@ def build_frozen_transition_children(
     m_lo = float(getattr(hyperparams, "pv_m_clamp_min", 0.7))
     m_hi = float(getattr(hyperparams, "pv_m_clamp_max", 1.3))
     children: List[torch.Tensor] = []
-    m_list: List[torch.Tensor] = []
+    m_raw_list: List[torch.Tensor] = []
+    m_used_list: List[torch.Tensor] = []
     for child_pos in range(int(n_child_shocks)):
         children.append(
             torch.stack(
@@ -92,10 +103,12 @@ def build_frozen_transition_children(
                 dim=1,
             )
         )
-        m = bundle.m_raw[:, child_pos, :]
+        m_raw = bundle.m_raw[:, child_pos, :]
+        m = m_raw
         if use_clipped_m:
             m = m.clamp(m_lo, m_hi)
-        m_list.append(m)
+        m_raw_list.append(m_raw)
+        m_used_list.append(m)
     metadata = {
         "builder": "ConvergenceShockBank+build_child_exogenous_bundle",
         "bp_teacher_model": "policy_value",
@@ -112,7 +125,36 @@ def build_frozen_transition_children(
         "m_raw_std": float(bundle.m_raw.detach().std(unbiased=False).item()),
         "eta_next_active_share": float(bundle.eta_next.detach().mean().item()),
     }
-    return children, m_list, metadata
+    return FrozenTransitionData(
+        children=children,
+        m_raw_list=m_raw_list,
+        m_used_list=m_used_list,
+        branch_weights=bundle.branch_weights,
+        metadata=metadata,
+    )
+
+
+def build_frozen_transition_children(
+    sdf_fc1_model: torch.nn.Module,
+    parent_states: torch.Tensor,
+    reference: ReferenceFirmState,
+    hyperparams: HyperParams,
+    economic_config: AnalysisEconomicConfig,
+    *,
+    n_child_shocks: int,
+    shock_seed: int,
+) -> tuple[List[torch.Tensor], List[torch.Tensor], Dict[str, Any]]:
+    """Backward-compatible transition tuple used by existing evaluator callers."""
+    data = build_frozen_transition_data(
+        sdf_fc1_model,
+        parent_states,
+        reference,
+        hyperparams,
+        economic_config,
+        n_child_shocks=n_child_shocks,
+        shock_seed=shock_seed,
+    )
+    return data.children, data.m_used_list, data.metadata
 
 
 def _losses(config: AnalysisEconomicConfig) -> tuple[P0Loss, PILoss]:
@@ -162,12 +204,28 @@ def _gap_statistics(pred: np.ndarray, star: np.ndarray, mask: np.ndarray) -> Dic
     }
 
 
+def _distribution_statistics(values: np.ndarray, mask: np.ndarray) -> Dict[str, float]:
+    finite = np.isfinite(values) & mask.astype(bool)
+    if not finite.any():
+        return {key: np.nan for key in ("mean", "median", "p90", "p99", "max")}
+    selected = values[finite]
+    return {
+        "mean": float(selected.mean()),
+        "median": float(np.median(selected)),
+        "p90": float(np.quantile(selected, 0.90)),
+        "p99": float(np.quantile(selected, 0.99)),
+        "max": float(selected.max()),
+    }
+
+
 def _summary(
     prefix: str,
     pred: np.ndarray,
     star: np.ndarray,
     survival_mask: np.ndarray,
     identified_mask: np.ndarray,
+    regret: np.ndarray | None = None,
+    top2_margin: np.ndarray | None = None,
     *,
     margin_tol: float,
 ) -> Dict[str, float]:
@@ -180,7 +238,30 @@ def _summary(
     values["survival_grid_share"] = float(survival_mask.astype(bool).mean())
     values["teacher_identified_grid_share"] = float(identified_mask.astype(bool).mean())
     values["survival_identified_grid_share"] = float(primary_mask.mean())
+    survival_count = int(survival_mask.astype(bool).sum())
+    values["teacher_identified_share"] = values["teacher_identified_grid_share"]
+    values["teacher_identified_share_survival"] = (
+        float(primary_mask.sum()) / float(survival_count) if survival_count else float("nan")
+    )
     values["teacher_margin_tol"] = float(margin_tol)
+    if regret is not None:
+        for key, value in _distribution_statistics(regret, primary_mask).items():
+            values[f"regret_{key}"] = value
+        for key, value in _distribution_statistics(regret, survival_mask).items():
+            values[f"survival_regret_{key}"] = value
+        for key, value in _distribution_statistics(
+            regret, np.ones_like(survival_mask, dtype=bool)
+        ).items():
+            values[f"raw_regret_{key}"] = value
+    if top2_margin is not None:
+        margin_finite = np.isfinite(top2_margin)
+        margin_values = top2_margin[margin_finite]
+        values.update({
+            "top2_margin_mean": float(margin_values.mean()) if margin_values.size else float("nan"),
+            "top2_margin_p10": float(np.quantile(margin_values, 0.10)) if margin_values.size else float("nan"),
+            "top2_margin_p50": float(np.quantile(margin_values, 0.50)) if margin_values.size else float("nan"),
+            "top2_margin_p90": float(np.quantile(margin_values, 0.90)) if margin_values.size else float("nan"),
+        })
     return {f"{prefix}_{key}": value for key, value in values.items()}
 
 
@@ -225,20 +306,20 @@ def evaluate_bp_consistency(
     n_child_shocks: int = 2,
     shock_seed: int = 12345,
     teacher_margin_tol: float = 1e-8,
+    transition_data: FrozenTransitionData | None = None,
+    write_objective_slices: bool = True,
 ) -> tuple[Dict[str, np.ndarray], Dict[str, float], Dict[str, Any]]:
     if float(teacher_margin_tol) < 0.0:
         raise ValueError("teacher_margin_tol must be non-negative")
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    children, m_list, transition_metadata = build_frozen_transition_children(
-        sdf_fc1_model,
-        grid.base_states,
-        reference,
-        hyperparams,
-        economic_config,
-        n_child_shocks=n_child_shocks,
-        shock_seed=shock_seed,
+    transition_data = transition_data or build_frozen_transition_data(
+        sdf_fc1_model, grid.base_states, reference, hyperparams, economic_config,
+        n_child_shocks=n_child_shocks, shock_seed=shock_seed,
     )
+    children = transition_data.children
+    m_list = transition_data.m_used_list
+    transition_metadata = dict(transition_data.metadata)
     p0_loss, pi_loss = _losses(economic_config)
     teacher = BPGridTeacher.from_hyperparams(model, p0_loss, pi_loss, hyperparams)
     branch_specs = {
@@ -271,6 +352,10 @@ def evaluate_bp_consistency(
             top2_margin = (
                 result["top2_margin"].detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
             )
+            confidence = (
+                result["confidence"].detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
+            )
+            regret = result["regret"].detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
             identified_mask = np.isfinite(top2_margin) & (top2_margin > float(teacher_margin_tol))
             primary_mask = survival_mask & identified_mask
             gap = np.abs(pred - star)
@@ -278,13 +363,17 @@ def evaluate_bp_consistency(
             surfaces[f"{label}_bp_grid_star_raw"] = star
             surfaces[f"{label}_bp_abs_gap_raw"] = gap
             surfaces[f"{label}_teacher_top2_margin_raw"] = top2_margin
+            surfaces[f"{label}_teacher_confidence_raw"] = confidence
             surfaces[f"{label}_teacher_identified_raw"] = identified_mask.astype(np.float64)
+            surfaces[f"{label}_bp_regret_raw"] = regret
             surfaces[f"{label}_bp_pred_survival"] = np.where(survival_mask, pred, np.nan)
             surfaces[f"{label}_bp_grid_star_survival"] = np.where(survival_mask, star, np.nan)
             surfaces[f"{label}_bp_abs_gap_survival"] = np.where(survival_mask, gap, np.nan)
+            surfaces[f"{label}_bp_regret_survival"] = np.where(survival_mask, regret, np.nan)
             surfaces[f"{label}_bp_pred_survival_identified"] = np.where(primary_mask, pred, np.nan)
             surfaces[f"{label}_bp_grid_star_survival_identified"] = np.where(primary_mask, star, np.nan)
             surfaces[f"{label}_bp_abs_gap_survival_identified"] = np.where(primary_mask, gap, np.nan)
+            surfaces[f"{label}_bp_regret_survival_identified"] = np.where(primary_mask, regret, np.nan)
             summary.update(
                 _summary(
                     label,
@@ -292,8 +381,26 @@ def evaluate_bp_consistency(
                     star,
                     survival_mask,
                     identified_mask,
+                    regret=regret,
+                    top2_margin=top2_margin,
                     margin_tol=teacher_margin_tol,
                 )
+            )
+            for component, key in (
+                ("cashflow", "coarse_cashflow_grid_mean"),
+                ("continuation", "coarse_continuation_grid_mean"),
+                ("value", "coarse_value_grid"),
+                ("q_issue", "coarse_q_issue_grid"),
+                ("p_child_mean", "coarse_p_child_grid_mean"),
+                ("default_mean", "coarse_default_grid_mean"),
+            ):
+                candidate_values = result[key].detach().cpu().numpy().astype(np.float64)
+                candidate_range = np.nanmax(candidate_values, axis=1) - np.nanmin(candidate_values, axis=1)
+                summary[f"{label}_{component}_candidate_range_mean"] = float(
+                    np.nanmean(candidate_range)
+                )
+            summary[f"{label}_eta_next_active_share"] = float(
+                result["eta_next_active_share"].detach().float().mean().item()
             )
 
     positions = {
@@ -307,12 +414,13 @@ def evaluate_bp_consistency(
         "b_high_z_mid": (len(grid.b_values) - 1) * len(grid.z_values) + len(grid.z_values) // 2,
         "b_high_z_high": len(grid.b_values) * len(grid.z_values) - 1,
     }
-    for branch_label in ("p0", "pi_mid"):
-        for state_label, pos in positions.items():
-            frame = _objective_frame(results[branch_label], pos)
-            stem = f"{branch_label}_{state_label}"
-            frame.to_csv(output / f"{stem}.csv", index=False)
-            plot_objective_slice(frame, output / f"{stem}.png", title=stem)
+    if write_objective_slices:
+        for branch_label in ("p0", "pi_mid"):
+            for state_label, pos in positions.items():
+                frame = _objective_frame(results[branch_label], pos)
+                stem = f"{branch_label}_{state_label}"
+                frame.to_csv(output / f"{stem}.csv", index=False)
+                plot_objective_slice(frame, output / f"{stem}.png", title=stem)
 
     transition_metadata["teacher_margin_tol"] = float(teacher_margin_tol)
     transition_metadata["primary_bp_mask"] = "finite Phat>0 and top2_margin>teacher_margin_tol"

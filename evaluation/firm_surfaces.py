@@ -214,3 +214,62 @@ def evaluate_investment_cutoff(
         "investment_status": status,
         "survival_mask": survival_mask.astype(bool),
     }
+
+
+def investment_margin_diagnostics(
+    surfaces: Dict[str, np.ndarray],
+    investment: Dict[str, np.ndarray],
+) -> tuple[Dict[str, np.ndarray], Dict[str, float]]:
+    margins = {
+        label: surfaces[f"PI_{label}"] - surfaces["P0"]
+        for label in ("low", "mid", "high")
+    }
+    output = {
+        f"D_VI_minus_V0_{label}": values
+        for label, values in margins.items()
+    }
+    for label, values in margins.items():
+        output[f"investment_region_{label}_raw"] = (values > 0.0).astype(np.float64)
+    survival = investment["survival_mask"].astype(bool)
+    output.update({
+        f"investment_region_{label}_survival": np.where(survival, values > 0.0, np.nan)
+        for label, values in margins.items()
+    })
+
+    violations = {
+        "mid_gt_low": margins["mid"] > margins["low"],
+        "high_gt_mid": margins["high"] > margins["mid"],
+        "high_gt_low": margins["high"] > margins["low"],
+    }
+    adjacent_violation = violations["mid_gt_low"] | violations["high_gt_mid"]
+    summary: Dict[str, float] = {
+        "investment_i_monotonicity_violation_share": float(adjacent_violation.mean()),
+    }
+    for name, mask in violations.items():
+        summary[f"investment_D_{name}_share"] = float(mask.mean())
+        summary[f"investment_D_{name}_share_survival"] = (
+            float(mask[survival].mean()) if survival.any() else float("nan")
+        )
+
+    status = investment["investment_status"]
+    for name in ("all_invest", "all_no_invest", "single_crossing", "multiple_crossings", "nonfinite"):
+        match = status == name
+        summary[f"investment_{name}_share_raw"] = float(match.mean())
+        summary[f"investment_{name}_share_survival"] = (
+            float(match[survival].mean()) if survival.any() else float("nan")
+        )
+    return output, summary
+
+
+def q_unit_summary(
+    q_unit: np.ndarray,
+    survival_mask: np.ndarray,
+) -> Dict[str, float]:
+    valid = np.isfinite(q_unit) & survival_mask.astype(bool)
+    if not valid.any():
+        return {"q_unit_mean_survival": float("nan"), "q_unit_p90_survival": float("nan")}
+    values = q_unit[valid]
+    return {
+        "q_unit_mean_survival": float(values.mean()),
+        "q_unit_p90_survival": float(np.quantile(values, 0.90)),
+    }

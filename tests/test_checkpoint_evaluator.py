@@ -4,7 +4,9 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -19,8 +21,16 @@ from analysis.checkpoint_loader import load_analysis_checkpoint
 from analysis.economic_config import AnalysisEconomicConfig
 from config import HyperParams
 from evaluation.boundaries import extract_phat_default_boundary
-from evaluation.bp_diagnostics import _summary, build_frozen_transition_children
-from evaluation.firm_surfaces import evaluate_investment_cutoff
+from evaluation.bellman_diagnostics import (
+    build_child_continuation_audit,
+    evaluate_bellman_residuals,
+)
+from evaluation.bp_diagnostics import (
+    FrozenTransitionData,
+    _summary,
+    build_frozen_transition_children,
+)
+from evaluation.firm_surfaces import evaluate_firm_surfaces, evaluate_investment_cutoff
 from evaluation.grids import ReferenceFirmState, build_frozen_grid, load_reference_state
 from experiments.run_utils import build_models
 from models import PolicyValueModel
@@ -115,7 +125,12 @@ def _write_reference_firm(path: Path) -> None:
     pd.DataFrame(rows).to_pickle(path)
 
 
-def _run_evaluator(checkpoint: Path, firm_data: Path, output: Path) -> subprocess.CompletedProcess[str]:
+def _run_evaluator(
+    checkpoint: Path,
+    firm_data: Path,
+    output: Path,
+    extra_args: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT)
     return subprocess.run(
@@ -130,7 +145,7 @@ def _run_evaluator(checkpoint: Path, firm_data: Path, output: Path) -> subproces
             "--z-points", "5",
             "--i-points", "5",
             "--forward-chunk-size", "17",
-        ],
+        ] + list(extra_args or []),
         cwd=ROOT,
         env=env,
         text=True,
@@ -310,6 +325,195 @@ def test_bp_consistency_primary_statistics_require_survival_and_identification()
     assert summary["p0_survival_identified_grid_share"] == pytest.approx(1.0 / 3.0)
 
 
+def test_flat_bp_objective_is_excluded_from_identified_metric():
+    summary = _summary(
+        "p0",
+        np.array([[0.9]]),
+        np.array([[0.1]]),
+        np.array([[True]]),
+        np.array([[False]]),
+        regret=np.array([[0.0]]),
+        top2_margin=np.array([[0.0]]),
+        margin_tol=1e-8,
+    )
+    assert np.isnan(summary["p0_mae"])
+    assert summary["p0_survival_mae"] == pytest.approx(0.8)
+    assert summary["p0_teacher_identified_share"] == 0.0
+    assert summary["p0_regret_mean"] != summary["p0_regret_mean"]
+
+
+def test_bp_regret_is_zero_when_prediction_equals_teacher_star():
+    summary = _summary(
+        "p0",
+        np.array([[0.2, 0.8]]),
+        np.array([[0.2, 0.8]]),
+        np.array([[True, True]]),
+        np.array([[True, True]]),
+        regret=np.zeros((1, 2)),
+        margin_tol=1e-8,
+    )
+    assert summary["p0_mae"] == 0.0
+    assert summary["p0_regret_mean"] == 0.0
+    assert summary["p0_regret_max"] == 0.0
+
+
+def _transition_fixture(grid, eta_values=(0.0, 1.0)):
+    children = []
+    m_raw = []
+    m_used = []
+    for eta in eta_values:
+        child = grid.base_states.clone()
+        child[:, 2] = float(eta)
+        children.append(child)
+        m_raw.append(torch.ones(len(child), 1))
+        m_used.append(torch.ones(len(child), 1))
+    return FrozenTransitionData(
+        children=children,
+        m_raw_list=m_raw,
+        m_used_list=m_used,
+        branch_weights=torch.full((len(grid.base_states), len(children)), 1.0 / len(children)),
+        metadata={"m_mode": "raw_sdf_m"},
+    )
+
+
+def test_child_audit_uses_eta_next_and_preserves_candidate_bp_for_eta1():
+    class ChildModel(torch.nn.Module):
+        def forward(self, states):
+            b = states[:, 0:1]
+            return SimpleNamespace(P=b, Phat=torch.ones_like(b), bar_z=torch.zeros_like(b))
+
+    reference = ReferenceFirmState(
+        eta=0.0, i_low=0.1, i_mid=0.2, i_high=0.3,
+        x=-2.0, hatcf=-2.1, lnkf=4.0, hatc_cal=-2.0, lnk_cal=4.1,
+        n_parent_rows=1, source="fixture", macro_source="fixture",
+    )
+    grid = build_frozen_grid(
+        reference, b_min=0.4, b_max=0.5, b_points=2,
+        z_min=-1.0, z_max=1.0, z_points=2, device=torch.device("cpu"),
+    )
+    audit = build_child_continuation_audit(
+        ChildModel(), grid, _transition_fixture(grid),
+        AnalysisEconomicConfig.from_current_config(), candidate_bp=(0.2, 0.5, 0.8),
+    )
+    rows = audit[(audit["state_label"] == "b_low_z_low") & (audit["branch"] == "p0")]
+    assert rows["child_b_identity_error"].max() == pytest.approx(0.0, abs=1e-7)
+    for candidate in (0.2, 0.5, 0.8):
+        selected = rows[rows["bp_candidate"] == candidate]
+        assert selected.loc[selected["eta_next"] == 0.0, "child_b"].iloc[0] == pytest.approx(0.4)
+        assert selected.loc[selected["eta_next"] == 1.0, "child_b"].iloc[0] == pytest.approx(candidate)
+    continuation = rows.groupby("bp_candidate")["M_times_P_child"].mean()
+    assert continuation.loc[0.2] != pytest.approx(continuation.loc[0.8])
+    from losses import P0Loss
+    loss = P0Loss()
+    zeros = torch.zeros(1, 1)
+    cf_low = loss.compute_cashflow_p0(
+        torch.tensor([[-2.0]]), torch.tensor([[-1.0]]), torch.tensor([[0.4]]),
+        zeros, torch.tensor([[0.2]]), zeros,
+    )
+    cf_high = loss.compute_cashflow_p0(
+        torch.tensor([[-2.0]]), torch.tensor([[-1.0]]), torch.tensor([[0.4]]),
+        zeros, torch.tensor([[0.8]]), zeros,
+    )
+    torch.testing.assert_close(cf_low, cf_high)
+
+
+def test_bellman_physical_residual_is_zero_for_exact_mock_equation():
+    economic = AnalysisEconomicConfig.from_current_config()
+
+    class ExactModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            from losses import P0Loss, PILoss
+            self.p0_loss = P0Loss(
+                delta=economic.DELTA, tau=economic.TAU,
+                kappa_b=economic.KAPPA_B, kappa_e=economic.KAPPA_E,
+            )
+            self.pi_loss = PILoss(
+                delta=economic.DELTA, tau=economic.TAU, g=economic.G,
+                kappa_b=economic.KAPPA_B, kappa_e=economic.KAPPA_E,
+                b_penalty_weight=0.0,
+            )
+
+        def forward(self, states):
+            zeros = torch.zeros_like(states[:, 0:1])
+            p_child = torch.full_like(zeros, 2.0)
+            cf0 = self.p0_loss.compute_cashflow_p0(
+                states[:, 4:5], states[:, 1:2], states[:, 0:1], zeros, zeros,
+                states[:, 2:3],
+            )
+            cfi = self.pi_loss.compute_cashflow_pi(
+                states[:, 4:5], states[:, 1:2], states[:, 0:1], states[:, 3:4],
+                zeros, zeros, states[:, 2:3],
+            )
+            return SimpleNamespace(
+                Q=zeros, bp0=torch.full_like(zeros, 0.3), bpI=torch.full_like(zeros, 0.7),
+                P0=cf0 + 2.0, PI=cfi + float(economic.G) * 2.0, P=p_child,
+            )
+
+        def equity_value_scale(self, states):
+            return torch.ones_like(states[:, 0:1])
+
+    reference = ReferenceFirmState(
+        eta=0.0, i_low=0.1, i_mid=0.2, i_high=0.3,
+        x=-2.0, hatcf=-2.1, lnkf=4.0, hatc_cal=-2.0, lnk_cal=4.1,
+        n_parent_rows=1, source="fixture", macro_source="fixture",
+    )
+    grid = build_frozen_grid(
+        reference, b_min=0.2, b_max=0.4, b_points=2,
+        z_min=-0.2, z_max=0.2, z_points=2, device=torch.device("cpu"),
+    )
+    surfaces, summary = evaluate_bellman_residuals(
+        ExactModel(), grid, _transition_fixture(grid), economic,
+    )
+    assert np.max(np.abs(surfaces["R0_signed"])) < 1e-6
+    assert np.max(np.abs(surfaces["RI_signed"])) < 1e-6
+    assert summary["p0_residual_abs_mean"] < 1e-6
+    assert summary["pi_residual_abs_mean"] < 1e-6
+
+
+def test_q_unit_masks_zero_debt_without_epsilon_division():
+    class QModel(torch.nn.Module):
+        def forward(self, states):
+            one = torch.ones_like(states[:, 0:1])
+            q = 2.0 * states[:, 0:1]
+            return SimpleNamespace(
+                Q=q, bp0=0.2 * one, bpI=0.8 * one, P0=one, PI=one,
+                bar_i_cond=0.5 * one, bar_i_eff=0.5 * one, bar_z=torch.zeros_like(one),
+                P=one, Phat=one, bp_cond=0.5 * one, bp=0.5 * one,
+                survival_prob=one,
+            )
+
+    reference = ReferenceFirmState(
+        eta=1.0, i_low=0.1, i_mid=0.2, i_high=0.3,
+        x=-2.0, hatcf=-2.1, lnkf=4.0, hatc_cal=-2.0, lnk_cal=4.1,
+        n_parent_rows=1, source="fixture", macro_source="fixture",
+    )
+    grid = build_frozen_grid(
+        reference, b_min=0.0, b_max=1.0, b_points=2,
+        z_min=-1.0, z_max=1.0, z_points=2, device=torch.device("cpu"),
+    )
+    surfaces = evaluate_firm_surfaces(QModel(), grid, reference)
+    assert np.isnan(surfaces["q_unit"][0]).all()
+    assert np.allclose(surfaces["q_unit"][1], 2.0)
+
+
+def test_eta0_eta1_grids_differ_only_in_parent_eta():
+    reference = ReferenceFirmState(
+        eta=0.0, i_low=0.1, i_mid=0.2, i_high=0.3,
+        x=-2.0, hatcf=-2.1, lnkf=4.0, hatc_cal=-2.0, lnk_cal=4.1,
+        n_parent_rows=1, source="fixture", macro_source="fixture",
+    )
+    kwargs = dict(
+        b_min=0.0, b_max=1.0, b_points=3, z_min=-2.0, z_max=2.0,
+        z_points=3, device=torch.device("cpu"),
+    )
+    eta0 = build_frozen_grid(reference, **kwargs).base_states
+    eta1 = build_frozen_grid(replace(reference, eta=1.0), **kwargs).base_states
+    torch.testing.assert_close(eta0[:, [0, 1, 3, 4, 5, 6]], eta1[:, [0, 1, 3, 4, 5, 6]])
+    assert torch.all(eta0[:, 2] == 0.0)
+    assert torch.all(eta1[:, 2] == 1.0)
+
+
 def test_investment_status_requires_exactly_one_crossing():
     class InvestmentModel(torch.nn.Module):
         def forward_value_components(self, states):
@@ -379,7 +583,10 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
         "value/PI_mid.png",
         "value/PI_high.png",
         "default/default_boundary.csv",
+        "default/boundary_comparison.csv",
+        "default/boundary_comparison.png",
         "investment/i_star.png",
+        "investment/D_VI_minus_V0_mid.csv",
         "investment/bar_i_cond.csv",
         "investment/bar_i_eff.csv",
         "q/Q_b_slices.png",
@@ -388,10 +595,14 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
         "bp/bp_survival.csv",
         "bp/p0_bp_abs_gap_survival.png",
         "bp/p0_bp_abs_gap_survival_identified.png",
+        "bp/p0_bp_regret_survival_identified.csv",
         "bp/p0_teacher_top2_margin_raw.csv",
         "bp/pi_mid_bp_grid_star_survival.csv",
         "objective_slices/p0_b_mid_z_mid.csv",
         "objective_slices/pi_mid_b_mid_z_mid.png",
+        "bellman/R0_signed.csv",
+        "bellman/RI_signed.png",
+        "audits/child_continuation_audit.csv",
     ]
     for relative in required:
         assert (out_a / relative).exists(), relative
@@ -411,6 +622,20 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
     assert metadata["reference_transition_bank"]["primary_bp_mask"] == (
         "finite Phat>0 and top2_margin>teacher_margin_tol"
     )
+    assert metadata["semantics"]["child_leverage_timing"] == (
+        "b_next = eta_next * bp_current + (1-eta_next) * b_current"
+    )
+    assert metadata["semantics"]["current_financing_eta"] == "eta_current"
+
+    summary = pd.read_csv(out_a / "summary.csv")
+    assert {
+        "p0_residual_signed_mean", "p0_residual_abs_p90",
+        "pi_residual_signed_mean", "pi_residual_abs_p90",
+        "bp_mae_raw", "bp_mae_survival_identified", "bp_regret_mean",
+        "bp_regret_median", "bp_regret_p90", "bp_regret_p99", "bp_regret_max",
+        "teacher_identified_share", "investment_i_monotonicity_violation_share",
+        "hard_default_share", "soft_default_mean", "q_unit_mean_survival",
+    }.issubset(summary.columns)
 
     q_unit = pd.read_csv(out_a / "q" / "q_unit.csv", index_col=0)
     assert q_unit.iloc[0].isna().all()
@@ -431,3 +656,47 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
         "child_b_eta0_mean",
         "child_b_eta1_mean",
     }.issubset(objective.columns)
+    audit = pd.read_csv(out_a / "audits" / "child_continuation_audit.csv")
+    assert audit["child_b_identity_error"].max() < 1e-6
+    assert {
+        "parent_eta", "eta_next", "child_b", "M_raw", "M_used", "P_child",
+        "Phat_child", "bar_z_child", "M_times_P_child", "continuation_contribution",
+    }.issubset(audit.columns)
+
+
+def test_eta_and_child_shock_matrix_writes_full_and_compact_cases(tmp_path):
+    checkpoint = tmp_path / "policy_combined.pt"
+    firm_data = tmp_path / "firm.pkl"
+    output = tmp_path / "matrix"
+    _write_combined_policy_checkpoint(checkpoint)
+    _write_reference_firm(firm_data)
+
+    result = _run_evaluator(
+        checkpoint,
+        firm_data,
+        output,
+        [
+            "--eta-values", "0", "1",
+            "--n-child-shocks", "2",
+            "--robustness-child-shocks", "2", "3",
+            "--b-points", "3",
+            "--z-points", "3",
+            "--i-points", "3",
+        ],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = pd.read_csv(output / "summary.csv")
+    assert set(zip(summary["eta_parent"], summary["n_child_shocks"])) == {
+        (0.0, 2), (0.0, 3), (1.0, 2), (1.0, 3)
+    }
+    for eta_label in ("eta0", "eta1"):
+        assert (output / eta_label / "bellman" / "R0_signed.csv").is_file()
+        assert (output / eta_label / "audits" / "child_continuation_audit.csv").is_file()
+        assert (output / "robustness" / f"{eta_label}_J3" / "summary.csv").is_file()
+        assert not (output / "robustness" / f"{eta_label}_J3" / "bellman").exists()
+    metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["eta_values"] == [0.0, 1.0]
+    assert metadata["robustness_n_child_shocks"] == [2, 3]
+    assert metadata["common_random_numbers_scope"] == (
+        "within_each_eta_J_case_same_seed_not_nested_across_J"
+    )

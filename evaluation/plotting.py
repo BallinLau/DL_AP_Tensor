@@ -45,6 +45,26 @@ def plot_default_boundary(
     plt.close(fig)
 
 
+def plot_default_boundary_comparison(
+    comparison: pd.DataFrame,
+    path: str | Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    hard = comparison[comparison["hard_status"] == "single_crossing"]
+    soft = comparison[comparison["soft_status"] == "single_crossing"]
+    ax.plot(hard["b"], hard["z_hard_phat0"], color="black", linewidth=1.5, label="Phat=0")
+    ax.plot(
+        soft["b"], soft["z_soft_barz0p5"], color="tab:red", linewidth=1.5,
+        linestyle="--", label="bar_z=0.5",
+    )
+    ax.set(xlabel="b", ylabel="z", title="Hard and soft default boundaries")
+    ax.legend()
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def plot_b_slices(
     surface: np.ndarray,
     b_values: np.ndarray,

@@ -90,3 +90,40 @@ def extract_phat_default_boundary(
         ),
     }
     return frame, summary
+
+
+def compare_hard_soft_default_boundaries(
+    b_values: np.ndarray,
+    z_values: np.ndarray,
+    phat: np.ndarray,
+    bar_z: np.ndarray,
+) -> tuple[pd.DataFrame, Dict[str, float]]:
+    """Compare the hard Phat=0 boundary with the soft bar_z=0.5 contour."""
+    hard, _ = extract_phat_default_boundary(b_values, z_values, phat)
+    soft, _ = extract_phat_default_boundary(b_values, z_values, 0.5 - bar_z)
+    frame = hard.rename(columns={
+        "z_default": "z_hard_phat0",
+        "boundary_status": "hard_status",
+        "crossing_count": "hard_crossing_count",
+    }).merge(
+        soft.rename(columns={
+            "z_default": "z_soft_barz0p5",
+            "boundary_status": "soft_status",
+            "crossing_count": "soft_crossing_count",
+        }),
+        on="b",
+        how="outer",
+    )
+    comparable = frame["hard_status"].eq("single_crossing") & frame["soft_status"].eq("single_crossing")
+    gap = (
+        frame.loc[comparable, "z_hard_phat0"]
+        - frame.loc[comparable, "z_soft_barz0p5"]
+    ).abs()
+    summary = {
+        "hard_default_share": float((np.asarray(phat) <= 0.0).mean()),
+        "soft_default_mean": float(np.nanmean(np.asarray(bar_z, dtype=np.float64))),
+        "hard_soft_boundary_comparable_share": float(comparable.mean()),
+        "hard_soft_boundary_abs_gap_mean": float(gap.mean()) if len(gap) else float("nan"),
+        "hard_soft_boundary_abs_gap_p90": float(gap.quantile(0.90)) if len(gap) else float("nan"),
+    }
+    return frame, summary
