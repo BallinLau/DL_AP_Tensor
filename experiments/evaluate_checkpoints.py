@@ -494,6 +494,10 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         "bp_teacher_model": "policy_value",
         "parent_eta": float(args.eta),
         "n_child_shocks": int(args.n_child_shocks),
+        "eta_integration_mode": transition_meta.get("eta_integration_mode"),
+        "eta_probability": transition_meta.get("eta_probability"),
+        "continuous_child_count": transition_meta.get("continuous_child_count"),
+        "expanded_child_count": transition_meta.get("expanded_child_count"),
         "shock_seed": int(args.shock_seed),
         "common_random_numbers": True,
         "common_random_numbers_scope": (

@@ -414,13 +414,16 @@ class HyperParams:
     kkt_boundary_weight: float = 1.0
     # 上边界(bp≈1)违反项附加权重（缓解 bp 贴边）
     kkt_high_weight: float = 3.0
-    # eta 稀疏时对 bp 相关项(FOC/KKT)做条件重权重
-    eta_active_reweight_enabled: bool = True
+    # Bellman/teacher 条件期望对 future eta 做精确 Bernoulli 求和。
+    # 关闭时保留历史 sampled-eta 行为，仅用于显式 ablation。
+    pv_exact_eta_integration_enabled: bool = True
+    # 历史稀有 eta=1 补偿；exact-eta baseline 不再启用。
+    eta_active_reweight_enabled: bool = False
     eta_active_target_ratio: float = 0.25
     eta_active_max_reweight: float = 6.0
     # 仅对 staged BP distillation train cache 按 child eta active 重采样；
     # Bellman/P0/PI/Q batches 始终保留原始 future-shock distribution。
-    pv_eta_resample_enabled: bool = True
+    pv_eta_resample_enabled: bool = False
     pv_eta_resample_active_share: float = 0.25
     # bp 项自适应权重：使 (FOC+KKT) 与 Bellman 主项同量级
     bp_adaptive_enabled: bool = False

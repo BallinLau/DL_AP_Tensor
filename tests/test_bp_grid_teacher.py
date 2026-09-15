@@ -192,6 +192,65 @@ def test_parent_eta_zero_keeps_cashflow_flat_but_child_continuation_moves():
     assert not torch.allclose(out["bp_star"], parent[:, 0:1])
 
 
+def test_grid_teacher_uses_exact_eta_weights_and_preserves_conditional_child_b():
+    target = HighLeverageTarget()
+    teacher = BPGridTeacher(
+        target,
+        P0Loss(),
+        PILoss(),
+        coarse_size=3,
+        refine=False,
+        candidate_chunk_size=3,
+        margin_scale=1e-4,
+    )
+    parent = torch.tensor([[0.4, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]])
+    child_eta0 = parent.clone()
+    child_eta1 = parent.clone()
+    child_eta0[:, 2] = 0.0
+    child_eta1[:, 2] = 1.0
+    zeta = 0.03
+
+    weighted = teacher.compute(
+        parent,
+        [child_eta0, child_eta1],
+        [torch.ones(1, 1), torch.ones(1, 1)],
+        branch="p0",
+        child_weights=torch.tensor([[1.0 - zeta, zeta]]),
+    )
+    equal_default = teacher.compute(
+        parent,
+        [child_eta0, child_eta1],
+        [torch.ones(1, 1), torch.ones(1, 1)],
+        branch="p0",
+    )
+    equal_explicit = teacher.compute(
+        parent,
+        [child_eta0, child_eta1],
+        [torch.ones(1, 1), torch.ones(1, 1)],
+        branch="p0",
+        child_weights=torch.tensor([[0.5, 0.5]]),
+    )
+
+    bp_grid = weighted["coarse_bp_grid"]
+    expected_child_b = (1.0 - zeta) * parent[:, 0:1] + zeta * bp_grid
+    torch.testing.assert_close(weighted["coarse_child_b_mean"], expected_child_b)
+    torch.testing.assert_close(
+        weighted["coarse_child_b_eta0_mean"], torch.full_like(bp_grid, 0.4)
+    )
+    torch.testing.assert_close(weighted["coarse_child_b_eta1_mean"], bp_grid)
+    torch.testing.assert_close(
+        weighted["eta_next_active_share"],
+        torch.full_like(weighted["eta_next_active_share"], zeta),
+    )
+    torch.testing.assert_close(
+        equal_default["coarse_value_grid"], equal_explicit["coarse_value_grid"]
+    )
+    torch.testing.assert_close(
+        equal_default["coarse_continuation_grid_mean"],
+        equal_explicit["coarse_continuation_grid_mean"],
+    )
+
+
 def test_grid_teacher_mix_branch_and_coarse_confidence():
     target = ParabolicTarget()
     teacher = BPGridTeacher(

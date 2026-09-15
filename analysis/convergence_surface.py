@@ -14,7 +14,7 @@ import torch
 
 from config import HyperParams
 from losses import P0Loss, PILoss, QLoss
-from utils.firm_transition import apply_refinancing_policy
+from utils.firm_transition import apply_refinancing_policy, exact_eta_pair_expectation
 
 from .checkpoint_loader import (
     AnalysisCheckpoint,
@@ -198,7 +198,33 @@ class VectorizedBellmanSurfaceBackend:
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         idx = FirmStateIndex()
         bsz = parent_states.shape[0]
-        n_child = child.z_next.shape[1]
+        n_continuous_child = child.z_next.shape[1]
+        exact_eta = bool(
+            getattr(self.hyperparams, "pv_exact_eta_integration_enabled", True)
+        )
+        zeta = float(self.economic_config.ZETA)
+
+        def expand_eta_pairs(value: torch.Tensor) -> torch.Tensor:
+            return value.repeat_interleave(2, dim=1) if exact_eta else value
+
+        z_next = expand_eta_pairs(child.z_next)
+        i_next = expand_eta_pairs(child.i_next)
+        x_next = expand_eta_pairs(child.x_next)
+        hatcf_next = expand_eta_pairs(child.hatcf_next)
+        lnkf_next = expand_eta_pairs(child.lnkf_next)
+        m_raw = expand_eta_pairs(child.m_raw)
+        if exact_eta:
+            eta_next = torch.zeros_like(z_next)
+            eta_next[:, 1::2, :] = 1.0
+        else:
+            eta_next = child.eta_next
+        n_child = z_next.shape[1]
+
+        def collapse_eta_pairs(value: torch.Tensor) -> torch.Tensor:
+            if not exact_eta:
+                return value
+            return exact_eta_pair_expectation(value, zeta=zeta)
+
         parent_out = self.policy_model(parent_states)
         bp0 = _policy_get(parent_out, "bp0")
         bpI = _policy_get(parent_out, "bpI")
@@ -232,17 +258,17 @@ class VectorizedBellmanSurfaceBackend:
         def make_child_states(b_child: torch.Tensor) -> torch.Tensor:
             return torch.stack([
                 b_child,
-                child.z_next.squeeze(-1),
-                child.eta_next.squeeze(-1),
-                child.i_next.squeeze(-1),
-                child.x_next.squeeze(-1),
-                child.hatcf_next.squeeze(-1),
-                child.lnkf_next.squeeze(-1),
+                z_next.squeeze(-1),
+                eta_next.squeeze(-1),
+                i_next.squeeze(-1),
+                x_next.squeeze(-1),
+                hatcf_next.squeeze(-1),
+                lnkf_next.squeeze(-1),
             ], dim=-1)
 
         eta_current = parent_states[:, idx.ETA:idx.ETA + 1].clamp(0.0, 1.0)
         b_parent = parent_states[:, idx.B:idx.B + 1]
-        eta_next = child.eta_next.clamp(0.0, 1.0)
+        eta_next = eta_next.clamp(0.0, 1.0)
         b_p0 = apply_refinancing_policy(
             b_current=b_parent.unsqueeze(1),
             bp_candidate=bp0.unsqueeze(1),
@@ -283,7 +309,6 @@ class VectorizedBellmanSurfaceBackend:
         q_exp = q_parent.unsqueeze(1).expand(-1, n_child, -1)
         p0_exp = p0_parent.unsqueeze(1).expand(-1, n_child, -1)
         pi_exp = pi_parent.unsqueeze(1).expand(-1, n_child, -1)
-        m_raw = child.m_raw
         branch_weights_3d = child.branch_weights.unsqueeze(-1)
         result: Dict[str, Dict[str, torch.Tensor]] = {}
         for eq in equations:
@@ -308,8 +333,10 @@ class VectorizedBellmanSurfaceBackend:
                 for mode in m_modes:
                     continuation = m_by_mode[mode] * outputs[eq]["P"]
                     if mode == "train":
-                        self.last_parent_diagnostics["continuation_P0"] = (branch_weights_3d * continuation).sum(dim=1).detach()
-                    result[eq][mode] = (p0_exp - cf - continuation).squeeze(-1)
+                        collapsed = collapse_eta_pairs(continuation)
+                        self.last_parent_diagnostics["continuation_P0"] = (branch_weights_3d * collapsed).sum(dim=1).detach()
+                    residual = (p0_exp - cf - continuation).squeeze(-1)
+                    result[eq][mode] = collapse_eta_pairs(residual)
             elif eq == "pi":
                 childpi_state = parent_states.clone()
                 childpi_state[:, idx.B:idx.B + 1] = bpI
@@ -327,11 +354,13 @@ class VectorizedBellmanSurfaceBackend:
                 for mode in m_modes:
                     continuation = float(self.economic_config.G) * m_by_mode[mode] * outputs[eq]["P"]
                     if mode == "train":
-                        self.last_parent_diagnostics["continuation_PI"] = (branch_weights_3d * continuation).sum(dim=1).detach()
-                    result[eq][mode] = (pi_exp - cf - continuation).squeeze(-1)
+                        collapsed = collapse_eta_pairs(continuation)
+                        self.last_parent_diagnostics["continuation_PI"] = (branch_weights_3d * collapsed).sum(dim=1).detach()
+                    residual = (pi_exp - cf - continuation).squeeze(-1)
+                    result[eq][mode] = collapse_eta_pairs(residual)
             elif eq == "q":
-                x_child = child.x_next
-                z_child = child.z_next
+                x_child = x_next
+                z_child = z_next
                 bar_z = outputs[eq]["bar_z"]
                 qsp = outputs[eq]["Q"]
                 for mode in m_modes:
@@ -345,7 +374,8 @@ class VectorizedBellmanSurfaceBackend:
                         [x_child[:, j, :] for j in range(n_child)],
                         [z_child[:, j, :] for j in range(n_child)],
                     )
-                    result[eq][mode] = torch.cat([r.reshape(bsz, 1) for r in residuals], dim=1)
+                    residual = torch.cat([r.reshape(bsz, 1) for r in residuals], dim=1)
+                    result[eq][mode] = collapse_eta_pairs(residual)
             else:
                 raise ValueError(f"unsupported equation: {eq}")
         return result

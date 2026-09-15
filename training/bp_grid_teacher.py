@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from config import Config
-from utils.firm_transition import apply_refinancing_policy
+from utils.firm_transition import apply_refinancing_policy, normalize_child_weights
 
 
 logger = logging.getLogger(__name__)
@@ -240,6 +240,7 @@ class BPGridTeacher:
         branch: str,
         bp_pred: Optional[torch.Tensor] = None,
         mix_weight: Optional[torch.Tensor] = None,
+        child_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         branch = branch.lower()
         if branch not in {"p0", "pi", "mix"}:
@@ -255,6 +256,11 @@ class BPGridTeacher:
                 m_chunk = [m[start:stop] for m in m_list]
                 bp_chunk = bp_pred[start:stop] if bp_pred is not None else None
                 mix_chunk = mix_weight[start:stop] if mix_weight is not None else None
+                weight_chunk = (
+                    child_weights
+                    if child_weights is not None and child_weights.ndim == 1
+                    else child_weights[start:stop] if child_weights is not None else None
+                )
                 chunks.append(
                     self._compute_no_parent_chunk(
                         parent_state[start:stop],
@@ -263,6 +269,7 @@ class BPGridTeacher:
                         branch=branch,
                         bp_pred=bp_chunk,
                         mix_weight=mix_chunk,
+                        child_weights=weight_chunk,
                     )
                 )
             return _concat_chunk_outputs(chunks)
@@ -273,6 +280,7 @@ class BPGridTeacher:
             branch=branch,
             bp_pred=bp_pred,
             mix_weight=mix_weight,
+            child_weights=child_weights,
         )
 
     def compute_value_target(
@@ -282,6 +290,7 @@ class BPGridTeacher:
         m_list: List[torch.Tensor],
         *,
         branch: str,
+        child_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Compute only value targets needed by cached P/Q training."""
         branch = branch.lower()
@@ -297,6 +306,11 @@ class BPGridTeacher:
                         [child[start:stop] for child in children],
                         [m[start:stop] for m in m_list],
                         branch=branch,
+                        child_weights=(
+                            child_weights
+                            if child_weights is not None and child_weights.ndim == 1
+                            else child_weights[start:stop] if child_weights is not None else None
+                        ),
                     )
                 )
             return _concat_chunk_outputs(chunks)
@@ -305,6 +319,7 @@ class BPGridTeacher:
             children,
             m_list,
             branch=branch,
+            child_weights=child_weights,
         )
 
     def _compute_value_target_no_parent_chunk(
@@ -314,13 +329,20 @@ class BPGridTeacher:
         m_list: List[torch.Tensor],
         *,
         branch: str,
+        child_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         with torch.no_grad():
             coarse_grid = self._uniform_grid(parent_state, self.coarse_size)
-            coarse = self._evaluate_grid(parent_state, children, m_list, coarse_grid, branch=branch)
+            coarse = self._evaluate_grid(
+                parent_state, children, m_list, coarse_grid,
+                branch=branch, child_weights=child_weights,
+            )
             if self.refine:
                 fine_grid = self._local_fine_grid(coarse_grid, coarse["argmax_index"])
-                result = self._evaluate_grid(parent_state, children, m_list, fine_grid, branch=branch)
+                result = self._evaluate_grid(
+                    parent_state, children, m_list, fine_grid,
+                    branch=branch, child_weights=child_weights,
+                )
             else:
                 result = coarse
             argmax_index = result["argmax_index"]
@@ -339,6 +361,7 @@ class BPGridTeacher:
                     m_list,
                     bp_star,
                     branch=branch,
+                    child_weights=child_weights,
                 )
                 value_star = refined_eval["value_grid"][:, 0:1]
             else:
@@ -358,13 +381,20 @@ class BPGridTeacher:
         branch: str,
         bp_pred: Optional[torch.Tensor] = None,
         mix_weight: Optional[torch.Tensor] = None,
+        child_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         with torch.no_grad():
             coarse_grid = self._uniform_grid(parent_state, self.coarse_size)
-            coarse = self._evaluate_grid(parent_state, children, m_list, coarse_grid, branch=branch, mix_weight=mix_weight)
+            coarse = self._evaluate_grid(
+                parent_state, children, m_list, coarse_grid, branch=branch,
+                mix_weight=mix_weight, child_weights=child_weights,
+            )
             if self.refine:
                 fine_grid = self._local_fine_grid(coarse_grid, coarse["argmax_index"])
-                result = self._evaluate_grid(parent_state, children, m_list, fine_grid, branch=branch, mix_weight=mix_weight)
+                result = self._evaluate_grid(
+                    parent_state, children, m_list, fine_grid, branch=branch,
+                    mix_weight=mix_weight, child_weights=child_weights,
+                )
             else:
                 result = coarse
 
@@ -385,6 +415,7 @@ class BPGridTeacher:
                     bp_star,
                     branch=branch,
                     mix_weight=mix_weight,
+                    child_weights=child_weights,
                 )
                 value_star = refined_eval["value_grid"][:, 0:1]
                 q_issue_at_star = refined_eval["q_issue_grid"][:, 0:1]
@@ -446,7 +477,10 @@ class BPGridTeacher:
 
             if bp_pred is not None:
                 pred_grid = bp_pred.detach().clamp(self.grid_min, self.grid_max).reshape(-1, 1)
-                pred_eval = self._evaluate_grid(parent_state, children, m_list, pred_grid, branch=branch, mix_weight=mix_weight)
+                pred_eval = self._evaluate_grid(
+                    parent_state, children, m_list, pred_grid, branch=branch,
+                    mix_weight=mix_weight, child_weights=child_weights,
+                )
                 value_pred = pred_eval["value_grid"][:, 0:1]
                 result["value_pred"] = value_pred.detach()
                 result["regret"] = (value_star - value_pred).clamp_min(0.0).detach()
@@ -500,6 +534,7 @@ class BPGridTeacher:
         *,
         branch: str,
         mix_weight: Optional[torch.Tensor] = None,
+        child_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size, n_grid = bp_grid.shape
         n_children = len(children)
@@ -529,7 +564,10 @@ class BPGridTeacher:
             )
             self._grid_chunk_logged = True
         if chunk_size >= n_grid:
-            return self._evaluate_grid_chunk(parent_state, children, m_list, bp_grid, branch=branch, mix_weight=mix_weight, q_current=q_current)
+            return self._evaluate_grid_chunk(
+                parent_state, children, m_list, bp_grid, branch=branch,
+                mix_weight=mix_weight, child_weights=child_weights, q_current=q_current,
+            )
 
         chunks = []
         for start in range(0, n_grid, chunk_size):
@@ -542,6 +580,7 @@ class BPGridTeacher:
                     bp_grid[:, start:stop],
                     branch=branch,
                     mix_weight=mix_weight,
+                    child_weights=child_weights,
                     q_current=q_current,
                 )
             )
@@ -569,6 +608,7 @@ class BPGridTeacher:
         *,
         branch: str,
         mix_weight: Optional[torch.Tensor] = None,
+        child_weights: Optional[torch.Tensor] = None,
         q_current: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size, n_grid = bp_grid.shape
@@ -600,6 +640,14 @@ class BPGridTeacher:
             b_parent,
         )
         n_children = p_child.shape[2]
+        weights = normalize_child_weights(
+            child_weights,
+            n_parent=batch_size,
+            n_child=n_children,
+            device=parent_state.device,
+            dtype=parent_state.dtype,
+        )
+        weights_grid = weights.unsqueeze(1)
         m_grid = torch.stack(m_list, dim=1).reshape(batch_size, 1, n_children).expand(batch_size, n_grid, n_children)
         flat_shape = (batch_size * n_grid * n_children, 1)
         x_grid = x_parent.unsqueeze(1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
@@ -651,23 +699,24 @@ class BPGridTeacher:
             branch_continuation = (1.0 - mix_w) * continuation0 + mix_w * continuationi
             branch_value = (1.0 - mix_w) * value0 + mix_w * valuei
 
-        value_grid = branch_value.mean(dim=2)
-        cashflow_grid_mean = branch_cashflow.mean(dim=2)
-        continuation_grid_mean = branch_continuation.mean(dim=2)
-        p_grid_mean = p_child.mean(dim=2)
-        default_grid_mean = bar_z_child.mean(dim=2)
+        value_grid = (weights_grid * branch_value).sum(dim=2)
+        cashflow_grid_mean = (weights_grid * branch_cashflow).sum(dim=2)
+        continuation_grid_mean = (weights_grid * branch_continuation).sum(dim=2)
+        p_grid_mean = (weights_grid * p_child).sum(dim=2)
+        default_grid_mean = (weights_grid * bar_z_child).sum(dim=2)
         eta_next = torch.stack(
             [(_strip_extra(child)[:, 2]).clamp(0.0, 1.0) for child in children],
             dim=1,
         )
-        eta_next_active_share = eta_next.mean(dim=1, keepdim=True).expand(batch_size, n_grid)
-        child_b_mean = child_b_grid.mean(dim=2)
+        eta_next_active_share = (weights * eta_next).sum(dim=1, keepdim=True).expand(batch_size, n_grid)
+        child_b_mean = (weights_grid * child_b_grid).sum(dim=2)
 
         def _conditional_child_b(mask: torch.Tensor) -> torch.Tensor:
-            mask_grid = mask.unsqueeze(1).expand_as(child_b_grid)
-            count = mask_grid.sum(dim=2)
-            mean = (child_b_grid * mask_grid).sum(dim=2) / count.clamp_min(1.0)
-            return torch.where(count > 0, mean, torch.full_like(mean, float("nan")))
+            conditional_weights = weights * mask
+            weight_grid = conditional_weights.unsqueeze(1).expand_as(child_b_grid)
+            mass = weight_grid.sum(dim=2)
+            mean = (child_b_grid * weight_grid).sum(dim=2) / mass.clamp_min(1e-12)
+            return torch.where(mass > 0, mean, torch.full_like(mean, float("nan")))
 
         child_b_eta0_mean = _conditional_child_b((eta_next <= 0.5).to(child_b_grid.dtype))
         child_b_eta1_mean = _conditional_child_b((eta_next > 0.5).to(child_b_grid.dtype))

@@ -18,6 +18,7 @@ from experiments.run_utils import build_hyperparams, build_models  # noqa: E402
 from losses import P0Loss, PILoss  # noqa: E402
 from training.bp_grid_teacher import BPGridTeacher  # noqa: E402
 from training.episode import Episode  # noqa: E402
+from utils.firm_transition import expand_children_exact_eta  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -297,6 +298,12 @@ def main() -> None:
     parent_state = parent_state_full[selected]
     children = [child[selected] for child in children_full]
     m_list = [m[selected] for m in m_full]
+    child_weights = None
+    if bool(getattr(hp, "pv_exact_eta_integration_enabled", True)):
+        expansion = expand_children_exact_eta(children, zeta=float(Config.ZETA))
+        children = expansion.children
+        m_list = [m_list[index] for index in expansion.source_child_indices]
+        child_weights = expansion.branch_weights
     source_index = source_index_full[selected]
 
     with torch.no_grad():
@@ -330,6 +337,7 @@ def main() -> None:
                 branch=branch,
                 bp_pred=inputs["bp_pred"],
                 mix_weight=inputs["mix_weight"],
+                child_weights=child_weights,
             )
             long_rows.extend(
                 make_long_rows(

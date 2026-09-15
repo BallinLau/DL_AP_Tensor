@@ -225,6 +225,8 @@ def build_child_continuation_audit(
                     rows.append({
                         **base,
                         "branch": branch,
+                        "continuation_raw": raw_term,
+                        "continuation_weighted": weighted_contribution,
                         "raw_continuation_term": raw_term,
                         "weighted_continuation_contribution": weighted_contribution,
                         "continuation_contribution": weighted_contribution,

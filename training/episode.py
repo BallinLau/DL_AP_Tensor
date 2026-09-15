@@ -58,7 +58,11 @@ from .pv_mixture import (
 from .pq_value_cache import PQValueTargetBatch
 from .target_utils import hard_update, soft_update
 from utils.gpu_monitor import GPUMonitor, print_memory_summary
-from utils.firm_transition import apply_refinancing_policy
+from utils.firm_transition import (
+    apply_refinancing_policy,
+    exact_eta_pair_expectation,
+    expand_children_exact_eta,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -754,7 +758,48 @@ class Episode:
             M_list = [m.clamp(clamp_min, clamp_max) for m in raw_M_list]
         else:
             M_list = raw_M_list
+
         return raw_M_list, M_list
+
+    def _pv_exact_eta_enabled(self) -> bool:
+        return bool(
+            getattr(self.hyperparams, "pv_exact_eta_integration_enabled", True)
+        )
+
+    def _expand_policy_expectation_children(
+        self,
+        children: List[torch.Tensor],
+        raw_m_list: List[torch.Tensor],
+        m_list: List[torch.Tensor],
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], Optional[torch.Tensor]]:
+        """Enumerate future eta while retaining the original J shock identities."""
+        if not self._pv_exact_eta_enabled():
+            return children, raw_m_list, m_list, None
+        if len(children) != len(raw_m_list) or len(children) != len(m_list):
+            raise ValueError("children and M lists must have the same branch count")
+        expansion = expand_children_exact_eta(
+            children,
+            zeta=float(getattr(self.config, "ZETA", Config.ZETA)),
+        )
+        return (
+            expansion.children,
+            [raw_m_list[index] for index in expansion.source_child_indices],
+            [m_list[index] for index in expansion.source_child_indices],
+            expansion.branch_weights,
+        )
+
+    def _collapse_policy_eta_pairs(
+        self,
+        values: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """Collapse eta pairs before AiO so branch count remains continuous-shock J."""
+        if not self._pv_exact_eta_enabled() or not values:
+            return values
+        collapsed = exact_eta_pair_expectation(
+            torch.stack(values, dim=1),
+            zeta=float(getattr(self.config, "ZETA", Config.ZETA)),
+        )
+        return list(collapsed.unbind(dim=1))
 
     @staticmethod
     def _safe_quantile(v: torch.Tensor, q: float) -> float:
@@ -1725,7 +1770,7 @@ class Episode:
         budget_mode = str(getattr(hp, "pv_mixture_budget_mode", "fixed_total")).lower()
         if budget_mode not in {"fixed_total"}:
             raise ValueError(f"Unknown pv_mixture_budget_mode={budget_mode!r}.")
-        if bool(getattr(hp, "pv_eta_resample_enabled", True)):
+        if bool(getattr(hp, "pv_eta_resample_enabled", False)):
             raise ValueError("PV mixture currently requires pv_eta_resample_enabled=False.")
         if str(getattr(hp, "pv_training_flow", "joint")).lower() != "staged":
             raise ValueError("PV mixture currently requires pv_training_flow='staged'.")
@@ -1738,7 +1783,7 @@ class Episode:
             "sim_parent_groups_available": float(n_available),
             "max_firm_train_units": float(max_units),
             "total_parent_budget": float(n_total),
-            "eta_resample_enabled": bool(getattr(hp, "pv_eta_resample_enabled", True)),
+            "eta_resample_enabled": bool(getattr(hp, "pv_eta_resample_enabled", False)),
         })
 
         rng_state = self._capture_rng_state() if bool(getattr(hp, "pv_mixture_preserve_rng", True)) else None
@@ -2328,7 +2373,7 @@ class Episode:
         """
         eta 稀疏时，对 bp 相关项(FOC/KKT)做条件重权重。
         """
-        if not bool(getattr(self.hyperparams, "eta_active_reweight_enabled", True)):
+        if not bool(getattr(self.hyperparams, "eta_active_reweight_enabled", False)):
             return 1.0
         target = float(getattr(self.hyperparams, "eta_active_target_ratio", 0.25))
         max_boost = float(getattr(self.hyperparams, "eta_active_max_reweight", 6.0))
@@ -4147,6 +4192,7 @@ class Episode:
         mix_weight: Optional[torch.Tensor] = None,
         bp_mix_pred: Optional[torch.Tensor] = None,
         mix_policy_sample_weight: Optional[torch.Tensor] = None,
+        child_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         branch = branch.lower()
         prefix = 'p0' if branch == 'p0' else 'pi'
@@ -4162,6 +4208,7 @@ class Episode:
             m_list=m_list,
             branch=branch,
             bp_pred=bp_pred,
+            child_weights=child_weights,
         )
 
         value_delta = float(getattr(self.hyperparams, "bp_grid_value_huber_delta", 1.0))
@@ -4227,6 +4274,7 @@ class Episode:
                 branch='mix',
                 bp_pred=bp_mix_pred,
                 mix_weight=mix_weight,
+                child_weights=child_weights,
             )
             mix_policy_weight = float(getattr(self.hyperparams, "bp_grid_mix_policy_weight", 1.0))
             mix_sample_weight = mix_policy_sample_weight
@@ -4396,7 +4444,14 @@ class Episode:
         
         m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
         m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-        raw_M_list, M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+        continuous_raw_M_list, continuous_M_list = self._build_policy_m_lists(
+            parent, children, m_lo, m_hi
+        )
+        children, raw_M_list, M_list, child_weights = (
+            self._expand_policy_expectation_children(
+                children, continuous_raw_M_list, continuous_M_list
+            )
+        )
         
         # 前向传播
         parent_state = strip_extra(parent)
@@ -4442,6 +4497,7 @@ class Episode:
                 m_lo=m_lo,
                 m_hi=m_hi,
                 loss_fn=loss_fn,
+                child_weights=child_weights,
             )
 
         child_pack = self._forward_vectorized_policy_children(
@@ -4513,6 +4569,7 @@ class Episode:
         residuals_physical = loss_fn.compute_bellman_residual(
             P0, CF0p, M_list, P_children, bar_z_children
         )
+        residuals_physical = self._collapse_policy_eta_pairs(residuals_physical)
         residual_scale = self._pv_bellman_residual_scale(model, parent_state)
         residuals = [
             r / residual_scale.clamp_min(1e-12)
@@ -4547,6 +4604,7 @@ class Episode:
                 bar_z_children=bar_z_children_for_foc,
                 bp=bp_for_p0,
             )
+            foc_residuals = self._collapse_policy_eta_pairs(foc_residuals)
             loss_foc, penalty_z_foc, foc_diag = self._compute_signed_foc_terms(
                 foc_residuals=foc_residuals,
                 z_parent=parent_state[:, 1:2],
@@ -4569,7 +4627,7 @@ class Episode:
             raw_m = torch.cat([m.reshape(-1) for m in raw_M_list], dim=0)
             use_m = torch.cat([m.reshape(-1) for m in M_list], dim=0)
             target_y = torch.cat(
-                [(cf + m * p).reshape(-1) for cf, m, p in zip(CF0p, M_list, P_children)],
+                [(P0 - residual).reshape(-1) for residual in residuals_physical],
                 dim=0,
             )
             residual_physical_flat = torch.cat([r.reshape(-1) for r in residuals_physical], dim=0)
@@ -4633,7 +4691,14 @@ class Episode:
         
         m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
         m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-        raw_M_list, M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+        continuous_raw_M_list, continuous_M_list = self._build_policy_m_lists(
+            parent, children, m_lo, m_hi
+        )
+        children, raw_M_list, M_list, child_weights = (
+            self._expand_policy_expectation_children(
+                children, continuous_raw_M_list, continuous_M_list
+            )
+        )
         
         # 前向传播
         parent_state = strip_extra(parent)
@@ -4706,6 +4771,7 @@ class Episode:
                 mix_weight=mix_weight_target,
                 bp_mix_pred=bp_mix_cond_pred,
                 mix_policy_sample_weight=mix_survival_target,
+                child_weights=child_weights,
             )
 
         child_pack = self._forward_vectorized_policy_children(
@@ -4782,6 +4848,7 @@ class Episode:
         residuals_physical = loss_fn.compute_bellman_residual(
             PI, CFip, M_list, P_children, bar_z_children
         )  # List[(batch,1)]
+        residuals_physical = self._collapse_policy_eta_pairs(residuals_physical)
         residual_scale = self._pv_bellman_residual_scale(model, parent_state)
         residuals = [
             r / residual_scale.clamp_min(1e-12)
@@ -4817,6 +4884,7 @@ class Episode:
                 bar_z_children=bar_z_children_for_foc,
                 bp=bp_for_pi,
             )
+            foc_residuals = self._collapse_policy_eta_pairs(foc_residuals)
             loss_foc, penalty_z_foc, foc_diag = self._compute_signed_foc_terms(
                 foc_residuals=foc_residuals,
                 z_parent=parent_state[:, 1:2],
@@ -4839,7 +4907,7 @@ class Episode:
             raw_m = torch.cat([m.reshape(-1) for m in raw_M_list], dim=0)
             use_m = torch.cat([m.reshape(-1) for m in M_list], dim=0)
             target_y = torch.cat(
-                [(cf + m * p).reshape(-1) for cf, m, p in zip(CFip, M_list, P_children)],
+                [(PI - residual).reshape(-1) for residual in residuals_physical],
                 dim=0,
             )
             residual_physical_flat = torch.cat([r.reshape(-1) for r in residuals_physical], dim=0)
@@ -4926,6 +4994,10 @@ class Episode:
         else:
             M_list = raw_M_list
 
+        children, raw_M_list, M_list, _child_weights = (
+            self._expand_policy_expectation_children(children, raw_M_list, M_list)
+        )
+
         # 前向传播（Q 形状正则需要对输入求梯度）
         parent_state = strip_extra(parent).clone().detach().requires_grad_(True)
         target_model = self._target_policy_value()
@@ -4986,6 +5058,7 @@ class Episode:
             Q, b_parent, bar_i_use, M_list, Qsp_children,
             bar_zsp_children, x_children, z_children
         )  # List[(batch,1)]
+        residuals = self._collapse_policy_eta_pairs(residuals)
         aio_residual = compute_aio_residual(residuals, loss_fn.aio_weight)
         main_loss = aio_residual.mean()
 
@@ -5515,6 +5588,9 @@ class Episode:
         m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
         raw_M_list, train_M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
         M_list = train_M_list if mode == "train" else raw_M_list
+        children, _raw_expanded, M_list, _child_weights = (
+            self._expand_policy_expectation_children(children, raw_M_list, M_list)
+        )
 
         parent_state = self._policy_strip_extra(parent)
         output_t = model(parent_state)
@@ -5562,6 +5638,7 @@ class Episode:
             for _ in children
         ]
         residuals = loss_fn.compute_bellman_residual(P0, CF0p, M_list, P_children, bar_z_children)
+        residuals = self._collapse_policy_eta_pairs(residuals)
         return self._stack_signed_branch_residuals(
             residuals,
             expected_batch=parent.shape[0],
@@ -5588,6 +5665,9 @@ class Episode:
         m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
         raw_M_list, train_M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
         M_list = train_M_list if mode == "train" else raw_M_list
+        children, _raw_expanded, M_list, _child_weights = (
+            self._expand_policy_expectation_children(children, raw_M_list, M_list)
+        )
 
         parent_state = self._policy_strip_extra(parent)
         output_t = model(parent_state)
@@ -5636,6 +5716,7 @@ class Episode:
             for _ in children
         ]
         residuals = loss_fn.compute_bellman_residual(PI, CFip, M_list, P_children, bar_z_children)
+        residuals = self._collapse_policy_eta_pairs(residuals)
         return self._stack_signed_branch_residuals(
             residuals,
             expected_batch=parent.shape[0],
@@ -5668,6 +5749,9 @@ class Episode:
             M_list = [m.detach().clamp(m_lo, m_hi) for m in raw_M_list]
         else:
             M_list = raw_M_list
+        children, _raw_expanded, M_list, _child_weights = (
+            self._expand_policy_expectation_children(children, raw_M_list, M_list)
+        )
 
         parent_state = self._policy_strip_extra(parent)
         output_t = model(parent_state)
@@ -5702,6 +5786,7 @@ class Episode:
             Q, b_parent, bar_i_use, M_list, Qsp_children,
             bar_zsp_children, x_children, z_children
         )
+        residuals = self._collapse_policy_eta_pairs(residuals)
         return self._stack_signed_branch_residuals(
             residuals,
             expected_batch=parent.shape[0],
@@ -5863,6 +5948,9 @@ class Episode:
                 if not children:
                     continue
                 raw_M_list, M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+                children, raw_M_list, M_list, child_weights = (
+                    self._expand_policy_expectation_children(children, raw_M_list, M_list)
+                )
                 del raw_M_list
                 parent_state = self._policy_strip_extra(parent)
                 output_t = model(parent_state)
@@ -5898,8 +5986,14 @@ class Episode:
                     fallback_bar_i=bar_i_cond_online,
                 )
 
-                p0_grid = teacher.compute(parent_state, children, M_list, branch='p0', bp_pred=bp0_t)
-                pi_grid = teacher.compute(parent_state, children, M_list, branch='pi', bp_pred=bpI_t)
+                p0_grid = teacher.compute(
+                    parent_state, children, M_list, branch='p0', bp_pred=bp0_t,
+                    child_weights=child_weights,
+                )
+                pi_grid = teacher.compute(
+                    parent_state, children, M_list, branch='pi', bp_pred=bpI_t,
+                    child_weights=child_weights,
+                )
                 mix_grid = teacher.compute(
                     parent_state,
                     children,
@@ -5907,6 +6001,7 @@ class Episode:
                     branch='mix',
                     bp_pred=bp_mix_cond,
                     mix_weight=mix_weight_target,
+                    child_weights=child_weights,
                 )
                 p0_acc.update(bp0_t, p0_grid, active_weight=p0_grid.get("refi_active"))
                 pi_acc.update(bpI_t, pi_grid, active_weight=pi_grid.get("refi_active"))
@@ -7179,7 +7274,10 @@ class Episode:
                 parent_state = parent[:, :7] if parent.shape[1] > 7 else parent
                 m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
                 m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-                _, m_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+                raw_m_list, m_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+                children, _raw_expanded, m_list, child_weights = (
+                    self._expand_policy_expectation_children(children, raw_m_list, m_list)
+                )
                 out = teacher_model(parent_state)
                 bp0 = getattr(out, "bp0")
                 bpI = getattr(out, "bpI")
@@ -7192,6 +7290,7 @@ class Episode:
                     m_list=m_list,
                     branch="p0",
                     bp_pred=bp0_for_grid,
+                    child_weights=child_weights,
                 )
                 pi_grid = teacher.compute(
                     parent_state=parent_state,
@@ -7199,6 +7298,7 @@ class Episode:
                     m_list=m_list,
                     branch="pi",
                     bp_pred=bpI_for_grid,
+                    child_weights=child_weights,
                 )
                 mix_weight = self._target_investment_conditional(
                     teacher_model,
@@ -7224,6 +7324,7 @@ class Episode:
                     branch="mix",
                     bp_pred=bp_mix,
                     mix_weight=mix_weight,
+                    child_weights=child_weights,
                 )
                 eta_next_active = torch.stack(
                     [child[:, 2:3] > 0.5 for child in children],
@@ -7251,7 +7352,7 @@ class Episode:
         cache: List[Dict[str, Any]],
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Optionally oversample child-eta-active rows for BP-only distillation."""
-        enabled = bool(getattr(self.hyperparams, "pv_eta_resample_enabled", True))
+        enabled = bool(getattr(self.hyperparams, "pv_eta_resample_enabled", False))
         summary: Dict[str, Any] = {
             "enabled": enabled,
             "scope": "bp_distillation_train_cache_only",
@@ -7364,6 +7465,7 @@ class Episode:
             "bp_grid_parent_chunk_size",
             "bp_grid_candidate_chunk_size",
             "bp_grid_max_expanded_states",
+            "pv_exact_eta_integration_enabled",
             "pv_m_clamp_min",
             "pv_m_clamp_max",
             "bp_grid_value_huber_delta",
@@ -7427,17 +7529,22 @@ class Episode:
                 parent_state, children, m_list, parent_hash, children_hash, m_hash = (
                     self._policy_batch_hash_components(batch)
                 )
+                children, _raw_expanded, m_list, child_weights = (
+                    self._expand_policy_expectation_children(children, m_list, m_list)
+                )
                 p0_target = grid_teacher.compute_value_target(
                     parent_state=parent_state,
                     children=children,
                     m_list=m_list,
                     branch="p0",
+                    child_weights=child_weights,
                 )
                 pi_target = grid_teacher.compute_value_target(
                     parent_state=parent_state,
                     children=children,
                     m_list=m_list,
                     branch="pi",
+                    child_weights=child_weights,
                 )
                 cache.append(
                     PQValueTargetBatch(

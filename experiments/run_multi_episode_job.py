@@ -328,6 +328,12 @@ def parse_args() -> argparse.Namespace:
         help="Enable child-ETA oversampling only for the staged BP distillation train cache.",
     )
     parser.add_argument(
+        "--pv-exact-eta-integration-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Exactly marginalize future Bernoulli ETA in Bellman and BP teacher expectations.",
+    )
+    parser.add_argument(
         "--bp-grid-confidence-relative",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -498,8 +504,12 @@ def configure_hyperparams(args: argparse.Namespace):
         raise ValueError("pv_mixture_coverage_group_size must be positive.")
     if args.pv_eta_resample_enabled is not None:
         hyperparams.pv_eta_resample_enabled = bool(args.pv_eta_resample_enabled)
+    if args.pv_exact_eta_integration_enabled is not None:
+        hyperparams.pv_exact_eta_integration_enabled = bool(
+            args.pv_exact_eta_integration_enabled
+        )
     if bool(getattr(hyperparams, "pv_mixture_enabled", False)):
-        if bool(getattr(hyperparams, "pv_eta_resample_enabled", True)):
+        if bool(getattr(hyperparams, "pv_eta_resample_enabled", False)):
             raise ValueError("PV mixture currently requires --no-pv-eta-resample-enabled.")
         if str(getattr(hyperparams, "pv_training_flow", "joint")).lower() != "staged":
             raise ValueError("PV mixture currently requires --pv-training-flow staged.")
@@ -704,6 +714,8 @@ def main():
                     "pv_mixture_coverage_group_size": hyperparams.pv_mixture_coverage_group_size,
                     "pv_mixture_seed": hyperparams.pv_mixture_seed,
                     "pv_eta_resample_enabled": hyperparams.pv_eta_resample_enabled,
+                    "pv_exact_eta_integration_enabled": hyperparams.pv_exact_eta_integration_enabled,
+                    "eta_active_reweight_enabled": hyperparams.eta_active_reweight_enabled,
                     "pv_rollback_on_soft_spikes": hyperparams.pv_rollback_on_soft_spikes,
                     "firm_target_update": hyperparams.firm_target_update,
                     "modeb_resimulate_after_pv": args.modeb_resimulate_after_pv,

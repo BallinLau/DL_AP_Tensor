@@ -298,6 +298,7 @@ def test_vectorized_backend_matches_episode_reference_for_all_equations():
 
     for eq in ("p0", "pi", "q"):
         for mode in ("train", "raw"):
+            assert actual[eq][mode].shape == (batch["parent"].shape[0], len(batch["children"]))
             assert torch.allclose(actual[eq][mode], refs[eq][mode], atol=1e-6, rtol=1e-5)
 
 

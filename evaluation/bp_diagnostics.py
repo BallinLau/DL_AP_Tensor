@@ -18,6 +18,7 @@ from analysis.convergence_transition import (
 from config import Config, HyperParams
 from losses import P0Loss, PILoss
 from training.bp_grid_teacher import BPGridTeacher
+from utils.firm_transition import expand_children_exact_eta
 
 from .grids import FrozenFirmGrid, ReferenceFirmState
 from .plotting import plot_objective_slice
@@ -98,16 +99,16 @@ def build_frozen_transition_data(
     use_clipped_m = bool(getattr(hyperparams, "pv_use_clipped_m", True))
     m_lo = float(getattr(hyperparams, "pv_m_clamp_min", 0.7))
     m_hi = float(getattr(hyperparams, "pv_m_clamp_max", 1.3))
-    children: List[torch.Tensor] = []
-    m_raw_list: List[torch.Tensor] = []
-    m_used_list: List[torch.Tensor] = []
+    continuous_children: List[torch.Tensor] = []
+    continuous_m_raw: List[torch.Tensor] = []
+    continuous_m_used: List[torch.Tensor] = []
     for child_pos in range(int(n_child_shocks)):
-        children.append(
+        continuous_children.append(
             torch.stack(
                 [
                     parent_states[:, 0],
                     bundle.z_next[:, child_pos, 0],
-                    bundle.eta_next[:, child_pos, 0],
+                    torch.zeros_like(bundle.eta_next[:, child_pos, 0]),
                     bundle.i_next[:, child_pos, 0],
                     bundle.x_next[:, child_pos, 0],
                     bundle.hatcf_next[:, child_pos, 0],
@@ -120,13 +121,26 @@ def build_frozen_transition_data(
         m = m_raw
         if use_clipped_m:
             m = m.clamp(m_lo, m_hi)
-        m_raw_list.append(m_raw)
-        m_used_list.append(m)
+        continuous_m_raw.append(m_raw)
+        continuous_m_used.append(m)
+    eta_expansion = expand_children_exact_eta(
+        continuous_children,
+        zeta=float(economic_config.ZETA),
+        child_weights=bundle.branch_weights,
+    )
+    m_raw_list = [continuous_m_raw[index] for index in eta_expansion.source_child_indices]
+    m_used_list = [continuous_m_used[index] for index in eta_expansion.source_child_indices]
+    eta_next = torch.stack([child[:, 2] for child in eta_expansion.children], dim=1)
+    eta_probability_mass = (eta_expansion.branch_weights * eta_next).sum(dim=1)
     metadata = {
         "builder": "ConvergenceShockBank+build_child_exogenous_bundle",
         "bp_teacher_model": "policy_value",
         "shock_seed": int(shock_seed),
         "n_child_shocks": int(n_child_shocks),
+        "eta_integration_mode": "exact",
+        "eta_probability": float(economic_config.ZETA),
+        "continuous_child_count": int(n_child_shocks),
+        "expanded_child_count": 2 * int(n_child_shocks),
         "shock_bank_max_child_shocks": bank_child_shocks,
         "nested_prefix_from_max_J": bank_child_shocks > int(n_child_shocks),
         "common_shocks_across_frozen_grid": True,
@@ -138,13 +152,13 @@ def build_frozen_transition_data(
         "m_mode": "clipped_train_m" if use_clipped_m else "raw_sdf_m",
         "m_raw_mean": float(bundle.m_raw.detach().mean().item()),
         "m_raw_std": float(bundle.m_raw.detach().std(unbiased=False).item()),
-        "eta_next_active_share": float(bundle.eta_next.detach().mean().item()),
+        "eta_next_active_share": float(eta_probability_mass.mean().item()),
     }
     return FrozenTransitionData(
-        children=children,
+        children=eta_expansion.children,
         m_raw_list=m_raw_list,
         m_used_list=m_used_list,
-        branch_weights=bundle.branch_weights,
+        branch_weights=eta_expansion.branch_weights,
         metadata=metadata,
     )
 
@@ -370,6 +384,7 @@ def evaluate_bp_consistency(
                 m_list,
                 branch=branch,
                 bp_pred=bp_pred,
+                child_weights=transition_data.branch_weights,
             )
             results[label] = result
             pred = bp_pred.detach().cpu().reshape(grid.shape).numpy().astype(np.float64)

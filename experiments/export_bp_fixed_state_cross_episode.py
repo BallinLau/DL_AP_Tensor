@@ -19,6 +19,7 @@ from experiments.export_bp_deep_diagnostics import make_episode_batches, stable_
 from experiments.run_utils import build_hyperparams, build_models  # noqa: E402
 from losses import P0Loss, PILoss  # noqa: E402
 from training.bp_grid_teacher import BPGridTeacher  # noqa: E402
+from utils.firm_transition import expand_children_exact_eta  # noqa: E402
 
 
 def parse_episodes(value: str) -> List[int]:
@@ -128,6 +129,12 @@ def compute_episode_rows(
     for p in target_model.parameters():
         p.requires_grad_(False)
     teacher = BPGridTeacher.from_hyperparams(target_model, P0Loss(), PILoss(), hp)
+    child_weights = None
+    if bool(getattr(hp, "pv_exact_eta_integration_enabled", True)):
+        expansion = expand_children_exact_eta(children, zeta=float(Config.ZETA))
+        children = expansion.children
+        m_list = [m_list[index] for index in expansion.source_child_indices]
+        child_weights = expansion.branch_weights
     with torch.no_grad():
         out = model(parent)
         mix_weight = out.bar_i_cond.clamp(0.0, 1.0)
@@ -135,9 +142,18 @@ def compute_episode_rows(
         bp0_logit, _, _ = stable_logit_with_censoring(out.bp0)
         bpI_logit, _, _ = stable_logit_with_censoring(out.bpI)
         grids = {
-            "p0": teacher.compute(parent, children, m_list, branch="p0", bp_pred=out.bp0),
-            "pi": teacher.compute(parent, children, m_list, branch="pi", bp_pred=out.bpI),
-            "mix": teacher.compute(parent, children, m_list, branch="mix", bp_pred=bp_mix, mix_weight=mix_weight),
+            "p0": teacher.compute(
+                parent, children, m_list, branch="p0", bp_pred=out.bp0,
+                child_weights=child_weights,
+            ),
+            "pi": teacher.compute(
+                parent, children, m_list, branch="pi", bp_pred=out.bpI,
+                child_weights=child_weights,
+            ),
+            "mix": teacher.compute(
+                parent, children, m_list, branch="mix", bp_pred=bp_mix,
+                mix_weight=mix_weight, child_weights=child_weights,
+            ),
         }
 
     rows = []

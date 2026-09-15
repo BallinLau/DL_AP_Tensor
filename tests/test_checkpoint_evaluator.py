@@ -39,6 +39,7 @@ from evaluation.firm_surfaces import (
 from evaluation.grids import ReferenceFirmState, build_frozen_grid, load_reference_state
 from experiments.run_utils import build_models
 from models import PolicyValueModel
+from utils.firm_transition import expand_children_exact_eta
 
 
 def _small_model() -> PolicyValueModel:
@@ -303,9 +304,16 @@ def test_frozen_transition_children_use_state_dependent_ar1_and_sdf_m():
     expected_z_difference = float(config.RHO_Z) * 8.0
     assert children[0][1, 1] - children[0][0, 1] == pytest.approx(expected_z_difference)
     assert expected_z_difference != pytest.approx(8.0)
-    assert not torch.allclose(m_list[0], m_list[1])
+    assert len(children) == 4
+    assert len(m_list) == 4
+    torch.testing.assert_close(m_list[0], m_list[1])
+    torch.testing.assert_close(m_list[2], m_list[3])
+    assert not torch.allclose(m_list[0], m_list[2])
     assert metadata["builder"] == "ConvergenceShockBank+build_child_exogenous_bundle"
-    assert 0.0 <= metadata["eta_next_active_share"] <= 1.0
+    assert metadata["eta_integration_mode"] == "exact"
+    assert metadata["continuous_child_count"] == 2
+    assert metadata["expanded_child_count"] == 4
+    assert metadata["eta_next_active_share"] == pytest.approx(float(config.ZETA))
 
     nested = build_frozen_transition_data(
         FakeSDF(), parents, reference, hp, config,
@@ -320,6 +328,95 @@ def test_frozen_transition_children_use_state_dependent_ar1_and_sdf_m():
         torch.testing.assert_close(nested.m_raw_list[child_index], full.m_raw_list[child_index])
     assert nested.metadata["nested_prefix_from_max_J"] is True
     assert full.metadata["nested_prefix_from_max_J"] is False
+
+
+@pytest.mark.parametrize("zeta", [0.0, 0.03, 1.0])
+def test_exact_eta_expansion_preserves_probability_and_pair_identity(zeta):
+    child0 = torch.tensor(
+        [[0.2, -0.5, 1.0, 0.1, -2.0, -2.2, 4.0]], dtype=torch.float64
+    )
+    child1 = torch.tensor(
+        [[0.2, 0.5, 0.0, 0.3, -1.8, -2.0, 4.2]], dtype=torch.float64
+    )
+    expanded = expand_children_exact_eta(
+        [child0, child1],
+        zeta=zeta,
+        child_weights=torch.tensor([[0.25, 0.75]], dtype=torch.float64),
+    )
+
+    assert len(expanded.children) == 4
+    torch.testing.assert_close(
+        expanded.branch_weights.sum(dim=1), torch.ones(1, dtype=torch.float64)
+    )
+    eta = torch.stack([child[:, 2] for child in expanded.children], dim=1)
+    torch.testing.assert_close(
+        (expanded.branch_weights * eta).sum(dim=1),
+        torch.tensor([zeta], dtype=torch.float64),
+    )
+    for pair_start in (0, 2):
+        eta0 = expanded.children[pair_start]
+        eta1 = expanded.children[pair_start + 1]
+        assert eta0[0, 2].item() == 0.0
+        assert eta1[0, 2].item() == 1.0
+        torch.testing.assert_close(
+            eta0[:, [0, 1, 3, 4, 5, 6]], eta1[:, [0, 1, 3, 4, 5, 6]]
+        )
+
+
+def test_exact_eta_child_leverage_expectation():
+    b_parent = torch.tensor([[0.2], [0.7]])
+    bp_candidate = torch.tensor([[0.9], [0.1]])
+    zeta = 0.03
+    continuous = [
+        torch.cat(
+            [b_parent, torch.zeros(2, 1), torch.zeros(2, 1), torch.zeros(2, 4)],
+            dim=1,
+        )
+        for _ in range(2)
+    ]
+    expanded = expand_children_exact_eta(continuous, zeta=zeta)
+    child_b = []
+    for child in expanded.children:
+        eta = child[:, 2:3]
+        child_b.append(eta * bp_candidate + (1.0 - eta) * b_parent)
+    weighted_b = (
+        expanded.branch_weights.unsqueeze(-1) * torch.stack(child_b, dim=1)
+    ).sum(dim=1)
+    torch.testing.assert_close(
+        weighted_b, (1.0 - zeta) * b_parent + zeta * bp_candidate
+    )
+
+
+def test_exact_eta_probability_mass_is_seed_invariant():
+    class FakeSDF(torch.nn.Module):
+        def forward_step(self, x_prev, x_curr, hatcf_prev, lnkf_prev, return_physical=True):
+            return (
+                torch.ones_like(x_prev),
+                torch.ones_like(x_curr),
+                torch.ones_like(x_curr),
+                hatcf_prev.unsqueeze(1).expand_as(x_curr),
+                lnkf_prev.unsqueeze(1).expand_as(x_curr),
+            )
+
+    reference = ReferenceFirmState(
+        eta=1.0, i_low=0.1, i_mid=0.2, i_high=0.3, x=-2.0,
+        hatcf=-2.2, lnkf=4.0, hatc_cal=-2.1, lnk_cal=4.1,
+        n_parent_rows=1, source="fixture", macro_source="fixture",
+    )
+    parents = torch.tensor([[0.2, 0.0, 1.0, 0.2, -2.0, -2.2, 4.0]])
+    hp = HyperParams()
+    hp.pv_use_clipped_m = False
+    config = AnalysisEconomicConfig.from_current_config()
+    for seed in (1, 7, 12345):
+        transition = build_frozen_transition_data(
+            FakeSDF(), parents, reference, hp, config,
+            n_child_shocks=2, shock_seed=seed,
+        )
+        eta = torch.stack([child[:, 2] for child in transition.children], dim=1)
+        eta_mass = (transition.branch_weights * eta).sum(dim=1)
+        torch.testing.assert_close(
+            eta_mass, torch.full_like(eta_mass, float(config.ZETA))
+        )
 
 
 def test_bp_consistency_primary_statistics_require_survival_and_identification():
@@ -662,7 +759,8 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
     assert metadata["grid"]["eta"] == 1.0
     assert metadata["reference_state"]["n_parent_rows"] == 6
     assert metadata["reference_transition_bank"]["m_source"] == "sdf_fc1.forward_step"
-    assert 0.0 <= metadata["reference_transition_bank"]["eta_next_active_share"] <= 1.0
+    assert metadata["reference_transition_bank"]["eta_integration_mode"] == "exact"
+    assert metadata["reference_transition_bank"]["eta_next_active_share"] == pytest.approx(0.03)
     assert metadata["bp_teacher_model"] == "policy_value"
     assert metadata["reference_transition_bank"]["bp_teacher_model"] == "policy_value"
     assert metadata["reference_transition_bank"]["teacher_margin_tol"] == 1e-8
@@ -709,9 +807,15 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
     assert audit["child_b_identity_error"].max() < 1e-6
     assert {
         "parent_eta", "eta_next", "child_b", "M_raw", "M_used", "P_child",
-        "Phat_child", "bar_z_child", "M_times_P_child", "raw_continuation_term",
+        "Phat_child", "bar_z_child", "M_times_P_child", "continuation_raw",
+        "continuation_weighted", "raw_continuation_term",
         "weighted_continuation_contribution", "continuation_contribution",
     }.issubset(audit.columns)
+    grouped = audit.groupby(["state_label", "bp_candidate", "branch"], sort=False)
+    for (_, _, branch), rows in grouped:
+        growth = 1.0 if branch == "p0" else float(AnalysisEconomicConfig.from_current_config().G)
+        expected = (rows["branch_weight"] * growth * rows["M_used"] * rows["P_child"]).sum()
+        assert rows["continuation_weighted"].sum() == pytest.approx(expected)
 
 
 def test_eta_and_child_shock_matrix_writes_full_and_compact_cases(tmp_path):
