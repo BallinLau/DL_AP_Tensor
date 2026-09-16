@@ -1647,7 +1647,7 @@ def test_bp_rejected_epoch_rolls_back_bp_heads():
 
     assert summary["status"] == "failed_no_valid_checkpoint"
     assert summary["optimizer_steps"] == 0
-    assert summary["attempted_optimizer_steps"] == 1
+    assert summary["attempted_optimizer_steps"] == 2
     assert summary["accepted_epochs"] == 0
     assert episode.step_count == before_step_count
     assert episode.bp_distill_step_count == before_bp_steps
@@ -1718,6 +1718,169 @@ def test_bp_best_checkpoint_restore_aligns_counters_records_and_rng():
     assert random.random() == best_snapshot["next_python"]
     assert float(np.random.rand()) == best_snapshot["next_numpy"]
     assert float(torch.rand(1).item()) == best_snapshot["next_torch"]
+
+
+def _configure_mock_bp_stage(episode):
+    episode._bp_cache_hash = lambda _cache: "fixed-cache"
+    episode._bp_cache_active_counts = lambda _cache: {
+        "bp0_active_count": 1.0,
+        "bpi_active_count": 1.0,
+        "mix_active_count": 1.0,
+        "total_active_count": 3.0,
+    }
+    episode.hyperparams.bp_distill_patience = 1000
+    episode.hyperparams.pv_epoch_max_skip_ratio = 1.0
+
+
+def test_bp_optimizer_step_budget_stops_exactly_at_successful_cap():
+    episode = _episode()
+    _configure_mock_bp_stage(episode)
+    episode.hyperparams.bp_distill_max_optimizer_steps = 5
+    param = episode._policy_value_stage_params("bp")[0]
+    episode._compute_bp_cache_loss = lambda _item: (
+        param.square().mean(),
+        {"total": float(param.square().mean().detach().item())},
+    )
+    episode._evaluate_bp_cache_score = lambda _cache: (
+        float(100 - episode.bp_distill_step_count),
+        {"total": float(100 - episode.bp_distill_step_count)},
+    )
+
+    summary = episode._run_bp_distillation_stage(
+        [{"batch": 0}],
+        [{"batch": 1}],
+        episode.firm_target,
+        n_epochs=1,
+    )
+
+    assert summary["status"] == "accepted"
+    assert summary["requested_max_optimizer_steps"] == 5
+    assert summary["attempted_optimizer_steps"] == 5
+    assert summary["accepted_optimizer_steps_total"] == 5
+    assert summary["optimizer_steps"] == 5
+    assert summary["bp_optimizer_steps"] == 5
+    assert summary["best_checkpoint_optimizer_steps"] == 5
+    assert summary["max_optimizer_steps_reached"] is True
+    assert summary["stop_reason"] == "max_optimizer_steps"
+
+
+def test_bp_step_budget_does_not_count_nonfinite_or_hard_skips():
+    episode = _episode()
+    _configure_mock_bp_stage(episode)
+    episode.hyperparams.bp_distill_max_optimizer_steps = 2
+    episode.hyperparams.pv_grad_hard_threshold = 100.0
+    param = episode._policy_value_stage_params("bp")[0]
+    episode._compute_bp_cache_loss = lambda _item: (
+        param.square().mean(),
+        {"total": float(param.square().mean().detach().item())},
+    )
+    norm_call = {"value": 0}
+
+    def _norm_with_skips(_params, _max_norm):
+        sequence = (float("nan"), 1_000.0, 1.0)
+        value = sequence[norm_call["value"] % len(sequence)]
+        norm_call["value"] += 1
+        return value, value
+
+    episode._clip_params_with_raw_norm = _norm_with_skips
+    episode._evaluate_bp_cache_score = lambda _cache: (
+        float(100 - episode.bp_distill_step_count),
+        {"total": float(100 - episode.bp_distill_step_count)},
+    )
+
+    summary = episode._run_bp_distillation_stage(
+        [{"batch": 0}, {"batch": 1}, {"batch": 2}],
+        [{"batch": 3}],
+        episode.firm_target,
+        n_epochs=1,
+    )
+
+    assert summary["attempted_optimizer_steps"] == 6
+    assert summary["accepted_optimizer_steps_total"] == 2
+    assert summary["optimizer_steps"] == 2
+    assert summary["nonfinite_count"] == 2
+    assert summary["hard_spike_count"] == 2
+    assert summary["stop_reason"] == "max_optimizer_steps"
+
+
+def test_zero_bp_step_budget_preserves_epoch_control():
+    episode = _episode()
+    _configure_mock_bp_stage(episode)
+    episode.hyperparams.bp_distill_max_optimizer_steps = 0
+    param = episode._policy_value_stage_params("bp")[0]
+    episode._compute_bp_cache_loss = lambda _item: (
+        param.square().mean(),
+        {"total": float(param.square().mean().detach().item())},
+    )
+    episode._evaluate_bp_cache_score = lambda _cache: (
+        float(100 - episode.bp_distill_step_count),
+        {"total": float(100 - episode.bp_distill_step_count)},
+    )
+
+    summary = episode._run_bp_distillation_stage(
+        [{"batch": 0}],
+        [{"batch": 1}],
+        episode.firm_target,
+        n_epochs=2,
+    )
+
+    assert summary["requested_max_optimizer_steps"] == 0
+    assert summary["attempted_optimizer_steps"] == 2
+    assert summary["optimizer_steps"] == 2
+    assert summary["epoch_limit"] == 2
+    assert summary["stop_reason"] == "epochs_exhausted"
+
+
+def test_staged_current_eta_sampler_changes_only_bp_train_cache(monkeypatch):
+    episode = _episode()
+    episode.hyperparams.bp_current_eta_resample_enabled = True
+    episode.hyperparams.bp_current_eta1_train_share = 0.25
+    episode.hyperparams.pv_eta_resample_enabled = False
+    pv_train_batches = [{"kind": "pq_train"}]
+    validation_batches = [{"kind": "natural_validation"}]
+    train_parent = torch.zeros(8, 7)
+    train_parent[:2, 2] = 1.0
+    val_parent = torch.zeros(4, 7)
+    val_parent[:2, 2] = 1.0
+    observed = {}
+
+    def _pq_stage(train, val, *_args, **_kwargs):
+        observed["pq_train_identity"] = train is pv_train_batches
+        observed["pq_val_identity"] = val is validation_batches
+        return {"status": "accepted"}
+
+    def _cache(batches, _teacher):
+        parent = train_parent if batches is pv_train_batches else val_parent
+        return [{"batch_id": 0, "parent": parent.clone()}]
+
+    def _bp_stage(train_cache, val_cache, *_args, **_kwargs):
+        observed["train_eta1_share"] = float(
+            (train_cache[0]["parent"][:, 2] > 0.5).float().mean().item()
+        )
+        observed["val_eta1_share"] = float(
+            (val_cache[0]["parent"][:, 2] > 0.5).float().mean().item()
+        )
+        return {"status": "accepted"}
+
+    monkeypatch.setattr(episode, "_run_policy_value_evaluation_stage", _pq_stage)
+    monkeypatch.setattr(episode, "_build_bp_target_cache", _cache)
+    monkeypatch.setattr(episode, "_run_bp_distillation_stage", _bp_stage)
+    monkeypatch.setattr(episode, "_update_firm_target_now", lambda *_args: None)
+
+    result = episode._run_policy_value_staged(
+        pv_train_batches,
+        validation_batches,
+        n_epochs=1,
+    )
+
+    bp_summary = result["metadata"]["bp_distillation_stage"]
+    assert result["metadata"]["policy_value_stage_status"] == "accepted"
+    assert observed["pq_train_identity"] is True
+    assert observed["pq_val_identity"] is True
+    assert observed["train_eta1_share"] == pytest.approx(0.25)
+    assert observed["val_eta1_share"] == pytest.approx(0.50)
+    assert bp_summary["validation_cache_resampled"] is False
+    assert bp_summary["validation_current_eta1_share"] == pytest.approx(0.50)
 
 
 def test_bp_exception_restores_stage_start_runtime():

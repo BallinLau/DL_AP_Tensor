@@ -7458,6 +7458,140 @@ class Episode:
         return resampled, summary
 
     @staticmethod
+    def _bp_cache_current_eta_counts(
+        cache: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not cache:
+            return {
+                "current_eta0_count": 0,
+                "current_eta1_count": 0,
+                "current_eta1_share": 0.0,
+            }
+        eta_current = torch.cat(
+            [
+                (item["parent"][:, 2].detach().cpu() > 0.5).reshape(-1)
+                for item in cache
+            ],
+            dim=0,
+        )
+        eta1_count = int(eta_current.sum().item())
+        total = int(eta_current.numel())
+        return {
+            "current_eta0_count": int(total - eta1_count),
+            "current_eta1_count": eta1_count,
+            "current_eta1_share": float(eta1_count / total) if total else 0.0,
+        }
+
+    def _resample_bp_target_cache_by_current_eta(
+        self,
+        cache: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Resample only BP train rows by current parent eta_t."""
+        enabled = bool(
+            getattr(self.hyperparams, "bp_current_eta_resample_enabled", False)
+        )
+        target_share = float(
+            getattr(self.hyperparams, "bp_current_eta1_train_share", 0.25)
+        )
+        if not 0.0 <= target_share <= 1.0:
+            raise ValueError(
+                "bp_current_eta1_train_share must be in [0, 1], "
+                f"got {target_share}."
+            )
+        before = self._bp_cache_current_eta_counts(cache)
+        summary: Dict[str, Any] = {
+            "enabled": enabled,
+            "scope": "bp_distillation_train_cache_only",
+            "eta_field": "parent[:, 2]",
+            "validation_cache_resampled": False,
+            "applied": False,
+            "reason": "disabled" if not enabled else "empty_cache",
+            "current_eta0_count_before": before["current_eta0_count"],
+            "current_eta1_count_before": before["current_eta1_count"],
+            "current_eta1_share_before": before["current_eta1_share"],
+            "current_eta0_count_after": before["current_eta0_count"],
+            "current_eta1_count_after": before["current_eta1_count"],
+            "current_eta1_share_after": before["current_eta1_share"],
+            "target_current_eta1_share": target_share,
+        }
+        if not enabled or not cache:
+            return cache, summary
+
+        if bool(getattr(self.hyperparams, "pv_eta_resample_enabled", False)):
+            raise ValueError(
+                "bp_current_eta_resample_enabled cannot be combined with the legacy "
+                "future-eta pv_eta_resample_enabled sampler."
+            )
+
+        eta_current = torch.cat(
+            [
+                (item["parent"][:, 2].detach().cpu() > 0.5).reshape(-1)
+                for item in cache
+            ],
+            dim=0,
+        )
+        n_total = int(eta_current.numel())
+        eta1_index = torch.where(eta_current)[0]
+        eta0_index = torch.where(~eta_current)[0]
+        if n_total <= 1 or eta0_index.numel() == 0 or eta1_index.numel() == 0:
+            summary["reason"] = "single_current_eta_stratum"
+            return cache, summary
+
+        n_eta1 = min(max(int(round(n_total * target_share)), 0), n_total)
+        n_eta0 = n_total - n_eta1
+
+        def _draw(pool: torch.Tensor, count: int) -> torch.Tensor:
+            if count <= 0:
+                return torch.empty(0, dtype=torch.long)
+            return pool[torch.randint(pool.numel(), (count,))]
+
+        selected = torch.cat(
+            [_draw(eta0_index, n_eta0), _draw(eta1_index, n_eta1)],
+            dim=0,
+        )
+        selected = selected[torch.randperm(selected.numel())]
+
+        row_counts = [int(item["parent"].shape[0]) for item in cache]
+        tensor_keys: List[str] = []
+        flat: Dict[str, torch.Tensor] = {}
+        for key, value in cache[0].items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            present = [isinstance(item.get(key), torch.Tensor) for item in cache]
+            if not all(present):
+                raise ValueError(f"BP cache has inconsistent tensor field {key!r}")
+            row_aligned = [
+                item[key].ndim > 0 and int(item[key].shape[0]) == row_count
+                for item, row_count in zip(cache, row_counts)
+            ]
+            if all(row_aligned):
+                tensor_keys.append(key)
+                flat[key] = torch.cat(
+                    [item[key].detach().cpu() for item in cache], dim=0
+                )
+
+        resampled: List[Dict[str, Any]] = []
+        cursor = 0
+        for batch_id, (template, batch_rows) in enumerate(zip(cache, row_counts)):
+            row_index = selected[cursor:cursor + batch_rows]
+            item = dict(template)
+            for key in tensor_keys:
+                item[key] = flat[key][row_index].clone()
+            item["batch_id"] = batch_id
+            resampled.append(item)
+            cursor += batch_rows
+
+        after = self._bp_cache_current_eta_counts(resampled)
+        summary.update({
+            "applied": True,
+            "reason": "target_current_eta_share_applied",
+            "current_eta0_count_after": after["current_eta0_count"],
+            "current_eta1_count_after": after["current_eta1_count"],
+            "current_eta1_share_after": after["current_eta1_share"],
+        })
+        return resampled, summary
+
+    @staticmethod
     def _policy_output_value(output: Any, name: str, idx: int) -> torch.Tensor:
         if isinstance(output, dict):
             return output[name]
@@ -8032,11 +8166,20 @@ class Episode:
         val_hash_before = self._bp_cache_hash(val_cache)
         train_active_counts = self._bp_cache_active_counts(train_cache)
         validation_active_counts = self._bp_cache_active_counts(val_cache)
+        max_optimizer_steps = max(
+            0,
+            int(getattr(self.hyperparams, "bp_distill_max_optimizer_steps", 0)),
+        )
         if n_epochs <= 0:
             return {
                 "status": "skipped_no_epochs",
                 "epochs_requested": int(n_epochs),
+                "requested_max_optimizer_steps": max_optimizer_steps,
                 "optimizer_steps": 0,
+                "bp_optimizer_steps": 0,
+                "successful_optimizer_steps": 0,
+                "attempted_optimizer_steps": 0,
+                "best_checkpoint_optimizer_steps": None,
                 "best_epoch": None,
                 "target_update_count": 0,
                 "train_cache_hash": train_hash_before,
@@ -8048,7 +8191,12 @@ class Episode:
             return {
                 "status": "skipped_no_active_refinancing",
                 "epochs_requested": int(n_epochs),
+                "requested_max_optimizer_steps": max_optimizer_steps,
                 "optimizer_steps": 0,
+                "bp_optimizer_steps": 0,
+                "successful_optimizer_steps": 0,
+                "attempted_optimizer_steps": 0,
+                "best_checkpoint_optimizer_steps": None,
                 "best_epoch": None,
                 "target_update_count": 0,
                 "train_cache_hash": train_hash_before,
@@ -8088,11 +8236,17 @@ class Episode:
         records: List[Dict[str, Any]] = []
         teacher_hash = self._state_dict_hash(teacher_snapshot)
         skipped_no_active = False
+        stop_reason = "epochs_exhausted"
         max_skip_ratio = float(getattr(self.hyperparams, "pv_epoch_max_skip_ratio", 0.05))
         hard_threshold = float(getattr(self.hyperparams, "pv_grad_hard_threshold", 1000.0))
         soft_threshold = float(getattr(self.hyperparams, "pv_grad_soft_threshold", 100.0))
         model = self.models["policy_value"]
         was_training = model.training
+        epoch_limit = (
+            int(n_epochs)
+            if max_optimizer_steps <= 0
+            else max(int(n_epochs), max_optimizer_steps)
+        )
 
         def _restore_bp_epoch_start(
             checkpoint: Dict[str, Any],
@@ -8124,7 +8278,7 @@ class Episode:
             try:
                 model.train()
                 with self._policy_value_train_scope("bp"):
-                    for epoch in range(int(n_epochs)):
+                    for epoch in range(epoch_limit):
                         epoch_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
                         step_count_before_epoch = int(self.step_count)
                         bp_step_count_before_epoch = int(self.bp_distill_step_count)
@@ -8136,8 +8290,17 @@ class Episode:
                         epoch_nonfinite = 0
                         epoch_soft = 0
                         epoch_total = 0
-                        for item in tqdm(train_cache, desc=f"BP distill {epoch+1}/{n_epochs}"):
+                        for item in tqdm(
+                            train_cache,
+                            desc=f"BP distill {epoch+1}/{epoch_limit}",
+                        ):
+                            if (
+                                max_optimizer_steps > 0
+                                and optimizer_steps >= max_optimizer_steps
+                            ):
+                                break
                             epoch_total += 1
+                            attempted_optimizer_steps += 1
                             optimizer.zero_grad(set_to_none=True)
                             total, losses = self._compute_bp_cache_loss(item)
                             if not torch.isfinite(total):
@@ -8165,7 +8328,6 @@ class Episode:
                                 soft_spike_count += 1
                                 epoch_soft += 1
                             optimizer.step()
-                            attempted_optimizer_steps += 1
                             self.step_count += 1
                             self.bp_distill_step_count += 1
                             optimizer_steps += 1
@@ -8187,6 +8349,9 @@ class Episode:
                                 "reason": "no_optimizer_steps",
                                 "skip_ratio": skip_ratio,
                             })
+                            if max_optimizer_steps > 0:
+                                stop_reason = "no_successful_optimizer_steps"
+                                break
                             continue
                         if skip_ratio > max_skip_ratio:
                             optimizer_steps = _restore_bp_epoch_start(
@@ -8266,7 +8431,14 @@ class Episode:
                         else:
                             wait += 1
                             if wait >= patience:
+                                stop_reason = "patience"
                                 break
+                        if (
+                            max_optimizer_steps > 0
+                            and optimizer_steps >= max_optimizer_steps
+                        ):
+                            stop_reason = "max_optimizer_steps"
+                            break
             except Exception:
                 _restore_bp_stage_start()
                 raise
@@ -8308,10 +8480,14 @@ class Episode:
         return {
             "status": status,
             "epochs_requested": int(n_epochs),
+            "epoch_limit": int(epoch_limit),
             "epochs_completed": int(best_epoch or 0),
+            "requested_max_optimizer_steps": max_optimizer_steps,
             "optimizer_steps": optimizer_steps,
+            "bp_optimizer_steps": optimizer_steps,
             "attempted_optimizer_steps": attempted_optimizer_steps,
             "accepted_optimizer_steps_total": accepted_optimizer_steps_total,
+            "successful_optimizer_steps": accepted_optimizer_steps_total,
             "best_checkpoint_optimizer_steps": (
                 int(best_runtime_state["optimizer_steps"])
                 if best_runtime_state is not None else None
@@ -8326,6 +8502,11 @@ class Episode:
             "best_epoch": best_epoch,
             "best_validation_score": best_score if np.isfinite(best_score) else None,
             "patience": patience,
+            "stop_reason": stop_reason,
+            "max_optimizer_steps_reached": bool(
+                max_optimizer_steps > 0
+                and accepted_optimizer_steps_total >= max_optimizer_steps
+            ),
             "restored_best_checkpoint": restored,
             "teacher_snapshot_hash": teacher_hash,
             "train_cache_hash": train_hash_before,
@@ -8433,7 +8614,11 @@ class Episode:
             bp_teacher.requires_grad_(False)
             train_cache = self._build_bp_target_cache(pv_train_batches, bp_teacher)
             train_cache, bp_eta_resample_summary = self._resample_bp_target_cache(train_cache)
+            train_cache, bp_current_eta_summary = (
+                self._resample_bp_target_cache_by_current_eta(train_cache)
+            )
             val_cache = self._build_bp_target_cache(validation_batches or pv_train_batches, bp_teacher)
+            validation_current_eta = self._bp_cache_current_eta_counts(val_cache)
             bp_summary = self._run_bp_distillation_stage(
                 train_cache,
                 val_cache,
@@ -8441,6 +8626,23 @@ class Episode:
                 bp_epochs,
             )
             bp_summary["eta_resampling"] = bp_eta_resample_summary
+            bp_summary["current_eta_resampling"] = bp_current_eta_summary
+            bp_summary.update({
+                key: value
+                for key, value in bp_current_eta_summary.items()
+                if key.startswith("current_eta")
+                or key == "target_current_eta1_share"
+            })
+            bp_summary["validation_current_eta0_count"] = validation_current_eta[
+                "current_eta0_count"
+            ]
+            bp_summary["validation_current_eta1_count"] = validation_current_eta[
+                "current_eta1_count"
+            ]
+            bp_summary["validation_current_eta1_share"] = validation_current_eta[
+                "current_eta1_share"
+            ]
+            bp_summary["validation_cache_resampled"] = False
             stages_successful = (
                 pq_summary.get("status") == "accepted"
                 and bp_summary.get("status") in {"accepted", "skipped_no_active_refinancing"}

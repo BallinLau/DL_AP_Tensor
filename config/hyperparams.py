@@ -160,6 +160,13 @@ class HyperParams:
     bp_distill_epochs: int = 20
     bp_distill_patience: int = 3
     bp_distill_min_delta: float = 1e-4
+    # Optional successful optimizer-step budget for staged BP distillation.
+    # Zero preserves the legacy epoch-controlled behavior.
+    bp_distill_max_optimizer_steps: int = 0
+    # Optional train-cache-only resampling by current parent eta_t.  This is
+    # separate from future-eta integration and leaves validation natural.
+    bp_current_eta_resample_enabled: bool = False
+    bp_current_eta1_train_share: float = 0.25
     pv_eval_grad_clip_norm: float = 10.0
     bp_distill_grad_clip_norm: float = 10.0
     pv_rollback_on_soft_spikes: bool = False

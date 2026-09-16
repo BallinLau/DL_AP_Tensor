@@ -120,6 +120,32 @@ class StageBatchSizeTest(unittest.TestCase):
         self.assertEqual(hp.pv_batch_size, 4096)
         self.assertEqual(hp.sdf_fc1_batch_size, 4096)
 
+    def test_cli_current_eta_bp_sampling_coexists_with_pv_mixture(self):
+        argv = [
+            "run_multi_episode_job.py",
+            "--pv-training-flow",
+            "staged",
+            "--firm-target-update",
+            "stage_hard",
+            "--pv-mixture-enabled",
+            "--no-pv-eta-resample-enabled",
+            "--bp-current-eta-resample-enabled",
+            "--bp-current-eta1-train-share",
+            "0.25",
+            "--bp-distill-max-optimizer-steps",
+            "500",
+        ]
+
+        with patch.object(sys, "argv", argv):
+            args = parse_args()
+        hp = configure_hyperparams(args)
+
+        self.assertTrue(hp.pv_mixture_enabled)
+        self.assertTrue(hp.bp_current_eta_resample_enabled)
+        self.assertEqual(hp.bp_current_eta1_train_share, 0.25)
+        self.assertEqual(hp.bp_distill_max_optimizer_steps, 500)
+        self.assertFalse(hp.pv_eta_resample_enabled)
+
     def test_tensor_pv_batches_do_not_resample_realized_child_eta(self):
         episode = Episode.__new__(Episode)
         episode.hyperparams = SimpleNamespace(
@@ -242,6 +268,64 @@ class StageBatchSizeTest(unittest.TestCase):
         self.assertFalse(summary["validation_cache_resampled"])
         self.assertEqual(int(resampled[0]["eta_next_active"].sum().item()), 2)
         torch.testing.assert_close(cache[0]["eta_next_active"], active)
+
+    def test_current_eta_resampling_reads_parent_column_not_future_eta(self):
+        episode = Episode.__new__(Episode)
+        episode.hyperparams = SimpleNamespace(
+            bp_current_eta_resample_enabled=True,
+            bp_current_eta1_train_share=0.25,
+            pv_eta_resample_enabled=False,
+        )
+        n_rows = 100
+        parent = torch.zeros(n_rows, 7)
+        parent[:10, 2] = 1.0
+        # Make the future-eta diagnostic exactly opposite to current eta.  If
+        # the sampler uses eta_next_active, the assertions below reverse.
+        eta_next_active = (parent[:, 2:3] < 0.5)
+        cache = [{
+            "batch_id": 0,
+            "parent": parent.clone(),
+            "source_id": torch.arange(n_rows),
+            "source_index": torch.arange(n_rows),
+            "bp0_target": torch.zeros(n_rows, 1),
+            "bpi_target": torch.zeros(n_rows, 1),
+            "mix_target": torch.zeros(n_rows, 1),
+            "bp0_confidence": torch.ones(n_rows, 1),
+            "bpi_confidence": torch.ones(n_rows, 1),
+            "mix_confidence": torch.ones(n_rows, 1),
+            "mix_sample_weight": torch.ones(n_rows, 1),
+            "eta_next_active": eta_next_active.clone(),
+            "teacher_snapshot_hash": "teacher",
+        }]
+
+        torch.manual_seed(1234)
+        resampled, summary = episode._resample_bp_target_cache_by_current_eta(cache)
+
+        current_eta = resampled[0]["parent"][:, 2] > 0.5
+        self.assertEqual(int(current_eta.sum().item()), 25)
+        self.assertAlmostEqual(float(current_eta.float().mean().item()), 0.25)
+        self.assertEqual(int(resampled[0]["eta_next_active"].sum().item()), 75)
+        self.assertEqual(summary["eta_field"], "parent[:, 2]")
+        self.assertEqual(summary["current_eta1_count_before"], 10)
+        self.assertEqual(summary["current_eta1_count_after"], 25)
+        self.assertAlmostEqual(summary["current_eta1_share_after"], 0.25)
+        self.assertFalse(summary["validation_cache_resampled"])
+        torch.testing.assert_close(cache[0]["parent"], parent)
+        torch.testing.assert_close(cache[0]["eta_next_active"], eta_next_active)
+
+    def test_disabled_current_eta_resampling_preserves_legacy_cache(self):
+        episode = Episode.__new__(Episode)
+        episode.hyperparams = SimpleNamespace(
+            bp_current_eta_resample_enabled=False,
+            bp_current_eta1_train_share=0.25,
+        )
+        cache = [{"parent": torch.zeros(4, 7)}]
+
+        result, summary = episode._resample_bp_target_cache_by_current_eta(cache)
+
+        self.assertIs(result, cache)
+        self.assertFalse(summary["applied"])
+        self.assertEqual(summary["reason"], "disabled")
 
 
 if __name__ == "__main__":

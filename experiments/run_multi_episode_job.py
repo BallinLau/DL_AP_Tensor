@@ -273,6 +273,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bp-distill-patience", type=int, default=None, help="BP distillation early-stop patience")
     parser.add_argument("--bp-distill-min-delta", type=float, default=None, help="BP distillation validation min delta")
     parser.add_argument(
+        "--bp-distill-max-optimizer-steps",
+        type=int,
+        default=None,
+        help="Maximum successful BP optimizer steps per episode; 0 keeps legacy epoch control",
+    )
+    parser.add_argument(
+        "--bp-current-eta-resample-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Resample only the staged BP train cache by current parent eta_t",
+    )
+    parser.add_argument(
+        "--bp-current-eta1-train-share",
+        type=float,
+        default=None,
+        help="Target current parent eta_t=1 share in the staged BP train cache",
+    )
+    parser.add_argument(
         "--pv-rollback-on-soft-spikes",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -474,6 +492,23 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.bp_distill_patience = args.bp_distill_patience
     if args.bp_distill_min_delta is not None:
         hyperparams.bp_distill_min_delta = args.bp_distill_min_delta
+    if args.bp_distill_max_optimizer_steps is not None:
+        hyperparams.bp_distill_max_optimizer_steps = int(args.bp_distill_max_optimizer_steps)
+    if args.bp_current_eta_resample_enabled is not None:
+        hyperparams.bp_current_eta_resample_enabled = bool(
+            args.bp_current_eta_resample_enabled
+        )
+    if args.bp_current_eta1_train_share is not None:
+        hyperparams.bp_current_eta1_train_share = float(
+            args.bp_current_eta1_train_share
+        )
+    if int(getattr(hyperparams, "bp_distill_max_optimizer_steps", 0)) < 0:
+        raise ValueError("bp_distill_max_optimizer_steps must be non-negative")
+    current_eta_share = float(
+        getattr(hyperparams, "bp_current_eta1_train_share", 0.25)
+    )
+    if not 0.0 <= current_eta_share <= 1.0:
+        raise ValueError("bp_current_eta1_train_share must be in [0, 1]")
     if args.pv_rollback_on_soft_spikes is not None:
         hyperparams.pv_rollback_on_soft_spikes = bool(args.pv_rollback_on_soft_spikes)
     if args.bp_distill_trainable_scope is not None:
@@ -706,6 +741,9 @@ def main():
                     "pv_eval_epochs": hyperparams.pv_eval_epochs,
                     "bp_distill_epochs": hyperparams.bp_distill_epochs,
                     "bp_distill_patience": hyperparams.bp_distill_patience,
+                    "bp_distill_max_optimizer_steps": hyperparams.bp_distill_max_optimizer_steps,
+                    "bp_current_eta_resample_enabled": hyperparams.bp_current_eta_resample_enabled,
+                    "bp_current_eta1_train_share": hyperparams.bp_current_eta1_train_share,
                     "pv_mixture_enabled": hyperparams.pv_mixture_enabled,
                     "pv_mixture_ratio": hyperparams.pv_mixture_ratio,
                     "pv_mixture_start_episode": hyperparams.pv_mixture_start_episode,
