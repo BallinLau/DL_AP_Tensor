@@ -132,6 +132,8 @@ class StageBatchSizeTest(unittest.TestCase):
             "--bp-current-eta-resample-enabled",
             "--bp-current-eta1-train-share",
             "0.25",
+            "--bp-current-eta-resample-seed",
+            "13579",
             "--bp-distill-max-optimizer-steps",
             "500",
         ]
@@ -143,6 +145,7 @@ class StageBatchSizeTest(unittest.TestCase):
         self.assertTrue(hp.pv_mixture_enabled)
         self.assertTrue(hp.bp_current_eta_resample_enabled)
         self.assertEqual(hp.bp_current_eta1_train_share, 0.25)
+        self.assertEqual(hp.bp_current_eta_resample_seed, 13579)
         self.assertEqual(hp.bp_distill_max_optimizer_steps, 500)
         self.assertFalse(hp.pv_eta_resample_enabled)
 
@@ -274,8 +277,10 @@ class StageBatchSizeTest(unittest.TestCase):
         episode.hyperparams = SimpleNamespace(
             bp_current_eta_resample_enabled=True,
             bp_current_eta1_train_share=0.25,
+            bp_current_eta_resample_seed=13579,
             pv_eta_resample_enabled=False,
         )
+        episode.episode_id = 2
         n_rows = 100
         parent = torch.zeros(n_rows, 7)
         parent[:10, 2] = 1.0
@@ -299,19 +304,54 @@ class StageBatchSizeTest(unittest.TestCase):
         }]
 
         torch.manual_seed(1234)
+        global_rng_before = torch.get_rng_state().clone()
         resampled, summary = episode._resample_bp_target_cache_by_current_eta(cache)
+        global_rng_after = torch.get_rng_state().clone()
+        repeated, repeated_summary = episode._resample_bp_target_cache_by_current_eta(cache)
 
         current_eta = resampled[0]["parent"][:, 2] > 0.5
+        repeated_eta = repeated[0]["parent"][:, 2] > 0.5
         self.assertEqual(int(current_eta.sum().item()), 25)
+        self.assertEqual(int(repeated_eta.sum().item()), 25)
         self.assertAlmostEqual(float(current_eta.float().mean().item()), 0.25)
         self.assertEqual(int(resampled[0]["eta_next_active"].sum().item()), 75)
+        torch.testing.assert_close(global_rng_after, global_rng_before)
+        torch.testing.assert_close(torch.get_rng_state(), global_rng_before)
+        torch.testing.assert_close(
+            resampled[0]["source_index"], repeated[0]["source_index"]
+        )
         self.assertEqual(summary["eta_field"], "parent[:, 2]")
+        self.assertEqual(summary["resample_seed"], 13579)
+        self.assertEqual(summary["episode_resample_seed"], 13579 + 2 * 100003)
+        self.assertEqual(
+            summary["episode_resample_seed"],
+            repeated_summary["episode_resample_seed"],
+        )
         self.assertEqual(summary["current_eta1_count_before"], 10)
         self.assertEqual(summary["current_eta1_count_after"], 25)
         self.assertAlmostEqual(summary["current_eta1_share_after"], 0.25)
         self.assertFalse(summary["validation_cache_resampled"])
         torch.testing.assert_close(cache[0]["parent"], parent)
         torch.testing.assert_close(cache[0]["eta_next_active"], eta_next_active)
+
+        episode.episode_id = 3
+        different_episode, _ = episode._resample_bp_target_cache_by_current_eta(cache)
+        self.assertFalse(torch.equal(
+            resampled[0]["source_index"],
+            different_episode[0]["source_index"],
+        ))
+
+        episode.episode_id = 2
+        episode.hyperparams.bp_current_eta_resample_seed = 13580
+        different_seed, _ = episode._resample_bp_target_cache_by_current_eta(cache)
+        self.assertFalse(torch.equal(
+            resampled[0]["source_index"],
+            different_seed[0]["source_index"],
+        ))
+        self.assertEqual(
+            int((different_seed[0]["parent"][:, 2] > 0.5).sum().item()),
+            25,
+        )
 
     def test_disabled_current_eta_resampling_preserves_legacy_cache(self):
         episode = Episode.__new__(Episode)

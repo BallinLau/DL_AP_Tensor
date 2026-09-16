@@ -7523,6 +7523,15 @@ class Episode:
                 "future-eta pv_eta_resample_enabled sampler."
             )
 
+        base_seed = int(
+            getattr(self.hyperparams, "bp_current_eta_resample_seed", 13579)
+        )
+        episode_seed = base_seed + int(getattr(self, "episode_id", 0)) * 100003
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(episode_seed)
+        summary["resample_seed"] = base_seed
+        summary["episode_resample_seed"] = episode_seed
+
         eta_current = torch.cat(
             [
                 (item["parent"][:, 2].detach().cpu() > 0.5).reshape(-1)
@@ -7543,13 +7552,17 @@ class Episode:
         def _draw(pool: torch.Tensor, count: int) -> torch.Tensor:
             if count <= 0:
                 return torch.empty(0, dtype=torch.long)
-            return pool[torch.randint(pool.numel(), (count,))]
+            return pool[
+                torch.randint(pool.numel(), (count,), generator=generator)
+            ]
 
         selected = torch.cat(
             [_draw(eta0_index, n_eta0), _draw(eta1_index, n_eta1)],
             dim=0,
         )
-        selected = selected[torch.randperm(selected.numel())]
+        selected = selected[
+            torch.randperm(selected.numel(), generator=generator)
+        ]
 
         row_counts = [int(item["parent"].shape[0]) for item in cache]
         tensor_keys: List[str] = []

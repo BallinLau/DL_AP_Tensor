@@ -291,6 +291,12 @@ def parse_args() -> argparse.Namespace:
         help="Target current parent eta_t=1 share in the staged BP train cache",
     )
     parser.add_argument(
+        "--bp-current-eta-resample-seed",
+        type=int,
+        default=None,
+        help="Deterministic CPU RNG seed for current parent eta_t BP resampling",
+    )
+    parser.add_argument(
         "--pv-rollback-on-soft-spikes",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -501,6 +507,10 @@ def configure_hyperparams(args: argparse.Namespace):
     if args.bp_current_eta1_train_share is not None:
         hyperparams.bp_current_eta1_train_share = float(
             args.bp_current_eta1_train_share
+        )
+    if args.bp_current_eta_resample_seed is not None:
+        hyperparams.bp_current_eta_resample_seed = int(
+            args.bp_current_eta_resample_seed
         )
     if int(getattr(hyperparams, "bp_distill_max_optimizer_steps", 0)) < 0:
         raise ValueError("bp_distill_max_optimizer_steps must be non-negative")
@@ -744,6 +754,7 @@ def main():
                     "bp_distill_max_optimizer_steps": hyperparams.bp_distill_max_optimizer_steps,
                     "bp_current_eta_resample_enabled": hyperparams.bp_current_eta_resample_enabled,
                     "bp_current_eta1_train_share": hyperparams.bp_current_eta1_train_share,
+                    "bp_current_eta_resample_seed": hyperparams.bp_current_eta_resample_seed,
                     "pv_mixture_enabled": hyperparams.pv_mixture_enabled,
                     "pv_mixture_ratio": hyperparams.pv_mixture_ratio,
                     "pv_mixture_start_episode": hyperparams.pv_mixture_start_episode,

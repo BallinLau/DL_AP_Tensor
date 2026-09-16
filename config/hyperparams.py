@@ -167,6 +167,7 @@ class HyperParams:
     # separate from future-eta integration and leaves validation natural.
     bp_current_eta_resample_enabled: bool = False
     bp_current_eta1_train_share: float = 0.25
+    bp_current_eta_resample_seed: int = 13579
     pv_eval_grad_clip_norm: float = 10.0
     bp_distill_grad_clip_norm: float = 10.0
     pv_rollback_on_soft_spikes: bool = False
