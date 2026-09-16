@@ -12,12 +12,15 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from analysis.bp_eta_imbalance import (  # noqa: E402
+    bp_teacher_cache_sha256,
     branch_distillation_loss,
     configure_bp_heads_only,
+    eta_switch_panel_sensitivity,
     gradient_contribution_audit,
     parameter_change_summary,
     sample_current_eta_rows,
     state_dict_sha256,
+    training_equivalent_total_objective_audit,
 )
 from config import Config  # noqa: E402
 from config.hyperparams import HyperParams  # noqa: E402
@@ -63,17 +66,18 @@ def _model_and_hp() -> tuple[PolicyValueModel, HyperParams]:
     return model, hp
 
 
-def test_natural_sampler_preserves_full_cache_eta_ratio():
+def test_natural_sampler_matches_cache_eta_ratio_with_replacement():
     cache = _cache(n_eta0=97, n_eta1=3)
     selected = sample_current_eta_rows(
         cache["eta_current"],
-        batch_size=100,
+        batch_size=10000,
         eta1_share=None,
         generator=torch.Generator().manual_seed(1),
     )
     sampled_share = float(cache["eta_current"][selected].float().mean().item())
-    assert selected.unique().numel() == 100
-    assert sampled_share == pytest.approx(0.03)
+    assert selected.numel() == 10000
+    assert selected.unique().numel() < selected.numel()
+    assert sampled_share == pytest.approx(0.03, abs=0.005)
 
 
 @pytest.mark.parametrize("target_share", [0.25, 0.50])
@@ -148,6 +152,67 @@ def test_gradient_audit_does_not_update_parameters_or_populate_gradients():
         assert branch["eta0_gradient_norm"] > 0.0
         assert branch["eta1_gradient_norm"] > 0.0
         assert np_is_finite(branch["gradient_cosine_similarity"])
+
+
+def test_training_equivalent_total_audit_includes_mix_and_takes_no_step():
+    model, _ = _model_and_hp()
+    cache = _cache()
+    before = state_dict_sha256(model)
+
+    def _full_loss(item):
+        parent = item["parent"]
+        bp0, bpi = model.forward_policy(parent)
+        mix = 0.5 * (bp0 + bpi)
+        bp0_loss = (bp0 - item["bp0_target"]).square().mean()
+        bpi_loss = (bpi - item["bpi_target"]).square().mean()
+        mix_loss = (mix - item["mix_target"]).square().mean()
+        total = bp0_loss + bpi_loss + mix_loss
+        return total, {
+            "bp0_loss": float(bp0_loss.detach().item()),
+            "bpi_loss": float(bpi_loss.detach().item()),
+            "mix_loss": float(mix_loss.detach().item()),
+        }
+
+    audit = training_equivalent_total_objective_audit(model, cache, _full_loss)
+    eta1_index = torch.where(cache["eta_current"].reshape(-1).bool())[0]
+    expected_eta1, expected_parts = _full_loss(
+        {key: value[eta1_index] for key, value in cache.items()}
+    )
+
+    assert audit["objective"] == "bp0_total + bpi_total + mix_total"
+    assert audit["eta1_conditional_loss"] == pytest.approx(float(expected_eta1.detach().item()))
+    assert audit["conditional_loss_components"]["eta1"]["mix_loss"] == pytest.approx(
+        expected_parts["mix_loss"]
+    )
+    assert audit["eta0_bp0_head_gradient_norm"] > 0.0
+    assert audit["eta1_bpi_head_gradient_norm"] > 0.0
+    assert state_dict_sha256(model) == before
+    assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_teacher_cache_hash_covers_targets_and_is_stable():
+    cache = _cache()
+    cache.update({
+        "bp0_regret": torch.zeros_like(cache["bp0_target"]),
+        "bpi_regret": torch.zeros_like(cache["bpi_target"]),
+        "mix_regret": torch.zeros_like(cache["mix_target"]),
+    })
+    first = bp_teacher_cache_sha256(cache)
+    clone = {key: value.clone() for key, value in cache.items()}
+    assert bp_teacher_cache_sha256(clone) == first
+    clone["bpi_target"][0, 0] += 0.01
+    assert bp_teacher_cache_sha256(clone) != first
+
+
+def test_eta_switch_panel_uses_actual_parent_rows():
+    model, _ = _model_and_hp()
+    cache = _cache()
+    summary = eta_switch_panel_sensitivity(model, cache["parent"], max_rows=8)
+    assert summary["n_actual_parent_states"] == 8
+    assert summary["selection"] == "evenly_spaced"
+    for branch in ("delta_bp0_eta", "delta_bpi_eta"):
+        assert set(summary[branch]) == {"mean", "median", "p10", "p90"}
+        assert all(np_is_finite(value) for value in summary[branch].values())
 
 
 def np_is_finite(value: float) -> bool:

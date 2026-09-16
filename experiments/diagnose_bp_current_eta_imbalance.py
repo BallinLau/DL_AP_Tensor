@@ -20,9 +20,10 @@ if str(ROOT) not in sys.path:
 
 from analysis.bp_eta_imbalance import (  # noqa: E402
     audit_bp_cache_by_current_eta,
+    bp_teacher_cache_sha256,
     configure_bp_heads_only,
     eta_count_summary,
-    eta_switch_sensitivity,
+    eta_switch_panel_sensitivity,
     flatten_bp_target_cache,
     gradient_contribution_audit,
     loss_contribution_audit,
@@ -30,6 +31,7 @@ from analysis.bp_eta_imbalance import (  # noqa: E402
     sample_current_eta_rows,
     select_bp_cache_rows,
     state_dict_sha256,
+    training_equivalent_total_objective_audit,
 )
 from analysis.checkpoint_loader import load_analysis_checkpoint  # noqa: E402
 from config import Config  # noqa: E402
@@ -238,6 +240,7 @@ def run_experiment(
     args: argparse.Namespace,
     output_dir: Path,
     initial_head_hash: str,
+    teacher_cache_hash: str,
 ) -> tuple[pd.DataFrame, Dict[str, Any], torch.nn.Module]:
     set_seed(args.seed)
     model = copy.deepcopy(base_model).to(base_episode.device)
@@ -325,6 +328,7 @@ def run_experiment(
         "optimizer_steps": int(args.steps),
         "seed": int(args.seed),
         "initial_bp_head_hash": initial_head_hash,
+        "teacher_cache_hash": teacher_cache_hash,
         "final_bp_head_hash": state_dict_sha256(model, ("bp0_head.", "bpi_head.")),
         **changes,
     }
@@ -374,6 +378,7 @@ def comparison_frame(finals: list[Dict[str, Any]]) -> pd.DataFrame:
         "realized_eta1_train_share",
         "bp_head_parameter_max_change",
         "non_bp_parameter_max_change",
+        "teacher_cache_hash",
     ]
     for branch in ("bp0", "bpi"):
         for eta_value in (0, 1):
@@ -502,6 +507,7 @@ def main() -> None:
             raise RuntimeError("No matched parent-child firm batches were constructed")
         fixed_cache_list = episode._build_bp_target_cache(batches, teacher_model)
         fixed_cache = flatten_bp_target_cache(fixed_cache_list)
+        teacher_cache_hash = bp_teacher_cache_sha256(fixed_cache)
         counts = eta_count_summary(fixed_cache)
         if counts["eta0_count"] == 0 or counts["eta1_count"] == 0:
             raise RuntimeError("The diagnostic cache must contain both current eta strata")
@@ -511,8 +517,21 @@ def main() -> None:
             audit_bp_cache_by_current_eta(base_model, fixed_cache, regrets=initial_regrets)
         )
         cache_audit.to_csv(output_dir / "cache_current_eta_audit.csv", index=False)
-        loss_audit = loss_contribution_audit(base_model, fixed_cache, loaded.hyperparams)
-        gradient_audit = gradient_contribution_audit(base_model, fixed_cache, loaded.hyperparams)
+        direct_loss_audit = loss_contribution_audit(base_model, fixed_cache, loaded.hyperparams)
+        direct_gradient_audit = gradient_contribution_audit(base_model, fixed_cache, loaded.hyperparams)
+        total_objective_audit = training_equivalent_total_objective_audit(
+            base_model,
+            fixed_cache,
+            episode._compute_bp_cache_loss,
+        )
+        loss_audit = {
+            "training_equivalent_total": total_objective_audit,
+            "direct_branch_only_reference": direct_loss_audit,
+        }
+        gradient_audit = {
+            "training_equivalent_total": total_objective_audit,
+            "direct_branch_only_reference": direct_gradient_audit,
+        }
         (output_dir / "loss_contribution_audit.json").write_text(
             json.dumps(loss_audit, indent=2, sort_keys=True, allow_nan=True), encoding="utf-8"
         )
@@ -520,9 +539,8 @@ def main() -> None:
             json.dumps(gradient_audit, indent=2, sort_keys=True, allow_nan=True), encoding="utf-8"
         )
 
-        median_parent = fixed_cache["parent"].median(dim=0).values
         sensitivity: Dict[str, Any] = {
-            "before": eta_switch_sensitivity(base_model, median_parent),
+            "before": eta_switch_panel_sensitivity(base_model, fixed_cache["parent"]),
         }
         all_metrics = []
         finals = []
@@ -539,14 +557,19 @@ def main() -> None:
                 args=args,
                 output_dir=output_dir / name.replace("A_", "").replace("B_", "").replace("C_", ""),
                 initial_head_hash=initial_head_hash,
+                teacher_cache_hash=teacher_cache_hash,
             )
             all_metrics.append(metrics)
             finals.append(final)
             final_models[name] = final_model
         if "A_natural" in final_models:
-            sensitivity["after_natural"] = eta_switch_sensitivity(final_models["A_natural"], median_parent)
+            sensitivity["after_natural"] = eta_switch_panel_sensitivity(
+                final_models["A_natural"], fixed_cache["parent"]
+            )
         if "C_eta50" in final_models:
-            sensitivity["after_eta50"] = eta_switch_sensitivity(final_models["C_eta50"], median_parent)
+            sensitivity["after_eta50"] = eta_switch_panel_sensitivity(
+                final_models["C_eta50"], fixed_cache["parent"]
+            )
         (output_dir / "eta_switch_sensitivity.json").write_text(
             json.dumps(sensitivity, indent=2, sort_keys=True, allow_nan=True), encoding="utf-8"
         )
@@ -568,6 +591,7 @@ def main() -> None:
         )
         zeta_after = float(Config.ZETA)
         exact_eta_after = bool(getattr(loaded.hyperparams, "pv_exact_eta_integration_enabled", True))
+        teacher_cache_hash_after = bp_teacher_cache_sha256(fixed_cache)
 
     if state_dict_sha256(base_model) != base_model_hash:
         raise RuntimeError("The source policy_value checkpoint model was mutated")
@@ -575,6 +599,8 @@ def main() -> None:
         raise RuntimeError("The fixed teacher model was mutated")
     if zeta_after != zeta_before or exact_eta_after != exact_eta_before:
         raise RuntimeError("Diagnostic changed future-eta economic integration settings")
+    if teacher_cache_hash_after != teacher_cache_hash:
+        raise RuntimeError("Controlled experiments mutated the fixed BP teacher cache")
 
     metadata = {
         "episode": int(args.episode),
@@ -583,6 +609,8 @@ def main() -> None:
         "checkpoint_metadata": loaded.metadata,
         "teacher_source": teacher_source,
         "teacher_hash": teacher_hash,
+        "teacher_cache_hash": teacher_cache_hash,
+        "teacher_cache_hash_after": teacher_cache_hash_after,
         "initial_policy_hash": base_model_hash,
         "initial_bp_head_hash": initial_head_hash,
         "cache_rows": int(fixed_cache["parent"].shape[0]),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 import torch
 
@@ -13,6 +13,19 @@ from training.bp_policy_loss import (
 
 
 BP_HEAD_PREFIXES = ("bp0_head.", "bpi_head.")
+TEACHER_CACHE_HASH_FIELDS = (
+    "parent",
+    "bp0_target",
+    "bpi_target",
+    "mix_target",
+    "bp0_confidence",
+    "bpi_confidence",
+    "mix_confidence",
+    "mix_sample_weight",
+    "bp0_regret",
+    "bpi_regret",
+    "mix_regret",
+)
 
 
 def flatten_bp_target_cache(cache: Iterable[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -56,6 +69,21 @@ def select_bp_cache_rows(
     }
 
 
+def bp_teacher_cache_sha256(cache: Mapping[str, torch.Tensor]) -> str:
+    """Hash the fixed rows, teacher targets, weights, and cached diagnostics."""
+    digest = hashlib.sha256()
+    for key in TEACHER_CACHE_HASH_FIELDS:
+        value = cache.get(key)
+        if not isinstance(value, torch.Tensor):
+            continue
+        tensor = value.detach().cpu().contiguous()
+        digest.update(key.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
 def sample_current_eta_rows(
     eta_current: torch.Tensor,
     *,
@@ -68,12 +96,11 @@ def sample_current_eta_rows(
     n_rows = int(eta.numel())
     if n_rows == 0:
         raise ValueError("Cannot sample an empty BP cache")
-    requested = max(1, min(int(batch_size), n_rows))
+    requested = max(1, int(batch_size))
     if eta1_share is None:
-        # A full-cache natural batch preserves the empirical ratio exactly.
-        if requested == n_rows:
-            return torch.randperm(n_rows, generator=generator)
-        return torch.randperm(n_rows, generator=generator)[:requested]
+        # Match the replacement mechanics used by the stratified samplers;
+        # only the current-eta composition differs across experiments.
+        return torch.randint(n_rows, (requested,), generator=generator)
 
     share = float(eta1_share)
     if not 0.0 <= share <= 1.0:
@@ -266,6 +293,81 @@ def gradient_contribution_audit(
     return result
 
 
+def training_equivalent_total_objective_audit(
+    model: torch.nn.Module,
+    cache: Mapping[str, torch.Tensor],
+    compute_total_loss: Callable[[Dict[str, torch.Tensor]], tuple[torch.Tensor, Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Audit the exact BP objective, including the mix term, without a step."""
+    eta = cache["eta_current"].reshape(-1).bool()
+    n_total = int(eta.numel())
+    if n_total == 0 or not eta.any() or eta.all():
+        raise ValueError("Total-objective audit requires both current-eta strata")
+    shares = {0: float((~eta).sum().item() / n_total), 1: float(eta.sum().item() / n_total)}
+    bp0_parameters = list(model.bp0_head.parameters())
+    bpi_parameters = list(model.bpi_head.parameters())
+    parameters = [*bp0_parameters, *bpi_parameters]
+    n_bp0 = len(bp0_parameters)
+    gradients: Dict[int, torch.Tensor] = {}
+    head_gradients: Dict[int, Dict[str, torch.Tensor]] = {}
+    losses: Dict[int, float] = {}
+    components: Dict[int, Dict[str, float]] = {}
+    for eta_value, mask in ((0, ~eta), (1, eta)):
+        index = torch.where(mask)[0]
+        loss, metrics = compute_total_loss(select_bp_cache_rows(cache, index))
+        raw_gradients = torch.autograd.grad(loss, parameters, allow_unused=True)
+        filled = [
+            torch.zeros_like(parameter).reshape(-1) if gradient is None else gradient.detach().reshape(-1)
+            for parameter, gradient in zip(parameters, raw_gradients)
+        ]
+        gradients[eta_value] = torch.cat(filled)
+        head_gradients[eta_value] = {
+            "bp0": torch.cat(filled[:n_bp0]),
+            "bpi": torch.cat(filled[n_bp0:]),
+        }
+        losses[eta_value] = float(loss.detach().item())
+        components[eta_value] = {
+            key: float(metrics[key])
+            for key in ("bp0_loss", "bpi_loss", "mix_loss")
+            if key in metrics
+        }
+
+    g0 = gradients[0]
+    g1 = gradients[1]
+    norm0 = float(torch.linalg.vector_norm(g0).item())
+    norm1 = float(torch.linalg.vector_norm(g1).item())
+    weighted0 = shares[0] * norm0
+    weighted1 = shares[1] * norm1
+    denom = norm0 * norm1
+    cosine = float(torch.dot(g0, g1).item() / denom) if denom > 0.0 else float("nan")
+    result: Dict[str, Any] = {
+        "objective": "bp0_total + bpi_total + mix_total",
+        "eta0_conditional_loss": losses[0],
+        "eta1_conditional_loss": losses[1],
+        "eta0_natural_contribution": shares[0] * losses[0],
+        "eta1_natural_contribution": shares[1] * losses[1],
+        "natural_contribution_ratio_eta0_to_eta1": (
+            shares[0] * losses[0] / (shares[1] * losses[1] + 1e-12)
+        ),
+        "eta0_gradient_norm": norm0,
+        "eta1_gradient_norm": norm1,
+        "eta0_natural_weighted_gradient_norm": weighted0,
+        "eta1_natural_weighted_gradient_norm": weighted1,
+        "natural_weighted_gradient_norm_ratio_eta0_to_eta1": weighted0 / (weighted1 + 1e-12),
+        "gradient_cosine_similarity": cosine,
+        "conditional_loss_components": {
+            "eta0": components[0],
+            "eta1": components[1],
+        },
+    }
+    for eta_value in (0, 1):
+        for head_name in ("bp0", "bpi"):
+            result[f"eta{eta_value}_{head_name}_head_gradient_norm"] = float(
+                torch.linalg.vector_norm(head_gradients[eta_value][head_name]).item()
+            )
+    return result
+
+
 def _finite_stats(values: torch.Tensor) -> Dict[str, float]:
     finite = values.detach().cpu().reshape(-1)
     finite = finite[torch.isfinite(finite)]
@@ -366,6 +468,47 @@ def eta_switch_sensitivity(model: torch.nn.Module, parent: torch.Tensor) -> Dict
         "bpi_eta0": float(bpi_eta0.item()),
         "bpi_eta1": float(bpi_eta1.item()),
         "delta_bpi_eta": float((bpi_eta1 - bpi_eta0).item()),
+    }
+
+
+@torch.no_grad()
+def eta_switch_panel_sensitivity(
+    model: torch.nn.Module,
+    parents: torch.Tensor,
+    *,
+    max_rows: int = 1024,
+) -> Dict[str, Any]:
+    """Toggle eta on actual cached parents and summarize the policy response."""
+    if parents.ndim != 2 or parents.shape[0] == 0:
+        raise ValueError("parents must be a non-empty two-dimensional tensor")
+    n_rows = min(int(parents.shape[0]), max(1, int(max_rows)))
+    if n_rows < int(parents.shape[0]):
+        index = torch.linspace(0, parents.shape[0] - 1, steps=n_rows).round().to(torch.long)
+        selected = parents[index]
+    else:
+        selected = parents
+    device = next(model.parameters()).device
+    eta0 = selected.detach().to(device).clone()
+    eta1 = eta0.clone()
+    eta0[:, 2] = 0.0
+    eta1[:, 2] = 1.0
+    bp0_eta0, bpi_eta0 = model.forward_policy(eta0)
+    bp0_eta1, bpi_eta1 = model.forward_policy(eta1)
+
+    def _summary(delta: torch.Tensor) -> Dict[str, float]:
+        values = delta.detach().cpu().reshape(-1)
+        return {
+            "mean": float(values.mean().item()),
+            "median": float(torch.quantile(values, 0.50).item()),
+            "p10": float(torch.quantile(values, 0.10).item()),
+            "p90": float(torch.quantile(values, 0.90).item()),
+        }
+
+    return {
+        "n_actual_parent_states": int(selected.shape[0]),
+        "selection": "all" if selected.shape[0] == parents.shape[0] else "evenly_spaced",
+        "delta_bp0_eta": _summary(bp0_eta1 - bp0_eta0),
+        "delta_bpi_eta": _summary(bpi_eta1 - bpi_eta0),
     }
 
 
