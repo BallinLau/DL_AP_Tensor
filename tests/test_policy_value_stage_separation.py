@@ -15,6 +15,7 @@ from config.hyperparams import HyperParams  # noqa: E402
 from models.policy_value import PolicyValueModel  # noqa: E402
 from training.bp_grid_teacher import BPGridTeacher  # noqa: E402
 from training.episode import Episode  # noqa: E402
+from training.pv_mixture import PVParentGroupPool  # noqa: E402
 
 
 def _small_hyperparams() -> HyperParams:
@@ -812,6 +813,71 @@ def test_bellman_convergence_max_is_exact_not_bounded_sample():
     metric = result["equations"]["p0"]["conditional_train_m"]
     assert metric["n_used_for_p90"] == 2
     assert metric["max"] == pytest.approx(100.0, abs=1e-7)
+
+
+def _pool_for_feature_stats(n_parents: int, n_children: int = 2, n_cols: int = 8) -> PVParentGroupPool:
+    parent = torch.arange(n_parents * n_cols, dtype=torch.float32).reshape(n_parents, n_cols)
+    children = [
+        torch.arange(n_parents * n_cols, dtype=torch.float32).reshape(n_parents, n_cols) + float(idx)
+        for idx in range(n_children)
+    ]
+    return PVParentGroupPool(
+        parent=parent,
+        children=children,
+        source_id=torch.zeros(n_parents, dtype=torch.long),
+        source_index=torch.arange(n_parents, dtype=torch.long),
+    )
+
+
+def test_tensor_distribution_stats_caps_quantile_samples_on_request():
+    values = torch.arange(10, dtype=torch.float32)
+    uncapped = Episode._tensor_distribution_stats("t", values)
+    assert uncapped["t_n_total"] == 10.0
+    assert uncapped["t_n_used_for_quantiles"] == 10.0
+
+    capped = Episode._tensor_distribution_stats("t", values, 3)
+    assert capped["t_n_total"] == 10.0
+    assert capped["t_n_used_for_quantiles"] == 3.0
+    for key in ["finite_ratio", "mean", "std", "min", "max"]:
+        assert capped[f"t_{key}"] == pytest.approx(uncapped[f"t_{key}"])
+
+    expected = torch.quantile(values[::4], torch.tensor([0.01, 0.10, 0.50, 0.90, 0.99]))
+    for idx, key in enumerate(["p01", "p10", "p50", "p90", "p99"]):
+        assert capped[f"t_{key}"] == pytest.approx(float(expected[idx]))
+
+
+def test_tensor_distribution_stats_handles_oversized_quantile_input():
+    # torch.quantile 在元素数超过 2^24 时直接抛 RuntimeError；限流后必须正常返回。
+    values = torch.arange(2**24 + 1, dtype=torch.float32)
+    stats = Episode._tensor_distribution_stats("t", values, 1_000_000)
+    assert stats["t_n_total"] == float(2**24 + 1)
+    assert stats["t_n_used_for_quantiles"] <= 1_000_000.0
+    assert np.isfinite(stats["t_p50"])
+
+    with pytest.raises(RuntimeError, match="too large"):
+        Episode._tensor_distribution_stats("t", values)
+
+
+def test_tensor_distribution_stats_reports_zero_samples_for_all_nonfinite_input():
+    stats = Episode._tensor_distribution_stats("t", torch.full((5,), float("nan")), 10)
+    assert stats["t_n_total"] == 5.0
+    assert stats["t_n_used_for_quantiles"] == 0.0
+    assert np.isnan(stats["t_p50"])
+
+
+def test_pool_feature_stats_reuses_hyperparams_quantile_cap():
+    episode = _episode()
+    episode.hyperparams = replace(episode.hyperparams, bellman_conv_max_samples=2)
+    pool = _pool_for_feature_stats(n_parents=6, n_children=2)
+
+    stats = episode._pool_feature_stats("simulate", pool)
+
+    assert stats["simulate_parent_groups"] == 6.0
+    assert stats["simulate_parent_M_n_total"] == 6.0
+    assert stats["simulate_parent_M_n_used_for_quantiles"] == 2.0
+    assert stats["simulate_child0_M_n_used_for_quantiles"] == 2.0
+    assert stats["simulate_child_all_M_n_total"] == 12.0
+    assert stats["simulate_child_all_M_n_used_for_quantiles"] == 2.0
 
 
 def test_bellman_convergence_primary_uses_conditional_not_legacy_abs():

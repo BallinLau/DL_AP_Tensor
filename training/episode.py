@@ -1622,10 +1622,14 @@ class Episode:
             return pool
         return select_parent_groups(pool, torch.randperm(len(pool), generator=generator))
 
-    @staticmethod
-    def _pool_feature_stats(prefix: str, pool: Optional[PVParentGroupPool]) -> Dict[str, float]:
+    def _distribution_quantile_cap(self) -> int:
+        # 与 Bellman 收敛诊断共用同一上限（torch.quantile 的元素数硬限制是 2^24）。
+        return max(1, int(getattr(self.hyperparams, "bellman_conv_max_samples", 1_000_000)))
+
+    def _pool_feature_stats(self, prefix: str, pool: Optional[PVParentGroupPool]) -> Dict[str, float]:
         if pool is None or len(pool) == 0:
             return {f"{prefix}_parent_groups": 0.0}
+        cap = self._distribution_quantile_cap()
         names = ["b", "z", "ETA", "i", "x", "Hatcf", "LnKF", "M"]
         data = pool.parent.detach().float().cpu()
         stats: Dict[str, float] = {f"{prefix}_parent_groups": float(data.shape[0])}
@@ -1634,41 +1638,60 @@ class Episode:
             stats[f"{prefix}_{name}_mean"] = float(col.mean().item())
             stats[f"{prefix}_{name}_std"] = float(col.std(unbiased=False).item()) if col.numel() > 1 else 0.0
         if pool.parent.shape[1] > 7:
-            stats.update(Episode._tensor_distribution_stats(f"{prefix}_parent_M", pool.parent[:, 7]))
+            stats.update(Episode._tensor_distribution_stats(f"{prefix}_parent_M", pool.parent[:, 7], cap))
         for child_idx, child in enumerate(pool.children):
             if child.shape[1] > 7:
-                stats.update(Episode._tensor_distribution_stats(f"{prefix}_child{child_idx}_M", child[:, 7]))
+                stats.update(Episode._tensor_distribution_stats(f"{prefix}_child{child_idx}_M", child[:, 7], cap))
         if pool.children and pool.children[0].shape[1] > 7:
             child_m = torch.cat([child[:, 7].reshape(-1) for child in pool.children if child.shape[1] > 7], dim=0)
-            stats.update(Episode._tensor_distribution_stats(f"{prefix}_child_all_M", child_m))
+            stats.update(Episode._tensor_distribution_stats(f"{prefix}_child_all_M", child_m, cap))
         return stats
 
     @staticmethod
-    def _tensor_distribution_stats(prefix: str, tensor: torch.Tensor) -> Dict[str, float]:
+    def _tensor_distribution_stats(
+        prefix: str,
+        tensor: torch.Tensor,
+        max_samples: Optional[int] = None,
+    ) -> Dict[str, float]:
         values = tensor.detach().reshape(-1).float().cpu()
+        n_total = int(values.numel())
         finite = torch.isfinite(values)
-        stats: Dict[str, float] = {
-            f"{prefix}_finite_ratio": float(finite.float().mean().item()) if values.numel() else 0.0,
-        }
         finite_values = values[finite]
-        if finite_values.numel() == 0:
+        n_finite = int(finite_values.numel())
+        stats: Dict[str, float] = {
+            f"{prefix}_finite_ratio": float(finite.float().mean().item()) if n_total else 0.0,
+            f"{prefix}_n_total": float(n_total),
+            f"{prefix}_n_used_for_quantiles": 0.0,
+        }
+        if n_finite == 0:
             for key in ["mean", "std", "p01", "p10", "p50", "p90", "p99", "min", "max"]:
                 stats[f"{prefix}_{key}"] = float("nan")
             return stats
-        qs = torch.quantile(
-            finite_values,
-            torch.tensor([0.01, 0.10, 0.50, 0.90, 0.99], dtype=finite_values.dtype),
-        )
+        # 均值/标准差/极值是无限流的规约，保持全量精度。
         stats.update({
             f"{prefix}_mean": float(finite_values.mean().item()),
-            f"{prefix}_std": float(finite_values.std(unbiased=False).item()) if finite_values.numel() > 1 else 0.0,
+            f"{prefix}_std": float(finite_values.std(unbiased=False).item()) if n_finite > 1 else 0.0,
+            f"{prefix}_min": float(finite_values.min().item()),
+            f"{prefix}_max": float(finite_values.max().item()),
+        })
+        # 分位数受 torch.quantile 的 2^24 元素硬限制，超限时等距下采样；
+        # 等距切片是确定性的，且不消耗 RNG 状态，不影响复现性。
+        sample = finite_values
+        cap = int(max_samples) if max_samples else 0
+        if cap > 0 and n_finite > cap:
+            step = -(-n_finite // cap)
+            sample = finite_values[::step]
+        stats[f"{prefix}_n_used_for_quantiles"] = float(sample.numel())
+        qs = torch.quantile(
+            sample,
+            torch.tensor([0.01, 0.10, 0.50, 0.90, 0.99], dtype=sample.dtype),
+        )
+        stats.update({
             f"{prefix}_p01": float(qs[0].item()),
             f"{prefix}_p10": float(qs[1].item()),
             f"{prefix}_p50": float(qs[2].item()),
             f"{prefix}_p90": float(qs[3].item()),
             f"{prefix}_p99": float(qs[4].item()),
-            f"{prefix}_min": float(finite_values.min().item()),
-            f"{prefix}_max": float(finite_values.max().item()),
         })
         return stats
 
