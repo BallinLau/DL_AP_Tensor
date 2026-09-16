@@ -7341,6 +7341,12 @@ class Episode:
                     "bp0_confidence": p0_grid["confidence"].detach().cpu(),
                     "bpi_confidence": pi_grid["confidence"].detach().cpu(),
                     "mix_confidence": mix_grid["confidence"].detach().cpu(),
+                    # Read-only diagnostics. These values are evaluated at the
+                    # policy prediction used when the fixed teacher cache is
+                    # built and do not enter the distillation objective.
+                    "bp0_regret": p0_grid.get("regret", torch.zeros_like(bp0)).detach().cpu(),
+                    "bpi_regret": pi_grid.get("regret", torch.zeros_like(bpI)).detach().cpu(),
+                    "mix_regret": mix_grid.get("regret", torch.zeros_like(bp_mix)).detach().cpu(),
                     "mix_sample_weight": mix_survival.detach().cpu(),
                     "eta_next_active": eta_next_active.detach().cpu(),
                     "teacher_snapshot_hash": self._state_dict_hash(teacher_model),
@@ -7413,7 +7419,13 @@ class Episode:
             for key in required_tensor_keys
         }
         optional_tensor_keys = []
-        for key in ("source_id", "source_index"):
+        for key in (
+            "source_id",
+            "source_index",
+            "bp0_regret",
+            "bpi_regret",
+            "mix_regret",
+        ):
             present = [isinstance(item.get(key), torch.Tensor) for item in cache]
             if any(present) and not all(present):
                 raise ValueError(f"BP cache has inconsistent optional field {key!r}")
