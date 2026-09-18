@@ -32,7 +32,11 @@ from data.data_utils import compute_quantile_features
 from losses import SDFLoss, P0Loss, PILoss, QLoss, FC2Loss
 from losses.FC2losspipe import FC2LossPipe
 from losses.utils import compute_z_penalty, compute_aio_residual
-from losses.sdf_loss import moment_penalty
+from losses.sdf_loss import (
+    compute_pooled_moment_constraints,
+    moment_penalty,
+    phr_augmented_lagrangian,
+)
 from data.data_utils import build_sdf_pairs_from_macro_ts
 from .gradient_utils import gradient_protection, compute_gradient_norm
 from .scheduler import LossWeightScheduler, LearningRateScheduler
@@ -242,6 +246,7 @@ class Episode:
         self._sdf_shock_bank_episode_id: Optional[int] = None
         self._sdf_shock_bank_key: Optional[Tuple[Any, ...]] = None
         self._sdf_pair_generator: Optional[torch.Generator] = None
+        self._reset_sdf_al_state()
 
     def _configure_policy_value_parameterization(self) -> None:
         mode = str(getattr(self.hyperparams, "pv_value_scale_mode", "none")).lower()
@@ -284,6 +289,87 @@ class Episode:
 
     def set_sdf_training_phase(self, phase: str | SDFTrainingPhase) -> None:
         self.sdf_training_phase = SDFTrainingPhase(phase)
+
+    def _sdf_moment_constraint_mode(self) -> str:
+        mode = str(
+            getattr(self.hyperparams, "sdf_moment_constraint_mode", "legacy_penalty")
+        ).lower()
+        if mode not in {"legacy_penalty", "augmented_lagrangian"}:
+            raise ValueError(f"Unknown sdf_moment_constraint_mode={mode!r}")
+        return mode
+
+    def _sdf_al_active_for_phase(self, phase: str | SDFTrainingPhase) -> bool:
+        return (
+            SDFTrainingPhase(phase) == SDFTrainingPhase.SDF_TRUE_ONLY
+            and self._sdf_moment_constraint_mode() == "augmented_lagrangian"
+        )
+
+    def _reset_sdf_al_state(self) -> Dict[str, float]:
+        lambda_init = float(getattr(self.hyperparams, "sdf_al_lambda_init", 0.0))
+        rho = float(getattr(self.hyperparams, "sdf_al_rho", 10.0))
+        if lambda_init < 0:
+            raise ValueError(f"sdf_al_lambda_init must be nonnegative, got {lambda_init}.")
+        if rho <= 0:
+            raise ValueError(f"sdf_al_rho must be positive, got {rho}.")
+        self._sdf_al_state = {
+            "lambda_mean_low": lambda_init,
+            "lambda_mean_high": lambda_init,
+            "lambda_var_high": lambda_init,
+            "rho": rho,
+        }
+        return self._get_sdf_al_state()
+
+    def _get_sdf_al_state(self) -> Dict[str, float]:
+        if not hasattr(self, "_sdf_al_state"):
+            self._reset_sdf_al_state()
+        return {key: float(value) for key, value in self._sdf_al_state.items()}
+
+    def _update_sdf_al_duals(self, constraint_estimate: Dict[str, float]) -> Dict[str, float]:
+        state = self._get_sdf_al_state()
+        rho = float(state["rho"])
+        for suffix in ("mean_low", "mean_high", "var_high"):
+            g = float(constraint_estimate[f"g_{suffix}"])
+            if not np.isfinite(g):
+                raise RuntimeError(f"Cannot update SDF AL dual from non-finite g_{suffix}={g}.")
+            key = f"lambda_{suffix}"
+            self._sdf_al_state[key] = max(0.0, float(state[key]) + rho * g)
+        return self._get_sdf_al_state()
+
+    def _sdf_constraint_bounds(self) -> Tuple[float, float, float, float]:
+        loss_fn = getattr(self, "loss_fns", {}).get("sdf") if hasattr(self, "loss_fns") else None
+        return (
+            float(getattr(loss_fn, "mu_lo", -0.025)),
+            float(getattr(loss_fn, "mu_hi", 0.0)),
+            float(getattr(loss_fn, "var_hi", 0.25)),
+            float(getattr(self.hyperparams, "sdf_al_eps", 1e-8)),
+        )
+
+    def _sdf_constraint_diagnostics_from_values(
+        self,
+        mu: float,
+        var: float,
+    ) -> Dict[str, Any]:
+        mu_lo, mu_hi, var_hi, eps = self._sdf_constraint_bounds()
+        mean_lower = float(np.exp(mu_lo))
+        mean_upper = float(np.exp(mu_hi))
+        var_upper = float(np.exp(var_hi))
+        g_mean_low = (mean_lower - mu) / mean_lower
+        g_mean_high = (mu - mean_upper) / mean_upper
+        g_var_high = (var - var_upper) / var_upper
+        g_values = np.asarray([g_mean_low, g_mean_high, g_var_high], dtype=np.float64)
+        finite = bool(np.isfinite(g_values).all())
+        max_violation = float(np.maximum(g_values, 0.0).max()) if finite else float("nan")
+        return {
+            "mu": float(mu),
+            "var": float(var),
+            "log_mu": float(np.log(max(mu, eps))) if np.isfinite(mu) else float("nan"),
+            "log_var": float(np.log(max(var, eps))) if np.isfinite(var) else float("nan"),
+            "g_mean_low": float(g_mean_low),
+            "g_mean_high": float(g_mean_high),
+            "g_var_high": float(g_var_high),
+            "max_constraint_violation": max_violation,
+            "constraints_finite": finite,
+        }
 
     @staticmethod
     def _state_dict_to_cpu(module: nn.Module) -> Dict[str, torch.Tensor]:
@@ -3457,6 +3543,30 @@ class Episode:
             L1, L2 = moment_penalty(M_use[:, j], loss_fn.mu_lo, loss_fn.mu_hi, loss_fn.var_hi)
             moment_loss = moment_loss + L1 + L2
 
+        # The AL treatment pools both child branches because they are draws
+        # from the same transition law. Legacy diagnostics remain branch-wise.
+        moment_constraints = compute_pooled_moment_constraints(
+            M_use,
+            mu_lo=loss_fn.mu_lo,
+            mu_hi=loss_fn.mu_hi,
+            var_hi=loss_fn.var_hi,
+            eps=float(getattr(self.hyperparams, "sdf_al_eps", 1e-8)),
+        )
+        al_active = self._sdf_al_active_for_phase(phase)
+        al_state = self._get_sdf_al_state()
+        al_total = torch.zeros((), device=M_use.device, dtype=M_use.dtype)
+        al_terms = {
+            "mean_low": torch.zeros_like(al_total),
+            "mean_high": torch.zeros_like(al_total),
+            "var_high": torch.zeros_like(al_total),
+        }
+        if al_active:
+            al_total, al_terms = phr_augmented_lagrangian(
+                moment_constraints,
+                al_state,
+                rho=al_state["rho"],
+            )
+
         euler_weight = 1.0
         recursive_euler_weight = 0.0
         # Explicit SDF phases use phase-specific weights to avoid legacy stage1/stage2 ambiguity.
@@ -3722,6 +3832,11 @@ class Episode:
             forecast_recon_weight_eff = 0.0
             delta_penalty_weight_eff = 0.0
             jacobian_penalty_weight_eff = 0.0
+        if al_active:
+            # The treatment replaces both historical regularizers; it never
+            # stacks AL on top of the fixed penalty or the log(0.98) anchor.
+            moment_weight_eff = 0.0
+            mean_anchor_weight_eff = 0.0
 
         if bool(getattr(self, "_fc1_teacher_forcing_stage", False)) and self.add_FC1loss:
             teacher_weight = float(getattr(self.hyperparams, "fc1_teacher_forcing_weight", 1.0))
@@ -3733,6 +3848,8 @@ class Episode:
             )
             moment_weight_eff = 0.0
             mean_anchor_weight_eff = 0.0
+        elif al_active:
+            total_sdf_loss = euler_weight * true_state_main_loss + al_total
         else:
             total_sdf_loss = (
                 euler_weight * true_state_main_loss
@@ -3747,8 +3864,8 @@ class Episode:
 
         # 诊断：每步记录 M 的矩和 FC1 跨期增量分布
         with torch.no_grad():
-            mu = M_use.mean().clamp_min(1e-8)
-            var = ((M_use - mu) ** 2).mean().clamp_min(1e-8)
+            mu = moment_constraints["mu"]
+            var = moment_constraints["var"]
             d_hatcf = (c_children_wealth - c_parent.unsqueeze(1)).reshape(-1)
             d_lnkf = (k_children_wealth - k_parent.unsqueeze(1)).reshape(-1)
             d_hatcf_recon = (c_children_recon - c_parent.unsqueeze(1)).reshape(-1)
@@ -3827,6 +3944,24 @@ class Episode:
                 'sdf_recursive_main_weight_effective': float(recursive_euler_weight),
                 'sdf_moment_weight_effective': float(moment_weight_eff),
                 'sdf_anchor_weight_effective': float(mean_anchor_weight_eff),
+                'sdf_al_active': float(1.0 if al_active else 0.0),
+                'sdf_al_rho': float(al_state["rho"]),
+                'sdf_al_lambda_mean_low': float(al_state["lambda_mean_low"]),
+                'sdf_al_lambda_mean_high': float(al_state["lambda_mean_high"]),
+                'sdf_al_lambda_var_high': float(al_state["lambda_var_high"]),
+                'sdf_constraint_mu': float(moment_constraints["mu"].detach().item()),
+                'sdf_constraint_var': float(moment_constraints["var"].detach().item()),
+                'sdf_constraint_log_mu': float(moment_constraints["log_mu"].detach().item()),
+                'sdf_constraint_log_var': float(moment_constraints["log_var"].detach().item()),
+                'sdf_constraint_g_mean_low': float(moment_constraints["g_mean_low"].detach().item()),
+                'sdf_constraint_g_mean_high': float(moment_constraints["g_mean_high"].detach().item()),
+                'sdf_constraint_g_var_high': float(moment_constraints["g_var_high"].detach().item()),
+                'sdf_constraint_max_violation': float(moment_constraints["max_violation"].detach().item()),
+                'sdf_constraint_batch_feasible': float(moment_constraints["feasible"].detach().item()),
+                'sdf_al_term_mean_low': float(al_terms["mean_low"].detach().item()),
+                'sdf_al_term_mean_high': float(al_terms["mean_high"].detach().item()),
+                'sdf_al_term_var_high': float(al_terms["var_high"].detach().item()),
+                'sdf_al_term_total': float(al_total.detach().item()),
                 'fc1_recon_weight_effective': float(recon_weight_eff),
                 'fc1_forecast_weight_effective': float(forecast_recon_weight_eff),
                 'fc1_rollout_weight_effective': 0.0,
@@ -3886,8 +4021,8 @@ class Episode:
             self._latest_sdf_terms.update(value_scale_diag)
             self._latest_sdf_terms.update(fresh_pair_diag)
             self._latest_sdf_diag = {
-                'sdf_log_mean_M': float(torch.log(mu).item()),
-                'sdf_log_var_M': float(torch.log(var).item()),
+                'sdf_log_mean_M': float(moment_constraints["log_mu"].detach().item()),
+                'sdf_log_var_M': float(moment_constraints["log_var"].detach().item()),
                 'sdf_dhatcf_mean': float(d_hatcf.mean().item()),
                 'sdf_dhatcf_p10': _q(d_hatcf, 0.10),
                 'sdf_dhatcf_p50': _q(d_hatcf, 0.50),
@@ -9475,6 +9610,19 @@ class Episode:
                 out[f'{prefix}_{name}_max'] = float(m.max().item())
                 out[f'{prefix}_{name}_lt_0p7_rate'] = float((m < 0.7).to(torch.float32).mean().item())
                 out[f'{prefix}_{name}_gt_1p3_rate'] = float((m > 1.3).to(torch.float32).mean().item())
+            if raw_m.numel() > 0 and bool(finite_mask.all().item()):
+                mu = raw_m.mean()
+                var = ((raw_m - mu) ** 2).mean()
+                eps = float(getattr(self.hyperparams, "sdf_al_eps", 1e-8))
+                out[f'{prefix}_{name}_var'] = float(var.item())
+                out[f'{prefix}_{name}_log_mean'] = float(torch.log(mu.clamp_min(eps)).item())
+                out[f'{prefix}_{name}_log_var'] = float(torch.log(var.clamp_min(eps)).item())
+            else:
+                # Do not filter non-finite M and then report a seemingly valid
+                # economic constraint diagnostic.
+                out[f'{prefix}_{name}_var'] = float('nan')
+                out[f'{prefix}_{name}_log_mean'] = float('nan')
+                out[f'{prefix}_{name}_log_var'] = float('nan')
 
         _safe_m_metrics('primary_true_state_M', primary_m_parts)
         _safe_m_metrics('recursive_forecast_state_M', recursive_m_parts)
@@ -10097,6 +10245,71 @@ class Episode:
             "rounds": rounds,
         }
 
+    def _estimate_sdf_al_constraints(
+        self,
+        train_batches: List[Dict[str, torch.Tensor]],
+    ) -> Dict[str, float]:
+        """Re-estimate pooled constraints at the accepted epoch's final theta.
+
+        The pass uses the fixed child transitions in the SDF_TRUE training
+        split. It intentionally does not reuse stochastic minibatch moments,
+        because those were produced at different parameter iterates.
+        """
+        if not train_batches:
+            raise RuntimeError("SDF AL dual estimation requires non-empty training batches.")
+        model = self.models["sdf_fc1"]
+        was_training = bool(model.training)
+        model.eval()
+        max_batches = int(getattr(self.hyperparams, "sdf_al_dual_max_batches", 0))
+        selected = train_batches if max_batches <= 0 else train_batches[:max_batches]
+        m_parts: List[torch.Tensor] = []
+        try:
+            with torch.no_grad():
+                for batch in selected:
+                    parent = batch["parent"]
+                    children = batch.get("children", [])
+                    if not children:
+                        child0 = batch.get("child0")
+                        child1 = batch.get("child1")
+                        if child0 is not None and child1 is not None:
+                            children = [child0, child1]
+                    if len(children) < 2:
+                        raise RuntimeError("SDF AL dual estimation requires exactly two fixed children.")
+                    if parent.shape[1] < 9:
+                        raise RuntimeError("SDF AL dual estimation requires true Hatc_t and LnK_t.")
+                    children_t = torch.stack(children[:2], dim=1)
+                    _, _, m_values, _, _ = model.forward_step(
+                        x_prev=parent[:, 4:5],
+                        x_curr=children_t[:, :, 4:5],
+                        hatcf_prev=parent[:, 7:8],
+                        lnkf_prev=parent[:, 8:9],
+                        return_physical=True,
+                    )
+                    m_parts.append(m_values.detach().reshape(-1).cpu())
+        finally:
+            if was_training:
+                model.train()
+
+        if not m_parts:
+            raise RuntimeError("SDF AL dual estimation produced no M observations.")
+        mu_lo, mu_hi, var_hi, eps = self._sdf_constraint_bounds()
+        constraints = compute_pooled_moment_constraints(
+            torch.cat(m_parts),
+            mu_lo=mu_lo,
+            mu_hi=mu_hi,
+            var_hi=var_hi,
+            eps=eps,
+        )
+        result = {
+            key: float(value.detach().item())
+            for key, value in constraints.items()
+            if key not in {"feasible"}
+        }
+        result["feasible"] = bool(constraints["feasible"].detach().item())
+        result["n_batches"] = int(len(selected))
+        result["n_observations"] = int(sum(part.numel() for part in m_parts))
+        return result
+
     def _sdf_gate_passed(
         self,
         eval_metrics: Dict[str, float],
@@ -10129,6 +10342,9 @@ class Episode:
         t_key = f"{signed_prefix}_t"
         m_key = f"{m_prefix}_mean"
         m_mean = eval_metrics.get(m_key, float("nan"))
+        m_var = eval_metrics.get(f"{m_prefix}_var", float("nan"))
+        log_m_mean = eval_metrics.get(f"{m_prefix}_log_mean", float("nan"))
+        log_m_var = eval_metrics.get(f"{m_prefix}_log_var", float("nan"))
         finite_ratio = eval_metrics.get(f"{m_prefix}_finite_ratio", float("nan"))
         m_p99 = eval_metrics.get(f"{m_prefix}_p99", float("nan"))
         m_max = eval_metrics.get(f"{m_prefix}_max", float("nan"))
@@ -10137,18 +10353,33 @@ class Episode:
             legacy_prefix = signed_prefix.replace(f"_{signed_suffix}", "_signed_aio")
             signed_t = eval_metrics.get(f"{legacy_prefix}_t", float("nan"))
         log_mean_error = abs(np.log(max(float(m_mean), 1e-12)) - target) if np.isfinite(m_mean) else float("nan")
-        passed = (
-            np.isfinite(log_mean_error)
-            and np.isfinite(signed_t)
+        al_active = self._sdf_al_active_for_phase(stage)
+        constraint_diag = self._sdf_constraint_diagnostics_from_values(float(m_mean), float(m_var))
+        gate_tolerance = float(getattr(self.hyperparams, "sdf_al_gate_tolerance", 0.0))
+        moment_feasible = bool(
+            constraint_diag["constraints_finite"]
+            and constraint_diag["g_mean_low"] <= gate_tolerance
+            and constraint_diag["g_mean_high"] <= gate_tolerance
+            and constraint_diag["g_var_high"] <= gate_tolerance
+        )
+        common_passed = (
+            np.isfinite(signed_t)
             and np.isfinite(finite_ratio)
             and np.isfinite(m_p99)
             and np.isfinite(m_max)
-            and log_mean_error <= max_log_mean_error
             and abs(float(signed_t)) <= max_t
             and float(finite_ratio) >= min_finite_ratio
             and float(m_p99) <= p99_max
             and float(m_max) <= max_max
         )
+        if al_active:
+            passed = common_passed and moment_feasible
+        else:
+            passed = (
+                common_passed
+                and np.isfinite(log_mean_error)
+                and log_mean_error <= max_log_mean_error
+            )
         diag = {
             "passed": bool(passed),
             "stage": stage.value,
@@ -10162,7 +10393,18 @@ class Episode:
             "tail_gate_active": tail_gate_active,
             "log_mean_target": target,
             "log_mean_error": float(log_mean_error),
+            "m_var": float(m_var),
+            "log_m_mean": float(log_m_mean),
+            "log_m_var": float(log_m_var),
             "max_log_mean_error": max_log_mean_error,
+            "constraint_mode": self._sdf_moment_constraint_mode(),
+            "al_active": bool(al_active),
+            "g_mean_low": constraint_diag["g_mean_low"],
+            "g_mean_high": constraint_diag["g_mean_high"],
+            "g_var_high": constraint_diag["g_var_high"],
+            "max_constraint_violation": constraint_diag["max_constraint_violation"],
+            "moment_feasible": moment_feasible,
+            "sdf_al_gate_tolerance": gate_tolerance,
             "gate_residual_mode": gate_residual_mode,
             "signed_aio_t": float(signed_t),
             "max_signed_t_abs": max_t,
@@ -10181,7 +10423,11 @@ class Episode:
             if np.isfinite(finite_ratio) and finite_ratio >= finite_min
             else 1.0
         )
-        m_violation = log_error / log_limit if np.isfinite(log_error) else float("inf")
+        if bool(gate_diag.get("al_active", False)):
+            raw_violation = float(gate_diag.get("max_constraint_violation", float("inf")))
+            m_violation = raw_violation if np.isfinite(raw_violation) else float("inf")
+        else:
+            m_violation = log_error / log_limit if np.isfinite(log_error) else float("inf")
         t_violation = signed_t / t_limit if np.isfinite(signed_t) else float("inf")
         return (
             float(finite_failure),
@@ -10232,6 +10478,9 @@ class Episode:
             else f"{prefix}_recursive_forecast_state_{signed_suffix}"
         )
         m_mean = float(eval_metrics.get(f"{m_prefix}_mean", float("nan")))
+        m_var = float(eval_metrics.get(f"{m_prefix}_var", float("nan")))
+        log_m_mean = float(eval_metrics.get(f"{m_prefix}_log_mean", float("nan")))
+        log_m_var = float(eval_metrics.get(f"{m_prefix}_log_var", float("nan")))
         finite_ratio = float(eval_metrics.get(f"{m_prefix}_finite_ratio", float("nan")))
         aio_t = float(eval_metrics.get(f"{signed_prefix}_t", float("nan")))
         if not np.isfinite(aio_t):
@@ -10257,16 +10506,36 @@ class Episode:
         )
         t_weight = float(getattr(self.hyperparams, "sdf_score_t_weight", 0.05))
         t_cap = float(getattr(self.hyperparams, "sdf_score_t_cap", 20.0))
-        sdf_score = (
-            abs(np.log(max(m_mean, 1e-12)) - target_log)
-            + t_weight * min(abs(aio_t), t_cap)
-            if np.isfinite(m_mean) and np.isfinite(aio_t)
-            else float("inf")
+        al_active = self._sdf_al_active_for_phase(stage)
+        constraint_diag = self._sdf_constraint_diagnostics_from_values(m_mean, m_var)
+        gate_tolerance = float(getattr(self.hyperparams, "sdf_al_gate_tolerance", 0.0))
+        moment_feasible = bool(
+            constraint_diag["constraints_finite"]
+            and constraint_diag["g_mean_low"] <= gate_tolerance
+            and constraint_diag["g_mean_high"] <= gate_tolerance
+            and constraint_diag["g_var_high"] <= gate_tolerance
         )
+        if al_active:
+            sdf_score = (
+                constraint_diag["max_constraint_violation"]
+                + t_weight * min(abs(aio_t), t_cap)
+                if constraint_diag["constraints_finite"] and np.isfinite(aio_t)
+                else float("inf")
+            )
+        else:
+            sdf_score = (
+                abs(np.log(max(m_mean, 1e-12)) - target_log)
+                + t_weight * min(abs(aio_t), t_cap)
+                if np.isfinite(m_mean) and np.isfinite(aio_t)
+                else float("inf")
+            )
         return {
             "prefix": prefix,
             "stage": stage.value,
             "m_mean": m_mean,
+            "m_var": m_var,
+            "log_m_mean": log_m_mean,
+            "log_m_var": log_m_var,
             "m_target": m_target,
             "m_finite_ratio": finite_ratio,
             "safe": safe,
@@ -10275,6 +10544,13 @@ class Episode:
             "hatc_rmse": hatc_rmse,
             "lnk_rmse": lnk_rmse,
             "sdf_score": float(sdf_score),
+            "constraint_mode": self._sdf_moment_constraint_mode(),
+            "al_active": bool(al_active),
+            "g_mean_low": constraint_diag["g_mean_low"],
+            "g_mean_high": constraint_diag["g_mean_high"],
+            "g_var_high": constraint_diag["g_var_high"],
+            "max_constraint_violation": constraint_diag["max_constraint_violation"],
+            "moment_feasible": moment_feasible,
             "wealth_ratio_p50": float(
                 eval_metrics.get(f"{prefix}_primary_true_state_wealth_ratio_p50", float("nan"))
             ),
@@ -10393,6 +10669,13 @@ class Episode:
         eval_batch_limit = int(getattr(self.hyperparams, "sdf_fc1_eval_max_batches", 0))
         eval_batch_limit = eval_batch_limit if eval_batch_limit > 0 else None
         history: List[Dict[str, Any]] = []
+        al_active = self._sdf_al_active_for_phase(stage)
+        if (
+            al_active
+            and bool(getattr(self.hyperparams, "sdf_al_reset_on_true_start", True))
+        ):
+            self._reset_sdf_al_state()
+        initial_al_state = self._get_sdf_al_state()
 
         initial_prefix = f"{prefix}_epoch0"
         initial_eval = self._evaluate_sdf_fc1_batches(
@@ -10433,6 +10716,11 @@ class Episode:
             "lr_at_first_optimizer_step": [],
             "lr_at_attempt_end": self._optimizer_lrs(optimizer),
             "learning_rate": self._optimizer_lrs(optimizer),
+            "al_dual_update_applied": False,
+            "al_dual_source": None,
+            "al_dual_before": initial_al_state,
+            "al_constraint_estimate": None,
+            "al_dual_after": initial_al_state,
         })
 
         if (
@@ -10534,11 +10822,40 @@ class Episode:
                     ),
                     "lr_at_attempt_end": self._optimizer_lrs(optimizer),
                     "learning_rate": self._optimizer_lrs(optimizer),
+                    "al_dual_update_applied": False,
+                    "al_dual_source": None,
+                    "al_dual_before": self._get_sdf_al_state(),
+                    "al_constraint_estimate": None,
+                    "al_dual_after": self._get_sdf_al_state(),
                 }
                 history.append(record)
                 last_epoch = epoch_idx
 
                 if accepted:
+                    if al_active:
+                        dual_before = self._get_sdf_al_state()
+                        constraint_estimate = self._estimate_sdf_al_constraints(train_batches)
+                        dual_after = self._update_sdf_al_duals(constraint_estimate)
+                        record.update({
+                            "al_dual_update_applied": True,
+                            "al_dual_source": "train_split",
+                            "al_dual_before": dual_before,
+                            "al_constraint_estimate": constraint_estimate,
+                            "al_dual_after": dual_after,
+                            "lambda_mean_low_before": dual_before["lambda_mean_low"],
+                            "lambda_mean_high_before": dual_before["lambda_mean_high"],
+                            "lambda_var_high_before": dual_before["lambda_var_high"],
+                            "dual_g_mean_low": constraint_estimate["g_mean_low"],
+                            "dual_g_mean_high": constraint_estimate["g_mean_high"],
+                            "dual_g_var_high": constraint_estimate["g_var_high"],
+                            "lambda_mean_low_after": dual_after["lambda_mean_low"],
+                            "lambda_mean_high_after": dual_after["lambda_mean_high"],
+                            "lambda_var_high_after": dual_after["lambda_var_high"],
+                            "dual_mu": constraint_estimate["mu"],
+                            "dual_var": constraint_estimate["var"],
+                            "dual_log_mu": constraint_estimate["log_mu"],
+                            "dual_log_var": constraint_estimate["log_var"],
+                        })
                     accepted_checkpoint = self._stage_checkpoint(model, optimizer, scheduler)
                     accepted_epoch = epoch_idx
                     accepted_epochs += 1
@@ -10645,6 +10962,7 @@ class Episode:
             "final_gate": final_gate,
             "final_validation_summary": final_summary,
             "history": history,
+            "sdf_al_state": self._get_sdf_al_state(),
         }
 
     def _episode0_sdf_safety_gate_passed(

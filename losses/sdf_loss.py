@@ -20,10 +20,12 @@ SDF 计算（对每条路径 j）：
 L_SDF = main_loss + Σ_j (L1_{M^{(j)}} + L2_{M^{(j)}})
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Dict, Optional, List, Union
+from typing import Tuple, Dict, Mapping, Optional, List, Union
 
 import sys
 sys.path.append('..')
@@ -77,6 +79,101 @@ def moment_penalty(
     L2 = step(log_var - var_hi) * 100.0 * (log_var - var_hi) ** 2
 
     return L1, L2
+
+
+def compute_pooled_moment_constraints(
+    M: torch.Tensor,
+    mu_lo: float,
+    mu_hi: float,
+    var_hi: float,
+    eps: float = 1e-8,
+) -> Dict[str, torch.Tensor]:
+    """Compute pooled raw-scale inequalities equivalent to the log restrictions.
+
+    The original economic restrictions are::
+
+        mu_lo <= log E[M] <= mu_hi
+        log Var(M) <= var_hi
+
+    Flattening every parent/branch observation into one common population, the
+    equivalent dimensionless constraints are::
+
+        g_mean_low  = (exp(mu_lo) - E[M]) / exp(mu_lo) <= 0
+        g_mean_high = (E[M] - exp(mu_hi)) / exp(mu_hi) <= 0
+        g_var_high  = (Var(M) - exp(var_hi)) / exp(var_hi) <= 0
+
+    ``mu`` and centered ``var`` are intentionally neither detached nor
+    clamped, so the primal constraint term remains differentiable and exposes
+    non-finite values to the caller. ``eps`` is used only for log diagnostics.
+    """
+    if not torch.is_tensor(M):
+        raise TypeError("M must be a torch.Tensor")
+    if M.numel() == 0:
+        raise ValueError("M must contain at least one observation")
+    if eps <= 0:
+        raise ValueError(f"eps must be positive, got {eps}.")
+
+    pooled = M.reshape(-1)
+    mu = pooled.mean()
+    var = ((pooled - mu) ** 2).mean()
+    mean_lower = torch.as_tensor(math.exp(float(mu_lo)), device=M.device, dtype=M.dtype)
+    mean_upper = torch.as_tensor(math.exp(float(mu_hi)), device=M.device, dtype=M.dtype)
+    var_upper = torch.as_tensor(math.exp(float(var_hi)), device=M.device, dtype=M.dtype)
+    g_mean_low = (mean_lower - mu) / mean_lower
+    g_mean_high = (mu - mean_upper) / mean_upper
+    g_var_high = (var - var_upper) / var_upper
+    violations = torch.stack((g_mean_low, g_mean_high, g_var_high))
+
+    return {
+        "mu": mu,
+        "var": var,
+        "log_mu": torch.log(mu.clamp_min(float(eps))),
+        "log_var": torch.log(var.clamp_min(float(eps))),
+        "mean_lower": mean_lower,
+        "mean_upper": mean_upper,
+        "var_upper": var_upper,
+        "g_mean_low": g_mean_low,
+        "g_mean_high": g_mean_high,
+        "g_var_high": g_var_high,
+        "max_violation": torch.relu(violations).max(),
+        "feasible": (violations <= 0).all(),
+    }
+
+
+def phr_augmented_lagrangian(
+    constraints: Mapping[str, torch.Tensor],
+    duals: Mapping[str, Union[float, torch.Tensor]],
+    rho: float,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Return the Powell-Hestenes-Rockafellar inequality AL term.
+
+    For each ``g_i(theta) <= 0`` and ``lambda_i >= 0``::
+
+        Phi_i = (relu(lambda_i + rho*g_i(theta))**2 - lambda_i**2) / (2*rho)
+        lambda_i <- max(0, lambda_i + rho*g_i)
+
+    This helper computes only the differentiable primal ``Phi_i`` terms. Dual
+    updates are episode-level optimization state and are applied separately
+    after an accepted epoch.
+    """
+    rho = float(rho)
+    if rho <= 0:
+        raise ValueError(f"rho must be positive, got {rho}.")
+
+    key_pairs = (
+        ("mean_low", "g_mean_low", "lambda_mean_low"),
+        ("mean_high", "g_mean_high", "lambda_mean_high"),
+        ("var_high", "g_var_high", "lambda_var_high"),
+    )
+    terms: Dict[str, torch.Tensor] = {}
+    for name, constraint_key, dual_key in key_pairs:
+        g = constraints[constraint_key]
+        lam = torch.as_tensor(duals[dual_key], device=g.device, dtype=g.dtype)
+        if bool((lam < 0).detach().item()):
+            raise ValueError(f"{dual_key} must be nonnegative.")
+        terms[name] = (torch.relu(lam + rho * g).pow(2) - lam.pow(2)) / (2.0 * rho)
+    total = torch.stack(tuple(terms.values())).sum()
+    return total, terms
 
 
 class SDFLoss(nn.Module):

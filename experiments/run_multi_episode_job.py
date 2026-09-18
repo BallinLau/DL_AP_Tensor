@@ -187,6 +187,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sdf-true-moment-weight", type=float, default=None, help="Override SDF_TRUE moment weight")
     parser.add_argument("--sdf-true-anchor-weight", type=float, default=None, help="Override SDF_TRUE log-mean anchor weight")
     parser.add_argument(
+        "--sdf-moment-constraint-mode",
+        type=str.lower,
+        default=None,
+        choices=["legacy_penalty", "augmented_lagrangian"],
+        help="SDF_TRUE_ONLY moment handling: legacy fixed penalties or pooled PHR AL",
+    )
+    parser.add_argument("--sdf-al-rho", type=float, default=None, help="Fixed PHR penalty parameter for SDF_TRUE_ONLY")
+    parser.add_argument(
+        "--sdf-al-gate-tolerance",
+        type=float,
+        default=None,
+        help="Allowed normalized moment-constraint violation in the SDF_TRUE strict gate",
+    )
+    parser.add_argument(
+        "--sdf-al-dual-max-batches",
+        type=int,
+        default=None,
+        help="Accepted-epoch train batches used by the dual estimator; <=0 uses the full split",
+    )
+    parser.add_argument(
+        "--sdf-al-reset-on-true-start",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Reset SDF PHR multipliers when SDF_TRUE_ONLY begins",
+    )
+    parser.add_argument(
         "--sdf-reset-optimizer-on-true-start",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -442,6 +468,16 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.sdf_true_moment_weight = float(args.sdf_true_moment_weight)
     if args.sdf_true_anchor_weight is not None:
         hyperparams.sdf_true_anchor_weight = float(args.sdf_true_anchor_weight)
+    if args.sdf_moment_constraint_mode is not None:
+        hyperparams.sdf_moment_constraint_mode = str(args.sdf_moment_constraint_mode)
+    if args.sdf_al_rho is not None:
+        hyperparams.sdf_al_rho = float(args.sdf_al_rho)
+    if args.sdf_al_gate_tolerance is not None:
+        hyperparams.sdf_al_gate_tolerance = float(args.sdf_al_gate_tolerance)
+    if args.sdf_al_dual_max_batches is not None:
+        hyperparams.sdf_al_dual_max_batches = int(args.sdf_al_dual_max_batches)
+    if args.sdf_al_reset_on_true_start is not None:
+        hyperparams.sdf_al_reset_on_true_start = bool(args.sdf_al_reset_on_true_start)
     if args.sdf_reset_optimizer_on_true_start is not None:
         hyperparams.sdf_reset_optimizer_on_true_start = bool(args.sdf_reset_optimizer_on_true_start)
     if args.sdf_restore_best_checkpoint is not None:
@@ -742,6 +778,13 @@ def main():
                     "sdf_min_parent_groups_per_batch": hyperparams.sdf_min_parent_groups_per_batch,
                     "sdf_true_moment_weight": hyperparams.sdf_true_moment_weight,
                     "sdf_true_anchor_weight": hyperparams.sdf_true_anchor_weight,
+                    "sdf_moment_constraint_mode": hyperparams.sdf_moment_constraint_mode,
+                    "sdf_al_rho": hyperparams.sdf_al_rho,
+                    "sdf_al_lambda_init": hyperparams.sdf_al_lambda_init,
+                    "sdf_al_eps": hyperparams.sdf_al_eps,
+                    "sdf_al_gate_tolerance": hyperparams.sdf_al_gate_tolerance,
+                    "sdf_al_dual_max_batches": hyperparams.sdf_al_dual_max_batches,
+                    "sdf_al_reset_on_true_start": hyperparams.sdf_al_reset_on_true_start,
                     "sdf_reset_optimizer_on_true_start": hyperparams.sdf_reset_optimizer_on_true_start,
                     "sdf_restore_best_checkpoint": hyperparams.sdf_restore_best_checkpoint,
                     "sdf_collapse_log_mean_error": hyperparams.sdf_collapse_log_mean_error,

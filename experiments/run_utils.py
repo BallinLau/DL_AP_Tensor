@@ -148,6 +148,13 @@ def build_hyperparams():
     hp.sdf_euler_weight = 1.0
     hp.sdf_true_moment_weight = 5e-4
     hp.sdf_true_anchor_weight = 0.05
+    hp.sdf_moment_constraint_mode = "augmented_lagrangian"
+    hp.sdf_al_rho = 10.0
+    hp.sdf_al_lambda_init = 0.0
+    hp.sdf_al_eps = 1e-8
+    hp.sdf_al_gate_tolerance = 0.0
+    hp.sdf_al_dual_max_batches = 0
+    hp.sdf_al_reset_on_true_start = True
     hp.sdf_recursive_loss_weight = 0.25
     hp.sdf_recursive_moment_weight = 5e-4
     hp.sdf_recursive_anchor_weight = 0.05

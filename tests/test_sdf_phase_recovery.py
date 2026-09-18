@@ -42,7 +42,7 @@ class _DummyScheduler:
         self.group_base_lrs = list(state["group_base_lrs"])
 
 
-def _make_episode(eval_items):
+def _make_episode(eval_items, *, al_mode=False):
     model = _DummySdfFc1()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     episode = Episode.__new__(Episode)
@@ -68,6 +68,13 @@ def _make_episode(eval_items):
         sdf_min_parent_groups_per_batch=256,
         stage_lr_decay_on_reject=0.1,
         stage_max_retries=1,
+        sdf_moment_constraint_mode=("augmented_lagrangian" if al_mode else "legacy_penalty"),
+        sdf_al_rho=10.0,
+        sdf_al_lambda_init=0.0,
+        sdf_al_eps=1e-8,
+        sdf_al_gate_tolerance=0.0,
+        sdf_al_dual_max_batches=0,
+        sdf_al_reset_on_true_start=True,
     )
     episode._eval_items = list(eval_items)
     episode._train_calls = 0
@@ -78,6 +85,9 @@ def _make_episode(eval_items):
         item["prefix"] = prefix
         gate = item.get("gate", {})
         item.setdefault(f"{prefix}_primary_true_state_M_mean", gate.get("m_mean", 0.98))
+        item.setdefault(f"{prefix}_primary_true_state_M_var", gate.get("m_var", 0.01))
+        item.setdefault(f"{prefix}_primary_true_state_M_log_mean", torch.log(torch.tensor(gate.get("m_mean", 0.98))).item())
+        item.setdefault(f"{prefix}_primary_true_state_M_log_var", torch.log(torch.tensor(gate.get("m_var", 0.01))).item())
         item.setdefault(f"{prefix}_primary_true_state_M_finite_ratio", gate.get("m_finite_ratio", 1.0))
         item.setdefault(f"{prefix}_primary_true_state_normalized_signed_aio_t", gate.get("signed_aio_t", 0.0))
         item.setdefault(f"{prefix}_primary_true_state_hatc_next_rmse", gate.get("hatc_rmse", 0.1))
@@ -393,6 +403,95 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             Episode._parameter_max_change(episode.models["sdf_fc1"].fc1_model, before),
             0.0,
         )
+
+    def test_sdf_al_dual_updates_once_after_accepted_epoch(self):
+        before_gate = {
+            "passed": False,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 1.0,
+        }
+        after_gate = {
+            **before_gate,
+            "passed": True,
+            "signed_aio_t": 0.0,
+        }
+        episode = _make_episode(
+            [{"gate": before_gate}, {"gate": after_gate}, {"gate": after_gate}],
+            al_mode=True,
+        )
+        estimator_calls = []
+
+        def _estimate(_batches):
+            estimator_calls.append(1)
+            return {
+                "mu": 0.95,
+                "var": 0.01,
+                "log_mu": float(torch.log(torch.tensor(0.95)).item()),
+                "log_var": float(torch.log(torch.tensor(0.01)).item()),
+                "g_mean_low": 0.1,
+                "g_mean_high": -0.05,
+                "g_var_high": -0.9,
+            }
+
+        episode._estimate_sdf_al_constraints = _estimate
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=1,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        self.assertEqual(len(estimator_calls), 1)
+        self.assertEqual(result["accepted_epochs"], 1)
+        accepted_record = result["history"][1]
+        self.assertTrue(accepted_record["al_dual_update_applied"])
+        self.assertEqual(accepted_record["al_dual_source"], "train_split")
+        self.assertAlmostEqual(accepted_record["lambda_mean_low_after"], 1.0)
+
+    def test_sdf_al_rejected_attempts_do_not_update_duals(self):
+        before_gate = {
+            "passed": False,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 0.0,
+        }
+        worse_gate = {
+            **before_gate,
+            "signed_aio_t": 1.0,
+        }
+        episode = _make_episode(
+            [
+                {"gate": before_gate},
+                {"gate": worse_gate},
+                {"gate": worse_gate},
+                {"gate": before_gate},
+            ],
+            al_mode=True,
+        )
+        estimator_calls = []
+        episode._estimate_sdf_al_constraints = lambda _batches: estimator_calls.append(1)
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=1,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        self.assertEqual(estimator_calls, [])
+        self.assertEqual(result["accepted_epochs"], 0)
+        self.assertEqual(result["sdf_al_state"]["lambda_mean_low"], 0.0)
+        self.assertEqual(result["sdf_al_state"]["lambda_mean_high"], 0.0)
+        self.assertEqual(result["sdf_al_state"]["lambda_var_high"], 0.0)
+        for record in result["history"][1:]:
+            self.assertFalse(record["al_dual_update_applied"])
 
     def test_sdf_retry_uses_decayed_lr_after_rollback(self):
         before_gate = {

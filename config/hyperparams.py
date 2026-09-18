@@ -272,6 +272,17 @@ class HyperParams:
     sdf_euler_weight: float = 1.0
     sdf_true_moment_weight: float = 5e-4
     sdf_true_anchor_weight: float = 0.05
+    # SDF_TRUE_ONLY moment restrictions. ``legacy_penalty`` preserves the
+    # historical fixed moment penalty and log-mean anchor exactly;
+    # ``augmented_lagrangian`` replaces both with pooled PHR inequalities.
+    sdf_moment_constraint_mode: str = "augmented_lagrangian"
+    sdf_al_rho: float = 10.0
+    sdf_al_lambda_init: float = 0.0
+    sdf_al_eps: float = 1e-8
+    sdf_al_gate_tolerance: float = 0.0
+    # 0 uses the complete SDF_TRUE training split for accepted-epoch dual updates.
+    sdf_al_dual_max_batches: int = 0
+    sdf_al_reset_on_true_start: bool = True
     sdf_recursive_loss_weight: float = 0.25
     sdf_recursive_moment_weight: float = 5e-4
     sdf_recursive_anchor_weight: float = 0.05
