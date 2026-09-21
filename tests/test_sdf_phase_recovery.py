@@ -467,6 +467,7 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         }
         worse_gate = {
             **before_gate,
+            "m_finite_ratio": 0.99,
             "signed_aio_t": 1.0,
         }
         episode = _make_episode(
@@ -619,7 +620,7 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             al_mode=True,
         )
         episode.hyperparams.sdf_required_consecutive_passes = 2
-        episode._sdf_epoch_acceptance = lambda _before, _after: (True, "accepted")
+        episode._sdf_epoch_acceptance = lambda _before, _after, **_kwargs: (True, "accepted")
 
         def _estimate(feasible):
             return {
@@ -670,7 +671,7 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             [{"gate": passing_gate}, {"gate": passing_gate}, {"gate": passing_gate}],
             al_mode=True,
         )
-        episode._sdf_epoch_acceptance = lambda _before, _after: (True, "accepted")
+        episode._sdf_epoch_acceptance = lambda _before, _after, **_kwargs: (True, "accepted")
         estimates = iter([
             {
                 "mu": 0.95,
@@ -718,7 +719,7 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             [{"gate": passing_gate}, {"gate": passing_gate}, {"gate": passing_gate}],
             al_mode=True,
         )
-        episode._sdf_epoch_acceptance = lambda _before, _after: (True, "accepted")
+        episode._sdf_epoch_acceptance = lambda _before, _after, **_kwargs: (True, "accepted")
         feasible = {
             "mu": 0.98,
             "var": 0.01,
@@ -756,7 +757,7 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             al_mode=False,
         )
         episode.hyperparams.sdf_required_consecutive_passes = 2
-        episode._sdf_epoch_acceptance = lambda _before, _after: (True, "accepted")
+        episode._sdf_epoch_acceptance = lambda _before, _after, **_kwargs: (True, "accepted")
 
         result = episode._run_sdf_phase_with_validation(
             train_batches=[{"x": torch.ones(1)}],
@@ -836,6 +837,7 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         worse_gate = {
             **feasible_gate,
             "passed": False,
+            "m_finite_ratio": 0.99,
             "signed_aio_t": 1.0,
         }
         episode = _make_episode(
@@ -956,7 +958,11 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             "m_finite_ratio": 1.0,
             "sdf_score": 3.8,
         }
-        accepted, reason = episode._sdf_epoch_acceptance(before, after)
+        accepted, reason = episode._sdf_epoch_acceptance(
+            before,
+            after,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+        )
         self.assertTrue(accepted)
         self.assertEqual(reason, "accepted_recovery_step")
 
@@ -976,9 +982,175 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             "m_finite_ratio": 1.0,
             "sdf_score": 3.8,
         }
-        accepted, reason = episode._sdf_epoch_acceptance(before, after)
+        accepted, reason = episode._sdf_epoch_acceptance(
+            before,
+            after,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+        )
         self.assertFalse(accepted)
         self.assertEqual(reason, "not_moving_toward_safe_region")
+
+    def test_sdf_al_accepts_safe_score_plateau_above_t_cap(self):
+        episode = _make_episode([], al_mode=True)
+        before = {
+            "safe": True,
+            "m_finite_ratio": 1.0,
+            "max_constraint_violation": 0.0,
+            "aio_t": 28.6,
+            "sdf_score": 1.0,
+            "al_active": True,
+        }
+        after = {
+            **before,
+            "aio_t": 25.0,
+        }
+
+        accepted, reason = episode._sdf_epoch_acceptance(
+            before,
+            after,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "accepted_al_safe_outer_step")
+
+    def test_sdf_al_accepts_safe_nonmonotone_aio_outer_step(self):
+        episode = _make_episode([], al_mode=True)
+        before = {
+            "safe": True,
+            "m_finite_ratio": 1.0,
+            "aio_t": 28.6,
+            "sdf_score": 1.0,
+        }
+        after = {
+            **before,
+            "aio_t": 28.9,
+        }
+
+        accepted, reason = episode._sdf_epoch_acceptance(
+            before,
+            after,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "accepted_al_safe_outer_step")
+
+    def test_sdf_al_rejects_nonfinite_or_left_safe_region(self):
+        episode = _make_episode([], al_mode=True)
+        before = {"safe": True, "m_finite_ratio": 1.0, "sdf_score": 1.0}
+
+        accepted, reason = episode._sdf_epoch_acceptance(
+            before,
+            {"safe": True, "m_finite_ratio": 0.99, "sdf_score": 0.5},
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "nonfinite_sdf_distribution")
+
+        accepted, reason = episode._sdf_epoch_acceptance(
+            before,
+            {"safe": False, "m_finite_ratio": 1.0, "sdf_score": 0.5},
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "left_safe_region")
+
+    def test_sdf_al_recovery_uses_safety_distance_not_score(self):
+        episode = _make_episode([], al_mode=True)
+        before = {
+            "safe": False,
+            "m_mean": 0.01,
+            "m_target": 0.98,
+            "m_finite_ratio": 1.0,
+            "sdf_score": 1.0,
+        }
+        improving = {
+            **before,
+            "m_mean": 0.02,
+            "sdf_score": 2.0,
+        }
+        accepted, reason = episode._sdf_epoch_acceptance(
+            before,
+            improving,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+        )
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "accepted_al_recovery_step")
+
+        accepted, reason = episode._sdf_epoch_acceptance(
+            before,
+            {**before, "m_mean": 0.005, "sdf_score": 0.5},
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "not_moving_toward_safe_region")
+
+    def test_legacy_safe_score_plateau_still_rejects(self):
+        episode = _make_episode([], al_mode=False)
+        before = {"safe": True, "m_finite_ratio": 1.0, "sdf_score": 1.0}
+        after = dict(before)
+
+        accepted, reason = episode._sdf_epoch_acceptance(
+            before,
+            after,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "sdf_score_not_improved")
+
+    def test_sdf_al_stage_runs_full_budget_through_safe_score_plateau(self):
+        def _gate(t_value):
+            return {
+                "passed": False,
+                "m_mean": 0.9834303,
+                "m_var": 0.162718,
+                "m_finite_ratio": 1.0,
+                "signed_aio_t": t_value,
+            }
+
+        episode = _make_episode(
+            [
+                {"gate": _gate(30.0)},
+                {"gate": _gate(28.0)},
+                {"gate": _gate(25.0)},
+                {"gate": _gate(22.0)},
+                {"gate": _gate(22.0)},
+            ],
+            al_mode=True,
+        )
+        feasible = {
+            "mu": 0.9834303,
+            "var": 0.162718,
+            "log_mu": float(torch.log(torch.tensor(0.9834303)).item()),
+            "log_var": float(torch.log(torch.tensor(0.162718)).item()),
+            "g_mean_low": -0.008326,
+            "g_mean_high": -0.016570,
+            "g_var_high": -0.873275,
+        }
+        episode._estimate_sdf_al_constraints = lambda _batches: dict(feasible)
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=3,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        self.assertEqual(episode._train_calls, 3)
+        self.assertEqual(result["epochs_completed"], 3)
+        self.assertEqual(result["accepted_epochs"], 3)
+        self.assertFalse(result["skipped_current_stage"])
+        self.assertFalse(result["strict_gate_passed"])
+        self.assertFalse(result["passed"])
+        self.assertTrue(all(
+            record["acceptance_mode"] == "al_safe_outer_step"
+            and record["rollback_reason"] is None
+            for record in result["history"][1:]
+        ))
 
     def test_post_refresh_safety_mode_can_pass_when_strict_gate_fails(self):
         episode = _make_post_refresh_episode(primary_m=0.98, recursive_m=0.98)

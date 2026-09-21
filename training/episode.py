@@ -10741,6 +10741,9 @@ class Episode:
             and constraint_diag["g_var_high"] <= gate_tolerance
         )
         if al_active:
+            # Diagnostic only in AL mode. The PHR objective changes after each
+            # dual update, so this capped score is not a monotone epoch-
+            # acceptance criterion.
             sdf_score = (
                 constraint_diag["max_constraint_violation"]
                 + t_weight * min(abs(aio_t), t_cap)
@@ -10827,7 +10830,14 @@ class Episode:
         self,
         before: Dict[str, Any],
         after: Dict[str, Any],
+        *,
+        stage: SDFTrainingPhase,
     ) -> Tuple[bool, str]:
+        if self._sdf_al_active_for_phase(stage):
+            return self._sdf_al_epoch_acceptance(before, after)
+
+        # Legacy fixed-penalty behavior intentionally retains monotone score
+        # improvement as an epoch-acceptance requirement.
         min_improvement = float(getattr(self.hyperparams, "stage_min_improvement", 1e-4))
         before_safe = bool(before.get("safe", False))
         after_safe = bool(after.get("safe", False))
@@ -10854,6 +10864,37 @@ class Episode:
         if np.isfinite(before_score) and after_score >= before_score - min_improvement:
             return False, "recovery_score_not_improved"
         return True, "accepted_recovery_step"
+
+    def _sdf_al_epoch_acceptance(
+        self,
+        before: Dict[str, Any],
+        after: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """Accept numerically safe AL outer iterates without score monotonicity.
+
+        The PHR primal objective changes after every accepted dual update, so
+        neither the capped validation score nor the AiO t-statistic must fall
+        monotonically across outer epochs. Strict convergence remains the
+        responsibility of the unchanged validation gate and final stage gate.
+        """
+        min_improvement = float(
+            getattr(self.hyperparams, "stage_min_improvement", 1e-4)
+        )
+        before_safe = bool(before.get("safe", False))
+        after_safe = bool(after.get("safe", False))
+        after_finite = float(after.get("m_finite_ratio", 0.0))
+        if after_finite < 1.0:
+            return False, "nonfinite_sdf_distribution"
+        if before_safe:
+            if not after_safe:
+                return False, "left_safe_region"
+            return True, "accepted_al_safe_outer_step"
+
+        before_distance = self._sdf_safety_distance(before)
+        after_distance = self._sdf_safety_distance(after)
+        if after_distance >= before_distance - min_improvement:
+            return False, "not_moving_toward_safe_region"
+        return True, "accepted_al_recovery_step"
 
     def _sdf_safety_distance(self, summary: Dict[str, Any]) -> float:
         m_mean = float(summary.get("m_mean", float("nan")))
@@ -11051,9 +11092,25 @@ class Episode:
                     prefix=eval_prefix,
                     stage=stage,
                 )
-                accepted, reason = self._sdf_epoch_acceptance(before_summary, after_summary)
+                accepted, reason = self._sdf_epoch_acceptance(
+                    before_summary,
+                    after_summary,
+                    stage=stage,
+                )
                 before_distance = self._sdf_safety_distance(before_summary)
                 after_distance = self._sdf_safety_distance(after_summary)
+                if al_active:
+                    acceptance_mode = (
+                        "al_safe_outer_step"
+                        if before_summary.get("safe", False)
+                        else "al_recovery"
+                    )
+                else:
+                    acceptance_mode = (
+                        "legacy_safe_improvement"
+                        if before_summary.get("safe", False)
+                        else "legacy_recovery"
+                    )
                 record = {
                     "epoch": epoch_idx,
                     "attempt": attempt_idx + 1,
@@ -11066,7 +11123,7 @@ class Episode:
                     "collapse_detected": bool(collapsed),
                     "accepted": bool(accepted),
                     "rollback_reason": None if accepted else reason,
-                    "acceptance_mode": "safe" if before_summary.get("safe", False) else "recovery",
+                    "acceptance_mode": acceptance_mode,
                     "safety_distance_before": before_distance,
                     "safety_distance_after": after_distance,
                     "lr_at_attempt_start": lr_at_attempt_start,
