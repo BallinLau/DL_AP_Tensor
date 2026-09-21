@@ -363,7 +363,7 @@ class Episode:
 
     def _reset_sdf_al_state(self) -> Dict[str, float]:
         lambda_init = float(getattr(self.hyperparams, "sdf_al_lambda_init", 0.0))
-        rho = float(getattr(self.hyperparams, "sdf_al_rho", 10.0))
+        rho = float(getattr(self.hyperparams, "sdf_al_rho", 2.0))
         if lambda_init < 0:
             raise ValueError(f"sdf_al_lambda_init must be nonnegative, got {lambda_init}.")
         if rho <= 0:
@@ -597,6 +597,10 @@ class Episode:
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[Any] = None,
+        *,
+        include_sdf_al_state: bool = False,
+        sdf_al_primal_epochs_since_dual_update: int = 0,
+        sdf_al_last_dual_update_epoch: Optional[int] = None,
     ) -> Dict[str, Any]:
         checkpoint = {
             "model_state": self._state_dict_to_cpu(model),
@@ -604,6 +608,16 @@ class Episode:
         }
         if scheduler is not None:
             checkpoint["scheduler_state"] = deepcopy(scheduler.state_dict())
+        if include_sdf_al_state:
+            checkpoint["sdf_al_state"] = deepcopy(self._get_sdf_al_state())
+            checkpoint["sdf_al_primal_epochs_since_dual_update"] = int(
+                sdf_al_primal_epochs_since_dual_update
+            )
+            checkpoint["sdf_al_last_dual_update_epoch"] = (
+                None
+                if sdf_al_last_dual_update_epoch is None
+                else int(sdf_al_last_dual_update_epoch)
+            )
         return checkpoint
 
     def _restore_stage_checkpoint(
@@ -617,6 +631,11 @@ class Episode:
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         if scheduler is not None and "scheduler_state" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state"])
+        if "sdf_al_state" in checkpoint:
+            self._sdf_al_state = {
+                key: float(value)
+                for key, value in checkpoint["sdf_al_state"].items()
+            }
 
     @staticmethod
     def _optimizer_lrs(optimizer: torch.optim.Optimizer) -> List[float]:
@@ -10938,6 +10957,20 @@ class Episode:
         eval_batch_limit = eval_batch_limit if eval_batch_limit > 0 else None
         history: List[Dict[str, Any]] = []
         al_active = self._sdf_al_active_for_phase(stage)
+        al_primal_epochs_per_dual_update = int(
+            getattr(
+                self.hyperparams,
+                "sdf_al_primal_epochs_per_dual_update",
+                5,
+            )
+        )
+        if al_active and al_primal_epochs_per_dual_update <= 0:
+            raise ValueError(
+                "sdf_al_primal_epochs_per_dual_update must be positive, got "
+                f"{al_primal_epochs_per_dual_update}."
+            )
+        accepted_primal_epochs_since_dual_update = 0
+        last_dual_update_epoch: Optional[int] = None
         if (
             al_active
             and bool(getattr(self.hyperparams, "sdf_al_reset_on_true_start", True))
@@ -10985,7 +11018,16 @@ class Episode:
         optimizer = self.optimizers["sdf_fc1"]
         scheduler = getattr(self, "lr_schedulers", {}).get("sdf_fc1")
         self._configure_sdf_lr_for_phase()
-        accepted_checkpoint = self._stage_checkpoint(model, optimizer, scheduler)
+        accepted_checkpoint = self._stage_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            include_sdf_al_state=al_active,
+            sdf_al_primal_epochs_since_dual_update=(
+                accepted_primal_epochs_since_dual_update
+            ),
+            sdf_al_last_dual_update_epoch=last_dual_update_epoch,
+        )
         accepted_epoch = 0
         best_eval = initial_eval
         best_gate = initial_gate
@@ -11006,7 +11048,10 @@ class Episode:
             "lr_at_attempt_end": self._optimizer_lrs(optimizer),
             "learning_rate": self._optimizer_lrs(optimizer),
             "al_dual_update_applied": False,
-            "al_dual_source": None,
+            "al_dual_source": "initial_no_update" if al_active else None,
+            "al_primal_epochs_since_dual_before": 0,
+            "al_primal_epochs_since_dual_after": 0,
+            "al_dual_update_due": False,
             "al_dual_before": initial_al_state,
             "al_constraint_estimate": initial_constraint_estimate,
             "al_dual_after": initial_al_state,
@@ -11042,11 +11087,27 @@ class Episode:
 
         max_retries = max(0, int(getattr(self.hyperparams, "stage_max_retries", 1)))
         lr_decay = float(getattr(self.hyperparams, "stage_lr_decay_on_reject", 0.1))
+        required_passes = max(
+            1,
+            int(getattr(self.hyperparams, "sdf_required_consecutive_passes", 1)),
+        )
+        stop_when_gate_passes = bool(
+            getattr(self.hyperparams, "sdf_stop_when_gate_passes", True)
+        )
         for epoch_idx in range(1, n_epochs + 1):
             epoch_accepted = False
             last_reject_reason = None
             for attempt_idx in range(max_retries + 1):
-                attempt_checkpoint = self._stage_checkpoint(model, optimizer, scheduler)
+                attempt_checkpoint = self._stage_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    include_sdf_al_state=al_active,
+                    sdf_al_primal_epochs_since_dual_update=(
+                        accepted_primal_epochs_since_dual_update
+                    ),
+                    sdf_al_last_dual_update_epoch=last_dual_update_epoch,
+                )
                 lr_at_attempt_start = self._optimizer_lrs(optimizer)
                 self._current_attempt_first_step_lrs = None
                 previous_offset = getattr(self, "_run_batches_epoch_offset", 0)
@@ -11136,6 +11197,13 @@ class Episode:
                     "learning_rate": self._optimizer_lrs(optimizer),
                     "al_dual_update_applied": False,
                     "al_dual_source": None,
+                    "al_primal_epochs_since_dual_before": int(
+                        accepted_primal_epochs_since_dual_update
+                    ),
+                    "al_primal_epochs_since_dual_after": int(
+                        accepted_primal_epochs_since_dual_update
+                    ),
+                    "al_dual_update_due": False,
                     "al_dual_before": self._get_sdf_al_state(),
                     "al_constraint_estimate": None,
                     "al_dual_after": self._get_sdf_al_state(),
@@ -11157,9 +11225,38 @@ class Episode:
                         train_constraint_passed = self._sdf_al_constraint_estimate_passed(
                             constraint_estimate
                         )
-                        dual_after = self._update_sdf_al_duals(constraint_estimate)
                         last_accepted_train_constraint_passed = train_constraint_passed
                         epoch_full_pass = bool(passed and train_constraint_passed)
+                        next_pass_streak = pass_streak + 1 if epoch_full_pass else 0
+                        primal_epochs_before = int(
+                            accepted_primal_epochs_since_dual_update
+                        )
+                        primal_epochs_after = primal_epochs_before + 1
+                        dual_update_due = bool(
+                            primal_epochs_after
+                            >= al_primal_epochs_per_dual_update
+                        )
+                        strict_success_now = bool(
+                            epoch_full_pass
+                            and next_pass_streak >= required_passes
+                            and stop_when_gate_passes
+                        )
+                        dual_update_applied = bool(
+                            dual_update_due and not strict_success_now
+                        )
+                        if dual_update_applied:
+                            dual_after = self._update_sdf_al_duals(
+                                constraint_estimate
+                            )
+                            accepted_primal_epochs_since_dual_update = 0
+                            last_dual_update_epoch = int(epoch_idx)
+                            dual_source = "accepted_primal_block_boundary"
+                        else:
+                            dual_after = dual_before
+                            accepted_primal_epochs_since_dual_update = int(
+                                primal_epochs_after
+                            )
+                            dual_source = "deferred_primal_inner_step"
                         aio_scale = self._sdf_true_main_loss_scale(train_summary)
                         al_diagnostics = self._sdf_al_epoch_diagnostics(
                             dual_before=dual_before,
@@ -11187,8 +11284,16 @@ class Episode:
                                 warn_ratio,
                             )
                         record.update({
-                            "al_dual_update_applied": True,
-                            "al_dual_source": "train_split",
+                            "al_dual_update_applied": dual_update_applied,
+                            "al_dual_source": dual_source,
+                            "al_primal_epochs_since_dual_before": primal_epochs_before,
+                            "al_primal_epochs_since_dual_after": int(
+                                accepted_primal_epochs_since_dual_update
+                            ),
+                            "al_dual_update_due": dual_update_due,
+                            "al_dual_update_skipped_for_strict_success": bool(
+                                dual_update_due and strict_success_now
+                            ),
                             "al_dual_before": dual_before,
                             "al_constraint_estimate": constraint_estimate,
                             "al_dual_after": dual_after,
@@ -11247,7 +11352,16 @@ class Episode:
                             "stage_passed": epoch_full_pass,
                             "full_stage_passed": epoch_full_pass,
                         })
-                    accepted_checkpoint = self._stage_checkpoint(model, optimizer, scheduler)
+                    accepted_checkpoint = self._stage_checkpoint(
+                        model,
+                        optimizer,
+                        scheduler,
+                        include_sdf_al_state=al_active,
+                        sdf_al_primal_epochs_since_dual_update=(
+                            accepted_primal_epochs_since_dual_update
+                        ),
+                        sdf_al_last_dual_update_epoch=last_dual_update_epoch,
+                    )
                     accepted_epoch = epoch_idx
                     accepted_epochs += 1
                     before_summary = after_summary
@@ -11264,6 +11378,16 @@ class Episode:
                 rejected_epochs += 1
                 last_reject_reason = reason
                 self._restore_stage_checkpoint(model, optimizer, attempt_checkpoint, scheduler)
+                accepted_primal_epochs_since_dual_update = int(
+                    attempt_checkpoint.get(
+                        "sdf_al_primal_epochs_since_dual_update",
+                        accepted_primal_epochs_since_dual_update,
+                    )
+                )
+                last_dual_update_epoch = attempt_checkpoint.get(
+                    "sdf_al_last_dual_update_epoch",
+                    last_dual_update_epoch,
+                )
                 decayed_lrs = self._decay_optimizer_and_scheduler_lr(
                     optimizer,
                     scheduler,
@@ -11290,23 +11414,29 @@ class Episode:
                 )
                 break
 
-            required_passes = max(
-                1,
-                int(getattr(self.hyperparams, "sdf_required_consecutive_passes", 1)),
-            )
             if (
                 pass_streak >= required_passes
                 and (
                     not al_active
                     or last_accepted_train_constraint_passed is True
                 )
-                and bool(getattr(self.hyperparams, "sdf_stop_when_gate_passes", True))
+                and stop_when_gate_passes
             ):
                 break
 
         restored = False
         if bool(getattr(self.hyperparams, "sdf_restore_best_checkpoint", True)):
             self._restore_stage_checkpoint(model, optimizer, accepted_checkpoint, scheduler)
+            accepted_primal_epochs_since_dual_update = int(
+                accepted_checkpoint.get(
+                    "sdf_al_primal_epochs_since_dual_update",
+                    accepted_primal_epochs_since_dual_update,
+                )
+            )
+            last_dual_update_epoch = accepted_checkpoint.get(
+                "sdf_al_last_dual_update_epoch",
+                last_dual_update_epoch,
+            )
             restored = True
             if bool(getattr(self.hyperparams, "sdf_clear_optimizer_after_restore", True)):
                 self._clear_optimizer_state_for_modules(
@@ -11372,6 +11502,18 @@ class Episode:
             "final_validation_summary": final_summary,
             "history": history,
             "sdf_al_state": self._get_sdf_al_state(),
+            "sdf_al_primal_epochs_per_dual_update": int(
+                al_primal_epochs_per_dual_update
+            ),
+            "final_primal_epochs_since_dual_update": int(
+                accepted_primal_epochs_since_dual_update
+            ),
+            "last_dual_update_epoch": last_dual_update_epoch,
+            "final_dual_has_subsequent_primal_epoch": (
+                None
+                if last_dual_update_epoch is None
+                else bool(accepted_epoch > last_dual_update_epoch)
+            ),
         }
 
     def _episode0_sdf_safety_gate_passed(
@@ -12108,6 +12250,19 @@ class Episode:
         use_sdf_fc1 = 'sdf_fc1' in train_modules and 'sdf_fc1' in self.models
         use_policy_value = 'policy_value' in train_modules and 'policy_value' in self.models
         use_fc2 = 'fc2' in train_modules and 'fc2' in self.models
+        sdf_true_start_episode = int(
+            getattr(self.hyperparams, "sdf_true_start_episode", 2)
+        )
+        if sdf_true_start_episode < 1:
+            raise ValueError(
+                "sdf_true_start_episode must be at least 1 so Episode 0 remains "
+                f"the bootstrap episode, got {sdf_true_start_episode}."
+            )
+        formal_sdf_active = bool(
+            mode == "modeb"
+            and use_sdf_fc1
+            and int(self.episode_id) >= sdf_true_start_episode
+        )
 
         def _record_policy_value_batching(stage_name: str, batches: List[Dict[str, torch.Tensor]]) -> None:
             pv_batching = self._parent_batching_summary(batches)
@@ -12346,6 +12501,29 @@ class Episode:
                         )
 
             elif mode == 'modeb':
+                calibration_generation_episode = bool(
+                    int(self.episode_id) == 1 and not formal_sdf_active
+                )
+                if formal_sdf_active:
+                    sdf_schedule_reason = "formal_sdf_active"
+                elif use_sdf_fc1:
+                    sdf_schedule_reason = (
+                        "deferred_until_first_calibration_episode_completed"
+                    )
+                else:
+                    sdf_schedule_reason = "sdf_fc1_not_active"
+                module_summaries["sdf_formal_stage_schedule"] = {
+                    "episode_id": int(self.episode_id),
+                    "formal_sdf_active": bool(formal_sdf_active),
+                    "sdf_true_start_episode": int(sdf_true_start_episode),
+                    "reason": sdf_schedule_reason,
+                    "policy_value_allowed_without_formal_sdf_gate": bool(
+                        use_policy_value and not formal_sdf_active
+                    ),
+                    "calibration_generation_episode": bool(
+                        calibration_generation_episode
+                    ),
+                }
                 modeb_rng_before_first_sim = self._capture_rng_state()
                 if tensor_pipeline:
                     self._simulate_tensor(
@@ -12399,7 +12577,7 @@ class Episode:
                 modeb_old_diag.update(old_firm_stats)
                 module_summaries['modeb_pre_pv_simulation_diag'] = modeb_old_diag
 
-                if use_sdf_fc1 and self.episode_id > 0:
+                if formal_sdf_active:
                     gate_result = self._run_sdf_recon_from_macro(
                         module_summaries=module_summaries,
                         n_epochs=n_epochs,
@@ -12414,7 +12592,7 @@ class Episode:
                             message_suffix="skip Q/P/bp.",
                         )
 
-                if use_policy_value and use_sdf_fc1 and self.episode_id > 0:
+                if use_policy_value and formal_sdf_active:
                     rng_after_sdf_training = self._capture_rng_state()
                     self._restore_rng_state(modeb_rng_before_first_sim)
                     if tensor_pipeline:
@@ -12518,6 +12696,11 @@ class Episode:
                         'resimulated_after_sdf_gate': False,
                         'rng_state_replayed': False,
                         'policy_value_uses_refreshed_sdf_data': bool(not use_sdf_fc1),
+                        'reason': (
+                            'formal_sdf_deferred'
+                            if use_sdf_fc1 and not formal_sdf_active
+                            else 'formal_sdf_not_requested'
+                        ),
                     }
 
                 if use_policy_value:

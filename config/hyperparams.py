@@ -220,6 +220,9 @@ class HyperParams:
     sdf_training_schedule_enabled: bool = True
     fc1_only_epochs: int = 10
     sdf_true_only_epochs: int = 5
+    # Episode 1 generates the first simulation-derived calculated macro data.
+    # Formal post-bootstrap FC1/SDF_TRUE training starts from Episode 2.
+    sdf_true_start_episode: int = 2
     sdf_recursive_only_epochs: int = 0
     fc1_recon_weight: float = 1.0
     # Optional forecast-state auxiliary reconstruction kept as an explicit
@@ -276,7 +279,9 @@ class HyperParams:
     # historical fixed moment penalty and log-mean anchor exactly;
     # ``augmented_lagrangian`` replaces both with pooled PHR inequalities.
     sdf_moment_constraint_mode: str = "augmented_lagrangian"
-    sdf_al_rho: float = 10.0
+    sdf_al_rho: float = 2.0
+    # Hold the PHR multipliers fixed for this many accepted primal epochs.
+    sdf_al_primal_epochs_per_dual_update: int = 5
     sdf_al_lambda_init: float = 0.0
     sdf_al_eps: float = 1e-8
     sdf_al_gate_tolerance: float = 0.0

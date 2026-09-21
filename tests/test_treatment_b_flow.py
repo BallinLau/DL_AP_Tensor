@@ -101,14 +101,25 @@ class TreatmentBFlowTest(unittest.TestCase):
         self.assertNotIn("sdf_training_phase", summary["final_losses"])
         self.assertEqual(summary["metadata"]["sdf_training_phase"], "episode0_bootstrap")
 
-    def _make_episode(self, resimulate_after_pv, post_refresh_pass=True):
+    def _make_episode(
+        self,
+        resimulate_after_pv,
+        post_refresh_pass=True,
+        *,
+        episode_id=1,
+        sdf_true_start_episode=1,
+    ):
         episode = Episode.__new__(Episode)
         episode.models = {"policy_value": object(), "sdf_fc1": object()}
         episode.optimizers = {}
         episode.config = SimpleNamespace(DEVICE=torch.device("cpu"))
-        episode.hyperparams = SimpleNamespace(use_tensor_pipeline=True, simulate_horizon=2)
+        episode.hyperparams = SimpleNamespace(
+            use_tensor_pipeline=True,
+            simulate_horizon=2,
+            sdf_true_start_episode=sdf_true_start_episode,
+        )
         episode.device = torch.device("cpu")
-        episode.episode_id = 1
+        episode.episode_id = episode_id
         episode.gpu_monitor = _DummyMonitor()
         episode.df = None
         episode.df_macro = None
@@ -221,6 +232,54 @@ class TreatmentBFlowTest(unittest.TestCase):
         self.assertIn("macro_old_to_new_common_rows", diag)
         self.assertIn("firm_old_to_new_keys_common_rows", diag)
 
+    def test_episode1_defers_formal_sdf_but_runs_pv_and_post_pv_resimulation(self):
+        calls, summary = self._make_episode(
+            resimulate_after_pv=True,
+            episode_id=1,
+            sdf_true_start_episode=2,
+        )
+
+        self.assertEqual(
+            calls,
+            ["simulate1", "build_pv_marker_1", "train_pv", "simulate2"],
+        )
+        modules = summary["module_summaries"]
+        schedule = modules["sdf_formal_stage_schedule"]
+        self.assertFalse(schedule["formal_sdf_active"])
+        self.assertTrue(schedule["calibration_generation_episode"])
+        self.assertTrue(schedule["policy_value_allowed_without_formal_sdf_gate"])
+        self.assertEqual(schedule["sdf_true_start_episode"], 2)
+        self.assertEqual(
+            schedule["reason"],
+            "deferred_until_first_calibration_episode_completed",
+        )
+        self.assertFalse(
+            modules["modeb_pre_pv_sdf_refresh_diag"][
+                "resimulated_after_sdf_gate"
+            ]
+        )
+        self.assertEqual(
+            modules["modeb_pre_pv_sdf_refresh_diag"]["reason"],
+            "formal_sdf_deferred",
+        )
+        self.assertTrue(
+            modules["modeb_post_pv_resimulation_diag"]["resimulated_after_pv"]
+        )
+
+    def test_start_episode_one_override_restores_formal_episode1_sdf(self):
+        calls, summary = self._make_episode(
+            resimulate_after_pv=False,
+            episode_id=1,
+            sdf_true_start_episode=1,
+        )
+
+        self.assertIn("train_sdf_marker_1", calls)
+        self.assertTrue(
+            summary["module_summaries"]["sdf_formal_stage_schedule"][
+                "formal_sdf_active"
+            ]
+        )
+
     def test_post_refresh_gate_failure_skips_policy_value(self):
         with self.assertRaisesRegex(Exception, "Post-refresh FC1/SDF gate failed"):
             self._make_episode(resimulate_after_pv=False, post_refresh_pass=False)
@@ -230,9 +289,13 @@ class TreatmentBFlowTest(unittest.TestCase):
         episode.models = {"policy_value": object(), "sdf_fc1": object()}
         episode.optimizers = {}
         episode.config = SimpleNamespace(DEVICE=torch.device("cpu"))
-        episode.hyperparams = SimpleNamespace(use_tensor_pipeline=True, simulate_horizon=2)
+        episode.hyperparams = SimpleNamespace(
+            use_tensor_pipeline=True,
+            simulate_horizon=2,
+            sdf_true_start_episode=2,
+        )
         episode.device = torch.device("cpu")
-        episode.episode_id = 1
+        episode.episode_id = 2
         episode.gpu_monitor = _DummyMonitor()
         episode.df = None
         episode.df_macro = None

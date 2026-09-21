@@ -70,6 +70,7 @@ def _make_episode(eval_items, *, al_mode=False):
         stage_max_retries=1,
         sdf_moment_constraint_mode=("augmented_lagrangian" if al_mode else "legacy_penalty"),
         sdf_al_rho=10.0,
+        sdf_al_primal_epochs_per_dual_update=1,
         sdf_al_lambda_init=0.0,
         sdf_al_eps=1e-8,
         sdf_al_gate_tolerance=0.0,
@@ -454,7 +455,10 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         self.assertEqual(result["history"][0]["al_dual_before"], result["history"][0]["al_dual_after"])
         accepted_record = result["history"][1]
         self.assertTrue(accepted_record["al_dual_update_applied"])
-        self.assertEqual(accepted_record["al_dual_source"], "train_split")
+        self.assertEqual(
+            accepted_record["al_dual_source"],
+            "accepted_primal_block_boundary",
+        )
         self.assertAlmostEqual(accepted_record["lambda_mean_low_after"], 1.0)
 
     def test_sdf_al_rejected_attempts_do_not_update_duals(self):
@@ -1151,6 +1155,145 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             and record["rollback_reason"] is None
             for record in result["history"][1:]
         ))
+
+    @staticmethod
+    def _dual_schedule_constraint_estimate(feasible=False):
+        return {
+            "mu": 0.98 if feasible else 0.95,
+            "var": 0.01,
+            "log_mu": float(
+                torch.log(torch.tensor(0.98 if feasible else 0.95)).item()
+            ),
+            "log_var": float(torch.log(torch.tensor(0.01)).item()),
+            "g_mean_low": -0.001 if feasible else 0.1,
+            "g_mean_high": -0.02,
+            "g_var_high": -0.9,
+        }
+
+    def test_sdf_al_k5_updates_dual_at_accepted_epochs_5_and_10(self):
+        gate = {
+            "passed": False,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 5.0,
+        }
+        episode = _make_episode(
+            [{"gate": gate} for _ in range(14)],
+            al_mode=True,
+        )
+        episode.hyperparams.sdf_al_rho = 2.0
+        episode.hyperparams.sdf_al_primal_epochs_per_dual_update = 5
+        episode.hyperparams.sdf_stop_when_gate_passes = False
+        estimate = self._dual_schedule_constraint_estimate(feasible=False)
+        episode._estimate_sdf_al_constraints = lambda _batches: dict(estimate)
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=12,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        updates = [
+            record["epoch"]
+            for record in result["history"][1:]
+            if record["al_dual_update_applied"]
+        ]
+        self.assertEqual(updates, [5, 10])
+        self.assertEqual(result["accepted_epochs"], 12)
+        self.assertEqual(result["final_primal_epochs_since_dual_update"], 2)
+        self.assertEqual(result["last_dual_update_epoch"], 10)
+        self.assertTrue(result["final_dual_has_subsequent_primal_epoch"])
+        self.assertAlmostEqual(result["sdf_al_state"]["lambda_mean_low"], 0.4)
+        for record in result["history"][1:]:
+            if record["epoch"] not in {5, 10}:
+                self.assertFalse(record["al_dual_update_applied"])
+                self.assertEqual(record["al_dual_before"], record["al_dual_after"])
+                self.assertEqual(
+                    record["al_dual_source"],
+                    "deferred_primal_inner_step",
+                )
+
+    def test_sdf_al_k1_updates_after_every_nonconverged_accepted_epoch(self):
+        gate = {
+            "passed": False,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 5.0,
+        }
+        episode = _make_episode(
+            [{"gate": gate} for _ in range(5)],
+            al_mode=True,
+        )
+        episode.hyperparams.sdf_al_primal_epochs_per_dual_update = 1
+        estimate = self._dual_schedule_constraint_estimate(feasible=False)
+        episode._estimate_sdf_al_constraints = lambda _batches: dict(estimate)
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=3,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        updates = [
+            record["epoch"]
+            for record in result["history"][1:]
+            if record["al_dual_update_applied"]
+        ]
+        self.assertEqual(updates, [1, 2, 3])
+        self.assertEqual(result["final_primal_epochs_since_dual_update"], 0)
+
+    def test_sdf_al_strict_success_before_k_boundary_skips_dual_update(self):
+        failing_gate = {
+            "passed": False,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 5.0,
+        }
+        passing_gate = {
+            **failing_gate,
+            "passed": True,
+            "signed_aio_t": 0.0,
+        }
+        episode = _make_episode(
+            [
+                {"gate": failing_gate},
+                {"gate": failing_gate},
+                {"gate": failing_gate},
+                {"gate": passing_gate},
+                {"gate": passing_gate},
+            ],
+            al_mode=True,
+        )
+        episode.hyperparams.sdf_al_primal_epochs_per_dual_update = 5
+        estimate = self._dual_schedule_constraint_estimate(feasible=True)
+        episode._estimate_sdf_al_constraints = lambda _batches: dict(estimate)
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=8,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        self.assertEqual(episode._train_calls, 3)
+        self.assertEqual(result["accepted_epochs"], 3)
+        self.assertTrue(result["passed"])
+        self.assertFalse(any(
+            record["al_dual_update_applied"]
+            for record in result["history"][1:]
+        ))
+        self.assertEqual(result["final_primal_epochs_since_dual_update"], 3)
 
     def test_post_refresh_safety_mode_can_pass_when_strict_gate_fails(self):
         episode = _make_post_refresh_episode(primary_m=0.98, recursive_m=0.98)

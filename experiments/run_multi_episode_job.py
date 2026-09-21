@@ -175,6 +175,12 @@ def parse_args() -> argparse.Namespace:
         help="Override SDF_TRUE_ONLY epochs; use 5 for normalized residual smoke tests",
     )
     parser.add_argument(
+        "--sdf-true-start-episode",
+        type=int,
+        default=None,
+        help="First post-bootstrap episode that runs formal FC1/SDF_TRUE training",
+    )
+    parser.add_argument(
         "--sdf-recursive-only-epochs",
         type=int,
         default=None,
@@ -194,6 +200,12 @@ def parse_args() -> argparse.Namespace:
         help="SDF_TRUE_ONLY moment handling: legacy fixed penalties or pooled PHR AL",
     )
     parser.add_argument("--sdf-al-rho", type=float, default=None, help="Fixed PHR penalty parameter for SDF_TRUE_ONLY")
+    parser.add_argument(
+        "--sdf-al-primal-epochs-per-dual-update",
+        type=int,
+        default=None,
+        help="Accepted SDF_TRUE primal epochs per PHR dual update",
+    )
     parser.add_argument(
         "--sdf-al-gate-tolerance",
         type=float,
@@ -466,6 +478,8 @@ def configure_hyperparams(args: argparse.Namespace):
     hyperparams.episode0_sdf_finite_ratio_min = float(args.episode0_sdf_finite_ratio_min)
     if args.sdf_true_only_epochs is not None:
         hyperparams.sdf_true_only_epochs = int(args.sdf_true_only_epochs)
+    if args.sdf_true_start_episode is not None:
+        hyperparams.sdf_true_start_episode = int(args.sdf_true_start_episode)
     if args.sdf_recursive_only_epochs is not None:
         hyperparams.sdf_recursive_only_epochs = int(args.sdf_recursive_only_epochs)
     if args.sdf_stage2_lr is not None:
@@ -484,6 +498,10 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.sdf_moment_constraint_mode = str(args.sdf_moment_constraint_mode)
     if args.sdf_al_rho is not None:
         hyperparams.sdf_al_rho = float(args.sdf_al_rho)
+    if args.sdf_al_primal_epochs_per_dual_update is not None:
+        hyperparams.sdf_al_primal_epochs_per_dual_update = int(
+            args.sdf_al_primal_epochs_per_dual_update
+        )
     if args.sdf_al_gate_tolerance is not None:
         hyperparams.sdf_al_gate_tolerance = float(args.sdf_al_gate_tolerance)
     if args.sdf_al_dual_max_batches is not None:
@@ -791,6 +809,7 @@ def main():
                     "post0_mode": args.post0_mode,
                     "sdf_wealth_loss_mode": hyperparams.sdf_wealth_loss_mode,
                     "sdf_true_only_epochs": hyperparams.sdf_true_only_epochs,
+                    "sdf_true_start_episode": hyperparams.sdf_true_start_episode,
                     "sdf_recursive_only_epochs": hyperparams.sdf_recursive_only_epochs,
                     "sdf_stage2_lr": hyperparams.sdf_stage2_lr,
                     "sdf_true_only_lr": hyperparams.sdf_true_only_lr,
@@ -800,6 +819,7 @@ def main():
                     "sdf_true_anchor_weight": hyperparams.sdf_true_anchor_weight,
                     "sdf_moment_constraint_mode": hyperparams.sdf_moment_constraint_mode,
                     "sdf_al_rho": hyperparams.sdf_al_rho,
+                    "sdf_al_primal_epochs_per_dual_update": hyperparams.sdf_al_primal_epochs_per_dual_update,
                     "sdf_al_lambda_init": hyperparams.sdf_al_lambda_init,
                     "sdf_al_eps": hyperparams.sdf_al_eps,
                     "sdf_al_gate_tolerance": hyperparams.sdf_al_gate_tolerance,

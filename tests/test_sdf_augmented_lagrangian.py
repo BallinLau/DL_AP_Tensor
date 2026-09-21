@@ -16,6 +16,7 @@ from losses.sdf_loss import (  # noqa: E402
     phr_augmented_lagrangian,
 )
 from models.sdf_fc1 import SDFFC1Combined  # noqa: E402
+from experiments.run_utils import build_hyperparams  # noqa: E402
 from training.episode import Episode, SDFTrainingPhase  # noqa: E402
 
 
@@ -24,6 +25,13 @@ BOUNDS = dict(mu_lo=-0.025, mu_hi=0.0, var_hi=0.25, eps=1e-8)
 
 def _constraints(values: torch.Tensor):
     return compute_pooled_moment_constraints(values, **BOUNDS)
+
+
+def test_formal_al_defaults_use_slow_dual_timescale():
+    for hp in (HyperParams(), build_hyperparams()):
+        assert hp.sdf_true_start_episode == 2
+        assert hp.sdf_al_rho == 2.0
+        assert hp.sdf_al_primal_epochs_per_dual_update == 5
 
 
 def test_pooled_constraints_use_flattened_branches_and_centered_variance():
