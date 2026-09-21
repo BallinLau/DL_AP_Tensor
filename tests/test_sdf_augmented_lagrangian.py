@@ -255,6 +255,103 @@ def test_dual_estimator_reforwards_fixed_training_split_at_current_theta():
     assert estimate["n_observations"] == 4
     for key in ("mu", "var", "g_mean_low", "g_mean_high", "g_var_high"):
         assert estimate[key] == pytest.approx(expected[key].item())
+    assert estimate["var_unbiased"] == pytest.approx(
+        torch.var(m.reshape(-1), unbiased=True).item()
+    )
+    assert estimate["variance_bias_correction"] == pytest.approx(
+        estimate["var_unbiased"] - estimate["var"]
+    )
+    # The formal constraint remains the population-variance constraint.
+    assert estimate["g_var_high"] == pytest.approx(expected["g_var_high"].item())
+
+
+def test_dual_estimator_reports_across_batch_constraint_dispersion():
+    episode = _loss_episode("augmented_lagrangian")
+    batch0 = _batch()
+    batch1 = _batch()
+    batch1["child0"] = batch1["children"][0]
+    batch1["child1"] = batch1["children"][1]
+    batch1["children"] = [child.clone() for child in batch1["children"]]
+    batch1["children"][0][:, 4] += 0.4
+    batch1["children"][1][:, 4] += 0.4
+
+    estimate = episode._estimate_sdf_al_constraints([batch0, batch1])
+
+    assert estimate["n_batches"] == 2
+    assert math.isfinite(estimate["g_mean_low_batch_std"])
+    assert math.isfinite(estimate["g_mean_high_batch_std"])
+    assert math.isfinite(estimate["g_var_high_batch_std"])
+    assert estimate["g_mean_low_batch_std"] > 0.0
+
+
+def test_al_dual_complementarity_noise_tax_and_rho_scale_diagnostics():
+    episode = Episode.__new__(Episode)
+    episode.hyperparams = HyperParams(sdf_al_eps=1e-8)
+    diagnostics = episode._sdf_al_epoch_diagnostics(
+        dual_before={
+            "lambda_mean_low": 1.0,
+            "lambda_mean_high": 2.0,
+            "lambda_var_high": 3.0,
+            "rho": 0.01,
+        },
+        dual_after={
+            "lambda_mean_low": 1.1,
+            "lambda_mean_high": 1.8,
+            "lambda_var_high": 3.0,
+            "rho": 0.01,
+        },
+        constraint_estimate={
+            "g_mean_low": 0.1,
+            "g_mean_high": -0.05,
+            "g_var_high": 0.0,
+            "g_mean_low_batch_std": 0.1,
+            "g_mean_high_batch_std": 0.2,
+            "g_var_high_batch_std": 0.0,
+        },
+        aio_scale=1e-4,
+    )
+
+    assert diagnostics["dual_delta_max"] == pytest.approx(0.2)
+    assert diagnostics["complementarity_mean_low"] == pytest.approx(0.11)
+    assert diagnostics["complementarity_mean_high"] == pytest.approx(0.09)
+    assert diagnostics["complementarity_var_high"] == pytest.approx(0.0)
+    assert diagnostics["complementarity_max"] == pytest.approx(0.11)
+    expected_noise_tax = 0.5 * 0.01 * (0.1 ** 2 + 0.2 ** 2)
+    assert diagnostics["al_noise_tax_proxy"] == pytest.approx(expected_noise_tax)
+    assert diagnostics["al_noise_tax_ratio"] == pytest.approx(
+        expected_noise_tax / 1e-4
+    )
+    assert diagnostics["rho_natural_proxy"] == pytest.approx(0.01)
+    assert diagnostics["rho_over_natural_proxy"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("wealth_mode", "residual_mode", "guard_enabled", "raises"),
+    [
+        ("signed_aio", "normalized_ratio", True, False),
+        ("legacy_abs_log1p", "normalized_ratio", True, True),
+        ("signed_aio", "raw", True, True),
+        ("legacy_abs_log1p", "raw", False, False),
+    ],
+)
+def test_formal_al_semantics_guard(
+    wealth_mode,
+    residual_mode,
+    guard_enabled,
+    raises,
+):
+    episode = Episode.__new__(Episode)
+    episode.hyperparams = HyperParams(
+        sdf_moment_constraint_mode="augmented_lagrangian",
+        sdf_wealth_loss_mode=wealth_mode,
+        sdf_wealth_residual_mode=residual_mode,
+        sdf_al_strict_semantics_guard=guard_enabled,
+    )
+    if raises:
+        with pytest.raises(RuntimeError, match="requires sdf_wealth_loss_mode='signed_aio'"):
+            episode._validate_sdf_al_semantics(SDFTrainingPhase.SDF_TRUE_ONLY)
+    else:
+        episode._validate_sdf_al_semantics(SDFTrainingPhase.SDF_TRUE_ONLY)
 
 
 def test_validation_metrics_report_centered_variance_and_logs():

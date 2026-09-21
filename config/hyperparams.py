@@ -283,6 +283,11 @@ class HyperParams:
     # 0 uses the complete SDF_TRUE training split for accepted-epoch dual updates.
     sdf_al_dual_max_batches: int = 0
     sdf_al_reset_on_true_start: bool = True
+    # Formal AL runs must retain the unbiased signed-AiO objective and the
+    # normalized Euler residual. Disable only for explicit debug/ablation.
+    sdf_al_strict_semantics_guard: bool = True
+    # Diagnostic warning only; it never changes rho or the stopping rule.
+    sdf_al_noise_tax_warn_ratio: float = 1.0
     sdf_recursive_loss_weight: float = 0.25
     sdf_recursive_moment_weight: float = 5e-4
     sdf_recursive_anchor_weight: float = 0.05

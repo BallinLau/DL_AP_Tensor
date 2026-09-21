@@ -155,6 +155,8 @@ def build_hyperparams():
     hp.sdf_al_gate_tolerance = 0.0
     hp.sdf_al_dual_max_batches = 0
     hp.sdf_al_reset_on_true_start = True
+    hp.sdf_al_strict_semantics_guard = True
+    hp.sdf_al_noise_tax_warn_ratio = 1.0
     hp.sdf_recursive_loss_weight = 0.25
     hp.sdf_recursive_moment_weight = 5e-4
     hp.sdf_recursive_anchor_weight = 0.05

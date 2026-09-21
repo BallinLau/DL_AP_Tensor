@@ -318,6 +318,27 @@ class Episode:
                 "the dual variables."
             )
 
+    def _validate_sdf_al_semantics(self, phase: str | SDFTrainingPhase) -> None:
+        """Require the formal AiO/residual semantics for SDF_TRUE AL runs."""
+        if not self._sdf_al_active_for_phase(phase):
+            return
+        if not bool(getattr(self.hyperparams, "sdf_al_strict_semantics_guard", True)):
+            return
+        wealth_mode = str(
+            getattr(self.hyperparams, "sdf_wealth_loss_mode", "signed_aio")
+        ).lower()
+        residual_mode = str(
+            getattr(self.hyperparams, "sdf_wealth_residual_mode", "normalized_ratio")
+        ).lower()
+        if wealth_mode != "signed_aio" or residual_mode != "normalized_ratio":
+            raise RuntimeError(
+                "Formal SDF augmented_lagrangian requires "
+                "sdf_wealth_loss_mode='signed_aio' and "
+                "sdf_wealth_residual_mode='normalized_ratio'; set "
+                "sdf_al_strict_semantics_guard=False only for an explicit "
+                "debug/ablation run."
+            )
+
     def _sdf_al_constraint_estimate_passed(
         self,
         constraint_estimate: Dict[str, float],
@@ -359,6 +380,109 @@ class Episode:
             key = f"lambda_{suffix}"
             self._sdf_al_state[key] = max(0.0, float(state[key]) + rho * g)
         return self._get_sdf_al_state()
+
+    @staticmethod
+    def _sdf_true_main_loss_scale(train_summary: Optional[Dict[str, Any]]) -> float:
+        if not isinstance(train_summary, dict):
+            return float("nan")
+        final_losses = train_summary.get("final_losses", {})
+        if not isinstance(final_losses, dict):
+            return float("nan")
+        return float(final_losses.get("sdf_true_state_main_loss", float("nan")))
+
+    def _sdf_al_epoch_diagnostics(
+        self,
+        *,
+        dual_before: Dict[str, float],
+        dual_after: Dict[str, float],
+        constraint_estimate: Dict[str, float],
+        aio_scale: float,
+    ) -> Dict[str, float]:
+        """Return AL convergence, stochastic-noise, and scale diagnostics only."""
+        deltas = {
+            suffix: abs(
+                float(dual_after[f"lambda_{suffix}"])
+                - float(dual_before[f"lambda_{suffix}"])
+            )
+            for suffix in ("mean_low", "mean_high", "var_high")
+        }
+        complementarity = {
+            suffix: abs(
+                float(dual_after[f"lambda_{suffix}"])
+                * float(constraint_estimate[f"g_{suffix}"])
+            )
+            for suffix in ("mean_low", "mean_high", "var_high")
+        }
+        noise_std = {
+            suffix: float(
+                constraint_estimate.get(f"g_{suffix}_batch_std", float("nan"))
+            )
+            for suffix in ("mean_low", "mean_high", "var_high")
+        }
+        rho = float(dual_after["rho"])
+        noise_values = np.asarray(list(noise_std.values()), dtype=np.float64)
+        noise_tax = (
+            float(0.5 * rho * np.square(noise_values).sum())
+            if np.isfinite(noise_values).all()
+            else float("nan")
+        )
+        eps = max(float(getattr(self.hyperparams, "sdf_al_eps", 1e-8)), 1e-16)
+        noise_tax_ratio = (
+            float(noise_tax / max(abs(float(aio_scale)), eps))
+            if np.isfinite(noise_tax) and np.isfinite(aio_scale)
+            else float("nan")
+        )
+        violations = np.maximum(
+            np.asarray(
+                [
+                    constraint_estimate["g_mean_low"],
+                    constraint_estimate["g_mean_high"],
+                    constraint_estimate["g_var_high"],
+                ],
+                dtype=np.float64,
+            ),
+            0.0,
+        )
+        max_violation = (
+            float(violations.max()) if np.isfinite(violations).all() else float("nan")
+        )
+        rho_natural = (
+            float(abs(float(aio_scale)) / (max_violation ** 2))
+            if np.isfinite(aio_scale) and np.isfinite(max_violation) and max_violation > eps
+            else float("nan")
+        )
+        rho_over_natural = (
+            float(rho / rho_natural)
+            if np.isfinite(rho_natural) and rho_natural > 0.0
+            else float("nan")
+        )
+        result = {
+            "sdf_true_state_main_loss": float(aio_scale),
+            "rho": rho,
+            "dual_delta_mean_low": deltas["mean_low"],
+            "dual_delta_mean_high": deltas["mean_high"],
+            "dual_delta_var_high": deltas["var_high"],
+            "dual_delta_max": float(max(deltas.values())),
+            "complementarity_mean_low": complementarity["mean_low"],
+            "complementarity_mean_high": complementarity["mean_high"],
+            "complementarity_var_high": complementarity["var_high"],
+            "complementarity_max": float(max(complementarity.values())),
+            "constraint_noise_std_mean_low": noise_std["mean_low"],
+            "constraint_noise_std_mean_high": noise_std["mean_high"],
+            "constraint_noise_std_var_high": noise_std["var_high"],
+            "al_noise_tax_proxy": noise_tax,
+            "al_noise_tax_ratio": noise_tax_ratio,
+            "rho_natural_proxy": rho_natural,
+            "rho_over_natural_proxy": rho_over_natural,
+        }
+        result.update({
+            "sdf_al_constraint_noise_std_mean_low": noise_std["mean_low"],
+            "sdf_al_constraint_noise_std_mean_high": noise_std["mean_high"],
+            "sdf_al_constraint_noise_std_var_high": noise_std["var_high"],
+            "sdf_al_noise_tax_proxy": noise_tax,
+            "sdf_al_noise_tax_ratio": noise_tax_ratio,
+        })
+        return result
 
     def _sdf_constraint_bounds(self) -> Tuple[float, float, float, float]:
         loss_fn = getattr(self, "loss_fns", {}).get("sdf") if hasattr(self, "loss_fns") else None
@@ -10288,6 +10412,8 @@ class Episode:
         max_batches = int(getattr(self.hyperparams, "sdf_al_dual_max_batches", 0))
         selected = train_batches if max_batches <= 0 else train_batches[:max_batches]
         m_parts: List[torch.Tensor] = []
+        batch_constraints: List[Dict[str, float]] = []
+        mu_lo, mu_hi, var_hi, eps = self._sdf_constraint_bounds()
         try:
             with torch.no_grad():
                 for batch in selected:
@@ -10310,16 +10436,28 @@ class Episode:
                         lnkf_prev=parent[:, 8:9],
                         return_physical=True,
                     )
-                    m_parts.append(m_values.detach().reshape(-1).cpu())
+                    m_batch = m_values.detach().reshape(-1).cpu()
+                    m_parts.append(m_batch)
+                    batch_result = compute_pooled_moment_constraints(
+                        m_batch,
+                        mu_lo=mu_lo,
+                        mu_hi=mu_hi,
+                        var_hi=var_hi,
+                        eps=eps,
+                    )
+                    batch_constraints.append({
+                        key: float(batch_result[key].detach().item())
+                        for key in ("g_mean_low", "g_mean_high", "g_var_high")
+                    })
         finally:
             if was_training:
                 model.train()
 
         if not m_parts:
             raise RuntimeError("SDF AL dual estimation produced no M observations.")
-        mu_lo, mu_hi, var_hi, eps = self._sdf_constraint_bounds()
+        pooled_m = torch.cat(m_parts)
         constraints = compute_pooled_moment_constraints(
-            torch.cat(m_parts),
+            pooled_m,
             mu_lo=mu_lo,
             mu_hi=mu_hi,
             var_hi=var_hi,
@@ -10333,6 +10471,30 @@ class Episode:
         result["feasible"] = bool(constraints["feasible"].detach().item())
         result["n_batches"] = int(len(selected))
         result["n_observations"] = int(sum(part.numel() for part in m_parts))
+        # Across-batch dispersion is an empirical stochastic-constraint-noise
+        # proxy. Batches are not assumed to be independent, so this is not a
+        # formal standard error.
+        for suffix in ("mean_low", "mean_high", "var_high"):
+            values = np.asarray(
+                [item[f"g_{suffix}"] for item in batch_constraints],
+                dtype=np.float64,
+            )
+            result[f"g_{suffix}_batch_std"] = (
+                float(values.std(ddof=0)) if values.size >= 2 else float("nan")
+            )
+        if pooled_m.numel() > 1:
+            var_unbiased = float(torch.var(pooled_m, unbiased=True).item())
+            variance_bias_correction = var_unbiased - float(result["var"])
+            variance_bias_relative = variance_bias_correction / max(var_unbiased, eps)
+        else:
+            var_unbiased = float("nan")
+            variance_bias_correction = float("nan")
+            variance_bias_relative = float("nan")
+        result.update({
+            "var_unbiased": var_unbiased,
+            "variance_bias_correction": float(variance_bias_correction),
+            "variance_bias_correction_relative": float(variance_bias_relative),
+        })
         return result
 
     def _sdf_gate_passed(
@@ -10689,6 +10851,8 @@ class Episode:
             raise RuntimeError(f"{stage.value} requires training batches.")
         if not val_batches:
             raise RuntimeError(f"{stage.value} requires validation batches.")
+        self._require_sdf_al_outer_loop(stage)
+        self._validate_sdf_al_semantics(stage)
 
         model = self.models["sdf_fc1"]
         eval_batch_limit = int(getattr(self.hyperparams, "sdf_fc1_eval_max_batches", 0))
@@ -10718,6 +10882,20 @@ class Episode:
             prefix=initial_prefix,
             stage=stage,
         )
+        initial_constraint_estimate = None
+        initial_train_constraint_passed: Optional[bool] = None
+        initial_al_diagnostics: Dict[str, float] = {}
+        if al_active:
+            initial_constraint_estimate = self._estimate_sdf_al_constraints(train_batches)
+            initial_train_constraint_passed = self._sdf_al_constraint_estimate_passed(
+                initial_constraint_estimate
+            )
+            initial_al_diagnostics = self._sdf_al_epoch_diagnostics(
+                dual_before=initial_al_state,
+                dual_after=initial_al_state,
+                constraint_estimate=initial_constraint_estimate,
+                aio_scale=float("nan"),
+            )
         optimizer = self.optimizers["sdf_fc1"]
         scheduler = getattr(self, "lr_schedulers", {}).get("sdf_fc1")
         self._configure_sdf_lr_for_phase()
@@ -10744,9 +10922,16 @@ class Episode:
             "al_dual_update_applied": False,
             "al_dual_source": None,
             "al_dual_before": initial_al_state,
-            "al_constraint_estimate": None,
+            "al_constraint_estimate": initial_constraint_estimate,
             "al_dual_after": initial_al_state,
-            "al_train_constraint_passed": None,
+            "al_train_constraint_passed": initial_train_constraint_passed,
+            "validation_strict_passed": bool(initial_passed),
+            "train_constraint_passed": initial_train_constraint_passed,
+            "stage_passed": bool(
+                initial_passed
+                and (not al_active or initial_train_constraint_passed is True)
+            ),
+            **initial_al_diagnostics,
         })
 
         if (
@@ -10763,7 +10948,7 @@ class Episode:
         accepted_epochs = 0
         rejected_epochs = 0
         skipped_current_stage = False
-        last_accepted_train_constraint_passed: Optional[bool] = None
+        last_accepted_train_constraint_passed = initial_train_constraint_passed
         fc1_before = None
         if (
             stage in {SDFTrainingPhase.SDF_TRUE_ONLY, SDFTrainingPhase.SDF_RECURSIVE_ONLY}
@@ -10855,6 +11040,9 @@ class Episode:
                     "al_constraint_estimate": None,
                     "al_dual_after": self._get_sdf_al_state(),
                     "al_train_constraint_passed": None,
+                    "validation_strict_passed": bool(passed),
+                    "train_constraint_passed": None,
+                    "stage_passed": False,
                 }
                 history.append(record)
                 last_epoch = epoch_idx
@@ -10868,6 +11056,32 @@ class Episode:
                         )
                         dual_after = self._update_sdf_al_duals(constraint_estimate)
                         last_accepted_train_constraint_passed = train_constraint_passed
+                        aio_scale = self._sdf_true_main_loss_scale(train_summary)
+                        al_diagnostics = self._sdf_al_epoch_diagnostics(
+                            dual_before=dual_before,
+                            dual_after=dual_after,
+                            constraint_estimate=constraint_estimate,
+                            aio_scale=aio_scale,
+                        )
+                        noise_tax_ratio = float(
+                            al_diagnostics.get("al_noise_tax_ratio", float("nan"))
+                        )
+                        warn_ratio = float(
+                            getattr(
+                                self.hyperparams,
+                                "sdf_al_noise_tax_warn_ratio",
+                                1.0,
+                            )
+                        )
+                        if np.isfinite(noise_tax_ratio) and noise_tax_ratio > warn_ratio:
+                            logger.warning(
+                                "SDF AL estimated constraint-noise tax exceeds the "
+                                "AiO objective scale: rho=%g, noise_tax_ratio=%g, "
+                                "warn_ratio=%g",
+                                dual_after["rho"],
+                                noise_tax_ratio,
+                                warn_ratio,
+                            )
                         record.update({
                             "al_dual_update_applied": True,
                             "al_dual_source": "train_split",
@@ -10888,6 +11102,33 @@ class Episode:
                             "dual_log_mu": constraint_estimate["log_mu"],
                             "dual_log_var": constraint_estimate["log_var"],
                             "al_train_constraint_passed": train_constraint_passed,
+                            "train_constraint_passed": train_constraint_passed,
+                            "stage_passed": bool(passed and train_constraint_passed),
+                            "signed_aio_t": float(gate.get("signed_aio_t", float("nan"))),
+                            "g_mean_low": constraint_estimate["g_mean_low"],
+                            "g_mean_high": constraint_estimate["g_mean_high"],
+                            "g_var_high": constraint_estimate["g_var_high"],
+                            "max_constraint_violation": constraint_estimate.get(
+                                "max_violation",
+                                max(
+                                    0.0,
+                                    float(constraint_estimate["g_mean_low"]),
+                                    float(constraint_estimate["g_mean_high"]),
+                                    float(constraint_estimate["g_var_high"]),
+                                ),
+                            ),
+                            "mu": constraint_estimate["mu"],
+                            "var": constraint_estimate["var"],
+                            "log_mu": constraint_estimate["log_mu"],
+                            "log_var": constraint_estimate["log_var"],
+                            "var_unbiased": constraint_estimate.get("var_unbiased", float("nan")),
+                            "variance_bias_correction": constraint_estimate.get(
+                                "variance_bias_correction", float("nan")
+                            ),
+                            "variance_bias_correction_relative": constraint_estimate.get(
+                                "variance_bias_correction_relative", float("nan")
+                            ),
+                            **al_diagnostics,
                         })
                     accepted_checkpoint = self._stage_checkpoint(model, optimizer, scheduler)
                     accepted_epoch = epoch_idx
@@ -10978,13 +11219,19 @@ class Episode:
         stage_safe = bool(final_summary.get("safe", False))
         stage_passed = bool(not catastrophic_failure)
         if al_active:
-            stage_passed = bool(stage_passed and final_passed)
+            stage_passed = bool(
+                stage_passed
+                and final_passed
+                and last_accepted_train_constraint_passed is True
+            )
         return {
             "stage": stage.value,
             "passed": stage_passed,
+            "stage_passed": stage_passed,
             "safe": bool(stage_safe),
             "catastrophic_failure": bool(catastrophic_failure),
             "strict_gate_passed": bool(final_passed),
+            "validation_strict_passed": bool(final_passed),
             "success_requires_strict_gate": bool(al_active),
             "final_train_constraint_passed": last_accepted_train_constraint_passed,
             "skipped_current_stage": bool(skipped_current_stage),

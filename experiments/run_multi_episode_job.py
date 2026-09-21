@@ -213,6 +213,18 @@ def parse_args() -> argparse.Namespace:
         help="Reset SDF PHR multipliers when SDF_TRUE_ONLY begins",
     )
     parser.add_argument(
+        "--sdf-al-strict-semantics-guard",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Require signed AiO with normalized residuals for formal SDF_TRUE AL runs",
+    )
+    parser.add_argument(
+        "--sdf-al-noise-tax-warn-ratio",
+        type=float,
+        default=None,
+        help="Warn when the estimated AL constraint-noise tax exceeds this AiO-loss ratio",
+    )
+    parser.add_argument(
         "--sdf-reset-optimizer-on-true-start",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -478,6 +490,14 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.sdf_al_dual_max_batches = int(args.sdf_al_dual_max_batches)
     if args.sdf_al_reset_on_true_start is not None:
         hyperparams.sdf_al_reset_on_true_start = bool(args.sdf_al_reset_on_true_start)
+    if args.sdf_al_strict_semantics_guard is not None:
+        hyperparams.sdf_al_strict_semantics_guard = bool(
+            args.sdf_al_strict_semantics_guard
+        )
+    if args.sdf_al_noise_tax_warn_ratio is not None:
+        hyperparams.sdf_al_noise_tax_warn_ratio = float(
+            args.sdf_al_noise_tax_warn_ratio
+        )
     if args.sdf_reset_optimizer_on_true_start is not None:
         hyperparams.sdf_reset_optimizer_on_true_start = bool(args.sdf_reset_optimizer_on_true_start)
     if args.sdf_restore_best_checkpoint is not None:
@@ -785,6 +805,8 @@ def main():
                     "sdf_al_gate_tolerance": hyperparams.sdf_al_gate_tolerance,
                     "sdf_al_dual_max_batches": hyperparams.sdf_al_dual_max_batches,
                     "sdf_al_reset_on_true_start": hyperparams.sdf_al_reset_on_true_start,
+                    "sdf_al_strict_semantics_guard": hyperparams.sdf_al_strict_semantics_guard,
+                    "sdf_al_noise_tax_warn_ratio": hyperparams.sdf_al_noise_tax_warn_ratio,
                     "sdf_reset_optimizer_on_true_start": hyperparams.sdf_reset_optimizer_on_true_start,
                     "sdf_restore_best_checkpoint": hyperparams.sdf_restore_best_checkpoint,
                     "sdf_collapse_log_mean_error": hyperparams.sdf_collapse_log_mean_error,

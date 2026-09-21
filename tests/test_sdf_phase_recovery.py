@@ -448,8 +448,10 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             prefix="sdf_true",
         )
 
-        self.assertEqual(len(estimator_calls), 1)
+        self.assertEqual(len(estimator_calls), 2)
         self.assertEqual(result["accepted_epochs"], 1)
+        self.assertFalse(result["history"][0]["al_dual_update_applied"])
+        self.assertEqual(result["history"][0]["al_dual_before"], result["history"][0]["al_dual_after"])
         accepted_record = result["history"][1]
         self.assertTrue(accepted_record["al_dual_update_applied"])
         self.assertEqual(accepted_record["al_dual_source"], "train_split")
@@ -477,7 +479,20 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             al_mode=True,
         )
         estimator_calls = []
-        episode._estimate_sdf_al_constraints = lambda _batches: estimator_calls.append(1)
+
+        def _estimate(_batches):
+            estimator_calls.append(1)
+            return {
+                "mu": 0.98,
+                "var": 0.01,
+                "log_mu": float(torch.log(torch.tensor(0.98)).item()),
+                "log_var": float(torch.log(torch.tensor(0.01)).item()),
+                "g_mean_low": -0.001,
+                "g_mean_high": -0.02,
+                "g_var_high": -0.9,
+            }
+
+        episode._estimate_sdf_al_constraints = _estimate
 
         result = episode._run_sdf_phase_with_validation(
             train_batches=[{"x": torch.ones(1)}],
@@ -488,7 +503,7 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             prefix="sdf_true",
         )
 
-        self.assertEqual(estimator_calls, [])
+        self.assertEqual(estimator_calls, [1])
         self.assertEqual(result["accepted_epochs"], 0)
         self.assertFalse(result["passed"])
         self.assertFalse(result["strict_gate_passed"])
@@ -527,6 +542,15 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             al_mode=True,
         )
         estimates = iter([
+            {
+                "mu": 0.98,
+                "var": 0.01,
+                "log_mu": float(torch.log(torch.tensor(0.98)).item()),
+                "log_var": float(torch.log(torch.tensor(0.01)).item()),
+                "g_mean_low": -0.001,
+                "g_mean_high": -0.02,
+                "g_var_high": -0.9,
+            },
             {
                 "mu": 0.95,
                 "var": 0.01,
@@ -574,6 +598,107 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         self.assertFalse(result["history"][1]["al_train_constraint_passed"])
         self.assertTrue(result["history"][2]["al_train_constraint_passed"])
         self.assertTrue(result["final_train_constraint_passed"])
+
+    def test_sdf_al_epoch_budget_requires_final_train_feasibility(self):
+        initial_gate = {
+            "passed": False,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 1.0,
+        }
+        passing_gate = {
+            **initial_gate,
+            "passed": True,
+            "signed_aio_t": 0.0,
+        }
+        episode = _make_episode(
+            [{"gate": initial_gate}, {"gate": passing_gate}, {"gate": passing_gate}],
+            al_mode=True,
+        )
+        estimates = iter([
+            {
+                "mu": 0.98,
+                "var": 0.01,
+                "log_mu": float(torch.log(torch.tensor(0.98)).item()),
+                "log_var": float(torch.log(torch.tensor(0.01)).item()),
+                "g_mean_low": -0.001,
+                "g_mean_high": -0.02,
+                "g_var_high": -0.9,
+            },
+            {
+                "mu": 0.95,
+                "var": 0.01,
+                "log_mu": float(torch.log(torch.tensor(0.95)).item()),
+                "log_var": float(torch.log(torch.tensor(0.01)).item()),
+                "g_mean_low": 0.02,
+                "g_mean_high": -0.05,
+                "g_var_high": -0.9,
+            },
+        ])
+        episode._estimate_sdf_al_constraints = lambda _batches: next(estimates)
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=1,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["stage_passed"])
+        self.assertTrue(result["strict_gate_passed"])
+        self.assertTrue(result["validation_strict_passed"])
+        self.assertFalse(result["final_train_constraint_passed"])
+
+    def test_sdf_al_rejected_epoch_preserves_initial_train_feasibility(self):
+        feasible_gate = {
+            "passed": True,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 0.0,
+        }
+        worse_gate = {
+            **feasible_gate,
+            "passed": False,
+            "signed_aio_t": 1.0,
+        }
+        episode = _make_episode(
+            [
+                {"gate": feasible_gate},
+                {"gate": worse_gate},
+                {"gate": worse_gate},
+                {"gate": feasible_gate},
+            ],
+            al_mode=True,
+        )
+        initial_estimate = {
+            "mu": 0.98,
+            "var": 0.01,
+            "log_mu": float(torch.log(torch.tensor(0.98)).item()),
+            "log_var": float(torch.log(torch.tensor(0.01)).item()),
+            "g_mean_low": -0.001,
+            "g_mean_high": -0.02,
+            "g_var_high": -0.9,
+        }
+        episode._estimate_sdf_al_constraints = lambda _batches: dict(initial_estimate)
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=1,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        self.assertTrue(result["history"][0]["al_train_constraint_passed"])
+        self.assertFalse(result["history"][0]["al_dual_update_applied"])
+        self.assertTrue(result["final_train_constraint_passed"])
+        self.assertTrue(result["passed"])
 
     def test_sdf_al_requires_epochwise_outer_loop(self):
         episode = _make_episode([], al_mode=True)
