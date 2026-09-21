@@ -108,6 +108,7 @@ class TreatmentBFlowTest(unittest.TestCase):
         *,
         episode_id=1,
         sdf_true_start_episode=1,
+        sdf_gate_result=None,
     ):
         episode = Episode.__new__(Episode)
         episode.models = {"policy_value": object(), "sdf_fc1": object()}
@@ -174,8 +175,9 @@ class TreatmentBFlowTest(unittest.TestCase):
             marker = int(self.tensor_macro.data[0, hatc_idx].item())
             calls.append(f"train_sdf_marker_{marker}")
             module_summaries["sdf_marker"] = marker
-            module_summaries["sdf_fc1_gate"] = {"passed": True, "failed_stage": None}
-            return {"passed": True, "failed_stage": None}
+            result = dict(sdf_gate_result or {"passed": True, "failed_stage": None})
+            module_summaries["sdf_fc1_gate"] = result
+            return result
 
         def fake_post_refresh_gate(self, module_summaries, batch_size, n_branches):
             calls.append("post_refresh_gate")
@@ -283,6 +285,27 @@ class TreatmentBFlowTest(unittest.TestCase):
     def test_post_refresh_gate_failure_skips_policy_value(self):
         with self.assertRaisesRegex(Exception, "Post-refresh FC1/SDF gate failed"):
             self._make_episode(resimulate_after_pv=False, post_refresh_pass=False)
+
+    def test_modeb_safe_progress_allows_policy_value_without_sdf_convergence(self):
+        calls, summary = self._make_episode(
+            resimulate_after_pv=False,
+            episode_id=2,
+            sdf_true_start_episode=2,
+            sdf_gate_result={
+                "passed": False,
+                "sdf_safe_to_continue": True,
+                "safe_to_continue": True,
+                "sdf_stage_progress": True,
+                "sdf_converged": False,
+                "failed_stage": None,
+            },
+        )
+
+        self.assertIn("train_pv", calls)
+        self.assertEqual(
+            summary["module_summaries"]["sdf_fc1_gate"]["sdf_converged"],
+            False,
+        )
 
     def test_modeb_sdf_gate_failure_skips_policy_value(self):
         episode = Episode.__new__(Episode)

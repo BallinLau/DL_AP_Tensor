@@ -155,6 +155,12 @@ def build_hyperparams():
     hp.sdf_al_lambda_init = 0.0
     hp.sdf_al_eps = 1e-8
     hp.sdf_al_gate_tolerance = 0.0
+    hp.sdf_continue_constraint_tol = 0.02
+    hp.sdf_aio_progress_ratio_max = 0.80
+    hp.sdf_aio_good_abs_tol = 1e-3
+    hp.sdf_final_constraint_tol = 1e-3
+    hp.sdf_final_max_signed_t_abs = 2.0
+    hp.sdf_final_aio_mean_tol = 1e-3
     hp.sdf_al_dual_max_batches = 0
     hp.sdf_al_reset_on_true_start = True
     hp.sdf_al_strict_semantics_guard = True

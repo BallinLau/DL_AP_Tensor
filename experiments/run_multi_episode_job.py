@@ -212,6 +212,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Allowed normalized moment-constraint violation in the SDF_TRUE strict gate",
     )
+    parser.add_argument("--sdf-continue-constraint-tol", type=float, default=None)
+    parser.add_argument("--sdf-aio-progress-ratio-max", type=float, default=None)
+    parser.add_argument("--sdf-aio-good-abs-tol", type=float, default=None)
+    parser.add_argument("--sdf-final-constraint-tol", type=float, default=None)
+    parser.add_argument("--sdf-final-max-signed-t-abs", type=float, default=None)
+    parser.add_argument("--sdf-final-aio-mean-tol", type=float, default=None)
     parser.add_argument(
         "--sdf-al-dual-max-batches",
         type=int,
@@ -504,6 +510,18 @@ def configure_hyperparams(args: argparse.Namespace):
         )
     if args.sdf_al_gate_tolerance is not None:
         hyperparams.sdf_al_gate_tolerance = float(args.sdf_al_gate_tolerance)
+    if args.sdf_continue_constraint_tol is not None:
+        hyperparams.sdf_continue_constraint_tol = float(args.sdf_continue_constraint_tol)
+    if args.sdf_aio_progress_ratio_max is not None:
+        hyperparams.sdf_aio_progress_ratio_max = float(args.sdf_aio_progress_ratio_max)
+    if args.sdf_aio_good_abs_tol is not None:
+        hyperparams.sdf_aio_good_abs_tol = float(args.sdf_aio_good_abs_tol)
+    if args.sdf_final_constraint_tol is not None:
+        hyperparams.sdf_final_constraint_tol = float(args.sdf_final_constraint_tol)
+    if args.sdf_final_max_signed_t_abs is not None:
+        hyperparams.sdf_final_max_signed_t_abs = float(args.sdf_final_max_signed_t_abs)
+    if args.sdf_final_aio_mean_tol is not None:
+        hyperparams.sdf_final_aio_mean_tol = float(args.sdf_final_aio_mean_tol)
     if args.sdf_al_dual_max_batches is not None:
         hyperparams.sdf_al_dual_max_batches = int(args.sdf_al_dual_max_batches)
     if args.sdf_al_reset_on_true_start is not None:
@@ -823,6 +841,12 @@ def main():
                     "sdf_al_lambda_init": hyperparams.sdf_al_lambda_init,
                     "sdf_al_eps": hyperparams.sdf_al_eps,
                     "sdf_al_gate_tolerance": hyperparams.sdf_al_gate_tolerance,
+                    "sdf_continue_constraint_tol": hyperparams.sdf_continue_constraint_tol,
+                    "sdf_aio_progress_ratio_max": hyperparams.sdf_aio_progress_ratio_max,
+                    "sdf_aio_good_abs_tol": hyperparams.sdf_aio_good_abs_tol,
+                    "sdf_final_constraint_tol": hyperparams.sdf_final_constraint_tol,
+                    "sdf_final_max_signed_t_abs": hyperparams.sdf_final_max_signed_t_abs,
+                    "sdf_final_aio_mean_tol": hyperparams.sdf_final_aio_mean_tol,
                     "sdf_al_dual_max_batches": hyperparams.sdf_al_dual_max_batches,
                     "sdf_al_reset_on_true_start": hyperparams.sdf_al_reset_on_true_start,
                     "sdf_al_strict_semantics_guard": hyperparams.sdf_al_strict_semantics_guard,

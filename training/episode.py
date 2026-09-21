@@ -10561,7 +10561,16 @@ class Episode:
         stage: SDFTrainingPhase
     ) -> Tuple[bool, Dict[str, Any]]:
         max_log_mean_error = float(getattr(self.hyperparams, "sdf_log_mean_error_max", 0.02))
-        max_t = float(getattr(self.hyperparams, "sdf_signed_t_abs_max", 2.0))
+        max_t = float(
+            getattr(
+                self.hyperparams,
+                "sdf_final_max_signed_t_abs",
+                getattr(self.hyperparams, "sdf_signed_t_abs_max", 2.0),
+            )
+        )
+        max_mean = float(
+            getattr(self.hyperparams, "sdf_final_aio_mean_tol", 1e-3)
+        )
         min_finite_ratio = float(getattr(self.hyperparams, "sdf_gate_m_finite_ratio_min", 1.0))
         p99_max = float(getattr(self.hyperparams, "sdf_gate_m_p99_max", float("inf")))
         max_max = float(getattr(self.hyperparams, "sdf_gate_m_max_max", float("inf")))
@@ -10583,6 +10592,7 @@ class Episode:
         else:
             m_prefix = f"{prefix}_recursive_forecast_state_M"
             signed_prefix = f"{prefix}_recursive_forecast_state_{signed_suffix}"
+        mean_key = f"{signed_prefix}_mean"
         t_key = f"{signed_prefix}_t"
         m_key = f"{m_prefix}_mean"
         m_mean = eval_metrics.get(m_key, float("nan"))
@@ -10592,29 +10602,42 @@ class Episode:
         finite_ratio = eval_metrics.get(f"{m_prefix}_finite_ratio", float("nan"))
         m_p99 = eval_metrics.get(f"{m_prefix}_p99", float("nan"))
         m_max = eval_metrics.get(f"{m_prefix}_max", float("nan"))
+        signed_mean = eval_metrics.get(mean_key, float("nan"))
         signed_t = eval_metrics.get(t_key, float("nan"))
         if not np.isfinite(signed_t):
             legacy_prefix = signed_prefix.replace(f"_{signed_suffix}", "_signed_aio")
+            signed_mean = eval_metrics.get(f"{legacy_prefix}_mean", signed_mean)
             signed_t = eval_metrics.get(f"{legacy_prefix}_t", float("nan"))
         log_mean_error = abs(np.log(max(float(m_mean), 1e-12)) - target) if np.isfinite(m_mean) else float("nan")
         al_active = self._sdf_al_active_for_phase(stage)
         constraint_diag = self._sdf_constraint_diagnostics_from_values(float(m_mean), float(m_var))
-        gate_tolerance = float(getattr(self.hyperparams, "sdf_al_gate_tolerance", 0.0))
+        gate_tolerance = float(
+            getattr(
+                self.hyperparams,
+                "sdf_final_constraint_tol",
+                getattr(self.hyperparams, "sdf_al_gate_tolerance", 0.0),
+            )
+        )
         moment_feasible = bool(
             constraint_diag["constraints_finite"]
             and constraint_diag["g_mean_low"] <= gate_tolerance
             and constraint_diag["g_mean_high"] <= gate_tolerance
             and constraint_diag["g_var_high"] <= gate_tolerance
         )
-        common_passed = (
-            np.isfinite(signed_t)
-            and np.isfinite(finite_ratio)
+        numerical_safe = (
+            np.isfinite(finite_ratio)
             and np.isfinite(m_p99)
             and np.isfinite(m_max)
-            and abs(float(signed_t)) <= max_t
             and float(finite_ratio) >= min_finite_ratio
             and float(m_p99) <= p99_max
             and float(m_max) <= max_max
+        )
+        common_passed = (
+            numerical_safe
+            and np.isfinite(signed_mean)
+            and np.isfinite(signed_t)
+            and abs(float(signed_mean)) <= max_mean
+            and abs(float(signed_t)) <= max_t
         )
         if al_active:
             passed = common_passed and moment_feasible
@@ -10649,7 +10672,11 @@ class Episode:
             "max_constraint_violation": constraint_diag["max_constraint_violation"],
             "moment_feasible": moment_feasible,
             "sdf_al_gate_tolerance": gate_tolerance,
+            "sdf_final_constraint_tol": gate_tolerance,
             "gate_residual_mode": gate_residual_mode,
+            "numerical_safe": bool(numerical_safe),
+            "signed_aio_mean": float(signed_mean),
+            "max_signed_aio_mean_abs": max_mean,
             "signed_aio_t": float(signed_t),
             "max_signed_t_abs": max_t,
         }
@@ -10715,21 +10742,33 @@ class Episode:
         residual_mode = str(
             getattr(self.hyperparams, "sdf_gate_residual_mode", "normalized_ratio")
         ).lower()
-        signed_suffix = "normalized_signed_aio" if residual_mode == "normalized_ratio" else "raw_signed_aio"
-        signed_prefix = (
-            f"{prefix}_primary_true_state_{signed_suffix}"
+        state_name = (
+            "primary_true_state"
             if stage in (SDFTrainingPhase.FC1_ONLY, SDFTrainingPhase.SDF_TRUE_ONLY)
-            else f"{prefix}_recursive_forecast_state_{signed_suffix}"
+            else "recursive_forecast_state"
         )
+        normalized_prefix = f"{prefix}_{state_name}_normalized_signed_aio"
+        raw_prefix = f"{prefix}_{state_name}_raw_signed_aio"
+        selected_prefix = normalized_prefix if residual_mode == "normalized_ratio" else raw_prefix
         m_mean = float(eval_metrics.get(f"{m_prefix}_mean", float("nan")))
         m_var = float(eval_metrics.get(f"{m_prefix}_var", float("nan")))
         log_m_mean = float(eval_metrics.get(f"{m_prefix}_log_mean", float("nan")))
         log_m_var = float(eval_metrics.get(f"{m_prefix}_log_var", float("nan")))
         finite_ratio = float(eval_metrics.get(f"{m_prefix}_finite_ratio", float("nan")))
-        aio_t = float(eval_metrics.get(f"{signed_prefix}_t", float("nan")))
+        aio_mean = float(eval_metrics.get(f"{selected_prefix}_mean", float("nan")))
+        aio_t = float(eval_metrics.get(f"{selected_prefix}_t", float("nan")))
         if not np.isfinite(aio_t):
-            legacy_prefix = signed_prefix.replace(f"_{signed_suffix}", "_signed_aio")
+            legacy_prefix = f"{prefix}_{state_name}_signed_aio"
+            aio_mean = float(eval_metrics.get(f"{legacy_prefix}_mean", aio_mean))
             aio_t = float(eval_metrics.get(f"{legacy_prefix}_t", float("nan")))
+        normalized_aio_mean = float(
+            eval_metrics.get(f"{normalized_prefix}_mean", float("nan"))
+        )
+        normalized_aio_t = float(
+            eval_metrics.get(f"{normalized_prefix}_t", float("nan"))
+        )
+        raw_aio_mean = float(eval_metrics.get(f"{raw_prefix}_mean", float("nan")))
+        raw_aio_t = float(eval_metrics.get(f"{raw_prefix}_t", float("nan")))
         hatc_rmse = float(
             eval_metrics.get(f"{prefix}_primary_true_state_hatc_next_rmse", float("nan"))
         )
@@ -10786,7 +10825,12 @@ class Episode:
             "m_target": m_target,
             "m_finite_ratio": finite_ratio,
             "safe": safe,
+            "aio_mean": aio_mean,
             "aio_t": aio_t,
+            "normalized_aio_mean": normalized_aio_mean,
+            "normalized_aio_t": normalized_aio_t,
+            "raw_aio_mean": raw_aio_mean,
+            "raw_aio_t": raw_aio_t,
             "fc1_loss": fc1_loss,
             "hatc_rmse": hatc_rmse,
             "lnk_rmse": lnk_rmse,
@@ -10804,6 +10848,140 @@ class Episode:
             "wealth_ratio_p99": float(
                 eval_metrics.get(f"{prefix}_primary_true_state_wealth_ratio_p99", float("nan"))
             ),
+        }
+
+    @staticmethod
+    def _sdf_aio_progress_ratio(before: float, after: float, eps: float) -> float:
+        if not (np.isfinite(before) and np.isfinite(after)):
+            return float("nan")
+        return float(abs(after) / (abs(before) + eps))
+
+    def _sdf_stage_status(
+        self,
+        before: Dict[str, Any],
+        after: Dict[str, Any],
+        final_gate: Dict[str, Any],
+        *,
+        training_numerical_failure: bool = False,
+    ) -> Dict[str, Any]:
+        """Separate continuation safety, within-stage progress, and convergence."""
+        eps = float(getattr(self.hyperparams, "sdf_al_eps", 1e-8))
+        continue_tol = float(
+            getattr(self.hyperparams, "sdf_continue_constraint_tol", 0.02)
+        )
+        progress_ratio_max = float(
+            getattr(self.hyperparams, "sdf_aio_progress_ratio_max", 0.80)
+        )
+        good_abs_tol = float(
+            getattr(self.hyperparams, "sdf_aio_good_abs_tol", 1e-3)
+        )
+        final_constraint_tol = float(
+            getattr(self.hyperparams, "sdf_final_constraint_tol", 1e-3)
+        )
+        final_t_abs_max = float(
+            getattr(self.hyperparams, "sdf_final_max_signed_t_abs", 2.0)
+        )
+        final_mean_abs_max = float(
+            getattr(self.hyperparams, "sdf_final_aio_mean_tol", 1e-3)
+        )
+
+        normalized_before = float(before.get("normalized_aio_mean", float("nan")))
+        normalized_after = float(after.get("normalized_aio_mean", float("nan")))
+        normalized_t_before = float(before.get("normalized_aio_t", float("nan")))
+        normalized_t_after = float(after.get("normalized_aio_t", float("nan")))
+        raw_before = float(before.get("raw_aio_mean", float("nan")))
+        raw_after = float(after.get("raw_aio_mean", float("nan")))
+        raw_t_before = float(before.get("raw_aio_t", float("nan")))
+        raw_t_after = float(after.get("raw_aio_t", float("nan")))
+        normalized_ratio = self._sdf_aio_progress_ratio(
+            normalized_before, normalized_after, eps
+        )
+        raw_ratio = self._sdf_aio_progress_ratio(raw_before, raw_after, eps)
+        max_violation = float(
+            after.get(
+                "max_constraint_violation",
+                final_gate.get("max_constraint_violation", float("nan")),
+            )
+        )
+        max_violation_before = float(
+            before.get("max_constraint_violation", float("nan"))
+        )
+        constraints_finite = bool(
+            np.isfinite(max_violation)
+            and all(
+                np.isfinite(float(after.get(key, float("nan"))))
+                for key in ("g_mean_low", "g_mean_high", "g_var_high")
+            )
+        )
+        numerical_safe = bool(
+            final_gate.get("numerical_safe", after.get("safe", False))
+            and after.get("safe", False)
+            and np.isfinite(normalized_after)
+            and np.isfinite(normalized_t_after)
+            and not self._sdf_collapse_detected(final_gate)
+            and not training_numerical_failure
+        )
+        safe_to_continue = bool(
+            numerical_safe
+            and constraints_finite
+            and max_violation <= continue_tol
+        )
+        stage_progress = bool(
+            np.isfinite(normalized_after)
+            and (
+                abs(normalized_after) <= good_abs_tol
+                or (
+                    np.isfinite(normalized_ratio)
+                    and normalized_ratio <= progress_ratio_max
+                )
+            )
+        )
+        converged = bool(
+            numerical_safe
+            and constraints_finite
+            and max_violation <= final_constraint_tol
+            and abs(normalized_t_after) <= final_t_abs_max
+            and abs(normalized_after) <= final_mean_abs_max
+        )
+        return {
+            "sdf_safe_to_continue": safe_to_continue,
+            "safe_to_continue": safe_to_continue,
+            "sdf_stage_progress": stage_progress,
+            "stage_progress": stage_progress,
+            "sdf_converged": converged,
+            "converged": converged,
+            "sdf_max_constraint_violation": max_violation,
+            "sdf_max_constraint_violation_before": max_violation_before,
+            "sdf_max_constraint_violation_after": max_violation,
+            "sdf_continue_constraint_tol": continue_tol,
+            "sdf_final_constraint_tol": final_constraint_tol,
+            "sdf_aio_mean_before": normalized_before,
+            "sdf_aio_mean_after": normalized_after,
+            "sdf_aio_progress_ratio": normalized_ratio,
+            "sdf_aio_t_before": normalized_t_before,
+            "sdf_aio_t_after": normalized_t_after,
+            "sdf_raw_aio_mean_before": raw_before,
+            "sdf_raw_aio_mean_after": raw_after,
+            "sdf_raw_aio_progress_ratio": raw_ratio,
+            "sdf_raw_aio_t_before": raw_t_before,
+            "sdf_raw_aio_t_after": raw_t_after,
+            "normalized_aio_mean_before": normalized_before,
+            "normalized_aio_mean_after": normalized_after,
+            "normalized_aio_progress_ratio": normalized_ratio,
+            "normalized_aio_t_before": normalized_t_before,
+            "normalized_aio_t_after": normalized_t_after,
+            "raw_aio_mean_before": raw_before,
+            "raw_aio_mean_after": raw_after,
+            "raw_aio_progress_ratio": raw_ratio,
+            "raw_aio_t_before": raw_t_before,
+            "raw_aio_t_after": raw_t_after,
+            "sdf_aio_good_abs_tol": good_abs_tol,
+            "sdf_aio_progress_ratio_max": progress_ratio_max,
+            "sdf_final_max_signed_t_abs": final_t_abs_max,
+            "sdf_final_aio_mean_tol": final_mean_abs_max,
+            "sdf_numerical_safe": numerical_safe,
+            "sdf_constraints_finite": constraints_finite,
+            "sdf_training_numerical_failure": bool(training_numerical_failure),
         }
 
     def _fc1_epoch_acceptance(
@@ -10971,6 +11149,9 @@ class Episode:
             )
         accepted_primal_epochs_since_dual_update = 0
         last_dual_update_epoch: Optional[int] = None
+        terminal_primal_tail_active = False
+        terminal_primal_tail_epochs_completed = 0
+        training_numerical_failure = False
         if (
             al_active
             and bool(getattr(self.hyperparams, "sdf_al_reset_on_true_start", True))
@@ -11094,7 +11275,13 @@ class Episode:
         stop_when_gate_passes = bool(
             getattr(self.hyperparams, "sdf_stop_when_gate_passes", True)
         )
-        for epoch_idx in range(1, n_epochs + 1):
+        max_epoch_index = n_epochs + (
+            al_primal_epochs_per_dual_update if al_active else 0
+        )
+        for epoch_idx in range(1, max_epoch_index + 1):
+            in_terminal_primal_tail = bool(epoch_idx > n_epochs)
+            if in_terminal_primal_tail and not terminal_primal_tail_active:
+                break
             epoch_accepted = False
             last_reject_reason = None
             for attempt_idx in range(max_retries + 1):
@@ -11119,7 +11306,7 @@ class Episode:
                         log_interval=log_interval,
                         train_modules=["sdf_fc1"],
                         desc_prefix=(
-                            f"{stage.value} epoch {epoch_idx}/{n_epochs} "
+                            f"{stage.value} epoch {epoch_idx}/{max_epoch_index} "
                             f"try {attempt_idx + 1}/{max_retries + 1} "
                         ),
                         configure_sdf_lr=False,
@@ -11213,6 +11400,7 @@ class Episode:
                     "stage_passed": False,
                     "full_stage_passed": False,
                     "full_pass_streak": pass_streak,
+                    "terminal_primal_tail": in_terminal_primal_tail,
                 }
                 history.append(record)
                 last_epoch = epoch_idx
@@ -11242,7 +11430,9 @@ class Episode:
                             and stop_when_gate_passes
                         )
                         dual_update_applied = bool(
-                            dual_update_due and not strict_success_now
+                            dual_update_due
+                            and not strict_success_now
+                            and not in_terminal_primal_tail
                         )
                         if dual_update_applied:
                             dual_after = self._update_sdf_al_duals(
@@ -11256,7 +11446,11 @@ class Episode:
                             accepted_primal_epochs_since_dual_update = int(
                                 primal_epochs_after
                             )
-                            dual_source = "deferred_primal_inner_step"
+                            dual_source = (
+                                "terminal_primal_tail_no_dual_update"
+                                if in_terminal_primal_tail
+                                else "deferred_primal_inner_step"
+                            )
                         aio_scale = self._sdf_true_main_loss_scale(train_summary)
                         al_diagnostics = self._sdf_al_epoch_diagnostics(
                             dual_before=dual_before,
@@ -11293,6 +11487,9 @@ class Episode:
                             "al_dual_update_due": dual_update_due,
                             "al_dual_update_skipped_for_strict_success": bool(
                                 dual_update_due and strict_success_now
+                            ),
+                            "al_dual_update_suppressed_for_terminal_primal_tail": bool(
+                                dual_update_due and in_terminal_primal_tail
                             ),
                             "al_dual_before": dual_before,
                             "al_constraint_estimate": constraint_estimate,
@@ -11406,6 +11603,16 @@ class Episode:
 
             if not epoch_accepted:
                 skipped_current_stage = True
+                failed_epoch_records = [
+                    record
+                    for record in history
+                    if int(record.get("epoch", -1)) == int(epoch_idx)
+                ]
+                training_numerical_failure = any(
+                    bool(record.get("collapse_detected", False))
+                    or "nonfinite" in str(record.get("rollback_reason", "")).lower()
+                    for record in failed_epoch_records
+                )
                 logger.warning(
                     "%s skipped after epoch %d failed to improve safely: %s",
                     stage.value,
@@ -11413,6 +11620,15 @@ class Episode:
                     last_reject_reason,
                 )
                 break
+
+            if in_terminal_primal_tail:
+                terminal_primal_tail_epochs_completed += 1
+                if (
+                    terminal_primal_tail_epochs_completed
+                    >= al_primal_epochs_per_dual_update
+                ):
+                    break
+                continue
 
             if (
                 pass_streak >= required_passes
@@ -11423,6 +11639,19 @@ class Episode:
                 and stop_when_gate_passes
             ):
                 break
+
+            if epoch_idx >= n_epochs:
+                if al_active and last_dual_update_epoch == epoch_idx:
+                    terminal_primal_tail_active = True
+                    logger.info(
+                        "%s final dual update at epoch %d; running %d terminal "
+                        "primal epochs with the updated multipliers before validation.",
+                        stage.value,
+                        epoch_idx,
+                        al_primal_epochs_per_dual_update,
+                    )
+                else:
+                    break
 
         restored = False
         if bool(getattr(self.hyperparams, "sdf_restore_best_checkpoint", True)):
@@ -11460,20 +11689,43 @@ class Episode:
             prefix=final_prefix,
             stage=stage,
         )
-        final_m_mean = float(final_summary.get("m_mean", float("nan")))
-        final_finite_ratio = float(final_summary.get("m_finite_ratio", 0.0))
-        catastrophic_failure = bool(
-            not np.isfinite(final_m_mean)
-            or final_finite_ratio < 1.0
+        stage_status = self._sdf_stage_status(
+            history[0].get("validation_summary", {}),
+            final_summary,
+            final_gate,
+            training_numerical_failure=training_numerical_failure,
         )
-        stage_safe = bool(final_summary.get("safe", False))
-        stage_passed = bool(not catastrophic_failure)
-        if al_active:
-            stage_passed = bool(
-                stage_passed
-                and final_passed
-                and last_accepted_train_constraint_passed is True
+        catastrophic_failure = not bool(stage_status["sdf_safe_to_continue"])
+        stage_safe = bool(stage_status["sdf_safe_to_continue"])
+        stage_passed = stage_safe
+        if stage_safe and not stage_status["sdf_stage_progress"]:
+            logger.warning(
+                "%s is numerically safe but did not meet the within-stage AiO "
+                "progress criterion; continuing the outer episode without marking "
+                "the SDF converged.",
+                stage.value,
             )
+        logger.info(
+            "SDF validation | safe_to_continue=%s stage_progress=%s "
+            "converged=%s normalized_mean=%g->%g normalized_t=%g->%g "
+            "max_constraint_violation=%g->%g result=%s",
+            stage_status["sdf_safe_to_continue"],
+            stage_status["sdf_stage_progress"],
+            stage_status["sdf_converged"],
+            stage_status["sdf_aio_mean_before"],
+            stage_status["sdf_aio_mean_after"],
+            stage_status["sdf_aio_t_before"],
+            stage_status["sdf_aio_t_after"],
+            stage_status["sdf_max_constraint_violation_before"],
+            stage_status["sdf_max_constraint_violation_after"],
+            (
+                "CONVERGED"
+                if stage_status["sdf_converged"]
+                else "CONTINUE OUTER EPISODE; NOT YET CONVERGED"
+                if stage_status["sdf_safe_to_continue"]
+                else "UNSAFE; STOP OUTER EPISODE"
+            ),
+        )
         return {
             "stage": stage.value,
             "passed": stage_passed,
@@ -11482,7 +11734,8 @@ class Episode:
             "catastrophic_failure": bool(catastrophic_failure),
             "strict_gate_passed": bool(final_passed),
             "validation_strict_passed": bool(final_passed),
-            "success_requires_strict_gate": bool(al_active),
+            "success_requires_strict_gate": False,
+            "convergence_requires_strict_gate": bool(al_active),
             "final_train_constraint_passed": last_accepted_train_constraint_passed,
             "skipped_current_stage": bool(skipped_current_stage),
             "epochs_requested": int(n_epochs),
@@ -11514,6 +11767,11 @@ class Episode:
                 if last_dual_update_epoch is None
                 else bool(accepted_epoch > last_dual_update_epoch)
             ),
+            "terminal_primal_tail_requested": bool(terminal_primal_tail_active),
+            "terminal_primal_tail_epochs_completed": int(
+                terminal_primal_tail_epochs_completed
+            ),
+            **stage_status,
         }
 
     def _episode0_sdf_safety_gate_passed(
@@ -11650,6 +11908,11 @@ class Episode:
                 prefix="post_refresh",
                 stage=SDFTrainingPhase.SDF_TRUE_ONLY,
             )
+            primary_sdf_status = self._sdf_stage_status(
+                primary_safety_summary,
+                primary_safety_summary,
+                primary_sdf_diag,
+            )
             _, forecast_counterfactual_diag = self._sdf_gate_passed(
                 refresh_eval,
                 prefix="post_refresh",
@@ -11667,7 +11930,7 @@ class Episode:
             )
             safety_passed = bool(
                 fc1_data_passed
-                and primary_safety_summary.get("safe", False)
+                and primary_sdf_status["sdf_safe_to_continue"]
             )
             gate_passed = strict_passed if gate_mode == "strict" else safety_passed
             result = {
@@ -11679,6 +11942,9 @@ class Episode:
                 "failed_stage": None if gate_passed else "post_refresh",
                 "holdout_split": holdout_diag,
                 "primary_safety_summary": primary_safety_summary,
+                "primary_sdf_status": primary_sdf_status,
+                "sdf_safe_to_continue": bool(safety_passed),
+                "sdf_converged": bool(primary_sdf_status["sdf_converged"]),
                 "fc1_gate": {
                     "passed": bool(fc1_passed),
                     "failure_source": None if fc1_passed else (
@@ -11812,7 +12078,12 @@ class Episode:
             )
             eval_batches = int(getattr(self.hyperparams, "sdf_fc1_eval_max_batches", 0))
             eval_batches_arg = eval_batches if eval_batches > 0 else None
-            gate_result: Dict[str, Any] = {"passed": True, "failed_stage": None}
+            gate_result: Dict[str, Any] = {
+                "passed": True,
+                "safe_to_continue": True,
+                "sdf_safe_to_continue": True,
+                "failed_stage": None,
+            }
             before_eval = self._evaluate_sdf_fc1_batches(
                 val_batches,
                 prefix='before',
@@ -11826,10 +12097,19 @@ class Episode:
             def _fail(stage_name: str, diag: Dict[str, Any]) -> Dict[str, Any]:
                 result = {
                     "passed": False,
+                    "safe_to_continue": False,
+                    "sdf_safe_to_continue": False,
                     "failed_stage": stage_name,
                     "failure_source": diag.get("failure_source") if isinstance(diag, dict) else None,
                     "diagnostics": diag,
                 }
+                phase_result = diag.get("phase_result", {}) if isinstance(diag, dict) else {}
+                if isinstance(phase_result, dict):
+                    result.update({
+                        key: value
+                        for key, value in phase_result.items()
+                        if key.startswith(("sdf_", "normalized_aio_", "raw_aio_"))
+                    })
                 module_summaries['sdf_fc1_gate'] = result
                 self._last_failed_stage_diagnostics = {
                     "episode_id": int(self.episode_id),
@@ -11906,14 +12186,33 @@ class Episode:
                             prefix='after_sdf_true',
                             stage=SDFTrainingPhase.SDF_TRUE_ONLY,
                         )
+                        before_true_summary = self._stage_validation_summary(
+                            pre_true_eval,
+                            prefix="before_sdf_true",
+                            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+                        )
+                        final_true_summary = self._stage_validation_summary(
+                            true_eval,
+                            prefix="after_sdf_true",
+                            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+                        )
+                        stage_status = self._sdf_stage_status(
+                            before_true_summary,
+                            final_true_summary,
+                            diag,
+                        )
                         true_result = {
                             "stage": SDFTrainingPhase.SDF_TRUE_ONLY.value,
-                            "passed": bool(passed),
+                            "passed": bool(stage_status["sdf_safe_to_continue"]),
+                            "strict_gate_passed": bool(passed),
                             "epochs_requested": int(true_epochs),
                             "epochs_completed": int(true_epochs),
                             "final_train_summary": train_summary,
                             "final_eval_metrics": true_eval,
                             "final_gate": diag,
+                            "initial_validation_summary": before_true_summary,
+                            "final_validation_summary": final_true_summary,
+                            **stage_status,
                         }
                     module_summaries['sdf_fc1_sdf_true_only'] = true_result
                     module_summaries['sdf_fc1_eval_after_sdf_true_only'] = true_result.get(
@@ -11925,13 +12224,38 @@ class Episode:
                         {},
                     )
                     self._last_partial_module_summaries = deepcopy(module_summaries)
-                    if not true_result.get("passed", False):
+                    if not true_result.get(
+                        "sdf_safe_to_continue",
+                        true_result.get("passed", False),
+                    ):
                         return _fail(
                             SDFTrainingPhase.SDF_TRUE_ONLY.value,
                             {
                                 **true_result.get("final_gate", {}),
                                 "phase_result": true_result,
                             },
+                        )
+                    gate_result.update({
+                        "passed": True,
+                        "safe_to_continue": True,
+                        "sdf_safe_to_continue": True,
+                        "sdf_stage_progress": bool(
+                            true_result.get("sdf_stage_progress", False)
+                        ),
+                        "sdf_converged": bool(
+                            true_result.get("sdf_converged", False)
+                        ),
+                        "sdf_true_only": true_result,
+                    })
+                    gate_result.update({
+                        key: value
+                        for key, value in true_result.items()
+                        if key.startswith(("sdf_", "normalized_aio_", "raw_aio_"))
+                    })
+                    if not true_result.get("sdf_stage_progress", False):
+                        logger.warning(
+                            "SDF_TRUE_ONLY remained safe but did not meet the AiO "
+                            "progress criterion; downstream Q/P/bp remains enabled."
                         )
                 if recursive_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.SDF_RECURSIVE_ONLY)
@@ -11953,7 +12277,10 @@ class Episode:
                         {},
                     )
                     self._last_partial_module_summaries = deepcopy(module_summaries)
-                    if not recursive_result.get("passed", False):
+                    if not recursive_result.get(
+                        "sdf_safe_to_continue",
+                        recursive_result.get("passed", False),
+                    ):
                         return _fail(
                             SDFTrainingPhase.SDF_RECURSIVE_ONLY.value,
                             {
@@ -11961,6 +12288,23 @@ class Episode:
                                 "phase_result": recursive_result,
                             },
                         )
+                    gate_result.update({
+                        "passed": True,
+                        "safe_to_continue": True,
+                        "sdf_safe_to_continue": True,
+                        "sdf_stage_progress": bool(
+                            recursive_result.get("sdf_stage_progress", False)
+                        ),
+                        "sdf_converged": bool(
+                            recursive_result.get("sdf_converged", False)
+                        ),
+                        "sdf_recursive_only": recursive_result,
+                    })
+                    gate_result.update({
+                        key: value
+                        for key, value in recursive_result.items()
+                        if key.startswith(("sdf_", "normalized_aio_", "raw_aio_"))
+                    })
                 module_summaries['sdf_fc1_stage2'] = module_summaries.get(
                     'sdf_fc1_sdf_recursive_only',
                     module_summaries.get('sdf_fc1_sdf_true_only', module_summaries.get('sdf_fc1_fc1_only', {}))
@@ -12426,7 +12770,10 @@ class Episode:
                         log_interval=log_interval,
                         n_branches=n_branches
                     )
-                    if not gate_result.get("passed", False):
+                    if not gate_result.get(
+                        "sdf_safe_to_continue",
+                        gate_result.get("passed", False),
+                    ):
                         self._raise_sdf_gate_failure(
                             gate_result,
                             module_summaries,
@@ -12493,7 +12840,10 @@ class Episode:
                         log_interval=log_interval,
                         n_branches=n_branches
                     )
-                    if not gate_result.get("passed", False):
+                    if not gate_result.get(
+                        "sdf_safe_to_continue",
+                        gate_result.get("passed", False),
+                    ):
                         self._raise_sdf_gate_failure(
                             gate_result,
                             module_summaries,
@@ -12585,7 +12935,10 @@ class Episode:
                         log_interval=log_interval,
                         n_branches=n_branches
                     )
-                    if not gate_result.get("passed", False):
+                    if not gate_result.get(
+                        "sdf_safe_to_continue",
+                        gate_result.get("passed", False),
+                    ):
                         self._raise_sdf_gate_failure(
                             gate_result,
                             module_summaries,

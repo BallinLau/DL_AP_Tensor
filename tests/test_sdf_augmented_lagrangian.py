@@ -419,6 +419,7 @@ def _gate_metrics(mean: float, var: float, signed_t: float):
         f"{root}_finite_ratio": 1.0,
         f"{root}_p99": mean,
         f"{root}_max": mean,
+        f"{prefix}_primary_true_state_normalized_signed_aio_mean": 0.0,
         f"{prefix}_primary_true_state_normalized_signed_aio_t": signed_t,
     }
 

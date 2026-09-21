@@ -285,6 +285,17 @@ class HyperParams:
     sdf_al_lambda_init: float = 0.0
     sdf_al_eps: float = 1e-8
     sdf_al_gate_tolerance: float = 0.0
+    # Continuation and convergence are intentionally separate.  The looser
+    # continuation tolerance only prevents catastrophic intermediate AL states
+    # from reaching Policy/Value; it is not a final feasibility criterion.
+    sdf_continue_constraint_tol: float = 0.02
+    sdf_aio_progress_ratio_max: float = 0.80
+    # Progress short-circuit only.  Final convergence uses the stricter field
+    # below together with the signed-AiO t-statistic and moment feasibility.
+    sdf_aio_good_abs_tol: float = 1e-3
+    sdf_final_constraint_tol: float = 1e-3
+    sdf_final_max_signed_t_abs: float = 2.0
+    sdf_final_aio_mean_tol: float = 1e-3
     # 0 uses the complete SDF_TRUE training split for accepted-epoch dual updates.
     sdf_al_dual_max_batches: int = 0
     sdf_al_reset_on_true_start: bool = True

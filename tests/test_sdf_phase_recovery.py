@@ -74,6 +74,12 @@ def _make_episode(eval_items, *, al_mode=False):
         sdf_al_lambda_init=0.0,
         sdf_al_eps=1e-8,
         sdf_al_gate_tolerance=0.0,
+        sdf_continue_constraint_tol=0.02,
+        sdf_aio_progress_ratio_max=0.80,
+        sdf_aio_good_abs_tol=1e-3,
+        sdf_final_constraint_tol=1e-3,
+        sdf_final_max_signed_t_abs=2.0,
+        sdf_final_aio_mean_tol=1e-3,
         sdf_al_dual_max_batches=0,
         sdf_al_reset_on_true_start=True,
     )
@@ -90,7 +96,15 @@ def _make_episode(eval_items, *, al_mode=False):
         item.setdefault(f"{prefix}_primary_true_state_M_log_mean", torch.log(torch.tensor(gate.get("m_mean", 0.98))).item())
         item.setdefault(f"{prefix}_primary_true_state_M_log_var", torch.log(torch.tensor(gate.get("m_var", 0.01))).item())
         item.setdefault(f"{prefix}_primary_true_state_M_finite_ratio", gate.get("m_finite_ratio", 1.0))
+        item.setdefault(f"{prefix}_primary_true_state_M_p99", gate.get("m_p99", gate.get("m_mean", 0.98)))
+        item.setdefault(f"{prefix}_primary_true_state_M_max", gate.get("m_max", gate.get("m_mean", 0.98)))
+        normalized_mean = gate.get("normalized_aio_mean", gate.get("signed_aio_mean", 0.1))
+        raw_mean = gate.get("raw_aio_mean", normalized_mean)
+        raw_t = gate.get("raw_aio_t", gate.get("signed_aio_t", 0.0))
+        item.setdefault(f"{prefix}_primary_true_state_normalized_signed_aio_mean", normalized_mean)
         item.setdefault(f"{prefix}_primary_true_state_normalized_signed_aio_t", gate.get("signed_aio_t", 0.0))
+        item.setdefault(f"{prefix}_primary_true_state_raw_signed_aio_mean", raw_mean)
+        item.setdefault(f"{prefix}_primary_true_state_raw_signed_aio_t", raw_t)
         item.setdefault(f"{prefix}_primary_true_state_hatc_next_rmse", gate.get("hatc_rmse", 0.1))
         item.setdefault(f"{prefix}_primary_true_state_lnk_next_rmse", gate.get("lnk_rmse", 0.1))
         item.setdefault(f"{prefix}_primary_true_state_wealth_ratio_p50", gate.get("wealth_ratio_p50", 1.0))
@@ -100,6 +114,14 @@ def _make_episode(eval_items, *, al_mode=False):
     def _gate(eval_metrics, prefix, stage):
         gate = dict(eval_metrics["gate"])
         gate.setdefault("stage", stage.value)
+        gate.setdefault("m_p99", gate.get("m_mean", 0.98))
+        gate.setdefault("m_max", gate.get("m_mean", 0.98))
+        gate.setdefault("m_finite_ratio_min", 1.0)
+        gate.setdefault("m_p99_max", float("inf"))
+        gate.setdefault("m_max_max", float("inf"))
+        gate.setdefault("log_mean_target", float(torch.log(torch.tensor(0.98)).item()))
+        gate.setdefault("log_mean_error", 0.0)
+        gate.setdefault("numerical_safe", True)
         return bool(gate.get("passed", False)), gate
 
     def _train(*_args, **_kwargs):
@@ -129,6 +151,12 @@ def _make_post_refresh_episode(primary_m=0.98, recursive_m=0.98):
         sdf_collapse_lower_ratio=0.1,
         sdf_collapse_upper_ratio=10.0,
         sdf_post_refresh_gate_mode="safety",
+        sdf_continue_constraint_tol=0.02,
+        sdf_aio_progress_ratio_max=0.80,
+        sdf_aio_good_abs_tol=1e-3,
+        sdf_final_constraint_tol=1e-3,
+        sdf_final_max_signed_t_abs=2.0,
+        sdf_final_aio_mean_tol=1e-3,
         fc1_gate_min_pairs=1,
         fc1_rollout_finite_ratio_min=1.0,
         fc1_target_std_floor=1e-4,
@@ -149,11 +177,23 @@ def _make_post_refresh_episode(primary_m=0.98, recursive_m=0.98):
     def _eval(_batches, prefix, max_batches=None):
         return {
             f"{prefix}_primary_true_state_M_mean": primary_m,
+            f"{prefix}_primary_true_state_M_var": 0.01,
             f"{prefix}_primary_true_state_M_finite_ratio": 1.0,
+            f"{prefix}_primary_true_state_M_p99": primary_m,
+            f"{prefix}_primary_true_state_M_max": primary_m,
+            f"{prefix}_primary_true_state_normalized_signed_aio_mean": 0.01,
             f"{prefix}_primary_true_state_normalized_signed_aio_t": 99.0,
+            f"{prefix}_primary_true_state_raw_signed_aio_mean": 0.01,
+            f"{prefix}_primary_true_state_raw_signed_aio_t": 2.0,
             f"{prefix}_recursive_forecast_state_M_mean": recursive_m,
+            f"{prefix}_recursive_forecast_state_M_var": 0.01,
             f"{prefix}_recursive_forecast_state_M_finite_ratio": 1.0,
+            f"{prefix}_recursive_forecast_state_M_p99": recursive_m,
+            f"{prefix}_recursive_forecast_state_M_max": recursive_m,
+            f"{prefix}_recursive_forecast_state_normalized_signed_aio_mean": 0.01,
             f"{prefix}_recursive_forecast_state_normalized_signed_aio_t": 99.0,
+            f"{prefix}_recursive_forecast_state_raw_signed_aio_mean": 0.01,
+            f"{prefix}_recursive_forecast_state_raw_signed_aio_t": 2.0,
             f"{prefix}_primary_true_state_hatc_next_target_finite_n": 10.0,
             f"{prefix}_primary_true_state_hatc_next_target_finite_ratio": 1.0,
             f"{prefix}_primary_true_state_hatc_next_target_std": 1.0,
@@ -181,6 +221,83 @@ def _make_post_refresh_episode(primary_m=0.98, recursive_m=0.98):
 
 
 class SdfPhaseRecoveryTest(unittest.TestCase):
+    @staticmethod
+    def _stage_summary(*, mean, t_value, violation, m_mean=0.98):
+        return {
+            "safe": True,
+            "m_mean": m_mean,
+            "m_finite_ratio": 1.0,
+            "normalized_aio_mean": mean,
+            "normalized_aio_t": t_value,
+            "raw_aio_mean": mean * 2.0,
+            "raw_aio_t": t_value / 10.0,
+            "g_mean_low": violation,
+            "g_mean_high": -0.1,
+            "g_var_high": -0.1,
+            "max_constraint_violation": max(violation, 0.0),
+        }
+
+    @staticmethod
+    def _stage_gate(*, m_mean=0.98, numerical_safe=True):
+        return {
+            "numerical_safe": numerical_safe,
+            "m_mean": m_mean,
+            "m_finite_ratio": 1.0 if numerical_safe else float("nan"),
+            "log_mean_target": float(torch.log(torch.tensor(0.98)).item()),
+            "log_mean_error": 0.0 if numerical_safe else float("nan"),
+        }
+
+    def test_sdf_progress_can_continue_without_final_convergence(self):
+        episode = _make_episode([], al_mode=True)
+        status = episode._sdf_stage_status(
+            self._stage_summary(mean=0.30, t_value=300.0, violation=0.85),
+            self._stage_summary(mean=0.03, t_value=30.0, violation=0.009),
+            self._stage_gate(),
+        )
+
+        self.assertTrue(status["sdf_safe_to_continue"])
+        self.assertTrue(status["sdf_stage_progress"])
+        self.assertFalse(status["sdf_converged"])
+        self.assertAlmostEqual(status["normalized_aio_progress_ratio"], 0.1)
+
+    def test_sdf_final_t_and_mean_define_convergence_not_continuation(self):
+        episode = _make_episode([], al_mode=True)
+        status = episode._sdf_stage_status(
+            self._stage_summary(mean=0.002, t_value=3.0, violation=0.002),
+            self._stage_summary(mean=5e-4, t_value=1.5, violation=5e-4),
+            self._stage_gate(),
+        )
+
+        self.assertTrue(status["sdf_safe_to_continue"])
+        self.assertTrue(status["sdf_stage_progress"])
+        self.assertTrue(status["sdf_converged"])
+
+    def test_sdf_large_t_without_mean_progress_is_not_a_hard_failure(self):
+        episode = _make_episode([], al_mode=True)
+        status = episode._sdf_stage_status(
+            self._stage_summary(mean=0.30, t_value=100.0, violation=0.01),
+            self._stage_summary(mean=0.29, t_value=100.0, violation=0.01),
+            self._stage_gate(),
+        )
+
+        self.assertTrue(status["sdf_safe_to_continue"])
+        self.assertFalse(status["sdf_stage_progress"])
+        self.assertFalse(status["sdf_converged"])
+
+    def test_sdf_nonfinite_or_collapse_is_unsafe(self):
+        episode = _make_episode([], al_mode=True)
+        nonfinite = self._stage_summary(
+            mean=float("nan"), t_value=float("nan"), violation=float("nan")
+        )
+        status = episode._sdf_stage_status(
+            self._stage_summary(mean=0.30, t_value=30.0, violation=0.01),
+            nonfinite,
+            self._stage_gate(numerical_safe=False),
+        )
+
+        self.assertFalse(status["sdf_safe_to_continue"])
+        self.assertFalse(status["sdf_converged"])
+
     def test_learning_rate_scheduler_round_trip_restores_base_lr(self):
         param = nn.Parameter(torch.ones(1))
         optimizer = torch.optim.Adam([{"params": [param], "lr": 1e-3, "base_lr": 1e-3}])
@@ -358,7 +475,9 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         self.assertEqual(result["accepted_epochs"], 0)
         self.assertTrue(result["skipped_current_stage"])
         self.assertTrue(result["restored_best_checkpoint"])
-        self.assertTrue(result["passed"])
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["sdf_safe_to_continue"])
+        self.assertTrue(result["sdf_training_numerical_failure"])
         self.assertFalse(result["strict_gate_passed"])
         self.assertFalse(result["success_requires_strict_gate"])
         for name, tensor in model.state_dict().items():
@@ -422,7 +541,12 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             "signed_aio_t": 0.0,
         }
         episode = _make_episode(
-            [{"gate": before_gate}, {"gate": after_gate}, {"gate": after_gate}],
+            [
+                {"gate": before_gate},
+                {"gate": after_gate},
+                {"gate": after_gate},
+                {"gate": after_gate},
+            ],
             al_mode=True,
         )
         estimator_calls = []
@@ -449,8 +573,8 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             prefix="sdf_true",
         )
 
-        self.assertEqual(len(estimator_calls), 2)
-        self.assertEqual(result["accepted_epochs"], 1)
+        self.assertEqual(len(estimator_calls), 3)
+        self.assertEqual(result["accepted_epochs"], 2)
         self.assertFalse(result["history"][0]["al_dual_update_applied"])
         self.assertEqual(result["history"][0]["al_dual_before"], result["history"][0]["al_dual_after"])
         accepted_record = result["history"][1]
@@ -512,7 +636,8 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         self.assertEqual(result["accepted_epochs"], 0)
         self.assertFalse(result["passed"])
         self.assertFalse(result["strict_gate_passed"])
-        self.assertTrue(result["success_requires_strict_gate"])
+        self.assertFalse(result["success_requires_strict_gate"])
+        self.assertTrue(result["convergence_requires_strict_gate"])
         self.assertEqual(result["sdf_al_state"]["lambda_mean_low"], 0.0)
         self.assertEqual(result["sdf_al_state"]["lambda_mean_high"], 0.0)
         self.assertEqual(result["sdf_al_state"]["lambda_var_high"], 0.0)
@@ -790,7 +915,12 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             "signed_aio_t": 0.0,
         }
         episode = _make_episode(
-            [{"gate": initial_gate}, {"gate": passing_gate}, {"gate": passing_gate}],
+            [
+                {"gate": initial_gate},
+                {"gate": passing_gate},
+                {"gate": passing_gate},
+                {"gate": passing_gate},
+            ],
             al_mode=True,
         )
         estimates = iter([
@@ -801,6 +931,15 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
                 "log_var": float(torch.log(torch.tensor(0.01)).item()),
                 "g_mean_low": -0.001,
                 "g_mean_high": -0.02,
+                "g_var_high": -0.9,
+            },
+            {
+                "mu": 0.95,
+                "var": 0.01,
+                "log_mu": float(torch.log(torch.tensor(0.95)).item()),
+                "log_var": float(torch.log(torch.tensor(0.01)).item()),
+                "g_mean_low": 0.02,
+                "g_mean_high": -0.05,
                 "g_var_high": -0.9,
             },
             {
@@ -824,11 +963,13 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             prefix="sdf_true",
         )
 
-        self.assertFalse(result["passed"])
-        self.assertFalse(result["stage_passed"])
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["stage_passed"])
         self.assertTrue(result["strict_gate_passed"])
         self.assertTrue(result["validation_strict_passed"])
         self.assertFalse(result["final_train_constraint_passed"])
+        self.assertTrue(result["sdf_safe_to_continue"])
+        self.assertFalse(result["sdf_converged"])
 
     def test_sdf_al_rejected_epoch_preserves_initial_train_feasibility(self):
         feasible_gate = {
@@ -876,7 +1017,9 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         self.assertTrue(result["history"][0]["al_train_constraint_passed"])
         self.assertFalse(result["history"][0]["al_dual_update_applied"])
         self.assertTrue(result["final_train_constraint_passed"])
-        self.assertTrue(result["passed"])
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["sdf_safe_to_continue"])
+        self.assertTrue(result["sdf_training_numerical_failure"])
 
     def test_sdf_al_requires_epochwise_outer_loop(self):
         episode = _make_episode([], al_mode=True)
@@ -1121,6 +1264,7 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
                 {"gate": _gate(25.0)},
                 {"gate": _gate(22.0)},
                 {"gate": _gate(22.0)},
+                {"gate": _gate(22.0)},
             ],
             al_mode=True,
         )
@@ -1144,12 +1288,15 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             prefix="sdf_true",
         )
 
-        self.assertEqual(episode._train_calls, 3)
-        self.assertEqual(result["epochs_completed"], 3)
-        self.assertEqual(result["accepted_epochs"], 3)
+        self.assertEqual(episode._train_calls, 4)
+        self.assertEqual(result["epochs_completed"], 4)
+        self.assertEqual(result["accepted_epochs"], 4)
         self.assertFalse(result["skipped_current_stage"])
         self.assertFalse(result["strict_gate_passed"])
-        self.assertFalse(result["passed"])
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["sdf_safe_to_continue"])
+        self.assertFalse(result["sdf_stage_progress"])
+        self.assertFalse(result["sdf_converged"])
         self.assertTrue(all(
             record["acceptance_mode"] == "al_safe_outer_step"
             and record["rollback_reason"] is None
@@ -1226,7 +1373,7 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             "signed_aio_t": 5.0,
         }
         episode = _make_episode(
-            [{"gate": gate} for _ in range(5)],
+            [{"gate": gate} for _ in range(6)],
             al_mode=True,
         )
         episode.hyperparams.sdf_al_primal_epochs_per_dual_update = 1
@@ -1248,7 +1395,62 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
             if record["al_dual_update_applied"]
         ]
         self.assertEqual(updates, [1, 2, 3])
-        self.assertEqual(result["final_primal_epochs_since_dual_update"], 0)
+        self.assertEqual(episode._train_calls, 4)
+        self.assertEqual(result["final_primal_epochs_since_dual_update"], 1)
+        self.assertEqual(result["last_dual_update_epoch"], 3)
+        self.assertTrue(result["final_dual_has_subsequent_primal_epoch"])
+        self.assertTrue(result["terminal_primal_tail_requested"])
+        self.assertEqual(result["terminal_primal_tail_epochs_completed"], 1)
+        tail = result["history"][-1]
+        self.assertTrue(tail["terminal_primal_tail"])
+        self.assertFalse(tail["al_dual_update_applied"])
+        self.assertEqual(
+            tail["al_dual_source"],
+            "terminal_primal_tail_no_dual_update",
+        )
+
+    def test_final_dual_update_runs_one_complete_k_epoch_primal_tail(self):
+        gate = {
+            "passed": False,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 5.0,
+        }
+        episode = _make_episode(
+            [{"gate": gate} for _ in range(6)],
+            al_mode=True,
+        )
+        episode.hyperparams.sdf_al_primal_epochs_per_dual_update = 2
+        estimate = self._dual_schedule_constraint_estimate(feasible=False)
+        episode._estimate_sdf_al_constraints = lambda _batches: dict(estimate)
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=2,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        updates = [
+            record["epoch"]
+            for record in result["history"][1:]
+            if record["al_dual_update_applied"]
+        ]
+        self.assertEqual(updates, [2])
+        self.assertEqual(result["accepted_epochs"], 4)
+        self.assertEqual(result["terminal_primal_tail_epochs_completed"], 2)
+        self.assertEqual(result["final_primal_epochs_since_dual_update"], 2)
+        self.assertTrue(result["final_dual_has_subsequent_primal_epoch"])
+        tail_records = [
+            record
+            for record in result["history"]
+            if record.get("terminal_primal_tail")
+        ]
+        self.assertEqual(len(tail_records), 2)
+        self.assertFalse(any(record["al_dual_update_applied"] for record in tail_records))
 
     def test_sdf_al_strict_success_before_k_boundary_skips_dual_update(self):
         failing_gate = {
