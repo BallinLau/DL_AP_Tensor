@@ -304,6 +304,31 @@ class Episode:
             and self._sdf_moment_constraint_mode() == "augmented_lagrangian"
         )
 
+    def _require_sdf_al_outer_loop(self, phase: str | SDFTrainingPhase) -> None:
+        """Fail fast instead of silently reducing AL to a fixed quadratic penalty."""
+        if not self._sdf_al_active_for_phase(phase):
+            return
+        epochwise_enabled = bool(
+            getattr(self.hyperparams, "stage_epochwise_validation", True)
+        ) and bool(getattr(self.hyperparams, "sdf_epoch_validation_enabled", True))
+        if not epochwise_enabled:
+            raise RuntimeError(
+                "SDF augmented_lagrangian requires stage_epochwise_validation=True "
+                "and sdf_epoch_validation_enabled=True so accepted epochs can update "
+                "the dual variables."
+            )
+
+    def _sdf_al_constraint_estimate_passed(
+        self,
+        constraint_estimate: Dict[str, float],
+    ) -> bool:
+        tolerance = float(getattr(self.hyperparams, "sdf_al_gate_tolerance", 0.0))
+        values = [
+            float(constraint_estimate[key])
+            for key in ("g_mean_low", "g_mean_high", "g_var_high")
+        ]
+        return bool(all(np.isfinite(value) and value <= tolerance for value in values))
+
     def _reset_sdf_al_state(self) -> Dict[str, float]:
         lambda_init = float(getattr(self.hyperparams, "sdf_al_lambda_init", 0.0))
         rho = float(getattr(self.hyperparams, "sdf_al_rho", 10.0))
@@ -10721,6 +10746,7 @@ class Episode:
             "al_dual_before": initial_al_state,
             "al_constraint_estimate": None,
             "al_dual_after": initial_al_state,
+            "al_train_constraint_passed": None,
         })
 
         if (
@@ -10737,6 +10763,7 @@ class Episode:
         accepted_epochs = 0
         rejected_epochs = 0
         skipped_current_stage = False
+        last_accepted_train_constraint_passed: Optional[bool] = None
         fc1_before = None
         if (
             stage in {SDFTrainingPhase.SDF_TRUE_ONLY, SDFTrainingPhase.SDF_RECURSIVE_ONLY}
@@ -10827,6 +10854,7 @@ class Episode:
                     "al_dual_before": self._get_sdf_al_state(),
                     "al_constraint_estimate": None,
                     "al_dual_after": self._get_sdf_al_state(),
+                    "al_train_constraint_passed": None,
                 }
                 history.append(record)
                 last_epoch = epoch_idx
@@ -10835,7 +10863,11 @@ class Episode:
                     if al_active:
                         dual_before = self._get_sdf_al_state()
                         constraint_estimate = self._estimate_sdf_al_constraints(train_batches)
+                        train_constraint_passed = self._sdf_al_constraint_estimate_passed(
+                            constraint_estimate
+                        )
                         dual_after = self._update_sdf_al_duals(constraint_estimate)
+                        last_accepted_train_constraint_passed = train_constraint_passed
                         record.update({
                             "al_dual_update_applied": True,
                             "al_dual_source": "train_split",
@@ -10855,6 +10887,7 @@ class Episode:
                             "dual_var": constraint_estimate["var"],
                             "dual_log_mu": constraint_estimate["log_mu"],
                             "dual_log_var": constraint_estimate["log_var"],
+                            "al_train_constraint_passed": train_constraint_passed,
                         })
                     accepted_checkpoint = self._stage_checkpoint(model, optimizer, scheduler)
                     accepted_epoch = epoch_idx
@@ -10902,6 +10935,10 @@ class Episode:
             )
             if (
                 pass_streak >= required_passes
+                and (
+                    not al_active
+                    or last_accepted_train_constraint_passed is True
+                )
                 and bool(getattr(self.hyperparams, "sdf_stop_when_gate_passes", True))
             ):
                 break
@@ -10939,12 +10976,17 @@ class Episode:
             or final_finite_ratio < 1.0
         )
         stage_safe = bool(final_summary.get("safe", False))
+        stage_passed = bool(not catastrophic_failure)
+        if al_active:
+            stage_passed = bool(stage_passed and final_passed)
         return {
             "stage": stage.value,
-            "passed": bool(not catastrophic_failure),
+            "passed": stage_passed,
             "safe": bool(stage_safe),
             "catastrophic_failure": bool(catastrophic_failure),
             "strict_gate_passed": bool(final_passed),
+            "success_requires_strict_gate": bool(al_active),
+            "final_train_constraint_passed": last_accepted_train_constraint_passed,
             "skipped_current_stage": bool(skipped_current_stage),
             "epochs_requested": int(n_epochs),
             "epochs_completed": int(last_epoch),
@@ -11317,6 +11359,7 @@ class Episode:
                         )
                 if true_epochs > 0:
                     self.set_sdf_training_phase(SDFTrainingPhase.SDF_TRUE_ONLY)
+                    self._require_sdf_al_outer_loop(SDFTrainingPhase.SDF_TRUE_ONLY)
                     pre_true_eval = self._evaluate_sdf_fc1_batches(
                         val_batches,
                         prefix='before_sdf_true',

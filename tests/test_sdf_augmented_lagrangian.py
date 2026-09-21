@@ -15,6 +15,7 @@ from losses.sdf_loss import (  # noqa: E402
     moment_penalty,
     phr_augmented_lagrangian,
 )
+from models.sdf_fc1 import SDFFC1Combined  # noqa: E402
 from training.episode import Episode, SDFTrainingPhase  # noqa: E402
 
 
@@ -189,6 +190,31 @@ def test_al_sdf_true_objective_keeps_signed_aio_and_fc1_frozen():
     assert all(torch.isfinite(parameter.grad).all() for parameter in model.sdf_model.parameters())
     assert all(torch.isfinite(parameter.grad).all() for parameter in model.value_model.parameters())
     assert all(torch.equal(value, fc1_before[name]) for name, value in model.fc1_model.state_dict().items())
+
+
+def test_production_combined_model_gradient_routing_matches_current_architecture():
+    torch.manual_seed(12345)
+    episode = _loss_episode("augmented_lagrangian")
+    episode.models["sdf_fc1"] = SDFFC1Combined(
+        sdf_input_dim=4,
+        fc1_input_dim=4,
+        sdf_hidden_dims=[4],
+        fc1_hidden_dims=[4],
+        w_hidden_dims=[4],
+    )
+    model = episode.models["sdf_fc1"]
+    episode._set_sdf_training_phase_freeze()
+
+    loss = episode._compute_sdf_loss(_batch())
+    loss.backward()
+
+    value_grads = [parameter.grad for parameter in model.value_model.parameters()]
+    assert any(grad is not None for grad in value_grads)
+    assert all(grad is None or torch.isfinite(grad).all() for grad in value_grads)
+    # Production M is structural and depends on ValueFunctionW; the historical
+    # SDFModel.network is not called by SDFFC1Combined.forward_step().
+    assert all(parameter.grad is None for parameter in model.sdf_model.network.parameters())
+    assert all(parameter.grad is None for parameter in model.fc1_model.parameters())
 
 
 def test_legacy_mode_preserves_fixed_penalty_and_anchor_objective():

@@ -357,6 +357,9 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         self.assertEqual(result["accepted_epochs"], 0)
         self.assertTrue(result["skipped_current_stage"])
         self.assertTrue(result["restored_best_checkpoint"])
+        self.assertTrue(result["passed"])
+        self.assertFalse(result["strict_gate_passed"])
+        self.assertFalse(result["success_requires_strict_gate"])
         for name, tensor in model.state_dict().items():
             self.assertTrue(torch.equal(tensor, before[name]))
 
@@ -487,11 +490,111 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
 
         self.assertEqual(estimator_calls, [])
         self.assertEqual(result["accepted_epochs"], 0)
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["strict_gate_passed"])
+        self.assertTrue(result["success_requires_strict_gate"])
         self.assertEqual(result["sdf_al_state"]["lambda_mean_low"], 0.0)
         self.assertEqual(result["sdf_al_state"]["lambda_mean_high"], 0.0)
         self.assertEqual(result["sdf_al_state"]["lambda_var_high"], 0.0)
         for record in result["history"][1:]:
             self.assertFalse(record["al_dual_update_applied"])
+
+    def test_sdf_al_early_stop_waits_for_train_constraint_feasibility(self):
+        initial_gate = {
+            "passed": False,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 1.5,
+        }
+        first_validation_pass = {
+            **initial_gate,
+            "passed": True,
+            "signed_aio_t": 0.5,
+        }
+        second_validation_pass = {
+            **initial_gate,
+            "passed": True,
+            "signed_aio_t": 0.0,
+        }
+        episode = _make_episode(
+            [
+                {"gate": initial_gate},
+                {"gate": first_validation_pass},
+                {"gate": second_validation_pass},
+                {"gate": second_validation_pass},
+            ],
+            al_mode=True,
+        )
+        estimates = iter([
+            {
+                "mu": 0.95,
+                "var": 0.01,
+                "log_mu": float(torch.log(torch.tensor(0.95)).item()),
+                "log_var": float(torch.log(torch.tensor(0.01)).item()),
+                "g_mean_low": 0.01,
+                "g_mean_high": -0.05,
+                "g_var_high": -0.9,
+            },
+            {
+                "mu": 0.98,
+                "var": 0.01,
+                "log_mu": float(torch.log(torch.tensor(0.98)).item()),
+                "log_var": float(torch.log(torch.tensor(0.01)).item()),
+                "g_mean_low": -0.001,
+                "g_mean_high": -0.02,
+                "g_var_high": -0.9,
+            },
+        ])
+        episode._estimate_sdf_al_constraints = lambda _batches: next(estimates)
+        original_train = episode._run_batches
+        lambda_at_epoch_start = []
+
+        def _train(*args, **kwargs):
+            lambda_at_epoch_start.append(
+                episode._get_sdf_al_state()["lambda_mean_low"]
+            )
+            return original_train(*args, **kwargs)
+
+        episode._run_batches = _train
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=3,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        self.assertEqual(episode._train_calls, 2)
+        self.assertEqual(lambda_at_epoch_start[0], 0.0)
+        self.assertGreater(lambda_at_epoch_start[1], 0.0)
+        self.assertEqual(result["accepted_epochs"], 2)
+        self.assertFalse(result["history"][1]["al_train_constraint_passed"])
+        self.assertTrue(result["history"][2]["al_train_constraint_passed"])
+        self.assertTrue(result["final_train_constraint_passed"])
+
+    def test_sdf_al_requires_epochwise_outer_loop(self):
+        episode = _make_episode([], al_mode=True)
+        episode.hyperparams.stage_epochwise_validation = False
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "augmented_lagrangian requires stage_epochwise_validation=True",
+        ):
+            episode._require_sdf_al_outer_loop(SDFTrainingPhase.SDF_TRUE_ONLY)
+
+        episode.hyperparams.stage_epochwise_validation = True
+        episode.hyperparams.sdf_epoch_validation_enabled = False
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "sdf_epoch_validation_enabled=True",
+        ):
+            episode._require_sdf_al_outer_loop(SDFTrainingPhase.SDF_TRUE_ONLY)
+
+        episode.hyperparams.sdf_moment_constraint_mode = "legacy_penalty"
+        episode._require_sdf_al_outer_loop(SDFTrainingPhase.SDF_TRUE_ONLY)
 
     def test_sdf_retry_uses_decayed_lr_after_rollback(self):
         before_gate = {
