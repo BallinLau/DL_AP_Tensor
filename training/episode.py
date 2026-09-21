@@ -330,11 +330,22 @@ class Episode:
         residual_mode = str(
             getattr(self.hyperparams, "sdf_wealth_residual_mode", "normalized_ratio")
         ).lower()
-        if wealth_mode != "signed_aio" or residual_mode != "normalized_ratio":
+        gate_residual_mode = str(
+            getattr(self.hyperparams, "sdf_gate_residual_mode", "normalized_ratio")
+        ).lower()
+        if (
+            wealth_mode != "signed_aio"
+            or residual_mode != "normalized_ratio"
+            or gate_residual_mode != "normalized_ratio"
+        ):
             raise RuntimeError(
-                "Formal SDF augmented_lagrangian requires "
-                "sdf_wealth_loss_mode='signed_aio' and "
-                "sdf_wealth_residual_mode='normalized_ratio'; set "
+                "Formal SDF augmented_lagrangian requires: "
+                "sdf_wealth_loss_mode='signed_aio', "
+                "sdf_wealth_residual_mode='normalized_ratio', "
+                "sdf_gate_residual_mode='normalized_ratio'. "
+                f"Current values: wealth={wealth_mode!r}, "
+                f"residual={residual_mode!r}, gate_residual={gate_residual_mode!r}. "
+                "Set "
                 "sdf_al_strict_semantics_guard=False only for an explicit "
                 "debug/ablation run."
             )
@@ -398,7 +409,7 @@ class Episode:
         constraint_estimate: Dict[str, float],
         aio_scale: float,
     ) -> Dict[str, float]:
-        """Return AL convergence, stochastic-noise, and scale diagnostics only."""
+        """Return AL convergence, batch-dispersion, and scale diagnostics only."""
         deltas = {
             suffix: abs(
                 float(dual_after[f"lambda_{suffix}"])
@@ -413,17 +424,23 @@ class Episode:
             )
             for suffix in ("mean_low", "mean_high", "var_high")
         }
-        noise_std = {
+        batch_dispersion = {
             suffix: float(
                 constraint_estimate.get(f"g_{suffix}_batch_std", float("nan"))
             )
             for suffix in ("mean_low", "mean_high", "var_high")
         }
         rho = float(dual_after["rho"])
-        noise_values = np.asarray(list(noise_std.values()), dtype=np.float64)
+        dispersion_values = np.asarray(
+            list(batch_dispersion.values()), dtype=np.float64
+        )
+        # Heuristic AL batch-dispersion tax proxy:
+        # rho/2 * sum_i Std_batch(g_i)^2. It combines stochastic sampling
+        # variation and batch-state composition heterogeneity; it is not a
+        # formal variance estimator or standard error and is diagnostic only.
         noise_tax = (
-            float(0.5 * rho * np.square(noise_values).sum())
-            if np.isfinite(noise_values).all()
+            float(0.5 * rho * np.square(dispersion_values).sum())
+            if np.isfinite(dispersion_values).all()
             else float("nan")
         )
         eps = max(float(getattr(self.hyperparams, "sdf_al_eps", 1e-8)), 1e-16)
@@ -446,8 +463,10 @@ class Episode:
         max_violation = (
             float(violations.max()) if np.isfinite(violations).all() else float("nan")
         )
+        # Natural diagnostic scale solves rho/2 * v^2 ~= |L_AiO|, where
+        # v = max_i [g_i]_+. It never changes rho or the stopping rule.
         rho_natural = (
-            float(abs(float(aio_scale)) / (max_violation ** 2))
+            float(2.0 * abs(float(aio_scale)) / (max_violation ** 2))
             if np.isfinite(aio_scale) and np.isfinite(max_violation) and max_violation > eps
             else float("nan")
         )
@@ -467,20 +486,30 @@ class Episode:
             "complementarity_mean_high": complementarity["mean_high"],
             "complementarity_var_high": complementarity["var_high"],
             "complementarity_max": float(max(complementarity.values())),
-            "constraint_noise_std_mean_low": noise_std["mean_low"],
-            "constraint_noise_std_mean_high": noise_std["mean_high"],
-            "constraint_noise_std_var_high": noise_std["var_high"],
+            "constraint_batch_dispersion_mean_low": batch_dispersion["mean_low"],
+            "constraint_batch_dispersion_mean_high": batch_dispersion["mean_high"],
+            "constraint_batch_dispersion_var_high": batch_dispersion["var_high"],
             "al_noise_tax_proxy": noise_tax,
             "al_noise_tax_ratio": noise_tax_ratio,
             "rho_natural_proxy": rho_natural,
             "rho_over_natural_proxy": rho_over_natural,
         }
         result.update({
-            "sdf_al_constraint_noise_std_mean_low": noise_std["mean_low"],
-            "sdf_al_constraint_noise_std_mean_high": noise_std["mean_high"],
-            "sdf_al_constraint_noise_std_var_high": noise_std["var_high"],
+            "sdf_al_constraint_batch_dispersion_mean_low": batch_dispersion["mean_low"],
+            "sdf_al_constraint_batch_dispersion_mean_high": batch_dispersion["mean_high"],
+            "sdf_al_constraint_batch_dispersion_var_high": batch_dispersion["var_high"],
             "sdf_al_noise_tax_proxy": noise_tax,
             "sdf_al_noise_tax_ratio": noise_tax_ratio,
+        })
+        # Deprecated aliases: across-batch dispersion is not a formal noise
+        # standard deviation or standard error.
+        result.update({
+            "constraint_noise_std_mean_low": batch_dispersion["mean_low"],
+            "constraint_noise_std_mean_high": batch_dispersion["mean_high"],
+            "constraint_noise_std_var_high": batch_dispersion["var_high"],
+            "sdf_al_constraint_noise_std_mean_low": batch_dispersion["mean_low"],
+            "sdf_al_constraint_noise_std_mean_high": batch_dispersion["mean_high"],
+            "sdf_al_constraint_noise_std_var_high": batch_dispersion["var_high"],
         })
         return result
 
@@ -10484,17 +10513,26 @@ class Episode:
             )
         if pooled_m.numel() > 1:
             var_unbiased = float(torch.var(pooled_m, unbiased=True).item())
-            variance_bias_correction = var_unbiased - float(result["var"])
-            variance_bias_relative = variance_bias_correction / max(var_unbiased, eps)
+            variance_bessel_correction = var_unbiased - float(result["var"])
+            variance_bessel_relative = (
+                variance_bessel_correction / max(var_unbiased, eps)
+            )
         else:
             var_unbiased = float("nan")
-            variance_bias_correction = float("nan")
-            variance_bias_relative = float("nan")
+            variance_bessel_correction = float("nan")
+            variance_bessel_relative = float("nan")
         result.update({
             "var_unbiased": var_unbiased,
-            "variance_bias_correction": float(variance_bias_correction),
-            "variance_bias_correction_relative": float(variance_bias_relative),
+            "variance_bessel_correction": float(variance_bessel_correction),
+            "variance_bessel_correction_relative": float(variance_bessel_relative),
         })
+        # This is only the finite-sample N versus N-1 Bessel correction. It is
+        # not a formal bias estimate under dependent parent/child/path data.
+        # Keep deprecated aliases for existing diagnostic parsers.
+        result["variance_bias_correction"] = result["variance_bessel_correction"]
+        result["variance_bias_correction_relative"] = result[
+            "variance_bessel_correction_relative"
+        ]
         return result
 
     def _sdf_gate_passed(
@@ -10896,6 +10934,13 @@ class Episode:
                 constraint_estimate=initial_constraint_estimate,
                 aio_scale=float("nan"),
             )
+        # FullPass_k = ValidationStrictPass_k AND TrainConstraintPass_k in AL
+        # mode. Legacy mode retains its validation-only pass semantics.
+        initial_full_pass = bool(
+            initial_passed
+            and (not al_active or initial_train_constraint_passed is True)
+        )
+        pass_streak = 1 if initial_full_pass else 0
         optimizer = self.optimizers["sdf_fc1"]
         scheduler = getattr(self, "lr_schedulers", {}).get("sdf_fc1")
         self._configure_sdf_lr_for_phase()
@@ -10927,10 +10972,9 @@ class Episode:
             "al_train_constraint_passed": initial_train_constraint_passed,
             "validation_strict_passed": bool(initial_passed),
             "train_constraint_passed": initial_train_constraint_passed,
-            "stage_passed": bool(
-                initial_passed
-                and (not al_active or initial_train_constraint_passed is True)
-            ),
+            "stage_passed": initial_full_pass,
+            "full_stage_passed": initial_full_pass,
+            "full_pass_streak": pass_streak,
             **initial_al_diagnostics,
         })
 
@@ -10943,7 +10987,6 @@ class Episode:
                 [model.sdf_model, model.value_model],
             )
 
-        pass_streak = 1 if initial_passed else 0
         last_epoch = 0
         accepted_epochs = 0
         rejected_epochs = 0
@@ -11043,11 +11086,14 @@ class Episode:
                     "validation_strict_passed": bool(passed),
                     "train_constraint_passed": None,
                     "stage_passed": False,
+                    "full_stage_passed": False,
+                    "full_pass_streak": pass_streak,
                 }
                 history.append(record)
                 last_epoch = epoch_idx
 
                 if accepted:
+                    epoch_full_pass = bool(passed)
                     if al_active:
                         dual_before = self._get_sdf_al_state()
                         constraint_estimate = self._estimate_sdf_al_constraints(train_batches)
@@ -11056,6 +11102,7 @@ class Episode:
                         )
                         dual_after = self._update_sdf_al_duals(constraint_estimate)
                         last_accepted_train_constraint_passed = train_constraint_passed
+                        epoch_full_pass = bool(passed and train_constraint_passed)
                         aio_scale = self._sdf_true_main_loss_scale(train_summary)
                         al_diagnostics = self._sdf_al_epoch_diagnostics(
                             dual_before=dual_before,
@@ -11075,8 +11122,8 @@ class Episode:
                         )
                         if np.isfinite(noise_tax_ratio) and noise_tax_ratio > warn_ratio:
                             logger.warning(
-                                "SDF AL estimated constraint-noise tax exceeds the "
-                                "AiO objective scale: rho=%g, noise_tax_ratio=%g, "
+                                "SDF AL batch-dispersion tax proxy exceeds the AiO "
+                                "objective scale: rho=%g, noise_tax_ratio=%g, "
                                 "warn_ratio=%g",
                                 dual_after["rho"],
                                 noise_tax_ratio,
@@ -11103,7 +11150,8 @@ class Episode:
                             "dual_log_var": constraint_estimate["log_var"],
                             "al_train_constraint_passed": train_constraint_passed,
                             "train_constraint_passed": train_constraint_passed,
-                            "stage_passed": bool(passed and train_constraint_passed),
+                            "stage_passed": epoch_full_pass,
+                            "full_stage_passed": epoch_full_pass,
                             "signed_aio_t": float(gate.get("signed_aio_t", float("nan"))),
                             "g_mean_low": constraint_estimate["g_mean_low"],
                             "g_mean_high": constraint_estimate["g_mean_high"],
@@ -11122,6 +11170,13 @@ class Episode:
                             "log_mu": constraint_estimate["log_mu"],
                             "log_var": constraint_estimate["log_var"],
                             "var_unbiased": constraint_estimate.get("var_unbiased", float("nan")),
+                            "variance_bessel_correction": constraint_estimate.get(
+                                "variance_bessel_correction", float("nan")
+                            ),
+                            "variance_bessel_correction_relative": constraint_estimate.get(
+                                "variance_bessel_correction_relative", float("nan")
+                            ),
+                            # Deprecated diagnostic aliases.
                             "variance_bias_correction": constraint_estimate.get(
                                 "variance_bias_correction", float("nan")
                             ),
@@ -11129,6 +11184,11 @@ class Episode:
                                 "variance_bias_correction_relative", float("nan")
                             ),
                             **al_diagnostics,
+                        })
+                    else:
+                        record.update({
+                            "stage_passed": epoch_full_pass,
+                            "full_stage_passed": epoch_full_pass,
                         })
                     accepted_checkpoint = self._stage_checkpoint(model, optimizer, scheduler)
                     accepted_epoch = epoch_idx
@@ -11138,7 +11198,10 @@ class Episode:
                     best_gate = gate
                     best_score = score
                     epoch_accepted = True
-                    pass_streak = pass_streak + 1 if passed else 0
+                    # Only accepted epochs update the consecutive full-pass
+                    # streak. Rejected attempts leave it unchanged.
+                    pass_streak = pass_streak + 1 if epoch_full_pass else 0
+                    record["full_pass_streak"] = pass_streak
                     break
 
                 rejected_epochs += 1

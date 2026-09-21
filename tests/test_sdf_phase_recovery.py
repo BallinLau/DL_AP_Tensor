@@ -599,6 +599,178 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         self.assertTrue(result["history"][2]["al_train_constraint_passed"])
         self.assertTrue(result["final_train_constraint_passed"])
 
+    def test_sdf_al_consecutive_passes_count_only_full_accepted_passes(self):
+        failing_gate = {
+            "passed": False,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 1.0,
+        }
+        passing_gate = {**failing_gate, "passed": True, "signed_aio_t": 0.0}
+        episode = _make_episode(
+            [
+                {"gate": failing_gate},
+                {"gate": passing_gate},
+                {"gate": passing_gate},
+                {"gate": passing_gate},
+                {"gate": passing_gate},
+            ],
+            al_mode=True,
+        )
+        episode.hyperparams.sdf_required_consecutive_passes = 2
+        episode._sdf_epoch_acceptance = lambda _before, _after: (True, "accepted")
+
+        def _estimate(feasible):
+            return {
+                "mu": 0.98 if feasible else 0.95,
+                "var": 0.01,
+                "log_mu": float(torch.log(torch.tensor(0.98 if feasible else 0.95)).item()),
+                "log_var": float(torch.log(torch.tensor(0.01)).item()),
+                "g_mean_low": -0.001 if feasible else 0.02,
+                "g_mean_high": -0.02,
+                "g_var_high": -0.9,
+            }
+
+        estimates = iter([
+            _estimate(True),
+            _estimate(False),
+            _estimate(True),
+            _estimate(True),
+        ])
+        episode._estimate_sdf_al_constraints = lambda _batches: next(estimates)
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=4,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        self.assertEqual(episode._train_calls, 3)
+        self.assertEqual(
+            [record["full_pass_streak"] for record in result["history"]],
+            [0, 0, 1, 2],
+        )
+        self.assertFalse(result["history"][1]["full_stage_passed"])
+        self.assertTrue(result["history"][2]["full_stage_passed"])
+        self.assertTrue(result["history"][3]["full_stage_passed"])
+
+    def test_sdf_al_initial_validation_only_pass_has_zero_full_streak(self):
+        passing_gate = {
+            "passed": True,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 0.0,
+        }
+        episode = _make_episode(
+            [{"gate": passing_gate}, {"gate": passing_gate}, {"gate": passing_gate}],
+            al_mode=True,
+        )
+        episode._sdf_epoch_acceptance = lambda _before, _after: (True, "accepted")
+        estimates = iter([
+            {
+                "mu": 0.95,
+                "var": 0.01,
+                "log_mu": float(torch.log(torch.tensor(0.95)).item()),
+                "log_var": float(torch.log(torch.tensor(0.01)).item()),
+                "g_mean_low": 0.02,
+                "g_mean_high": -0.05,
+                "g_var_high": -0.9,
+            },
+            {
+                "mu": 0.98,
+                "var": 0.01,
+                "log_mu": float(torch.log(torch.tensor(0.98)).item()),
+                "log_var": float(torch.log(torch.tensor(0.01)).item()),
+                "g_mean_low": -0.001,
+                "g_mean_high": -0.02,
+                "g_var_high": -0.9,
+            },
+        ])
+        episode._estimate_sdf_al_constraints = lambda _batches: next(estimates)
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=2,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        self.assertEqual(result["history"][0]["full_pass_streak"], 0)
+        self.assertFalse(result["history"][0]["full_stage_passed"])
+        self.assertEqual(episode._train_calls, 1)
+
+    def test_sdf_al_initial_full_pass_still_runs_first_epoch(self):
+        passing_gate = {
+            "passed": True,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 0.0,
+        }
+        episode = _make_episode(
+            [{"gate": passing_gate}, {"gate": passing_gate}, {"gate": passing_gate}],
+            al_mode=True,
+        )
+        episode._sdf_epoch_acceptance = lambda _before, _after: (True, "accepted")
+        feasible = {
+            "mu": 0.98,
+            "var": 0.01,
+            "log_mu": float(torch.log(torch.tensor(0.98)).item()),
+            "log_var": float(torch.log(torch.tensor(0.01)).item()),
+            "g_mean_low": -0.001,
+            "g_mean_high": -0.02,
+            "g_var_high": -0.9,
+        }
+        episode._estimate_sdf_al_constraints = lambda _batches: dict(feasible)
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=2,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        self.assertEqual(result["history"][0]["full_pass_streak"], 1)
+        self.assertTrue(result["history"][0]["full_stage_passed"])
+        self.assertEqual(episode._train_calls, 1)
+
+    def test_legacy_consecutive_pass_behavior_is_unchanged(self):
+        passing_gate = {
+            "passed": True,
+            "m_mean": 0.98,
+            "m_var": 0.01,
+            "m_finite_ratio": 1.0,
+            "signed_aio_t": 0.0,
+        }
+        episode = _make_episode(
+            [{"gate": passing_gate}, {"gate": passing_gate}, {"gate": passing_gate}],
+            al_mode=False,
+        )
+        episode.hyperparams.sdf_required_consecutive_passes = 2
+        episode._sdf_epoch_acceptance = lambda _before, _after: (True, "accepted")
+
+        result = episode._run_sdf_phase_with_validation(
+            train_batches=[{"x": torch.ones(1)}],
+            val_batches=[{"x": torch.ones(1)}],
+            n_epochs=3,
+            log_interval=1,
+            stage=SDFTrainingPhase.SDF_TRUE_ONLY,
+            prefix="sdf_true",
+        )
+
+        self.assertEqual(episode._train_calls, 1)
+        self.assertEqual(result["history"][0]["full_pass_streak"], 1)
+        self.assertEqual(result["history"][1]["full_pass_streak"], 2)
+
     def test_sdf_al_epoch_budget_requires_final_train_feasibility(self):
         initial_gate = {
             "passed": False,

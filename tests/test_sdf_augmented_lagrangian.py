@@ -258,8 +258,17 @@ def test_dual_estimator_reforwards_fixed_training_split_at_current_theta():
     assert estimate["var_unbiased"] == pytest.approx(
         torch.var(m.reshape(-1), unbiased=True).item()
     )
-    assert estimate["variance_bias_correction"] == pytest.approx(
+    assert estimate["variance_bessel_correction"] == pytest.approx(
         estimate["var_unbiased"] - estimate["var"]
+    )
+    assert estimate["variance_bessel_correction_relative"] == pytest.approx(
+        estimate["variance_bessel_correction"] / estimate["var_unbiased"]
+    )
+    assert estimate["variance_bias_correction"] == pytest.approx(
+        estimate["variance_bessel_correction"]
+    )
+    assert estimate["variance_bias_correction_relative"] == pytest.approx(
+        estimate["variance_bessel_correction_relative"]
     )
     # The formal constraint remains the population-variance constraint.
     assert estimate["g_var_high"] == pytest.approx(expected["g_var_high"].item())
@@ -321,22 +330,35 @@ def test_al_dual_complementarity_noise_tax_and_rho_scale_diagnostics():
     assert diagnostics["al_noise_tax_ratio"] == pytest.approx(
         expected_noise_tax / 1e-4
     )
-    assert diagnostics["rho_natural_proxy"] == pytest.approx(0.01)
-    assert diagnostics["rho_over_natural_proxy"] == pytest.approx(1.0)
+    assert diagnostics["rho_natural_proxy"] == pytest.approx(0.02)
+    assert diagnostics["rho_over_natural_proxy"] == pytest.approx(0.5)
+    assert diagnostics["constraint_batch_dispersion_mean_low"] == pytest.approx(0.1)
+    assert diagnostics["constraint_batch_dispersion_mean_high"] == pytest.approx(0.2)
+    assert diagnostics["constraint_batch_dispersion_var_high"] == pytest.approx(0.0)
+    assert diagnostics["sdf_al_constraint_batch_dispersion_mean_low"] == pytest.approx(0.1)
+    assert diagnostics["constraint_noise_std_mean_low"] == pytest.approx(
+        diagnostics["constraint_batch_dispersion_mean_low"]
+    )
+    assert diagnostics["sdf_al_constraint_noise_std_mean_high"] == pytest.approx(
+        diagnostics["sdf_al_constraint_batch_dispersion_mean_high"]
+    )
+    assert episode.hyperparams.sdf_al_noise_tax_warn_ratio == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(
-    ("wealth_mode", "residual_mode", "guard_enabled", "raises"),
+    ("wealth_mode", "residual_mode", "gate_residual_mode", "guard_enabled", "raises"),
     [
-        ("signed_aio", "normalized_ratio", True, False),
-        ("legacy_abs_log1p", "normalized_ratio", True, True),
-        ("signed_aio", "raw", True, True),
-        ("legacy_abs_log1p", "raw", False, False),
+        ("signed_aio", "normalized_ratio", "normalized_ratio", True, False),
+        ("legacy_abs_log1p", "normalized_ratio", "normalized_ratio", True, True),
+        ("signed_aio", "raw", "normalized_ratio", True, True),
+        ("signed_aio", "normalized_ratio", "raw", True, True),
+        ("legacy_abs_log1p", "raw", "raw", False, False),
     ],
 )
 def test_formal_al_semantics_guard(
     wealth_mode,
     residual_mode,
+    gate_residual_mode,
     guard_enabled,
     raises,
 ):
@@ -345,10 +367,11 @@ def test_formal_al_semantics_guard(
         sdf_moment_constraint_mode="augmented_lagrangian",
         sdf_wealth_loss_mode=wealth_mode,
         sdf_wealth_residual_mode=residual_mode,
+        sdf_gate_residual_mode=gate_residual_mode,
         sdf_al_strict_semantics_guard=guard_enabled,
     )
     if raises:
-        with pytest.raises(RuntimeError, match="requires sdf_wealth_loss_mode='signed_aio'"):
+        with pytest.raises(RuntimeError, match="Formal SDF augmented_lagrangian requires"):
             episode._validate_sdf_al_semantics(SDFTrainingPhase.SDF_TRUE_ONLY)
     else:
         episode._validate_sdf_al_semantics(SDFTrainingPhase.SDF_TRUE_ONLY)
