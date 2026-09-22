@@ -153,6 +153,7 @@ def load_analysis_checkpoint(
     policy_state = None
     sdf_state = None
     firm_target_state = None
+    fc2_state = None
     payload_for_config: Optional[Dict[str, Any]] = None
     checkpoint_value_parameterization: Optional[Dict[str, Any]] = None
     policy_path_for_meta = policy_checkpoint
@@ -174,9 +175,12 @@ def load_analysis_checkpoint(
             policy_state = model_states["policy_value"]
             sdf_state = model_states.get("sdf_fc1") if m_source == "sdf_fc1" else None
             firm_target_state = model_states.get("firm_target")
+            fc2_state = model_states.get("fc2")
             checkpoint_value_parameterization = payload.get("value_parameterization")
             if firm_target_state is None:
                 missing_optional_fields.append("models.firm_target")
+            if fc2_state is None:
+                missing_optional_fields.append("models.fc2")
             hp_payload = payload.get("hyperparams")
             if hp_payload is None:
                 if not allow_default_hyperparams:
@@ -301,6 +305,12 @@ def load_analysis_checkpoint(
             raise RuntimeError("firm_target state_dict is incompatible with current model architecture") from exc
         models["firm_target"] = firm_target
 
+    if fc2_state is not None:
+        try:
+            models["fc2"].load_state_dict(fc2_state, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError("fc2 state_dict is incompatible with current model architecture") from exc
+
     economic_config, config_source = _load_config_payload(
         payload=payload_for_config,
         config_json=config_json,
@@ -322,8 +332,14 @@ def load_analysis_checkpoint(
         "checkpoint_sha256": checkpoint_hash,
         "policy_state_hash": _state_hash(policy_state),
         "sdf_state_hash": _state_hash(sdf_state),
+        "fc2_state_hash": _state_hash(fc2_state),
         "checkpoint_format": checkpoint_format,
-        "loaded_model_keys": ["policy_value"] + (["sdf_fc1"] if sdf_state is not None else []),
+        "loaded_model_keys": (
+            ["policy_value"]
+            + (["sdf_fc1"] if sdf_state is not None else [])
+            + (["fc2"] if fc2_state is not None else [])
+            + (["firm_target"] if firm_target_state is not None else [])
+        ),
         "hyperparameter_source": hp_source,
         "config_source": config_source,
         "config_snapshot": economic_config.to_dict(),

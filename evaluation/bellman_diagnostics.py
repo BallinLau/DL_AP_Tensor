@@ -8,6 +8,7 @@ import torch
 
 from analysis.economic_config import AnalysisEconomicConfig
 from losses import P0Loss, PILoss
+from losses.q_loss import compute_q_survival_recovery_components
 from utils.firm_transition import apply_refinancing_policy
 
 from .bp_diagnostics import FrozenTransitionData
@@ -74,7 +75,7 @@ def evaluate_bellman_residuals(
     *,
     chunk_size: int = 8192,
 ) -> tuple[Dict[str, np.ndarray], Dict[str, float]]:
-    """Evaluate physical conditional-mean P0/PI Bellman residuals."""
+    """Evaluate physical conditional-mean P0/PI/Q Bellman residuals."""
     parent = grid.base_states
     p0_loss = P0Loss(
         delta=economic_config.DELTA, tau=economic_config.TAU,
@@ -96,6 +97,10 @@ def evaluate_bellman_residuals(
         q = _get(parent_out, "Q")
         p0 = _get(parent_out, "P0")
         pi = _get(parent_out, "PI")
+        try:
+            bar_i = _get(parent_out, "bar_i")
+        except (AttributeError, KeyError):
+            bar_i = torch.zeros_like(q)
 
         issue_p0 = parent.clone()
         issue_p0[:, 0:1] = bp0
@@ -127,6 +132,49 @@ def evaluate_bellman_residuals(
         continuationi = float(economic_config.G) * (weights * m_used * p_child_pi).sum(dim=1)
         r0 = p0 - cf0 - continuation0
         ri = pi - cfi - continuationi
+        # Match Episode._compute_q_bellman_signed_residuals exactly: Qsp is
+        # evaluated at issue debt b / (bar_i * (G - 1) + 1), while child x/z,
+        # default and the configured train-M semantics remain branch specific.
+        multiplier = bar_i * (float(economic_config.G) - 1.0) + 1.0
+        b_sp = parent[:, 0:1] / multiplier.clamp_min(1e-6)
+        q_child_states = torch.stack(
+            [child[:, :7] for child in transition.children], dim=1
+        ).clone()
+        q_child_states[..., 0:1] = b_sp.unsqueeze(1)
+        qsp = _forward_fields(
+            model,
+            q_child_states.reshape(-1, q_child_states.shape[-1]),
+            ("Q",),
+            chunk_size=chunk_size,
+        )["Q"].reshape(n_parent, n_child, 1)
+        try:
+            bar_zsp = _forward_fields(
+                model,
+                q_child_states.reshape(-1, q_child_states.shape[-1]),
+                ("bar_z",),
+                chunk_size=chunk_size,
+            )["bar_z"].reshape(n_parent, n_child, 1)
+        except (AttributeError, KeyError):
+            bar_zsp = torch.zeros_like(qsp)
+        x_child = q_child_states[..., 4:5]
+        z_child = q_child_states[..., 1:2]
+        q_components = compute_q_survival_recovery_components(
+            Q=q.unsqueeze(1),
+            b=parent[:, 0:1].unsqueeze(1),
+            bar_i=bar_i.unsqueeze(1),
+            M=m_used,
+            Qsp=qsp,
+            bar_z=bar_zsp,
+            x_child=x_child,
+            z_child=z_child,
+            g=float(economic_config.G),
+            delta=float(economic_config.DELTA),
+            phi=float(economic_config.PHI),
+        )
+        rq_branch = q_components["q_training_residual"]
+        rq = (weights * rq_branch).sum(dim=1)
+        q_target = (weights * q_components["q_target_total"]).sum(dim=1)
+        q_scale = torch.maximum(q.abs(), q_target.abs()).clamp_min(1e-8)
         scale_fn = getattr(model, "equity_value_scale", None)
         scale = scale_fn(parent) if callable(scale_fn) else torch.ones_like(r0)
 
@@ -140,13 +188,23 @@ def evaluate_bellman_residuals(
         "abs_RI": surface(ri.abs()),
         "R0_scale_normalized": surface(r0 / scale.clamp_min(1e-12)),
         "RI_scale_normalized": surface(ri / scale.clamp_min(1e-12)),
+        "RQ_signed": surface(rq),
+        "abs_RQ": surface(rq.abs()),
+        "RQ_scale_normalized": surface(rq / q_scale),
+        "abs_RQ_scale_normalized": surface((rq / q_scale).abs()),
+        "Q_target": surface(q_target),
         "CF0": surface(cf0),
         "CFI": surface(cfi),
         "continuation_P0": surface(continuation0),
         "continuation_PI": surface(continuationi),
     }
     summary: Dict[str, float] = {}
-    for prefix, values in (("p0_residual", surfaces["R0_signed"]), ("pi_residual", surfaces["RI_signed"])):
+    for prefix, values in (
+        ("p0_residual", surfaces["R0_signed"]),
+        ("pi_residual", surfaces["RI_signed"]),
+        ("q_residual", surfaces["RQ_signed"]),
+        ("q_residual_normalized", surfaces["RQ_scale_normalized"]),
+    ):
         summary.update({f"{prefix}_{key}": value for key, value in residual_statistics(values).items()})
     return surfaces, summary
 

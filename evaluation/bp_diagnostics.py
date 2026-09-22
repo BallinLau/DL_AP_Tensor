@@ -55,9 +55,13 @@ def build_frozen_transition_data(
     n_child_shocks: int,
     shock_seed: int,
     shock_bank_max_child_shocks: int | None = None,
+    hatc_cal_values: torch.Tensor | None = None,
+    lnk_cal_values: torch.Tensor | None = None,
 ) -> FrozenTransitionData:
     if int(n_child_shocks) < 2:
         raise ValueError("n_child_shocks must be at least 2")
+    if (hatc_cal_values is None) != (lnk_cal_values is None):
+        raise ValueError("hatc_cal_values and lnk_cal_values must be provided together")
     bank_child_shocks = int(shock_bank_max_child_shocks or n_child_shocks)
     if bank_child_shocks < int(n_child_shocks):
         raise ValueError(
@@ -82,11 +86,15 @@ def build_frozen_transition_data(
     reference_index = torch.zeros(parent_states.shape[0], dtype=torch.long, device=device)
     shock_bank = base_bank.gather(reference_index)
     macro = MacroTransitionContext(
-        hatc_cal=torch.full(
-            (parent_states.shape[0], 1), reference.hatc_cal, device=device, dtype=dtype
+        hatc_cal=(
+            hatc_cal_values.to(device=device, dtype=dtype).reshape(-1, 1)
+            if hatc_cal_values is not None else
+            torch.full((parent_states.shape[0], 1), reference.hatc_cal, device=device, dtype=dtype)
         ),
-        lnk_cal=torch.full(
-            (parent_states.shape[0], 1), reference.lnk_cal, device=device, dtype=dtype
+        lnk_cal=(
+            lnk_cal_values.to(device=device, dtype=dtype).reshape(-1, 1)
+            if lnk_cal_values is not None else
+            torch.full((parent_states.shape[0], 1), reference.lnk_cal, device=device, dtype=dtype)
         ),
     )
     bundle = build_child_exogenous_bundle(
@@ -152,8 +160,9 @@ def build_frozen_transition_data(
         "nested_prefix_from_max_J": bank_child_shocks > int(n_child_shocks),
         "common_shocks_across_frozen_grid": True,
         "macro_context": {
-            "hatc_cal": float(reference.hatc_cal),
-            "lnk_cal": float(reference.lnk_cal),
+            "mode": "per_parent" if hatc_cal_values is not None else "fixed_reference",
+            "hatc_cal": float(macro.hatc_cal.mean().item()),
+            "lnk_cal": float(macro.lnk_cal.mean().item()),
         },
         "m_source": "sdf_fc1.forward_step",
         "m_mode": "clipped_train_m" if use_clipped_m else "raw_sdf_m",

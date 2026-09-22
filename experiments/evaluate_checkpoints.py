@@ -163,6 +163,7 @@ def _write_selected_surfaces(
     b_values: np.ndarray,
     z_values: np.ndarray,
     output_root: Path,
+    write_plots: bool = True,
 ) -> None:
     groups = {
         "value": ["P0", "V0", "PI_low", "PI_mid", "PI_high", "VI_low", "VI_mid", "VI_high", "P", "Phat"],
@@ -187,6 +188,8 @@ def _write_selected_surfaces(
         directory.mkdir(parents=True, exist_ok=True)
         selected = {name: surfaces[name] for name in names}
         save_surface_csvs(directory, selected, b_values, z_values)
+        if not write_plots:
+            continue
         for name, values in selected.items():
             plot_heatmap(
                 values,
@@ -221,6 +224,7 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     summary_only = bool(getattr(args, "summary_only", False))
+    detailed_output = bool(getattr(args, "detailed_output", not summary_only))
     loaded = load_analysis_checkpoint(
         args.checkpoint or args.pv_ckpt,
         sdf_checkpoint=args.sdf_ckpt,
@@ -267,6 +271,7 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
             b_values=grid.b_values,
             z_values=grid.z_values,
             output_root=output,
+            write_plots=detailed_output,
         )
 
     boundary, boundary_summary = extract_phat_default_boundary(
@@ -280,11 +285,12 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     if not summary_only:
         (output / "default").mkdir(parents=True, exist_ok=True)
         boundary.to_csv(output / "default" / "default_boundary.csv", index=False)
-        plot_default_boundary(boundary, output / "default" / "default_boundary.png")
         default_comparison.to_csv(output / "default" / "boundary_comparison.csv", index=False)
-        plot_default_boundary_comparison(
-            default_comparison, output / "default" / "boundary_comparison.png"
-        )
+        if detailed_output:
+            plot_default_boundary(boundary, output / "default" / "default_boundary.png")
+            plot_default_boundary_comparison(
+                default_comparison, output / "default" / "boundary_comparison.png"
+            )
 
     investment = evaluate_investment_cutoff(
         model,
@@ -320,19 +326,20 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
             output / "investment", investment_surfaces, grid.b_values, grid.z_values,
         )
         investment_boundary.to_csv(output / "investment" / "investment_boundary.csv", index=False)
-        for name, values in investment_surfaces.items():
-            plot_heatmap(
-                values, grid.b_values, grid.z_values,
-                output / "investment" / f"{name}.png",
-                title=name, colorbar_label=name,
-                cmap="gray_r" if "investment_region" in name else "viridis",
+        if detailed_output:
+            for name, values in investment_surfaces.items():
+                plot_heatmap(
+                    values, grid.b_values, grid.z_values,
+                    output / "investment" / f"{name}.png",
+                    title=name, colorbar_label=name,
+                    cmap="gray_r" if "investment_region" in name else "viridis",
+                )
+            plot_i_star_slices(
+                investment["i_star"], grid.b_values, grid.z_values,
+                output / "investment" / "i_star_z_slices.png",
             )
-        plot_i_star_slices(
-            investment["i_star"], grid.b_values, grid.z_values,
-            output / "investment" / "i_star_z_slices.png",
-        )
 
-    if not summary_only:
+    if detailed_output:
         plot_b_slices(
             surfaces["Q"], grid.b_values, grid.z_values,
             output / "q" / "Q_b_slices.png", title="Q(b) at fixed z", ylabel="Q",
@@ -351,7 +358,8 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     )
     if not summary_only:
         q_peak.to_csv(output / "q" / "Q_peak_by_z.csv", index=False)
-        plot_q_peak(q_peak, output / "q" / "Q_peak_by_z.png")
+        if detailed_output:
+            plot_q_peak(q_peak, output / "q" / "Q_peak_by_z.png")
 
     transition_data = build_frozen_transition_data(
         sdf_fc1_model, grid.base_states, reference, loaded.hyperparams,
@@ -365,11 +373,12 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     )
     if not summary_only:
         save_surface_csvs(output / "bellman", bellman_surfaces, grid.b_values, grid.z_values)
-        for name, values in bellman_surfaces.items():
-            plot_heatmap(
-                values, grid.b_values, grid.z_values, output / "bellman" / f"{name}.png",
-                title=name, colorbar_label=name,
-            )
+        if detailed_output:
+            for name, values in bellman_surfaces.items():
+                plot_heatmap(
+                    values, grid.b_values, grid.z_values, output / "bellman" / f"{name}.png",
+                    title=name, colorbar_label=name,
+                )
 
     bp_surfaces, bp_summary, transition_meta = evaluate_bp_consistency(
         model,
@@ -383,21 +392,24 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         shock_seed=args.shock_seed,
         teacher_margin_tol=args.bp_teacher_margin_tol,
         transition_data=transition_data,
-        write_objective_slices=not summary_only,
+        write_objective_slices=detailed_output,
     )
     if not summary_only:
         save_surface_csvs(output / "bp", bp_surfaces, grid.b_values, grid.z_values)
-        for name, values in bp_surfaces.items():
-            plot_heatmap(
-                values, grid.b_values, grid.z_values, output / "bp" / f"{name}.png",
-                title=name, colorbar_label=name,
+        if detailed_output:
+            for name, values in bp_surfaces.items():
+                plot_heatmap(
+                    values, grid.b_values, grid.z_values, output / "bp" / f"{name}.png",
+                    title=name, colorbar_label=name,
+                )
+            audit = build_child_continuation_audit(
+                model, grid, transition_data, loaded.economic_config,
+                chunk_size=args.forward_chunk_size,
             )
-        audit = build_child_continuation_audit(
-            model, grid, transition_data, loaded.economic_config,
-            chunk_size=args.forward_chunk_size,
-        )
-        (output / "audits").mkdir(parents=True, exist_ok=True)
-        audit.to_csv(output / "audits" / "child_continuation_audit.csv", index=False)
+            (output / "audits").mkdir(parents=True, exist_ok=True)
+            audit.to_csv(output / "audits" / "child_continuation_audit.csv", index=False)
+        else:
+            audit = None
     else:
         audit = None
 
@@ -611,6 +623,9 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
             case_args.n_child_shocks = child_count
             case_args.output_dir = case_output
             case_args.summary_only = not primary
+            case_args.detailed_output = primary and not bool(
+                getattr(args, "summary_only_all", False)
+            )
             case_args.eta_values = None
             case_args.robustness_child_shocks = None
             case_args.shock_bank_max_child_shocks = max(j_values)
