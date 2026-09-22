@@ -38,10 +38,10 @@ def _forward_fields(
 
 def _child_states(
     parent_states: torch.Tensor,
-    children: List[torch.Tensor],
+    children: torch.Tensor,
     bp: torch.Tensor,
 ) -> torch.Tensor:
-    states = torch.stack([child[:, :7] for child in children], dim=1).clone()
+    states = children[..., :7].clone()
     states[..., 0:1] = apply_refinancing_policy(
         b_current=parent_states[:, 0:1].unsqueeze(1),
         bp_candidate=bp.unsqueeze(1),
@@ -117,8 +117,9 @@ def evaluate_bellman_residuals(
             q, q_issue_pi, eta_current,
         )
 
-        child_p0 = _child_states(parent, transition.children, bp0)
-        child_pi = _child_states(parent, transition.children, bpi)
+        children_tensor = transition.stacked_children()
+        child_p0 = _child_states(parent, children_tensor, bp0)
+        child_pi = _child_states(parent, children_tensor, bpi)
         n_parent, n_child, state_dim = child_p0.shape
         p_child_p0 = _forward_fields(
             model, child_p0.reshape(-1, state_dim), ("P",), chunk_size=chunk_size
@@ -132,9 +133,7 @@ def evaluate_bellman_residuals(
         # default and the configured train-M semantics remain branch specific.
         multiplier = bar_i * (float(economic_config.G) - 1.0) + 1.0
         b_sp = parent[:, 0:1] / multiplier.clamp_min(1e-6)
-        q_child_states = torch.stack(
-            [child[:, :7] for child in transition.children], dim=1
-        ).clone()
+        q_child_states = children_tensor[..., :7].clone()
         q_child_states[..., 0:1] = b_sp.unsqueeze(1)
         qsp = _forward_fields(
             model,
@@ -181,8 +180,8 @@ def evaluate_bellman_residuals(
                 "continuationi": continuationi,
             }
 
-        train_m = residuals_for_m(torch.stack(transition.m_used_list, dim=1))
-        raw_m = residuals_for_m(torch.stack(transition.m_raw_list, dim=1))
+        train_m = residuals_for_m(transition.stacked_m_used())
+        raw_m = residuals_for_m(transition.stacked_m_raw())
         scale_fn = getattr(model, "equity_value_scale", None)
         scale = scale_fn(parent) if callable(scale_fn) else torch.ones_like(train_m["r0"])
 

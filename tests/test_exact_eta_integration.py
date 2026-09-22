@@ -15,6 +15,7 @@ from utils.firm_transition import (
     apply_refinancing_policy,
     exact_eta_pair_expectation,
     expand_children_exact_eta,
+    expand_children_exact_eta_tensor,
 )
 
 
@@ -79,6 +80,26 @@ def test_exact_eta_expectation_matches_large_monte_carlo():
     draws = torch.rand(500_000, generator=generator, dtype=torch.float64) < zeta
     simulated = torch.where(draws.unsqueeze(1), eta1, eta0).mean(dim=0)
     torch.testing.assert_close(simulated, exact, atol=1e-2, rtol=0.0)
+
+
+def test_tensorized_exact_eta_expansion_matches_list_api_and_probability_mass():
+    children = _continuous_children()
+    weights = torch.tensor([[0.25, 0.75], [0.60, 0.40]], dtype=torch.float64)
+    legacy = expand_children_exact_eta(children, zeta=0.03, child_weights=weights)
+    tensorized = expand_children_exact_eta_tensor(
+        torch.stack(children, dim=1), zeta=0.03, child_weights=weights
+    )
+    torch.testing.assert_close(
+        torch.stack(legacy.children, dim=1), tensorized.children_tensor
+    )
+    torch.testing.assert_close(legacy.branch_weights, tensorized.branch_weights)
+    torch.testing.assert_close(
+        tensorized.branch_weights.sum(dim=1), torch.ones(2, dtype=torch.float64)
+    )
+    eta_mass = (
+        tensorized.branch_weights * tensorized.children_tensor[..., 2]
+    ).sum(dim=1)
+    torch.testing.assert_close(eta_mass, torch.full_like(eta_mass, 0.03))
 
 
 def test_bp_teacher_exact_eta_matches_large_sampled_eta_benchmark():

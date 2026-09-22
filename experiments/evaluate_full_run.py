@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -30,13 +31,16 @@ from evaluation.convergence_metrics import (  # noqa: E402
     compute_simulated_moments,
 )
 from evaluation.full_run_diagnostics import (  # noqa: E402
+    build_config_invariant_snapshot,
+    compare_config_invariant_snapshots,
     evaluate_fc1_checkpoint,
-    evaluate_sdf_heldout,
+    evaluate_sdf_heldout_multi_k,
     model_state_hash,
     namespace_sdf_summary,
     parse_sdf_validation_log_blocks,
     parse_training_log,
     select_primary_sdf_validation_blocks,
+    summarize_episode_statuses,
     write_json,
 )
 from evaluation.bellman_diagnostics import evaluate_bellman_residuals  # noqa: E402
@@ -75,6 +79,11 @@ HEADLINE_COLUMNS = [
     "sdf_after_aio_t", "sdf_safe_to_continue", "sdf_stage_progress", "sdf_converged",
     "checkpoint", "firm_data", "macro_data", "error",
 ]
+
+
+def _sync_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def parse_args() -> argparse.Namespace:
@@ -440,7 +449,8 @@ def _write_output_schema(
     _plot_metric_dashboard(
         headline,
         ["sdf_common_conditional_abs_mean", "sdf_ondist_conditional_abs_mean",
-         "sdf_common_u_stat", "sdf_common_g_max", "sdf_common_M_mean"],
+         "sdf_common_u_stat", "sdf_ondist_g_max", "sdf_ondist_M_mean",
+         "sdf_ondist_M_std"],
         figures / "sdf_convergence_dashboard.png", title="SDF held-out convergence",
     )
     _plot_metric_dashboard(
@@ -473,10 +483,13 @@ def _discover_episode_macro(run_root: Path, episode: int) -> Path | None:
 
 def main() -> None:
     args = parse_args()
+    total_started = time.perf_counter()
     run_root = args.run_root.expanduser().resolve()
     output = (args.output_dir or run_root / "data" / "outputs" / "full_run_evaluation").resolve()
     args.device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     dirty = _git(["status", "--porcelain"])
     if dirty and not args.allow_dirty_worktree:
         raise RuntimeError("Working tree is dirty; use --allow-dirty-worktree only for intentional local diagnostics")
@@ -503,7 +516,20 @@ def main() -> None:
     availability_notes: list[str] = []
     structural_rows: list[Dict[str, Any]] = []
     sdf_rows_all: list[Dict[str, Any]] = []
+    timing_rows: list[Dict[str, Any]] = []
+    config_records: list[tuple[int, Dict[str, Any], str]] = []
     for episode in episodes:
+        episode_started = time.perf_counter()
+        episode_timing: Dict[str, Any] = {
+            "episode": int(episode),
+            "firm_structural_seconds": float("nan"),
+            "sdf_common_seconds": float("nan"),
+            "sdf_ondist_seconds": float("nan"),
+            "bellman_seconds": float("nan"),
+            "bp_seconds": float("nan"),
+            "investment_seconds": float("nan"),
+            "fc1_seconds": float("nan"),
+        }
         episode_root = output / "episodes" / f"ep{episode}"
         for name in ("firm", "sdf", "fc1", "simulation", "training_log"):
             (episode_root / name).mkdir(parents=True, exist_ok=True)
@@ -516,6 +542,8 @@ def main() -> None:
             availability_notes.append(f"Episode {episode}: {row['error']}")
             headline_rows.append(row)
             error_rows.append({"episode": episode, "stage": "discovery", "error": row["error"]})
+            episode_timing["total_seconds"] = time.perf_counter() - episode_started
+            timing_rows.append(episode_timing)
             continue
         macro_path = _macro_for_firm(firm_path) if firm_path else _discover_episode_macro(run_root, episode)
         row.update({
@@ -524,11 +552,18 @@ def main() -> None:
             "macro_data": str(macro_path) if macro_path else np.nan,
         })
         try:
+            _sync_cuda(device)
+            firm_started = time.perf_counter()
             firm_summary, firm_meta = evaluate_matrix(_firm_eval_args(
                 args, checkpoint=checkpoint, reference_firm=reference_firm,
                 reference_macro=reference_macro, output=episode_root / "firm",
                 representative=episode in representative,
             ))
+            _sync_cuda(device)
+            episode_timing["firm_structural_seconds"] = time.perf_counter() - firm_started
+            firm_timing = firm_meta.get("timing", {})
+            for timing_name in ("bellman_seconds", "bp_seconds", "investment_seconds"):
+                episode_timing[timing_name] = float(firm_timing.get(timing_name, float("nan")))
             structural_rows.extend(
                 {"episode": episode, **item}
                 for item in firm_summary.to_dict(orient="records")
@@ -551,23 +586,30 @@ def main() -> None:
                 name: model_state_hash(loaded.models[name])
                 for name in active_model_names
             }
+            config_snapshot, config_hash = build_config_invariant_snapshot(loaded)
+            config_records.append((episode, config_snapshot, config_hash))
             episode_sdf_rows: list[Dict[str, Any]] = []
             common_primary_meta: Dict[str, Any] | None = None
-            for child_count in sorted(set(args.robustness_child_shocks + [args.n_child_shocks])):
-                sdf_summary, sdf_meta = evaluate_sdf_heldout(
-                    loaded.models["sdf_fc1"], common_parent_states, hatc_cal=common_hatc,
-                    lnk_cal=common_lnk, economic_config=loaded.economic_config,
-                    n_children=child_count, seed=args.shock_seed,
-                    shock_bank_max_children=max_j,
-                    normalized_logr_clip=float(getattr(loaded.hyperparams, "sdf_normalized_logr_clip", 20.0)),
-                )
+            sdf_child_counts = sorted(set(args.robustness_child_shocks + [args.n_child_shocks]))
+            _sync_cuda(device)
+            sdf_common_started = time.perf_counter()
+            common_sdf_summaries, common_sdf_meta = evaluate_sdf_heldout_multi_k(
+                loaded.models["sdf_fc1"], common_parent_states, hatc_cal=common_hatc,
+                lnk_cal=common_lnk, economic_config=loaded.economic_config,
+                child_counts=sdf_child_counts, seed=args.shock_seed,
+                shock_bank_max_children=max_j,
+                normalized_logr_clip=float(getattr(loaded.hyperparams, "sdf_normalized_logr_clip", 20.0)),
+            )
+            _sync_cuda(device)
+            episode_timing["sdf_common_seconds"] = time.perf_counter() - sdf_common_started
+            for child_count, sdf_summary in common_sdf_summaries.items():
                 namespaced = namespace_sdf_summary(sdf_summary, scope="common")
                 item = {"episode": episode, "scope": "common", "n_children": child_count, **namespaced}
                 episode_sdf_rows.append(item)
                 sdf_rows_all.append(item)
                 if child_count == args.n_child_shocks:
                     row.update(namespaced)
-                    common_primary_meta = {**sdf_meta, "parent_bank": common_parent_meta}
+                    common_primary_meta = {**common_sdf_meta, "parent_bank": common_parent_meta}
                     if float(namespaced["sdf_common_valid_parent_ratio"]) < 1.0:
                         availability_notes.append(
                             f"Episode {episode}: common SDF valid_parent_ratio="
@@ -604,21 +646,25 @@ def main() -> None:
                 pd.DataFrame([ondist_summary]).to_csv(
                     episode_root / "firm" / "on_distribution_metrics.csv", index=False
                 )
-                for child_count in sorted(set(args.robustness_child_shocks + [args.n_child_shocks])):
-                    sdf_summary, sdf_meta = evaluate_sdf_heldout(
-                        loaded.models["sdf_fc1"], parent_states, hatc_cal=hatc_cal,
-                        lnk_cal=lnk_cal, economic_config=loaded.economic_config,
-                        n_children=child_count, seed=args.shock_seed,
-                        shock_bank_max_children=max_j,
-                        normalized_logr_clip=float(getattr(loaded.hyperparams, "sdf_normalized_logr_clip", 20.0)),
-                    )
+                _sync_cuda(device)
+                sdf_ondist_started = time.perf_counter()
+                ondist_sdf_summaries, ondist_sdf_meta = evaluate_sdf_heldout_multi_k(
+                    loaded.models["sdf_fc1"], parent_states, hatc_cal=hatc_cal,
+                    lnk_cal=lnk_cal, economic_config=loaded.economic_config,
+                    child_counts=sdf_child_counts, seed=args.shock_seed,
+                    shock_bank_max_children=max_j,
+                    normalized_logr_clip=float(getattr(loaded.hyperparams, "sdf_normalized_logr_clip", 20.0)),
+                )
+                _sync_cuda(device)
+                episode_timing["sdf_ondist_seconds"] = time.perf_counter() - sdf_ondist_started
+                for child_count, sdf_summary in ondist_sdf_summaries.items():
                     namespaced = namespace_sdf_summary(sdf_summary, scope="ondist")
                     item = {"episode": episode, "scope": "ondist", "n_children": child_count, **namespaced}
                     episode_sdf_rows.append(item)
                     sdf_rows_all.append(item)
                     if child_count == args.n_child_shocks:
                         row.update(namespaced)
-                        ondist_primary_meta = {**sdf_meta, "parent_bank": ondist_parent_meta}
+                        ondist_primary_meta = {**ondist_sdf_meta, "parent_bank": ondist_parent_meta}
                         if float(namespaced["sdf_ondist_valid_parent_ratio"]) < 1.0:
                             availability_notes.append(
                                 f"Episode {episode}: on-distribution SDF valid_parent_ratio="
@@ -642,9 +688,13 @@ def main() -> None:
 
             macro_frame = read_dataframe(macro_path) if macro_path else pd.DataFrame()
             if not macro_frame.empty:
+                _sync_cuda(device)
+                fc1_started = time.perf_counter()
                 fc1_summary, timing, rollout = evaluate_fc1_checkpoint(
                     loaded.models["sdf_fc1"], macro_frame, device=device
                 )
+                _sync_cuda(device)
+                episode_timing["fc1_seconds"] = time.perf_counter() - fc1_started
                 row.update(fc1_summary)
                 row.update({
                     "fc1_hatc_skill": fc1_summary.get("fc1_hatc_persistence_skill"),
@@ -681,6 +731,8 @@ def main() -> None:
                 "ondist_sdf_parent_bank": ondist_parent_meta,
                 "common_sdf_metadata": common_primary_meta,
                 "ondist_sdf_metadata": ondist_primary_meta,
+                "config_invariant_snapshot": config_snapshot,
+                "config_hash": config_hash,
             })
         except Exception as exc:
             row.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
@@ -700,6 +752,8 @@ def main() -> None:
         pd.DataFrame([row]).to_csv(episode_root / "summary.csv", index=False)
         write_json(episode_root / "summary.json", row)
         headline_rows.append(row)
+        episode_timing["total_seconds"] = time.perf_counter() - episode_started
+        timing_rows.append(episode_timing)
 
     log_meta: Dict[str, Any] = {"source": "unavailable", "reason": "no explicit or unambiguous training log"}
     log_path = args.training_log.resolve() if args.training_log else None
@@ -759,12 +813,13 @@ def main() -> None:
         HEADLINE_COLUMNS + [c for c in headline.columns if c not in HEADLINE_COLUMNS]
     ].sort_values("episode")
     headline.to_csv(output / "headline_metrics.csv", index=False)
+    status_summary = summarize_episode_statuses(headline, n_requested=len(episodes))
     write_json(output / "run_summary.json", {
         "episodes": headline.to_dict(orient="records"),
-        "n_requested": len(episodes),
-        "n_ok": int((headline["status"] == "ok").sum()),
-        "n_partial": int((headline["status"] == "partial").sum()),
-        "n_error_or_missing": int((headline["status"] != "ok").sum()),
+        **status_summary,
+        "deprecated_fields": {
+            "n_error_or_missing": "alias for n_error + n_missing; partial is excluded"
+        },
     })
     headline.to_csv(output / "run_summary.csv", index=False)
     pd.DataFrame(error_rows).to_csv(output / "errors.csv", index=False)
@@ -785,6 +840,22 @@ def main() -> None:
         headline, parsed_log, drift, pd.DataFrame(structural_rows),
         pd.DataFrame(sdf_rows_all), sdf_log_blocks, output,
     )
+    config_table, config_comparability = compare_config_invariant_snapshots(config_records)
+    (output / "tables").mkdir(parents=True, exist_ok=True)
+    config_table.to_csv(output / "tables" / "cross_episode_config_invariants.csv", index=False)
+    (output / "cross_episode").mkdir(parents=True, exist_ok=True)
+    write_json(
+        output / "cross_episode" / "config_comparability.json",
+        config_comparability,
+    )
+    for episode in config_comparability["mismatched_episodes"]:
+        fields = config_table.loc[
+            config_table["episode"] == episode, "diff_fields"
+        ].iloc[0]
+        missing.add(
+            f"Episode {episode}: config invariant mismatch versus episode "
+            f"{config_comparability['reference_episode']}: {fields}"
+        )
     shutil.copyfile(
         output / "convergence_dashboard.png",
         output / "figures" / "equilibrium_convergence_dashboard.png",
@@ -811,6 +882,38 @@ def main() -> None:
             metric_sources[name] = "structured_simulation_artifact"
         elif name not in {"episode", "status", "checkpoint", "firm_data", "macro_data", "error"}:
             metric_sources[name] = "formal_read_only_checkpoint_evaluator"
+    _sync_cuda(device)
+    timing_frame = pd.DataFrame(timing_rows)
+    timing_payload = {
+        "total_seconds": time.perf_counter() - total_started,
+        "firm_structural_seconds": float(pd.to_numeric(
+            timing_frame.get("firm_structural_seconds"), errors="coerce"
+        ).sum()),
+        "sdf_common_seconds": float(pd.to_numeric(
+            timing_frame.get("sdf_common_seconds"), errors="coerce"
+        ).sum()),
+        "sdf_ondist_seconds": float(pd.to_numeric(
+            timing_frame.get("sdf_ondist_seconds"), errors="coerce"
+        ).sum()),
+        "bellman_seconds": float(pd.to_numeric(
+            timing_frame.get("bellman_seconds"), errors="coerce"
+        ).sum()),
+        "bp_seconds": float(pd.to_numeric(
+            timing_frame.get("bp_seconds"), errors="coerce"
+        ).sum()),
+        "investment_seconds": float(pd.to_numeric(
+            timing_frame.get("investment_seconds"), errors="coerce"
+        ).sum()),
+        "fc1_seconds": float(pd.to_numeric(
+            timing_frame.get("fc1_seconds"), errors="coerce"
+        ).sum()),
+        "cuda_peak_memory_mb": (
+            float(torch.cuda.max_memory_allocated(device)) / (1024.0 ** 2)
+            if device.type == "cuda" else None
+        ),
+        "episodes": timing_rows,
+    }
+    write_json(output / "evaluation_timing.json", timing_payload)
     metadata = {
         "evaluator": "full_run_checkpoint_evaluator_v2",
         "run_root": str(run_root), "git_commit": _git(["rev-parse", "HEAD"]),
@@ -843,6 +946,16 @@ def main() -> None:
         "reference_macro_sha256": _file_hash(reference_macro) if reference_macro else None,
         "training_log": log_meta, "discovery_warnings": discovery_warnings,
         "episode_metadata": episode_metadata,
+        "cross_episode_comparable": bool(config_comparability["all_comparable"]),
+        "config_invariants": config_comparability,
+        "bellman_residual_semantics": {
+            "trainM": (
+                "current-policy fixed-point residual using M_used/clipped-M semantics; "
+                "not historical target-network training residual"
+            ),
+            "rawM": "current-policy fixed-point residual using raw SDF M",
+        },
+        "timing": timing_payload,
         "metric_source_priority": "formal evaluator > structured artifact > parsed log",
         "metric_sources": metric_sources,
         "primary_structural_eta": 1.0,

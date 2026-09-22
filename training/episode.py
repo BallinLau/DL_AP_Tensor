@@ -11706,9 +11706,10 @@ class Episode:
                 stage.value,
             )
         logger.info(
-            "SDF validation | safe_to_continue=%s stage_progress=%s "
+            "SDF validation | stage=%s safe_to_continue=%s stage_progress=%s "
             "converged=%s normalized_mean=%g->%g normalized_t=%g->%g "
             "max_constraint_violation=%g->%g result=%s",
+            stage.value,
             stage_status["sdf_safe_to_continue"],
             stage_status["sdf_stage_progress"],
             stage_status["sdf_converged"],

@@ -19,7 +19,7 @@ from analysis.convergence_transition import (
 from config import Config, HyperParams
 from losses import P0Loss, PILoss
 from training.bp_grid_teacher import BPGridTeacher
-from utils.firm_transition import expand_children_exact_eta
+from utils.firm_transition import expand_children_exact_eta_tensor
 
 from .grids import FrozenFirmGrid, ReferenceFirmState
 from .plotting import plot_objective_slice
@@ -32,6 +32,63 @@ class FrozenTransitionData:
     m_used_list: List[torch.Tensor]
     branch_weights: torch.Tensor
     metadata: Dict[str, Any]
+    children_tensor: torch.Tensor | None = None
+    m_raw_tensor: torch.Tensor | None = None
+    m_used_tensor: torch.Tensor | None = None
+
+    def stacked_children(self) -> torch.Tensor:
+        return self.children_tensor if self.children_tensor is not None else torch.stack(self.children, dim=1)
+
+    def stacked_m_raw(self) -> torch.Tensor:
+        return self.m_raw_tensor if self.m_raw_tensor is not None else torch.stack(self.m_raw_list, dim=1)
+
+    def stacked_m_used(self) -> torch.Tensor:
+        return self.m_used_tensor if self.m_used_tensor is not None else torch.stack(self.m_used_list, dim=1)
+
+
+def slice_frozen_transition_data(
+    transition: FrozenTransitionData,
+    *,
+    n_continuous_children: int,
+) -> FrozenTransitionData:
+    """Take a nested continuous-shock prefix from an exact-eta transition bank."""
+    available = int(transition.metadata.get("continuous_child_count", 0))
+    requested = int(n_continuous_children)
+    if requested < 1 or requested > available:
+        raise ValueError(
+            f"n_continuous_children must be in [1, {available}], got {requested}"
+        )
+    if transition.metadata.get("eta_integration_mode") != "exact":
+        raise ValueError("transition prefix slicing requires exact eta expansion")
+    stop = 2 * requested
+    children_tensor = transition.stacked_children()[:, :stop]
+    m_raw_tensor = transition.stacked_m_raw()[:, :stop]
+    m_used_tensor = transition.stacked_m_used()[:, :stop]
+    branch_weights = transition.branch_weights[:, :stop]
+    branch_weights = branch_weights / branch_weights.sum(dim=1, keepdim=True)
+    metadata = dict(transition.metadata)
+    metadata.update({
+        "n_child_shocks": requested,
+        "continuous_child_count": requested,
+        "expanded_child_count": stop,
+        "shock_bank_max_child_shocks": available,
+        "nested_prefix_from_max_J": requested < available,
+        "transition_build_count": 0,
+        "transition_source": "Jmax_tensor_prefix",
+        "eta_next_active_share": float(
+            (branch_weights * children_tensor[..., 2]).sum(dim=1).mean().item()
+        ),
+    })
+    return FrozenTransitionData(
+        children=list(children_tensor.unbind(dim=1)),
+        m_raw_list=list(m_raw_tensor.unbind(dim=1)),
+        m_used_list=list(m_used_tensor.unbind(dim=1)),
+        branch_weights=branch_weights,
+        metadata=metadata,
+        children_tensor=children_tensor,
+        m_raw_tensor=m_raw_tensor,
+        m_used_tensor=m_used_tensor,
+    )
 
 
 def _shock_bank_hash(bank: ConvergenceShockBank) -> str:
@@ -119,38 +176,46 @@ def build_frozen_transition_data(
     use_clipped_m = bool(getattr(hyperparams, "pv_use_clipped_m", True))
     m_lo = float(getattr(hyperparams, "pv_m_clamp_min", 0.7))
     m_hi = float(getattr(hyperparams, "pv_m_clamp_max", 1.3))
-    continuous_children: List[torch.Tensor] = []
-    continuous_m_raw: List[torch.Tensor] = []
-    continuous_m_used: List[torch.Tensor] = []
-    for child_pos in range(int(n_child_shocks)):
-        continuous_children.append(
-            torch.stack(
-                [
-                    parent_states[:, 0],
-                    bundle.z_next[:, child_pos, 0],
-                    torch.zeros_like(bundle.eta_next[:, child_pos, 0]),
-                    bundle.i_next[:, child_pos, 0],
-                    bundle.x_next[:, child_pos, 0],
-                    bundle.hatcf_next[:, child_pos, 0],
-                    bundle.lnkf_next[:, child_pos, 0],
-                ],
-                dim=1,
-            )
-        )
-        m_raw = bundle.m_raw[:, child_pos, :]
-        m = m_raw
-        if use_clipped_m:
-            m = m.clamp(m_lo, m_hi)
-        continuous_m_raw.append(m_raw)
-        continuous_m_used.append(m)
-    eta_expansion = expand_children_exact_eta(
-        continuous_children,
+    n_parent = parent_states.shape[0]
+    continuous_children_tensor = torch.stack(
+        [
+            parent_states[:, 0].reshape(n_parent, 1).expand(-1, n_child_shocks),
+            bundle.z_next[..., 0],
+            torch.zeros_like(bundle.eta_next[..., 0]),
+            bundle.i_next[..., 0],
+            bundle.x_next[..., 0],
+            bundle.hatcf_next[..., 0],
+            bundle.lnkf_next[..., 0],
+        ],
+        dim=-1,
+    )
+    continuous_m_raw_tensor = bundle.m_raw[:, :n_child_shocks, :]
+    continuous_m_used_tensor = (
+        continuous_m_raw_tensor.clamp(m_lo, m_hi)
+        if use_clipped_m else continuous_m_raw_tensor
+    )
+    eta_expansion = expand_children_exact_eta_tensor(
+        continuous_children_tensor,
         zeta=float(economic_config.ZETA),
         child_weights=bundle.branch_weights,
     )
-    m_raw_list = [continuous_m_raw[index] for index in eta_expansion.source_child_indices]
-    m_used_list = [continuous_m_used[index] for index in eta_expansion.source_child_indices]
-    eta_next = torch.stack([child[:, 2] for child in eta_expansion.children], dim=1)
+    m_raw_tensor = (
+        continuous_m_raw_tensor.unsqueeze(2)
+        .expand(-1, -1, 2, -1)
+        .reshape(n_parent, 2 * n_child_shocks, 1)
+    )
+    m_used_tensor = (
+        continuous_m_used_tensor.unsqueeze(2)
+        .expand(-1, -1, 2, -1)
+        .reshape(n_parent, 2 * n_child_shocks, 1)
+    )
+    children_tensor = eta_expansion.children_tensor
+    if children_tensor is None:
+        raise RuntimeError("tensorized exact-eta expansion did not return children_tensor")
+    children = list(children_tensor.unbind(dim=1))
+    m_raw_list = list(m_raw_tensor.unbind(dim=1))
+    m_used_list = list(m_used_tensor.unbind(dim=1))
+    eta_next = children_tensor[..., 2]
     eta_probability_mass = (eta_expansion.branch_weights * eta_next).sum(dim=1)
     metadata = {
         "builder": "ConvergenceShockBank+build_child_exogenous_bundle",
@@ -168,6 +233,13 @@ def build_frozen_transition_data(
         "eta_probability": float(economic_config.ZETA),
         "continuous_child_count": int(n_child_shocks),
         "expanded_child_count": 2 * int(n_child_shocks),
+        "tensor_layout": {
+            "continuous_children": "[N,J,7]",
+            "expanded_children": "[N,2J,7]",
+            "m_raw": "[N,2J,1]",
+            "m_used": "[N,2J,1]",
+        },
+        "transition_build_count": 1,
         "shock_bank_max_child_shocks": bank_child_shocks,
         "shock_bank_sha256": _shock_bank_hash(generated_bank),
         "shock_bank_prefix_sha256": _shock_bank_hash(base_bank),
@@ -185,11 +257,14 @@ def build_frozen_transition_data(
         "eta_next_active_share": float(eta_probability_mass.mean().item()),
     }
     return FrozenTransitionData(
-        children=eta_expansion.children,
+        children=children,
         m_raw_list=m_raw_list,
         m_used_list=m_used_list,
         branch_weights=eta_expansion.branch_weights,
         metadata=metadata,
+        children_tensor=children_tensor,
+        m_raw_tensor=m_raw_tensor,
+        m_used_tensor=m_used_tensor,
     )
 
 

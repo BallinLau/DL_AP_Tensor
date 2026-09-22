@@ -21,6 +21,49 @@ class ExactEtaChildExpansion:
     branch_weights: torch.Tensor
     source_child_indices: tuple[int, ...]
     continuous_child_count: int
+    children_tensor: Optional[torch.Tensor] = None
+
+
+def expand_children_exact_eta_tensor(
+    children: torch.Tensor,
+    *,
+    zeta: float,
+    child_weights: Optional[torch.Tensor] = None,
+) -> ExactEtaChildExpansion:
+    """Tensorized exact Bernoulli eta expansion for children shaped ``[B,J,D]``."""
+    if children.ndim != 3 or children.shape[1] < 1 or children.shape[2] < 3:
+        raise ValueError("children must have shape [B,J,D] with J>=1 and D>=3")
+    probability = float(zeta)
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError(f"zeta must be in [0, 1], got {probability}")
+    n_parent, n_child, _ = children.shape
+    base_weights = normalize_child_weights(
+        child_weights,
+        n_parent=n_parent,
+        n_child=n_child,
+        device=children.device,
+        dtype=children.dtype,
+    )
+    eta_pair = children.unsqueeze(2).expand(-1, -1, 2, -1).clone()
+    eta_pair[:, :, 0, 2] = 0.0
+    eta_pair[:, :, 1, 2] = 1.0
+    children_tensor = eta_pair.reshape(n_parent, 2 * n_child, children.shape[2])
+    eta_probabilities = torch.as_tensor(
+        [1.0 - probability, probability],
+        device=children.device,
+        dtype=children.dtype,
+    )
+    expanded_weights = (
+        base_weights.unsqueeze(-1) * eta_probabilities.reshape(1, 1, 2)
+    ).reshape(n_parent, 2 * n_child)
+    source_indices = tuple(index for index in range(n_child) for _ in range(2))
+    return ExactEtaChildExpansion(
+        children=list(children_tensor.unbind(dim=1)),
+        branch_weights=expanded_weights,
+        source_child_indices=source_indices,
+        continuous_child_count=n_child,
+        children_tensor=children_tensor,
+    )
 
 
 def normalize_child_weights(
@@ -65,42 +108,15 @@ def expand_children_exact_eta(
     """
     if not children:
         raise ValueError("exact eta expansion requires at least one child")
-    probability = float(zeta)
-    if not 0.0 <= probability <= 1.0:
-        raise ValueError(f"zeta must be in [0, 1], got {probability}")
     first = children[0]
     n_parent = int(first.shape[0])
     for child in children:
         if child.ndim != 2 or child.shape[0] != n_parent or child.shape[1] < 3:
             raise ValueError("all child tensors must have shape [B,D] with D>=3")
-    base_weights = normalize_child_weights(
-        child_weights,
-        n_parent=n_parent,
-        n_child=len(children),
-        device=first.device,
-        dtype=first.dtype,
-    )
-    expanded: List[torch.Tensor] = []
-    expanded_weights = []
-    source_indices = []
-    for child_index, child in enumerate(children):
-        eta0 = child.clone()
-        eta1 = child.clone()
-        eta0[:, 2] = 0.0
-        eta1[:, 2] = 1.0
-        expanded.extend((eta0, eta1))
-        expanded_weights.extend(
-            (
-                base_weights[:, child_index] * (1.0 - probability),
-                base_weights[:, child_index] * probability,
-            )
-        )
-        source_indices.extend((child_index, child_index))
-    return ExactEtaChildExpansion(
-        children=expanded,
-        branch_weights=torch.stack(expanded_weights, dim=1),
-        source_child_indices=tuple(source_indices),
-        continuous_child_count=len(children),
+    return expand_children_exact_eta_tensor(
+        torch.stack(tuple(children), dim=1),
+        zeta=zeta,
+        child_weights=child_weights,
     )
 
 

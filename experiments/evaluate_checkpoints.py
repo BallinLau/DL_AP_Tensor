@@ -6,6 +6,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict
@@ -31,6 +32,7 @@ from evaluation.bellman_diagnostics import (  # noqa: E402
 from evaluation.bp_diagnostics import (  # noqa: E402
     build_frozen_transition_data,
     evaluate_bp_consistency,
+    slice_frozen_transition_data,
 )
 from evaluation.firm_surfaces import (  # noqa: E402
     evaluate_firm_surfaces,
@@ -49,6 +51,11 @@ from evaluation.plotting import (  # noqa: E402
     plot_q_peak,
     save_surface_csvs,
 )
+
+
+def _sync_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def parse_args() -> argparse.Namespace:
@@ -221,21 +228,29 @@ def _bp_boundary_summary(surfaces: Dict[str, np.ndarray]) -> Dict[str, float]:
 
 def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]:
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    _sync_cuda(device)
+    total_started = time.perf_counter()
+    phase_timing: Dict[str, float] = {}
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     summary_only = bool(getattr(args, "summary_only", False))
     detailed_output = bool(getattr(args, "detailed_output", not summary_only))
-    loaded = load_analysis_checkpoint(
-        args.checkpoint or args.pv_ckpt,
-        sdf_checkpoint=args.sdf_ckpt,
-        hyperparams_json=args.hyperparams_json,
-        config_json=args.config_json,
-        model_spec_json=args.model_spec_json,
-        device=device,
-        allow_default_hyperparams=bool(args.allow_default_hyperparams),
-        allow_current_config=bool(args.allow_current_config),
-        m_source="sdf_fc1",
-    )
+    shared_cache = getattr(args, "_evaluation_cache", None)
+    loaded = shared_cache.get("loaded") if shared_cache is not None else None
+    if loaded is None:
+        loaded = load_analysis_checkpoint(
+            args.checkpoint or args.pv_ckpt,
+            sdf_checkpoint=args.sdf_ckpt,
+            hyperparams_json=args.hyperparams_json,
+            config_json=args.config_json,
+            model_spec_json=args.model_spec_json,
+            device=device,
+            allow_default_hyperparams=bool(args.allow_default_hyperparams),
+            allow_current_config=bool(args.allow_current_config),
+            m_source="sdf_fc1",
+        )
+        if shared_cache is not None:
+            shared_cache["loaded"] = loaded
     model = loaded.models["policy_value"]
     sdf_fc1_model = loaded.models["sdf_fc1"]
     model.eval()
@@ -245,26 +260,107 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         "sdf_fc1": _state_hash(sdf_fc1_model),
     }
 
-    _, reference = load_reference_state(args.firm_data, macro_path=args.macro_data)
-    reference = dataclasses.replace(reference, eta=float(args.eta))
-    b_min = float(Config.SIM_B_INIT_MIN if args.b_min is None else args.b_min)
-    b_max = float(Config.SIM_B_INIT_MAX if args.b_max is None else args.b_max)
-    grid = build_frozen_grid(
-        reference,
-        b_min=b_min,
-        b_max=b_max,
-        b_points=args.b_points,
-        z_min=args.z_min,
-        z_max=args.z_max,
-        z_points=args.z_points,
-        device=device,
+    static_cache = (
+        shared_cache.setdefault("static_by_eta", {})
+        if shared_cache is not None else {}
     )
-    surfaces = evaluate_firm_surfaces(
-        model,
-        grid,
-        reference,
-        chunk_size=args.forward_chunk_size,
-    )
+    static_key = float(args.eta)
+    cached_static = static_cache.get(static_key)
+    if cached_static is None:
+        _sync_cuda(device)
+        static_started = time.perf_counter()
+        _, reference = load_reference_state(args.firm_data, macro_path=args.macro_data)
+        reference = dataclasses.replace(reference, eta=static_key)
+        b_min = float(Config.SIM_B_INIT_MIN if args.b_min is None else args.b_min)
+        b_max = float(Config.SIM_B_INIT_MAX if args.b_max is None else args.b_max)
+        grid = build_frozen_grid(
+            reference,
+            b_min=b_min,
+            b_max=b_max,
+            b_points=args.b_points,
+            z_min=args.z_min,
+            z_max=args.z_max,
+            z_points=args.z_points,
+            device=device,
+        )
+        surfaces = evaluate_firm_surfaces(
+            model,
+            grid,
+            reference,
+            chunk_size=args.forward_chunk_size,
+        )
+        boundary, boundary_summary = extract_phat_default_boundary(
+            grid.b_values,
+            grid.z_values,
+            surfaces["Phat"],
+        )
+        default_comparison, default_comparison_summary = compare_hard_soft_default_boundaries(
+            grid.b_values, grid.z_values, surfaces["Phat"], surfaces["bar_z"]
+        )
+        _sync_cuda(device)
+        phase_timing["firm_static_seconds"] = time.perf_counter() - static_started
+
+        investment_started = time.perf_counter()
+        investment = evaluate_investment_cutoff(
+            model,
+            grid,
+            reference,
+            i_points=args.i_points,
+            i_min=0.0,
+            i_max=float(loaded.economic_config.I_THRESHOLD),
+            chunk_size=args.forward_chunk_size,
+            survival_mask=surfaces["survival_mask"],
+        )
+        investment_surfaces = {
+            "i_star": investment["i_star"],
+            "investment_region_mid": investment["investment_region_mid"],
+            "investment_crossing_count": investment["crossing_count"].astype(np.float64),
+        }
+        margin_surfaces, investment_margin_summary = investment_margin_diagnostics(
+            surfaces, investment
+        )
+        investment_surfaces.update(margin_surfaces)
+        investment_boundary = pd.DataFrame(
+            {
+                "b": grid.mesh_b.reshape(-1),
+                "z": grid.mesh_z.reshape(-1),
+                "i_star": investment["i_star"].reshape(-1),
+                "investment_status": investment["investment_status"].reshape(-1),
+                "crossing_count": investment["crossing_count"].reshape(-1),
+                "survival_region": investment["survival_mask"].reshape(-1),
+            }
+        )
+        _sync_cuda(device)
+        phase_timing["investment_seconds"] = time.perf_counter() - investment_started
+        cached_static = {
+            "reference": reference, "b_min": b_min, "b_max": b_max,
+            "grid": grid, "surfaces": surfaces,
+            "boundary": boundary, "boundary_summary": boundary_summary,
+            "default_comparison": default_comparison,
+            "default_comparison_summary": default_comparison_summary,
+            "investment": investment,
+            "investment_surfaces": investment_surfaces,
+            "investment_boundary": investment_boundary,
+            "investment_margin_summary": investment_margin_summary,
+        }
+        if shared_cache is not None:
+            static_cache[static_key] = cached_static
+    else:
+        phase_timing["firm_static_seconds"] = 0.0
+        phase_timing["investment_seconds"] = 0.0
+    reference = cached_static["reference"]
+    b_min = cached_static["b_min"]
+    b_max = cached_static["b_max"]
+    grid = cached_static["grid"]
+    surfaces = cached_static["surfaces"]
+    boundary = cached_static["boundary"]
+    boundary_summary = cached_static["boundary_summary"]
+    default_comparison = cached_static["default_comparison"]
+    default_comparison_summary = cached_static["default_comparison_summary"]
+    investment = cached_static["investment"]
+    investment_surfaces = cached_static["investment_surfaces"]
+    investment_boundary = cached_static["investment_boundary"]
+    investment_margin_summary = cached_static["investment_margin_summary"]
     if not summary_only:
         _write_selected_surfaces(
             surfaces,
@@ -274,14 +370,6 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
             write_plots=detailed_output,
         )
 
-    boundary, boundary_summary = extract_phat_default_boundary(
-        grid.b_values,
-        grid.z_values,
-        surfaces["Phat"],
-    )
-    default_comparison, default_comparison_summary = compare_hard_soft_default_boundaries(
-        grid.b_values, grid.z_values, surfaces["Phat"], surfaces["bar_z"]
-    )
     if not summary_only:
         (output / "default").mkdir(parents=True, exist_ok=True)
         boundary.to_csv(output / "default" / "default_boundary.csv", index=False)
@@ -292,35 +380,6 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
                 default_comparison, output / "default" / "boundary_comparison.png"
             )
 
-    investment = evaluate_investment_cutoff(
-        model,
-        grid,
-        reference,
-        i_points=args.i_points,
-        i_min=0.0,
-        i_max=float(loaded.economic_config.I_THRESHOLD),
-        chunk_size=args.forward_chunk_size,
-        survival_mask=surfaces["survival_mask"],
-    )
-    investment_surfaces = {
-        "i_star": investment["i_star"],
-        "investment_region_mid": investment["investment_region_mid"],
-        "investment_crossing_count": investment["crossing_count"].astype(np.float64),
-    }
-    margin_surfaces, investment_margin_summary = investment_margin_diagnostics(
-        surfaces, investment
-    )
-    investment_surfaces.update(margin_surfaces)
-    investment_boundary = pd.DataFrame(
-        {
-            "b": grid.mesh_b.reshape(-1),
-            "z": grid.mesh_z.reshape(-1),
-            "i_star": investment["i_star"].reshape(-1),
-            "investment_status": investment["investment_status"].reshape(-1),
-            "crossing_count": investment["crossing_count"].reshape(-1),
-            "survival_region": investment["survival_mask"].reshape(-1),
-        }
-    )
     if not summary_only:
         save_surface_csvs(
             output / "investment", investment_surfaces, grid.b_values, grid.z_values,
@@ -361,16 +420,35 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         if detailed_output:
             plot_q_peak(q_peak, output / "q" / "Q_peak_by_z.png")
 
-    transition_data = build_frozen_transition_data(
-        sdf_fc1_model, grid.base_states, reference, loaded.hyperparams,
-        loaded.economic_config, n_child_shocks=args.n_child_shocks,
-        shock_seed=args.shock_seed,
-        shock_bank_max_child_shocks=args.shock_bank_max_child_shocks,
+    transition_cache = (
+        shared_cache.setdefault("transition_by_eta", {})
+        if shared_cache is not None else {}
     )
+    transition_max = transition_cache.get(static_key)
+    configured_max = (
+        shared_cache.get("max_child_shocks") if shared_cache is not None else None
+    ) or args.shock_bank_max_child_shocks or args.n_child_shocks
+    max_child_shocks = int(configured_max)
+    if transition_max is None:
+        transition_max = build_frozen_transition_data(
+            sdf_fc1_model, grid.base_states, reference, loaded.hyperparams,
+            loaded.economic_config, n_child_shocks=max_child_shocks,
+            shock_seed=args.shock_seed,
+            shock_bank_max_child_shocks=max_child_shocks,
+        )
+        if shared_cache is not None:
+            transition_cache[static_key] = transition_max
+    transition_data = slice_frozen_transition_data(
+        transition_max, n_continuous_children=int(args.n_child_shocks)
+    )
+    _sync_cuda(device)
+    bellman_started = time.perf_counter()
     bellman_surfaces, bellman_summary = evaluate_bellman_residuals(
         model, grid, transition_data, loaded.economic_config,
         chunk_size=args.forward_chunk_size,
     )
+    _sync_cuda(device)
+    phase_timing["bellman_seconds"] = time.perf_counter() - bellman_started
     if not summary_only:
         save_surface_csvs(output / "bellman", bellman_surfaces, grid.b_values, grid.z_values)
         if detailed_output:
@@ -380,6 +458,8 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
                     title=name, colorbar_label=name,
                 )
 
+    _sync_cuda(device)
+    bp_started = time.perf_counter()
     bp_surfaces, bp_summary, transition_meta = evaluate_bp_consistency(
         model,
         sdf_fc1_model,
@@ -394,6 +474,8 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         transition_data=transition_data,
         write_objective_slices=detailed_output,
     )
+    _sync_cuda(device)
+    phase_timing["bp_seconds"] = time.perf_counter() - bp_started
     if not summary_only:
         save_surface_csvs(output / "bp", bp_surfaces, grid.b_values, grid.z_values)
         if detailed_output:
@@ -491,6 +573,18 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     }
     if before_hashes != after_hashes:
         raise RuntimeError("Checkpoint model state changed during read-only evaluation")
+    _sync_cuda(device)
+    phase_timing["total_seconds"] = time.perf_counter() - total_started
+    phase_timing["firm_structural_seconds"] = sum(
+        float(phase_timing.get(name, 0.0))
+        for name in (
+            "firm_static_seconds", "investment_seconds", "bellman_seconds", "bp_seconds"
+        )
+    )
+    phase_timing["cuda_peak_memory_mb"] = (
+        float(torch.cuda.max_memory_allocated(device)) / (1024.0 ** 2)
+        if device.type == "cuda" else float("nan")
+    )
     checkpoint_path = Path(args.checkpoint or args.pv_ckpt).expanduser().resolve()
     metadata: Dict[str, object] = {
         "evaluator": "firm_side_checkpoint_evaluator_v2",
@@ -551,6 +645,7 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         "model_state_hash_before": before_hashes,
         "model_state_hash_after": after_hashes,
         "model_state_unchanged": True,
+        "timing": phase_timing,
         "semantics": {
             "default_boundary": (
                 "linearly interpolated Phat=0 when exactly one crossing exists; "
@@ -584,6 +679,13 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
                 "physical conditional mean: P0-CF0-E[M_used*P_child] and "
                 "PI-CFI-G*E[M_used*P_child]"
             ),
+            "bellman_residual_semantics": {
+                "trainM": (
+                    "current-policy fixed-point residual using M_used/clipped-M semantics; "
+                    "not historical target-network training residual"
+                ),
+                "rawM": "current-policy fixed-point residual using raw SDF M",
+            },
         },
     }
     (output / "metadata.json").write_text(
@@ -605,6 +707,12 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
     j_values = list(dict.fromkeys(int(value) for value in j_values))
     if any(value < 2 for value in j_values):
         raise ValueError("All robustness child-shock counts must be at least 2")
+
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    matrix_started = time.perf_counter()
+    evaluation_cache: Dict[str, object] = {"max_child_shocks": max(j_values)}
 
     rows = []
     case_metadata = []
@@ -629,6 +737,7 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
             case_args.eta_values = None
             case_args.robustness_child_shocks = None
             case_args.shock_bank_max_child_shocks = max(j_values)
+            case_args._evaluation_cache = evaluation_cache
             summary, metadata = evaluate(case_args)
             if first_case_metadata is None:
                 first_case_metadata = metadata
@@ -647,6 +756,7 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
                 "output": str(case_output),
                 "metadata": str(case_output / "metadata.json"),
                 "model_state_unchanged": bool(metadata.get("model_state_unchanged")),
+                "timing": metadata.get("timing", {}),
             })
 
     combined = pd.DataFrame(rows)
@@ -655,6 +765,35 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
     robustness.mkdir(parents=True, exist_ok=True)
     combined.to_csv(robustness / "j_comparison.csv", index=False)
     first_case_metadata = first_case_metadata or {}
+    matrix_timing = {
+        "total_seconds": time.perf_counter() - matrix_started,
+        "firm_static_seconds": sum(
+            float((item.get("timing") or {}).get("firm_static_seconds", 0.0))
+            for item in case_metadata
+        ),
+        "investment_seconds": sum(
+            float((item.get("timing") or {}).get("investment_seconds", 0.0))
+            for item in case_metadata
+        ),
+        "bellman_seconds": sum(
+            float((item.get("timing") or {}).get("bellman_seconds", 0.0))
+            for item in case_metadata
+        ),
+        "bp_seconds": sum(
+            float((item.get("timing") or {}).get("bp_seconds", 0.0))
+            for item in case_metadata
+        ),
+        "transition_build_count": len(evaluation_cache.get("transition_by_eta", {})),
+        "checkpoint_load_count": 1 if "loaded" in evaluation_cache else 0,
+        "cuda_peak_memory_mb": (
+            float(torch.cuda.max_memory_allocated(device)) / (1024.0 ** 2)
+            if device.type == "cuda" else float("nan")
+        ),
+    }
+    matrix_timing["firm_structural_seconds"] = sum(
+        float(matrix_timing[name])
+        for name in ("firm_static_seconds", "investment_seconds", "bellman_seconds", "bp_seconds")
+    )
     metadata = {
         "evaluator": "firm_side_checkpoint_evaluator_v2_matrix",
         "git_commit_sha": _git_sha(),
@@ -683,6 +822,12 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
         "model_state_unchanged": all(
             bool(item.get("model_state_unchanged")) for item in case_metadata
         ),
+        "timing": matrix_timing,
+        "matrix_reuse": {
+            "checkpoint_loaded_once": True,
+            "static_surfaces_once_per_eta": True,
+            "transition_built_at_Jmax_once_per_eta": True,
+        },
         "cases": case_metadata,
         "semantics": {
             "child_leverage_timing": "b_next = eta_next * bp_current + (1-eta_next) * b_current",

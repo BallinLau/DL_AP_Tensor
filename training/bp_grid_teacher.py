@@ -9,7 +9,7 @@ detached bp labels for the policy heads. Simulation code never calls this module
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
@@ -48,6 +48,36 @@ def _strip_extra(x: torch.Tensor) -> torch.Tensor:
     return x[:, :7] if x.shape[1] > 7 else x
 
 
+def _stack_children(children: Sequence[torch.Tensor] | torch.Tensor) -> torch.Tensor:
+    if isinstance(children, torch.Tensor):
+        if children.ndim != 3:
+            raise ValueError("children tensor must have shape [N,J,D]")
+        return children
+    if not children:
+        raise ValueError("BP grid evaluation requires at least one child tensor.")
+    return torch.stack(tuple(children), dim=1)
+
+
+def _stack_m(m_values: Sequence[torch.Tensor] | torch.Tensor) -> torch.Tensor:
+    if isinstance(m_values, torch.Tensor):
+        if m_values.ndim != 3:
+            raise ValueError("M tensor must have shape [N,J,1]")
+        return m_values
+    if not m_values:
+        raise ValueError("BP grid evaluation requires at least one M tensor.")
+    return torch.stack(tuple(m_values), dim=1)
+
+
+def _slice_child_axis(
+    values: Sequence[torch.Tensor] | torch.Tensor,
+    start: int,
+    stop: int,
+) -> Sequence[torch.Tensor] | torch.Tensor:
+    if isinstance(values, torch.Tensor):
+        return values[start:stop]
+    return [value[start:stop] for value in values]
+
+
 def _expand_candidates(base: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
     """Repeat a (B,D) tensor over candidate dimension and flatten to (B*J,D)."""
     batch_size, n_grid = candidates.shape
@@ -64,7 +94,7 @@ def _candidate_flat(candidates: torch.Tensor) -> torch.Tensor:
 
 
 def _expand_grid_children(
-    children: List[torch.Tensor],
+    children: Sequence[torch.Tensor] | torch.Tensor,
     bp_grid: torch.Tensor,
     b_parent: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -72,10 +102,7 @@ def _expand_grid_children(
 
     Children contain next-period exogenous states, including eta_{t+1}.
     """
-    if not children:
-        raise ValueError("BP grid evaluation requires at least one child tensor.")
-
-    children_t = torch.stack(children, dim=1)
+    children_t = _stack_children(children)
     child_state_raw = children_t[..., :7] if children_t.shape[-1] > 7 else children_t
     batch_size, n_children, state_dim = child_state_raw.shape
     n_grid = bp_grid.shape[1]
@@ -97,7 +124,7 @@ def _expand_grid_children(
 
 def _forward_equity_grid_children(
     model: Any,
-    children: List[torch.Tensor],
+    children: Sequence[torch.Tensor] | torch.Tensor,
     bp_grid: torch.Tensor,
     b_parent: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -234,8 +261,8 @@ class BPGridTeacher:
     def compute(
         self,
         parent_state: torch.Tensor,
-        children: List[torch.Tensor],
-        m_list: List[torch.Tensor],
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
         *,
         branch: str,
         bp_pred: Optional[torch.Tensor] = None,
@@ -252,8 +279,8 @@ class BPGridTeacher:
             chunks = []
             for start in range(0, parent_state.shape[0], self.parent_chunk_size):
                 stop = min(start + self.parent_chunk_size, parent_state.shape[0])
-                child_chunk = [child[start:stop] for child in children]
-                m_chunk = [m[start:stop] for m in m_list]
+                child_chunk = _slice_child_axis(children, start, stop)
+                m_chunk = _slice_child_axis(m_list, start, stop)
                 bp_chunk = bp_pred[start:stop] if bp_pred is not None else None
                 mix_chunk = mix_weight[start:stop] if mix_weight is not None else None
                 weight_chunk = (
@@ -286,8 +313,8 @@ class BPGridTeacher:
     def compute_value_target(
         self,
         parent_state: torch.Tensor,
-        children: List[torch.Tensor],
-        m_list: List[torch.Tensor],
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
         *,
         branch: str,
         child_weights: Optional[torch.Tensor] = None,
@@ -303,8 +330,8 @@ class BPGridTeacher:
                 chunks.append(
                     self._compute_value_target_no_parent_chunk(
                         parent_state[start:stop],
-                        [child[start:stop] for child in children],
-                        [m[start:stop] for m in m_list],
+                        _slice_child_axis(children, start, stop),
+                        _slice_child_axis(m_list, start, stop),
                         branch=branch,
                         child_weights=(
                             child_weights
@@ -325,8 +352,8 @@ class BPGridTeacher:
     def _compute_value_target_no_parent_chunk(
         self,
         parent_state: torch.Tensor,
-        children: List[torch.Tensor],
-        m_list: List[torch.Tensor],
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
         *,
         branch: str,
         child_weights: Optional[torch.Tensor] = None,
@@ -375,8 +402,8 @@ class BPGridTeacher:
     def _compute_no_parent_chunk(
         self,
         parent_state: torch.Tensor,
-        children: List[torch.Tensor],
-        m_list: List[torch.Tensor],
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
         *,
         branch: str,
         bp_pred: Optional[torch.Tensor] = None,
@@ -528,8 +555,8 @@ class BPGridTeacher:
     def _evaluate_grid(
         self,
         parent_state: torch.Tensor,
-        children: List[torch.Tensor],
-        m_list: List[torch.Tensor],
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
         bp_grid: torch.Tensor,
         *,
         branch: str,
@@ -537,7 +564,9 @@ class BPGridTeacher:
         child_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size, n_grid = bp_grid.shape
-        n_children = len(children)
+        children_tensor = _stack_children(children)
+        m_tensor = _stack_m(m_list)
+        n_children = int(children_tensor.shape[1])
         q_current = _target_q(self.target_model, parent_state)
         expanded_per_candidate = max(batch_size * n_children, 1)
         dynamic_chunk = max(1, self.max_expanded_states // expanded_per_candidate)
@@ -565,7 +594,7 @@ class BPGridTeacher:
             self._grid_chunk_logged = True
         if chunk_size >= n_grid:
             return self._evaluate_grid_chunk(
-                parent_state, children, m_list, bp_grid, branch=branch,
+                parent_state, children_tensor, m_tensor, bp_grid, branch=branch,
                 mix_weight=mix_weight, child_weights=child_weights, q_current=q_current,
             )
 
@@ -575,8 +604,8 @@ class BPGridTeacher:
             chunks.append(
                 self._evaluate_grid_chunk(
                     parent_state,
-                    children,
-                    m_list,
+                    children_tensor,
+                    m_tensor,
                     bp_grid[:, start:stop],
                     branch=branch,
                     mix_weight=mix_weight,
@@ -602,8 +631,8 @@ class BPGridTeacher:
     def _evaluate_grid_chunk(
         self,
         parent_state: torch.Tensor,
-        children: List[torch.Tensor],
-        m_list: List[torch.Tensor],
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
         bp_grid: torch.Tensor,
         *,
         branch: str,
@@ -622,11 +651,14 @@ class BPGridTeacher:
         issue_state[:, 0:1] = _candidate_flat(bp_grid)
         q_issue = _target_q(self.target_model, issue_state).reshape(batch_size, n_grid)
 
+        children_tensor = _stack_children(children)
+        m_tensor = _stack_m(m_list)
+        n_children = int(children_tensor.shape[1])
         mix_w = None
         if branch == "mix":
             if mix_weight is None:
                 raise ValueError("mix_weight is required for branch='mix'")
-            mix_w = mix_weight.clamp(0.0, 1.0).reshape(batch_size, 1, 1).expand(batch_size, n_grid, len(children))
+            mix_w = mix_weight.clamp(0.0, 1.0).reshape(batch_size, 1, 1).expand(batch_size, n_grid, n_children)
 
         x_parent = parent_state[:, 4:5]
         z_parent = parent_state[:, 1:2]
@@ -635,7 +667,7 @@ class BPGridTeacher:
 
         p_child, bar_z_child, child_b_grid = _forward_equity_grid_children(
             self.target_model,
-            children,
+            children_tensor,
             bp_grid,
             b_parent,
         )
@@ -648,7 +680,7 @@ class BPGridTeacher:
             dtype=parent_state.dtype,
         )
         weights_grid = weights.unsqueeze(1)
-        m_grid = torch.stack(m_list, dim=1).reshape(batch_size, 1, n_children).expand(batch_size, n_grid, n_children)
+        m_grid = m_tensor.reshape(batch_size, 1, n_children).expand(batch_size, n_grid, n_children)
         flat_shape = (batch_size * n_grid * n_children, 1)
         x_grid = x_parent.unsqueeze(1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
         z_grid = z_parent.unsqueeze(1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
@@ -704,10 +736,7 @@ class BPGridTeacher:
         continuation_grid_mean = (weights_grid * branch_continuation).sum(dim=2)
         p_grid_mean = (weights_grid * p_child).sum(dim=2)
         default_grid_mean = (weights_grid * bar_z_child).sum(dim=2)
-        eta_next = torch.stack(
-            [(_strip_extra(child)[:, 2]).clamp(0.0, 1.0) for child in children],
-            dim=1,
-        )
+        eta_next = children_tensor[..., 2].clamp(0.0, 1.0)
         eta_next_active_share = (weights * eta_next).sum(dim=1, keepdim=True).expand(batch_size, n_grid)
         child_b_mean = (weights_grid * child_b_grid).sum(dim=2)
 

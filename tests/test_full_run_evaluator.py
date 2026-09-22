@@ -15,16 +15,22 @@ from evaluation.bp_diagnostics import (
     FrozenTransitionData,
     _shock_bank_hash,
     build_frozen_transition_data,
+    slice_frozen_transition_data,
 )
 from evaluation.full_run_diagnostics import (
+    build_config_invariant_snapshot,
+    compare_config_invariant_snapshots,
     conditional_residual_summary,
     evaluate_fc1_checkpoint,
     evaluate_sdf_heldout,
+    evaluate_sdf_heldout_multi_k,
     model_state_hash,
     namespace_sdf_summary,
     parse_sdf_validation_log_blocks,
     parse_training_log,
     select_primary_sdf_validation_blocks,
+    stable_config_hash,
+    summarize_episode_statuses,
 )
 from evaluation.grids import FrozenFirmGrid, ReferenceFirmState, build_frozen_grid
 from experiments.evaluate_full_run import (
@@ -61,6 +67,8 @@ class QDiagnosticModel(torch.nn.Module):
     def __init__(self, q_value: float):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.tensor(q_value))
+        self.value_scale_mode = "none"
+        self.value_scale_log_max = 20.0
 
     def forward(self, states):
         q = torch.ones_like(states[:, :1]) * self.anchor
@@ -140,6 +148,16 @@ class StableSDF(torch.nn.Module):
         return w_parent, w_children, m, hatc, lnk
 
 
+class CountingStableSDF(StableSDF):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward_step(self, *args, **kwargs):
+        self.forward_calls += 1
+        return super().forward_step(*args, **kwargs)
+
+
 def test_sdf_heldout_is_nested_and_read_only():
     model = StableSDF()
     parents = torch.tensor([
@@ -164,6 +182,32 @@ def test_sdf_heldout_is_nested_and_read_only():
     assert meta2["shock_bank_max_children"] == meta4["shock_bank_max_children"] == 4
     assert meta2["shock_bank_sha256"] == meta4["shock_bank_sha256"]
     assert model_state_hash(model) == before
+
+
+def test_sdf_multi_k_matches_single_k_and_uses_one_forward():
+    parents = torch.tensor([
+        [0.2, -0.2, 1.0, 0.2, -2.0, -2.1, 4.0],
+        [0.4, 0.2, 0.0, 0.3, -1.9, -2.0, 4.1],
+    ])
+    hatc = torch.full((2, 1), -2.0)
+    lnk = torch.full((2, 1), 4.1)
+    model = CountingStableSDF()
+    multi, metadata = evaluate_sdf_heldout_multi_k(
+        model, parents, hatc_cal=hatc, lnk_cal=lnk,
+        economic_config=AnalysisEconomicConfig.from_current_config(),
+        child_counts=[2, 4, 8], seed=7, shock_bank_max_children=8,
+    )
+    assert model.forward_calls == 1
+    assert metadata["sdf_forward_calls"] == 1
+    for child_count in (2, 4, 8):
+        single, _ = evaluate_sdf_heldout(
+            StableSDF(), parents, hatc_cal=hatc, lnk_cal=lnk,
+            economic_config=AnalysisEconomicConfig.from_current_config(),
+            n_children=child_count, seed=7, shock_bank_max_children=8,
+        )
+        assert multi[child_count].keys() == single.keys()
+        for key in single:
+            assert multi[child_count][key] == pytest.approx(single[key], nan_ok=True)
 
 
 class NonfiniteSDF(StableSDF):
@@ -281,6 +325,66 @@ def test_sdf_validation_parser_preserves_arrow_values_and_repeated_blocks(tmp_pa
     assert metadata["n_blocks"] == 2
 
 
+def test_sdf_validation_parser_prefers_explicit_stage_and_rejects_duplicates(tmp_path):
+    log = tmp_path / "train.out"
+    log.write_text(
+        "Episode 3 SDF recursive context\n"
+        "SDF validation | stage=sdf_true_only safe_to_continue=True "
+        "stage_progress=True converged=False normalized_mean=1->0.5 "
+        "normalized_t=4->3 max_constraint_violation=0.2->0.1 result=CONTINUE\n"
+        "Episode 4\n"
+        "SDF validation | stage=sdf_true_only safe_to_continue=True "
+        "stage_progress=True converged=False normalized_mean=1->0.5 "
+        "normalized_t=4->3 max_constraint_violation=0.2->0.1 result=CONTINUE\n"
+        "SDF validation | stage=sdf_true_only safe_to_continue=True "
+        "stage_progress=True converged=True normalized_mean=0.5->0.1 "
+        "normalized_t=3->1 max_constraint_violation=0.1->0 result=PASS\n",
+        encoding="utf-8",
+    )
+    blocks, _ = parse_sdf_validation_log_blocks(log)
+    assert list(blocks["stage_source"]) == ["explicit", "explicit", "explicit"]
+    primary, selection = select_primary_sdf_validation_blocks(blocks)
+    assert list(primary["episode"]) == [3]
+    assert primary.iloc[0]["sdf_validation_stage_source"] == "explicit"
+    assert selection["ambiguous_episodes"] == [4]
+
+
+def test_config_invariant_hash_and_comparison_are_stable():
+    hp = SimpleNamespace(
+        sdf_wealth_loss_mode="signed_aio", sdf_normalized_logr_clip=20.0,
+        pv_use_clipped_m=True, pv_m_clamp_min=0.7, pv_m_clamp_max=1.3,
+        pv_bellman_normalize_by_value_scale=True,
+        pv_exact_eta_integration_enabled=True,
+    )
+    loaded = SimpleNamespace(
+        economic_config=AnalysisEconomicConfig.from_current_config(), hp=hp,
+        hyperparams=hp,
+        models={"policy_value": QDiagnosticModel(0.0), "sdf_fc1": StableSDF()},
+    )
+    snapshot, config_hash = build_config_invariant_snapshot(loaded)
+    assert stable_config_hash(snapshot) == config_hash
+    reordered = {key: snapshot[key] for key in reversed(snapshot)}
+    assert stable_config_hash(reordered) == config_hash
+    changed = {**snapshot, "policy_value": {**snapshot["policy_value"], "pv_m_clamp_max": 1.4}}
+    frame, metadata = compare_config_invariant_snapshots([
+        (0, snapshot, config_hash), (1, reordered, stable_config_hash(reordered)),
+        (2, changed, stable_config_hash(changed)),
+    ])
+    assert metadata["all_comparable"] is False
+    assert metadata["mismatched_episodes"] == [2]
+    assert frame.loc[frame["episode"] == 2, "diff_fields"].iloc[0] == "policy_value.pv_m_clamp_max"
+
+
+def test_status_summary_distinguishes_partial_error_and_missing():
+    summary = summarize_episode_statuses(pd.DataFrame({
+        "status": ["ok", "partial", "error", "missing"]
+    }))
+    assert summary == {
+        "n_requested": 4, "n_ok": 1, "n_partial": 1, "n_error": 1,
+        "n_missing": 1, "n_not_fully_ok": 3, "n_error_or_missing": 2,
+    }
+
+
 def test_full_run_schema_has_no_fc2_and_output_overwrite_is_explicit(tmp_path):
     assert not any("fc2" in name.lower() for name in HEADLINE_COLUMNS)
     output = tmp_path / "evaluation"
@@ -351,6 +455,14 @@ def test_actual_shock_bank_hash_uses_tensor_contents():
         1, 4, seed=19, device=torch.device("cpu"), dtype=parents.dtype
     )
     assert transition.metadata["shock_bank_sha256"] == _shock_bank_hash(actual_builder_bank)
+    prefix = slice_frozen_transition_data(transition, n_continuous_children=2)
+    assert prefix.children_tensor.shape == (2, 4, 7)
+    assert prefix.m_raw_tensor.shape == (2, 4, 1)
+    torch.testing.assert_close(prefix.branch_weights.sum(dim=1), torch.ones(2))
+    eta_mass = (prefix.branch_weights * prefix.children_tensor[..., 2]).sum(dim=1)
+    torch.testing.assert_close(
+        eta_mass, torch.full_like(eta_mass, AnalysisEconomicConfig.from_current_config().ZETA)
+    )
 
 
 def test_checkpoint_without_episode_firm_still_runs_structural_and_common_sdf(
@@ -383,12 +495,20 @@ def test_checkpoint_without_episode_firm_still_runs_structural_and_common_sdf(
             "eta_parent": 1.0, "n_child_shocks": 2,
             "p0_residual_abs_mean": 0.1, "pi_residual_abs_mean": 0.2,
             "q_residual_abs_mean": 0.3,
-        }]), {"reference_transition_bank": {"shock_bank_sha256": "actual"}}
+        }]), {
+            "reference_transition_bank": {"shock_bank_sha256": "actual"},
+            "timing": {"bellman_seconds": 0.1, "bp_seconds": 0.1, "investment_seconds": 0.1},
+        }
 
     loaded = SimpleNamespace(
         models={"policy_value": QDiagnosticModel(0.25), "sdf_fc1": StableSDF()},
         metadata={"loaded_model_keys": ["policy_value", "sdf_fc1"]},
-        hyperparams=SimpleNamespace(sdf_normalized_logr_clip=20.0),
+        hyperparams=SimpleNamespace(
+            sdf_normalized_logr_clip=20.0, sdf_wealth_loss_mode="signed_aio",
+            pv_use_clipped_m=True, pv_m_clamp_min=0.7, pv_m_clamp_max=1.3,
+            pv_bellman_normalize_by_value_scale=False,
+            pv_exact_eta_integration_enabled=True,
+        ),
         economic_config=AnalysisEconomicConfig.from_current_config(),
     )
     monkeypatch.setattr(full_run_module, "evaluate_matrix", fake_matrix)
@@ -411,6 +531,13 @@ def test_checkpoint_without_episode_firm_still_runs_structural_and_common_sdf(
     assert headline.loc[0, "p0_residual_abs_mean"] == pytest.approx(0.1)
     assert np.isfinite(headline.loc[0, "sdf_common_conditional_abs_mean"])
     assert not (output / "episodes" / "ep0" / "fc2").exists()
+    run_summary = pd.read_json(output / "run_summary.json", typ="series")
+    assert run_summary["n_partial"] == 1
+    assert run_summary["n_error_or_missing"] == 0
+    metadata = pd.read_json(output / "metadata.json", typ="series")
+    assert bool(metadata["cross_episode_comparable"])
+    assert (output / "evaluation_timing.json").is_file()
+    assert (output / "tables" / "cross_episode_config_invariants.csv").is_file()
 
 
 def test_checkpoint_discovery_preserves_missing_episode(tmp_path):

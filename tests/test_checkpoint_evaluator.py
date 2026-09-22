@@ -892,3 +892,10 @@ def test_eta_and_child_shock_matrix_writes_full_and_compact_cases(tmp_path):
     )
     assert metadata["nested_shock_prefix_across_J"] is True
     assert metadata["shock_bank_max_child_shocks"] == 3
+    assert metadata["matrix_reuse"] == {
+        "checkpoint_loaded_once": True,
+        "static_surfaces_once_per_eta": True,
+        "transition_built_at_Jmax_once_per_eta": True,
+    }
+    assert metadata["timing"]["checkpoint_load_count"] == 1
+    assert metadata["timing"]["transition_build_count"] == 2

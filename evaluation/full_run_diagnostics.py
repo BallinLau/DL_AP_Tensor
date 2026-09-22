@@ -19,6 +19,141 @@ from losses.sdf_loss import compute_pooled_moment_constraints
 from utils.metrics import conditional_moment_metrics
 
 
+_CONFIG_ECONOMIC_FIELDS = (
+    "RHO_X", "SIGMA_X", "XBAR", "ZETA", "G", "DELTA", "PHI", "TAU",
+    "KAPPA_B", "KAPPA_E",
+)
+
+
+def _stable_config_value(value: Any) -> Any:
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return float(value)
+    if value is None or isinstance(value, str):
+        return value
+    raise TypeError(f"Unsupported config invariant value: {type(value).__name__}")
+
+
+def stable_config_hash(snapshot: Dict[str, Any]) -> str:
+    """Hash semantic configuration only, excluding paths and runtime fields."""
+    payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_config_invariant_snapshot(loaded: Any) -> tuple[Dict[str, Any], str]:
+    """Build the cross-episode economic/model-semantic invariant snapshot."""
+    economic = loaded.economic_config
+    hp = loaded.hyperparams
+    policy_model = loaded.models["policy_value"]
+    sdf_fc1 = loaded.models["sdf_fc1"]
+    sdf_model = sdf_fc1.sdf_model
+    snapshot = {
+        "economic": {
+            name: _stable_config_value(getattr(economic, name))
+            for name in _CONFIG_ECONOMIC_FIELDS
+        },
+        "sdf": {
+            "wealth_residual_mode": str(getattr(hp, "sdf_wealth_loss_mode")),
+            "normalized_logr_clip": float(getattr(hp, "sdf_normalized_logr_clip")),
+            "gamma": float(sdf_model.gamma),
+            "kappa": float(sdf_model.kappa),
+            "sigma": float(sdf_model.sigma),
+            "beta": float(sdf_model.beta),
+        },
+        "policy_value": {
+            "pv_use_clipped_m": bool(getattr(hp, "pv_use_clipped_m")),
+            "pv_m_clamp_min": float(getattr(hp, "pv_m_clamp_min")),
+            "pv_m_clamp_max": float(getattr(hp, "pv_m_clamp_max")),
+            "value_scale_mode": str(policy_model.value_scale_mode),
+            "value_scale_log_max": float(policy_model.value_scale_log_max),
+            "bellman_normalize_by_value_scale": bool(
+                getattr(hp, "pv_bellman_normalize_by_value_scale")
+            ),
+            "eta_integration_semantics": (
+                "exact_bernoulli"
+                if bool(getattr(hp, "pv_exact_eta_integration_enabled"))
+                else "sampled_eta"
+            ),
+        },
+    }
+    return snapshot, stable_config_hash(snapshot)
+
+
+def _config_diff_fields(reference: Any, candidate: Any, *, prefix: str = "") -> list[str]:
+    if isinstance(reference, dict) and isinstance(candidate, dict):
+        fields: list[str] = []
+        for key in sorted(set(reference) | set(candidate)):
+            name = f"{prefix}.{key}" if prefix else str(key)
+            if key not in reference or key not in candidate:
+                fields.append(name)
+            else:
+                fields.extend(_config_diff_fields(reference[key], candidate[key], prefix=name))
+        return fields
+    return [] if reference == candidate else [prefix]
+
+
+def compare_config_invariant_snapshots(
+    records: Sequence[tuple[int, Dict[str, Any], str]],
+) -> tuple[pd.DataFrame, Dict[str, Any]]:
+    """Compare episode snapshots against the first available episode."""
+    if not records:
+        empty = pd.DataFrame(columns=[
+            "episode", "config_hash", "comparable_to_reference", "diff_fields"
+        ])
+        return empty, {
+            "reference_episode": None, "all_comparable": False,
+            "mismatched_episodes": [], "fields": [],
+        }
+    ordered = sorted(records, key=lambda item: item[0])
+    reference_episode, reference, reference_hash = ordered[0]
+    rows = []
+    all_fields: set[str] = set()
+    mismatched: list[int] = []
+    for episode, snapshot, config_hash in ordered:
+        diff_fields = _config_diff_fields(reference, snapshot)
+        all_fields.update(diff_fields)
+        comparable = config_hash == reference_hash and not diff_fields
+        if not comparable:
+            mismatched.append(int(episode))
+        rows.append({
+            "episode": int(episode),
+            "config_hash": config_hash,
+            "comparable_to_reference": bool(comparable),
+            "diff_fields": ";".join(diff_fields),
+        })
+    return pd.DataFrame(rows), {
+        "reference_episode": int(reference_episode),
+        "reference_config_hash": reference_hash,
+        "all_comparable": not mismatched,
+        "mismatched_episodes": mismatched,
+        "fields": sorted(all_fields),
+    }
+
+
+def summarize_episode_statuses(
+    frame: pd.DataFrame,
+    *,
+    n_requested: int | None = None,
+) -> Dict[str, int]:
+    counts = frame.get("status", pd.Series(dtype=object)).value_counts()
+    result = {
+        "n_requested": int(len(frame) if n_requested is None else n_requested),
+        "n_ok": int(counts.get("ok", 0)),
+        "n_partial": int(counts.get("partial", 0)),
+        "n_error": int(counts.get("error", 0)),
+        "n_missing": int(counts.get("missing", 0)),
+    }
+    result["n_not_fully_ok"] = (
+        result["n_partial"] + result["n_error"] + result["n_missing"]
+    )
+    # Backward-compatible alias with corrected semantics.
+    result["n_error_or_missing"] = result["n_error"] + result["n_missing"]
+    return result
+
+
 def model_state_hash(model: torch.nn.Module) -> str:
     digest = hashlib.sha256()
     for name, tensor in sorted(model.state_dict().items()):
@@ -73,77 +208,38 @@ def conditional_residual_summary(residuals: torch.Tensor, *, prefix: str) -> Dic
     return {f"{prefix}_{key}": value for key, value in result.items()}
 
 
-def evaluate_sdf_heldout(
-    model: torch.nn.Module,
-    parent_states: torch.Tensor,
+def _summarize_sdf_prefix(
     *,
-    hatc_cal: torch.Tensor,
-    lnk_cal: torch.Tensor,
-    economic_config: AnalysisEconomicConfig,
+    raw_residual: torch.Tensor,
+    normalized_residual: torch.Tensor,
+    m_raw: torch.Tensor,
+    log_r: torch.Tensor,
+    loss: SDFLoss,
+    normalized_logr_clip: float,
+    n_parent: int,
     n_children: int,
-    seed: int,
-    shock_bank_max_children: int | None = None,
-    normalized_logr_clip: float = 20.0,
-) -> tuple[Dict[str, float], Dict[str, Any]]:
-    """Fresh-shock held-out SDF/wealth residual evaluation."""
-    if n_children < 2:
-        raise ValueError("SDF held-out evaluation requires at least two children")
-    device, dtype = parent_states.device, parent_states.dtype
-    n_parent = int(parent_states.shape[0])
-    bank_size = int(shock_bank_max_children or n_children)
-    if bank_size < n_children:
-        raise ValueError("shock_bank_max_children must be >= n_children")
-    full_bank = ConvergenceShockBank.create(
-        n_parent, bank_size, seed=seed, device=device, dtype=dtype
-    )
-    bank = ConvergenceShockBank(
-        eps_x=full_bank.eps_x[:, :n_children],
-        eps_z=full_bank.eps_z[:, :n_children],
-        u_eta=full_bank.u_eta[:, :n_children],
-        u_i=full_bank.u_i[:, :n_children],
-        seed=full_bank.seed,
-    )
-    x_prev = parent_states[:, 4:5]
-    x_next = (
-        (1.0 - economic_config.RHO_X) * economic_config.XBAR
-        + economic_config.RHO_X * x_prev.unsqueeze(1)
-        + economic_config.SIGMA_X * bank.eps_x
-    )
-    with torch.no_grad():
-        w_parent, w_children, m_raw, hatc_next, lnk_next = model.forward_step(
-            x_prev=x_prev,
-            x_curr=x_next,
-            hatcf_prev=hatc_cal,
-            lnkf_prev=lnk_cal,
-            return_physical=True,
-        )
-        loss = SDFLoss(
-            gamma=float(model.sdf_model.gamma),
-            kappa=float(model.sdf_model.kappa),
-            sigma=float(model.sdf_model.sigma),
-            beta=float(model.sdf_model.beta),
-            wealth_loss_mode="signed_aio",
-        )
-        residuals = loss.compute_wealth_residuals(
-            w_parent=w_parent,
-            w_children=w_children,
-            k_parent=lnk_cal,
-            k_children=lnk_next,
-            c_parent=hatc_cal,
-            c_children=hatc_next,
-            normalized_logr_clip=normalized_logr_clip,
-        )
+) -> Dict[str, float]:
     summary: Dict[str, float] = {}
-    summary.update(conditional_residual_summary(residuals["raw"], prefix="sdf_raw"))
-    summary.update(conditional_residual_summary(residuals["normalized"], prefix="sdf_normalized"))
-    normalized_finite = torch.isfinite(residuals["normalized"])
-    valid_parent = normalized_finite.all(dim=1)
+    summary.update(conditional_residual_summary(raw_residual, prefix="sdf_raw"))
+    summary.update(conditional_residual_summary(normalized_residual, prefix="sdf_normalized"))
+    raw_finite = torch.isfinite(raw_residual)
+    normalized_finite = torch.isfinite(normalized_residual)
+    raw_valid_parent = raw_finite.all(dim=1)
+    normalized_valid_parent = normalized_finite.all(dim=1)
     summary.update({
         "sdf_n_parents_requested": n_parent,
-        "sdf_n_parents_valid": int(valid_parent.sum().item()),
-        "sdf_valid_parent_ratio": float(valid_parent.double().mean().item()),
+        "sdf_n_parents_valid": int(normalized_valid_parent.sum().item()),
+        "sdf_valid_parent_ratio": float(normalized_valid_parent.double().mean().item()),
         "sdf_n_children": int(n_children),
         "sdf_finite_child_ratio": float(normalized_finite.double().mean().item()),
+        "sdf_raw_valid_parent_ratio": float(raw_valid_parent.double().mean().item()),
+        "sdf_normalized_valid_parent_ratio": float(
+            normalized_valid_parent.double().mean().item()
+        ),
+        "sdf_raw_finite_child_ratio": float(raw_finite.double().mean().item()),
+        "sdf_normalized_finite_child_ratio": float(
+            normalized_finite.double().mean().item()
+        ),
     })
     finite_m = m_raw.detach().reshape(-1).to(torch.float64)
     finite_m = finite_m[torch.isfinite(finite_m)]
@@ -153,10 +249,15 @@ def evaluate_sdf_heldout(
         "sdf_M_min": float(finite_m.min().item()) if finite_m.numel() else float("nan"),
         "sdf_M_max": float(finite_m.max().item()) if finite_m.numel() else float("nan"),
         "sdf_M_finite_ratio": float(torch.isfinite(m_raw).double().mean().item()),
-        "sdf_log_R_clip_share": float(residuals["log_R_clip_share"].item()),
+        "sdf_log_R_clip_share": float(
+            (log_r.abs() > float(normalized_logr_clip)).double().mean().item()
+        ),
     })
     if finite_m.numel():
-        for quantile, label in ((0.01, "p01"), (0.05, "p05"), (0.50, "p50"), (0.95, "p95"), (0.99, "p99")):
+        for quantile, label in (
+            (0.01, "p01"), (0.05, "p05"), (0.50, "p50"),
+            (0.95, "p95"), (0.99, "p99"),
+        ):
             summary[f"sdf_M_{label}"] = float(torch.quantile(finite_m, quantile).item())
         constraints = compute_pooled_moment_constraints(
             finite_m, loss.mu_lo, loss.mu_hi, loss.var_hi
@@ -180,12 +281,92 @@ def evaluate_sdf_heldout(
         "heldout_n_parents": summary["sdf_normalized_n_parents"],
         "heldout_n_children": summary["sdf_normalized_n_children"],
     })
+    return summary
+
+
+def evaluate_sdf_heldout_multi_k(
+    model: torch.nn.Module,
+    parent_states: torch.Tensor,
+    *,
+    hatc_cal: torch.Tensor,
+    lnk_cal: torch.Tensor,
+    economic_config: AnalysisEconomicConfig,
+    child_counts: Sequence[int],
+    seed: int,
+    shock_bank_max_children: int | None = None,
+    normalized_logr_clip: float = 20.0,
+) -> tuple[Dict[int, Dict[str, float]], Dict[str, Any]]:
+    """Evaluate nested child-count prefixes with one max-K SDF forward."""
+    counts = sorted(set(int(value) for value in child_counts))
+    if not counts or counts[0] < 2:
+        raise ValueError("SDF held-out evaluation requires child counts >= 2")
+    device, dtype = parent_states.device, parent_states.dtype
+    n_parent = int(parent_states.shape[0])
+    max_children = max(counts)
+    bank_size = int(shock_bank_max_children or max_children)
+    if bank_size < max_children:
+        raise ValueError("shock_bank_max_children must be >= max(child_counts)")
+    full_bank = ConvergenceShockBank.create(
+        n_parent, bank_size, seed=seed, device=device, dtype=dtype
+    )
+    bank = ConvergenceShockBank(
+        eps_x=full_bank.eps_x[:, :max_children],
+        eps_z=full_bank.eps_z[:, :max_children],
+        u_eta=full_bank.u_eta[:, :max_children],
+        u_i=full_bank.u_i[:, :max_children],
+        seed=full_bank.seed,
+    )
+    x_prev = parent_states[:, 4:5]
+    x_next = (
+        (1.0 - economic_config.RHO_X) * economic_config.XBAR
+        + economic_config.RHO_X * x_prev.unsqueeze(1)
+        + economic_config.SIGMA_X * bank.eps_x
+    )
+    with torch.inference_mode():
+        w_parent, w_children, m_raw, hatc_next, lnk_next = model.forward_step(
+            x_prev=x_prev,
+            x_curr=x_next,
+            hatcf_prev=hatc_cal,
+            lnkf_prev=lnk_cal,
+            return_physical=True,
+        )
+        loss = SDFLoss(
+            gamma=float(model.sdf_model.gamma),
+            kappa=float(model.sdf_model.kappa),
+            sigma=float(model.sdf_model.sigma),
+            beta=float(model.sdf_model.beta),
+            wealth_loss_mode="signed_aio",
+        )
+        residuals = loss.compute_wealth_residuals(
+            w_parent=w_parent,
+            w_children=w_children,
+            k_parent=lnk_cal,
+            k_children=lnk_next,
+            c_parent=hatc_cal,
+            c_children=hatc_next,
+            normalized_logr_clip=normalized_logr_clip,
+        )
+    summaries = {
+        count: _summarize_sdf_prefix(
+            raw_residual=residuals["raw"][:, :count],
+            normalized_residual=residuals["normalized"][:, :count],
+            m_raw=m_raw[:, :count],
+            log_r=residuals["log_R"][:, :count],
+            loss=loss,
+            normalized_logr_clip=normalized_logr_clip,
+            n_parent=n_parent,
+            n_children=count,
+        )
+        for count in counts
+    }
     metadata = {
         "source": "fresh_ConvergenceShockBank",
         "seed": int(seed),
         "n_parents": n_parent,
-        "n_children": int(n_children),
+        "child_counts": counts,
+        "max_children_evaluated": max_children,
         "shock_bank_max_children": bank_size,
+        "sdf_forward_calls": 1,
         "common_random_nested_prefix_compatible": True,
         "parent_bank_sha256": _tensor_hash((
             ("parent_states", parent_states), ("hatc_cal", hatc_cal), ("lnk_cal", lnk_cal),
@@ -197,7 +378,34 @@ def evaluate_sdf_heldout(
         "residual_helper": "SDFLoss.compute_wealth_residuals",
         "conditional_metric_helper": "utils.metrics.conditional_moment_metrics",
     }
-    return summary, metadata
+    return summaries, metadata
+
+
+def evaluate_sdf_heldout(
+    model: torch.nn.Module,
+    parent_states: torch.Tensor,
+    *,
+    hatc_cal: torch.Tensor,
+    lnk_cal: torch.Tensor,
+    economic_config: AnalysisEconomicConfig,
+    n_children: int,
+    seed: int,
+    shock_bank_max_children: int | None = None,
+    normalized_logr_clip: float = 20.0,
+) -> tuple[Dict[str, float], Dict[str, Any]]:
+    """Backward-compatible single-K wrapper around the max-K evaluator."""
+    summaries, metadata = evaluate_sdf_heldout_multi_k(
+        model,
+        parent_states,
+        hatc_cal=hatc_cal,
+        lnk_cal=lnk_cal,
+        economic_config=economic_config,
+        child_counts=[n_children],
+        seed=seed,
+        shock_bank_max_children=shock_bank_max_children,
+        normalized_logr_clip=normalized_logr_clip,
+    )
+    return summaries[int(n_children)], {**metadata, "n_children": int(n_children)}
 
 
 def namespace_sdf_summary(summary: Dict[str, float], *, scope: str) -> Dict[str, float]:
@@ -231,6 +439,8 @@ def namespace_sdf_summary(summary: Dict[str, float], *, scope: str) -> Dict[str,
         "n_children", "finite_child_ratio", "M_mean", "M_std", "M_min", "M_max",
         "M_p01", "M_p05", "M_p50", "M_p95", "M_p99", "M_finite_ratio",
         "log_R_clip_share", "g_mean_low", "g_mean_high", "g_var_high", "g_max",
+        "raw_valid_parent_ratio", "normalized_valid_parent_ratio",
+        "raw_finite_child_ratio", "normalized_finite_child_ratio",
     )
     for name in direct:
         result[f"{prefix}_{name}"] = summary.get(f"sdf_{name}", float("nan"))
@@ -408,19 +618,29 @@ def parse_sdf_validation_log_blocks(path: str | Path) -> tuple[pd.DataFrame, Dic
         r"(?P<key>safe_to_continue|stage_progress|converged)\s*=\s*(?P<value>true|false)",
         re.IGNORECASE,
     )
+    explicit_stage_pattern = re.compile(r"\bstage\s*=\s*(?P<stage>[A-Za-z0-9_.-]+)")
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         episode_match = _EPISODE_RE.search(line)
         if episode_match:
             current_episode = int(episode_match.group("episode"))
             current_stage = None
-        current_stage = _sdf_stage_from_line(line, current_stage)
+        inferred_stage = _sdf_stage_from_line(line, current_stage)
+        current_stage = inferred_stage
         if current_episode is None or "SDF validation" not in line:
             continue
+        explicit_stage = explicit_stage_pattern.search(line)
+        if explicit_stage is not None:
+            block_stage = explicit_stage.group("stage").lower().replace("-", "_")
+            stage_source = "explicit"
+        else:
+            block_stage = inferred_stage
+            stage_source = "inferred"
         occurrence = occurrences.get(current_episode, 0) + 1
         occurrences[current_episode] = occurrence
         row: Dict[str, Any] = {
             "episode": current_episode,
-            "stage": current_stage or "unknown",
+            "stage": block_stage or "unknown",
+            "stage_source": stage_source,
             "occurrence": occurrence,
         }
         for match in bool_pattern.finditer(line):
@@ -453,10 +673,15 @@ def select_primary_sdf_validation_blocks(
     ambiguous: list[int] = []
     for episode, group in blocks.groupby("episode", sort=True):
         formal = group[group["stage"] == "sdf_true_only"]
-        if len(formal) != 1:
+        explicit_formal = (
+            formal[formal["stage_source"] == "explicit"]
+            if "stage_source" in formal.columns else formal.iloc[0:0]
+        )
+        candidates = explicit_formal if not explicit_formal.empty else formal
+        if len(candidates) != 1:
             ambiguous.append(int(episode))
             continue
-        item = formal.iloc[0]
+        item = candidates.iloc[0]
         rows.append({
             "episode": int(episode),
             "sdf_before_aio_mean": item.get("normalized_mean_before", np.nan),
@@ -470,11 +695,12 @@ def select_primary_sdf_validation_blocks(
             "sdf_converged": item.get("converged", np.nan),
             "sdf_validation_result": item.get("result", ""),
             "sdf_validation_stage": item.get("stage", ""),
+            "sdf_validation_stage_source": item.get("stage_source", "inferred"),
             "sdf_validation_occurrence": item.get("occurrence", np.nan),
         })
     return pd.DataFrame(rows), {
         "ambiguous_episodes": ambiguous,
-        "selection_rule": "exactly_one_sdf_true_only_block",
+        "selection_rule": "exactly_one_explicit_sdf_true_only_else_exactly_one_inferred",
     }
 
 

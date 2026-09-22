@@ -35,6 +35,10 @@ log-derived metrics remain unavailable instead of guessing a file.
 - P0/PI/Q structural metrics use the common frozen reference grid. Each equation
   reports both training-M and raw-M residuals; backward-compatible unqualified
   aliases retain training-M semantics.
+  `trainM` means a current-policy fixed-point residual evaluated with the
+  checkpoint's `M_used`/clipped-M semantics. It is not a historical optimizer
+  residual and does not use a historical target-network RHS. `rawM` evaluates
+  the same current-policy fixed point with raw SDF M.
 - `ondist_*` P0/PI/Q metrics use each episode's observed parent-state bank and
   likewise retain separate train-M/raw-M outputs.
 - Q uses `compute_q_survival_recovery_components()` and reports
@@ -46,6 +50,9 @@ log-derived metrics remain unavailable instead of guessing a file.
   `utils.metrics.conditional_moment_metrics()` for CMSE and the U-statistic.
   They also report the M distribution and the same pooled mean/variance
   inequality constraints used by the SDF implementation.
+  Model convergence is read primarily from common-bank conditional residuals
+  and U-statistics. Distribution-dependent feasibility (`E[M]`, `std(M)`, and
+  `g_max`) is read primarily from the on-distribution parent bank.
 - FC1 reports one-step RMSE/MAE/R2/correlation/slope/intercept, persistence
   skill, rollout RMSE/MAE/finite ratios, and timing shifts.
 - Adjacent-checkpoint Q/P0/PI/P/bar_z/bp drift is computed by the existing
@@ -67,6 +74,7 @@ log-derived metrics remain unavailable instead of guessing a file.
   training_log_metrics.csv
   errors.csv
   metadata.json
+  evaluation_timing.json
   missing_artifacts.md
   convergence_dashboard.png
   README.md
@@ -94,6 +102,7 @@ log-derived metrics remain unavailable instead of guessing a file.
       training_log/
         metrics.csv (when an explicit log row is available)
   cross_episode/
+    config_comparability.json
     equation_residuals/
     function_drift/
     equation_error_vs_drift/
@@ -112,6 +121,7 @@ log-derived metrics remain unavailable instead of guessing a file.
     fc1_convergence_dashboard.png
     simulated_moments_dashboard.png
   tables/
+    cross_episode_config_invariants.csv
     headline_metrics_by_episode.csv
     equation_metrics_by_episode.csv
     macro_metrics_by_episode.csv
@@ -129,6 +139,34 @@ episodes and strict checkpoint reconstruction errors are preserved in
 `headline_metrics.csv`, `errors.csv`, and `missing_artifacts.md`. Metadata
 records input hashes, checkpoint hashes, model hashes before/after evaluation,
 the structural shock-bank hash, evaluator commit, grid, and metric sources.
+
+## Vectorization and comparability
+
+- SDF robustness counts use a nested max-K bank. For child counts 32/64/128,
+  the evaluator generates K=128 once, performs one SDF/FC1 forward, and computes
+  each smaller result from tensor prefixes. Common and on-distribution scopes
+  therefore require two SDF forwards per episode instead of six.
+- Frozen transitions are represented as `[N,J,7]` before exact eta expansion
+  and `[N,2J,7]` afterwards. Raw/used M use `[N,2J,1]`; branch weights use
+  `[N,2J]` and sum to one for every parent.
+- The firm robustness matrix loads the checkpoint once, evaluates static
+  surfaces and investment once per current eta, builds one Jmax transition per
+  eta, and derives smaller-J exact-eta prefixes. Bellman and BP computations
+  retain flatten-and-chunk GPU forwards for memory control.
+- BP candidate evaluation already uses joint parent x candidate x child tensors
+  `[N,B,J,D]`, flattened to `[N*B*J,D]` within each candidate chunk. The
+  evaluator now passes transition tensors directly into that path.
+- `cross_episode_config_invariants.csv` hashes only stable economic and model
+  semantics. Paths, devices, timestamps, and runtime fields are excluded. Any
+  audited difference marks `cross_episode_comparable=false` but does not stop
+  metric generation.
+- `evaluation_timing.json` reports total, firm structural, common/ondist SDF,
+  Bellman, BP, investment, FC1, and CUDA peak-memory measurements. CUDA is
+  synchronized only at phase boundaries.
+
+FC1 rollout retains its horizon recursion and path/origin loop in this change.
+It is timed separately; batching it is deferred until a real run identifies it
+as a material bottleneck. FC2 remains explicitly out of scope.
 
 ## Slurm
 

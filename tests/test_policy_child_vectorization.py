@@ -443,6 +443,18 @@ class PolicyChildVectorizationTest(unittest.TestCase):
                 branch=branch,
                 mix_weight=mix_weight if branch == "mix" else None,
             )
+            tensor_model = _CountingTargetModel().to(dtype=torch.float64)
+            tensor_teacher = BPGridTeacher(
+                tensor_model, P0Loss(), PILoss(), refine=False,
+            )
+            tensor_result = tensor_teacher._evaluate_grid_chunk(
+                parent_state,
+                torch.stack(children, dim=1),
+                torch.stack(m_list, dim=1),
+                bp_grid,
+                branch=branch,
+                mix_weight=mix_weight if branch == "mix" else None,
+            )
             reference = _reference_target_grid_chunk(
                 reference_teacher,
                 parent_state,
@@ -463,8 +475,11 @@ class PolicyChildVectorizationTest(unittest.TestCase):
                 "default_grid_mean",
             ):
                 torch.testing.assert_close(vector[key], reference[key], rtol=1e-10, atol=1e-10)
+                torch.testing.assert_close(tensor_result[key], vector[key], rtol=1e-10, atol=1e-10)
             torch.testing.assert_close(vector["argmax_index"], reference["argmax_index"], rtol=0.0, atol=0.0)
+            torch.testing.assert_close(tensor_result["argmax_index"], vector["argmax_index"], rtol=0.0, atol=0.0)
             self.assertEqual(vector_model.equity_calls, 1)
+            self.assertEqual(tensor_model.equity_calls, 1)
             self.assertEqual(reference_model.equity_calls, n_children)
 
     def test_parent_eta_zero_does_not_mask_target_when_child_eta_can_refinance(self):
