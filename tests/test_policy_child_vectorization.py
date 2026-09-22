@@ -13,7 +13,11 @@ from models import PolicyValueModel
 from losses.p0_loss import P0Loss
 from losses.pi_loss import PILoss
 from config import Config
-from training.bp_grid_teacher import BPGridTeacher, _forward_equity_grid_children
+from training.bp_grid_teacher import (
+    BPGridTeacher,
+    _forward_equity_grid_children,
+    resolve_grid_chunk_plan,
+)
 from training.episode import Episode
 from utils.firm_transition import apply_refinancing_policy
 
@@ -166,6 +170,35 @@ def _reference_target_grid_chunk(teacher, parent_state, children, m_list, bp_gri
 
 
 class PolicyChildVectorizationTest(unittest.TestCase):
+    def test_grid_chunk_plan_enforces_hard_cap_at_realistic_child_counts(self):
+        for n_children in (256, 128, 64):
+            plan = resolve_grid_chunk_plan(
+                n_parent=10201,
+                n_grid=21,
+                n_children=n_children,
+                configured_parent_chunk=2048,
+                configured_candidate_chunk=0,
+                max_expanded_states=65536,
+            )
+            self.assertLessEqual(plan.expanded_states_per_forward, 65536)
+            self.assertLessEqual(
+                plan.parent_chunk_effective
+                * plan.candidate_chunk_effective
+                * n_children,
+                65536,
+            )
+
+    def test_grid_chunk_plan_rejects_even_one_parent_child_bundle_above_cap(self):
+        with self.assertRaisesRegex(ValueError, "smaller than one parent"):
+            resolve_grid_chunk_plan(
+                n_parent=10,
+                n_grid=21,
+                n_children=256,
+                configured_parent_chunk=2048,
+                configured_candidate_chunk=0,
+                max_expanded_states=255,
+            )
+
     def test_policy_value_model_default_has_no_batchnorm_or_dropout(self):
         model = PolicyValueModel()
         self.assertFalse(any(isinstance(m, nn.BatchNorm1d) for m in model.modules()))
@@ -481,6 +514,53 @@ class PolicyChildVectorizationTest(unittest.TestCase):
             self.assertEqual(vector_model.equity_calls, 1)
             self.assertEqual(tensor_model.equity_calls, 1)
             self.assertEqual(reference_model.equity_calls, n_children)
+
+    def test_dynamic_parent_candidate_chunks_match_one_shot_teacher(self):
+        torch.manual_seed(912)
+        batch_size = 5
+        n_children = 4
+        parent_state = torch.randn(batch_size, 7, dtype=torch.float64)
+        parent_state[:, 0:1] = torch.sigmoid(parent_state[:, 0:1])
+        parent_state[:, 2:3] = torch.sigmoid(parent_state[:, 2:3])
+        children = _make_children(batch_size=batch_size, n_children=n_children)
+        m_list = [
+            torch.full((batch_size, 1), 0.92 + 0.01 * index, dtype=torch.float64)
+            for index in range(n_children)
+        ]
+        bp_pred = torch.linspace(0.1, 0.9, batch_size, dtype=torch.float64).reshape(-1, 1)
+        common = dict(
+            p0_loss_fn=P0Loss(),
+            pi_loss_fn=PILoss(),
+            coarse_size=7,
+            fine_size=5,
+            refine=True,
+            quadratic_refine=False,
+            parent_chunk_size=5,
+        )
+        one_shot = BPGridTeacher(
+            target_model=_CountingTargetModel().to(dtype=torch.float64),
+            max_expanded_states=10_000,
+            **common,
+        ).compute(parent_state, children, m_list, branch="p0", bp_pred=bp_pred)
+        dynamically_chunked = BPGridTeacher(
+            target_model=_CountingTargetModel().to(dtype=torch.float64),
+            max_expanded_states=8,
+            **common,
+        ).compute(parent_state, children, m_list, branch="p0", bp_pred=bp_pred)
+
+        for key in (
+            "bp_star",
+            "coarse_value_grid",
+            "value_grid",
+            "regret",
+            "top2_margin",
+            "q_issue_at_star",
+            "p_child_at_star",
+            "default_at_star",
+        ):
+            torch.testing.assert_close(
+                dynamically_chunked[key], one_shot[key], rtol=1e-5, atol=1e-6
+            )
 
     def test_parent_eta_zero_does_not_mask_target_when_child_eta_can_refinance(self):
         batch_size = 2

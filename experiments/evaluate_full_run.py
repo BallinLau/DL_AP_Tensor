@@ -86,6 +86,29 @@ def _sync_cuda(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def aggregate_episode_peak_memory(peaks: list[float | None]) -> float | None:
+    finite = [float(value) for value in peaks if value is not None and np.isfinite(value)]
+    return max(finite) if finite else None
+
+
+def select_episode_child_counts(
+    *,
+    episode: int,
+    representative_episodes: set[int],
+    primary_child_shocks: int,
+    robustness_child_shocks: list[int],
+    robustness_scope: str,
+) -> list[int]:
+    if robustness_scope not in {"representative", "all", "none"}:
+        raise ValueError(f"Unsupported robustness_scope={robustness_scope!r}")
+    include_robustness = (
+        robustness_scope == "all"
+        or (robustness_scope == "representative" and episode in representative_episodes)
+    )
+    selected = robustness_child_shocks if include_robustness else []
+    return sorted(set([int(primary_child_shocks), *(int(value) for value in selected)]))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Read-only full-run checkpoint evaluator across all episodes."
@@ -99,6 +122,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--n-child-shocks", type=int, default=64)
     parser.add_argument("--robustness-child-shocks", type=int, nargs="+", default=[32, 64, 128])
+    parser.add_argument(
+        "--robustness-scope",
+        choices=("representative", "all", "none"),
+        default="representative",
+        help="Run extra J robustness cases on representative episodes, all episodes, or none.",
+    )
     parser.add_argument("--shock-seed", type=int, default=12345)
     parser.add_argument("--max-sdf-parents", type=int, default=512)
     parser.add_argument("--eta-values", type=float, nargs="+", default=[0.0, 1.0])
@@ -214,6 +243,8 @@ def _firm_eval_args(
     reference_macro: Path | None,
     output: Path,
     representative: bool,
+    child_counts: list[int],
+    loaded_checkpoint: Any,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         checkpoint=checkpoint, pv_ckpt=None, sdf_ckpt=None, hyperparams_json=None,
@@ -224,10 +255,17 @@ def _firm_eval_args(
         z_min=args.z_min, z_max=args.z_max, z_points=args.z_points,
         i_points=args.i_points, forward_chunk_size=args.forward_chunk_size,
         n_child_shocks=args.n_child_shocks, shock_seed=args.shock_seed,
-        shock_bank_max_child_shocks=max(args.robustness_child_shocks + [args.n_child_shocks]),
-        robustness_child_shocks=args.robustness_child_shocks,
+        shock_bank_max_child_shocks=max(child_counts),
+        robustness_child_shocks=[
+            value for value in child_counts if value != int(args.n_child_shocks)
+        ],
+        robustness_scope=args.robustness_scope,
         bp_teacher_margin_tol=args.bp_teacher_margin_tol,
         summary_only_all=not representative,
+        loaded_checkpoint=loaded_checkpoint,
+        checkpoint_load_count=1,
+        defer_model_state_hash_to_outer=True,
+        manage_cuda_peak_stats=False,
     )
 
 
@@ -488,8 +526,6 @@ def main() -> None:
     output = (args.output_dir or run_root / "data" / "outputs" / "full_run_evaluation").resolve()
     args.device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     device = torch.device(args.device)
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
     dirty = _git(["status", "--porcelain"])
     if dirty and not args.allow_dirty_worktree:
         raise RuntimeError("Working tree is dirty; use --allow-dirty-worktree only for intentional local diagnostics")
@@ -508,7 +544,16 @@ def main() -> None:
         reference_firm, reference_macro, device=device, max_parents=args.max_sdf_parents
     )
     representative = set(choose_representative_episodes(episodes))
-    max_j = max(args.robustness_child_shocks + [args.n_child_shocks])
+    child_counts_by_episode = {
+        int(episode): select_episode_child_counts(
+            episode=int(episode),
+            representative_episodes=representative,
+            primary_child_shocks=args.n_child_shocks,
+            robustness_child_shocks=args.robustness_child_shocks,
+            robustness_scope=args.robustness_scope,
+        )
+        for episode in episodes
+    }
 
     headline_rows: list[Dict[str, Any]] = []
     error_rows: list[Dict[str, Any]] = []
@@ -522,14 +567,20 @@ def main() -> None:
         episode_started = time.perf_counter()
         episode_timing: Dict[str, Any] = {
             "episode": int(episode),
+            "checkpoint_load_count": 0,
+            "firm_matrix_wall_seconds": float("nan"),
             "firm_structural_seconds": float("nan"),
+            "firm_static_seconds": float("nan"),
             "sdf_common_seconds": float("nan"),
             "sdf_ondist_seconds": float("nan"),
             "bellman_seconds": float("nan"),
             "bp_seconds": float("nan"),
             "investment_seconds": float("nan"),
             "fc1_seconds": float("nan"),
+            "cuda_peak_memory_mb": None,
         }
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         episode_root = output / "episodes" / f"ep{episode}"
         for name in ("firm", "sdf", "fc1", "simulation", "training_log"):
             (episode_root / name).mkdir(parents=True, exist_ok=True)
@@ -552,18 +603,42 @@ def main() -> None:
             "macro_data": str(macro_path) if macro_path else np.nan,
         })
         try:
+            selected_child_counts = child_counts_by_episode[int(episode)]
+            max_j = max(selected_child_counts)
+            loaded = load_analysis_checkpoint(checkpoint, device=device)
+            episode_timing["checkpoint_load_count"] = 1
+            for loaded_model in loaded.models.values():
+                loaded_model.eval()
+            active_model_names = loaded.metadata.get("loaded_model_keys", [])
+            before = {
+                name: model_state_hash(loaded.models[name])
+                for name in active_model_names
+            }
+            config_snapshot, config_hash = build_config_invariant_snapshot(loaded)
+            config_records.append((episode, config_snapshot, config_hash))
             _sync_cuda(device)
             firm_started = time.perf_counter()
             firm_summary, firm_meta = evaluate_matrix(_firm_eval_args(
                 args, checkpoint=checkpoint, reference_firm=reference_firm,
                 reference_macro=reference_macro, output=episode_root / "firm",
                 representative=episode in representative,
+                child_counts=selected_child_counts,
+                loaded_checkpoint=loaded,
             ))
             _sync_cuda(device)
-            episode_timing["firm_structural_seconds"] = time.perf_counter() - firm_started
+            episode_timing["firm_matrix_wall_seconds"] = time.perf_counter() - firm_started
             firm_timing = firm_meta.get("timing", {})
-            for timing_name in ("bellman_seconds", "bp_seconds", "investment_seconds"):
+            for timing_name in (
+                "firm_static_seconds", "bellman_seconds", "bp_seconds", "investment_seconds"
+            ):
                 episode_timing[timing_name] = float(firm_timing.get(timing_name, float("nan")))
+            episode_timing["firm_structural_seconds"] = sum(
+                float(episode_timing[name])
+                for name in (
+                    "firm_static_seconds", "investment_seconds", "bellman_seconds", "bp_seconds"
+                )
+                if np.isfinite(episode_timing[name])
+            )
             structural_rows.extend(
                 {"episode": episode, **item}
                 for item in firm_summary.to_dict(orient="records")
@@ -578,19 +653,9 @@ def main() -> None:
             row.update(structural_values)
             row.update({f"structural_{key}": value for key, value in structural_values.items()})
 
-            loaded = load_analysis_checkpoint(checkpoint, device=device)
-            for loaded_model in loaded.models.values():
-                loaded_model.eval()
-            active_model_names = loaded.metadata.get("loaded_model_keys", [])
-            before = {
-                name: model_state_hash(loaded.models[name])
-                for name in active_model_names
-            }
-            config_snapshot, config_hash = build_config_invariant_snapshot(loaded)
-            config_records.append((episode, config_snapshot, config_hash))
             episode_sdf_rows: list[Dict[str, Any]] = []
             common_primary_meta: Dict[str, Any] | None = None
-            sdf_child_counts = sorted(set(args.robustness_child_shocks + [args.n_child_shocks]))
+            sdf_child_counts = selected_child_counts
             _sync_cuda(device)
             sdf_common_started = time.perf_counter()
             common_sdf_summaries, common_sdf_meta = evaluate_sdf_heldout_multi_k(
@@ -727,6 +792,9 @@ def main() -> None:
                 "episode": episode, "checkpoint_sha256": _file_hash(checkpoint),
                 "model_hashes_before": before, "model_hashes_after": after,
                 "model_state_unchanged": True, "firm_metadata": firm_meta,
+                "checkpoint_load_count": 1,
+                "robustness_scope": args.robustness_scope,
+                "selected_child_shocks": selected_child_counts,
                 "common_sdf_parent_bank": common_parent_meta,
                 "ondist_sdf_parent_bank": ondist_parent_meta,
                 "common_sdf_metadata": common_primary_meta,
@@ -740,6 +808,11 @@ def main() -> None:
                 "episode": episode, "stage": "evaluation",
                 "error_type": type(exc).__name__, "error": str(exc),
             })
+        _sync_cuda(device)
+        if device.type == "cuda":
+            episode_timing["cuda_peak_memory_mb"] = (
+                float(torch.cuda.max_memory_allocated(device)) / (1024.0 ** 2)
+            )
         write_json(episode_root / "metadata.json", {
             "episode": episode,
             "status": row["status"],
@@ -747,6 +820,8 @@ def main() -> None:
             "firm_data": row.get("firm_data"),
             "macro_data": row.get("macro_data"),
             "representative_detailed_visuals": episode in representative,
+            "robustness_scope": args.robustness_scope,
+            "selected_child_shocks": child_counts_by_episode[int(episode)],
             "error": row.get("error", ""),
         })
         pd.DataFrame([row]).to_csv(episode_root / "summary.csv", index=False)
@@ -886,6 +961,12 @@ def main() -> None:
     timing_frame = pd.DataFrame(timing_rows)
     timing_payload = {
         "total_seconds": time.perf_counter() - total_started,
+        "checkpoint_load_count": int(pd.to_numeric(
+            timing_frame.get("checkpoint_load_count"), errors="coerce"
+        ).sum()),
+        "firm_matrix_wall_seconds": float(pd.to_numeric(
+            timing_frame.get("firm_matrix_wall_seconds"), errors="coerce"
+        ).sum()),
         "firm_structural_seconds": float(pd.to_numeric(
             timing_frame.get("firm_structural_seconds"), errors="coerce"
         ).sum()),
@@ -907,10 +988,16 @@ def main() -> None:
         "fc1_seconds": float(pd.to_numeric(
             timing_frame.get("fc1_seconds"), errors="coerce"
         ).sum()),
-        "cuda_peak_memory_mb": (
-            float(torch.cuda.max_memory_allocated(device)) / (1024.0 ** 2)
-            if device.type == "cuda" else None
+        "cuda_peak_memory_mb": aggregate_episode_peak_memory(
+            [item.get("cuda_peak_memory_mb") for item in timing_rows]
         ),
+        "timing_semantics": {
+            "firm_matrix_wall_seconds": "wall time for evaluate_matrix",
+            "firm_structural_seconds": (
+                "derived sum of firm_static, investment, bellman, and bp component times"
+            ),
+            "total_seconds": "full evaluator wall time; component fields are not re-summed into it",
+        },
         "episodes": timing_rows,
     }
     write_json(output / "evaluation_timing.json", timing_payload)
@@ -918,6 +1005,10 @@ def main() -> None:
         "evaluator": "full_run_checkpoint_evaluator_v2",
         "run_root": str(run_root), "git_commit": _git(["rev-parse", "HEAD"]),
         "episodes": episodes, "representative_visual_episodes": sorted(representative),
+        "robustness_scope": args.robustness_scope,
+        "primary_n_child_shocks": args.n_child_shocks,
+        "robustness_child_shocks": args.robustness_child_shocks,
+        "selected_child_shocks_by_episode": child_counts_by_episode,
         "reference_firm_data": str(reference_firm),
         "reference_macro_data": str(reference_macro) if reference_macro else None,
         "reference_state": reference_state.to_dict(),
@@ -926,8 +1017,11 @@ def main() -> None:
             "z": [args.z_min, args.z_max, args.z_points], "eta_values": args.eta_values,
         },
         "common_shock_bank": {
-            "seed": args.shock_seed, "max_children": max_j,
+            "seed": args.shock_seed,
+            "max_children": max(max(values) for values in child_counts_by_episode.values()),
             "robustness_children": args.robustness_child_shocks,
+            "robustness_scope": args.robustness_scope,
+            "selected_children_by_episode": child_counts_by_episode,
             "nested_prefix": True,
             "sdf_common_parent_bank_sha256": common_parent_meta["parent_bank_sha256"],
             "sdf_shock_bank_sha256": next((

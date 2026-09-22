@@ -9,6 +9,7 @@ detached bp labels for the policy heads. Simulation code never calls this module
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
@@ -18,6 +19,64 @@ from utils.firm_transition import apply_refinancing_policy, normalize_child_weig
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class GridChunkPlan:
+    parent_batch_requested: int
+    parent_chunk_effective: int
+    candidate_chunk_effective: int
+    n_children: int
+    n_grid: int
+    expanded_states_per_forward: int
+    max_expanded_states: int
+
+
+def resolve_grid_chunk_plan(
+    *,
+    n_parent: int,
+    n_grid: int,
+    n_children: int,
+    configured_parent_chunk: int,
+    configured_candidate_chunk: int,
+    max_expanded_states: int,
+) -> GridChunkPlan:
+    """Jointly cap parent and candidate chunks by expanded child-state count."""
+    n_parent = int(n_parent)
+    n_grid = int(n_grid)
+    n_children = int(n_children)
+    max_expanded_states = int(max_expanded_states)
+    if n_parent < 1 or n_grid < 1 or n_children < 1:
+        raise ValueError("n_parent, n_grid, and n_children must all be positive")
+    if max_expanded_states < n_children:
+        raise ValueError(
+            "bp_grid_max_expanded_states is smaller than one parent x one candidate "
+            f"x all children: {max_expanded_states} < {n_children}"
+        )
+    requested_parent = (
+        n_parent if int(configured_parent_chunk) <= 0
+        else min(n_parent, int(configured_parent_chunk))
+    )
+    parent_cap = max_expanded_states // n_children
+    parent_chunk = max(1, min(requested_parent, parent_cap))
+    candidate_cap = max_expanded_states // (parent_chunk * n_children)
+    requested_candidate = (
+        n_grid if int(configured_candidate_chunk) <= 0
+        else min(n_grid, int(configured_candidate_chunk))
+    )
+    candidate_chunk = max(1, min(requested_candidate, candidate_cap, n_grid))
+    expanded = parent_chunk * candidate_chunk * n_children
+    if expanded > max_expanded_states:
+        raise AssertionError("resolved BP grid chunk plan exceeds max_expanded_states")
+    return GridChunkPlan(
+        parent_batch_requested=n_parent,
+        parent_chunk_effective=parent_chunk,
+        candidate_chunk_effective=candidate_chunk,
+        n_children=n_children,
+        n_grid=n_grid,
+        expanded_states_per_forward=expanded,
+        max_expanded_states=max_expanded_states,
+    )
 
 
 def _get_out(out: Any, name: str, idx: int) -> torch.Tensor:
@@ -236,7 +295,25 @@ class BPGridTeacher:
         self.margin_scale = max(float(margin_scale), 1e-12)
         self.confidence_relative = bool(confidence_relative)
         self.confidence_min = min(max(float(confidence_min), 0.0), 1.0)
-        self._grid_chunk_logged = False
+        self._logged_grid_chunk_plans: set[tuple[int, int]] = set()
+
+    def _log_grid_chunk_plan(self, plan: GridChunkPlan) -> None:
+        log_key = (plan.n_grid, plan.n_children)
+        if log_key in self._logged_grid_chunk_plans:
+            return
+        logger.info(
+            "BP grid chunk plan | parent_batch_requested=%d parent_chunk_effective=%d "
+            "candidate_chunk_effective=%d n_children=%d n_grid=%d "
+            "expanded_states_per_forward=%d max_expanded_states=%d",
+            plan.parent_batch_requested,
+            plan.parent_chunk_effective,
+            plan.candidate_chunk_effective,
+            plan.n_children,
+            plan.n_grid,
+            plan.expanded_states_per_forward,
+            plan.max_expanded_states,
+        )
+        self._logged_grid_chunk_plans.add(log_key)
 
     @classmethod
     def from_hyperparams(cls, target_model, p0_loss_fn, pi_loss_fn, hyperparams) -> "BPGridTeacher":
@@ -275,10 +352,26 @@ class BPGridTeacher:
         if branch == "mix" and mix_weight is None:
             raise ValueError("mix_weight is required for branch='mix'")
 
-        if self.parent_chunk_size > 0 and parent_state.shape[0] > self.parent_chunk_size:
+        n_children = int(_stack_children(children).shape[1])
+        grid_sizes = {self.coarse_size, self.fine_size} if self.refine else {self.coarse_size}
+        plans = [
+            resolve_grid_chunk_plan(
+                n_parent=int(parent_state.shape[0]),
+                n_grid=grid_size,
+                n_children=n_children,
+                configured_parent_chunk=self.parent_chunk_size,
+                configured_candidate_chunk=self.candidate_chunk_size,
+                max_expanded_states=self.max_expanded_states,
+            )
+            for grid_size in grid_sizes
+        ]
+        for plan in plans:
+            self._log_grid_chunk_plan(plan)
+        parent_chunk_size = min(plan.parent_chunk_effective for plan in plans)
+        if parent_state.shape[0] > parent_chunk_size:
             chunks = []
-            for start in range(0, parent_state.shape[0], self.parent_chunk_size):
-                stop = min(start + self.parent_chunk_size, parent_state.shape[0])
+            for start in range(0, parent_state.shape[0], parent_chunk_size):
+                stop = min(start + parent_chunk_size, parent_state.shape[0])
                 child_chunk = _slice_child_axis(children, start, stop)
                 m_chunk = _slice_child_axis(m_list, start, stop)
                 bp_chunk = bp_pred[start:stop] if bp_pred is not None else None
@@ -323,10 +416,26 @@ class BPGridTeacher:
         branch = branch.lower()
         if branch not in {"p0", "pi"}:
             raise ValueError(f"compute_value_target only supports p0/pi, got {branch!r}")
-        if self.parent_chunk_size > 0 and parent_state.shape[0] > self.parent_chunk_size:
+        n_children = int(_stack_children(children).shape[1])
+        grid_sizes = {self.coarse_size, self.fine_size} if self.refine else {self.coarse_size}
+        plans = [
+            resolve_grid_chunk_plan(
+                n_parent=int(parent_state.shape[0]),
+                n_grid=grid_size,
+                n_children=n_children,
+                configured_parent_chunk=self.parent_chunk_size,
+                configured_candidate_chunk=self.candidate_chunk_size,
+                max_expanded_states=self.max_expanded_states,
+            )
+            for grid_size in grid_sizes
+        ]
+        for plan in plans:
+            self._log_grid_chunk_plan(plan)
+        parent_chunk_size = min(plan.parent_chunk_effective for plan in plans)
+        if parent_state.shape[0] > parent_chunk_size:
             chunks = []
-            for start in range(0, parent_state.shape[0], self.parent_chunk_size):
-                stop = min(start + self.parent_chunk_size, parent_state.shape[0])
+            for start in range(0, parent_state.shape[0], parent_chunk_size):
+                stop = min(start + parent_chunk_size, parent_state.shape[0])
                 chunks.append(
                     self._compute_value_target_no_parent_chunk(
                         parent_state[start:stop],
@@ -547,10 +656,14 @@ class BPGridTeacher:
         n_grid: int,
         n_children: int,
     ) -> int:
-        expanded_per_candidate = max(batch_size * n_children, 1)
-        dynamic_chunk = max(1, self.max_expanded_states // expanded_per_candidate)
-        requested_chunk = n_grid if self.candidate_chunk_size <= 0 else self.candidate_chunk_size
-        return max(1, min(requested_chunk, dynamic_chunk, n_grid))
+        return resolve_grid_chunk_plan(
+            n_parent=batch_size,
+            n_grid=n_grid,
+            n_children=n_children,
+            configured_parent_chunk=batch_size,
+            configured_candidate_chunk=self.candidate_chunk_size,
+            max_expanded_states=self.max_expanded_states,
+        ).candidate_chunk_effective
 
     def _evaluate_grid(
         self,
@@ -568,30 +681,21 @@ class BPGridTeacher:
         m_tensor = _stack_m(m_list)
         n_children = int(children_tensor.shape[1])
         q_current = _target_q(self.target_model, parent_state)
-        expanded_per_candidate = max(batch_size * n_children, 1)
-        dynamic_chunk = max(1, self.max_expanded_states // expanded_per_candidate)
-        chunk_size = self._resolve_candidate_chunk_size(
-            batch_size=batch_size,
+        plan = resolve_grid_chunk_plan(
+            n_parent=batch_size,
             n_grid=n_grid,
             n_children=n_children,
+            configured_parent_chunk=batch_size,
+            configured_candidate_chunk=self.candidate_chunk_size,
+            max_expanded_states=self.max_expanded_states,
         )
-        actual_expanded_states = batch_size * chunk_size * max(n_children, 1)
-        if not self._grid_chunk_logged:
-            logger.info(
-                "BP grid chunk plan | parent_batch=%d n_grid=%d n_children=%d candidate_chunk_cfg=%d "
-                "dynamic_chunk=%d resolved_chunk=%d one_shot=%s expanded_states=%d "
-                "max_expanded_states=%d",
-                batch_size,
-                n_grid,
-                n_children,
-                self.candidate_chunk_size,
-                dynamic_chunk,
-                chunk_size,
-                str(chunk_size == n_grid),
-                actual_expanded_states,
-                self.max_expanded_states,
+        if plan.parent_chunk_effective != batch_size:
+            raise RuntimeError(
+                "BP parent batch reached grid evaluation above the resolved hard cap; "
+                "compute() must apply the parent chunk plan first"
             )
-            self._grid_chunk_logged = True
+        chunk_size = plan.candidate_chunk_effective
+        self._log_grid_chunk_plan(plan)
         if chunk_size >= n_grid:
             return self._evaluate_grid_chunk(
                 parent_state, children_tensor, m_tensor, bp_grid, branch=branch,

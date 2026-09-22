@@ -35,6 +35,7 @@ class FrozenTransitionData:
     children_tensor: torch.Tensor | None = None
     m_raw_tensor: torch.Tensor | None = None
     m_used_tensor: torch.Tensor | None = None
+    continuous_shock_bank: ConvergenceShockBank | None = None
 
     def stacked_children(self) -> torch.Tensor:
         return self.children_tensor if self.children_tensor is not None else torch.stack(self.children, dim=1)
@@ -67,14 +68,33 @@ def slice_frozen_transition_data(
     branch_weights = transition.branch_weights[:, :stop]
     branch_weights = branch_weights / branch_weights.sum(dim=1, keepdim=True)
     metadata = dict(transition.metadata)
+    shock_bank = transition.continuous_shock_bank
+    if shock_bank is None:
+        raise ValueError("transition is missing the continuous shock bank required for prefix hashing")
+    source_max_j = int(shock_bank.eps_x.shape[1])
+    prefix_bank = ConvergenceShockBank(
+        eps_x=shock_bank.eps_x[:, :requested],
+        eps_z=shock_bank.eps_z[:, :requested],
+        u_eta=shock_bank.u_eta[:, :requested],
+        u_i=shock_bank.u_i[:, :requested],
+        seed=shock_bank.seed,
+    )
+    max_bank_sha256 = _shock_bank_hash(shock_bank)
+    prefix_sha256 = _shock_bank_hash(prefix_bank)
     metadata.update({
         "n_child_shocks": requested,
         "continuous_child_count": requested,
         "expanded_child_count": stop,
-        "shock_bank_max_child_shocks": available,
-        "nested_prefix_from_max_J": requested < available,
+        "shock_bank_max_child_shocks": source_max_j,
+        "nested_prefix_from_max_J": requested < source_max_j,
         "transition_build_count": 0,
         "transition_source": "Jmax_tensor_prefix",
+        "source_max_J": source_max_j,
+        "requested_J": requested,
+        "max_bank_sha256": max_bank_sha256,
+        "prefix_sha256": prefix_sha256,
+        "shock_bank_sha256": max_bank_sha256,
+        "shock_bank_prefix_sha256": prefix_sha256,
         "eta_next_active_share": float(
             (branch_weights * children_tensor[..., 2]).sum(dim=1).mean().item()
         ),
@@ -88,6 +108,7 @@ def slice_frozen_transition_data(
         children_tensor=children_tensor,
         m_raw_tensor=m_raw_tensor,
         m_used_tensor=m_used_tensor,
+        continuous_shock_bank=shock_bank,
     )
 
 
@@ -243,6 +264,10 @@ def build_frozen_transition_data(
         "shock_bank_max_child_shocks": bank_child_shocks,
         "shock_bank_sha256": _shock_bank_hash(generated_bank),
         "shock_bank_prefix_sha256": _shock_bank_hash(base_bank),
+        "max_bank_sha256": _shock_bank_hash(generated_bank),
+        "prefix_sha256": _shock_bank_hash(base_bank),
+        "source_max_J": bank_child_shocks,
+        "requested_J": int(n_child_shocks),
         "nested_prefix_from_max_J": bank_child_shocks > int(n_child_shocks),
         "common_shocks_across_frozen_grid": True,
         "macro_context": {
@@ -265,6 +290,7 @@ def build_frozen_transition_data(
         children_tensor=children_tensor,
         m_raw_tensor=m_raw_tensor,
         m_used_tensor=m_used_tensor,
+        continuous_shock_bank=generated_bank,
     )
 
 

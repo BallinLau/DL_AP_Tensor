@@ -40,6 +40,7 @@ from evaluation.grids import ReferenceFirmState, build_frozen_grid, load_referen
 from experiments.run_utils import build_models
 from models import PolicyValueModel
 from utils.firm_transition import expand_children_exact_eta
+import experiments.evaluate_checkpoints as evaluator_module
 
 
 def _small_model() -> PolicyValueModel:
@@ -899,3 +900,86 @@ def test_eta_and_child_shock_matrix_writes_full_and_compact_cases(tmp_path):
     }
     assert metadata["timing"]["checkpoint_load_count"] == 1
     assert metadata["timing"]["transition_build_count"] == 2
+
+
+def test_matrix_loads_once_hashes_only_at_boundary_and_uses_primary_metadata(
+    tmp_path, monkeypatch,
+):
+    loaded = SimpleNamespace(
+        models={
+            "policy_value": torch.nn.Linear(1, 1),
+            "sdf_fc1": torch.nn.Linear(1, 1),
+        },
+        metadata={"loaded_model_keys": ["policy_value", "sdf_fc1"]},
+    )
+    load_calls = []
+    hash_calls = []
+
+    def fake_load(*args, **kwargs):
+        load_calls.append((args, kwargs))
+        return loaded
+
+    def fake_hash(model):
+        hash_calls.append(model)
+        return f"hash-{id(model)}"
+
+    def fake_evaluate(case_args):
+        assert case_args.loaded_checkpoint is loaded
+        assert case_args.defer_model_state_hash is True
+        assert case_args.manage_cuda_peak_stats is False
+        case_args.output_dir.mkdir(parents=True, exist_ok=True)
+        marker = f"eta{case_args.eta:g}-J{case_args.n_child_shocks}"
+        metadata = {
+            "training_eta_integration_mode": "exact",
+            "grid": {"marker": marker},
+            "reference_state": {"marker": marker},
+            "reference_transition_bank": {"marker": marker},
+            "m_mode": marker,
+            "m_clamp_bounds": None,
+            "timing": {
+                "firm_static_seconds": 1.0,
+                "investment_seconds": 2.0,
+                "bellman_seconds": 3.0,
+                "bp_seconds": 4.0,
+            },
+        }
+        return pd.DataFrame([{
+            "eta_parent": case_args.eta,
+            "n_child_shocks": case_args.n_child_shocks,
+        }]), metadata
+
+    monkeypatch.setattr(evaluator_module, "load_analysis_checkpoint", fake_load)
+    monkeypatch.setattr(evaluator_module, "_state_hash", fake_hash)
+    monkeypatch.setattr(evaluator_module, "evaluate", fake_evaluate)
+    args = SimpleNamespace(
+        output_dir=tmp_path / "matrix",
+        eta_values=[0.0, 1.0],
+        eta=1.0,
+        n_child_shocks=64,
+        robustness_child_shocks=[32, 64, 128],
+        device="cpu",
+        checkpoint=tmp_path / "checkpoint.pt",
+        pv_ckpt=None,
+        sdf_ckpt=None,
+        hyperparams_json=None,
+        config_json=None,
+        model_spec_json=None,
+        allow_default_hyperparams=False,
+        allow_current_config=False,
+        bp_teacher_margin_tol=1e-8,
+        summary_only_all=True,
+        shock_seed=12345,
+        robustness_scope="all",
+    )
+    summary, metadata = evaluator_module.evaluate_matrix(args)
+
+    assert len(summary) == 6
+    assert len(load_calls) == 1
+    assert len(hash_calls) == 4
+    assert metadata["reference_transition_bank"] == {"marker": "eta1-J64"}
+    assert metadata["primary_eta"] == 1.0
+    assert metadata["primary_n_child_shocks"] == 64
+    assert metadata["robustness_scope"] == "all"
+    assert metadata["model_state_unchanged"] is True
+    assert metadata["timing"]["checkpoint_load_count"] == 1
+    assert len(metadata["case_metadata_by_eta_j"]) == 6

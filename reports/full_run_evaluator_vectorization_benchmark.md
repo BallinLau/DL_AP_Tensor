@@ -29,4 +29,7 @@ invented from CPU measurements; `evaluation_timing.json` records
 The firm robustness matrix separately records `checkpoint_load_count` and
 `transition_build_count`. Its intended counts are one checkpoint load per
 episode evaluation and one Jmax transition build per current-eta case, with
-smaller J values derived as exact-eta tensor prefixes.
+smaller J values derived as exact-eta tensor prefixes. This is an SDF multi-K
+microbenchmark, not evidence for end-to-end full-run speedup. Use the GPU-ready
+recipes in `reports/full_run_checkpoint_evaluator.md` for full-run wall-time
+and peak-memory measurements.

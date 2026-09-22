@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,6 +39,8 @@ from experiments.evaluate_full_run import (
     _discover_checkpoints,
     _prepare_output_directory,
     _sample_parent_tensors,
+    aggregate_episode_peak_memory,
+    select_episode_child_counts,
 )
 import experiments.evaluate_full_run as full_run_module
 
@@ -463,6 +466,53 @@ def test_actual_shock_bank_hash_uses_tensor_contents():
     torch.testing.assert_close(
         eta_mass, torch.full_like(eta_mass, AnalysisEconomicConfig.from_current_config().ZETA)
     )
+    torch.testing.assert_close(prefix.children_tensor[:, 0::2, 2], torch.zeros(2, 2))
+    torch.testing.assert_close(prefix.children_tensor[:, 1::2, 2], torch.ones(2, 2))
+    torch.testing.assert_close(
+        prefix.children_tensor[:, 0::2][:, :, [0, 1, 3, 4, 5, 6]],
+        prefix.children_tensor[:, 1::2][:, :, [0, 1, 3, 4, 5, 6]],
+    )
+    assert prefix.metadata["source_max_J"] == 4
+    assert prefix.metadata["requested_J"] == 2
+    assert prefix.metadata["max_bank_sha256"] == _shock_bank_hash(actual_builder_bank)
+    expected_prefix_bank = ConvergenceShockBank(
+        eps_x=actual_builder_bank.eps_x[:, :2],
+        eps_z=actual_builder_bank.eps_z[:, :2],
+        u_eta=actual_builder_bank.u_eta[:, :2],
+        u_i=actual_builder_bank.u_i[:, :2],
+        seed=actual_builder_bank.seed,
+    )
+    assert prefix.metadata["prefix_sha256"] == _shock_bank_hash(expected_prefix_bank)
+    assert prefix.metadata["prefix_sha256"] != prefix.metadata["max_bank_sha256"]
+
+
+def test_robustness_scope_and_episode_peak_aggregation():
+    representatives = {0, 4, 8}
+    for episode in range(9):
+        expected = [32, 64, 128] if episode in representatives else [64]
+        assert select_episode_child_counts(
+            episode=episode,
+            representative_episodes=representatives,
+            primary_child_shocks=64,
+            robustness_child_shocks=[32, 64, 128],
+            robustness_scope="representative",
+        ) == expected
+        assert select_episode_child_counts(
+            episode=episode,
+            representative_episodes=representatives,
+            primary_child_shocks=64,
+            robustness_child_shocks=[32, 64, 128],
+            robustness_scope="all",
+        ) == [32, 64, 128]
+        assert select_episode_child_counts(
+            episode=episode,
+            representative_episodes=representatives,
+            primary_child_shocks=64,
+            robustness_child_shocks=[32, 64, 128],
+            robustness_scope="none",
+        ) == [64]
+    assert aggregate_episode_peak_memory([100.0, 250.0, 180.0]) == 250.0
+    assert aggregate_episode_peak_memory([None, float("nan")]) is None
 
 
 def test_checkpoint_without_episode_firm_still_runs_structural_and_common_sdf(
@@ -485,7 +535,12 @@ def test_checkpoint_without_episode_firm_still_runs_structural_and_common_sdf(
     ]).to_pickle(reference)
     output = tmp_path / "evaluation"
 
+    load_calls = []
+
     def fake_matrix(args):
+        assert args.loaded_checkpoint is loaded
+        assert args.defer_model_state_hash_to_outer is True
+        assert args.manage_cuda_peak_stats is False
         args.output_dir.mkdir(parents=True, exist_ok=True)
         for eta in (0, 1):
             eta_dir = args.output_dir / f"eta{eta}"
@@ -512,7 +567,11 @@ def test_checkpoint_without_episode_firm_still_runs_structural_and_common_sdf(
         economic_config=AnalysisEconomicConfig.from_current_config(),
     )
     monkeypatch.setattr(full_run_module, "evaluate_matrix", fake_matrix)
-    monkeypatch.setattr(full_run_module, "load_analysis_checkpoint", lambda *a, **k: loaded)
+    def fake_load(*args, **kwargs):
+        load_calls.append((args, kwargs))
+        return loaded
+
+    monkeypatch.setattr(full_run_module, "load_analysis_checkpoint", fake_load)
     monkeypatch.setattr(full_run_module, "discover_episode_firm_data", lambda root: ({}, []))
     monkeypatch.setattr(full_run_module, "_git", lambda args: "")
     monkeypatch.setattr(
@@ -536,6 +595,9 @@ def test_checkpoint_without_episode_firm_still_runs_structural_and_common_sdf(
     assert run_summary["n_error_or_missing"] == 0
     metadata = pd.read_json(output / "metadata.json", typ="series")
     assert bool(metadata["cross_episode_comparable"])
+    assert len(load_calls) == 1
+    timing = json.loads((output / "evaluation_timing.json").read_text(encoding="utf-8"))
+    assert timing["checkpoint_load_count"] == 1
     assert (output / "evaluation_timing.json").is_file()
     assert (output / "tables" / "cross_episode_config_invariants.csv").is_file()
 

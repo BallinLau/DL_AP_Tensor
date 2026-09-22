@@ -17,6 +17,7 @@ python3 -u experiments/evaluate_full_run.py \
   --run-root /path/to/completed_run \
   --device cuda:0 \
   --n-child-shocks 64 \
+  --robustness-scope representative \
   --robustness-child-shocks 32 64 128
 ```
 
@@ -146,6 +147,10 @@ the structural shock-bank hash, evaluator commit, grid, and metric sources.
   the evaluator generates K=128 once, performs one SDF/FC1 forward, and computes
   each smaller result from tensor prefixes. Common and on-distribution scopes
   therefore require two SDF forwards per episode instead of six.
+- `--robustness-scope representative` is the default: every episode runs the
+  primary J, while early/middle/final episodes additionally run the requested
+  robustness J values. `all` runs every J on every episode; `none` runs only
+  the primary J. Each episode builds only the largest J selected for it.
 - Frozen transitions are represented as `[N,J,7]` before exact eta expansion
   and `[N,2J,7]` afterwards. Raw/used M use `[N,2J,1]`; branch weights use
   `[N,2J]` and sum to one for every parent.
@@ -182,11 +187,35 @@ EPISODES="0:9"
 TRAINING_LOG=/path/to/stdout.log
 N_CHILD_SHOCKS=64
 ROBUSTNESS_CHILD_SHOCKS="32 64 128"
+ROBUSTNESS_SCOPE=representative  # representative | all | none
 MAX_SDF_PARENTS=512
 RUN_EVALUATOR_TESTS=1
 REQUIRED_COMMIT=<minimum-evaluator-commit>
 OVERWRITE=1  # required to replace a non-empty evaluator output directory
 ```
+
+## GPU benchmark recipes
+
+Primary-only 101x101 benchmark for one episode:
+
+```bash
+sbatch --export=ALL,RUN_ROOT=/path/to/completed_run,EPISODES=4,\
+ROBUSTNESS_SCOPE=none,N_CHILD_SHOCKS=64,B_POINTS=101,Z_POINTS=101 \
+  slurm/run_full_run_evaluator_gpu.slurm
+```
+
+J=32/64/128 robustness benchmark for one selected episode:
+
+```bash
+sbatch --export=ALL,RUN_ROOT=/path/to/completed_run,EPISODES=4,\
+ROBUSTNESS_SCOPE=all,N_CHILD_SHOCKS=64,ROBUSTNESS_CHILD_SHOCKS="32 64 128",\
+B_POINTS=101,Z_POINTS=101 \
+  slurm/run_full_run_evaluator_gpu.slurm
+```
+
+Compare `firm_static_seconds`, `investment_seconds`, `bellman_seconds`,
+`bp_seconds`, `sdf_common_seconds`, `sdf_ondist_seconds`, `fc1_seconds`, and
+episode-level `cuda_peak_memory_mb` in `evaluation_timing.json`.
 
 The Slurm requires one GPU on partition `a01`, uses the `DL_HL` environment,
 performs CUDA and syntax/test preflight checks, and invokes only

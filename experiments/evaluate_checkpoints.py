@@ -236,7 +236,9 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     summary_only = bool(getattr(args, "summary_only", False))
     detailed_output = bool(getattr(args, "detailed_output", not summary_only))
     shared_cache = getattr(args, "_evaluation_cache", None)
-    loaded = shared_cache.get("loaded") if shared_cache is not None else None
+    loaded = getattr(args, "loaded_checkpoint", None)
+    if loaded is None and shared_cache is not None:
+        loaded = shared_cache.get("loaded")
     if loaded is None:
         loaded = load_analysis_checkpoint(
             args.checkpoint or args.pv_ckpt,
@@ -255,10 +257,14 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     sdf_fc1_model = loaded.models["sdf_fc1"]
     model.eval()
     sdf_fc1_model.eval()
-    before_hashes = {
-        "policy_value": _state_hash(model),
-        "sdf_fc1": _state_hash(sdf_fc1_model),
-    }
+    hash_locally = not bool(getattr(args, "defer_model_state_hash", False))
+    before_hashes = (
+        {
+            "policy_value": _state_hash(model),
+            "sdf_fc1": _state_hash(sdf_fc1_model),
+        }
+        if hash_locally else None
+    )
 
     static_cache = (
         shared_cache.setdefault("static_by_eta", {})
@@ -567,11 +573,14 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     summary = pd.DataFrame([summary_values])
     summary.to_csv(output / "summary.csv", index=False)
 
-    after_hashes = {
-        "policy_value": _state_hash(model),
-        "sdf_fc1": _state_hash(sdf_fc1_model),
-    }
-    if before_hashes != after_hashes:
+    after_hashes = (
+        {
+            "policy_value": _state_hash(model),
+            "sdf_fc1": _state_hash(sdf_fc1_model),
+        }
+        if hash_locally else None
+    )
+    if hash_locally and before_hashes != after_hashes:
         raise RuntimeError("Checkpoint model state changed during read-only evaluation")
     _sync_cuda(device)
     phase_timing["total_seconds"] = time.perf_counter() - total_started
@@ -583,7 +592,8 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     )
     phase_timing["cuda_peak_memory_mb"] = (
         float(torch.cuda.max_memory_allocated(device)) / (1024.0 ** 2)
-        if device.type == "cuda" else float("nan")
+        if device.type == "cuda" and bool(getattr(args, "manage_cuda_peak_stats", True))
+        else float("nan")
     )
     checkpoint_path = Path(args.checkpoint or args.pv_ckpt).expanduser().resolve()
     metadata: Dict[str, object] = {
@@ -644,7 +654,8 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         ),
         "model_state_hash_before": before_hashes,
         "model_state_hash_after": after_hashes,
-        "model_state_unchanged": True,
+        "model_state_unchanged": True if hash_locally else None,
+        "model_state_hash_scope": "single_case" if hash_locally else "deferred_to_orchestrator",
         "timing": phase_timing,
         "semantics": {
             "default_boundary": (
@@ -700,23 +711,53 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
     root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)
     eta_values = list(args.eta_values or [args.eta])
-    j_values = list(args.robustness_child_shocks or [args.n_child_shocks])
+    requested_robustness = list(args.robustness_child_shocks or [])
+    j_values = list(requested_robustness)
     if int(args.n_child_shocks) not in j_values:
         j_values.insert(0, int(args.n_child_shocks))
     eta_values = list(dict.fromkeys(float(value) for value in eta_values))
-    j_values = list(dict.fromkeys(int(value) for value in j_values))
+    j_values = sorted(set(int(value) for value in j_values))
     if any(value < 2 for value in j_values):
         raise ValueError("All robustness child-shock counts must be at least 2")
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    if device.type == "cuda":
+    manage_cuda_peak_stats = bool(getattr(args, "manage_cuda_peak_stats", True))
+    if device.type == "cuda" and manage_cuda_peak_stats:
         torch.cuda.reset_peak_memory_stats(device)
     matrix_started = time.perf_counter()
-    evaluation_cache: Dict[str, object] = {"max_child_shocks": max(j_values)}
+    loaded = getattr(args, "loaded_checkpoint", None)
+    checkpoint_load_count_local = 0
+    if loaded is None:
+        loaded = load_analysis_checkpoint(
+            args.checkpoint or args.pv_ckpt,
+            sdf_checkpoint=args.sdf_ckpt,
+            hyperparams_json=args.hyperparams_json,
+            config_json=args.config_json,
+            model_spec_json=args.model_spec_json,
+            device=device,
+            allow_default_hyperparams=bool(args.allow_default_hyperparams),
+            allow_current_config=bool(args.allow_current_config),
+            m_source="sdf_fc1",
+        )
+        checkpoint_load_count_local = 1
+    for loaded_model in loaded.models.values():
+        loaded_model.eval()
+    evaluation_cache: Dict[str, object] = {
+        "max_child_shocks": max(j_values),
+        "loaded": loaded,
+    }
+    defer_hash_to_outer = bool(getattr(args, "defer_model_state_hash_to_outer", False))
+    active_model_names = list(loaded.metadata.get("loaded_model_keys", loaded.models.keys()))
+    hash_before = (
+        {name: _state_hash(loaded.models[name]) for name in active_model_names}
+        if not defer_hash_to_outer else None
+    )
 
     rows = []
     case_metadata = []
-    first_case_metadata: Dict[str, object] | None = None
+    requested_primary_eta = float(getattr(args, "eta", 1.0))
+    primary_eta = requested_primary_eta if requested_primary_eta in eta_values else eta_values[0]
+    primary_case_metadata: Dict[str, object] | None = None
     for eta in eta_values:
         eta_label = f"eta{eta:g}".replace("-", "m").replace(".", "p")
         for child_count in j_values:
@@ -738,9 +779,12 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
             case_args.robustness_child_shocks = None
             case_args.shock_bank_max_child_shocks = max(j_values)
             case_args._evaluation_cache = evaluation_cache
+            case_args.loaded_checkpoint = loaded
+            case_args.defer_model_state_hash = True
+            case_args.manage_cuda_peak_stats = False
             summary, metadata = evaluate(case_args)
-            if first_case_metadata is None:
-                first_case_metadata = metadata
+            if eta == primary_eta and child_count == int(args.n_child_shocks):
+                primary_case_metadata = metadata
             row = summary.iloc[0].to_dict()
             row.update({
                 "eta_parent": eta,
@@ -755,7 +799,8 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
                 "full_output": primary,
                 "output": str(case_output),
                 "metadata": str(case_output / "metadata.json"),
-                "model_state_unchanged": bool(metadata.get("model_state_unchanged")),
+                "model_state_unchanged": None,
+                "reference_transition_bank": metadata.get("reference_transition_bank"),
                 "timing": metadata.get("timing", {}),
             })
 
@@ -764,7 +809,22 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
     robustness = root / "robustness"
     robustness.mkdir(parents=True, exist_ok=True)
     combined.to_csv(robustness / "j_comparison.csv", index=False)
-    first_case_metadata = first_case_metadata or {}
+    primary_case_metadata = primary_case_metadata or {}
+    hash_after = (
+        {name: _state_hash(loaded.models[name]) for name in active_model_names}
+        if not defer_hash_to_outer else None
+    )
+    if not defer_hash_to_outer and hash_before != hash_after:
+        raise RuntimeError("Checkpoint model state changed during matrix evaluation")
+    matrix_state_unchanged = None if defer_hash_to_outer else True
+    for item in case_metadata:
+        item["model_state_unchanged"] = matrix_state_unchanged
+        item["model_state_hash_scope"] = (
+            "deferred_to_outer_episode" if defer_hash_to_outer else "matrix"
+        )
+    checkpoint_load_count = int(
+        getattr(args, "checkpoint_load_count", checkpoint_load_count_local)
+    )
     matrix_timing = {
         "total_seconds": time.perf_counter() - matrix_started,
         "firm_static_seconds": sum(
@@ -784,10 +844,11 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
             for item in case_metadata
         ),
         "transition_build_count": len(evaluation_cache.get("transition_by_eta", {})),
-        "checkpoint_load_count": 1 if "loaded" in evaluation_cache else 0,
+        "checkpoint_load_count": checkpoint_load_count,
+        "checkpoint_load_count_local": checkpoint_load_count_local,
         "cuda_peak_memory_mb": (
             float(torch.cuda.max_memory_allocated(device)) / (1024.0 ** 2)
-            if device.type == "cuda" else float("nan")
+            if device.type == "cuda" and manage_cuda_peak_stats else float("nan")
         ),
     }
     matrix_timing["firm_structural_seconds"] = sum(
@@ -801,8 +862,11 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
         "checkpoint_path": str(Path(args.checkpoint or args.pv_ckpt).expanduser().resolve()),
         "checkpoint_filename": Path(args.checkpoint or args.pv_ckpt).name,
         "eta_values": eta_values,
+        "primary_eta": primary_eta,
         "primary_n_child_shocks": int(args.n_child_shocks),
         "robustness_n_child_shocks": j_values,
+        "robustness_child_shocks": requested_robustness,
+        "robustness_scope": getattr(args, "robustness_scope", "matrix_explicit"),
         "shock_seed": int(args.shock_seed),
         "common_random_numbers": True,
         "common_random_numbers_scope": "within_each_eta_grid_and_nested_prefix_across_J",
@@ -810,18 +874,19 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
         "nested_shock_prefix_across_J": True,
         "formal_evaluator_eta_integration_mode": "exact",
         "formal_eta_integration_independent_of_training_ablation": True,
-        "training_eta_integration_mode": first_case_metadata.get(
+        "training_eta_integration_mode": primary_case_metadata.get(
             "training_eta_integration_mode"
         ),
         "bp_margin_identification_threshold": float(args.bp_teacher_margin_tol),
-        "grid": first_case_metadata.get("grid"),
-        "reference_state": first_case_metadata.get("reference_state"),
-        "reference_transition_bank": first_case_metadata.get("reference_transition_bank"),
-        "m_mode": first_case_metadata.get("m_mode"),
-        "m_clamp_bounds": first_case_metadata.get("m_clamp_bounds"),
-        "model_state_unchanged": all(
-            bool(item.get("model_state_unchanged")) for item in case_metadata
-        ),
+        "grid": primary_case_metadata.get("grid"),
+        "reference_state": primary_case_metadata.get("reference_state"),
+        "reference_transition_bank": primary_case_metadata.get("reference_transition_bank"),
+        "m_mode": primary_case_metadata.get("m_mode"),
+        "m_clamp_bounds": primary_case_metadata.get("m_clamp_bounds"),
+        "model_state_hash_before": hash_before,
+        "model_state_hash_after": hash_after,
+        "model_state_hash_scope": "outer_episode" if defer_hash_to_outer else "matrix",
+        "model_state_unchanged": matrix_state_unchanged,
         "timing": matrix_timing,
         "matrix_reuse": {
             "checkpoint_loaded_once": True,
@@ -829,6 +894,10 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
             "transition_built_at_Jmax_once_per_eta": True,
         },
         "cases": case_metadata,
+        "case_metadata_by_eta_j": {
+            f"eta{item['eta_parent']:g}_J{item['n_child_shocks']}": item
+            for item in case_metadata
+        },
         "semantics": {
             "child_leverage_timing": "b_next = eta_next * bp_current + (1-eta_next) * b_current",
             "current_financing_eta": "eta_current",
