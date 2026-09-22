@@ -14,7 +14,7 @@ import torch
 from analysis.convergence_transition import ConvergenceShockBank
 from analysis.economic_config import AnalysisEconomicConfig
 from evaluation.convergence_metrics import compute_shift_metrics, regression_metrics
-from losses import FC2Loss, SDFLoss
+from losses import SDFLoss
 from losses.sdf_loss import compute_pooled_moment_constraints
 from utils.metrics import conditional_moment_metrics
 
@@ -136,6 +136,15 @@ def evaluate_sdf_heldout(
     summary: Dict[str, float] = {}
     summary.update(conditional_residual_summary(residuals["raw"], prefix="sdf_raw"))
     summary.update(conditional_residual_summary(residuals["normalized"], prefix="sdf_normalized"))
+    normalized_finite = torch.isfinite(residuals["normalized"])
+    valid_parent = normalized_finite.all(dim=1)
+    summary.update({
+        "sdf_n_parents_requested": n_parent,
+        "sdf_n_parents_valid": int(valid_parent.sum().item()),
+        "sdf_valid_parent_ratio": float(valid_parent.double().mean().item()),
+        "sdf_n_children": int(n_children),
+        "sdf_finite_child_ratio": float(normalized_finite.double().mean().item()),
+    })
     finite_m = m_raw.detach().reshape(-1).to(torch.float64)
     finite_m = finite_m[torch.isfinite(finite_m)]
     summary.update({
@@ -189,6 +198,43 @@ def evaluate_sdf_heldout(
         "conditional_metric_helper": "utils.metrics.conditional_moment_metrics",
     }
     return summary, metadata
+
+
+def namespace_sdf_summary(summary: Dict[str, float], *, scope: str) -> Dict[str, float]:
+    """Give common/ondist SDF metrics explicit, non-overlapping names."""
+    if scope not in {"common", "ondist"}:
+        raise ValueError("scope must be 'common' or 'ondist'")
+    prefix = f"sdf_{scope}"
+    result: Dict[str, float] = {}
+    metric_names = {
+        "conditional_mean_abs": "conditional_abs_mean",
+        "conditional_p50_abs": "conditional_abs_p50",
+        "conditional_p90_abs": "conditional_abs_p90",
+        "conditional_p95_abs": "conditional_abs_p95",
+        "conditional_p99_abs": "conditional_abs_p99",
+        "conditional_max_abs": "conditional_abs_max",
+        "cm_mse": "cm_mse",
+        "u_stat": "u_stat",
+        "raw_r_rms": "raw_r_rms",
+    }
+    for residual_kind in ("raw", "normalized"):
+        for name, destination_name in metric_names.items():
+            source = f"sdf_{residual_kind}_{name}"
+            result[f"{prefix}_{residual_kind}_{destination_name}"] = summary.get(source, float("nan"))
+    # The unqualified scope metrics are normalized residuals and are the primary
+    # cross-episode SDF convergence semantics.
+    for name, destination_name in metric_names.items():
+        source = f"sdf_normalized_{name}"
+        result[f"{prefix}_{destination_name}"] = summary.get(source, float("nan"))
+    direct = (
+        "n_parents_requested", "n_parents_valid", "valid_parent_ratio",
+        "n_children", "finite_child_ratio", "M_mean", "M_std", "M_min", "M_max",
+        "M_p01", "M_p05", "M_p50", "M_p95", "M_p99", "M_finite_ratio",
+        "log_R_clip_share", "g_mean_low", "g_mean_high", "g_var_high", "g_max",
+    )
+    for name in direct:
+        result[f"{prefix}_{name}"] = summary.get(f"sdf_{name}", float("nan"))
+    return result
 
 
 def _normalize_macro(frame: pd.DataFrame) -> pd.DataFrame:
@@ -322,122 +368,114 @@ def evaluate_fc1_checkpoint(
     return summary, timing, pd.DataFrame(rollout_rows)
 
 
-def evaluate_fc2_checkpoint(
-    fc2_model: torch.nn.Module,
-    policy_model: torch.nn.Module,
-    firm_frame: pd.DataFrame,
-    macro_frame: pd.DataFrame,
-    *,
-    device: torch.device,
-    economic_config: AnalysisEconomicConfig,
-) -> tuple[Dict[str, float], pd.DataFrame]:
-    """Evaluate current FC2 parent/child aggregation semantics without training."""
-    if fc2_model is None:
-        return {}, pd.DataFrame()
-    firm = firm_frame.copy()
-    _ = macro_frame  # Kept in the interface because availability is checked by the orchestrator.
-    required = {"b", "z", "x", "ETA", "i"}
-    if "path" not in firm or not required.issubset(firm.columns):
-        raise ValueError("FC2 evaluation requires path and five firm-state columns")
-    if "branch" not in firm:
-        firm["branch"] = 0
-    branch_numeric = pd.to_numeric(firm["branch"], errors="coerce")
-    parent_branch = -1 if bool((branch_numeric < 0).any()) else 0
-    keys = ["path"] + (["t"] if "t" in firm else []) + ["branch"]
-    rows = []
-    quantiles = torch.linspace(0, 1, steps=int(fc2_model.quantile_num), device=device)
-    loss = FC2Loss(delta=economic_config.DELTA, phi=economic_config.PHI)
-    with torch.no_grad():
-        for group_key, group in firm.groupby(keys):
-            ordered = ["b", "z", "ETA", "i", "x"]
-            numeric = group[ordered + (["K"] if "K" in group else [])].apply(
-                pd.to_numeric, errors="coerce"
-            ).dropna()
-            if numeric.empty:
-                continue
-            phi = torch.cat([
-                torch.quantile(torch.as_tensor(numeric["b"].to_numpy(), device=device, dtype=torch.float32), quantiles),
-                torch.quantile(torch.as_tensor(numeric["z"].to_numpy(), device=device, dtype=torch.float32), quantiles),
-                torch.tensor([float(numeric["x"].mean())], device=device),
-            ]).unsqueeze(0)
-            pred = fc2_model(phi)
-            key_tuple = group_key if isinstance(group_key, tuple) else (group_key,)
-            base_states = torch.as_tensor(numeric[ordered].to_numpy(np.float32), device=device)
-            # Match FC2LossPipe exactly: it concatenates [lnk_pred, hatc_pred]
-            # after the five firm states before calling PolicyValueModel.
-            states = torch.cat([
-                base_states,
-                pred["lnk"].expand(len(numeric), 1),
-                pred["hatc"].expand(len(numeric), 1),
-            ], dim=1)
-            policy = policy_model(states)
-            get = lambda name: policy[name] if isinstance(policy, dict) else getattr(policy, name)
-            k = torch.as_tensor(
-                numeric["K"].to_numpy(np.float32) if "K" in numeric else np.ones(len(numeric), np.float32),
-                device=device,
-            )
-            y, investment, adjustment, consumption = loss.compute_resource_accounting(
-                k, states[:, 1], states[:, 4], get("bar_i").reshape(-1),
-                get("bar_z").reshape(-1), states[:, 3],
-            )
-            # FC2LossPipe trains against absolute consumption and treats any
-            # positive bar_z as present in the aggregate. Preserve that actual
-            # checkpoint target here and report its resource-accounting effect.
-            consumption_used = consumption.abs()
-            aggregate_mask = (get("bar_z").reshape(-1) > 0).to(k.dtype)
-            hatc_agg, lnk_agg = loss.aggregate(k, consumption_used, aggregate_mask)
-            resource_residual = y - consumption_used - investment - adjustment
-            branch_value = float(pd.to_numeric(group["branch"], errors="coerce").iloc[0])
-            rows.append({
-                **dict(zip(keys, key_tuple)),
-                "node_role": "parent" if branch_value == parent_branch else "child",
-                "hatc_fc2": float(pred["hatc"].item()),
-                "lnk_fc2": float(pred["lnk"].item()),
-                "hatc_agg": float(hatc_agg.item()),
-                "lnk_agg": float(lnk_agg.item()),
-                "resource_residual_mean": float(resource_residual.mean().item()),
-                "resource_residual_abs_max": float(resource_residual.abs().max().item()),
-                "resource_output_abs_mean": float(y.abs().mean().item()),
-                "consumption_finite_ratio": float(torch.isfinite(consumption).float().mean().item()),
-            })
-    frame = pd.DataFrame(rows)
-    summary: Dict[str, float] = {}
-    if not frame.empty:
-        for name in ("hatc", "lnk"):
-            err = frame[f"{name}_fc2"] - frame[f"{name}_agg"]
-            absolute = np.abs(err.to_numpy(dtype=np.float64))
-            summary[f"fc2_{name}_rmse"] = float(np.sqrt(np.mean(np.square(err))))
-            summary[f"fc2_{name}_mae"] = float(absolute.mean())
-            summary[f"fc2_{name}_p90"] = float(np.quantile(absolute, 0.90))
-            summary[f"fc2_{name}_p99"] = float(np.quantile(absolute, 0.99))
-            summary[f"fc2_{name}_max"] = float(absolute.max())
-        summary["fc2_n_nodes"] = int(len(frame))
-        summary["fc2_resource_residual_abs_mean"] = float(
-            frame["resource_residual_mean"].abs().mean()
-        )
-        summary["fc2_resource_residual_abs_max"] = float(frame["resource_residual_abs_max"].max())
-        resource_scale = np.maximum(frame["resource_output_abs_mean"].to_numpy(dtype=np.float64), 1e-8)
-        summary["fc2_resource_residual_relative_abs_mean"] = float(
-            np.mean(np.abs(frame["resource_residual_mean"].to_numpy(dtype=np.float64)) / resource_scale)
-        )
-        summary["fc2_consumption_finite_ratio"] = float(frame["consumption_finite_ratio"].mean())
-        child = frame[frame["node_role"] == "child"]
-        summary["fc2_transition_consistency_available"] = bool(not child.empty)
-        for name in ("hatc", "lnk"):
-            child_error = (
-                child[f"{name}_fc2"].to_numpy(dtype=np.float64)
-                - child[f"{name}_agg"].to_numpy(dtype=np.float64)
-            )
-            summary[f"fc2_transition_{name}_rmse"] = (
-                float(np.sqrt(np.mean(np.square(child_error)))) if child_error.size else float("nan")
-            )
-            summary[f"fc2_transition_{name}_mae"] = (
-                float(np.mean(np.abs(child_error))) if child_error.size else float("nan")
-            )
-    return summary, frame
-
-
 _EPISODE_RE = re.compile(r"Episode\s+(?P<episode>\d+)", re.IGNORECASE)
+_SDF_ARROW_NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+
+
+def _sdf_stage_from_line(line: str, current_stage: str | None) -> str:
+    lowered = line.lower().replace("-", "_")
+    if "sdf_true" in lowered or "sdf true" in lowered:
+        return "sdf_true_only"
+    if "sdf_recursive" in lowered:
+        return "sdf_recursive_only"
+    if "ep0_sdf" in lowered or "sdf bootstrap" in lowered:
+        return "episode0_bootstrap"
+    return current_stage or "unknown"
+
+
+def parse_sdf_validation_log_blocks(path: str | Path) -> tuple[pd.DataFrame, Dict[str, Any]]:
+    """Parse every SDF validation block without silently collapsing repeats."""
+    path = Path(path)
+    current_episode: int | None = None
+    current_stage: str | None = None
+    occurrences: Dict[int, int] = {}
+    rows: list[Dict[str, Any]] = []
+    arrow_patterns = {
+        "normalized_mean": re.compile(
+            rf"normalized_mean\s*=\s*({_SDF_ARROW_NUMBER})\s*->\s*({_SDF_ARROW_NUMBER})",
+            re.IGNORECASE,
+        ),
+        "normalized_t": re.compile(
+            rf"normalized_t\s*=\s*({_SDF_ARROW_NUMBER})\s*->\s*({_SDF_ARROW_NUMBER})",
+            re.IGNORECASE,
+        ),
+        "constraint": re.compile(
+            rf"max_constraint_violation\s*=\s*({_SDF_ARROW_NUMBER})\s*->\s*({_SDF_ARROW_NUMBER})",
+            re.IGNORECASE,
+        ),
+    }
+    bool_pattern = re.compile(
+        r"(?P<key>safe_to_continue|stage_progress|converged)\s*=\s*(?P<value>true|false)",
+        re.IGNORECASE,
+    )
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        episode_match = _EPISODE_RE.search(line)
+        if episode_match:
+            current_episode = int(episode_match.group("episode"))
+            current_stage = None
+        current_stage = _sdf_stage_from_line(line, current_stage)
+        if current_episode is None or "SDF validation" not in line:
+            continue
+        occurrence = occurrences.get(current_episode, 0) + 1
+        occurrences[current_episode] = occurrence
+        row: Dict[str, Any] = {
+            "episode": current_episode,
+            "stage": current_stage or "unknown",
+            "occurrence": occurrence,
+        }
+        for match in bool_pattern.finditer(line):
+            row[match.group("key").lower()] = match.group("value").lower() == "true"
+        for name, pattern in arrow_patterns.items():
+            match = pattern.search(line)
+            row[f"{name}_before"] = float(match.group(1)) if match else float("nan")
+            row[f"{name}_after"] = float(match.group(2)) if match else float("nan")
+        result_match = re.search(r"\bresult\s*=\s*(.+?)\s*$", line, re.IGNORECASE)
+        row["result"] = result_match.group(1).strip() if result_match else ""
+        rows.append(row)
+    frame = pd.DataFrame(rows)
+    return frame, {
+        "source": "explicit_sdf_validation_blocks",
+        "path": str(path.resolve()),
+        "n_blocks": len(rows),
+        "primary_selection_rule": (
+            "exactly one sdf_true_only block per episode; otherwise headline unavailable"
+        ),
+    }
+
+
+def select_primary_sdf_validation_blocks(
+    blocks: pd.DataFrame,
+) -> tuple[pd.DataFrame, Dict[str, Any]]:
+    """Select an unambiguous formal true-SDF validation block per episode."""
+    if blocks.empty:
+        return pd.DataFrame(columns=["episode"]), {"ambiguous_episodes": [], "missing_episodes": []}
+    rows: list[Dict[str, Any]] = []
+    ambiguous: list[int] = []
+    for episode, group in blocks.groupby("episode", sort=True):
+        formal = group[group["stage"] == "sdf_true_only"]
+        if len(formal) != 1:
+            ambiguous.append(int(episode))
+            continue
+        item = formal.iloc[0]
+        rows.append({
+            "episode": int(episode),
+            "sdf_before_aio_mean": item.get("normalized_mean_before", np.nan),
+            "sdf_after_aio_mean": item.get("normalized_mean_after", np.nan),
+            "sdf_before_aio_t": item.get("normalized_t_before", np.nan),
+            "sdf_after_aio_t": item.get("normalized_t_after", np.nan),
+            "sdf_constraint_before": item.get("constraint_before", np.nan),
+            "sdf_constraint_after": item.get("constraint_after", np.nan),
+            "sdf_safe_to_continue": item.get("safe_to_continue", np.nan),
+            "sdf_stage_progress": item.get("stage_progress", np.nan),
+            "sdf_converged": item.get("converged", np.nan),
+            "sdf_validation_result": item.get("result", ""),
+            "sdf_validation_stage": item.get("stage", ""),
+            "sdf_validation_occurrence": item.get("occurrence", np.nan),
+        })
+    return pd.DataFrame(rows), {
+        "ambiguous_episodes": ambiguous,
+        "selection_rule": "exactly_one_sdf_true_only_block",
+    }
 
 
 def parse_training_log(path: str | Path) -> tuple[pd.DataFrame, Dict[str, Any]]:

@@ -18,7 +18,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from analysis.checkpoint_loader import load_analysis_checkpoint  # noqa: E402
-from analysis.convergence_transition import ConvergenceShockBank  # noqa: E402
 from evaluation.convergence_artifacts import (  # noqa: E402
     EpisodeEvaluation,
     discover_episode_firm_data,
@@ -32,10 +31,12 @@ from evaluation.convergence_metrics import (  # noqa: E402
 )
 from evaluation.full_run_diagnostics import (  # noqa: E402
     evaluate_fc1_checkpoint,
-    evaluate_fc2_checkpoint,
     evaluate_sdf_heldout,
     model_state_hash,
+    namespace_sdf_summary,
+    parse_sdf_validation_log_blocks,
     parse_training_log,
+    select_primary_sdf_validation_blocks,
     write_json,
 )
 from evaluation.bellman_diagnostics import evaluate_bellman_residuals  # noqa: E402
@@ -53,16 +54,21 @@ HEADLINE_COLUMNS = [
     "p0_residual_abs_p99", "pi_residual_abs_mean", "pi_residual_abs_p90",
     "pi_residual_abs_p99", "q_residual_abs_mean", "q_residual_abs_p90",
     "q_residual_abs_p99", "q_residual_normalized_abs_mean",
-    "sdf_conditional_abs_mean", "sdf_conditional_abs_p90", "sdf_conditional_abs_p99",
-    "sdf_u_stat", "sdf_g_max", "M_mean", "M_std",
-    "sdf_normalized_conditional_mean_abs", "sdf_normalized_conditional_p90_abs",
-    "sdf_normalized_cm_mse", "sdf_normalized_u_stat", "sdf_M_mean", "sdf_M_std",
+    "p0_trainM_residual_abs_mean", "p0_rawM_residual_abs_mean",
+    "pi_trainM_residual_abs_mean", "pi_rawM_residual_abs_mean",
+    "q_trainM_residual_abs_mean", "q_rawM_residual_abs_mean",
+    "sdf_common_conditional_abs_mean", "sdf_common_conditional_abs_p90",
+    "sdf_common_conditional_abs_p99", "sdf_common_u_stat", "sdf_common_g_max",
+    "sdf_common_M_mean", "sdf_common_M_std", "sdf_common_valid_parent_ratio",
+    "sdf_ondist_conditional_abs_mean", "sdf_ondist_conditional_abs_p90",
+    "sdf_ondist_conditional_abs_p99", "sdf_ondist_u_stat", "sdf_ondist_g_max",
+    "sdf_ondist_M_mean", "sdf_ondist_M_std", "sdf_ondist_valid_parent_ratio",
     "bp_mae_survival_identified", "bp_regret_mean", "bp_regret_p90", "bp_regret_p99",
     "teacher_identified_share", "fc1_hatc_rmse", "fc1_hatc_skill",
     "fc1_hatc_persistence_skill", "fc1_lnk_rmse", "fc1_lnk_skill",
     "fc1_lnk_persistence_skill", "fc1_hatc_best_shift", "fc1_lnk_best_shift",
-    "fc2_hatc_rmse", "fc2_lnk_rmse", "resource_residual_abs_mean",
-    "Q_mean_abs_diff", "P_mean_abs_diff", "bp_mean_abs_diff", "bar_z_mean_abs_diff",
+    "Q_mean_abs_diff", "P0_mean_abs_diff", "PI_mean_abs_diff", "P_mean_abs_diff",
+    "bp_mean_abs_diff", "bar_z_mean_abs_diff",
     "mean_b", "p90_b", "p99_b", "mean_bp", "p99_bp",
     "default_rate", "survival_rate", "investment_rate",
     "sdf_before_aio_mean", "sdf_after_aio_mean", "sdf_before_aio_t",
@@ -97,6 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forward-chunk-size", type=int, default=8192)
     parser.add_argument("--bp-teacher-margin-tol", type=float, default=1e-8)
     parser.add_argument("--allow-dirty-worktree", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
@@ -154,7 +161,7 @@ def _sample_parent_tensors(
     *,
     device: torch.device,
     max_parents: int,
-) -> tuple[pd.DataFrame, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[pd.DataFrame, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     merged, _ = load_reference_state(firm_path, macro_path=macro_path)
     parents = select_parent_rows(merged)
     columns = ["b", "z", "ETA", "i", "x", "Hatcf", "LnKF", "hatc_cal", "lnk_cal"]
@@ -162,16 +169,32 @@ def _sample_parent_tensors(
     numeric = numeric.loc[np.isfinite(numeric.to_numpy()).all(axis=1)]
     if numeric.empty:
         raise ValueError("No finite parent states for held-out diagnostics")
+    source_positions = numeric.index.to_numpy()
     if len(numeric) > max_parents:
         positions = np.linspace(0, len(numeric) - 1, max_parents).round().astype(int)
         numeric = numeric.iloc[positions]
+        source_positions = source_positions[positions]
     states = torch.as_tensor(
         numeric[["b", "z", "ETA", "i", "x", "Hatcf", "LnKF"]].to_numpy(np.float32),
         device=device,
     )
     hatc = torch.as_tensor(numeric["hatc_cal"].to_numpy(np.float32), device=device).reshape(-1, 1)
     lnk = torch.as_tensor(numeric["lnk_cal"].to_numpy(np.float32), device=device).reshape(-1, 1)
-    return merged, states, hatc, lnk
+    digest = hashlib.sha256()
+    for name, value in (("states", states), ("hatc_cal", hatc), ("lnk_cal", lnk)):
+        array = value.detach().cpu().contiguous().numpy()
+        digest.update(name.encode("utf-8"))
+        digest.update(array.tobytes())
+    metadata = {
+        "source_artifact": str(firm_path.resolve()),
+        "macro_context_source": str(macro_path.resolve()) if macro_path else None,
+        "n_parent": int(len(numeric)),
+        "selected_row_indices": [str(value) for value in source_positions.tolist()],
+        "columns": columns,
+        "parent_bank_sha256": digest.hexdigest(),
+        "selection": "finite_parent_rows_then_evenly_spaced_positions",
+    }
+    return merged, states, hatc, lnk, metadata
 
 
 def _firm_eval_args(
@@ -201,8 +224,8 @@ def _firm_eval_args(
 
 def _write_dashboard(headline: pd.DataFrame, output: Path) -> None:
     metrics = [
-        "p0_residual_abs_mean", "pi_residual_abs_mean", "q_residual_abs_mean",
-        "sdf_normalized_conditional_mean_abs", "fc1_hatc_rmse", "fc1_lnk_rmse",
+        "p0_rawM_residual_abs_mean", "pi_rawM_residual_abs_mean", "q_rawM_residual_abs_mean",
+        "sdf_common_conditional_abs_mean", "fc1_hatc_rmse", "fc1_lnk_rmse",
     ]
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
     for axis, metric in zip(axes.reshape(-1), metrics):
@@ -243,37 +266,17 @@ def _plot_metric_dashboard(
     plt.close(fig)
 
 
-def _hash_shock_bank(*, n_reference: int, max_children: int, seed: int) -> str:
-    bank = ConvergenceShockBank.create(
-        n_reference, max_children, seed=seed, device=torch.device("cpu"), dtype=torch.float32
-    )
-    digest = hashlib.sha256()
-    for name in ("eps_x", "eps_z", "u_eta", "u_i"):
-        value = getattr(bank, name).detach().cpu().contiguous()
-        digest.update(name.encode("utf-8"))
-        digest.update(value.numpy().tobytes())
-    return digest.hexdigest()
-
-
 def _merge_training_log(headline: pd.DataFrame, parsed: pd.DataFrame) -> pd.DataFrame:
     if parsed.empty:
         return headline
-    aliases = {
-        "sdf_before_aio_mean": ("sdf_before_aio_mean", "before_signed_aio_mean"),
-        "sdf_after_aio_mean": ("sdf_after_aio_mean", "after_signed_aio_mean"),
-        "sdf_before_aio_t": ("sdf_before_aio_t", "before_signed_aio_t"),
-        "sdf_after_aio_t": ("sdf_after_aio_t", "after_signed_aio_t"),
-        "sdf_safe_to_continue": ("sdf_safe_to_continue", "safe_to_continue"),
-        "sdf_stage_progress": ("sdf_stage_progress", "stage_progress"),
-        "sdf_converged": ("sdf_converged",),
-    }
-    selected = parsed[["episode"]].copy()
-    for destination, candidates in aliases.items():
-        source = next((name for name in candidates if name in parsed.columns), None)
-        if source is not None:
-            selected[destination] = parsed[source]
-    extra = [name for name in parsed.columns if name != "episode" and name not in selected.columns]
-    selected = selected.join(parsed[extra].add_prefix("training_log_"))
+    selected = parsed.copy()
+    extra = [name for name in selected.columns if name != "episode" and name not in {
+        "sdf_before_aio_mean", "sdf_after_aio_mean", "sdf_before_aio_t",
+        "sdf_after_aio_t", "sdf_constraint_before", "sdf_constraint_after",
+        "sdf_safe_to_continue", "sdf_stage_progress", "sdf_converged",
+        "sdf_validation_result", "sdf_validation_stage", "sdf_validation_occurrence",
+    }]
+    selected = selected.rename(columns={name: f"training_log_{name}" for name in extra})
     existing = [name for name in selected.columns if name != "episode" and name in headline.columns]
     if existing:
         headline = headline.drop(columns=existing)
@@ -286,7 +289,7 @@ def _add_function_drift(
     eta_values: list[float],
     missing: MissingArtifacts,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    valid = headline.loc[headline["status"] == "ok", "episode"].astype(int).tolist()
+    valid = headline.loc[headline["status"].isin(["ok", "partial"]), "episode"].astype(int).tolist()
     cases = [EpisodeEvaluation(ep, output / "episodes" / f"ep{ep}" / "firm") for ep in valid]
     frames = []
     for eta_value in eta_values:
@@ -313,43 +316,54 @@ def _add_function_drift(
 
 def _write_error_vs_drift(headline: pd.DataFrame, output: Path) -> pd.DataFrame:
     specifications = (
-        ("P0", "p0_residual_abs_mean", "P_mean_abs_diff"),
-        ("PI", "pi_residual_abs_mean", "P_mean_abs_diff"),
-        ("Q", "q_residual_abs_mean", "Q_mean_abs_diff"),
-        ("BP", "bp_regret_mean", "bp_mean_abs_diff"),
+        ("rawM", "P0", "p0_rawM_residual_abs_mean", "P0_mean_abs_diff"),
+        ("rawM", "PI", "pi_rawM_residual_abs_mean", "PI_mean_abs_diff"),
+        ("rawM", "Q", "q_rawM_residual_abs_mean", "Q_mean_abs_diff"),
+        ("rawM", "BP", "bp_regret_mean", "bp_mean_abs_diff"),
+        ("trainM", "P0", "p0_trainM_residual_abs_mean", "P0_mean_abs_diff"),
+        ("trainM", "PI", "pi_trainM_residual_abs_mean", "PI_mean_abs_diff"),
+        ("trainM", "Q", "q_trainM_residual_abs_mean", "Q_mean_abs_diff"),
+        ("trainM", "BP", "bp_regret_mean", "bp_mean_abs_diff"),
     )
     rows = []
-    for module, error_name, drift_name in specifications:
+    for semantics, module, error_name, drift_name in specifications:
         if error_name not in headline or drift_name not in headline:
             continue
         for _, item in headline.iterrows():
             rows.append({
-                "episode": int(item["episode"]), "module": module,
+                "episode": int(item["episode"]), "semantics": semantics, "module": module,
                 "equation_error_metric": error_name,
                 "equation_error": item[error_name],
                 "function_drift_metric": drift_name,
                 "function_drift": item[drift_name],
             })
-    frame = pd.DataFrame(rows)
+    frame = pd.DataFrame(rows, columns=[
+        "episode", "semantics", "module", "equation_error_metric",
+        "equation_error", "function_drift_metric", "function_drift",
+    ])
     destination = output / "cross_episode" / "equation_error_vs_drift"
     destination.mkdir(parents=True, exist_ok=True)
     frame.to_csv(destination / "equation_error_vs_drift.csv", index=False)
-    finite = frame.assign(
-        equation_error=pd.to_numeric(frame.get("equation_error"), errors="coerce"),
-        function_drift=pd.to_numeric(frame.get("function_drift"), errors="coerce"),
-    ).dropna(subset=["equation_error", "function_drift"])
-    if not finite.empty:
+    for semantics in ("rawM", "trainM"):
+        subset = frame[frame["semantics"] == semantics]
+        finite = subset.assign(
+            equation_error=pd.to_numeric(subset.get("equation_error"), errors="coerce"),
+            function_drift=pd.to_numeric(subset.get("function_drift"), errors="coerce"),
+        ).dropna(subset=["equation_error", "function_drift"])
+        if finite.empty:
+            continue
         fig, axis = plt.subplots(figsize=(8, 6))
         for module, group in finite.groupby("module"):
             axis.plot(group["function_drift"], group["equation_error"], marker="o", label=module)
             for _, item in group.iterrows():
                 axis.annotate(f"ep{int(item['episode'])}", (item["function_drift"], item["equation_error"]), fontsize=7)
         axis.set_xlabel("mean absolute function drift")
-        axis.set_ylabel("equation error / BP regret")
+        axis.set_ylabel(f"equation error / BP regret ({semantics})")
+        axis.set_title(f"Equation error vs drift: {semantics}")
         axis.grid(alpha=0.25)
         axis.legend()
         fig.tight_layout()
-        fig.savefig(destination / "equation_error_vs_drift.png", dpi=160)
+        fig.savefig(destination / f"equation_error_vs_drift_{semantics}.png", dpi=160)
         plt.close(fig)
     return frame
 
@@ -358,6 +372,9 @@ def _write_output_schema(
     headline: pd.DataFrame,
     parsed_log: pd.DataFrame,
     drift: pd.DataFrame,
+    structural_long: pd.DataFrame,
+    sdf_long: pd.DataFrame,
+    sdf_blocks: pd.DataFrame,
     output: Path,
 ) -> None:
     tables = output / "tables"
@@ -368,8 +385,7 @@ def _write_output_schema(
     table_groups = {
         "equation_metrics_by_episode.csv": ("p0_", "pi_", "q_", "ondist_p0_", "ondist_pi_", "ondist_q_"),
         "macro_metrics_by_episode.csv": ("fc1_",),
-        "sdf_metrics_by_episode.csv": ("sdf_", "M_"),
-        "fc2_metrics_by_episode.csv": ("fc2_", "resource_"),
+        "sdf_metrics_by_episode.csv": ("sdf_",),
         "simulated_moments_by_episode.csv": (
             "mean_b", "std_b", "median_b", "p90_b", "p95_b", "p99_b",
             "mean_bp", "p90_bp", "p99_bp", "default_rate", "survival_rate",
@@ -383,6 +399,9 @@ def _write_output_schema(
         ]
         headline[columns].to_csv(tables / filename, index=False)
     parsed_log.to_csv(tables / "training_log_metrics_by_episode.csv", index=False)
+    structural_long.to_csv(tables / "structural_metrics_by_episode_eta.csv", index=False)
+    sdf_long.to_csv(tables / "sdf_metrics_long.csv", index=False)
+    sdf_blocks.to_csv(tables / "sdf_validation_log_blocks.csv", index=False)
 
     cross = output / "cross_episode"
     cross.mkdir(parents=True, exist_ok=True)
@@ -390,7 +409,6 @@ def _write_output_schema(
         "equation_residuals": tables / "equation_metrics_by_episode.csv",
         "macro": tables / "macro_metrics_by_episode.csv",
         "sdf": tables / "sdf_metrics_by_episode.csv",
-        "fc2": tables / "fc2_metrics_by_episode.csv",
         "simulated_moments": tables / "simulated_moments_by_episode.csv",
         "log_diagnostics": tables / "training_log_metrics_by_episode.csv",
     }
@@ -403,7 +421,9 @@ def _write_output_schema(
 
     _plot_metric_dashboard(
         headline,
-        ["p0_residual_abs_mean", "pi_residual_abs_mean", "q_residual_abs_mean"],
+        ["p0_trainM_residual_abs_mean", "p0_rawM_residual_abs_mean",
+         "pi_trainM_residual_abs_mean", "pi_rawM_residual_abs_mean",
+         "q_trainM_residual_abs_mean", "q_rawM_residual_abs_mean"],
         figures / "equation_error_by_episode.png", title="Equation error by episode",
     )
     _plot_metric_dashboard(
@@ -413,12 +433,14 @@ def _write_output_schema(
     )
     _plot_metric_dashboard(
         headline,
-        ["Q_mean_abs_diff", "P_mean_abs_diff", "bar_z_mean_abs_diff", "bp_mean_abs_diff"],
+        ["Q_mean_abs_diff", "P0_mean_abs_diff", "PI_mean_abs_diff",
+         "P_mean_abs_diff", "bar_z_mean_abs_diff", "bp_mean_abs_diff"],
         figures / "function_drift_dashboard.png", title="Function drift",
     )
     _plot_metric_dashboard(
         headline,
-        ["sdf_conditional_abs_mean", "sdf_conditional_abs_p90", "sdf_g_max", "M_mean", "M_std"],
+        ["sdf_common_conditional_abs_mean", "sdf_ondist_conditional_abs_mean",
+         "sdf_common_u_stat", "sdf_common_g_max", "sdf_common_M_mean"],
         figures / "sdf_convergence_dashboard.png", title="SDF held-out convergence",
     )
     _plot_metric_dashboard(
@@ -428,26 +450,37 @@ def _write_output_schema(
     )
     _plot_metric_dashboard(
         headline,
-        ["fc2_hatc_rmse", "fc2_lnk_rmse", "resource_residual_abs_mean"],
-        figures / "fc2_convergence_dashboard.png", title="FC2 convergence",
-    )
-    _plot_metric_dashboard(
-        headline,
         ["mean_b", "p90_b", "mean_bp", "default_rate", "survival_rate", "investment_rate"],
         figures / "simulated_moments_dashboard.png", title="Simulated moments",
     )
+
+
+def _prepare_output_directory(path: Path, *, overwrite: bool) -> None:
+    if path.exists() and any(path.iterdir()):
+        if not overwrite:
+            raise RuntimeError(
+                f"Output directory is non-empty: {path}. Pass --overwrite to replace evaluator output."
+            )
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _discover_episode_macro(run_root: Path, episode: int) -> Path | None:
+    output = run_root / "data" / "outputs"
+    candidates = sorted(output.glob(f"ep{episode}_stage_*_macro.pkl")) if output.is_dir() else []
+    return candidates[-1].resolve() if candidates else None
 
 
 def main() -> None:
     args = parse_args()
     run_root = args.run_root.expanduser().resolve()
     output = (args.output_dir or run_root / "data" / "outputs" / "full_run_evaluation").resolve()
-    output.mkdir(parents=True, exist_ok=True)
     args.device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     device = torch.device(args.device)
     dirty = _git(["status", "--porcelain"])
     if dirty and not args.allow_dirty_worktree:
         raise RuntimeError("Working tree is dirty; use --allow-dirty-worktree only for intentional local diagnostics")
+    _prepare_output_directory(output, overwrite=bool(args.overwrite))
 
     checkpoints = _discover_checkpoints(run_root)
     firms, discovery_warnings = discover_episode_firm_data(run_root)
@@ -458,6 +491,9 @@ def main() -> None:
         raise RuntimeError("No episodes discovered or selected")
     reference_firm, reference_macro = _choose_reference(run_root, firms, args)
     _, reference_state = load_reference_state(reference_firm, macro_path=reference_macro)
+    _, common_parent_states, common_hatc, common_lnk, common_parent_meta = _sample_parent_tensors(
+        reference_firm, reference_macro, device=device, max_parents=args.max_sdf_parents
+    )
     representative = set(choose_representative_episodes(episodes))
     max_j = max(args.robustness_child_shocks + [args.n_child_shocks])
 
@@ -465,28 +501,26 @@ def main() -> None:
     error_rows: list[Dict[str, Any]] = []
     episode_metadata: list[Dict[str, Any]] = []
     availability_notes: list[str] = []
+    structural_rows: list[Dict[str, Any]] = []
+    sdf_rows_all: list[Dict[str, Any]] = []
     for episode in episodes:
         episode_root = output / "episodes" / f"ep{episode}"
-        for name in ("firm", "sdf", "fc1", "fc2", "simulation", "training_log"):
+        for name in ("firm", "sdf", "fc1", "simulation", "training_log"):
             (episode_root / name).mkdir(parents=True, exist_ok=True)
         row: Dict[str, Any] = {name: np.nan for name in HEADLINE_COLUMNS}
         row.update({"episode": episode, "status": "missing"})
         checkpoint = checkpoints.get(episode)
         firm_path = firms.get(episode)
-        if checkpoint is None or firm_path is None:
-            missing = []
-            if checkpoint is None:
-                missing.append("checkpoint")
-            if firm_path is None:
-                missing.append("firm_data")
-            row["error"] = f"missing {' and '.join(missing)}"
+        if checkpoint is None:
+            row["error"] = "missing checkpoint"
             availability_notes.append(f"Episode {episode}: {row['error']}")
             headline_rows.append(row)
             error_rows.append({"episode": episode, "stage": "discovery", "error": row["error"]})
             continue
-        macro_path = _macro_for_firm(firm_path)
+        macro_path = _macro_for_firm(firm_path) if firm_path else _discover_episode_macro(run_root, episode)
         row.update({
-            "checkpoint": str(checkpoint), "firm_data": str(firm_path),
+            "checkpoint": str(checkpoint),
+            "firm_data": str(firm_path) if firm_path else np.nan,
             "macro_data": str(macro_path) if macro_path else np.nan,
         })
         try:
@@ -495,6 +529,10 @@ def main() -> None:
                 reference_macro=reference_macro, output=episode_root / "firm",
                 representative=episode in representative,
             ))
+            structural_rows.extend(
+                {"episode": episode, **item}
+                for item in firm_summary.to_dict(orient="records")
+            )
             primary = firm_summary[
                 (firm_summary["n_child_shocks"] == args.n_child_shocks)
                 & (firm_summary["eta_parent"] == 1.0)
@@ -513,54 +551,94 @@ def main() -> None:
                 name: model_state_hash(loaded.models[name])
                 for name in active_model_names
             }
-            firm_frame, parent_states, hatc_cal, lnk_cal = _sample_parent_tensors(
-                firm_path, macro_path, device=device, max_parents=args.max_sdf_parents
-            )
-            ondist_transition = build_frozen_transition_data(
-                loaded.models["sdf_fc1"], parent_states, reference_state,
-                loaded.hyperparams, loaded.economic_config,
-                n_child_shocks=args.n_child_shocks, shock_seed=args.shock_seed,
-                shock_bank_max_child_shocks=max_j,
-                hatc_cal_values=hatc_cal, lnk_cal_values=lnk_cal,
-            )
-            parent_b = parent_states[:, 0].detach().cpu().numpy().astype(np.float64)
-            parent_z = parent_states[:, 1].detach().cpu().numpy().astype(np.float64)
-            ondist_grid = FrozenFirmGrid(
-                b_values=parent_b, z_values=np.asarray([0.0]),
-                mesh_b=parent_b.reshape(-1, 1), mesh_z=parent_z.reshape(-1, 1),
-                base_states=parent_states,
-            )
-            _, ondist_summary = evaluate_bellman_residuals(
-                loaded.models["policy_value"], ondist_grid, ondist_transition,
-                loaded.economic_config, chunk_size=args.forward_chunk_size,
-            )
-            ondist_summary = {f"ondist_{key}": value for key, value in ondist_summary.items()}
-            row.update(ondist_summary)
-            pd.DataFrame([ondist_summary]).to_csv(
-                episode_root / "firm" / "on_distribution_metrics.csv", index=False
-            )
-            sdf_rows = []
+            episode_sdf_rows: list[Dict[str, Any]] = []
+            common_primary_meta: Dict[str, Any] | None = None
             for child_count in sorted(set(args.robustness_child_shocks + [args.n_child_shocks])):
                 sdf_summary, sdf_meta = evaluate_sdf_heldout(
-                    loaded.models["sdf_fc1"], parent_states, hatc_cal=hatc_cal,
-                    lnk_cal=lnk_cal, economic_config=loaded.economic_config,
+                    loaded.models["sdf_fc1"], common_parent_states, hatc_cal=common_hatc,
+                    lnk_cal=common_lnk, economic_config=loaded.economic_config,
                     n_children=child_count, seed=args.shock_seed,
                     shock_bank_max_children=max_j,
                     normalized_logr_clip=float(getattr(loaded.hyperparams, "sdf_normalized_logr_clip", 20.0)),
                 )
-                sdf_rows.append({"n_children": child_count, **sdf_summary})
+                namespaced = namespace_sdf_summary(sdf_summary, scope="common")
+                item = {"episode": episode, "scope": "common", "n_children": child_count, **namespaced}
+                episode_sdf_rows.append(item)
+                sdf_rows_all.append(item)
                 if child_count == args.n_child_shocks:
-                    row.update(sdf_summary)
-                    row.update({
-                        "sdf_conditional_abs_mean": sdf_summary.get("sdf_normalized_conditional_mean_abs"),
-                        "sdf_conditional_abs_p90": sdf_summary.get("sdf_normalized_conditional_p90_abs"),
-                        "sdf_conditional_abs_p99": sdf_summary.get("sdf_normalized_conditional_p99_abs"),
-                        "sdf_u_stat": sdf_summary.get("sdf_normalized_u_stat"),
-                        "M_mean": sdf_summary.get("sdf_M_mean"),
-                        "M_std": sdf_summary.get("sdf_M_std"),
-                    })
-                    write_json(episode_root / "sdf" / "metadata.json", sdf_meta)
-            pd.DataFrame(sdf_rows).to_csv(episode_root / "sdf" / "metrics.csv", index=False)
+                    row.update(namespaced)
+                    common_primary_meta = {**sdf_meta, "parent_bank": common_parent_meta}
+                    if float(namespaced["sdf_common_valid_parent_ratio"]) < 1.0:
+                        availability_notes.append(
+                            f"Episode {episode}: common SDF valid_parent_ratio="
+                            f"{namespaced['sdf_common_valid_parent_ratio']:.6g}"
+                        )
+
+            firm_frame = pd.DataFrame()
+            ondist_parent_meta: Dict[str, Any] | None = None
+            ondist_primary_meta: Dict[str, Any] | None = None
+            if firm_path is not None:
+                firm_frame, parent_states, hatc_cal, lnk_cal, ondist_parent_meta = _sample_parent_tensors(
+                    firm_path, macro_path, device=device, max_parents=args.max_sdf_parents
+                )
+                ondist_transition = build_frozen_transition_data(
+                    loaded.models["sdf_fc1"], parent_states, reference_state,
+                    loaded.hyperparams, loaded.economic_config,
+                    n_child_shocks=args.n_child_shocks, shock_seed=args.shock_seed,
+                    shock_bank_max_child_shocks=max_j,
+                    hatc_cal_values=hatc_cal, lnk_cal_values=lnk_cal,
+                )
+                parent_b = parent_states[:, 0].detach().cpu().numpy().astype(np.float64)
+                parent_z = parent_states[:, 1].detach().cpu().numpy().astype(np.float64)
+                ondist_grid = FrozenFirmGrid(
+                    b_values=parent_b, z_values=np.asarray([0.0]),
+                    mesh_b=parent_b.reshape(-1, 1), mesh_z=parent_z.reshape(-1, 1),
+                    base_states=parent_states,
+                )
+                _, ondist_summary = evaluate_bellman_residuals(
+                    loaded.models["policy_value"], ondist_grid, ondist_transition,
+                    loaded.economic_config, chunk_size=args.forward_chunk_size,
+                )
+                ondist_summary = {f"ondist_{key}": value for key, value in ondist_summary.items()}
+                row.update(ondist_summary)
+                pd.DataFrame([ondist_summary]).to_csv(
+                    episode_root / "firm" / "on_distribution_metrics.csv", index=False
+                )
+                for child_count in sorted(set(args.robustness_child_shocks + [args.n_child_shocks])):
+                    sdf_summary, sdf_meta = evaluate_sdf_heldout(
+                        loaded.models["sdf_fc1"], parent_states, hatc_cal=hatc_cal,
+                        lnk_cal=lnk_cal, economic_config=loaded.economic_config,
+                        n_children=child_count, seed=args.shock_seed,
+                        shock_bank_max_children=max_j,
+                        normalized_logr_clip=float(getattr(loaded.hyperparams, "sdf_normalized_logr_clip", 20.0)),
+                    )
+                    namespaced = namespace_sdf_summary(sdf_summary, scope="ondist")
+                    item = {"episode": episode, "scope": "ondist", "n_children": child_count, **namespaced}
+                    episode_sdf_rows.append(item)
+                    sdf_rows_all.append(item)
+                    if child_count == args.n_child_shocks:
+                        row.update(namespaced)
+                        ondist_primary_meta = {**sdf_meta, "parent_bank": ondist_parent_meta}
+                        if float(namespaced["sdf_ondist_valid_parent_ratio"]) < 1.0:
+                            availability_notes.append(
+                                f"Episode {episode}: on-distribution SDF valid_parent_ratio="
+                                f"{namespaced['sdf_ondist_valid_parent_ratio']:.6g}"
+                            )
+                moments, unavailable = compute_simulated_moments(select_simulated_state_rows(firm_frame))
+                row.update(moments)
+                pd.DataFrame([moments]).to_csv(episode_root / "simulation" / "moments.csv", index=False)
+                write_json(episode_root / "simulation" / "metadata.json", {"unavailable": unavailable})
+            else:
+                write_json(episode_root / "simulation" / "missing.json", {"reason": "episode firm artifact absent"})
+                availability_notes.append(
+                    f"Episode {episode}: episode firm artifact absent; on-distribution and simulation metrics unavailable"
+                )
+            pd.DataFrame(episode_sdf_rows).to_csv(episode_root / "sdf" / "metrics.csv", index=False)
+            write_json(episode_root / "sdf" / "metadata.json", {
+                "common": common_primary_meta,
+                "ondist": ondist_primary_meta,
+                "common_parent_bank_sha256": common_parent_meta["parent_bank_sha256"],
+            })
 
             macro_frame = read_dataframe(macro_path) if macro_path else pd.DataFrame()
             if not macro_frame.empty:
@@ -577,53 +655,32 @@ def main() -> None:
                 pd.DataFrame([fc1_summary]).to_csv(episode_root / "fc1" / "metrics.csv", index=False)
                 timing.to_csv(episode_root / "fc1" / "timing_alignment.csv", index=False)
                 rollout.to_csv(episode_root / "fc1" / "rollout.csv", index=False)
-                if "fc2" in loaded.metadata.get("loaded_model_keys", []):
-                    fc2_summary, fc2_nodes = evaluate_fc2_checkpoint(
-                        loaded.models["fc2"], loaded.models["policy_value"],
-                        firm_frame, macro_frame, device=device,
-                        economic_config=loaded.economic_config,
-                    )
-                    row.update(fc2_summary)
-                    row["resource_residual_abs_mean"] = (
-                        float(fc2_nodes["resource_residual_mean"].abs().mean())
-                        if not fc2_nodes.empty else float("nan")
-                    )
-                    pd.DataFrame([fc2_summary]).to_csv(episode_root / "fc2" / "metrics.csv", index=False)
-                    fc2_nodes.to_csv(episode_root / "fc2" / "node_consistency.csv", index=False)
-                    write_json(episode_root / "fc2" / "metadata.json", {
-                        "node_target": (
-                            "FC2Loss.compute_resource_accounting plus FC2LossPipe-compatible "
-                            "absolute-consumption aggregation"
-                        ),
-                        "policy_macro_input_order": "[lnk_fc2, hatc_fc2] as implemented by FC2LossPipe",
-                        "transition_consistency": (
-                            "child-node FC2 prediction versus child-distribution aggregation; "
-                            "reported separately from parent-node consistency"
-                        ),
-                    })
-                else:
-                    write_json(episode_root / "fc2" / "missing.json", {"reason": "models.fc2 absent"})
-                    availability_notes.append(f"Episode {episode}: FC2 unavailable because models.fc2 is absent")
             else:
                 write_json(episode_root / "fc1" / "missing.json", {"reason": "macro artifact absent"})
-                write_json(episode_root / "fc2" / "missing.json", {"reason": "macro artifact absent"})
-                availability_notes.append(f"Episode {episode}: FC1 and FC2 unavailable because macro artifact is absent")
-
-            moments, unavailable = compute_simulated_moments(select_simulated_state_rows(firm_frame))
-            row.update(moments)
-            pd.DataFrame([moments]).to_csv(episode_root / "simulation" / "moments.csv", index=False)
-            write_json(episode_root / "simulation" / "metadata.json", {"unavailable": unavailable})
+                availability_notes.append(f"Episode {episode}: FC1 unavailable because macro artifact is absent")
             after = {
                 name: model_state_hash(loaded.models[name])
                 for name in active_model_names
             }
             if before != after:
                 raise RuntimeError("Full-run evaluator changed checkpoint model parameters")
-            row.update({"status": "ok", "error": ""})
+            missing_components = []
+            if firm_path is None:
+                missing_components.append("firm_data")
+            if macro_path is None:
+                missing_components.append("macro_data")
+            row.update({
+                "status": "partial" if missing_components else "ok",
+                "error": f"unavailable: {', '.join(missing_components)}" if missing_components else "",
+            })
             episode_metadata.append({
                 "episode": episode, "checkpoint_sha256": _file_hash(checkpoint),
                 "model_hashes_before": before, "model_hashes_after": after,
                 "model_state_unchanged": True, "firm_metadata": firm_meta,
+                "common_sdf_parent_bank": common_parent_meta,
+                "ondist_sdf_parent_bank": ondist_parent_meta,
+                "common_sdf_metadata": common_primary_meta,
+                "ondist_sdf_metadata": ondist_primary_meta,
             })
         except Exception as exc:
             row.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
@@ -653,8 +710,16 @@ def main() -> None:
             log_path = candidates[0]
     if log_path is not None and log_path.is_file():
         parsed_log, log_meta = parse_training_log(log_path)
+        sdf_log_blocks, sdf_block_meta = parse_sdf_validation_log_blocks(log_path)
+        primary_sdf_log, primary_sdf_meta = select_primary_sdf_validation_blocks(sdf_log_blocks)
+        log_meta.update({
+            "sdf_validation_blocks": sdf_block_meta,
+            "sdf_primary_selection": primary_sdf_meta,
+        })
     else:
         parsed_log = pd.DataFrame(columns=["episode"])
+        sdf_log_blocks = pd.DataFrame()
+        primary_sdf_log = pd.DataFrame(columns=["episode"])
         availability_notes.append("Training log diagnostics unavailable: no explicit or unambiguous log path")
 
     if not parsed_log.empty:
@@ -664,8 +729,17 @@ def main() -> None:
             if episode_log_dir.is_dir():
                 pd.DataFrame([log_row]).to_csv(episode_log_dir / "metrics.csv", index=False)
 
-    headline = _merge_training_log(pd.DataFrame(headline_rows), parsed_log)
+    headline = _merge_training_log(pd.DataFrame(headline_rows), primary_sdf_log)
+    if not parsed_log.empty:
+        generic = parsed_log.rename(
+            columns={name: f"training_log_{name}" for name in parsed_log if name != "episode"}
+        )
+        headline = headline.merge(generic, on="episode", how="left")
     missing = MissingArtifacts()
+    for episode in log_meta.get("sdf_primary_selection", {}).get("ambiguous_episodes", []):
+        missing.add(
+            f"Episode {episode}: SDF validation primary block is ambiguous; headline log fields are NaN"
+        )
     for warning in discovery_warnings:
         missing.add(warning)
     for item in error_rows:
@@ -689,6 +763,7 @@ def main() -> None:
         "episodes": headline.to_dict(orient="records"),
         "n_requested": len(episodes),
         "n_ok": int((headline["status"] == "ok").sum()),
+        "n_partial": int((headline["status"] == "partial").sum()),
         "n_error_or_missing": int((headline["status"] != "ok").sum()),
     })
     headline.to_csv(output / "run_summary.csv", index=False)
@@ -696,7 +771,9 @@ def main() -> None:
     parsed_log.to_csv(output / "training_log_metrics.csv", index=False)
     equation_cols = [
         c for c in headline
-        if c.startswith(("p0_residual_", "pi_residual_", "q_residual_"))
+        if c.startswith(("p0_residual_", "pi_residual_", "q_residual_",
+                         "p0_trainM_", "p0_rawM_", "pi_trainM_", "pi_rawM_",
+                         "q_trainM_", "q_rawM_"))
     ]
     headline[["episode", *equation_cols]].to_csv(
         output / "equation_residual_trajectories.csv", index=False
@@ -704,16 +781,17 @@ def main() -> None:
 
     _write_dashboard(headline, output)
     _write_error_vs_drift(headline, output)
-    _write_output_schema(headline, parsed_log, drift, output)
+    _write_output_schema(
+        headline, parsed_log, drift, pd.DataFrame(structural_rows),
+        pd.DataFrame(sdf_rows_all), sdf_log_blocks, output,
+    )
     shutil.copyfile(
         output / "convergence_dashboard.png",
         output / "figures" / "equilibrium_convergence_dashboard.png",
     )
-    error_vs_drift_plot = (
-        output / "cross_episode" / "equation_error_vs_drift" / "equation_error_vs_drift.png"
-    )
+    error_vs_drift_plot = output / "cross_episode" / "equation_error_vs_drift" / "equation_error_vs_drift_rawM.png"
     if error_vs_drift_plot.is_file():
-        shutil.copyfile(error_vs_drift_plot, output / "figures" / "equation_error_vs_drift.png")
+        shutil.copyfile(error_vs_drift_plot, output / "figures" / "equation_error_vs_drift_rawM.png")
     missing.write(output / "missing_artifacts.md")
 
     metric_sources = {}
@@ -734,7 +812,7 @@ def main() -> None:
         elif name not in {"episode", "status", "checkpoint", "firm_data", "macro_data", "error"}:
             metric_sources[name] = "formal_read_only_checkpoint_evaluator"
     metadata = {
-        "evaluator": "full_run_checkpoint_evaluator_v1",
+        "evaluator": "full_run_checkpoint_evaluator_v2",
         "run_root": str(run_root), "git_commit": _git(["rev-parse", "HEAD"]),
         "episodes": episodes, "representative_visual_episodes": sorted(representative),
         "reference_firm_data": str(reference_firm),
@@ -748,11 +826,18 @@ def main() -> None:
             "seed": args.shock_seed, "max_children": max_j,
             "robustness_children": args.robustness_child_shocks,
             "nested_prefix": True,
-            "structural_grid_sha256": _hash_shock_bank(
-                n_reference=int(args.b_points) * int(args.z_points),
-                max_children=max_j,
-                seed=args.shock_seed,
-            ),
+            "sdf_common_parent_bank_sha256": common_parent_meta["parent_bank_sha256"],
+            "sdf_shock_bank_sha256": next((
+                item.get("common_sdf_metadata", {}).get("shock_bank_sha256")
+                for item in episode_metadata
+                if item.get("common_sdf_metadata")
+            ), None),
+            "structural_actual_shock_bank_sha256_by_episode": {
+                str(item["episode"]): (
+                    item.get("firm_metadata", {}).get("reference_transition_bank", {}) or {}
+                ).get("shock_bank_sha256")
+                for item in episode_metadata
+            },
         },
         "reference_firm_sha256": _file_hash(reference_firm),
         "reference_macro_sha256": _file_hash(reference_macro) if reference_macro else None,
@@ -760,6 +845,22 @@ def main() -> None:
         "episode_metadata": episode_metadata,
         "metric_source_priority": "formal evaluator > structured artifact > parsed log",
         "metric_sources": metric_sources,
+        "primary_structural_eta": 1.0,
+        "residual_alias_semantics": {
+            "p0_residual_*": "p0_trainM_residual_*",
+            "pi_residual_*": "pi_trainM_residual_*",
+            "q_residual_*": "q_trainM_residual_*",
+        },
+        "equation_error_vs_drift": {
+            "primary": "rawM",
+            "supplementary": "trainM",
+            "p0_drift_surface": "P0",
+            "pi_drift_surface": "PI_mid",
+        },
+        "sdf_scopes": {
+            "common": "fixed parent bank from reference artifact for model convergence",
+            "ondist": "episode-specific parent bank for visited-distribution fit",
+        },
     }
     write_json(output / "metadata.json", metadata)
     (output / "README.md").write_text(

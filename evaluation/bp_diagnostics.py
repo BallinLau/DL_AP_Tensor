@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,17 @@ class FrozenTransitionData:
     m_used_list: List[torch.Tensor]
     branch_weights: torch.Tensor
     metadata: Dict[str, Any]
+
+
+def _shock_bank_hash(bank: ConvergenceShockBank) -> str:
+    digest = hashlib.sha256()
+    for name in ("eps_x", "eps_z", "u_eta", "u_i"):
+        value = getattr(bank, name).detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(value.dtype).encode("utf-8"))
+        digest.update(str(tuple(value.shape)).encode("utf-8"))
+        digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
 
 
 @contextmanager
@@ -69,7 +81,7 @@ def build_frozen_transition_data(
         )
     device = parent_states.device
     dtype = parent_states.dtype
-    base_bank = ConvergenceShockBank.create(
+    generated_bank = ConvergenceShockBank.create(
         1,
         bank_child_shocks,
         seed=int(shock_seed),
@@ -77,11 +89,11 @@ def build_frozen_transition_data(
         dtype=dtype,
     )
     base_bank = ConvergenceShockBank(
-        eps_x=base_bank.eps_x[:, :n_child_shocks],
-        eps_z=base_bank.eps_z[:, :n_child_shocks],
-        u_eta=base_bank.u_eta[:, :n_child_shocks],
-        u_i=base_bank.u_i[:, :n_child_shocks],
-        seed=base_bank.seed,
+        eps_x=generated_bank.eps_x[:, :n_child_shocks],
+        eps_z=generated_bank.eps_z[:, :n_child_shocks],
+        u_eta=generated_bank.u_eta[:, :n_child_shocks],
+        u_i=generated_bank.u_i[:, :n_child_shocks],
+        seed=generated_bank.seed,
     )
     reference_index = torch.zeros(parent_states.shape[0], dtype=torch.long, device=device)
     shock_bank = base_bank.gather(reference_index)
@@ -157,6 +169,8 @@ def build_frozen_transition_data(
         "continuous_child_count": int(n_child_shocks),
         "expanded_child_count": 2 * int(n_child_shocks),
         "shock_bank_max_child_shocks": bank_child_shocks,
+        "shock_bank_sha256": _shock_bank_hash(generated_bank),
+        "shock_bank_prefix_sha256": _shock_bank_hash(base_bank),
         "nested_prefix_from_max_J": bank_child_shocks > int(n_child_shocks),
         "common_shocks_across_frozen_grid": True,
         "macro_context": {

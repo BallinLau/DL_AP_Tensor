@@ -677,6 +677,7 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
         "bp_margin_identification_threshold": float(args.bp_teacher_margin_tol),
         "grid": first_case_metadata.get("grid"),
         "reference_state": first_case_metadata.get("reference_state"),
+        "reference_transition_bank": first_case_metadata.get("reference_transition_bank"),
         "m_mode": first_case_metadata.get("m_mode"),
         "m_clamp_bounds": first_case_metadata.get("m_clamp_bounds"),
         "model_state_unchanged": all(

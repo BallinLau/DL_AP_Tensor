@@ -32,23 +32,23 @@ log-derived metrics remain unavailable instead of guessing a file.
 
 ## Statistical semantics
 
-- P0/PI/Q structural metrics use the common frozen reference grid.
-- `ondist_*` P0/PI/Q metrics use each episode's observed parent-state bank.
+- P0/PI/Q structural metrics use the common frozen reference grid. Each equation
+  reports both training-M and raw-M residuals; backward-compatible unqualified
+  aliases retain training-M semantics.
+- `ondist_*` P0/PI/Q metrics use each episode's observed parent-state bank and
+  likewise retain separate train-M/raw-M outputs.
 - Q uses `compute_q_survival_recovery_components()` and reports
   `q_target_total - Q_parent`; it does not reimplement the pricing equation.
 - Formal future eta integration remains exact and uses checkpoint `ZETA`.
-- SDF held-out metrics use fresh common-random nested shock banks and
+- `sdf_common_*` uses one deterministic parent bank from the reference artifact
+  for every checkpoint. `sdf_ondist_*` uses each episode's visited parent bank.
+  Both use fresh common-random nested shock banks and
   `utils.metrics.conditional_moment_metrics()` for CMSE and the U-statistic.
   They also report the M distribution and the same pooled mean/variance
   inequality constraints used by the SDF implementation.
 - FC1 reports one-step RMSE/MAE/R2/correlation/slope/intercept, persistence
   skill, rollout RMSE/MAE/finite ratios, and timing shifts.
-- FC2 is optional. When `models.fc2` is absent, the output contains a
-  `missing.json` reason and headline values remain `NaN`. When present, parent
-  and child nodes are evaluated separately. The evaluator preserves the
-  current `FC2LossPipe` macro-input order and absolute-consumption aggregation
-  instead of silently correcting those training semantics.
-- Adjacent-checkpoint Q/P/bar_z/bp drift is computed by the existing
+- Adjacent-checkpoint Q/P0/PI/P/bar_z/bp drift is computed by the existing
   `build_convergence_report.compute_function_drift()` implementation. It is
   not reimplemented in this evaluator.
 - Equation-error-versus-drift output is diagnostic only; no pass/fail
@@ -88,9 +88,6 @@ log-derived metrics remain unavailable instead of guessing a file.
         metrics.csv
         timing_alignment.csv
         rollout.csv
-      fc2/
-        metrics.csv or missing.json
-        node_consistency.csv (when available)
       simulation/
         moments.csv
         metadata.json
@@ -102,7 +99,6 @@ log-derived metrics remain unavailable instead of guessing a file.
     equation_error_vs_drift/
     macro/
     sdf/
-    fc2/
     simulated_moments/
     log_diagnostics/
   figures/
@@ -110,17 +106,19 @@ log-derived metrics remain unavailable instead of guessing a file.
     equation_error_by_episode.png
     equation_tail_error_by_episode.png
     function_drift_dashboard.png
-    equation_error_vs_drift.png (when adjacent drift is available)
+    equation_error_vs_drift_rawM.png (primary, when adjacent drift is available)
+    equation_error_vs_drift_trainM.png (training-semantics supplementary)
     sdf_convergence_dashboard.png
     fc1_convergence_dashboard.png
-    fc2_convergence_dashboard.png
     simulated_moments_dashboard.png
   tables/
     headline_metrics_by_episode.csv
     equation_metrics_by_episode.csv
     macro_metrics_by_episode.csv
     sdf_metrics_by_episode.csv
-    fc2_metrics_by_episode.csv
+    structural_metrics_by_episode_eta.csv
+    sdf_metrics_long.csv
+    sdf_validation_log_blocks.csv
     simulated_moments_by_episode.csv
     training_log_metrics_by_episode.csv
 ```
@@ -149,6 +147,7 @@ ROBUSTNESS_CHILD_SHOCKS="32 64 128"
 MAX_SDF_PARENTS=512
 RUN_EVALUATOR_TESTS=1
 REQUIRED_COMMIT=<minimum-evaluator-commit>
+OVERWRITE=1  # required to replace a non-empty evaluator output directory
 ```
 
 The Slurm requires one GPU on partition `a01`, uses the `DL_HL` environment,
@@ -157,8 +156,10 @@ performs CUDA and syntax/test preflight checks, and invokes only
 
 ## Known unavailable fields
 
-- FC2 metrics are unavailable for checkpoints without `models.fc2`.
-- FC1/FC2 metrics are unavailable without an alignable macro artifact.
+- FC1 metrics are unavailable without an alignable macro artifact.
+- Missing episode-specific firm data yields `status=partial`; structural-grid
+  and common-reference SDF evaluation still run from the checkpoint and common
+  reference artifact.
 - Explicit default and investment rates remain unavailable when simulation
   data does not store realized indicators.
 - Log metrics remain unavailable when no explicit or unambiguous log exists.

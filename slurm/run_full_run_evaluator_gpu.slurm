@@ -40,6 +40,7 @@ FORWARD_CHUNK_SIZE="${FORWARD_CHUNK_SIZE:-8192}"
 BP_TEACHER_MARGIN_TOL="${BP_TEACHER_MARGIN_TOL:-1e-8}"
 RUN_EVALUATOR_TESTS="${RUN_EVALUATOR_TESTS:-1}"
 ALLOW_DIRTY_WORKTREE="${ALLOW_DIRTY_WORKTREE:-0}"
+OVERWRITE="${OVERWRITE:-0}"
 REQUIRED_COMMIT="${REQUIRED_COMMIT:-}"
 
 mkdir -p "$LOG_DIR" "$OUTPUT_DIR" "$WORK_ROOT/.mplcache"
@@ -66,6 +67,7 @@ echo "Episodes: ${EPISODES:-auto}"
 echo "Training log: ${TRAINING_LOG:-auto/unavailable}"
 echo "Device: $DEVICE"
 echo "Child shocks: primary=$N_CHILD_SHOCKS robustness=$ROBUSTNESS_CHILD_SHOCKS"
+echo "Overwrite evaluator output: $OVERWRITE"
 echo "Grid: b=[$B_MIN,$B_MAX]x$B_POINTS z=[$Z_MIN,$Z_MAX]x$Z_POINTS"
 echo "============================================================"
 
@@ -128,6 +130,7 @@ ARGS+=(--robustness-child-shocks "${ROBUSTNESS_ARGS[@]}" --eta-values "${ETA_ARG
 [[ -n "$REFERENCE_FIRM_DATA" ]] && ARGS+=(--reference-firm-data "$REFERENCE_FIRM_DATA")
 [[ -n "$REFERENCE_MACRO_DATA" ]] && ARGS+=(--reference-macro-data "$REFERENCE_MACRO_DATA")
 [[ "$ALLOW_DIRTY_WORKTREE" == "1" ]] && ARGS+=(--allow-dirty-worktree)
+[[ "$OVERWRITE" == "1" ]] && ARGS+=(--overwrite)
 
 python3 -u experiments/evaluate_full_run.py "${ARGS[@]}"
 

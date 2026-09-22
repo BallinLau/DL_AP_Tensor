@@ -126,12 +126,7 @@ def evaluate_bellman_residuals(
         p_child_pi = _forward_fields(
             model, child_pi.reshape(-1, state_dim), ("P",), chunk_size=chunk_size
         )["P"].reshape(n_parent, n_child, 1)
-        m_used = torch.stack(transition.m_used_list, dim=1)
         weights = transition.branch_weights.unsqueeze(-1)
-        continuation0 = (weights * m_used * p_child_p0).sum(dim=1)
-        continuationi = float(economic_config.G) * (weights * m_used * p_child_pi).sum(dim=1)
-        r0 = p0 - cf0 - continuation0
-        ri = pi - cfi - continuationi
         # Match Episode._compute_q_bellman_signed_residuals exactly: Qsp is
         # evaluated at issue debt b / (bar_i * (G - 1) + 1), while child x/z,
         # default and the configured train-M semantics remain branch specific.
@@ -158,54 +153,100 @@ def evaluate_bellman_residuals(
             bar_zsp = torch.zeros_like(qsp)
         x_child = q_child_states[..., 4:5]
         z_child = q_child_states[..., 1:2]
-        q_components = compute_q_survival_recovery_components(
-            Q=q.unsqueeze(1),
-            b=parent[:, 0:1].unsqueeze(1),
-            bar_i=bar_i.unsqueeze(1),
-            M=m_used,
-            Qsp=qsp,
-            bar_z=bar_zsp,
-            x_child=x_child,
-            z_child=z_child,
-            g=float(economic_config.G),
-            delta=float(economic_config.DELTA),
-            phi=float(economic_config.PHI),
-        )
-        rq_branch = q_components["q_training_residual"]
-        rq = (weights * rq_branch).sum(dim=1)
-        q_target = (weights * q_components["q_target_total"]).sum(dim=1)
-        q_scale = torch.maximum(q.abs(), q_target.abs()).clamp_min(1e-8)
+        def residuals_for_m(m_values: torch.Tensor) -> Dict[str, torch.Tensor]:
+            continuation0 = (weights * m_values * p_child_p0).sum(dim=1)
+            continuationi = float(economic_config.G) * (
+                weights * m_values * p_child_pi
+            ).sum(dim=1)
+            q_components = compute_q_survival_recovery_components(
+                Q=q.unsqueeze(1),
+                b=parent[:, 0:1].unsqueeze(1),
+                bar_i=bar_i.unsqueeze(1),
+                M=m_values,
+                Qsp=qsp,
+                bar_z=bar_zsp,
+                x_child=x_child,
+                z_child=z_child,
+                g=float(economic_config.G),
+                delta=float(economic_config.DELTA),
+                phi=float(economic_config.PHI),
+            )
+            q_target = (weights * q_components["q_target_total"]).sum(dim=1)
+            return {
+                "r0": p0 - cf0 - continuation0,
+                "ri": pi - cfi - continuationi,
+                "rq": (weights * q_components["q_training_residual"]).sum(dim=1),
+                "q_target": q_target,
+                "continuation0": continuation0,
+                "continuationi": continuationi,
+            }
+
+        train_m = residuals_for_m(torch.stack(transition.m_used_list, dim=1))
+        raw_m = residuals_for_m(torch.stack(transition.m_raw_list, dim=1))
         scale_fn = getattr(model, "equity_value_scale", None)
-        scale = scale_fn(parent) if callable(scale_fn) else torch.ones_like(r0)
+        scale = scale_fn(parent) if callable(scale_fn) else torch.ones_like(train_m["r0"])
 
     def surface(value: torch.Tensor) -> np.ndarray:
         return value.detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
 
-    surfaces = {
-        "R0_signed": surface(r0),
-        "abs_R0": surface(r0.abs()),
-        "RI_signed": surface(ri),
-        "abs_RI": surface(ri.abs()),
-        "R0_scale_normalized": surface(r0 / scale.clamp_min(1e-12)),
-        "RI_scale_normalized": surface(ri / scale.clamp_min(1e-12)),
-        "RQ_signed": surface(rq),
-        "abs_RQ": surface(rq.abs()),
-        "RQ_scale_normalized": surface(rq / q_scale),
-        "abs_RQ_scale_normalized": surface((rq / q_scale).abs()),
-        "Q_target": surface(q_target),
+    surfaces: Dict[str, np.ndarray] = {
         "CF0": surface(cf0),
         "CFI": surface(cfi),
-        "continuation_P0": surface(continuation0),
-        "continuation_PI": surface(continuationi),
+        "continuation_P0": surface(train_m["continuation0"]),
+        "continuation_PI": surface(train_m["continuationi"]),
     }
+    for label, values in (("trainM", train_m), ("rawM", raw_m)):
+        q_scale = torch.maximum(q.abs(), values["q_target"].abs()).clamp_min(1e-8)
+        surfaces.update({
+            f"R0_{label}_signed": surface(values["r0"]),
+            f"abs_R0_{label}": surface(values["r0"].abs()),
+            f"RI_{label}_signed": surface(values["ri"]),
+            f"abs_RI_{label}": surface(values["ri"].abs()),
+            f"R0_{label}_scale_normalized": surface(values["r0"] / scale.clamp_min(1e-12)),
+            f"RI_{label}_scale_normalized": surface(values["ri"] / scale.clamp_min(1e-12)),
+            f"RQ_{label}_signed": surface(values["rq"]),
+            f"abs_RQ_{label}": surface(values["rq"].abs()),
+            f"RQ_{label}_scale_normalized": surface(values["rq"] / q_scale),
+            f"abs_RQ_{label}_scale_normalized": surface((values["rq"] / q_scale).abs()),
+            f"Q_target_{label}": surface(values["q_target"]),
+        })
+    # Backward-compatible canonical files and fields retain training-M semantics.
+    surfaces.update({
+        "R0_signed": surfaces["R0_trainM_signed"],
+        "abs_R0": surfaces["abs_R0_trainM"],
+        "RI_signed": surfaces["RI_trainM_signed"],
+        "abs_RI": surfaces["abs_RI_trainM"],
+        "R0_scale_normalized": surfaces["R0_trainM_scale_normalized"],
+        "RI_scale_normalized": surfaces["RI_trainM_scale_normalized"],
+        "RQ_signed": surfaces["RQ_trainM_signed"],
+        "abs_RQ": surfaces["abs_RQ_trainM"],
+        "RQ_scale_normalized": surfaces["RQ_trainM_scale_normalized"],
+        "abs_RQ_scale_normalized": surfaces["abs_RQ_trainM_scale_normalized"],
+        "Q_target": surfaces["Q_target_trainM"],
+    })
     summary: Dict[str, float] = {}
     for prefix, values in (
-        ("p0_residual", surfaces["R0_signed"]),
-        ("pi_residual", surfaces["RI_signed"]),
-        ("q_residual", surfaces["RQ_signed"]),
-        ("q_residual_normalized", surfaces["RQ_scale_normalized"]),
+        ("p0_trainM_residual", surfaces["R0_trainM_signed"]),
+        ("pi_trainM_residual", surfaces["RI_trainM_signed"]),
+        ("q_trainM_residual", surfaces["RQ_trainM_signed"]),
+        ("p0_rawM_residual", surfaces["R0_rawM_signed"]),
+        ("pi_rawM_residual", surfaces["RI_rawM_signed"]),
+        ("q_rawM_residual", surfaces["RQ_rawM_signed"]),
+        ("p0_trainM_residual_normalized", surfaces["R0_trainM_scale_normalized"]),
+        ("pi_trainM_residual_normalized", surfaces["RI_trainM_scale_normalized"]),
+        ("q_trainM_residual_normalized", surfaces["RQ_trainM_scale_normalized"]),
+        ("p0_rawM_residual_normalized", surfaces["R0_rawM_scale_normalized"]),
+        ("pi_rawM_residual_normalized", surfaces["RI_rawM_scale_normalized"]),
+        ("q_rawM_residual_normalized", surfaces["RQ_rawM_scale_normalized"]),
     ):
         summary.update({f"{prefix}_{key}": value for key, value in residual_statistics(values).items()})
+    for equation in ("p0", "pi", "q"):
+        for key, value in residual_statistics(
+            surfaces[{"p0": "R0_trainM_signed", "pi": "RI_trainM_signed", "q": "RQ_trainM_signed"}[equation]]
+        ).items():
+            summary[f"{equation}_residual_{key}"] = value
+    for key, value in residual_statistics(surfaces["RQ_trainM_scale_normalized"]).items():
+        summary[f"q_residual_normalized_{key}"] = value
     return surfaces, summary
 
 

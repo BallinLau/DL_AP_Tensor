@@ -10,17 +10,30 @@ import torch
 
 from analysis.economic_config import AnalysisEconomicConfig
 from evaluation.bellman_diagnostics import evaluate_bellman_residuals
-from evaluation.bp_diagnostics import FrozenTransitionData
+from analysis.convergence_transition import ConvergenceShockBank
+from evaluation.bp_diagnostics import (
+    FrozenTransitionData,
+    _shock_bank_hash,
+    build_frozen_transition_data,
+)
 from evaluation.full_run_diagnostics import (
     conditional_residual_summary,
     evaluate_fc1_checkpoint,
-    evaluate_fc2_checkpoint,
     evaluate_sdf_heldout,
     model_state_hash,
+    namespace_sdf_summary,
+    parse_sdf_validation_log_blocks,
     parse_training_log,
+    select_primary_sdf_validation_blocks,
 )
 from evaluation.grids import FrozenFirmGrid, ReferenceFirmState, build_frozen_grid
-from experiments.evaluate_full_run import _discover_checkpoints
+from experiments.evaluate_full_run import (
+    HEADLINE_COLUMNS,
+    _discover_checkpoints,
+    _prepare_output_directory,
+    _sample_parent_tensors,
+)
+import experiments.evaluate_full_run as full_run_module
 
 
 def _reference() -> ReferenceFirmState:
@@ -31,11 +44,15 @@ def _reference() -> ReferenceFirmState:
     )
 
 
-def _transition(grid, *, m=1.0) -> FrozenTransitionData:
+def _transition(grid, *, m=1.0, raw_m=None) -> FrozenTransitionData:
     children = [grid.base_states.clone(), grid.base_states.clone()]
-    values = [torch.full((len(grid.base_states), 1), m) for _ in children]
+    used_values = [torch.full((len(grid.base_states), 1), m) for _ in children]
+    raw_values = [
+        torch.full((len(grid.base_states), 1), raw_m if raw_m is not None else m)
+        for _ in children
+    ]
     return FrozenTransitionData(
-        children=children, m_raw_list=values, m_used_list=values,
+        children=children, m_raw_list=raw_values, m_used_list=used_values,
         branch_weights=torch.full((len(grid.base_states), 2), 0.5), metadata={},
     )
 
@@ -80,6 +97,22 @@ def test_formal_q_residual_zero_and_known_bias():
     )
     np.testing.assert_allclose(biased_surfaces["RQ_signed"], -0.125)
     np.testing.assert_allclose(biased_surfaces["abs_RQ"], 0.125)
+
+
+def test_raw_m_and_train_m_residuals_are_distinct_and_aliases_use_train_m():
+    state = torch.tensor([[0.0, 0.0, 1.0, 0.2, -2.0, -2.1, 4.0]])
+    grid = FrozenFirmGrid(
+        b_values=np.array([0.0]), z_values=np.array([0.0]),
+        mesh_b=np.array([[0.0]]), mesh_z=np.array([[0.0]]), base_states=state,
+    )
+    surfaces, summary = evaluate_bellman_residuals(
+        QDiagnosticModel(0.25), grid, _transition(grid, m=0.5, raw_m=1.0),
+        AnalysisEconomicConfig.from_current_config(),
+    )
+    np.testing.assert_allclose(surfaces["RQ_trainM_signed"], -0.125)
+    np.testing.assert_allclose(surfaces["RQ_rawM_signed"], 0.0)
+    np.testing.assert_allclose(surfaces["RQ_signed"], surfaces["RQ_trainM_signed"])
+    assert summary["q_residual_abs_mean"] == summary["q_trainM_residual_abs_mean"]
 
 
 def test_conditional_moment_summary_matches_manual_u_statistic():
@@ -129,7 +162,33 @@ def test_sdf_heldout_is_nested_and_read_only():
     assert result2["sdf_normalized_n_children"] == 2
     assert result4["sdf_normalized_n_children"] == 4
     assert meta2["shock_bank_max_children"] == meta4["shock_bank_max_children"] == 4
+    assert meta2["shock_bank_sha256"] == meta4["shock_bank_sha256"]
     assert model_state_hash(model) == before
+
+
+class NonfiniteSDF(StableSDF):
+    def forward_step(self, *args, **kwargs):
+        result = list(super().forward_step(*args, **kwargs))
+        result[1][0, 0, 0] = float("nan")
+        return tuple(result)
+
+
+def test_sdf_valid_parent_ratio_reports_filtered_nonfinite_parent():
+    parents = torch.tensor([
+        [0.2, -0.2, 1.0, 0.2, -2.0, -2.1, 4.0],
+        [0.4, 0.2, 0.0, 0.3, -1.9, -2.0, 4.1],
+    ])
+    summary, _ = evaluate_sdf_heldout(
+        NonfiniteSDF(), parents, hatc_cal=torch.full((2, 1), -2.0),
+        lnk_cal=torch.full((2, 1), 4.1),
+        economic_config=AnalysisEconomicConfig.from_current_config(),
+        n_children=2, seed=7,
+    )
+    assert summary["sdf_n_parents_requested"] == 2
+    assert summary["sdf_n_parents_valid"] == 1
+    assert summary["sdf_valid_parent_ratio"] == pytest.approx(0.5)
+    scoped = namespace_sdf_summary(summary, scope="common")
+    assert scoped["sdf_common_valid_parent_ratio"] == pytest.approx(0.5)
 
 
 class ExactFC1(torch.nn.Module):
@@ -197,42 +256,161 @@ def test_training_log_parser_handles_repeated_scientific_boolean_and_nonfinite(t
     assert metadata["nonfinite_values_recorded_as_nan"] == 2
 
 
-class ConstantFC2(torch.nn.Module):
-    quantile_num = 2
 
-    def forward(self, phi):
-        value = torch.zeros((phi.shape[0], 1), device=phi.device)
-        return {"hatc": value, "lnk": value}
+def test_sdf_validation_parser_preserves_arrow_values_and_repeated_blocks(tmp_path):
+    log = tmp_path / "train.out"
+    log.write_text(
+        "Episode 2 SDF_TRUE_ONLY\n"
+        "SDF validation | safe_to_continue=True stage_progress=True converged=False "
+        "normalized_mean=1.2e-2->4.0e-3 normalized_t=30->12 "
+        "max_constraint_violation=3e-2->1e-2 result=CONTINUE\n"
+        "SDF validation | safe_to_continue=True stage_progress=False converged=False "
+        "normalized_mean=4e-3->3e-3 normalized_t=12->10 "
+        "max_constraint_violation=1e-2->9e-3 result=RETRY\n",
+        encoding="utf-8",
+    )
+    blocks, metadata = parse_sdf_validation_log_blocks(log)
+    assert len(blocks) == 2
+    assert blocks.iloc[0]["normalized_mean_before"] == pytest.approx(0.012)
+    assert blocks.iloc[0]["normalized_mean_after"] == pytest.approx(0.004)
+    assert blocks.iloc[0]["constraint_after"] == pytest.approx(0.01)
+    assert list(blocks["occurrence"]) == [1, 2]
+    primary, selection = select_primary_sdf_validation_blocks(blocks)
+    assert primary.empty
+    assert selection["ambiguous_episodes"] == [2]
+    assert metadata["n_blocks"] == 2
 
 
-class ConstantPolicy(torch.nn.Module):
-    def forward(self, states):
-        zeros = torch.zeros_like(states[:, :1])
-        return {"bar_i": zeros, "bar_z": zeros}
+def test_full_run_schema_has_no_fc2_and_output_overwrite_is_explicit(tmp_path):
+    assert not any("fc2" in name.lower() for name in HEADLINE_COLUMNS)
+    output = tmp_path / "evaluation"
+    output.mkdir()
+    (output / "stale.txt").write_text("stale", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="non-empty"):
+        _prepare_output_directory(output, overwrite=False)
+    _prepare_output_directory(output, overwrite=True)
+    assert list(output.iterdir()) == []
 
 
-def test_fc2_checkpoint_uses_formal_resource_accounting():
-    rows = []
-    for branch in (-1, 0, 1):
-        for position in range(4):
-            rows.append({
-                "path": 0, "t": 0, "branch": branch,
-                "b": 0.1 * (position + 1), "z": -0.2 + 0.1 * position,
-                "ETA": float(position % 2), "i": 0.1 * (position + 1),
-                "x": -2.0, "Hatcf": -2.0, "LnKF": 4.0, "K": 1.0,
-            })
-    firm = pd.DataFrame(rows)
-    summary, nodes = evaluate_fc2_checkpoint(
-        ConstantFC2(), ConstantPolicy(), firm,
-        pd.DataFrame({"path": [0], "t": [0], "Hatc": [-2.0], "LnK": [4.0]}),
-        device=torch.device("cpu"),
+def test_common_parent_bank_is_deterministic_and_ondist_bank_can_differ(tmp_path):
+    def write_firm(path, offset):
+        pd.DataFrame([
+            {
+                "path": 0, "t": index, "branch": -1, "b": 0.1 * index + offset,
+                "z": -0.2 + index, "ETA": index % 2, "i": 0.1,
+                "x": -2.0, "Hatcf": -2.1, "LnKF": 4.0,
+                "hatc_cal": -2.0, "lnk_cal": 4.1,
+            }
+            for index in range(4)
+        ]).to_pickle(path)
+
+    common_path = tmp_path / "common.pkl"
+    ondist_path = tmp_path / "ondist.pkl"
+    write_firm(common_path, 0.0)
+    write_firm(ondist_path, 0.3)
+    common_a = _sample_parent_tensors(
+        common_path, None, device=torch.device("cpu"), max_parents=3
+    )[-1]
+    common_b = _sample_parent_tensors(
+        common_path, None, device=torch.device("cpu"), max_parents=3
+    )[-1]
+    ondist = _sample_parent_tensors(
+        ondist_path, None, device=torch.device("cpu"), max_parents=3
+    )[-1]
+    assert common_a["parent_bank_sha256"] == common_b["parent_bank_sha256"]
+    assert common_a["selected_row_indices"] == common_b["selected_row_indices"]
+    assert common_a["parent_bank_sha256"] != ondist["parent_bank_sha256"]
+
+
+def test_actual_shock_bank_hash_uses_tensor_contents():
+    bank = ConvergenceShockBank.create(
+        3, 4, seed=19, device=torch.device("cpu"), dtype=torch.float32
+    )
+    same = ConvergenceShockBank.create(
+        3, 4, seed=19, device=torch.device("cpu"), dtype=torch.float32
+    )
+    different = ConvergenceShockBank.create(
+        3, 4, seed=20, device=torch.device("cpu"), dtype=torch.float32
+    )
+    assert _shock_bank_hash(bank) == _shock_bank_hash(same)
+    assert _shock_bank_hash(bank) != _shock_bank_hash(different)
+    parents = torch.tensor([
+        [0.2, -0.2, 1.0, 0.2, -2.0, -2.1, 4.0],
+        [0.4, 0.2, 0.0, 0.3, -1.9, -2.0, 4.1],
+    ])
+    transition = build_frozen_transition_data(
+        StableSDF(), parents, _reference(),
+        SimpleNamespace(
+            pv_use_clipped_m=True, pv_m_clamp_min=0.7, pv_m_clamp_max=1.3,
+            pv_exact_eta_integration_enabled=True,
+        ),
+        AnalysisEconomicConfig.from_current_config(), n_child_shocks=2,
+        shock_seed=19, shock_bank_max_child_shocks=4,
+    )
+    actual_builder_bank = ConvergenceShockBank.create(
+        1, 4, seed=19, device=torch.device("cpu"), dtype=parents.dtype
+    )
+    assert transition.metadata["shock_bank_sha256"] == _shock_bank_hash(actual_builder_bank)
+
+
+def test_checkpoint_without_episode_firm_still_runs_structural_and_common_sdf(
+    tmp_path, monkeypatch,
+):
+    run_root = tmp_path / "run"
+    checkpoint_dir = run_root / "checkpoints_analysis"
+    checkpoint_dir.mkdir(parents=True)
+    checkpoint = checkpoint_dir / "ep0_combined.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    reference = tmp_path / "reference.pkl"
+    pd.DataFrame([
+        {
+            "path": 0, "t": index, "branch": -1, "b": 0.1 * index,
+            "z": -0.2 + index, "ETA": index % 2, "i": 0.1,
+            "x": -2.0, "Hatcf": -2.1, "LnKF": 4.0,
+            "hatc_cal": -2.0, "lnk_cal": 4.1,
+        }
+        for index in range(3)
+    ]).to_pickle(reference)
+    output = tmp_path / "evaluation"
+
+    def fake_matrix(args):
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        for eta in (0, 1):
+            eta_dir = args.output_dir / f"eta{eta}"
+            eta_dir.mkdir()
+            (eta_dir / "metadata.json").write_text("{}", encoding="utf-8")
+        return pd.DataFrame([{
+            "eta_parent": 1.0, "n_child_shocks": 2,
+            "p0_residual_abs_mean": 0.1, "pi_residual_abs_mean": 0.2,
+            "q_residual_abs_mean": 0.3,
+        }]), {"reference_transition_bank": {"shock_bank_sha256": "actual"}}
+
+    loaded = SimpleNamespace(
+        models={"policy_value": QDiagnosticModel(0.25), "sdf_fc1": StableSDF()},
+        metadata={"loaded_model_keys": ["policy_value", "sdf_fc1"]},
+        hyperparams=SimpleNamespace(sdf_normalized_logr_clip=20.0),
         economic_config=AnalysisEconomicConfig.from_current_config(),
     )
-    assert summary["fc2_n_nodes"] == 3
-    assert bool(summary["fc2_transition_consistency_available"]) is True
-    assert summary["fc2_resource_residual_abs_max"] == pytest.approx(0.0, abs=1e-7)
-    assert summary["fc2_resource_residual_relative_abs_mean"] == pytest.approx(0.0, abs=1e-7)
-    assert nodes.loc[0, "consumption_finite_ratio"] == pytest.approx(1.0)
+    monkeypatch.setattr(full_run_module, "evaluate_matrix", fake_matrix)
+    monkeypatch.setattr(full_run_module, "load_analysis_checkpoint", lambda *a, **k: loaded)
+    monkeypatch.setattr(full_run_module, "discover_episode_firm_data", lambda root: ({}, []))
+    monkeypatch.setattr(full_run_module, "_git", lambda args: "")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "evaluate_full_run.py", "--run-root", str(run_root),
+            "--reference-firm-data", str(reference), "--output-dir", str(output),
+            "--device", "cpu", "--episodes", "0", "--n-child-shocks", "2",
+            "--robustness-child-shocks", "2", "--max-sdf-parents", "2",
+            "--b-points", "2", "--z-points", "2", "--i-points", "2",
+        ],
+    )
+    full_run_module.main()
+    headline = pd.read_csv(output / "headline_metrics.csv")
+    assert headline.loc[0, "status"] == "partial"
+    assert headline.loc[0, "p0_residual_abs_mean"] == pytest.approx(0.1)
+    assert np.isfinite(headline.loc[0, "sdf_common_conditional_abs_mean"])
+    assert not (output / "episodes" / "ep0" / "fc2").exists()
 
 
 def test_checkpoint_discovery_preserves_missing_episode(tmp_path):

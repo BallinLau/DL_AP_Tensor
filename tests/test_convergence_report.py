@@ -144,7 +144,8 @@ def test_synthetic_cross_episode_report_writes_nonempty_csvs_and_plots(tmp_path)
             eta_dir.mkdir()
             (eta_dir / "metadata.json").write_text(json.dumps(eta_metadata), encoding="utf-8")
             for relative in (
-                "q/Q.csv", "value/P.csv", "default/bar_z.csv", "bp/bp_raw.csv",
+                "q/Q.csv", "value/P.csv", "value/P0.csv", "value/PI_mid.csv",
+                "default/bar_z.csv", "bp/bp_raw.csv",
                 "bellman/R0_signed.csv", "bellman/RI_signed.csv",
             ):
                 _write_surface(eta_dir / relative, offset)
@@ -179,7 +180,7 @@ def test_synthetic_cross_episode_report_writes_nonempty_csvs_and_plots(tmp_path)
     assert result.returncode == 0, result.stderr
     drift = pd.read_csv(output / "function_drift" / "eta0_function_drift.csv")
     assert not drift.empty
-    assert set(drift["surface"]) == {"Q", "P", "bar_z", "bp"}
+    assert set(drift["surface"]) == {"Q", "P", "P0", "PI", "bar_z", "bp"}
     assert (output / "function_drift" / "function_drift_dashboard.png").is_file()
     bellman = pd.read_csv(output / "bellman_convergence" / "bellman_residual_by_episode.csv")
     assert not bellman.empty

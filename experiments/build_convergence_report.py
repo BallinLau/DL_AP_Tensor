@@ -51,6 +51,8 @@ from evaluation.convergence_plots import (  # noqa: E402
 SURFACE_PATHS = {
     "Q": Path("q/Q.csv"),
     "P": Path("value/P.csv"),
+    "P0": Path("value/P0.csv"),
+    "PI": Path("value/PI_mid.csv"),
     "bar_z": Path("default/bar_z.csv"),
     "bp": Path("bp/bp_raw.csv"),
 }
