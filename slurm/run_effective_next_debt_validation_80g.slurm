@@ -134,8 +134,8 @@ if merged.empty:
     raise SystemExit("transition check failed: no parent/main-child matches found")
 
 expected = (
-    merged["ETA_child"] * merged["bp_parent"]
-    + (1.0 - merged["ETA_child"]) * merged["b_parent"]
+    merged["ETA_parent"] * merged["bp_parent"]
+    + (1.0 - merged["ETA_parent"]) * merged["b_parent"]
 )
 max_identity_error = (merged["b_next_policy_parent"] - expected).abs().max()
 print(f"max_identity_error={max_identity_error:.12g}")
@@ -155,7 +155,7 @@ if not max_transition_error < tol:
 
 print("Tiny simulation smoke passed.")
 print(f"firm_rows={len(df_firm)} macro_rows={len(df_macro)}")
-print("Verified b_child = eta_child * bp_parent + (1 - eta_child) * b_parent.")
+print("Verified b_child = eta_parent * bp_parent + (1 - eta_parent) * b_parent.")
 PY
 
 echo "[5/5] Final acceptance summary"
