@@ -482,8 +482,14 @@ def _one_step_frame(model: torch.nn.Module, frame: pd.DataFrame, device: torch.d
         _, _, _, hatc_pred, lnk_pred = model.forward_step(
             tensor("x"), tensor("x_next"), tensor("hatc_cal"), tensor("lnk_cal")
         )
-    paired["hatc_pred"] = hatc_pred.detach().cpu().reshape(-1).numpy()
-    paired["lnk_pred"] = lnk_pred.detach().cpu().reshape(-1).numpy()
+    # Evaluator-generated forecasts always use dedicated ``*_eval`` names so we
+    # can never collide with (or silently duplicate) artifact columns such as
+    # Hatcf / LnKF that may already be present in the macro frame.
+    for column in ("hatc_pred_eval", "lnk_pred_eval"):
+        if column in paired.columns:
+            paired = paired.drop(columns=column)
+    paired["hatc_pred_eval"] = hatc_pred.detach().cpu().reshape(-1).numpy()
+    paired["lnk_pred_eval"] = lnk_pred.detach().cpu().reshape(-1).numpy()
     return paired
 
 
@@ -498,10 +504,17 @@ def evaluate_fc1_checkpoint(
     paired = _one_step_frame(model, macro_frame, device)
     summary: Dict[str, float] = {}
     for name in ("hatc", "lnk"):
-        metrics = regression_metrics(paired[f"{name}_target"], paired[f"{name}_pred"])
+        forecast_col = f"{name}_pred_eval"
+        target_col = f"{name}_target"
+        metrics = regression_metrics(
+            paired[target_col],
+            paired[forecast_col],
+            calculated_name=target_col,
+            forecast_name=forecast_col,
+        )
         summary.update({f"fc1_{name}_{key}": value for key, value in metrics.items()})
         persistence_rmse = float(np.sqrt(np.mean(np.square(
-            paired[f"{name}_target"].to_numpy() - paired[f"{name}_cal"].to_numpy()
+            paired[target_col].to_numpy() - paired[f"{name}_cal"].to_numpy()
         ))))
         summary[f"fc1_{name}_persistence_rmse"] = persistence_rmse
         summary[f"fc1_{name}_persistence_skill"] = (
@@ -510,18 +523,22 @@ def evaluate_fc1_checkpoint(
         )
 
     timing_rows = []
-    timing_source = paired.rename(columns={"hatc_pred": "Hatcf", "lnk_pred": "LnKF"})
-    for name, forecast, calculated in (
-        ("hatc", "Hatcf", "hatc_target"), ("lnk", "LnKF", "lnk_target")
-    ):
+    for name in ("hatc", "lnk"):
+        forecast_col = f"{name}_pred_eval"
+        target_col = f"{name}_target"
         # Targets in paired are already t+1. Treat that alignment as shift 0.
-        base = timing_source[["path", "t", forecast, calculated]].copy()
+        base = paired[["path", "t", forecast_col, target_col]].copy()
         for shift in shifts:
-            target = base[["path", "t", calculated]].copy()
-            target["t"] -= int(shift)
-            target = target.rename(columns={calculated: "target_shifted"})
+            target = base[["path", "t", target_col]].copy()
+            target["t"] = target["t"] - int(shift)
+            target = target.rename(columns={target_col: "target_shifted"})
             aligned = base.merge(target, on=["path", "t"], how="inner")
-            metrics = regression_metrics(aligned["target_shifted"], aligned[forecast])
+            metrics = regression_metrics(
+                aligned["target_shifted"],
+                aligned[forecast_col],
+                calculated_name="target_shifted",
+                forecast_name=forecast_col,
+            )
             timing_rows.append({"variable": name, "shift": int(shift), **metrics})
     timing = pd.DataFrame(timing_rows)
     for name in ("hatc", "lnk"):

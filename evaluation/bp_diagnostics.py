@@ -466,6 +466,164 @@ def _objective_frame(result: Dict[str, torch.Tensor], pos: int) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+def _objective_positions(grid: FrozenFirmGrid) -> Dict[str, int]:
+    return {
+        "b_low_z_low": 0,
+        "b_low_z_mid": len(grid.z_values) // 2,
+        "b_low_z_high": len(grid.z_values) - 1,
+        "b_mid_z_low": (len(grid.b_values) // 2) * len(grid.z_values),
+        "b_mid_z_mid": (len(grid.b_values) // 2) * len(grid.z_values) + len(grid.z_values) // 2,
+        "b_mid_z_high": (len(grid.b_values) // 2 + 1) * len(grid.z_values) - 1,
+        "b_high_z_low": (len(grid.b_values) - 1) * len(grid.z_values),
+        "b_high_z_mid": (len(grid.b_values) - 1) * len(grid.z_values) + len(grid.z_values) // 2,
+        "b_high_z_high": len(grid.b_values) * len(grid.z_values) - 1,
+    }
+
+
+def write_bp_objective_slices(
+    results: Dict[str, Dict[str, torch.Tensor]],
+    grid: FrozenFirmGrid,
+    output_dir: str | Path,
+) -> None:
+    """Write the detailed p0/pi_mid objective-slice CSV/PNG pair for one J case."""
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    positions = _objective_positions(grid)
+    for branch_label in ("p0", "pi_mid"):
+        if branch_label not in results:
+            continue
+        for state_label, pos in positions.items():
+            frame = _objective_frame(results[branch_label], pos)
+            stem = f"{branch_label}_{state_label}"
+            frame.to_csv(output / f"{stem}.csv", index=False)
+            plot_objective_slice(frame, output / f"{stem}.png", title=stem)
+
+
+def _summarize_bp_branch(
+    *,
+    label: str,
+    result: Dict[str, torch.Tensor],
+    bp_pred: torch.Tensor,
+    phat: torch.Tensor,
+    grid: FrozenFirmGrid,
+    teacher_margin_tol: float,
+    surfaces: Dict[str, np.ndarray],
+    summary: Dict[str, float],
+) -> None:
+    """Add one branch's surfaces and summary statistics (shared by every BP path)."""
+    shape = grid.shape
+    pred = bp_pred.detach().cpu().reshape(shape).numpy().astype(np.float64)
+    star = result["bp_star"].detach().cpu().reshape(shape).numpy().astype(np.float64)
+    phat_values = phat.detach().cpu().reshape(shape).numpy().astype(np.float64)
+    survival_mask = np.isfinite(phat_values) & (phat_values > 0.0)
+    top2_margin = (
+        result["top2_margin"].detach().cpu().reshape(shape).numpy().astype(np.float64)
+    )
+    confidence = (
+        result["confidence"].detach().cpu().reshape(shape).numpy().astype(np.float64)
+    )
+    regret = result["regret"].detach().cpu().reshape(shape).numpy().astype(np.float64)
+    identified_mask = np.isfinite(top2_margin) & (top2_margin > float(teacher_margin_tol))
+    primary_mask = survival_mask & identified_mask
+    gap = np.abs(pred - star)
+    surfaces[f"{label}_bp_pred_raw"] = pred
+    surfaces[f"{label}_bp_grid_star_raw"] = star
+    surfaces[f"{label}_bp_abs_gap_raw"] = gap
+    surfaces[f"{label}_teacher_top2_margin_raw"] = top2_margin
+    surfaces[f"{label}_teacher_confidence_raw"] = confidence
+    surfaces[f"{label}_teacher_identified_raw"] = identified_mask.astype(np.float64)
+    surfaces[f"{label}_bp_regret_raw"] = regret
+    surfaces[f"{label}_bp_pred_survival"] = np.where(survival_mask, pred, np.nan)
+    surfaces[f"{label}_bp_grid_star_survival"] = np.where(survival_mask, star, np.nan)
+    surfaces[f"{label}_bp_abs_gap_survival"] = np.where(survival_mask, gap, np.nan)
+    surfaces[f"{label}_bp_regret_survival"] = np.where(survival_mask, regret, np.nan)
+    surfaces[f"{label}_bp_pred_survival_identified"] = np.where(primary_mask, pred, np.nan)
+    surfaces[f"{label}_bp_grid_star_survival_identified"] = np.where(primary_mask, star, np.nan)
+    surfaces[f"{label}_bp_abs_gap_survival_identified"] = np.where(primary_mask, gap, np.nan)
+    surfaces[f"{label}_bp_regret_survival_identified"] = np.where(primary_mask, regret, np.nan)
+    summary.update(
+        _summary(
+            label,
+            pred,
+            star,
+            survival_mask,
+            identified_mask,
+            regret=regret,
+            top2_margin=top2_margin,
+            margin_tol=teacher_margin_tol,
+        )
+    )
+    for component, key in (
+        ("cashflow", "coarse_cashflow_grid_mean"),
+        ("continuation", "coarse_continuation_grid_mean"),
+        ("value", "coarse_value_grid"),
+        ("q_issue", "coarse_q_issue_grid"),
+        ("p_child_mean", "coarse_p_child_grid_mean"),
+        ("default_mean", "coarse_default_grid_mean"),
+    ):
+        candidate_values = result[key].detach().cpu().numpy().astype(np.float64)
+        candidate_range = np.nanmax(candidate_values, axis=1) - np.nanmin(candidate_values, axis=1)
+        summary[f"{label}_{component}_candidate_range_mean"] = float(
+            np.nanmean(candidate_range)
+        )
+    coarse_argmax = result["coarse_value_grid"].argmax(dim=1, keepdim=True)
+    coarse_continuation_at_star = torch.gather(
+        result["coarse_continuation_grid_mean"], 1, coarse_argmax
+    )
+    summary[f"{label}_coarse_continuation_at_star_mean"] = float(
+        coarse_continuation_at_star.detach().float().mean().item()
+    )
+    summary[f"{label}_eta_next_active_share"] = float(
+        result["eta_next_active_share"].detach().float().mean().item()
+    )
+
+
+BP_EVAL_ALLOWED_EXPANDED_STATES = (65536, 131072, 262144, 524288)
+BP_EVAL_CUDA_MEMORY_TIERS = ((70.0, 262144), (35.0, 131072))
+BP_EVAL_SAFE_DEFAULT_EXPANDED_STATES = 65536
+
+
+def resolve_bp_eval_max_expanded_states(
+    explicit: int | None,
+    device: torch.device,
+) -> tuple[int, Dict[str, Any]]:
+    """Resolve the evaluator-only BP chunk budget without touching checkpoint state.
+
+    The override only changes how the read-only evaluator chunks its candidate
+    forwards; it never reaches the checkpoint hyperparameters, the training
+    semantics, or any persisted model state. An explicit value always wins; on
+    CUDA without an explicit value a conservative device-memory tier is used;
+    every other case falls back to the safe legacy default.
+    """
+    if explicit is not None:
+        value = int(explicit)
+        if value not in BP_EVAL_ALLOWED_EXPANDED_STATES:
+            raise ValueError(
+                "bp-eval-max-expanded-states must be one of "
+                f"{BP_EVAL_ALLOWED_EXPANDED_STATES}, got {value}"
+            )
+        return value, {"mode": "explicit", "requested": value, "selected": value}
+    if device.type != "cuda":
+        return BP_EVAL_SAFE_DEFAULT_EXPANDED_STATES, {
+            "mode": "cpu_safe_default",
+            "selected": BP_EVAL_SAFE_DEFAULT_EXPANDED_STATES,
+        }
+    total_gib = float(torch.cuda.get_device_properties(device).total_memory) / (1024.0 ** 3)
+    for threshold_gib, tier_value in BP_EVAL_CUDA_MEMORY_TIERS:
+        if total_gib >= threshold_gib:
+            return tier_value, {
+                "mode": "auto_cuda_memory_tier",
+                "gpu_total_memory_gib": total_gib,
+                "threshold_gib": threshold_gib,
+                "selected": tier_value,
+            }
+    return BP_EVAL_SAFE_DEFAULT_EXPANDED_STATES, {
+        "mode": "auto_cuda_small_gpu_default",
+        "gpu_total_memory_gib": total_gib,
+        "selected": BP_EVAL_SAFE_DEFAULT_EXPANDED_STATES,
+    }
+
+
 def evaluate_bp_consistency(
     model: torch.nn.Module,
     sdf_fc1_model: torch.nn.Module,
@@ -480,7 +638,9 @@ def evaluate_bp_consistency(
     teacher_margin_tol: float = 1e-8,
     transition_data: FrozenTransitionData | None = None,
     write_objective_slices: bool = True,
+    bp_eval_max_expanded_states: int | None = None,
 ) -> tuple[Dict[str, np.ndarray], Dict[str, float], Dict[str, Any]]:
+    """Legacy single-J reference path: one ``teacher.compute`` call per branch."""
     if float(teacher_margin_tol) < 0.0:
         raise ValueError("teacher_margin_tol must be non-negative")
     output = Path(output_dir)
@@ -493,7 +653,13 @@ def evaluate_bp_consistency(
     m_list = transition_data.m_used_list
     transition_metadata = dict(transition_data.metadata)
     p0_loss, pi_loss = _losses(economic_config)
-    teacher = BPGridTeacher.from_hyperparams(model, p0_loss, pi_loss, hyperparams)
+    teacher = BPGridTeacher.from_hyperparams(
+        model,
+        p0_loss,
+        pi_loss,
+        hyperparams,
+        max_expanded_states_override=bp_eval_max_expanded_states,
+    )
     branch_specs = {
         "p0": ("p0", reference.i_mid),
         "pi_low": ("pi", reference.i_low),
@@ -518,90 +684,145 @@ def evaluate_bp_consistency(
                 child_weights=transition_data.branch_weights,
             )
             results[label] = result
-            pred = bp_pred.detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
-            star = result["bp_star"].detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
-            phat = output_model.Phat.detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
-            survival_mask = np.isfinite(phat) & (phat > 0.0)
-            top2_margin = (
-                result["top2_margin"].detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
-            )
-            confidence = (
-                result["confidence"].detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
-            )
-            regret = result["regret"].detach().cpu().reshape(grid.shape).numpy().astype(np.float64)
-            identified_mask = np.isfinite(top2_margin) & (top2_margin > float(teacher_margin_tol))
-            primary_mask = survival_mask & identified_mask
-            gap = np.abs(pred - star)
-            surfaces[f"{label}_bp_pred_raw"] = pred
-            surfaces[f"{label}_bp_grid_star_raw"] = star
-            surfaces[f"{label}_bp_abs_gap_raw"] = gap
-            surfaces[f"{label}_teacher_top2_margin_raw"] = top2_margin
-            surfaces[f"{label}_teacher_confidence_raw"] = confidence
-            surfaces[f"{label}_teacher_identified_raw"] = identified_mask.astype(np.float64)
-            surfaces[f"{label}_bp_regret_raw"] = regret
-            surfaces[f"{label}_bp_pred_survival"] = np.where(survival_mask, pred, np.nan)
-            surfaces[f"{label}_bp_grid_star_survival"] = np.where(survival_mask, star, np.nan)
-            surfaces[f"{label}_bp_abs_gap_survival"] = np.where(survival_mask, gap, np.nan)
-            surfaces[f"{label}_bp_regret_survival"] = np.where(survival_mask, regret, np.nan)
-            surfaces[f"{label}_bp_pred_survival_identified"] = np.where(primary_mask, pred, np.nan)
-            surfaces[f"{label}_bp_grid_star_survival_identified"] = np.where(primary_mask, star, np.nan)
-            surfaces[f"{label}_bp_abs_gap_survival_identified"] = np.where(primary_mask, gap, np.nan)
-            surfaces[f"{label}_bp_regret_survival_identified"] = np.where(primary_mask, regret, np.nan)
-            summary.update(
-                _summary(
-                    label,
-                    pred,
-                    star,
-                    survival_mask,
-                    identified_mask,
-                    regret=regret,
-                    top2_margin=top2_margin,
-                    margin_tol=teacher_margin_tol,
-                )
-            )
-            for component, key in (
-                ("cashflow", "coarse_cashflow_grid_mean"),
-                ("continuation", "coarse_continuation_grid_mean"),
-                ("value", "coarse_value_grid"),
-                ("q_issue", "coarse_q_issue_grid"),
-                ("p_child_mean", "coarse_p_child_grid_mean"),
-                ("default_mean", "coarse_default_grid_mean"),
-            ):
-                candidate_values = result[key].detach().cpu().numpy().astype(np.float64)
-                candidate_range = np.nanmax(candidate_values, axis=1) - np.nanmin(candidate_values, axis=1)
-                summary[f"{label}_{component}_candidate_range_mean"] = float(
-                    np.nanmean(candidate_range)
-                )
-            coarse_argmax = result["coarse_value_grid"].argmax(dim=1, keepdim=True)
-            coarse_continuation_at_star = torch.gather(
-                result["coarse_continuation_grid_mean"], 1, coarse_argmax
-            )
-            summary[f"{label}_coarse_continuation_at_star_mean"] = float(
-                coarse_continuation_at_star.detach().float().mean().item()
-            )
-            summary[f"{label}_eta_next_active_share"] = float(
-                result["eta_next_active_share"].detach().float().mean().item()
+            _summarize_bp_branch(
+                label=label,
+                result=result,
+                bp_pred=bp_pred,
+                phat=output_model.Phat,
+                grid=grid,
+                teacher_margin_tol=teacher_margin_tol,
+                surfaces=surfaces,
+                summary=summary,
             )
 
-    positions = {
-        "b_low_z_low": 0,
-        "b_low_z_mid": len(grid.z_values) // 2,
-        "b_low_z_high": len(grid.z_values) - 1,
-        "b_mid_z_low": (len(grid.b_values) // 2) * len(grid.z_values),
-        "b_mid_z_mid": (len(grid.b_values) // 2) * len(grid.z_values) + len(grid.z_values) // 2,
-        "b_mid_z_high": (len(grid.b_values) // 2 + 1) * len(grid.z_values) - 1,
-        "b_high_z_low": (len(grid.b_values) - 1) * len(grid.z_values),
-        "b_high_z_mid": (len(grid.b_values) - 1) * len(grid.z_values) + len(grid.z_values) // 2,
-        "b_high_z_high": len(grid.b_values) * len(grid.z_values) - 1,
-    }
     if write_objective_slices:
-        for branch_label in ("p0", "pi_mid"):
-            for state_label, pos in positions.items():
-                frame = _objective_frame(results[branch_label], pos)
-                stem = f"{branch_label}_{state_label}"
-                frame.to_csv(output / f"{stem}.csv", index=False)
-                plot_objective_slice(frame, output / f"{stem}.png", title=stem)
+        write_bp_objective_slices(results, grid, output)
 
     transition_metadata["teacher_margin_tol"] = float(teacher_margin_tol)
     transition_metadata["primary_bp_mask"] = "finite Phat>0 and top2_margin>teacher_margin_tol"
     return surfaces, summary, transition_metadata
+
+
+def evaluate_bp_consistency_multi_j(
+    model: torch.nn.Module,
+    sdf_fc1_model: torch.nn.Module,
+    grid: FrozenFirmGrid,
+    reference: ReferenceFirmState,
+    hyperparams: HyperParams,
+    economic_config: AnalysisEconomicConfig,
+    *,
+    output_dir: str | Path,
+    j_values: list[int] | tuple[int, ...],
+    primary_j: int,
+    transition_max: FrozenTransitionData,
+    shock_seed: int = 12345,
+    teacher_margin_tol: float = 1e-8,
+    write_objective_slices: bool = True,
+    bp_eval_max_expanded_states: int | None = None,
+) -> tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
+    """Evaluate every requested J in one shared pass with identical statistics.
+
+    The largest J case supplies the children; every other J is evaluated on its
+    nested prefix of that same child set, which is exactly what
+    ``slice_frozen_transition_data`` produces. One coarse child-equity forward is
+    shared by all four branches and all J prefixes, and the coarse ``q_issue``
+    grid is shared by all J prefixes.
+    """
+    if float(teacher_margin_tol) < 0.0:
+        raise ValueError("teacher_margin_tol must be non-negative")
+    requested = sorted({int(value) for value in j_values})
+    if not requested:
+        raise ValueError("j_values must contain at least one child-shock count")
+    max_j = int(requested[-1])
+    available = int(transition_max.metadata.get("continuous_child_count", 0))
+    if max_j > available:
+        raise ValueError(
+            f"transition_max provides {available} continuous children but J={max_j} was requested"
+        )
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    p0_loss, pi_loss = _losses(economic_config)
+    teacher = BPGridTeacher.from_hyperparams(
+        model,
+        p0_loss,
+        pi_loss,
+        hyperparams,
+        max_expanded_states_override=bp_eval_max_expanded_states,
+    )
+    teacher.reset_forward_stats()
+    children_max = transition_max.stacked_children()
+    m_max = transition_max.stacked_m_used()
+    branch_specs = {
+        "p0": ("p0", reference.i_mid),
+        "pi_low": ("pi", reference.i_low),
+        "pi_mid": ("pi", reference.i_mid),
+        "pi_high": ("pi", reference.i_high),
+    }
+    labels = list(branch_specs)
+    branch_states: list[torch.Tensor] = []
+    bp_preds: list[torch.Tensor] = []
+    model_outputs: Dict[str, Any] = {}
+    with _checkpoint_economic_config(economic_config), torch.no_grad():
+        for label in labels:
+            branch, i_value = branch_specs[label]
+            states = grid.base_states.clone()
+            states[:, 3] = float(i_value)
+            output_model = model(states)
+            model_outputs[label] = output_model
+            branch_states.append(states)
+            bp_preds.append(output_model.bp0 if branch == "p0" else output_model.bpI)
+        bundles = teacher.compute_multi_j_branches(
+            branch_states,
+            children_max,
+            m_max,
+            branches=[branch_specs[label][0] for label in labels],
+            prefix_child_counts=[2 * value for value in requested],
+            child_weights=transition_max.branch_weights,
+            bp_preds=bp_preds,
+        )
+    forward_stats = teacher.forward_stats()
+    forward_stats["bp_grid_chunk_plans"] = teacher.grid_chunk_plans()
+
+    results_by_j: Dict[int, Dict[str, Any]] = {}
+    for index, j_value in enumerate(requested):
+        count = 2 * j_value
+        surfaces: Dict[str, np.ndarray] = {}
+        summary: Dict[str, float] = {}
+        results: Dict[str, Dict[str, torch.Tensor]] = {}
+        for label in labels:
+            result = bundles[index][count]
+            results[label] = result
+            _summarize_bp_branch(
+                label=label,
+                result=result,
+                bp_pred=bp_preds[labels.index(label)],
+                phat=model_outputs[label].Phat,
+                grid=grid,
+                teacher_margin_tol=teacher_margin_tol,
+                surfaces=surfaces,
+                summary=summary,
+            )
+        metadata = dict(
+            slice_frozen_transition_data(
+                transition_max, n_continuous_children=int(j_value)
+            ).metadata
+        )
+        metadata["teacher_margin_tol"] = float(teacher_margin_tol)
+        metadata["primary_bp_mask"] = "finite Phat>0 and top2_margin>teacher_margin_tol"
+        metadata["bp_multi_j_evaluation"] = {
+            "evaluated_child_counts": requested,
+            "primary_j": int(primary_j),
+            "shock_seed": int(shock_seed),
+            "coarse_equity_shared_across_branches": True,
+            "coarse_equity_shared_across_j": len(requested) > 1,
+            "fine_grid_per_branch_and_j": True,
+        }
+        results_by_j[int(j_value)] = {
+            "surfaces": surfaces,
+            "summary": summary,
+            "metadata": metadata,
+            "results": results,
+        }
+        if write_objective_slices and int(j_value) == int(primary_j):
+            write_bp_objective_slices(results, grid, output)
+    return results_by_j, forward_stats

@@ -33,6 +33,7 @@ from evaluation.full_run_diagnostics import (
     stable_config_hash,
     summarize_episode_statuses,
 )
+from evaluation.convergence_metrics import regression_metrics
 from evaluation.grids import FrozenFirmGrid, ReferenceFirmState, build_frozen_grid
 from experiments.evaluate_full_run import (
     HEADLINE_COLUMNS,
@@ -40,6 +41,7 @@ from experiments.evaluate_full_run import (
     _prepare_output_directory,
     _sample_parent_tensors,
     aggregate_episode_peak_memory,
+    canonical_bank_max_children,
     select_episode_child_counts,
 )
 import experiments.evaluate_full_run as full_run_module
@@ -610,3 +612,206 @@ def test_checkpoint_discovery_preserves_missing_episode(tmp_path):
     assert sorted(_discover_checkpoints(tmp_path)) == [0, 2]
     requested = {0, 1, 2}
     assert sorted(requested - set(_discover_checkpoints(tmp_path))) == [1]
+
+
+def test_regression_metrics_rejects_duplicate_column_selection():
+    frame = pd.DataFrame({"target": [1.0, 2.0, 3.0], "forecast": [1.0, 2.0, 3.0]})
+    duplicated = pd.concat([frame, frame[["target"]]], axis=1)
+    assert isinstance(duplicated["target"], pd.DataFrame)
+    assert isinstance(duplicated["forecast"], pd.Series)
+    with pytest.raises(ValueError, match="identically shaped"):
+        regression_metrics(
+            duplicated["target"], duplicated["forecast"],
+            calculated_name="target", forecast_name="forecast",
+        )
+
+
+def test_fc1_checkpoint_handles_artifact_hatcf_lnkf_columns():
+    """Regression: real macro frames already carry Hatcf/LnKF.
+
+    The old evaluator renamed its own forecast columns to ``Hatcf``/``LnKF``,
+    producing duplicate columns whose selection returned a DataFrame instead of a
+    Series, which crashed the FC1 timing-alignment regression.
+    """
+    rows = []
+    for path in range(2):
+        for t in range(6):
+            x = -2.0 + 0.1 * t
+            rows.append({
+                "path": path, "t": t, "x": x,
+                "Hatc": -1.0 + 0.1 * t, "LnK": 4.0 + 0.05 * t,
+                "Hatcf": -1.0 + 0.1 * t, "LnKF": 4.0 + 0.05 * t,
+            })
+    frame = pd.DataFrame(rows)
+    assert frame.columns.duplicated().sum() == 0
+    summary, timing, rollout = evaluate_fc1_checkpoint(
+        ExactFC1(), frame, device=torch.device("cpu"),
+        rollout_horizons=(1, 5), shifts=(-1, 0, 1),
+    )
+    assert summary["fc1_hatc_rmse"] == pytest.approx(0.0, abs=1e-6)
+    assert summary["fc1_lnk_rmse"] == pytest.approx(0.0, abs=1e-6)
+    assert summary["fc1_hatc_best_timing_shift"] == 0
+    assert set(timing["variable"]) == {"hatc", "lnk"}
+    assert len(timing) == 6
+    assert set(rollout["horizon"]) == {1, 5}
+
+
+class ShockSensitiveSDF(torch.nn.Module):
+    """SDF stub whose held-out residuals genuinely depend on the shock draws."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(1.0))
+        self.sdf_model = SimpleNamespace(gamma=2.0, kappa=-1.0, sigma=1.0, beta=0.98)
+
+    def forward_step(self, x_prev, x_curr, hatcf_prev, lnkf_prev, return_physical=True):
+        batch, children, _ = x_curr.shape
+        w_parent = 10.0 + x_prev
+        w_children = 10.0 + x_curr
+        hatc = hatcf_prev.unsqueeze(1).expand(batch, children, 1) + x_curr
+        lnk = lnkf_prev.unsqueeze(1).expand(batch, children, 1) + 0.5 * x_curr
+        m = torch.full((batch, children, 1), 0.98, device=x_curr.device)
+        return w_parent, w_children, m, hatc, lnk
+
+
+def test_canonical_bank_max_children_spans_primary_and_robustness():
+    assert canonical_bank_max_children(64, [32, 64, 128]) == 128
+    assert canonical_bank_max_children(64, [32, 64]) == 64
+    assert canonical_bank_max_children(2, []) == 2
+
+
+def test_cross_episode_crn_requires_one_canonical_shock_bank():
+    """A J=64 episode must draw the same shocks as a J=128 representative episode."""
+    parents = torch.tensor([
+        [0.2, -0.2, 1.0, 0.2, -2.0, -2.1, 4.0],
+        [0.4, 0.2, 0.0, 0.3, -1.9, -2.0, 4.1],
+    ])
+    hatc = torch.full((2, 1), -2.0)
+    lnk = torch.full((2, 1), 4.1)
+    economic = AnalysisEconomicConfig.from_current_config()
+    canonical = canonical_bank_max_children(64, [32, 64, 128])
+    assert canonical == 128
+    shared = dict(
+        hatc_cal=hatc, lnk_cal=lnk, economic_config=economic, seed=12345,
+        shock_bank_max_children=canonical,
+    )
+    representative, rep_meta = evaluate_sdf_heldout_multi_k(
+        ShockSensitiveSDF(), parents, child_counts=[32, 64, 128], **shared
+    )
+    plain, plain_meta = evaluate_sdf_heldout_multi_k(
+        ShockSensitiveSDF(), parents, child_counts=[64], **shared
+    )
+    assert plain_meta["shock_bank_max_children"] == 128
+    assert plain_meta["shock_bank_sha256"] == rep_meta["shock_bank_sha256"]
+    for key, value in plain[64].items():
+        assert value == pytest.approx(representative[64][key], nan_ok=True)
+    # Shrinking the bank to the episode's own max child count shifts the per-parent
+    # shock draws, so the shared cross-episode CRN prefix silently breaks.
+    drifted, drifted_meta = evaluate_sdf_heldout_multi_k(
+        ShockSensitiveSDF(), parents, child_counts=[64], hatc_cal=hatc, lnk_cal=lnk,
+        economic_config=economic, seed=12345, shock_bank_max_children=64,
+    )
+    assert drifted_meta["shock_bank_sha256"] != rep_meta["shock_bank_sha256"]
+    changed = [
+        key for key in representative[64]
+        if drifted[64][key] != representative[64][key]
+    ]
+    assert "sdf_normalized_conditional_mean_abs" in changed
+
+
+def test_component_isolation_keeps_firm_and_sdf_when_fc1_raises(tmp_path, monkeypatch):
+    run_root = tmp_path / "run"
+    checkpoint_dir = run_root / "checkpoints_analysis"
+    checkpoint_dir.mkdir(parents=True)
+    for episode in (0, 1):
+        (checkpoint_dir / f"ep{episode}_combined.pt").write_bytes(b"checkpoint")
+    reference = tmp_path / "reference.pkl"
+    pd.DataFrame([
+        {
+            "path": 0, "t": index, "branch": -1, "b": 0.1 * index,
+            "z": -0.2 + index, "ETA": index % 2, "i": 0.1,
+            "x": -2.0, "Hatcf": -2.1, "LnKF": 4.0,
+            "hatc_cal": -2.0, "lnk_cal": 4.1,
+        }
+        for index in range(3)
+    ]).to_pickle(reference)
+    macro_path = tmp_path / "ep1_macro.pkl"
+    macro_path.write_bytes(b"macro")
+    output = tmp_path / "evaluation"
+
+    def fake_matrix(args):
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        for eta in (0, 1):
+            eta_dir = args.output_dir / f"eta{eta}"
+            eta_dir.mkdir()
+            (eta_dir / "metadata.json").write_text("{}", encoding="utf-8")
+        return pd.DataFrame([{
+            "eta_parent": 1.0, "n_child_shocks": 2,
+            "p0_residual_abs_mean": 0.1, "pi_residual_abs_mean": 0.2,
+            "q_residual_abs_mean": 0.3,
+        }]), {
+            "reference_transition_bank": {"shock_bank_sha256": "actual"},
+            "timing": {"bellman_seconds": 0.1, "bp_seconds": 0.1, "investment_seconds": 0.1},
+        }
+
+    loaded = SimpleNamespace(
+        models={"policy_value": QDiagnosticModel(0.25), "sdf_fc1": StableSDF()},
+        metadata={"loaded_model_keys": ["policy_value", "sdf_fc1"]},
+        hyperparams=SimpleNamespace(
+            sdf_normalized_logr_clip=20.0, sdf_wealth_loss_mode="signed_aio",
+            pv_use_clipped_m=True, pv_m_clamp_min=0.7, pv_m_clamp_max=1.3,
+            pv_bellman_normalize_by_value_scale=False,
+            pv_exact_eta_integration_enabled=True,
+        ),
+        economic_config=AnalysisEconomicConfig.from_current_config(),
+    )
+    monkeypatch.setattr(full_run_module, "evaluate_matrix", fake_matrix)
+    monkeypatch.setattr(full_run_module, "load_analysis_checkpoint", lambda *a, **k: loaded)
+    monkeypatch.setattr(full_run_module, "discover_episode_firm_data", lambda root: ({}, []))
+    monkeypatch.setattr(full_run_module, "_git", lambda args: "")
+    monkeypatch.setattr(full_run_module, "_discover_episode_macro", lambda root, episode: macro_path)
+    monkeypatch.setattr(
+        full_run_module, "read_dataframe",
+        lambda path: pd.DataFrame({"path": [0], "t": [0], "x": [-2.0]}),
+    )
+
+    def failing_fc1(*args, **kwargs):
+        raise RuntimeError("fc1 boom")
+
+    monkeypatch.setattr(full_run_module, "evaluate_fc1_checkpoint", failing_fc1)
+    drift_calls = {}
+
+    def fake_drift(cases, eta, out, missing):
+        drift_calls.setdefault("episodes", set()).update(case.episode for case in cases)
+        return pd.DataFrame(), {}
+
+    monkeypatch.setattr(full_run_module, "compute_function_drift", fake_drift)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "evaluate_full_run.py", "--run-root", str(run_root),
+            "--reference-firm-data", str(reference), "--output-dir", str(output),
+            "--device", "cpu", "--episodes", "0,1", "--n-child-shocks", "2",
+            "--robustness-child-shocks", "2", "--max-sdf-parents", "2",
+            "--b-points", "2", "--z-points", "2", "--i-points", "2",
+        ],
+    )
+    full_run_module.main()
+    headline = pd.read_csv(output / "headline_metrics.csv").set_index("episode")
+    assert set(headline["status"]) == {"partial"}
+    assert set(headline["firm_status"]) == {"ok"}
+    assert set(headline["sdf_common_status"]) == {"ok"}
+    assert set(headline["fc1_status"]) == {"error"}
+    assert set(headline["sdf_ondist_status"]) == {"missing"}
+    assert headline["p0_residual_abs_mean"].notna().all()
+    assert headline["sdf_common_conditional_abs_mean"].notna().all()
+    errors = pd.read_csv(output / "errors.csv")
+    assert set(errors.loc[errors["stage"] == "fc1", "episode"]) == {0, 1}
+    assert not any("firm_structural" in str(message) for message in errors["stage"])
+    assert drift_calls["episodes"] == {0, 1}
+    metadata = pd.read_json(output / "metadata.json", typ="series")
+    assert metadata["common_shock_bank"]["canonical_shock_bank_max_children"] == 2
+    episode_meta = pd.read_json(output / "episodes" / "ep1" / "metadata.json", typ="series")
+    assert episode_meta["component_status"]["fc1"] == "error"
+    assert episode_meta["component_status"]["firm_structural"] == "ok"
+    assert not (output / "episodes" / "ep1" / "fc2").exists()

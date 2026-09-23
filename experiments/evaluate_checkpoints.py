@@ -4,6 +4,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -31,7 +32,8 @@ from evaluation.bellman_diagnostics import (  # noqa: E402
 )
 from evaluation.bp_diagnostics import (  # noqa: E402
     build_frozen_transition_data,
-    evaluate_bp_consistency,
+    evaluate_bp_consistency_multi_j,
+    resolve_bp_eval_max_expanded_states,
     slice_frozen_transition_data,
 )
 from evaluation.firm_surfaces import (  # noqa: E402
@@ -57,6 +59,63 @@ def _sync_cuda(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    return int(raw)
+
+_BP_FORWARD_STAT_COUNTERS = (
+    "bp_model_forward_calls",
+    "bp_child_equity_forward_calls",
+    "bp_q_forward_calls",
+    "bp_parent_chunks",
+    "bp_candidate_chunks",
+)
+
+
+def _zero_bp_forward_stats(budget: int) -> Dict[str, object]:
+    stats: Dict[str, object] = {name: 0 for name in _BP_FORWARD_STAT_COUNTERS}
+    stats.update(
+        {
+            "bp_max_expanded_states": int(budget),
+            "bp_max_actual_expanded_states": 0,
+            "bp_multi_j_reuse_enabled": False,
+            "bp_branch_reuse_enabled": False,
+            "bp_grid_chunk_plans": [],
+        }
+    )
+    return stats
+
+
+def sum_bp_forward_stats(items) -> Dict[str, object]:
+    """Aggregate per-case BP hot-path counters into one matrix-level summary."""
+    totals: Dict[str, object] = {name: 0 for name in _BP_FORWARD_STAT_COUNTERS}
+    max_expanded = 0
+    max_actual = 0
+    multi_j_reuse = False
+    branch_reuse = False
+    plans: list = []
+    for stats in items:
+        if not stats:
+            continue
+        for name in _BP_FORWARD_STAT_COUNTERS:
+            totals[name] = int(totals[name]) + int(stats.get(name, 0))
+        max_expanded = max(max_expanded, int(stats.get("bp_max_expanded_states", 0)))
+        max_actual = max(max_actual, int(stats.get("bp_max_actual_expanded_states", 0)))
+        multi_j_reuse = multi_j_reuse or bool(stats.get("bp_multi_j_reuse_enabled", False))
+        branch_reuse = branch_reuse or bool(stats.get("bp_branch_reuse_enabled", False))
+        plans.extend(stats.get("bp_grid_chunk_plans") or [])
+    totals.update(
+        {
+            "bp_max_expanded_states": max_expanded,
+            "bp_max_actual_expanded_states": max_actual,
+            "bp_multi_j_reuse_enabled": multi_j_reuse,
+            "bp_branch_reuse_enabled": branch_reuse,
+            "bp_grid_chunk_plans": plans,
+        }
+    )
+    return totals
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -118,6 +177,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1e-8,
         help="Minimum BPGridTeacher top-two objective margin for an identified bp target.",
+    )
+    parser.add_argument(
+        "--bp-eval-max-expanded-states",
+        type=int,
+        default=_env_int("BP_EVAL_MAX_EXPANDED_STATES"),
+        help=(
+            "Evaluator-only BP chunk budget (one of 65536/131072/262144/524288). "
+            "Overrides the checkpoint's bp_grid_max_expanded_states for this read-only "
+            "evaluation only; it never changes training semantics or model state. "
+            "Defaults to a conservative GPU-memory tier on CUDA and 65536 otherwise. "
+            "Falls back to the BP_EVAL_MAX_EXPANDED_STATES environment variable."
+        ),
     )
     return parser.parse_args()
 
@@ -464,24 +535,82 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
                     title=name, colorbar_label=name,
                 )
 
-    _sync_cuda(device)
-    bp_started = time.perf_counter()
-    bp_surfaces, bp_summary, transition_meta = evaluate_bp_consistency(
-        model,
-        sdf_fc1_model,
-        grid,
-        reference,
-        loaded.hyperparams,
-        loaded.economic_config,
-        output_dir=output / "objective_slices",
-        n_child_shocks=args.n_child_shocks,
-        shock_seed=args.shock_seed,
-        teacher_margin_tol=args.bp_teacher_margin_tol,
-        transition_data=transition_data,
-        write_objective_slices=detailed_output,
+    bp_budget, bp_budget_resolution = resolve_bp_eval_max_expanded_states(
+        getattr(args, "bp_eval_max_expanded_states", None), device
     )
-    _sync_cuda(device)
-    phase_timing["bp_seconds"] = time.perf_counter() - bp_started
+    checkpoint_bp_budget = int(
+        getattr(loaded.hyperparams, "bp_grid_max_expanded_states", 65536)
+    )
+    shared_bp_j = shared_cache.get("bp_j_values") if shared_cache is not None else None
+    bp_multi_cache = (
+        shared_cache.setdefault("bp_multi_j_by_eta", {})
+        if shared_cache is not None else {}
+    )
+    if shared_bp_j:
+        bp_bundle = bp_multi_cache.get(static_key)
+        if bp_bundle is None:
+            _sync_cuda(device)
+            multi_started = time.perf_counter()
+            results_by_j, bp_forward_stats = evaluate_bp_consistency_multi_j(
+                model,
+                sdf_fc1_model,
+                grid,
+                reference,
+                loaded.hyperparams,
+                loaded.economic_config,
+                output_dir=Path(shared_cache["bp_primary_output_dir"]) / "objective_slices",
+                j_values=shared_bp_j,
+                primary_j=int(shared_cache["bp_primary_j"]),
+                transition_max=transition_max,
+                shock_seed=args.shock_seed,
+                teacher_margin_tol=args.bp_teacher_margin_tol,
+                write_objective_slices=bool(
+                    shared_cache.get("bp_write_objective_slices", True)
+                ),
+                bp_eval_max_expanded_states=bp_budget,
+            )
+            _sync_cuda(device)
+            bp_bundle = {
+                "results_by_j": results_by_j,
+                "forward_stats": bp_forward_stats,
+                "seconds": time.perf_counter() - multi_started,
+            }
+            bp_multi_cache[static_key] = bp_bundle
+        else:
+            # Every J of this eta shares one multi-J pass; only the leading case
+            # carries its wall time and forward counters.
+            bp_forward_stats = _zero_bp_forward_stats(bp_budget)
+            bp_bundle = dict(bp_bundle, seconds=0.0, forward_stats=bp_forward_stats)
+        entry = bp_bundle["results_by_j"][int(args.n_child_shocks)]
+        bp_surfaces = entry["surfaces"]
+        bp_summary = entry["summary"]
+        transition_meta = entry["metadata"]
+        phase_timing["bp_seconds"] = float(bp_bundle["seconds"])
+    else:
+        _sync_cuda(device)
+        bp_started = time.perf_counter()
+        results_by_j, bp_forward_stats = evaluate_bp_consistency_multi_j(
+            model,
+            sdf_fc1_model,
+            grid,
+            reference,
+            loaded.hyperparams,
+            loaded.economic_config,
+            output_dir=output / "objective_slices",
+            j_values=[int(args.n_child_shocks)],
+            primary_j=int(args.n_child_shocks),
+            transition_max=transition_max,
+            shock_seed=args.shock_seed,
+            teacher_margin_tol=args.bp_teacher_margin_tol,
+            write_objective_slices=detailed_output,
+            bp_eval_max_expanded_states=bp_budget,
+        )
+        _sync_cuda(device)
+        phase_timing["bp_seconds"] = time.perf_counter() - bp_started
+        entry = results_by_j[int(args.n_child_shocks)]
+        bp_surfaces = entry["surfaces"]
+        bp_summary = entry["summary"]
+        transition_meta = entry["metadata"]
     if not summary_only:
         save_surface_csvs(output / "bp", bp_surfaces, grid.b_values, grid.z_values)
         if detailed_output:
@@ -630,6 +759,10 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
             transition_meta.get("shock_bank_max_child_shocks", args.n_child_shocks)
         ),
         "bp_margin_identification_threshold": float(args.bp_teacher_margin_tol),
+        "checkpoint_bp_grid_max_expanded_states": checkpoint_bp_budget,
+        "evaluator_bp_max_expanded_states": int(bp_budget),
+        "bp_eval_max_expanded_states_resolution": bp_budget_resolution,
+        "bp_forward_stats": bp_forward_stats,
         "reference_state": reference.to_dict(),
         "grid": {
             "b_min": b_min,
@@ -757,6 +890,15 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
     case_metadata = []
     requested_primary_eta = float(getattr(args, "eta", 1.0))
     primary_eta = requested_primary_eta if requested_primary_eta in eta_values else eta_values[0]
+    primary_eta_label = f"eta{primary_eta:g}".replace("-", "m").replace(".", "p")
+    # One shared BP pass per eta covers every requested J, so the J=Jmax child
+    # equity forward and the coarse objective grid are never recomputed per J.
+    evaluation_cache["bp_j_values"] = list(j_values)
+    evaluation_cache["bp_primary_j"] = int(args.n_child_shocks)
+    evaluation_cache["bp_primary_output_dir"] = str(root / primary_eta_label)
+    evaluation_cache["bp_write_objective_slices"] = not bool(
+        getattr(args, "summary_only_all", False)
+    )
     primary_case_metadata: Dict[str, object] | None = None
     for eta in eta_values:
         eta_label = f"eta{eta:g}".replace("-", "m").replace(".", "p")
@@ -802,6 +944,8 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
                 "model_state_unchanged": None,
                 "reference_transition_bank": metadata.get("reference_transition_bank"),
                 "timing": metadata.get("timing", {}),
+                "bp_forward_stats": metadata.get("bp_forward_stats"),
+                "bp_eval_max_expanded_states": metadata.get("evaluator_bp_max_expanded_states"),
             })
 
     combined = pd.DataFrame(rows)
@@ -855,6 +999,10 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
         float(matrix_timing[name])
         for name in ("firm_static_seconds", "investment_seconds", "bellman_seconds", "bp_seconds")
     )
+    matrix_bp_forward_stats = sum_bp_forward_stats(
+        item.get("bp_forward_stats") for item in case_metadata
+    )
+    matrix_timing.update(matrix_bp_forward_stats)
     metadata = {
         "evaluator": "firm_side_checkpoint_evaluator_v2_matrix",
         "git_commit_sha": _git_sha(),
@@ -878,6 +1026,17 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
             "training_eta_integration_mode"
         ),
         "bp_margin_identification_threshold": float(args.bp_teacher_margin_tol),
+        "checkpoint_bp_grid_max_expanded_states": primary_case_metadata.get(
+            "checkpoint_bp_grid_max_expanded_states"
+        ),
+        "evaluator_bp_max_expanded_states": primary_case_metadata.get(
+            "evaluator_bp_max_expanded_states"
+        ),
+        "bp_eval_max_expanded_states_resolution": primary_case_metadata.get(
+            "bp_eval_max_expanded_states_resolution"
+        ),
+        "bp_multi_j_shared_pass_per_eta": True,
+        "bp_forward_stats": matrix_bp_forward_stats,
         "grid": primary_case_metadata.get("grid"),
         "reference_state": primary_case_metadata.get("reference_state"),
         "reference_transition_bank": primary_case_metadata.get("reference_transition_bank"),

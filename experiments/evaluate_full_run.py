@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sys
 import time
@@ -77,13 +78,56 @@ HEADLINE_COLUMNS = [
     "default_rate", "survival_rate", "investment_rate",
     "sdf_before_aio_mean", "sdf_after_aio_mean", "sdf_before_aio_t",
     "sdf_after_aio_t", "sdf_safe_to_continue", "sdf_stage_progress", "sdf_converged",
+    "firm_status", "sdf_common_status", "sdf_ondist_status",
+    "simulation_status", "fc1_status", "training_log_status",
     "checkpoint", "firm_data", "macro_data", "error",
 ]
+
+
+COMPONENT_STATUS_COLUMNS = {
+    "firm_structural": "firm_status",
+    "sdf_common": "sdf_common_status",
+    "sdf_ondist": "sdf_ondist_status",
+    "simulation": "simulation_status",
+    "fc1": "fc1_status",
+    "training_log": "training_log_status",
+}
+FORMAL_COMPONENTS = ("firm_structural", "sdf_common", "sdf_ondist", "simulation", "fc1")
+
+BP_TIMING_COUNTERS = (
+    "bp_model_forward_calls",
+    "bp_child_equity_forward_calls",
+    "bp_q_forward_calls",
+    "bp_parent_chunks",
+    "bp_candidate_chunks",
+    "bp_max_expanded_states",
+    "bp_max_actual_expanded_states",
+    "bp_multi_j_reuse_enabled",
+    "bp_branch_reuse_enabled",
+)
 
 
 def _sync_cuda(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    return int(raw)
+
+def canonical_bank_max_children(
+    primary_child_shocks: int,
+    robustness_child_shocks: list[int] | tuple[int, ...],
+) -> int:
+    """Global common-random-number bank size shared by every episode.
+
+    Every episode must slice its nested prefixes out of the same canonical bank,
+    otherwise the primary J case of a non-representative episode would use a
+    different shock draw than the representative episodes.
+    """
+    return max([int(primary_child_shocks), *(int(value) for value in robustness_child_shocks)])
 
 
 def aggregate_episode_peak_memory(peaks: list[float | None]) -> float | None:
@@ -140,6 +184,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--i-points", type=int, default=101)
     parser.add_argument("--forward-chunk-size", type=int, default=8192)
     parser.add_argument("--bp-teacher-margin-tol", type=float, default=1e-8)
+    parser.add_argument(
+        "--bp-eval-max-expanded-states",
+        type=int,
+        default=_env_int("BP_EVAL_MAX_EXPANDED_STATES"),
+        help=(
+            "Evaluator-only BP chunk budget (65536/131072/262144/524288). Overrides the "
+            "checkpoint bp_grid_max_expanded_states for this read-only evaluation only; "
+            "training semantics, model state, and formal metric definitions are unchanged."
+        ),
+    )
     parser.add_argument("--allow-dirty-worktree", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -244,6 +298,7 @@ def _firm_eval_args(
     output: Path,
     representative: bool,
     child_counts: list[int],
+    canonical_bank_max: int,
     loaded_checkpoint: Any,
 ) -> argparse.Namespace:
     return argparse.Namespace(
@@ -255,7 +310,8 @@ def _firm_eval_args(
         z_min=args.z_min, z_max=args.z_max, z_points=args.z_points,
         i_points=args.i_points, forward_chunk_size=args.forward_chunk_size,
         n_child_shocks=args.n_child_shocks, shock_seed=args.shock_seed,
-        shock_bank_max_child_shocks=max(child_counts),
+        shock_bank_max_child_shocks=int(canonical_bank_max),
+        bp_eval_max_expanded_states=args.bp_eval_max_expanded_states,
         robustness_child_shocks=[
             value for value in child_counts if value != int(args.n_child_shocks)
         ],
@@ -336,7 +392,11 @@ def _add_function_drift(
     eta_values: list[float],
     missing: MissingArtifacts,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    valid = headline.loc[headline["status"].isin(["ok", "partial"]), "episode"].astype(int).tolist()
+    # Function drift only needs the firm structural surface artifacts, so a broken
+    # FC1 or SDF component must never remove an otherwise valid episode here.
+    valid = headline.loc[
+        headline.get("firm_status", pd.Series(dtype=object)).eq("ok"), "episode"
+    ].astype(int).tolist()
     cases = [EpisodeEvaluation(ep, output / "episodes" / f"ep{ep}" / "firm") for ep in valid]
     frames = []
     for eta_value in eta_values:
@@ -579,6 +639,8 @@ def main() -> None:
             "fc1_seconds": float("nan"),
             "cuda_peak_memory_mb": None,
         }
+        for counter_name in BP_TIMING_COUNTERS:
+            episode_timing[counter_name] = 0
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         episode_root = output / "episodes" / f"ep{episode}"
@@ -590,6 +652,8 @@ def main() -> None:
         firm_path = firms.get(episode)
         if checkpoint is None:
             row["error"] = "missing checkpoint"
+            for headline_name in COMPONENT_STATUS_COLUMNS.values():
+                row[headline_name] = "missing"
             availability_notes.append(f"Episode {episode}: {row['error']}")
             headline_rows.append(row)
             error_rows.append({"episode": episode, "stage": "discovery", "error": row["error"]})
@@ -602,97 +666,160 @@ def main() -> None:
             "firm_data": str(firm_path) if firm_path else np.nan,
             "macro_data": str(macro_path) if macro_path else np.nan,
         })
+        canonical_max_j = canonical_bank_max_children(
+            args.n_child_shocks, args.robustness_child_shocks
+        )
+        selected_child_counts = child_counts_by_episode[int(episode)]
+        component_status: Dict[str, str] = {
+            "firm_structural": "missing",
+            "sdf_common": "missing",
+            "sdf_ondist": "missing",
+            "simulation": "missing",
+            "fc1": "missing",
+            "training_log": "missing",
+        }
+        component_errors: Dict[str, str] = {}
+        loaded = None
+        active_model_names: list[str] = []
+        before: Dict[str, str] | None = None
+        firm_meta: Dict[str, Any] = {}
+        common_primary_meta: Dict[str, Any] | None = None
+        ondist_parent_meta: Dict[str, Any] | None = None
+        ondist_primary_meta: Dict[str, Any] | None = None
+        episode_sdf_rows: list[Dict[str, Any]] = []
+        config_snapshot: Dict[str, Any] = {}
+        config_hash = ""
+        firm_frame = pd.DataFrame()
+        parent_states = None
+        hatc_cal = None
+        lnk_cal = None
         try:
-            selected_child_counts = child_counts_by_episode[int(episode)]
-            max_j = max(selected_child_counts)
             loaded = load_analysis_checkpoint(checkpoint, device=device)
             episode_timing["checkpoint_load_count"] = 1
             for loaded_model in loaded.models.values():
                 loaded_model.eval()
-            active_model_names = loaded.metadata.get("loaded_model_keys", [])
+            active_model_names = list(loaded.metadata.get("loaded_model_keys", []))
             before = {
                 name: model_state_hash(loaded.models[name])
                 for name in active_model_names
             }
             config_snapshot, config_hash = build_config_invariant_snapshot(loaded)
             config_records.append((episode, config_snapshot, config_hash))
-            _sync_cuda(device)
-            firm_started = time.perf_counter()
-            firm_summary, firm_meta = evaluate_matrix(_firm_eval_args(
-                args, checkpoint=checkpoint, reference_firm=reference_firm,
-                reference_macro=reference_macro, output=episode_root / "firm",
-                representative=episode in representative,
-                child_counts=selected_child_counts,
-                loaded_checkpoint=loaded,
-            ))
-            _sync_cuda(device)
-            episode_timing["firm_matrix_wall_seconds"] = time.perf_counter() - firm_started
-            firm_timing = firm_meta.get("timing", {})
-            for timing_name in (
-                "firm_static_seconds", "bellman_seconds", "bp_seconds", "investment_seconds"
-            ):
-                episode_timing[timing_name] = float(firm_timing.get(timing_name, float("nan")))
-            episode_timing["firm_structural_seconds"] = sum(
-                float(episode_timing[name])
-                for name in (
-                    "firm_static_seconds", "investment_seconds", "bellman_seconds", "bp_seconds"
-                )
-                if np.isfinite(episode_timing[name])
-            )
-            structural_rows.extend(
-                {"episode": episode, **item}
-                for item in firm_summary.to_dict(orient="records")
-            )
-            primary = firm_summary[
-                (firm_summary["n_child_shocks"] == args.n_child_shocks)
-                & (firm_summary["eta_parent"] == 1.0)
-            ]
-            if primary.empty:
-                primary = firm_summary.iloc[[0]]
-            structural_values = primary.iloc[0].to_dict()
-            row.update(structural_values)
-            row.update({f"structural_{key}": value for key, value in structural_values.items()})
+        except Exception as exc:
+            component_errors["checkpoint_load"] = f"{type(exc).__name__}: {exc}"
+            error_rows.append({
+                "episode": episode, "stage": "checkpoint_load",
+                "error_type": type(exc).__name__, "error": str(exc),
+            })
 
-            episode_sdf_rows: list[Dict[str, Any]] = []
-            common_primary_meta: Dict[str, Any] | None = None
-            sdf_child_counts = selected_child_counts
+        # Each formal component is isolated: one crashing component must never
+        # destroy the artifacts produced by the others.
+        if loaded is not None:
+            try:
+                _sync_cuda(device)
+                firm_started = time.perf_counter()
+                firm_summary, firm_meta = evaluate_matrix(_firm_eval_args(
+                    args, checkpoint=checkpoint, reference_firm=reference_firm,
+                    reference_macro=reference_macro, output=episode_root / "firm",
+                    representative=episode in representative,
+                    child_counts=selected_child_counts,
+                    canonical_bank_max=canonical_max_j,
+                    loaded_checkpoint=loaded,
+                ))
+                _sync_cuda(device)
+                episode_timing["firm_matrix_wall_seconds"] = time.perf_counter() - firm_started
+                firm_timing = firm_meta.get("timing", {})
+                for timing_name in (
+                    "firm_static_seconds", "bellman_seconds", "bp_seconds", "investment_seconds"
+                ):
+                    episode_timing[timing_name] = float(firm_timing.get(timing_name, float("nan")))
+                for counter_name in BP_TIMING_COUNTERS:
+                    if counter_name in firm_timing:
+                        episode_timing[counter_name] = firm_timing[counter_name]
+                episode_timing["firm_structural_seconds"] = sum(
+                    float(episode_timing[name])
+                    for name in (
+                        "firm_static_seconds", "investment_seconds", "bellman_seconds", "bp_seconds"
+                    )
+                    if np.isfinite(episode_timing[name])
+                )
+                structural_rows.extend(
+                    {"episode": episode, **item}
+                    for item in firm_summary.to_dict(orient="records")
+                )
+                primary = firm_summary[
+                    (firm_summary["n_child_shocks"] == args.n_child_shocks)
+                    & (firm_summary["eta_parent"] == 1.0)
+                ]
+                if primary.empty:
+                    primary = firm_summary.iloc[[0]]
+                structural_values = primary.iloc[0].to_dict()
+                row.update(structural_values)
+                row.update({f"structural_{key}": value for key, value in structural_values.items()})
+                component_status["firm_structural"] = "ok"
+            except Exception as exc:
+                component_status["firm_structural"] = "error"
+                component_errors["firm_structural"] = f"{type(exc).__name__}: {exc}"
+                error_rows.append({
+                    "episode": episode, "stage": "firm_structural",
+                    "error_type": type(exc).__name__, "error": str(exc),
+                })
+
+        if loaded is not None:
             _sync_cuda(device)
             sdf_common_started = time.perf_counter()
-            common_sdf_summaries, common_sdf_meta = evaluate_sdf_heldout_multi_k(
-                loaded.models["sdf_fc1"], common_parent_states, hatc_cal=common_hatc,
-                lnk_cal=common_lnk, economic_config=loaded.economic_config,
-                child_counts=sdf_child_counts, seed=args.shock_seed,
-                shock_bank_max_children=max_j,
-                normalized_logr_clip=float(getattr(loaded.hyperparams, "sdf_normalized_logr_clip", 20.0)),
-            )
-            _sync_cuda(device)
-            episode_timing["sdf_common_seconds"] = time.perf_counter() - sdf_common_started
-            for child_count, sdf_summary in common_sdf_summaries.items():
-                namespaced = namespace_sdf_summary(sdf_summary, scope="common")
-                item = {"episode": episode, "scope": "common", "n_children": child_count, **namespaced}
-                episode_sdf_rows.append(item)
-                sdf_rows_all.append(item)
-                if child_count == args.n_child_shocks:
-                    row.update(namespaced)
-                    common_primary_meta = {**common_sdf_meta, "parent_bank": common_parent_meta}
-                    if float(namespaced["sdf_common_valid_parent_ratio"]) < 1.0:
-                        availability_notes.append(
-                            f"Episode {episode}: common SDF valid_parent_ratio="
-                            f"{namespaced['sdf_common_valid_parent_ratio']:.6g}"
-                        )
+            try:
+                common_sdf_summaries, common_sdf_meta = evaluate_sdf_heldout_multi_k(
+                    loaded.models["sdf_fc1"], common_parent_states, hatc_cal=common_hatc,
+                    lnk_cal=common_lnk, economic_config=loaded.economic_config,
+                    child_counts=selected_child_counts, seed=args.shock_seed,
+                    shock_bank_max_children=canonical_max_j,
+                    normalized_logr_clip=float(getattr(loaded.hyperparams, "sdf_normalized_logr_clip", 20.0)),
+                )
+                _sync_cuda(device)
+                episode_timing["sdf_common_seconds"] = time.perf_counter() - sdf_common_started
+                for child_count, sdf_summary in common_sdf_summaries.items():
+                    namespaced = namespace_sdf_summary(sdf_summary, scope="common")
+                    item = {"episode": episode, "scope": "common", "n_children": child_count, **namespaced}
+                    episode_sdf_rows.append(item)
+                    sdf_rows_all.append(item)
+                    if child_count == args.n_child_shocks:
+                        row.update(namespaced)
+                        common_primary_meta = {**common_sdf_meta, "parent_bank": common_parent_meta}
+                        if float(namespaced["sdf_common_valid_parent_ratio"]) < 1.0:
+                            availability_notes.append(
+                                f"Episode {episode}: common SDF valid_parent_ratio="
+                                f"{namespaced['sdf_common_valid_parent_ratio']:.6g}"
+                            )
+                component_status["sdf_common"] = "ok"
+            except Exception as exc:
+                component_status["sdf_common"] = "error"
+                component_errors["sdf_common"] = f"{type(exc).__name__}: {exc}"
+                error_rows.append({
+                    "episode": episode, "stage": "sdf_common",
+                    "error_type": type(exc).__name__, "error": str(exc),
+                })
 
-            firm_frame = pd.DataFrame()
-            ondist_parent_meta: Dict[str, Any] | None = None
-            ondist_primary_meta: Dict[str, Any] | None = None
-            if firm_path is not None:
+        if loaded is not None and firm_path is not None:
+            try:
                 firm_frame, parent_states, hatc_cal, lnk_cal, ondist_parent_meta = _sample_parent_tensors(
                     firm_path, macro_path, device=device, max_parents=args.max_sdf_parents
                 )
+            except Exception as exc:
+                parent_states = None
+                component_errors["ondist_parent_bank"] = f"{type(exc).__name__}: {exc}"
+                error_rows.append({
+                    "episode": episode, "stage": "ondist_parent_bank",
+                    "error_type": type(exc).__name__, "error": str(exc),
+                })
+
+        if loaded is not None and parent_states is not None:
+            try:
                 ondist_transition = build_frozen_transition_data(
                     loaded.models["sdf_fc1"], parent_states, reference_state,
                     loaded.hyperparams, loaded.economic_config,
                     n_child_shocks=args.n_child_shocks, shock_seed=args.shock_seed,
-                    shock_bank_max_child_shocks=max_j,
+                    shock_bank_max_child_shocks=canonical_max_j,
                     hatc_cal_values=hatc_cal, lnk_cal_values=lnk_cal,
                 )
                 parent_b = parent_states[:, 0].detach().cpu().numpy().astype(np.float64)
@@ -716,8 +843,8 @@ def main() -> None:
                 ondist_sdf_summaries, ondist_sdf_meta = evaluate_sdf_heldout_multi_k(
                     loaded.models["sdf_fc1"], parent_states, hatc_cal=hatc_cal,
                     lnk_cal=lnk_cal, economic_config=loaded.economic_config,
-                    child_counts=sdf_child_counts, seed=args.shock_seed,
-                    shock_bank_max_children=max_j,
+                    child_counts=selected_child_counts, seed=args.shock_seed,
+                    shock_bank_max_children=canonical_max_j,
                     normalized_logr_clip=float(getattr(loaded.hyperparams, "sdf_normalized_logr_clip", 20.0)),
                 )
                 _sync_cuda(device)
@@ -735,79 +862,148 @@ def main() -> None:
                                 f"Episode {episode}: on-distribution SDF valid_parent_ratio="
                                 f"{namespaced['sdf_ondist_valid_parent_ratio']:.6g}"
                             )
+                component_status["sdf_ondist"] = "ok"
+            except Exception as exc:
+                component_status["sdf_ondist"] = "error"
+                component_errors["sdf_ondist"] = f"{type(exc).__name__}: {exc}"
+                error_rows.append({
+                    "episode": episode, "stage": "sdf_ondist",
+                    "error_type": type(exc).__name__, "error": str(exc),
+                })
+            try:
                 moments, unavailable = compute_simulated_moments(select_simulated_state_rows(firm_frame))
                 row.update(moments)
                 pd.DataFrame([moments]).to_csv(episode_root / "simulation" / "moments.csv", index=False)
                 write_json(episode_root / "simulation" / "metadata.json", {"unavailable": unavailable})
-            else:
-                write_json(episode_root / "simulation" / "missing.json", {"reason": "episode firm artifact absent"})
-                availability_notes.append(
-                    f"Episode {episode}: episode firm artifact absent; on-distribution and simulation metrics unavailable"
-                )
-            pd.DataFrame(episode_sdf_rows).to_csv(episode_root / "sdf" / "metrics.csv", index=False)
-            write_json(episode_root / "sdf" / "metadata.json", {
-                "common": common_primary_meta,
-                "ondist": ondist_primary_meta,
-                "common_parent_bank_sha256": common_parent_meta["parent_bank_sha256"],
-            })
-
-            macro_frame = read_dataframe(macro_path) if macro_path else pd.DataFrame()
-            if not macro_frame.empty:
-                _sync_cuda(device)
-                fc1_started = time.perf_counter()
-                fc1_summary, timing, rollout = evaluate_fc1_checkpoint(
-                    loaded.models["sdf_fc1"], macro_frame, device=device
-                )
-                _sync_cuda(device)
-                episode_timing["fc1_seconds"] = time.perf_counter() - fc1_started
-                row.update(fc1_summary)
-                row.update({
-                    "fc1_hatc_skill": fc1_summary.get("fc1_hatc_persistence_skill"),
-                    "fc1_lnk_skill": fc1_summary.get("fc1_lnk_persistence_skill"),
-                    "fc1_hatc_best_shift": fc1_summary.get("fc1_hatc_best_timing_shift"),
-                    "fc1_lnk_best_shift": fc1_summary.get("fc1_lnk_best_timing_shift"),
+                component_status["simulation"] = "ok"
+            except Exception as exc:
+                component_status["simulation"] = "error"
+                component_errors["simulation"] = f"{type(exc).__name__}: {exc}"
+                error_rows.append({
+                    "episode": episode, "stage": "simulation",
+                    "error_type": type(exc).__name__, "error": str(exc),
                 })
-                pd.DataFrame([fc1_summary]).to_csv(episode_root / "fc1" / "metrics.csv", index=False)
-                timing.to_csv(episode_root / "fc1" / "timing_alignment.csv", index=False)
-                rollout.to_csv(episode_root / "fc1" / "rollout.csv", index=False)
+        elif loaded is not None and firm_path is None:
+            write_json(episode_root / "simulation" / "missing.json", {"reason": "episode firm artifact absent"})
+            availability_notes.append(
+                f"Episode {episode}: episode firm artifact absent; on-distribution and simulation metrics unavailable"
+            )
+        elif loaded is not None:
+            write_json(
+                episode_root / "simulation" / "missing.json",
+                {"reason": "on-distribution parent bank could not be sampled"},
+            )
+
+        if loaded is not None:
+            try:
+                pd.DataFrame(episode_sdf_rows).to_csv(episode_root / "sdf" / "metrics.csv", index=False)
+                write_json(episode_root / "sdf" / "metadata.json", {
+                    "common": common_primary_meta,
+                    "ondist": ondist_primary_meta,
+                    "common_parent_bank_sha256": (
+                        common_parent_meta["parent_bank_sha256"] if common_parent_meta else None
+                    ),
+                    "shock_bank_max_children": int(canonical_max_j),
+                    "evaluated_child_counts": selected_child_counts,
+                })
+            except Exception as exc:
+                component_errors["sdf_artifacts"] = f"{type(exc).__name__}: {exc}"
+                error_rows.append({
+                    "episode": episode, "stage": "sdf_artifacts",
+                    "error_type": type(exc).__name__, "error": str(exc),
+                })
+
+        if loaded is not None:
+            try:
+                macro_frame = read_dataframe(macro_path) if macro_path else pd.DataFrame()
+            except Exception as exc:
+                macro_frame = pd.DataFrame()
+                component_errors["macro_artifact"] = f"{type(exc).__name__}: {exc}"
+                error_rows.append({
+                    "episode": episode, "stage": "macro_artifact",
+                    "error_type": type(exc).__name__, "error": str(exc),
+                })
+            if not macro_frame.empty:
+                try:
+                    _sync_cuda(device)
+                    fc1_started = time.perf_counter()
+                    fc1_summary, timing, rollout = evaluate_fc1_checkpoint(
+                        loaded.models["sdf_fc1"], macro_frame, device=device
+                    )
+                    _sync_cuda(device)
+                    episode_timing["fc1_seconds"] = time.perf_counter() - fc1_started
+                    row.update(fc1_summary)
+                    row.update({
+                        "fc1_hatc_skill": fc1_summary.get("fc1_hatc_persistence_skill"),
+                        "fc1_lnk_skill": fc1_summary.get("fc1_lnk_persistence_skill"),
+                        "fc1_hatc_best_shift": fc1_summary.get("fc1_hatc_best_timing_shift"),
+                        "fc1_lnk_best_shift": fc1_summary.get("fc1_lnk_best_timing_shift"),
+                    })
+                    pd.DataFrame([fc1_summary]).to_csv(episode_root / "fc1" / "metrics.csv", index=False)
+                    timing.to_csv(episode_root / "fc1" / "timing_alignment.csv", index=False)
+                    rollout.to_csv(episode_root / "fc1" / "rollout.csv", index=False)
+                    component_status["fc1"] = "ok"
+                except Exception as exc:
+                    component_status["fc1"] = "error"
+                    component_errors["fc1"] = f"{type(exc).__name__}: {exc}"
+                    error_rows.append({
+                        "episode": episode, "stage": "fc1",
+                        "error_type": type(exc).__name__, "error": str(exc),
+                    })
             else:
                 write_json(episode_root / "fc1" / "missing.json", {"reason": "macro artifact absent"})
                 availability_notes.append(f"Episode {episode}: FC1 unavailable because macro artifact is absent")
-            after = {
-                name: model_state_hash(loaded.models[name])
-                for name in active_model_names
-            }
-            if before != after:
-                raise RuntimeError("Full-run evaluator changed checkpoint model parameters")
-            missing_components = []
-            if firm_path is None:
-                missing_components.append("firm_data")
-            if macro_path is None:
-                missing_components.append("macro_data")
-            row.update({
-                "status": "partial" if missing_components else "ok",
-                "error": f"unavailable: {', '.join(missing_components)}" if missing_components else "",
-            })
-            episode_metadata.append({
-                "episode": episode, "checkpoint_sha256": _file_hash(checkpoint),
-                "model_hashes_before": before, "model_hashes_after": after,
-                "model_state_unchanged": True, "firm_metadata": firm_meta,
-                "checkpoint_load_count": 1,
-                "robustness_scope": args.robustness_scope,
-                "selected_child_shocks": selected_child_counts,
-                "common_sdf_parent_bank": common_parent_meta,
-                "ondist_sdf_parent_bank": ondist_parent_meta,
-                "common_sdf_metadata": common_primary_meta,
-                "ondist_sdf_metadata": ondist_primary_meta,
-                "config_invariant_snapshot": config_snapshot,
-                "config_hash": config_hash,
-            })
-        except Exception as exc:
-            row.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
-            error_rows.append({
-                "episode": episode, "stage": "evaluation",
-                "error_type": type(exc).__name__, "error": str(exc),
-            })
+
+        after: Dict[str, str] | None = None
+        model_state_violation: str | None = None
+        try:
+            pass
+        finally:
+            if loaded is not None and before is not None:
+                after = {
+                    name: model_state_hash(loaded.models[name])
+                    for name in active_model_names
+                }
+                if before != after:
+                    model_state_violation = "Full-run evaluator changed checkpoint model parameters"
+        if model_state_violation is not None:
+            raise RuntimeError(model_state_violation)
+
+        formal_statuses = [component_status[name] for name in FORMAL_COMPONENTS]
+        if all(value == "ok" for value in formal_statuses):
+            row["status"] = "ok"
+        elif any(value == "ok" for value in formal_statuses):
+            row["status"] = "partial"
+        else:
+            row["status"] = "error"
+        missing_components = [
+            name for name in FORMAL_COMPONENTS if component_status[name] == "missing"
+        ]
+        error_parts = [f"{name}: {message}" for name, message in sorted(component_errors.items())]
+        if missing_components:
+            error_parts.append("unavailable: " + ", ".join(missing_components))
+        row["error"] = "; ".join(error_parts)
+        for component_name, headline_name in COMPONENT_STATUS_COLUMNS.items():
+            row[headline_name] = component_status[component_name]
+        episode_metadata.append({
+            "episode": episode, "checkpoint_sha256": _file_hash(checkpoint),
+            "model_hashes_before": before, "model_hashes_after": after,
+            "model_state_unchanged": bool(before is not None and before == after),
+            "firm_metadata": firm_meta,
+            "checkpoint_load_count": int(episode_timing["checkpoint_load_count"]),
+            "robustness_scope": args.robustness_scope,
+            "selected_child_shocks": selected_child_counts,
+            "canonical_shock_bank_max_children": int(canonical_max_j),
+            "max_evaluated_children": max(selected_child_counts),
+            "common_sdf_parent_bank": common_parent_meta,
+            "ondist_sdf_parent_bank": ondist_parent_meta,
+            "common_sdf_metadata": common_primary_meta,
+            "ondist_sdf_metadata": ondist_primary_meta,
+            "component_status": dict(component_status),
+            "component_errors": dict(component_errors),
+            "config_invariant_snapshot": config_snapshot,
+            "config_hash": config_hash,
+        })
         _sync_cuda(device)
         if device.type == "cuda":
             episode_timing["cuda_peak_memory_mb"] = (
@@ -816,12 +1012,16 @@ def main() -> None:
         write_json(episode_root / "metadata.json", {
             "episode": episode,
             "status": row["status"],
+            "component_status": dict(component_status),
+            "component_errors": dict(component_errors),
             "checkpoint": row.get("checkpoint"),
             "firm_data": row.get("firm_data"),
             "macro_data": row.get("macro_data"),
             "representative_detailed_visuals": episode in representative,
             "robustness_scope": args.robustness_scope,
-            "selected_child_shocks": child_counts_by_episode[int(episode)],
+            "selected_child_shocks": list(selected_child_counts),
+            "canonical_shock_bank_max_children": int(canonical_max_j),
+            "max_evaluated_children": max(selected_child_counts),
             "error": row.get("error", ""),
         })
         pd.DataFrame([row]).to_csv(episode_root / "summary.csv", index=False)
@@ -864,6 +1064,14 @@ def main() -> None:
             columns={name: f"training_log_{name}" for name in parsed_log if name != "episode"}
         )
         headline = headline.merge(generic, on="episode", how="left")
+    logged_episodes = set(parsed_log["episode"].astype(int).tolist()) if not parsed_log.empty else set()
+    if "episode" in headline.columns:
+        headline["training_log_status"] = headline["episode"].astype(int).map(
+            lambda value: "ok" if value in logged_episodes else "missing"
+        )
+    for item in episode_metadata:
+        if int(item["episode"]) in logged_episodes:
+            item.setdefault("component_status", {})["training_log"] = "ok"
     missing = MissingArtifacts()
     for episode in log_meta.get("sdf_primary_selection", {}).get("ambiguous_episodes", []):
         missing.add(
@@ -988,6 +1196,37 @@ def main() -> None:
         "fc1_seconds": float(pd.to_numeric(
             timing_frame.get("fc1_seconds"), errors="coerce"
         ).sum()),
+        "bp_model_forward_calls": int(pd.to_numeric(
+            timing_frame.get("bp_model_forward_calls"), errors="coerce"
+        ).fillna(0).sum()),
+        "bp_child_equity_forward_calls": int(pd.to_numeric(
+            timing_frame.get("bp_child_equity_forward_calls"), errors="coerce"
+        ).fillna(0).sum()),
+        "bp_q_forward_calls": int(pd.to_numeric(
+            timing_frame.get("bp_q_forward_calls"), errors="coerce"
+        ).fillna(0).sum()),
+        "bp_parent_chunks": int(pd.to_numeric(
+            timing_frame.get("bp_parent_chunks"), errors="coerce"
+        ).fillna(0).sum()),
+        "bp_candidate_chunks": int(pd.to_numeric(
+            timing_frame.get("bp_candidate_chunks"), errors="coerce"
+        ).fillna(0).sum()),
+        "bp_max_expanded_states": int(pd.to_numeric(
+            timing_frame.get("bp_max_expanded_states"), errors="coerce"
+        ).fillna(0).max()) if not timing_frame.empty else 0,
+        "bp_max_actual_expanded_states": int(pd.to_numeric(
+            timing_frame.get("bp_max_actual_expanded_states"), errors="coerce"
+        ).fillna(0).max()) if not timing_frame.empty else 0,
+        "bp_multi_j_reuse_enabled": bool(
+            pd.to_numeric(
+                timing_frame.get("bp_multi_j_reuse_enabled"), errors="coerce"
+            ).fillna(0).astype(bool).any()
+        ) if not timing_frame.empty else False,
+        "bp_branch_reuse_enabled": bool(
+            pd.to_numeric(
+                timing_frame.get("bp_branch_reuse_enabled"), errors="coerce"
+            ).fillna(0).astype(bool).any()
+        ) if not timing_frame.empty else False,
         "cuda_peak_memory_mb": aggregate_episode_peak_memory(
             [item.get("cuda_peak_memory_mb") for item in timing_rows]
         ),
@@ -1018,7 +1257,18 @@ def main() -> None:
         },
         "common_shock_bank": {
             "seed": args.shock_seed,
-            "max_children": max(max(values) for values in child_counts_by_episode.values()),
+            "canonical_shock_bank_max_children": canonical_bank_max_children(
+                args.n_child_shocks, args.robustness_child_shocks
+            ),
+            "max_children": canonical_bank_max_children(
+                args.n_child_shocks, args.robustness_child_shocks
+            ),
+            "evaluated_child_counts": sorted({
+                int(value) for values in child_counts_by_episode.values() for value in values
+            }),
+            "max_evaluated_children": max(
+                int(value) for values in child_counts_by_episode.values() for value in values
+            ),
             "robustness_children": args.robustness_child_shocks,
             "robustness_scope": args.robustness_scope,
             "selected_children_by_episode": child_counts_by_episode,

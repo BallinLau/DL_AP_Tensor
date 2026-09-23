@@ -12,7 +12,12 @@ sys.path.append(str(ROOT))
 from models import PolicyValueModel
 from losses.p0_loss import P0Loss
 from losses.pi_loss import PILoss
-from config import Config
+from config import Config, HyperParams
+from evaluation.bp_diagnostics import (
+    BP_EVAL_ALLOWED_EXPANDED_STATES,
+    BP_EVAL_SAFE_DEFAULT_EXPANDED_STATES,
+    resolve_bp_eval_max_expanded_states,
+)
 from training.bp_grid_teacher import (
     BPGridTeacher,
     _forward_equity_grid_children,
@@ -561,6 +566,142 @@ class PolicyChildVectorizationTest(unittest.TestCase):
             torch.testing.assert_close(
                 dynamically_chunked[key], one_shot[key], rtol=1e-5, atol=1e-6
             )
+
+    def test_multi_j_branch_reuse_matches_legacy_single_j_compute(self):
+        torch.manual_seed(2024)
+        batch_size = 4
+        n_children_max = 16  # expanded children of Jmax=8
+        children = _make_children(batch_size=batch_size, n_children=n_children_max)
+        m_list = [
+            torch.full((batch_size, 1), 0.88 + 0.005 * index, dtype=torch.float64)
+            for index in range(n_children_max)
+        ]
+        base_parent = torch.randn(batch_size, 7, dtype=torch.float64)
+        base_parent[:, 0:1] = torch.sigmoid(base_parent[:, 0:1])
+        base_parent[:, 2:3] = torch.sigmoid(base_parent[:, 2:3])
+        branch_states = []
+        bp_preds = []
+        for i_value in (0.15, 0.35):
+            state = base_parent.clone()
+            state[:, 3] = i_value
+            branch_states.append(state)
+            bp_preds.append(
+                torch.linspace(0.1, 0.9, batch_size, dtype=torch.float64).reshape(-1, 1)
+            )
+        prefix_counts = [4, 8, 16]
+        weights = torch.linspace(1.0, 2.0, n_children_max, dtype=torch.float64)
+        common = dict(
+            p0_loss_fn=P0Loss(),
+            pi_loss_fn=PILoss(),
+            coarse_size=7,
+            fine_size=5,
+            refine=True,
+            quadratic_refine=False,
+            parent_chunk_size=0,
+            max_expanded_states=24,
+        )
+        multi_teacher = BPGridTeacher(
+            target_model=_CountingTargetModel().to(dtype=torch.float64),
+            **common,
+        )
+        bundles = multi_teacher.compute_multi_j_branches(
+            branch_states,
+            torch.stack(children, dim=1),
+            torch.stack(m_list, dim=1),
+            branches=["p0", "pi"],
+            prefix_child_counts=prefix_counts,
+            child_weights=weights,
+            bp_preds=bp_preds,
+        )
+        stats = multi_teacher.forward_stats()
+        self.assertTrue(stats["bp_multi_j_reuse_enabled"])
+        self.assertTrue(stats["bp_branch_reuse_enabled"])
+        self.assertLessEqual(
+            stats["bp_max_actual_expanded_states"], stats["bp_max_expanded_states"]
+        )
+
+        keys = (
+            "bp_star",
+            "bp_star_grid",
+            "value_star",
+            "regret",
+            "top2_margin",
+            "confidence",
+            "q_issue_at_star",
+            "p_child_at_star",
+            "default_at_star",
+            "coarse_value_grid",
+            "coarse_bp_grid",
+        )
+        legacy_equity_calls = 0
+        for index, branch in enumerate(("p0", "pi")):
+            for count in prefix_counts:
+                legacy_teacher = BPGridTeacher(
+                    target_model=_CountingTargetModel().to(dtype=torch.float64),
+                    **common,
+                )
+                legacy = legacy_teacher.compute(
+                    branch_states[index],
+                    children[:count],
+                    m_list[:count],
+                    branch=branch,
+                    bp_pred=bp_preds[index],
+                    child_weights=weights[:count],
+                )
+                legacy_equity_calls += legacy_teacher.target_model.equity_calls
+                optimized = bundles[index][count]
+                for key in keys:
+                    torch.testing.assert_close(
+                        optimized[key], legacy[key], rtol=1e-5, atol=1e-6
+                    )
+        self.assertLess(
+            multi_teacher.target_model.equity_calls, legacy_equity_calls
+        )
+
+    def test_bp_eval_budget_override_is_evaluator_only_and_numerically_neutral(self):
+        self.assertEqual(BP_EVAL_ALLOWED_EXPANDED_STATES, (65536, 131072, 262144, 524288))
+        self.assertEqual(BP_EVAL_SAFE_DEFAULT_EXPANDED_STATES, 65536)
+        cpu = torch.device("cpu")
+        budget, resolution = resolve_bp_eval_max_expanded_states(None, cpu)
+        self.assertEqual((budget, resolution["mode"]), (65536, "cpu_safe_default"))
+        budget, resolution = resolve_bp_eval_max_expanded_states(262144, cpu)
+        self.assertEqual((budget, resolution["mode"]), (262144, "explicit"))
+        with self.assertRaises(ValueError):
+            resolve_bp_eval_max_expanded_states(1234, cpu)
+
+        hyperparams = HyperParams()
+        hyperparams.bp_grid_max_expanded_states = 65536
+        small = BPGridTeacher.from_hyperparams(
+            _CountingTargetModel().to(dtype=torch.float64),
+            P0Loss(), PILoss(), hyperparams,
+            max_expanded_states_override=8,
+        )
+        large = BPGridTeacher.from_hyperparams(
+            _CountingTargetModel().to(dtype=torch.float64),
+            P0Loss(), PILoss(), hyperparams,
+            max_expanded_states_override=65536,
+        )
+        self.assertEqual(small.max_expanded_states, 8)
+        self.assertEqual(large.max_expanded_states, 65536)
+        # The override is evaluator-only: checkpoint hyperparams stay untouched.
+        self.assertEqual(int(hyperparams.bp_grid_max_expanded_states), 65536)
+
+        torch.manual_seed(11)
+        batch_size = 4
+        children = _make_children(batch_size=batch_size, n_children=8)
+        m_list = [torch.full((batch_size, 1), 0.9, dtype=torch.float64) for _ in range(8)]
+        parent = torch.randn(batch_size, 7, dtype=torch.float64)
+        parent[:, 0:1] = torch.sigmoid(parent[:, 0:1])
+        parent[:, 2:3] = torch.sigmoid(parent[:, 2:3])
+        bp_pred = torch.linspace(0.1, 0.9, batch_size, dtype=torch.float64).reshape(-1, 1)
+        budgeted = small.compute(parent, children, m_list, branch="p0", bp_pred=bp_pred)
+        unbudgeted = large.compute(parent, children, m_list, branch="p0", bp_pred=bp_pred)
+        self.assertLess(
+            small.forward_stats()["bp_max_actual_expanded_states"],
+            large.forward_stats()["bp_max_actual_expanded_states"],
+        )
+        for key in ("bp_star", "bp_star_grid", "value_star", "regret", "coarse_value_grid"):
+            torch.testing.assert_close(budgeted[key], unbudgeted[key], rtol=1e-6, atol=1e-8)
 
     def test_parent_eta_zero_does_not_mask_target_when_child_eta_can_refinance(self):
         batch_size = 2

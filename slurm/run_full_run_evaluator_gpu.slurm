@@ -39,6 +39,10 @@ Z_POINTS="${Z_POINTS:-101}"
 I_POINTS="${I_POINTS:-101}"
 FORWARD_CHUNK_SIZE="${FORWARD_CHUNK_SIZE:-8192}"
 BP_TEACHER_MARGIN_TOL="${BP_TEACHER_MARGIN_TOL:-1e-8}"
+# Evaluator-only BP chunk budget (65536/131072/262144/524288). Empty means "auto":
+# >=70GiB -> 262144, >=35GiB -> 131072, otherwise 65536. An explicit value always wins.
+# This only changes read-only evaluator chunking; training semantics and model state are untouched.
+BP_EVAL_MAX_EXPANDED_STATES="${BP_EVAL_MAX_EXPANDED_STATES:-}"
 RUN_EVALUATOR_TESTS="${RUN_EVALUATOR_TESTS:-1}"
 ALLOW_DIRTY_WORKTREE="${ALLOW_DIRTY_WORKTREE:-0}"
 OVERWRITE="${OVERWRITE:-0}"
@@ -69,6 +73,7 @@ echo "Training log: ${TRAINING_LOG:-auto/unavailable}"
 echo "Device: $DEVICE"
 echo "Child shocks: primary=$N_CHILD_SHOCKS robustness=$ROBUSTNESS_CHILD_SHOCKS"
 echo "Robustness scope: $ROBUSTNESS_SCOPE"
+echo "BP evaluator budget (BP_EVAL_MAX_EXPANDED_STATES): ${BP_EVAL_MAX_EXPANDED_STATES:-auto}"
 echo "Overwrite evaluator output: $OVERWRITE"
 echo "Grid: b=[$B_MIN,$B_MAX]x$B_POINTS z=[$Z_MIN,$Z_MAX]x$Z_POINTS"
 echo "============================================================"
@@ -95,6 +100,8 @@ print("cuda_device_count:", torch.cuda.device_count())
 if not torch.cuda.is_available():
     raise SystemExit("CUDA is not available on this allocation")
 print("cuda_device_0:", torch.cuda.get_device_name(0))
+total_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+print(f"cuda_device_0_total_memory_gib: {total_gib:.2f}")
 PY
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi
@@ -105,10 +112,15 @@ python3 -m py_compile \
   experiments/evaluate_checkpoints.py \
   evaluation/full_run_diagnostics.py \
   evaluation/bellman_diagnostics.py \
+  evaluation/bp_diagnostics.py \
+  training/bp_grid_teacher.py \
   analysis/checkpoint_loader.py
 
 if [[ "$RUN_EVALUATOR_TESTS" == "1" ]]; then
-  python3 -m pytest tests/test_full_run_evaluator.py tests/test_checkpoint_evaluator.py -q
+  python3 -m pytest \
+    tests/test_full_run_evaluator.py \
+    tests/test_checkpoint_evaluator.py \
+    tests/test_policy_child_vectorization.py -q
 fi
 
 ARGS=(
@@ -134,8 +146,39 @@ ARGS+=(--robustness-child-shocks "${ROBUSTNESS_ARGS[@]}" --eta-values "${ETA_ARG
 [[ -n "$REFERENCE_MACRO_DATA" ]] && ARGS+=(--reference-macro-data "$REFERENCE_MACRO_DATA")
 [[ "$ALLOW_DIRTY_WORKTREE" == "1" ]] && ARGS+=(--allow-dirty-worktree)
 [[ "$OVERWRITE" == "1" ]] && ARGS+=(--overwrite)
+[[ -n "$BP_EVAL_MAX_EXPANDED_STATES" ]] && ARGS+=(--bp-eval-max-expanded-states "$BP_EVAL_MAX_EXPANDED_STATES")
 
 python3 -u experiments/evaluate_full_run.py "${ARGS[@]}"
+
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+output = Path(os.environ["OUTPUT_DIR"])
+metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
+timing = json.loads((output / "evaluation_timing.json").read_text(encoding="utf-8"))
+bank = metadata.get("common_shock_bank", {})
+print("------------------------------------------------------------")
+print("Evaluator BP summary")
+print("canonical_shock_bank_max_children:", bank.get("canonical_shock_bank_max_children"))
+print("evaluated_child_counts:", bank.get("evaluated_child_counts"))
+print("max_evaluated_children:", bank.get("max_evaluated_children"))
+print("primary_n_child_shocks:", metadata.get("primary_n_child_shocks"))
+print("robustness_child_shocks:", metadata.get("robustness_child_shocks"))
+print("robustness_scope:", metadata.get("robustness_scope"))
+print("bp_max_expanded_states:", timing.get("bp_max_expanded_states"))
+print("bp_max_actual_expanded_states:", timing.get("bp_max_actual_expanded_states"))
+print("bp_multi_j_reuse_enabled:", timing.get("bp_multi_j_reuse_enabled"))
+print("bp_branch_reuse_enabled:", timing.get("bp_branch_reuse_enabled"))
+print("bp_model_forward_calls:", timing.get("bp_model_forward_calls"))
+print("bp_child_equity_forward_calls:", timing.get("bp_child_equity_forward_calls"))
+print("bp_q_forward_calls:", timing.get("bp_q_forward_calls"))
+print("bp_seconds:", timing.get("bp_seconds"))
+print("total_seconds:", timing.get("total_seconds"))
+print("cuda_peak_memory_mb:", timing.get("cuda_peak_memory_mb"))
+print("------------------------------------------------------------")
+PY
 
 for required in \
   headline_metrics.csv \

@@ -137,9 +137,26 @@ def compute_simulated_moments(frame: pd.DataFrame) -> tuple[dict[str, float], li
     return row, unavailable
 
 
-def regression_metrics(calculated: np.ndarray, forecast: np.ndarray) -> dict[str, float]:
-    x = np.asarray(calculated, dtype=np.float64).reshape(-1)
-    y = np.asarray(forecast, dtype=np.float64).reshape(-1)
+def regression_metrics(
+    calculated: np.ndarray,
+    forecast: np.ndarray,
+    *,
+    calculated_name: str | None = None,
+    forecast_name: str | None = None,
+) -> dict[str, float]:
+    raw_x = np.asarray(calculated, dtype=np.float64)
+    raw_y = np.asarray(forecast, dtype=np.float64)
+    if raw_x.shape != raw_y.shape:
+        x_label = "calculated" if calculated_name is None else f"calculated ({calculated_name})"
+        y_label = "forecast" if forecast_name is None else f"forecast ({forecast_name})"
+        raise ValueError(
+            "regression_metrics requires identically shaped inputs; got "
+            f"{x_label} shape {raw_x.shape} vs {y_label} shape {raw_y.shape}. "
+            "This usually means a duplicate column was selected from a pandas "
+            "DataFrame (which returns a DataFrame, not a Series)."
+        )
+    x = raw_x.reshape(-1)
+    y = raw_y.reshape(-1)
     mask = np.isfinite(x) & np.isfinite(y)
     x, y = x[mask], y[mask]
     if x.size < 2:

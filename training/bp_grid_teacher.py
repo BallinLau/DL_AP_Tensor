@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -30,6 +30,21 @@ class GridChunkPlan:
     n_grid: int
     expanded_states_per_forward: int
     max_expanded_states: int
+
+
+@dataclass(frozen=True)
+class _EquityBlock:
+    """Branch-independent candidate child equity block.
+
+    ``p_child``/``bar_z_child``/``child_b_grid`` depend only on the frozen child
+    states, the candidate bp grid, and the parent leverage. They never depend on
+    the P0/PI branch, so the same block can be reused for every branch (and, when
+    evaluated over the full Jmax child set, for every nested J prefix).
+    """
+
+    p_child: torch.Tensor
+    bar_z_child: torch.Tensor
+    child_b_grid: torch.Tensor
 
 
 def resolve_grid_chunk_plan(
@@ -135,6 +150,16 @@ def _slice_child_axis(
     if isinstance(values, torch.Tensor):
         return values[start:stop]
     return [value[start:stop] for value in values]
+
+
+def _slice_prefix_weights(
+    weights: Optional[torch.Tensor],
+    count: int,
+) -> Optional[torch.Tensor]:
+    """Nested child-weight prefix; ``normalize_child_weights`` renormalizes it."""
+    if weights is None:
+        return None
+    return weights[..., : int(count)]
 
 
 def _expand_candidates(base: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
@@ -296,9 +321,66 @@ class BPGridTeacher:
         self.confidence_relative = bool(confidence_relative)
         self.confidence_min = min(max(float(confidence_min), 0.0), 1.0)
         self._logged_grid_chunk_plans: set[tuple[int, int]] = set()
+        self._recorded_grid_chunk_plans: Dict[tuple[int, int], Dict[str, int]] = {}
+        self._forward_stats: Dict[str, Any] = self._empty_forward_stats()
+
+    def _empty_forward_stats(self) -> Dict[str, Any]:
+        return {
+            "bp_model_forward_calls": 0,
+            "bp_child_equity_forward_calls": 0,
+            "bp_q_forward_calls": 0,
+            "bp_parent_chunks": 0,
+            "bp_candidate_chunks": 0,
+            "bp_max_expanded_states": int(self.max_expanded_states),
+            "bp_max_actual_expanded_states": 0,
+            "bp_multi_j_reuse_enabled": False,
+            "bp_branch_reuse_enabled": False,
+        }
+
+    def reset_forward_stats(self) -> None:
+        self._forward_stats = self._empty_forward_stats()
+        self._recorded_grid_chunk_plans = {}
+
+    def forward_stats(self) -> Dict[str, Any]:
+        """Return a copy of the BP hot-path instrumentation counters."""
+        return dict(self._forward_stats)
+
+    def grid_chunk_plans(self) -> List[Dict[str, int]]:
+        """Return the effective chunk plans used since the last reset."""
+        return [dict(value) for _, value in sorted(self._recorded_grid_chunk_plans.items())]
+
+    def _record_q_forward(self) -> None:
+        self._forward_stats["bp_q_forward_calls"] += 1
+        self._forward_stats["bp_model_forward_calls"] += 1
+
+    def _record_equity_forward(self, expanded_states: int) -> None:
+        self._forward_stats["bp_child_equity_forward_calls"] += 1
+        self._forward_stats["bp_model_forward_calls"] += 1
+        self._forward_stats["bp_max_actual_expanded_states"] = max(
+            int(self._forward_stats["bp_max_actual_expanded_states"]),
+            int(expanded_states),
+        )
+
+    def _record_candidate_chunk(self, expanded_states: int) -> None:
+        self._forward_stats["bp_candidate_chunks"] += 1
+        self._forward_stats["bp_max_actual_expanded_states"] = max(
+            int(self._forward_stats["bp_max_actual_expanded_states"]),
+            int(expanded_states),
+        )
+
+    def _record_parent_chunk(self) -> None:
+        self._forward_stats["bp_parent_chunks"] += 1
 
     def _log_grid_chunk_plan(self, plan: GridChunkPlan) -> None:
         log_key = (plan.n_grid, plan.n_children)
+        self._recorded_grid_chunk_plans[log_key] = {
+            "n_grid": int(plan.n_grid),
+            "n_children": int(plan.n_children),
+            "parent_chunk_effective": int(plan.parent_chunk_effective),
+            "candidate_chunk_effective": int(plan.candidate_chunk_effective),
+            "expanded_states_per_forward": int(plan.expanded_states_per_forward),
+            "max_expanded_states": int(plan.max_expanded_states),
+        }
         if log_key in self._logged_grid_chunk_plans:
             return
         logger.info(
@@ -316,7 +398,18 @@ class BPGridTeacher:
         self._logged_grid_chunk_plans.add(log_key)
 
     @classmethod
-    def from_hyperparams(cls, target_model, p0_loss_fn, pi_loss_fn, hyperparams) -> "BPGridTeacher":
+    def from_hyperparams(
+        cls,
+        target_model,
+        p0_loss_fn,
+        pi_loss_fn,
+        hyperparams,
+        *,
+        max_expanded_states_override: Optional[int] = None,
+    ) -> "BPGridTeacher":
+        max_expanded_states = int(getattr(hyperparams, "bp_grid_max_expanded_states", 65536))
+        if max_expanded_states_override is not None:
+            max_expanded_states = int(max_expanded_states_override)
         return cls(
             target_model,
             p0_loss_fn,
@@ -329,7 +422,7 @@ class BPGridTeacher:
             quadratic_refine=bool(getattr(hyperparams, "bp_grid_quadratic_refine", False)),
             parent_chunk_size=int(getattr(hyperparams, "bp_grid_parent_chunk_size", 2048)),
             candidate_chunk_size=int(getattr(hyperparams, "bp_grid_candidate_chunk_size", 0)),
-            max_expanded_states=int(getattr(hyperparams, "bp_grid_max_expanded_states", 65536)),
+            max_expanded_states=max_expanded_states,
             margin_scale=float(getattr(hyperparams, "bp_grid_margin_scale", 1e-3)),
             confidence_relative=bool(getattr(hyperparams, "bp_grid_confidence_relative", True)),
             confidence_min=float(getattr(hyperparams, "bp_grid_confidence_min", 0.0)),
@@ -458,6 +551,241 @@ class BPGridTeacher:
             child_weights=child_weights,
         )
 
+    def compute_multi_j_branches(
+        self,
+        parent_states: Sequence[torch.Tensor],
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
+        *,
+        branches: Sequence[str],
+        prefix_child_counts: Sequence[int],
+        child_weights: Optional[torch.Tensor] = None,
+        bp_preds: Optional[Sequence[Optional[torch.Tensor]]] = None,
+        mix_weights: Optional[Sequence[Optional[torch.Tensor]]] = None,
+    ) -> List[Dict[int, Dict[str, torch.Tensor]]]:
+        """Evaluate several branches over nested child prefixes sharing one forward.
+
+        ``children``/``m_list`` must hold the largest (Jmax) child set. Every entry
+        of ``prefix_child_counts`` is evaluated on its nested prefix along the child
+        axis, which reproduces ``slice_frozen_transition_data`` semantics because the
+        exact-eta expansion keeps continuous child ``j`` at expanded positions
+        ``2j``/``2j+1``.
+
+        Sharing rules (all of them are exact, not approximations):
+
+        * the branch-independent candidate child-equity block
+          (``P_child``/``bar_z_child``/``child_b_grid``) depends only on the children,
+          the candidate bp grid and parent leverage, so it is computed once per
+          coarse candidate chunk and reused by every branch *and* every prefix;
+        * the coarse uniform candidate grid is identical for every branch;
+        * ``q_current`` and the coarse ``q_issue`` grid are prefix independent, so
+          they are computed once per branch;
+        * fine-grid candidates stay branch- and prefix-specific because the coarse
+          argmax (and therefore the local grid) differs between them.
+
+        Returns one ``{prefix_child_count: result}`` mapping per requested branch, in
+        the same order as ``branches``. Each result matches ``compute(...)`` on the
+        sliced child prefix.
+        """
+        branch_labels = [str(branch).lower() for branch in branches]
+        for branch in branch_labels:
+            if branch not in {"p0", "pi", "mix"}:
+                raise ValueError(f"Unknown branch: {branch}")
+            if branch == "mix" and mix_weights is None:
+                raise ValueError("mix_weights is required for branch='mix'")
+        states = [
+            state if isinstance(state, torch.Tensor) else torch.as_tensor(state)
+            for state in parent_states
+        ]
+        if not states:
+            raise ValueError("compute_multi_j_branches requires at least one parent state tensor")
+        batch_size = int(states[0].shape[0])
+        for state in states:
+            if int(state.shape[0]) != batch_size:
+                raise ValueError("all branch parent states must share the same batch size")
+        reference_leverage = states[0][:, 0:1]
+        for state in states[1:]:
+            if not torch.equal(state[:, 0:1], reference_leverage):
+                raise ValueError(
+                    "compute_multi_j_branches requires identical parent leverage (column 0) "
+                    "across branches so the child-equity block can be shared"
+                )
+        children_tensor = _stack_children(children)
+        m_tensor = _stack_m(m_list)
+        n_children = int(children_tensor.shape[1])
+        counts = sorted({int(value) for value in prefix_child_counts})
+        if not counts:
+            raise ValueError("compute_multi_j_branches requires at least one prefix child count")
+        if counts[0] < 1 or counts[-1] > n_children:
+            raise ValueError(
+                f"prefix child counts must lie in [1, {n_children}], got {counts}"
+            )
+        if bp_preds is not None and len(bp_preds) != len(states):
+            raise ValueError("bp_preds must provide one entry per branch")
+        if mix_weights is not None and len(mix_weights) != len(states):
+            raise ValueError("mix_weights must provide one entry per branch")
+
+        grid_sizes = {self.coarse_size, self.fine_size} if self.refine else {self.coarse_size}
+        plans = [
+            resolve_grid_chunk_plan(
+                n_parent=batch_size,
+                n_grid=grid_size,
+                n_children=n_children,
+                configured_parent_chunk=self.parent_chunk_size,
+                configured_candidate_chunk=self.candidate_chunk_size,
+                max_expanded_states=self.max_expanded_states,
+            )
+            for grid_size in grid_sizes
+        ]
+        for plan in plans:
+            self._log_grid_chunk_plan(plan)
+        parent_chunk_size = min(plan.parent_chunk_effective for plan in plans)
+
+        if len(counts) > 1:
+            self._forward_stats["bp_multi_j_reuse_enabled"] = True
+        if len(states) > 1:
+            self._forward_stats["bp_branch_reuse_enabled"] = True
+
+        collected: List[Dict[int, List[Dict[str, torch.Tensor]]]] = [
+            {count: [] for count in counts} for _ in states
+        ]
+        with torch.no_grad():
+            for start in range(0, batch_size, parent_chunk_size):
+                stop = min(start + parent_chunk_size, batch_size)
+                chunk_states = [state[start:stop] for state in states]
+                child_chunk = children_tensor[start:stop]
+                m_chunk = m_tensor[start:stop]
+                weights_chunk = (
+                    child_weights[start:stop]
+                    if child_weights is not None and child_weights.ndim > 1
+                    else child_weights
+                )
+                self._record_parent_chunk()
+                coarse_grid = self._uniform_grid(chunk_states[0], self.coarse_size)
+                n_grid = int(coarse_grid.shape[1])
+                candidate_plan = resolve_grid_chunk_plan(
+                    n_parent=stop - start,
+                    n_grid=n_grid,
+                    n_children=n_children,
+                    configured_parent_chunk=stop - start,
+                    configured_candidate_chunk=self.candidate_chunk_size,
+                    max_expanded_states=self.max_expanded_states,
+                )
+                if candidate_plan.parent_chunk_effective != stop - start:
+                    raise RuntimeError(
+                        "BP parent batch reached grid evaluation above the resolved hard cap; "
+                        "compute_multi_j_branches() must apply the parent chunk plan first"
+                    )
+                self._log_grid_chunk_plan(candidate_plan)
+                candidate_chunk = candidate_plan.candidate_chunk_effective
+                q_current_by_branch: List[Optional[torch.Tensor]] = [
+                    None for _ in states
+                ]
+                coarse_parts: List[Dict[int, List[Dict[str, torch.Tensor]]]] = [
+                    {count: [] for count in counts} for _ in states
+                ]
+                for grid_start in range(0, n_grid, candidate_chunk):
+                    grid_stop = min(grid_start + candidate_chunk, n_grid)
+                    sub_grid = coarse_grid[:, grid_start:grid_stop]
+                    equity = self._child_equity_block(
+                        child_chunk, sub_grid, chunk_states[0][:, 0:1]
+                    )
+                    self._record_candidate_chunk(int(equity.p_child.numel()))
+                    for index, branch in enumerate(branch_labels):
+                        state_chunk = chunk_states[index]
+                        if q_current_by_branch[index] is None:
+                            q_current_by_branch[index] = _target_q(self.target_model, state_chunk)
+                            self._record_q_forward()
+                        q_issue = self._q_issue_grid(state_chunk, sub_grid)
+                        for count in counts:
+                            coarse_parts[index][count].append(
+                                self._branch_objective_grid(
+                                    state_chunk,
+                                    sub_grid,
+                                    branch=branch,
+                                    p_child=equity.p_child[:, :, :count],
+                                    bar_z_child=equity.bar_z_child[:, :, :count],
+                                    child_b_grid=equity.child_b_grid[:, :, :count],
+                                    child_eta_next=child_chunk[:, :count, 2],
+                                    m_tensor=m_chunk[:, :count, :],
+                                    q_current=q_current_by_branch[index],
+                                    q_issue=q_issue,
+                                    mix_weight=(
+                                        mix_weights[index][start:stop]
+                                        if mix_weights is not None and mix_weights[index] is not None
+                                        else None
+                                    ),
+                                    child_weights=_slice_prefix_weights(weights_chunk, count),
+                                )
+                            )
+                for index, branch in enumerate(branch_labels):
+                    for count in counts:
+                        parts = coarse_parts[index][count]
+                        coarse = {
+                            "bp_grid": torch.cat([part["bp_grid"] for part in parts], dim=1),
+                            "value_grid": torch.cat([part["value_grid"] for part in parts], dim=1),
+                            "cashflow_grid_mean": torch.cat(
+                                [part["cashflow_grid_mean"] for part in parts], dim=1
+                            ),
+                            "continuation_grid_mean": torch.cat(
+                                [part["continuation_grid_mean"] for part in parts], dim=1
+                            ),
+                            "q_issue_grid": torch.cat(
+                                [part["q_issue_grid"] for part in parts], dim=1
+                            ),
+                            "p_child_grid_mean": torch.cat(
+                                [part["p_child_grid_mean"] for part in parts], dim=1
+                            ),
+                            "default_grid_mean": torch.cat(
+                                [part["default_grid_mean"] for part in parts], dim=1
+                            ),
+                            "eta_next_active_share": torch.cat(
+                                [part["eta_next_active_share"] for part in parts], dim=1
+                            ),
+                            "child_b_mean": torch.cat(
+                                [part["child_b_mean"] for part in parts], dim=1
+                            ),
+                            "child_b_eta0_mean": torch.cat(
+                                [part["child_b_eta0_mean"] for part in parts], dim=1
+                            ),
+                            "child_b_eta1_mean": torch.cat(
+                                [part["child_b_eta1_mean"] for part in parts], dim=1
+                            ),
+                        }
+                        coarse["argmax_index"] = coarse["value_grid"].argmax(
+                            dim=1, keepdim=True
+                        )
+                        bp_pred = None
+                        if bp_preds is not None and bp_preds[index] is not None:
+                            bp_pred = bp_preds[index][start:stop]
+                        collected[index][count].append(
+                            self._finalize_grid_result(
+                                chunk_states[index],
+                                child_chunk[:, :count],
+                                m_chunk[:, :count],
+                                coarse,
+                                branch=branch,
+                                mix_weight=(
+                                    mix_weights[index][start:stop]
+                                    if mix_weights is not None and mix_weights[index] is not None
+                                    else None
+                                ),
+                                child_weights=_slice_prefix_weights(weights_chunk, count),
+                                bp_pred=bp_pred,
+                                diagnostics=True,
+                            )
+                        )
+
+        results: List[Dict[int, Dict[str, torch.Tensor]]] = []
+        for index in range(len(states)):
+            results.append(
+                {
+                    count: _concat_chunk_outputs(collected[index][count])
+                    for count in counts
+                }
+            )
+        return results
+
     def _compute_value_target_no_parent_chunk(
         self,
         parent_state: torch.Tensor,
@@ -468,45 +796,16 @@ class BPGridTeacher:
         child_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         with torch.no_grad():
+            self._record_parent_chunk()
             coarse_grid = self._uniform_grid(parent_state, self.coarse_size)
             coarse = self._evaluate_grid(
                 parent_state, children, m_list, coarse_grid,
                 branch=branch, child_weights=child_weights,
             )
-            if self.refine:
-                fine_grid = self._local_fine_grid(coarse_grid, coarse["argmax_index"])
-                result = self._evaluate_grid(
-                    parent_state, children, m_list, fine_grid,
-                    branch=branch, child_weights=child_weights,
-                )
-            else:
-                result = coarse
-            argmax_index = result["argmax_index"]
-            bp_star_grid = _gather_by_index(result["bp_grid"], argmax_index)
-            bp_star = _quadratic_refine(
-                result["bp_grid"],
-                result["value_grid"],
-                argmax_index,
-                bp_star_grid,
-                self.quadratic_refine,
-            ).clamp(self.grid_min, self.grid_max)
-            if self.quadratic_refine:
-                refined_eval = self._evaluate_grid(
-                    parent_state,
-                    children,
-                    m_list,
-                    bp_star,
-                    branch=branch,
-                    child_weights=child_weights,
-                )
-                value_star = refined_eval["value_grid"][:, 0:1]
-            else:
-                value_star = _gather_by_index(result["value_grid"], argmax_index)
-            return {
-                "value_star": value_star.detach(),
-                "bp_star": bp_star.detach(),
-                "bp_star_grid": bp_star_grid.detach(),
-            }
+            return self._finalize_grid_result(
+                parent_state, children, m_list, coarse, branch=branch,
+                child_weights=child_weights, diagnostics=False,
+            )
 
     def _compute_no_parent_chunk(
         self,
@@ -520,111 +819,145 @@ class BPGridTeacher:
         child_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         with torch.no_grad():
+            self._record_parent_chunk()
             coarse_grid = self._uniform_grid(parent_state, self.coarse_size)
             coarse = self._evaluate_grid(
                 parent_state, children, m_list, coarse_grid, branch=branch,
                 mix_weight=mix_weight, child_weights=child_weights,
             )
-            if self.refine:
-                fine_grid = self._local_fine_grid(coarse_grid, coarse["argmax_index"])
-                result = self._evaluate_grid(
-                    parent_state, children, m_list, fine_grid, branch=branch,
-                    mix_weight=mix_weight, child_weights=child_weights,
-                )
-            else:
-                result = coarse
-
-            argmax_index = result["argmax_index"]
-            bp_star_grid = _gather_by_index(result["bp_grid"], argmax_index)
-            bp_star = _quadratic_refine(
-                result["bp_grid"],
-                result["value_grid"],
-                argmax_index,
-                bp_star_grid,
-                self.quadratic_refine,
-            ).clamp(self.grid_min, self.grid_max)
-            if self.quadratic_refine:
-                refined_eval = self._evaluate_grid(
-                    parent_state,
-                    children,
-                    m_list,
-                    bp_star,
-                    branch=branch,
-                    mix_weight=mix_weight,
-                    child_weights=child_weights,
-                )
-                value_star = refined_eval["value_grid"][:, 0:1]
-                q_issue_at_star = refined_eval["q_issue_grid"][:, 0:1]
-                p_child_at_star = refined_eval["p_child_grid_mean"][:, 0:1]
-                default_at_star = refined_eval["default_grid_mean"][:, 0:1]
-            else:
-                value_star = _gather_by_index(result["value_grid"], argmax_index)
-                q_issue_at_star = _gather_by_index(result["q_issue_grid"], argmax_index)
-                p_child_at_star = _gather_by_index(result["p_child_grid_mean"], argmax_index)
-                default_at_star = _gather_by_index(result["default_grid_mean"], argmax_index)
-
-            coarse_top2_margin, _ = _safe_top2_margin(coarse["value_grid"])
-            fine_top2_margin, _ = _safe_top2_margin(result["value_grid"])
-            coarse_value_star = _gather_by_index(coarse["value_grid"], coarse["argmax_index"])
-            if self.confidence_relative:
-                value_scale = coarse_value_star.abs().clamp_min(1e-8)
-                relative_margin = coarse_top2_margin / value_scale
-                confidence = (relative_margin / self.margin_scale).clamp(self.confidence_min, 1.0)
-            else:
-                confidence = (coarse_top2_margin / self.margin_scale).clamp(self.confidence_min, 1.0)
-            target_available = torch.ones_like(bp_star)
-
-            result.update(
-                {
-                    "bp_star": bp_star.detach(),
-                    "bp_star_grid": bp_star_grid.detach(),
-                    "value_star": value_star.detach(),
-                    "top2_margin": coarse_top2_margin.detach(),
-                    "coarse_top2_margin": coarse_top2_margin.detach(),
-                    "fine_top2_margin": fine_top2_margin.detach(),
-                    "confidence": confidence.detach(),
-                    "boundary_low": (
-                        bp_star_grid <= self.grid_min + 1e-8
-                    ).to(parent_state.dtype).detach(),
-                    "boundary_high": (
-                        bp_star_grid >= self.grid_max - 1e-8
-                    ).to(parent_state.dtype).detach(),
-                    # Compatibility field: every parent now has a meaningful bp target.
-                    "refi_active": target_available.detach(),
-                    "eta_next_active_share": result["eta_next_active_share"][:, 0:1].detach(),
-                    "coarse_bp_grid": coarse["bp_grid"].detach(),
-                    "coarse_value_grid": coarse["value_grid"].detach(),
-                    "coarse_cashflow_grid_mean": coarse["cashflow_grid_mean"].detach(),
-                    "coarse_continuation_grid_mean": coarse["continuation_grid_mean"].detach(),
-                    "coarse_q_issue_grid": coarse["q_issue_grid"].detach(),
-                    "coarse_p_child_grid_mean": coarse["p_child_grid_mean"].detach(),
-                    "coarse_default_grid_mean": coarse["default_grid_mean"].detach(),
-                    "coarse_eta_next_active_share": coarse["eta_next_active_share"].detach(),
-                    "coarse_child_b_mean": coarse["child_b_mean"].detach(),
-                    "coarse_child_b_eta0_mean": coarse["child_b_eta0_mean"].detach(),
-                    "coarse_child_b_eta1_mean": coarse["child_b_eta1_mean"].detach(),
-                    "local_value_left": result["value_grid"][:, 0:1].detach(),
-                    "local_value_right": result["value_grid"][:, -1:].detach(),
-                    "q_issue_at_star": q_issue_at_star.detach(),
-                    "p_child_at_star": p_child_at_star.detach(),
-                    "default_at_star": default_at_star.detach(),
-                }
+            return self._finalize_grid_result(
+                parent_state, children, m_list, coarse, branch=branch,
+                mix_weight=mix_weight, child_weights=child_weights,
+                bp_pred=bp_pred, diagnostics=True,
             )
 
-            if bp_pred is not None:
-                pred_grid = bp_pred.detach().clamp(self.grid_min, self.grid_max).reshape(-1, 1)
-                pred_eval = self._evaluate_grid(
-                    parent_state, children, m_list, pred_grid, branch=branch,
-                    mix_weight=mix_weight, child_weights=child_weights,
-                )
-                value_pred = pred_eval["value_grid"][:, 0:1]
-                result["value_pred"] = value_pred.detach()
-                result["regret"] = (value_star - value_pred).clamp_min(0.0).detach()
-            else:
-                result["value_pred"] = torch.zeros_like(value_star)
-                result["regret"] = torch.zeros_like(value_star)
+    def _finalize_grid_result(
+        self,
+        parent_state: torch.Tensor,
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
+        coarse: Dict[str, torch.Tensor],
+        *,
+        branch: str,
+        mix_weight: Optional[torch.Tensor] = None,
+        child_weights: Optional[torch.Tensor] = None,
+        bp_pred: Optional[torch.Tensor] = None,
+        diagnostics: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """Local refinement, star selection and diagnostics from a coarse grid result.
 
-            return {k: v.detach() for k, v in result.items()}
+        ``coarse`` must contain the coarse candidate objective grids (either from
+        ``_evaluate_grid`` or assembled from shared candidate chunks). Keeping this
+        step separate lets the multi-J/multi-branch path reuse one coarse
+        child-equity forward while still refining each (branch, J) locally.
+        """
+        if self.refine:
+            fine_grid = self._local_fine_grid(coarse["bp_grid"], coarse["argmax_index"])
+            result = self._evaluate_grid(
+                parent_state, children, m_list, fine_grid, branch=branch,
+                mix_weight=mix_weight, child_weights=child_weights,
+            )
+        else:
+            result = coarse
+
+        argmax_index = result["argmax_index"]
+        bp_star_grid = _gather_by_index(result["bp_grid"], argmax_index)
+        bp_star = _quadratic_refine(
+            result["bp_grid"],
+            result["value_grid"],
+            argmax_index,
+            bp_star_grid,
+            self.quadratic_refine,
+        ).clamp(self.grid_min, self.grid_max)
+        if self.quadratic_refine:
+            refined_eval = self._evaluate_grid(
+                parent_state,
+                children,
+                m_list,
+                bp_star,
+                branch=branch,
+                mix_weight=mix_weight,
+                child_weights=child_weights,
+            )
+            value_star = refined_eval["value_grid"][:, 0:1]
+            q_issue_at_star = refined_eval["q_issue_grid"][:, 0:1]
+            p_child_at_star = refined_eval["p_child_grid_mean"][:, 0:1]
+            default_at_star = refined_eval["default_grid_mean"][:, 0:1]
+        else:
+            value_star = _gather_by_index(result["value_grid"], argmax_index)
+            q_issue_at_star = _gather_by_index(result["q_issue_grid"], argmax_index)
+            p_child_at_star = _gather_by_index(result["p_child_grid_mean"], argmax_index)
+            default_at_star = _gather_by_index(result["default_grid_mean"], argmax_index)
+
+        if not diagnostics:
+            return {
+                "value_star": value_star.detach(),
+                "bp_star": bp_star.detach(),
+                "bp_star_grid": bp_star_grid.detach(),
+            }
+
+        coarse_top2_margin, _ = _safe_top2_margin(coarse["value_grid"])
+        fine_top2_margin, _ = _safe_top2_margin(result["value_grid"])
+        coarse_value_star = _gather_by_index(coarse["value_grid"], coarse["argmax_index"])
+        if self.confidence_relative:
+            value_scale = coarse_value_star.abs().clamp_min(1e-8)
+            relative_margin = coarse_top2_margin / value_scale
+            confidence = (relative_margin / self.margin_scale).clamp(self.confidence_min, 1.0)
+        else:
+            confidence = (coarse_top2_margin / self.margin_scale).clamp(self.confidence_min, 1.0)
+        target_available = torch.ones_like(bp_star)
+
+        result.update(
+            {
+                "bp_star": bp_star.detach(),
+                "bp_star_grid": bp_star_grid.detach(),
+                "value_star": value_star.detach(),
+                "top2_margin": coarse_top2_margin.detach(),
+                "coarse_top2_margin": coarse_top2_margin.detach(),
+                "fine_top2_margin": fine_top2_margin.detach(),
+                "confidence": confidence.detach(),
+                "boundary_low": (
+                    bp_star_grid <= self.grid_min + 1e-8
+                ).to(parent_state.dtype).detach(),
+                "boundary_high": (
+                    bp_star_grid >= self.grid_max - 1e-8
+                ).to(parent_state.dtype).detach(),
+                # Compatibility field: every parent now has a meaningful bp target.
+                "refi_active": target_available.detach(),
+                "eta_next_active_share": result["eta_next_active_share"][:, 0:1].detach(),
+                "coarse_bp_grid": coarse["bp_grid"].detach(),
+                "coarse_value_grid": coarse["value_grid"].detach(),
+                "coarse_cashflow_grid_mean": coarse["cashflow_grid_mean"].detach(),
+                "coarse_continuation_grid_mean": coarse["continuation_grid_mean"].detach(),
+                "coarse_q_issue_grid": coarse["q_issue_grid"].detach(),
+                "coarse_p_child_grid_mean": coarse["p_child_grid_mean"].detach(),
+                "coarse_default_grid_mean": coarse["default_grid_mean"].detach(),
+                "coarse_eta_next_active_share": coarse["eta_next_active_share"].detach(),
+                "coarse_child_b_mean": coarse["child_b_mean"].detach(),
+                "coarse_child_b_eta0_mean": coarse["child_b_eta0_mean"].detach(),
+                "coarse_child_b_eta1_mean": coarse["child_b_eta1_mean"].detach(),
+                "local_value_left": result["value_grid"][:, 0:1].detach(),
+                "local_value_right": result["value_grid"][:, -1:].detach(),
+                "q_issue_at_star": q_issue_at_star.detach(),
+                "p_child_at_star": p_child_at_star.detach(),
+                "default_at_star": default_at_star.detach(),
+            }
+        )
+
+        if bp_pred is not None:
+            pred_grid = bp_pred.detach().clamp(self.grid_min, self.grid_max).reshape(-1, 1)
+            pred_eval = self._evaluate_grid(
+                parent_state, children, m_list, pred_grid, branch=branch,
+                mix_weight=mix_weight, child_weights=child_weights,
+            )
+            value_pred = pred_eval["value_grid"][:, 0:1]
+            result["value_pred"] = value_pred.detach()
+            result["regret"] = (value_star - value_pred).clamp_min(0.0).detach()
+        else:
+            result["value_pred"] = torch.zeros_like(value_star)
+            result["regret"] = torch.zeros_like(value_star)
+
+        return {k: v.detach() for k, v in result.items()}
 
     def _uniform_grid(self, parent_state: torch.Tensor, size: int) -> torch.Tensor:
         grid = torch.linspace(
@@ -732,50 +1065,67 @@ class BPGridTeacher:
             "argmax_index": torch.cat([c["value_grid"] for c in chunks], dim=1).argmax(dim=1, keepdim=True),
         }
 
-    def _evaluate_grid_chunk(
+    def _child_equity_block(
         self,
-        parent_state: torch.Tensor,
         children: Sequence[torch.Tensor] | torch.Tensor,
-        m_list: Sequence[torch.Tensor] | torch.Tensor,
         bp_grid: torch.Tensor,
-        *,
-        branch: str,
-        mix_weight: Optional[torch.Tensor] = None,
-        child_weights: Optional[torch.Tensor] = None,
-        q_current: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        batch_size, n_grid = bp_grid.shape
-        if q_current is None:
-            q_current = _target_q(self.target_model, parent_state)
-
-        b_parent = parent_state[:, 0:1]
-        eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
-
-        issue_state = _expand_candidates(parent_state, bp_grid)
-        issue_state[:, 0:1] = _candidate_flat(bp_grid)
-        q_issue = _target_q(self.target_model, issue_state).reshape(batch_size, n_grid)
-
+        b_parent: torch.Tensor,
+    ) -> _EquityBlock:
+        """Branch-independent child equity block for one candidate chunk."""
         children_tensor = _stack_children(children)
-        m_tensor = _stack_m(m_list)
-        n_children = int(children_tensor.shape[1])
-        mix_w = None
-        if branch == "mix":
-            if mix_weight is None:
-                raise ValueError("mix_weight is required for branch='mix'")
-            mix_w = mix_weight.clamp(0.0, 1.0).reshape(batch_size, 1, 1).expand(batch_size, n_grid, n_children)
-
-        x_parent = parent_state[:, 4:5]
-        z_parent = parent_state[:, 1:2]
-        i_parent = parent_state[:, 3:4]
-        q_current_grid = q_current.expand(batch_size, n_grid)
-
         p_child, bar_z_child, child_b_grid = _forward_equity_grid_children(
             self.target_model,
             children_tensor,
             bp_grid,
             b_parent,
         )
-        n_children = p_child.shape[2]
+        self._record_equity_forward(int(p_child.numel()))
+        return _EquityBlock(
+            p_child=p_child, bar_z_child=bar_z_child, child_b_grid=child_b_grid
+        )
+
+    def _q_issue_grid(self, parent_state: torch.Tensor, bp_grid: torch.Tensor) -> torch.Tensor:
+        batch_size, n_grid = bp_grid.shape
+        issue_state = _expand_candidates(parent_state, bp_grid)
+        issue_state[:, 0:1] = _candidate_flat(bp_grid)
+        q_issue = _target_q(self.target_model, issue_state).reshape(batch_size, n_grid)
+        self._record_q_forward()
+        return q_issue
+
+    def _branch_objective_grid(
+        self,
+        parent_state: torch.Tensor,
+        bp_grid: torch.Tensor,
+        *,
+        branch: str,
+        p_child: torch.Tensor,
+        bar_z_child: torch.Tensor,
+        child_b_grid: torch.Tensor,
+        child_eta_next: torch.Tensor,
+        m_tensor: torch.Tensor,
+        q_current: torch.Tensor,
+        q_issue: torch.Tensor,
+        mix_weight: Optional[torch.Tensor] = None,
+        child_weights: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Assemble branch-specific objectives from a precomputed equity block."""
+        batch_size, n_grid = bp_grid.shape
+        n_children = int(p_child.shape[2])
+        mix_w = None
+        if branch == "mix":
+            if mix_weight is None:
+                raise ValueError("mix_weight is required for branch='mix'")
+            mix_w = mix_weight.clamp(0.0, 1.0).reshape(batch_size, 1, 1).expand(
+                batch_size, n_grid, n_children
+            )
+
+        b_parent = parent_state[:, 0:1]
+        eta_current = parent_state[:, 2:3].clamp(0.0, 1.0)
+        x_parent = parent_state[:, 4:5]
+        z_parent = parent_state[:, 1:2]
+        i_parent = parent_state[:, 3:4]
+        q_current_grid = q_current.expand(batch_size, n_grid)
+
         weights = normalize_child_weights(
             child_weights,
             n_parent=batch_size,
@@ -784,14 +1134,20 @@ class BPGridTeacher:
             dtype=parent_state.dtype,
         )
         weights_grid = weights.unsqueeze(1)
-        m_grid = m_tensor.reshape(batch_size, 1, n_children).expand(batch_size, n_grid, n_children)
+        m_grid = m_tensor.reshape(batch_size, 1, n_children).expand(
+            batch_size, n_grid, n_children
+        )
         flat_shape = (batch_size * n_grid * n_children, 1)
         x_grid = x_parent.unsqueeze(1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
         z_grid = z_parent.unsqueeze(1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
         b_grid = b_parent.unsqueeze(1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
         i_grid = i_parent.unsqueeze(1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
-        q_current_flat = q_current_grid.unsqueeze(-1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
-        q_issue_flat = q_issue.unsqueeze(-1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
+        q_current_flat = (
+            q_current_grid.unsqueeze(-1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
+        )
+        q_issue_flat = (
+            q_issue.unsqueeze(-1).expand(batch_size, n_grid, n_children).reshape(flat_shape)
+        )
         eta_current_flat = (
             eta_current
             .reshape(batch_size, 1, 1)
@@ -840,7 +1196,7 @@ class BPGridTeacher:
         continuation_grid_mean = (weights_grid * branch_continuation).sum(dim=2)
         p_grid_mean = (weights_grid * p_child).sum(dim=2)
         default_grid_mean = (weights_grid * bar_z_child).sum(dim=2)
-        eta_next = children_tensor[..., 2].clamp(0.0, 1.0)
+        eta_next = child_eta_next.clamp(0.0, 1.0)
         eta_next_active_share = (weights * eta_next).sum(dim=1, keepdim=True).expand(batch_size, n_grid)
         child_b_mean = (weights_grid * child_b_grid).sum(dim=2)
 
@@ -869,6 +1225,43 @@ class BPGridTeacher:
             "child_b_eta0_mean": child_b_eta0_mean,
             "child_b_eta1_mean": child_b_eta1_mean,
         }
+
+    def _evaluate_grid_chunk(
+        self,
+        parent_state: torch.Tensor,
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
+        bp_grid: torch.Tensor,
+        *,
+        branch: str,
+        mix_weight: Optional[torch.Tensor] = None,
+        child_weights: Optional[torch.Tensor] = None,
+        q_current: Optional[torch.Tensor] = None,
+        equity: Optional[_EquityBlock] = None,
+    ) -> Dict[str, torch.Tensor]:
+        children_tensor = _stack_children(children)
+        m_tensor = _stack_m(m_list)
+        if q_current is None:
+            q_current = _target_q(self.target_model, parent_state)
+            self._record_q_forward()
+        if equity is None:
+            equity = self._child_equity_block(children_tensor, bp_grid, parent_state[:, 0:1])
+        self._record_candidate_chunk(int(equity.p_child.numel()))
+        q_issue = self._q_issue_grid(parent_state, bp_grid)
+        return self._branch_objective_grid(
+            parent_state,
+            bp_grid,
+            branch=branch,
+            p_child=equity.p_child,
+            bar_z_child=equity.bar_z_child,
+            child_b_grid=equity.child_b_grid,
+            child_eta_next=children_tensor[..., 2],
+            m_tensor=m_tensor,
+            q_current=q_current,
+            q_issue=q_issue,
+            mix_weight=mix_weight,
+            child_weights=child_weights,
+        )
 
     def _attach_star_diagnostics(self, result: Dict[str, torch.Tensor], argmax_index: torch.Tensor) -> None:
         result["q_issue_at_star"] = _gather_by_index(result["q_issue_grid"], argmax_index)
