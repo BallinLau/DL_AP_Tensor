@@ -855,6 +855,94 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
         assert rows["continuation_weighted"].sum() == pytest.approx(expected)
 
 
+def test_transition_is_built_at_evaluated_j_not_canonical_bank(tmp_path):
+    """An ordinary episode must not build a J=Jcanonical transition."""
+    checkpoint = tmp_path / "policy_combined.pt"
+    firm_data = tmp_path / "firm.pkl"
+    output = tmp_path / "matrix"
+    _write_combined_policy_checkpoint(checkpoint)
+    _write_reference_firm(firm_data)
+
+    result = _run_evaluator(
+        checkpoint,
+        firm_data,
+        output,
+        [
+            "--eta-values", "1",
+            "--n-child-shocks", "4",
+            "--robustness-child-shocks", "4",
+            "--shock-bank-max-child-shocks", "8",
+            "--b-points", "3",
+            "--z-points", "3",
+            "--i-points", "3",
+        ],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["canonical_shock_bank_max_child_shocks"] == 8
+    assert metadata["max_evaluated_child_shocks"] == 4
+    assert metadata["evaluated_child_shocks"] == [4]
+    assert metadata["shock_bank_max_child_shocks"] == 8
+    case = metadata["case_metadata_by_eta_j"]["eta1_J4"]
+    assert case["canonical_shock_bank_max_child_shocks"] == 8
+    assert case["max_evaluated_child_shocks"] == 4
+    assert case["evaluated_child_shocks"] == [4]
+    # Built transition is J=4 (8 expanded children), drawn from the 8-child bank.
+    assert case["transition_continuous_child_count"] == 4
+    assert case["transition_expanded_child_count"] == 8
+    assert case["reference_transition_bank"]["source_max_J"] == 8
+    assert case["reference_transition_bank"]["requested_J"] == 4
+    assert case["reference_transition_bank"]["continuous_child_count"] == 4
+    assert case["reference_transition_bank"]["expanded_child_count"] == 8
+    # The chunk planner must see 8 expanded children, never 16.
+    plans = case["bp_forward_stats"]["bp_grid_chunk_plans"]
+    assert {plan["n_children"] for plan in plans} == {8}
+    assert max(plan["n_children"] for plan in plans) == 8
+
+
+def test_objective_slices_are_written_per_eta(tmp_path):
+    """Each eta must own its objective slices; eta1 must not overwrite eta0."""
+    checkpoint = tmp_path / "policy_combined.pt"
+    firm_data = tmp_path / "firm.pkl"
+    output = tmp_path / "matrix"
+    _write_combined_policy_checkpoint(checkpoint)
+    _write_reference_firm(firm_data)
+
+    result = _run_evaluator(
+        checkpoint,
+        firm_data,
+        output,
+        [
+            "--eta-values", "0", "1",
+            "--n-child-shocks", "4",
+            "--robustness-child-shocks", "2", "4",
+            "--b-points", "3",
+            "--z-points", "3",
+            "--i-points", "3",
+        ],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    eta_dirs = {eta: output / eta / "objective_slices" for eta in ("eta0", "eta1")}
+    for directory in eta_dirs.values():
+        assert directory.is_dir(), f"missing objective slice dir {directory}"
+        for label in ("p0", "pi_mid"):
+            assert list(directory.glob(f"{label}_*.csv")), f"missing {label} csv"
+            assert list(directory.glob(f"{label}_*.png")), f"missing {label} png"
+
+    names = sorted(path.name for path in eta_dirs["eta0"].glob("*.csv"))
+    assert names == sorted(path.name for path in eta_dirs["eta1"].glob("*.csv"))
+    assert names, "no objective slices were written"
+    assert any(
+        not pd.read_csv(eta_dirs["eta0"] / name).equals(
+            pd.read_csv(eta_dirs["eta1"] / name)
+        )
+        for name in names
+    ), "eta0 and eta1 objective slices are identical: they were overwritten"
+    # Only the primary J carries detailed slices; robustness cases must not.
+    assert not list((output / "robustness").glob("**/objective_slices"))
+
+
 def test_eta_and_child_shock_matrix_writes_full_and_compact_cases(tmp_path):
     checkpoint = tmp_path / "policy_combined.pt"
     firm_data = tmp_path / "firm.pkl"

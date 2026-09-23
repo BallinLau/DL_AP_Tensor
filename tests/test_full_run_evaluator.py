@@ -752,6 +752,136 @@ def test_transition_children_depend_on_the_canonical_bank_not_the_evaluated_j():
     assert not torch.equal(shrunken.stacked_children(), canonical_a.stacked_children())
 
 
+def test_compact_transition_matches_jmax_build_then_slice():
+    """A J=4 transition built from an 8-child canonical bank must equal an
+    J=8 transition sliced to 4, element for element."""
+    reference = _reference()
+    grid = build_frozen_grid(
+        reference, b_min=0.2, b_max=0.4, b_points=2,
+        z_min=-0.4, z_max=0.4, z_points=2, device=torch.device("cpu"),
+    )
+    hyperparams = HyperParams()
+    economic = AnalysisEconomicConfig.from_current_config()
+
+    def build(n_child_shocks: int):
+        return build_frozen_transition_data(
+            StableSDF(), grid.base_states, reference, hyperparams, economic,
+            n_child_shocks=n_child_shocks, shock_seed=12345,
+            shock_bank_max_child_shocks=8,
+        )
+
+    compact = build(4)
+    wide = build(8)
+    sliced = slice_frozen_transition_data(wide, n_continuous_children=4)
+
+    assert compact.metadata["continuous_child_count"] == 4
+    assert compact.metadata["expanded_child_count"] == 8
+    assert compact.metadata["source_max_J"] == 8
+    assert compact.metadata["requested_J"] == 4
+    assert wide.metadata["continuous_child_count"] == 8
+    assert wide.metadata["expanded_child_count"] == 16
+
+    torch.testing.assert_close(
+        compact.stacked_children(), sliced.stacked_children(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        compact.stacked_m_raw(), sliced.stacked_m_raw(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        compact.stacked_m_used(), sliced.stacked_m_used(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        compact.branch_weights, sliced.branch_weights, rtol=1e-6, atol=1e-9
+    )
+    assert compact.metadata["prefix_sha256"] == sliced.metadata["prefix_sha256"]
+    assert compact.metadata["max_bank_sha256"] == sliced.metadata["max_bank_sha256"]
+
+
+def test_compact_ordinary_transition_keeps_canonical_crn_prefix():
+    """Sizing the transition by the evaluated J must not break cross-episode CRN."""
+    reference = _reference()
+    grid = build_frozen_grid(
+        reference, b_min=0.2, b_max=0.4, b_points=2,
+        z_min=-0.4, z_max=0.4, z_points=2, device=torch.device("cpu"),
+    )
+    hyperparams = HyperParams()
+    economic = AnalysisEconomicConfig.from_current_config()
+
+    def build(n_child_shocks: int):
+        return build_frozen_transition_data(
+            StableSDF(), grid.base_states, reference, hyperparams, economic,
+            n_child_shocks=n_child_shocks, shock_seed=12345,
+            shock_bank_max_child_shocks=8,
+        )
+
+    # Ordinary episode: canonical bank 8, only J=4 evaluated.
+    ordinary = slice_frozen_transition_data(build(4), n_continuous_children=4)
+    # Representative episode: canonical bank 8, J in {2, 4, 8} evaluated.
+    representative = slice_frozen_transition_data(build(8), n_continuous_children=4)
+    assert ordinary.metadata["source_max_J"] == 8
+    assert representative.metadata["source_max_J"] == 8
+    assert ordinary.metadata["prefix_sha256"] == representative.metadata["prefix_sha256"]
+    torch.testing.assert_close(
+        ordinary.stacked_children(), representative.stacked_children(), rtol=0, atol=0
+    )
+
+
+def test_multi_j_bp_evaluator_accepts_compact_transition_equally(tmp_path):
+    """The compact transition must give the same BP numbers with less work.
+
+    Path A: a J=4 transition built from the 8-child canonical bank.
+    Path B: the J=8 transition sliced down to J=4 inside the evaluator.
+    """
+    reference, grid, hyperparams, economic, transition_max = _bp_parity_setup()
+    compact = build_frozen_transition_data(
+        _BpToySDF(), grid.base_states, reference, hyperparams, economic,
+        n_child_shocks=4, shock_seed=12345, shock_bank_max_child_shocks=8,
+    )
+    assert compact.metadata["expanded_child_count"] == 8
+    assert compact.metadata["source_max_J"] == 8
+    assert transition_max.metadata["expanded_child_count"] == 16
+
+    def run(transition, name):
+        results, stats = evaluate_bp_consistency_multi_j(
+            _BpToyPolicy(), _BpToySDF(), grid, reference, hyperparams, economic,
+            output_dir=tmp_path / name, j_values=[4], primary_j=4,
+            transition_max=transition, shock_seed=12345,
+            write_objective_slices=False,
+        )
+        return results[4], stats
+
+    compact_entry, compact_stats = run(compact, "compact")
+    wide_entry, wide_stats = run(transition_max, "wide")
+
+    for key, expected in wide_entry["surfaces"].items():
+        assert key in compact_entry["surfaces"], f"missing surface {key}"
+        np.testing.assert_allclose(
+            compact_entry["surfaces"][key], expected, rtol=1e-5, atol=1e-6,
+            equal_nan=True,
+        )
+    for key, expected in wide_entry["summary"].items():
+        assert key in compact_entry["summary"], f"missing summary {key}"
+        actual = compact_entry["summary"][key]
+        if isinstance(expected, float) and np.isnan(expected):
+            assert np.isnan(actual)
+        else:
+            assert actual == pytest.approx(expected, rel=1e-5, abs=1e-6)
+
+    # The chunk planner must only ever see the evaluated children. The wide path
+    # still forwards the full Jmax child block on the coarse grid (then slices the
+    # objective), which is exactly the wasted work the compact transition removes.
+    assert {plan["n_children"] for plan in compact_stats["bp_grid_chunk_plans"]} == {8}
+    assert max(plan["n_children"] for plan in wide_stats["bp_grid_chunk_plans"]) == 16
+    assert (
+        compact_stats["bp_max_actual_expanded_states"]
+        < wide_stats["bp_max_actual_expanded_states"]
+    )
+    assert (
+        compact_stats["bp_child_equity_forward_calls"]
+        <= wide_stats["bp_child_equity_forward_calls"]
+    )
+
+
 def test_cross_episode_crn_requires_one_canonical_shock_bank():
     """A J=64 episode must draw the same shocks as a J=128 representative episode."""
     parents = torch.tensor([

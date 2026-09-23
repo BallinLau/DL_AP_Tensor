@@ -502,16 +502,39 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         if shared_cache is not None else {}
     )
     transition_max = transition_cache.get(static_key)
-    configured_max = (
-        shared_cache.get("max_child_shocks") if shared_cache is not None else None
-    ) or args.shock_bank_max_child_shocks or args.n_child_shocks
-    max_child_shocks = int(configured_max)
+    # ``max_evaluated_child_shocks`` sizes the transition that is actually built;
+    # ``canonical_shock_bank_max_child_shocks`` only sizes the deterministic bank
+    # the prefix is drawn from. Keeping them separate means an episode that only
+    # evaluates J=64 builds a J=64 transition (128 expanded children) instead of a
+    # J=128 transition (256 expanded children) whose upper half is then discarded,
+    # while still drawing from the same canonical bank for cross-episode CRN.
+    max_evaluated_child_shocks = int(
+        (
+            shared_cache.get("max_evaluated_child_shocks")
+            if shared_cache is not None else None
+        )
+        or args.n_child_shocks
+    )
+    canonical_shock_bank_max_child_shocks = int(
+        (
+            shared_cache.get("canonical_shock_bank_max_child_shocks")
+            if shared_cache is not None else None
+        )
+        or getattr(args, "shock_bank_max_child_shocks", None)
+        or max_evaluated_child_shocks
+    )
+    if canonical_shock_bank_max_child_shocks < max_evaluated_child_shocks:
+        raise ValueError(
+            "shock_bank_max_child_shocks "
+            f"({canonical_shock_bank_max_child_shocks}) must cover the largest "
+            f"evaluated J ({max_evaluated_child_shocks})"
+        )
     if transition_max is None:
         transition_max = build_frozen_transition_data(
             sdf_fc1_model, grid.base_states, reference, loaded.hyperparams,
-            loaded.economic_config, n_child_shocks=max_child_shocks,
+            loaded.economic_config, n_child_shocks=max_evaluated_child_shocks,
             shock_seed=args.shock_seed,
-            shock_bank_max_child_shocks=max_child_shocks,
+            shock_bank_max_child_shocks=canonical_shock_bank_max_child_shocks,
         )
         if shared_cache is not None:
             transition_cache[static_key] = transition_max
@@ -546,6 +569,14 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         shared_cache.setdefault("bp_multi_j_by_eta", {})
         if shared_cache is not None else {}
     )
+    bp_primary_output_dirs = (
+        shared_cache.get("bp_primary_output_dirs") if shared_cache is not None else None
+    )
+    bp_objective_output_dir = (
+        Path(bp_primary_output_dirs[static_key]) / "objective_slices"
+        if bp_primary_output_dirs and static_key in bp_primary_output_dirs
+        else output / "objective_slices"
+    )
     if shared_bp_j:
         bp_bundle = bp_multi_cache.get(static_key)
         if bp_bundle is None:
@@ -558,7 +589,7 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
                 reference,
                 loaded.hyperparams,
                 loaded.economic_config,
-                output_dir=Path(shared_cache["bp_primary_output_dir"]) / "objective_slices",
+                output_dir=bp_objective_output_dir,
                 j_values=shared_bp_j,
                 primary_j=int(shared_cache["bp_primary_j"]),
                 transition_max=transition_max,
@@ -758,6 +789,23 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         "shock_bank_max_child_shocks": int(
             transition_meta.get("shock_bank_max_child_shocks", args.n_child_shocks)
         ),
+        "canonical_shock_bank_max_child_shocks": int(
+            canonical_shock_bank_max_child_shocks
+        ),
+        "max_evaluated_child_shocks": int(max_evaluated_child_shocks),
+        "evaluated_child_shocks": sorted(
+            int(value) for value in (shared_bp_j or [args.n_child_shocks])
+        ),
+        "transition_continuous_child_count": int(
+            transition_max.metadata.get(
+                "continuous_child_count", max_evaluated_child_shocks
+            )
+        ),
+        "transition_expanded_child_count": int(
+            transition_max.metadata.get(
+                "expanded_child_count", 2 * max_evaluated_child_shocks
+            )
+        ),
         "bp_margin_identification_threshold": float(args.bp_teacher_margin_tol),
         "checkpoint_bp_grid_max_expanded_states": checkpoint_bp_budget,
         "evaluator_bp_max_expanded_states": int(bp_budget),
@@ -852,20 +900,23 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
     j_values = sorted(set(int(value) for value in j_values))
     if any(value < 2 for value in j_values):
         raise ValueError("All robustness child-shock counts must be at least 2")
-    # The canonical shock bank is the single bank every episode draws from, so it
-    # must be at least as large as the largest evaluated J. ``max(j_values)`` is
-    # only a fallback: the full-run driver passes an explicit canonical value that
-    # can exceed the largest evaluated J (canonical 128, evaluated 64).
+    # Two distinct quantities that must never be conflated:
+    #   * ``max_evaluated_child_shocks`` is the largest J this episode actually
+    #     evaluates; it sizes the transition that is built (and sliced).
+    #   * ``canonical_shock_bank_max_child_shocks`` is the single shock bank every
+    #     episode draws from, so cross-episode common random numbers line up. It
+    #     can exceed the largest evaluated J (canonical 128, evaluated 64).
+    max_evaluated_child_shocks = max(j_values)
     canonical_max_child_shocks = (
         int(args.shock_bank_max_child_shocks)
         if getattr(args, "shock_bank_max_child_shocks", None) is not None
-        else max(j_values)
+        else max_evaluated_child_shocks
     )
-    if canonical_max_child_shocks < max(j_values):
+    if canonical_max_child_shocks < max_evaluated_child_shocks:
         raise ValueError(
             "shock_bank_max_child_shocks "
             f"({canonical_max_child_shocks}) must cover the largest evaluated J "
-            f"({max(j_values)})"
+            f"({max_evaluated_child_shocks})"
         )
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -891,7 +942,8 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
     for loaded_model in loaded.models.values():
         loaded_model.eval()
     evaluation_cache: Dict[str, object] = {
-        "max_child_shocks": canonical_max_child_shocks,
+        "canonical_shock_bank_max_child_shocks": canonical_max_child_shocks,
+        "max_evaluated_child_shocks": max_evaluated_child_shocks,
         "loaded": loaded,
     }
     defer_hash_to_outer = bool(getattr(args, "defer_model_state_hash_to_outer", False))
@@ -905,12 +957,20 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
     case_metadata = []
     requested_primary_eta = float(getattr(args, "eta", 1.0))
     primary_eta = requested_primary_eta if requested_primary_eta in eta_values else eta_values[0]
-    primary_eta_label = f"eta{primary_eta:g}".replace("-", "m").replace(".", "p")
     # One shared BP pass per eta covers every requested J, so the J=Jmax child
     # equity forward and the coarse objective grid are never recomputed per J.
     evaluation_cache["bp_j_values"] = list(j_values)
     evaluation_cache["bp_primary_j"] = int(args.n_child_shocks)
-    evaluation_cache["bp_primary_output_dir"] = str(root / primary_eta_label)
+    # Objective slices are per-eta artefacts: every eta writes its own primary-J
+    # slices under ``root/<eta_label>/objective_slices``. The multi-J pass is
+    # cached per eta, so the eta that happens to run first must not decide the
+    # output root for the others.
+    evaluation_cache["bp_primary_output_dirs"] = {
+        float(eta): str(
+            root / f"eta{eta:g}".replace("-", "m").replace(".", "p")
+        )
+        for eta in eta_values
+    }
     evaluation_cache["bp_write_objective_slices"] = not bool(
         getattr(args, "summary_only_all", False)
     )
@@ -958,6 +1018,17 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
                 "metadata": str(case_output / "metadata.json"),
                 "model_state_unchanged": None,
                 "reference_transition_bank": metadata.get("reference_transition_bank"),
+                "canonical_shock_bank_max_child_shocks": metadata.get(
+                    "canonical_shock_bank_max_child_shocks"
+                ),
+                "max_evaluated_child_shocks": metadata.get("max_evaluated_child_shocks"),
+                "evaluated_child_shocks": metadata.get("evaluated_child_shocks"),
+                "transition_continuous_child_count": metadata.get(
+                    "transition_continuous_child_count"
+                ),
+                "transition_expanded_child_count": metadata.get(
+                    "transition_expanded_child_count"
+                ),
                 "timing": metadata.get("timing", {}),
                 "bp_forward_stats": metadata.get("bp_forward_stats"),
                 "bp_eval_max_expanded_states": metadata.get("evaluator_bp_max_expanded_states"),
