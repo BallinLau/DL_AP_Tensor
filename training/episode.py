@@ -7754,14 +7754,20 @@ class Episode:
                 # eta_t = 0 rows have no refinancing choice, so they keep a
                 # bookkeeping entry with zero confidence and receive no BP-head
                 # gradient. The teacher already skips the bp grid for them.
-                eta_current = parent_state[:, 2:3].clamp(0.0, 1.0).detach().cpu()
-                refinancing_active = (eta_current > 0.5).to(eta_current.dtype)
+                eta_current = parent_state[:, 2:3].clamp(0.0, 1.0).detach()
+                # Keep the mask on the teacher grid's device (cuda:0) so the
+                # confidence product below is device-consistent; move to CPU
+                # only when storing into the cache.
+                refinancing_active = (eta_current > 0.5).to(
+                    device=p0_grid["confidence"].device,
+                    dtype=p0_grid["confidence"].dtype,
+                )
                 cache.append({
                     "batch_id": batch_id,
                     "parent": parent_state.detach().cpu(),
                     "source_id": batch["source_id"].detach().cpu() if "source_id" in batch else None,
                     "source_index": batch["source_index"].detach().cpu() if "source_index" in batch else None,
-                    "eta_current": eta_current,
+                    "eta_current": eta_current.cpu(),
                     "bp0_target": p0_grid["bp_star"].detach().cpu(),
                     "bpi_target": pi_grid["bp_star"].detach().cpu(),
                     "mix_target": mix_grid["bp_star"].detach().cpu(),
