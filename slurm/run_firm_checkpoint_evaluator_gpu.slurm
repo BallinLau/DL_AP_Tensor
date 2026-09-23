@@ -274,7 +274,7 @@ for case_record in full_cases:
     if case_meta.get("model_state_unchanged") is not True:
         raise SystemExit(f"{eta_label}: evaluator changed checkpoint model state")
     timing = case_meta.get("semantics", {}).get("child_leverage_timing")
-    if timing != "b_next = eta_next * bp_current + (1-eta_next) * b_current":
+    if timing != "b_next = eta_current * bp_current + (1-eta_current) * b_current":
         raise SystemExit(f"{eta_label}: leverage timing metadata mismatch")
     audit = pd.read_csv(case / "audits" / "child_continuation_audit.csv")
     if audit["child_b_identity_error"].max() > 1e-6:

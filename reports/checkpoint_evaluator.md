@@ -111,7 +111,9 @@ diagnostics because it permits modified tracked source files.
   normalized diagnostics. These are evaluator outputs, not training losses.
 - `audits/child_continuation_audit.csv` records each representative parent,
   candidate BP, and child realization. Its `child_b_identity_error` directly
-  checks `b_next=eta_next*bp+(1-eta_next)*b`. `continuation_raw` excludes the
+  checks `b_next=eta_current*bp+(1-eta_current)*b`, where `eta_current` is the
+  parent's own `eta_t`: the child `eta_next` column is kept as a state shock
+  and never gates child leverage. `continuation_raw` excludes the
   branch probability, while `continuation_weighted` includes `branch_weight`.
   The older `raw_continuation_term`, `weighted_continuation_contribution`, and
   `continuation_contribution` names remain as compatibility aliases.

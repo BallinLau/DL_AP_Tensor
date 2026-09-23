@@ -13,14 +13,19 @@ Firm-state (7D):
 
 ### Output (PolicyValueOutput)
 - `Q`, `bp0`, `bpI`, `P0`, `PI`, `bar_i`, `bar_z`, `P`, `Phat`, `bp`
+- `bp0`/`bpI`/`bp` are the conditional policy heads (valid only for `eta_t=1`)
+- `bp0_effective`/`bpI_effective`/`bp_effective` are the realized next leverage
+  (`b_t` whenever `eta_t=0`)
 
 ### Update rule
-`update_leverage(b_old, bp, eta_next)`:
+`update_leverage(b_old, bp, eta_current)`:
 ```
-b_{t+1} = eta_{t+1} * bp_t + (1 - eta_{t+1}) * b_t
+b_{t+1} = eta_t * bp_t + (1 - eta_t) * b_t
 ```
-Current `eta_t` enters current financing cash flow; child `eta_{t+1}` alone
-determines whether the parent policy is implemented in child leverage.
+The current parent `eta_t` alone determines whether the policy is implemented
+in child leverage; `bp_t` is a real control only when `eta_t=1`. Child
+`eta_{t+1}` remains a state shock and is still enumerated in the expectation,
+but it never gates `b_t -> b_{t+1}`.
 
 ## sdf_fc1.py
 `SDFFC1Combined` combines SDF, FC1, and value model `W`.
