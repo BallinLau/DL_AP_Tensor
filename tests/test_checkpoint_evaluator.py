@@ -511,6 +511,63 @@ def test_bp_regret_is_zero_when_prediction_equals_teacher_star():
     assert summary["p0_regret_max"] == 0.0
 
 
+def test_bp_summary_conditions_policy_statistics_on_refi_active():
+    """TEST 7: eta_t = 0 rows are masked out of every BP policy statistic."""
+    pred = np.array([[0.9, 0.1]])
+    star = np.array([[0.1, 0.1]])
+    survival = np.array([[True, True]])
+    identified = np.array([[True, True]])
+    refi_active = np.array([[True, False]])
+
+    summary = _summary(
+        "p0",
+        pred,
+        star,
+        survival,
+        identified,
+        margin_tol=1e-8,
+        refi_active_mask=refi_active,
+    )
+
+    # Only the eta_t = 1 row feeds the policy-accuracy statistics; without the
+    # mask the mae would have been (0.8 + 0.0) / 2 = 0.4.
+    assert summary["p0_mae"] == pytest.approx(0.8)
+    assert summary["p0_survival_mae"] == pytest.approx(0.8)
+    assert summary["p0_raw_mae"] == pytest.approx(0.8)
+    assert summary["p0_bp_pred_mean"] == pytest.approx(0.9)
+    assert summary["p0_bp_grid_star_mean"] == pytest.approx(0.1)
+    assert summary["p0_survival_grid_share"] == pytest.approx(0.5)
+    assert summary["p0_refi_active_grid_share"] == pytest.approx(0.5)
+
+    # A grid with no active refinancing has no defined BP policy metric at all.
+    inactive_summary = _summary(
+        "p0",
+        pred,
+        star,
+        survival,
+        identified,
+        margin_tol=1e-8,
+        refi_active_mask=np.array([[False, False]]),
+    )
+    assert np.isnan(inactive_summary["p0_mae"])
+    assert np.isnan(inactive_summary["p0_raw_mae"])
+    assert np.isnan(inactive_summary["p0_survival_mae"])
+    assert inactive_summary["p0_refi_active_grid_share"] == 0.0
+
+
+def test_bp_summary_without_refi_active_mask_preserves_legacy_behaviour():
+    summary = _summary(
+        "p0",
+        np.array([[0.9, 0.1]]),
+        np.array([[0.1, 0.1]]),
+        np.array([[True, True]]),
+        np.array([[True, True]]),
+        margin_tol=1e-8,
+    )
+    assert summary["p0_mae"] == pytest.approx(0.4)
+    assert summary["p0_refi_active_grid_share"] == pytest.approx(1.0)
+
+
 def _transition_fixture(grid, eta_values=(0.0, 1.0)):
     children = []
     m_raw = []

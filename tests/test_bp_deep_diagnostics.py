@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from config import Config
@@ -9,7 +10,9 @@ from losses.utils import compute_cashflow
 from models.policy_value import PolicyValueModel
 from training.bp_policy_loss import (
     compute_target_grid_policy_distillation_loss,
+    compute_target_grid_policy_logit_distillation_loss,
     huber_element,
+    reduce_active_weighted,
 )
 
 
@@ -143,3 +146,130 @@ def test_cashflow_identity_formula_is_small():
     reconstructed = production + debt_adjustment - equity_cost
     exported = raw - equity_cost
     assert float((exported - reconstructed).abs().max().item()) < 1e-5
+
+
+def test_reduce_active_weighted_uses_active_row_count_as_denominator():
+    weighted = torch.tensor(
+        [[4.0], [9.0], [9.0], [9.0]], dtype=torch.float64, requires_grad=True
+    )
+    active = torch.tensor([[1.0], [0.0], [0.0], [0.0]], dtype=torch.float64)
+
+    reduced = reduce_active_weighted(weighted, active)
+
+    # The eta_t = 0 rows enter neither numerator nor denominator.
+    assert float(reduced.detach()) == pytest.approx(4.0)
+    assert float(reduced.detach()) != pytest.approx(float(weighted.detach().mean()))
+
+    # No active row: an exact zero that still supports backward().
+    empty = reduce_active_weighted(weighted, torch.zeros(4, 1, dtype=torch.float64))
+    assert float(empty.detach()) == 0.0
+    empty.backward()
+    assert weighted.grad is not None
+    assert float(weighted.grad.abs().sum()) == 0.0
+
+
+def test_distillation_loss_conditions_on_eta_current_active_rows():
+    """TEST 2: eta_t = 0 rows must not dilute the conditional BP objective.
+
+    With one active row of loss ``X`` and three inactive rows whose elementwise
+    loss is exactly zero, the objective must be ``X`` and never ``X / 4``.
+    """
+    pred = torch.tensor([[0.3], [0.1], [0.1], [0.1]], dtype=torch.float64)
+    target = torch.tensor([[0.1], [0.1], [0.1], [0.1]], dtype=torch.float64)
+    confidence = torch.ones_like(pred)
+    active = torch.tensor([[1.0], [0.0], [0.0], [0.0]], dtype=torch.float64)
+    delta = 0.05
+
+    total, unweighted, elem = compute_target_grid_policy_distillation_loss(
+        pred, target, confidence, huber_delta=delta, active_mask=active,
+    )
+
+    active_elem = float(huber_element(pred[:1], target[:1], delta).mean().detach())
+    assert active_elem > 0.0
+    assert float(unweighted.detach()) == pytest.approx(active_elem)
+    assert float(total.detach()) == pytest.approx(active_elem)
+    assert float(unweighted.detach()) != pytest.approx(active_elem / 4.0)
+    assert float(elem.mean().detach()) == pytest.approx(active_elem / 4.0)
+
+    # The logit-space objective must use the same conditional reduction.
+    logit_total, logit_unweighted, _, target_logit = (
+        compute_target_grid_policy_logit_distillation_loss(
+            torch.logit(pred), target, confidence,
+            target_eps=1e-4, huber_delta=1.0, active_mask=active,
+        )
+    )
+    expected_logit_elem = float(
+        huber_element(torch.logit(pred[:1]), target_logit[:1], 1.0).mean().detach()
+    )
+    assert float(logit_unweighted.detach()) == pytest.approx(expected_logit_elem)
+    assert float(logit_total.detach()) == pytest.approx(expected_logit_elem)
+    assert float(logit_unweighted.detach()) != pytest.approx(expected_logit_elem / 4.0)
+
+
+def test_distillation_loss_keeps_confidence_as_weight_not_sum_normalizer():
+    """TEST 3: confidence multiplies the numerator; it is never renormalized."""
+    pred = torch.tensor([[0.3], [0.5]], dtype=torch.float64)
+    target = torch.tensor([[0.1], [0.1]], dtype=torch.float64)
+    delta = 0.05
+    elem = huber_element(pred, target, delta)
+
+    _, unweighted_full, _ = compute_target_grid_policy_distillation_loss(
+        pred, target, torch.ones_like(pred), huber_delta=delta,
+    )
+    _, unweighted_half, _ = compute_target_grid_policy_distillation_loss(
+        pred, target, torch.full_like(pred, 0.5), huber_delta=delta,
+    )
+    assert float(unweighted_full.detach()) == pytest.approx(float(elem.mean().detach()))
+    assert float(unweighted_half.detach()) == pytest.approx(
+        0.5 * float(unweighted_full.detach())
+    )
+
+    # A confidence spike must not be cancelled by sum(confidence): the value is
+    # the confidence-weighted mean, not the unweighted elementwise mean.
+    conf_spike = torch.tensor([[3.0], [1.0]], dtype=torch.float64)
+    _, unweighted_spike, _ = compute_target_grid_policy_distillation_loss(
+        pred, target, conf_spike, huber_delta=delta,
+    )
+    manual = float((conf_spike * elem).mean().detach())
+    assert float(unweighted_spike.detach()) == pytest.approx(manual)
+    assert float(unweighted_spike.detach()) != pytest.approx(float(elem.mean().detach()))
+
+
+def test_distillation_loss_is_invariant_to_appended_inactive_rows():
+    """TEST 5: appending eta_t = 0 rows leaves the objective unchanged."""
+    torch.manual_seed(11)
+    n_active = 10
+    n_inactive = 100
+    pred_active = torch.rand(n_active, 1, dtype=torch.float64)
+    target_active = torch.rand(n_active, 1, dtype=torch.float64)
+    conf_active = torch.rand(n_active, 1, dtype=torch.float64)
+
+    active_only = compute_target_grid_policy_distillation_loss(
+        pred_active,
+        target_active,
+        conf_active,
+        huber_delta=0.05,
+        active_mask=torch.ones(n_active, 1, dtype=torch.float64),
+    )
+
+    pred_mixed = torch.cat([pred_active, torch.rand(n_inactive, 1, dtype=torch.float64)])
+    target_mixed = torch.cat([target_active, torch.rand(n_inactive, 1, dtype=torch.float64)])
+    conf_mixed = torch.cat(
+        [conf_active, torch.zeros(n_inactive, 1, dtype=torch.float64)]
+    )
+    mask_mixed = torch.cat(
+        [
+            torch.ones(n_active, 1, dtype=torch.float64),
+            torch.zeros(n_inactive, 1, dtype=torch.float64),
+        ]
+    )
+    mixed = compute_target_grid_policy_distillation_loss(
+        pred_mixed,
+        target_mixed,
+        conf_mixed,
+        huber_delta=0.05,
+        active_mask=mask_mixed,
+    )
+
+    assert float(mixed[0].detach()) == pytest.approx(float(active_only[0].detach()), rel=1e-12)
+    assert float(mixed[1].detach()) == pytest.approx(float(active_only[1].detach()), rel=1e-12)

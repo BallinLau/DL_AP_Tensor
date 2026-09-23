@@ -103,7 +103,7 @@ Training orchestration for episodes and modules.
 - `HyperParams.pv_bp_training_mode='target_grid'` enables the new Grid-B policy/value training path.
 - During PV training, `_compute_p0_loss(...)` and `_compute_pi_loss(...)` call `BPGridTeacher`:
   - build a coarse bp-grid, optionally refine locally;
-  - construct continuation child states with `b_child = eta_child * bp_candidate + (1 - eta_child) * b_parent`;
+  - construct continuation child states with `b_child = eta_t * bp_candidate + (1 - eta_t) * b_parent`, where `eta_t` is the CURRENT parent refinancing realization; the child `eta_{t+1}` stays a state shock and never gates child leverage, so both children of a parent share the same realized `b_child`;
   - construct issuance-Q states with debt set directly to `bp_candidate`;
   - evaluate issuance `Q` with the frozen target network and child continuation `(P, bar_z)` through `target_model.forward_equity(...)`;
   - choose the candidate maximizing economic RHS `cashflow + continuation value`;

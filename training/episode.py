@@ -4637,6 +4637,7 @@ class Episode:
                 grid["confidence"],
                 huber_delta=policy_delta,
                 branch_weight=policy_weight,
+                active_mask=grid["refi_active"],
             )
         else:
             if bp_logit_pred is None:
@@ -4650,6 +4651,7 @@ class Episode:
                 target_eps=logit_eps,
                 huber_delta=logit_delta,
                 branch_weight=policy_weight,
+                active_mask=grid["refi_active"],
             )
         penalty_loss = penalty_z
         total_loss = value_loss + penalty_loss + policy_total
@@ -4683,6 +4685,7 @@ class Episode:
                 huber_delta=policy_delta,
                 branch_weight=mix_policy_weight,
                 sample_weight=mix_sample_weight,
+                active_mask=mix_grid["refi_active"],
             )
             total_loss = total_loss + mix_total
             mix_terms = self._grid_policy_only_diag_terms(
@@ -8242,6 +8245,39 @@ class Episode:
         return self._tensor_list_hash(tensors)
 
     @staticmethod
+    def _bp_cache_item_has_active_supervision(item: Dict[str, Any]) -> bool:
+        """True when a cache item carries any eta_t = 1 BP supervision.
+
+        The three effective channels mirror ``_bp_cache_active_counts``: the two
+        head confidences and the mix confidence gated by its survival weight.
+        An item with none of them active has no refinancing supervision, so it
+        must not take an optimizer step (AdamW weight decay would otherwise move
+        the BP head and consume optimizer-step accounting).
+
+        Items that do not expose the standard supervision channels (lightweight
+        test doubles) cannot be classified and are treated as active so the
+        legacy behaviour is preserved.
+        """
+        channels: List[torch.Tensor] = []
+        for key in ("bp0_confidence", "bpi_confidence"):
+            value = item.get(key)
+            if value is not None:
+                channels.append(value.detach().cpu() > 0)
+        mix_conf = item.get("mix_confidence")
+        if mix_conf is not None:
+            mix_active = mix_conf.detach().cpu() > 0
+            mix_weight = item.get("mix_sample_weight")
+            if mix_weight is not None:
+                mix_active = mix_active & (mix_weight.detach().cpu() > 0)
+            channels.append(mix_active)
+        if not channels:
+            return True
+        active = channels[0]
+        for channel in channels[1:]:
+            active = active | channel
+        return bool(active.any().item())
+
+    @staticmethod
     def _bp_cache_active_counts(cache: List[Dict[str, Any]]) -> Dict[str, float]:
         counts = {
             "bp0_active_count": 0.0,
@@ -8289,6 +8325,14 @@ class Episode:
         bpi_conf = item["bpi_confidence"].to(self.device)
         mix_conf = item["mix_confidence"].to(self.device)
         mix_weight = item["mix_sample_weight"].to(self.device)
+        # BP supervision is conditional on the CURRENT parent eta_t. Cache rows
+        # with eta_t = 0 carry zero confidence; excluding them from the reduction
+        # denominator keeps the objective E[confidence * elem | eta_t = 1] instead
+        # of diluting it by the refinancing frequency.
+        active_mask = item.get("eta_current")
+        if active_mask is None:
+            active_mask = parent[:, SIMMODEL.ETA:SIMMODEL.ETA + 1]
+        active_mask = active_mask.to(self.device)
         model = self.models["policy_value"]
         output = model(parent)
         bp0_logit, bpi_logit = model.forward_policy_logits(parent)
@@ -8306,6 +8350,7 @@ class Episode:
                 target_eps=logit_eps,
                 huber_delta=logit_delta,
                 branch_weight=policy_weight,
+                active_mask=active_mask,
             )
             bpi_total, bpi_loss, _, _ = compute_target_grid_policy_logit_distillation_loss(
                 bpi_logit,
@@ -8314,13 +8359,16 @@ class Episode:
                 target_eps=logit_eps,
                 huber_delta=logit_delta,
                 branch_weight=policy_weight,
+                active_mask=active_mask,
             )
         else:
             bp0_total, bp0_loss, _ = compute_target_grid_policy_distillation_loss(
-                bp0, bp0_target, bp0_conf, huber_delta=policy_delta, branch_weight=policy_weight
+                bp0, bp0_target, bp0_conf, huber_delta=policy_delta,
+                branch_weight=policy_weight, active_mask=active_mask,
             )
             bpi_total, bpi_loss, _ = compute_target_grid_policy_distillation_loss(
-                bpi, bpi_target, bpi_conf, huber_delta=policy_delta, branch_weight=policy_weight
+                bpi, bpi_target, bpi_conf, huber_delta=policy_delta,
+                branch_weight=policy_weight, active_mask=active_mask,
             )
         b_parent = parent[:, 0:1]
         bp_mix = self._mixed_policy_conditional_bp(
@@ -8337,6 +8385,7 @@ class Episode:
             huber_delta=policy_delta,
             branch_weight=float(getattr(self.hyperparams, "bp_grid_mix_policy_weight", 1.0)),
             sample_weight=mix_weight,
+            active_mask=active_mask,
         )
         total = bp0_total + bpi_total + mix_total
 
@@ -8520,6 +8569,7 @@ class Episode:
         records: List[Dict[str, Any]] = []
         teacher_hash = self._state_dict_hash(teacher_snapshot)
         skipped_no_active = False
+        skipped_no_active_batches = 0
         stop_reason = "epochs_exhausted"
         max_skip_ratio = float(getattr(self.hyperparams, "pv_epoch_max_skip_ratio", 0.05))
         hard_threshold = float(getattr(self.hyperparams, "pv_grad_hard_threshold", 1000.0))
@@ -8583,6 +8633,13 @@ class Episode:
                                 and optimizer_steps >= max_optimizer_steps
                             ):
                                 break
+                            # An item with no eta_t = 1 supervision must not reach
+                            # backward()/optimizer.step(): zero gradients would
+                            # still let AdamW weight decay move the BP head and
+                            # would consume optimizer-step accounting.
+                            if not self._bp_cache_item_has_active_supervision(item):
+                                skipped_no_active_batches += 1
+                                continue
                             epoch_total += 1
                             attempted_optimizer_steps += 1
                             optimizer.zero_grad(set_to_none=True)
@@ -8807,6 +8864,7 @@ class Episode:
             "soft_spike_count": soft_spike_count,
             "hard_spike_count": hard_spike_count,
             "nonfinite_count": nonfinite_count,
+            "skipped_no_active_refinancing_batches": skipped_no_active_batches,
             "epoch_summaries": epoch_summaries,
             "train_metrics": {**avg, **meta},
         }

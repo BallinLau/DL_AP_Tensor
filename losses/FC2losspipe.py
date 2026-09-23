@@ -11,6 +11,7 @@ import torch
 
 from config import Config
 from experiments.fill_fullN_entrants import fill_df_to_fullN
+from utils.firm_transition import apply_refinancing_policy
 
 # Helpers
 
@@ -232,10 +233,18 @@ class FC2Pipeline:
         )
         child0 = children_s_full[:, :, 0, :]
         child1 = children_s_full[:, :, 1, :]
-        new_b0 = masked_bp * child0[:, :, 2] + masked_b * (1 - child0[:, :, 2])
-        new_b1 = masked_bp * child1[:, :, 2] + masked_b * (1 - child1[:, :, 2])
-        child0 = torch.cat([new_b0.unsqueeze(-1), child0[:, :, 1:]], dim=-1)
-        child1 = torch.cat([new_b1.unsqueeze(-1), child1[:, :, 1:]], dim=-1)
+        # Realized next leverage is gated by the CURRENT parent eta_t (column 2 of
+        # the parent state), not by each child's eta_{t+1}: both children of a
+        # parent share the same realized b_next. Child eta_{t+1} is left untouched
+        # in the child state and remains a state shock only.
+        eta_current = self.P_s_full[:, :, 2]
+        new_b = apply_refinancing_policy(
+            b_current=masked_b,
+            bp_candidate=masked_bp,
+            eta_current=eta_current,
+        )
+        child0 = torch.cat([new_b.unsqueeze(-1), child0[:, :, 1:]], dim=-1)
+        child1 = torch.cat([new_b.unsqueeze(-1), child1[:, :, 1:]], dim=-1)
         children_s_full = torch.stack([child0, child1], dim=2)
 
 

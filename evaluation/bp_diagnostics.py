@@ -390,17 +390,34 @@ def _summary(
     top2_margin: np.ndarray | None = None,
     *,
     margin_tol: float,
+    refi_active_mask: np.ndarray | None = None,
 ) -> Dict[str, float]:
-    primary_mask = survival_mask.astype(bool) & identified_mask.astype(bool)
+    """Summarize one BP branch over economically defined refinancing states.
+
+    ``bp_t`` is a real control only when the parent has ``eta_t = 1``. Every
+    policy-accuracy statistic therefore requires ``refi_active``: the survival
+    variants use ``survival_mask & refi_active_mask`` and the "raw" variants are
+    restricted to ``refi_active_mask`` instead of silently averaging the eta_t = 0
+    rows (whose ``bp_grid_star`` is a forced bookkeeping value, not an optimum).
+    """
+    active_mask = (
+        np.ones_like(survival_mask, dtype=bool)
+        if refi_active_mask is None
+        else refi_active_mask.astype(bool)
+    )
+    survival_mask = survival_mask.astype(bool) & active_mask
+    identified_mask = identified_mask.astype(bool) & active_mask
+    primary_mask = survival_mask & identified_mask
     values = _gap_statistics(pred, star, primary_mask)
     survival_values = _gap_statistics(pred, star, survival_mask)
-    raw_values = _gap_statistics(pred, star, np.ones_like(survival_mask, dtype=bool))
+    raw_values = _gap_statistics(pred, star, active_mask)
     values.update({f"survival_{key}": value for key, value in survival_values.items()})
     values.update({f"raw_{key}": value for key, value in raw_values.items()})
-    values["survival_grid_share"] = float(survival_mask.astype(bool).mean())
-    values["teacher_identified_grid_share"] = float(identified_mask.astype(bool).mean())
+    values["survival_grid_share"] = float(survival_mask.mean())
+    values["teacher_identified_grid_share"] = float(identified_mask.mean())
     values["survival_identified_grid_share"] = float(primary_mask.mean())
-    survival_count = int(survival_mask.astype(bool).sum())
+    values["refi_active_grid_share"] = float(active_mask.mean())
+    survival_count = int(survival_mask.sum())
     values["teacher_identified_share"] = values["teacher_identified_grid_share"]
     values["teacher_identified_share_survival"] = (
         float(primary_mask.sum()) / float(survival_count) if survival_count else float("nan")
@@ -414,19 +431,17 @@ def _summary(
             metric_values, survival_mask
         )["mean"]
         values[f"raw_{metric_name}_mean"] = _distribution_statistics(
-            metric_values, np.ones_like(survival_mask, dtype=bool)
+            metric_values, active_mask
         )["mean"]
     if regret is not None:
         for key, value in _distribution_statistics(regret, primary_mask).items():
             values[f"regret_{key}"] = value
         for key, value in _distribution_statistics(regret, survival_mask).items():
             values[f"survival_regret_{key}"] = value
-        for key, value in _distribution_statistics(
-            regret, np.ones_like(survival_mask, dtype=bool)
-        ).items():
+        for key, value in _distribution_statistics(regret, active_mask).items():
             values[f"raw_regret_{key}"] = value
     if top2_margin is not None:
-        margin_finite = np.isfinite(top2_margin)
+        margin_finite = np.isfinite(top2_margin) & active_mask
         margin_values = top2_margin[margin_finite]
         values.update({
             "top2_margin_mean": float(margin_values.mean()) if margin_values.size else float("nan"),
@@ -509,6 +524,7 @@ def _summarize_bp_branch(
     teacher_margin_tol: float,
     surfaces: Dict[str, np.ndarray],
     summary: Dict[str, float],
+    parent_state: torch.Tensor | None = None,
 ) -> None:
     """Add one branch's surfaces and summary statistics (shared by every BP path).
 
@@ -550,7 +566,11 @@ def _summarize_bp_branch(
     surfaces[f"{label}_teacher_identified_raw"] = identified_mask.astype(np.float64)
     surfaces[f"{label}_refi_active_raw"] = refi_active
     surfaces[f"{label}_bp_regret_raw"] = np.where(refi_active_mask, regret, np.nan)
-    surfaces[f"{label}_bp_pred_survival"] = np.where(survival_mask, pred, np.nan)
+    # The neural BP head is still evaluated on eta_t = 0 states (checkpoint
+    # compatible), but its output is not an economic policy there. Expose it only
+    # under an explicit eta0 name so it cannot be confused with BP accuracy.
+    surfaces[f"{label}_bp_raw_head_eta0"] = np.where(refi_active_mask, np.nan, pred)
+    surfaces[f"{label}_bp_pred_survival"] = np.where(survival_refi_mask, pred, np.nan)
     surfaces[f"{label}_bp_grid_star_survival"] = np.where(survival_refi_mask, star, np.nan)
     surfaces[f"{label}_bp_abs_gap_survival"] = np.where(survival_refi_mask, gap, np.nan)
     surfaces[f"{label}_bp_regret_survival"] = np.where(survival_refi_mask, regret, np.nan)
@@ -568,6 +588,7 @@ def _summarize_bp_branch(
             regret=regret,
             top2_margin=top2_margin,
             margin_tol=teacher_margin_tol,
+            refi_active_mask=refi_active_mask,
         )
     )
     for component, key in (
@@ -630,10 +651,54 @@ def _summarize_bp_branch(
     )
     summary[f"{label}_child_b_eta_independent_share"] = float(eta_consistent.mean())
     refi_active_flat = refi_active_mask.reshape(-1)
+    n_active = int(refi_active_flat.sum())
     n_inactive = int((~refi_active_flat).sum())
     summary[f"{label}_eta0_child_b_equals_forced_share"] = (
         float(eta_consistent[~refi_active_flat].mean()) if n_inactive else float("nan")
     )
+    # Explicit per-eta child-leverage diagnostics.
+    # eta_t = 1: both conditional child leverages must equal the candidate bp.
+    # eta_t = 0: both must equal b_parent (the forced transition). The inactive
+    # rows are never compared against the raw neural BP head.
+    eta0_equals_candidate = (
+        np.isfinite(child_b_eta0_at_star)
+        & (np.abs(child_b_eta0_at_star - candidate_at_star) <= tol)
+    )
+    eta1_equals_candidate = (
+        np.isfinite(child_b_eta1_at_star)
+        & (np.abs(child_b_eta1_at_star - candidate_at_star) <= tol)
+    )
+    summary[f"{label}_eta1_child_b_eta0_equals_candidate_share"] = (
+        float(eta0_equals_candidate[refi_active_flat].mean())
+        if n_active else float("nan")
+    )
+    summary[f"{label}_eta1_child_b_eta1_equals_candidate_share"] = (
+        float(eta1_equals_candidate[refi_active_flat].mean())
+        if n_active else float("nan")
+    )
+    if parent_state is not None:
+        b_parent = (
+            parent_state.detach().cpu()[:, 0:1].reshape(-1).numpy().astype(np.float64)
+        )
+        eta0_equals_parent = (
+            np.isfinite(child_b_eta0_at_star)
+            & (np.abs(child_b_eta0_at_star - b_parent) <= tol)
+        )
+        eta1_equals_parent = (
+            np.isfinite(child_b_eta1_at_star)
+            & (np.abs(child_b_eta1_at_star - b_parent) <= tol)
+        )
+        inactive = ~refi_active_flat
+        summary[f"{label}_eta0_child_b_eta0_equals_parent_share"] = (
+            float(eta0_equals_parent[inactive].mean()) if n_inactive else float("nan")
+        )
+        summary[f"{label}_eta0_child_b_eta1_equals_parent_share"] = (
+            float(eta1_equals_parent[inactive].mean()) if n_inactive else float("nan")
+        )
+        summary[f"{label}_eta0_realized_b_next_equals_parent_share"] = (
+            float((eta0_equals_parent[inactive] & eta1_equals_parent[inactive]).mean())
+            if n_inactive else float("nan")
+        )
 
 
 BP_EVAL_ALLOWED_EXPANDED_STATES = (65536, 131072, 262144, 524288)
@@ -751,6 +816,7 @@ def evaluate_bp_consistency(
                 teacher_margin_tol=teacher_margin_tol,
                 surfaces=surfaces,
                 summary=summary,
+                parent_state=states,
             )
 
     if write_objective_slices:
@@ -876,6 +942,7 @@ def evaluate_bp_consistency_multi_j(
                 teacher_margin_tol=teacher_margin_tol,
                 surfaces=surfaces,
                 summary=summary,
+                parent_state=branch_states[branch_index],
             )
         metadata = dict(
             slice_frozen_transition_data(

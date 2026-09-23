@@ -565,6 +565,86 @@ def test_bp_distillation_supervises_only_eta_current_active_rows():
     assert episode._param_max_change_from_snapshot(bp_params, snapshot) > 0.0
 
 
+def test_zero_active_bp_cache_item_is_skipped_without_optimizer_step():
+    """TEST 4: an eta_t = 0-only cache item must not take an optimizer step.
+
+    AdamW weight decay would still move the BP head on a zero-gradient batch,
+    so the stage has to skip such items before ``backward()`` and leave the
+    optimizer-step counters untouched.
+    """
+    episode = _episode()
+    device = episode.device
+    teacher = episode.firm_target
+    active_item = episode._build_bp_target_cache([_batch(device)], teacher)[0]
+    zero_item = episode._build_bp_target_cache([_batch(device)], teacher)[0]
+    _zero_bp_cache_activity([zero_item])
+
+    assert episode._bp_cache_item_has_active_supervision(active_item) is True
+    assert episode._bp_cache_item_has_active_supervision(zero_item) is False
+
+    # The zero-active item produces an exactly-zero loss and zero gradient.
+    bp_params = episode._policy_value_stage_params("bp")
+    for param in bp_params:
+        param.grad = None
+    total, _ = episode._compute_bp_cache_loss(zero_item)
+    assert float(total.detach()) == 0.0
+    total.backward()
+    assert all(
+        param.grad is None or float(param.grad.abs().sum()) == 0.0
+        for param in bp_params
+    )
+    episode.models["policy_value"].zero_grad(set_to_none=True)
+
+    before_step_count = int(episode.step_count)
+    before_bp_steps = int(episode.bp_distill_step_count)
+    summary = episode._run_bp_distillation_stage(
+        [active_item, zero_item],
+        [active_item],
+        teacher,
+        n_epochs=1,
+    )
+
+    assert summary["status"] == "accepted"
+    assert summary["skipped_no_active_refinancing_batches"] == 1
+    # Only the single active item is allowed to consume an optimizer step.
+    assert summary["attempted_optimizer_steps"] == 1
+    assert summary["optimizer_steps"] == 1
+    assert episode.step_count == before_step_count + 1
+    assert episode.bp_distill_step_count == before_bp_steps + 1
+
+
+def _subset_batch(batch, index):
+    return {
+        **{key: value for key, value in batch.items() if key not in ("parent", "children")},
+        "parent": batch["parent"][index],
+        "children": [child[index] for child in batch["children"]],
+    }
+
+
+def test_p0_pi_value_loss_still_supervises_eta_current_zero_rows():
+    """TEST 6: eta_t = 0 rows keep contributing to the P0/PI value objective."""
+    episode = _episode()
+    device = episode.device
+    batch = _batch(device)
+    # Row 0 has parent eta_t = 1, row 1 has parent eta_t = 0.
+    active_only = _subset_batch(batch, [0])
+    active_plus_inactive = _subset_batch(batch, [0, 1])
+    episode._target_grid_loss_component_mode = "value"
+    try:
+        p0_active = episode._compute_p0_loss(active_only)
+        p0_mixed = episode._compute_p0_loss(active_plus_inactive)
+        pi_active = episode._compute_pi_loss(active_only)
+        pi_mixed = episode._compute_pi_loss(active_plus_inactive)
+    finally:
+        episode._target_grid_loss_component_mode = "joint"
+
+    assert torch.isfinite(p0_mixed) and torch.isfinite(pi_mixed)
+    # Appending an eta_t = 0 parent still changes the value objective, i.e. the
+    # value loss is not masked to the active refinancing rows.
+    assert not torch.isclose(p0_active, p0_mixed, atol=1e-7)
+    assert not torch.isclose(pi_active, pi_mixed, atol=1e-7)
+
+
 def test_reduce_signed_branch_residuals_cancellation_and_realized_abs():
     signed = torch.tensor([[0.3, -0.3]], dtype=torch.float32)
     reduced = Episode._reduce_signed_branch_residuals(signed)
