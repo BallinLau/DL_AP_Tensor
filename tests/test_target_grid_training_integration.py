@@ -103,9 +103,12 @@ def test_target_grid_loss_logs_mix_regret_and_freezes_target_gradients():
     for key in required_active_diag_keys:
         assert key in episode._latest_pi_terms
         assert torch.isfinite(torch.tensor(episode._latest_pi_terms[key]))
-    assert episode._latest_pi_terms["mix_grid_refi_active_n"] == 2.0
+    # Only the row with CURRENT parent eta_t = 1 has a well-defined BP grid
+    # optimum; the eta_t = 0 row is forced and excluded from the active
+    # diagnostics (n = 1 of 2 rows, share = 0.5).
+    assert episode._latest_pi_terms["mix_grid_refi_active_n"] == 1.0
     assert episode._latest_pi_terms["mix_grid_refi_active_available"] == 1.0
-    assert episode._latest_pi_terms["mix_grid_refi_active_share"] == 1.0
+    assert episode._latest_pi_terms["mix_grid_refi_active_share"] == 0.5
 
     online_grad = [
         p.grad.detach().abs().sum().item()
@@ -273,7 +276,7 @@ def test_bp_grid_boundary_low_threshold_is_explicit_hyperparameter():
     assert hp.bp_grid_boundary_low_threshold == 0.05
 
 
-def test_parent_eta_zero_does_not_skip_policy_convergence():
+def test_parent_eta_zero_skips_policy_convergence():
     device = torch.device("cpu")
     Config.DEVICE = device
     online = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8).to(device)
@@ -287,17 +290,32 @@ def test_parent_eta_zero_does_not_skip_policy_convergence():
         firm_target=target,
     )
 
-    batch = _batch(device)
-    batch["parent"][:, 2:3] = 0.0
-    result = episode.evaluate_target_grid_policy_convergence([batch])
+    # All rows have CURRENT parent eta_t = 0, so refinancing never triggers and
+    # there is no BP choice to evaluate: every policy is skipped.  This is the
+    # correct new timing behavior, not a failure.
+    inactive = _batch(device)
+    inactive["parent"][:, 2:3] = 0.0
+    result = episode.evaluate_target_grid_policy_convergence([inactive])
 
     assert result["enabled"] is True
     assert result["passed"] is True
-    assert result["informative"] is True
-    assert result["all_skipped"] is False
-    assert result["skip_reason"] is None
-    assert result["informative_policies"] == ["bp0", "bpI", "mix"]
-    assert result["skipped_policies"] == []
+    assert result["informative"] is False
+    assert result["all_skipped"] is True
+    assert result["skip_reason"] == "no_active_refinancing_states"
+    assert result["informative_policies"] == []
+    assert result["skipped_policies"] == ["bp0", "bpI", "mix"]
+
+    # With refinancing-active rows the policies become informative again.
+    active = _batch(device)
+    active["parent"][:, 2:3] = 1.0
+    active_result = episode.evaluate_target_grid_policy_convergence([active])
+
+    assert active_result["enabled"] is True
+    assert active_result["informative"] is True
+    assert active_result["all_skipped"] is False
+    assert active_result["skip_reason"] is None
+    assert active_result["informative_policies"] == ["bp0", "bpI", "mix"]
+    assert active_result["skipped_policies"] == []
 
 
 def test_policy_convergence_selector_prefers_informative_validation():

@@ -215,8 +215,9 @@ class PILoss(nn.Module):
         - cfip_grad = ∂CFip/∂bp
         - P'_grad^{(j)} = ∂P_children^{(j)}/∂bp
 
-        ``P'_grad`` already contains db_child/dbp = eta_child, so no separate
-        eta multiplier is applied here.
+        ``P'_grad`` already contains db_child/dbp = eta_current (the CURRENT
+        parent refinancing realization), so no separate eta multiplier is
+        applied here.
         """
         n_branches = len(P_children)
         cf_grad_missing = 0

@@ -1085,6 +1085,17 @@ class Episode:
         return list(collapsed.unbind(dim=1))
 
     @staticmethod
+    def _eta_current_active_mask(eta_current: torch.Tensor) -> torch.Tensor:
+        """``1{eta_t = 1}`` gate for debt-choice (bp) terms.
+
+        Realized leverage is ``b_{t+1} = eta_t * bp_t + (1 - eta_t) * b_t``, so
+        ``bp_t`` is a control only when the CURRENT parent state has eta_t = 1.
+        Value/Bellman targets stay defined for every row; BP policy, FOC and KKT
+        terms are restricted to this mask.
+        """
+        return (eta_current.reshape(-1, 1) > 0.5).to(eta_current.dtype)
+
+    @staticmethod
     def _safe_quantile(v: torch.Tensor, q: float) -> float:
         vv = v.detach().reshape(-1)
         vv = vv[torch.isfinite(vv)]
@@ -2527,12 +2538,17 @@ class Episode:
         self,
         bp: torch.Tensor,
         foc_residuals: List[torch.Tensor],
+        active_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         对有界控制变量 bp ∈ [0,1] 施加 KKT 条件：
         - 内点: FOC = 0
         - 下边界(bp≈0): FOC <= 0
         - 上边界(bp≈1): FOC >= 0
+
+        ``active_mask`` is the ``1{eta_t = 1}`` gate: a debt-choice KKT condition
+        only exists when refinancing is available. Parents with ``eta_t = 0`` have
+        no bp control, so their FOC/KKT contribution is exactly zero.
         """
         if not foc_residuals:
             z = torch.tensor(0.0, device=self.device)
@@ -2549,7 +2565,10 @@ class Episode:
             }
 
         foc_stack = torch.stack([r if r.dim() == 2 else r.unsqueeze(-1) for r in foc_residuals], dim=1)  # (B, N, 1)
-        active_mask = torch.ones_like(bp)
+        if active_mask is None:
+            active_mask = torch.ones_like(bp)
+        else:
+            active_mask = active_mask.to(device=bp.device, dtype=bp.dtype)
         foc_mean = foc_stack.mean(dim=1)  # (B, 1), signed
         active_ratio = float(active_mask.mean().item())
         if active_ratio <= 1e-8:
@@ -2579,7 +2598,7 @@ class Episode:
         # 软区域权重，避免硬切分导致不连续
         w_low = torch.sigmoid(temp * (eps_low - bp)) * active_mask
         w_high = torch.sigmoid(temp * (bp - (1.0 - eps_high))) * active_mask
-        w_inner = (1.0 - w_low) * (1.0 - w_high)
+        w_inner = (1.0 - w_low) * (1.0 - w_high) * active_mask
 
         def _wmean(v: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             return (v * w).sum() / (w.sum() + 1e-6)
@@ -2621,13 +2640,18 @@ class Episode:
         z_parent: torch.Tensor,
         alpha_z: float,
         beta_z: float,
-        z0: float
+        z0: float,
+        active_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
         """
         Aggregate branch FOCs as a signed mean over child draws.
 
         Each P gradient is taken directly with respect to bp, so
-        db_child/dbp = eta_child is already in the autograd graph.
+        db_child/dbp = eta_current is already in the autograd graph.
+
+        ``active_mask`` is the ``1{eta_t = 1}`` gate. Parents with ``eta_t = 0``
+        have no debt-choice FOC: ``bp_t`` is not a control there, so they are
+        excluded from both the signed moment and the z penalty.
         """
         if not foc_residuals:
             z = torch.tensor(0.0, device=self.device)
@@ -2638,7 +2662,12 @@ class Episode:
             }
 
         foc_stack = torch.stack([r if r.dim() == 2 else r.unsqueeze(-1) for r in foc_residuals], dim=1)  # (B,N,1)
-        active_mask = torch.ones_like(foc_stack[:, 0, :])
+        if active_mask is None:
+            active_mask = torch.ones_like(foc_stack[:, 0, :])
+        else:
+            active_mask = active_mask.to(
+                device=foc_stack.device, dtype=foc_stack.dtype
+            )
         active_bool = active_mask.squeeze(-1) > 0.5
         active_n = int(active_bool.sum().item())
         if active_n == 0:
@@ -4238,6 +4267,20 @@ class Episode:
         return huber_element(pred, target, beta)
 
     @staticmethod
+    def _finite_diag_mean(value: torch.Tensor) -> float:
+        """Mean over the finite entries; 0.0 when every entry is undefined.
+
+        ``BPGridTeacher`` reports grid-only diagnostics as NaN for parents with
+        eta_t = 0, where the bp grid is never evaluated. Ignoring those rows keeps
+        the metric's meaning for the rows where it is defined.
+        """
+        flat = value.detach().reshape(-1)
+        finite = flat[torch.isfinite(flat)]
+        if finite.numel() == 0:
+            return 0.0
+        return float(finite.mean().item())
+
+    @staticmethod
     def _masked_diag_mean(value: torch.Tensor, mask: torch.Tensor) -> float:
         value_flat = value.detach().reshape(-1)
         mask_flat = mask.detach().reshape(-1).to(torch.bool)
@@ -4329,8 +4372,8 @@ class Episode:
             f'{prefix}_grid_bp_err_p90': self._safe_quantile(bp_err, 0.90),
             f'{prefix}_grid_regret_mean': float(grid["regret"].mean().item()),
             f'{prefix}_grid_regret_p90': self._safe_quantile(grid["regret"], 0.90),
-            f'{prefix}_grid_top2_margin_mean': float(grid["top2_margin"].mean().item()),
-            f'{prefix}_grid_fine_top2_margin_mean': float(grid["fine_top2_margin"].mean().item()),
+            f'{prefix}_grid_top2_margin_mean': self._finite_diag_mean(grid["top2_margin"]),
+            f'{prefix}_grid_fine_top2_margin_mean': self._finite_diag_mean(grid["fine_top2_margin"]),
             f'{prefix}_grid_top2_margin_p10': self._safe_quantile(grid["top2_margin"], 0.10),
             f'{prefix}_grid_confidence_mean': float(grid["confidence"].mean().item()),
             f'{prefix}_grid_refi_active_share': float(refi_active.detach().mean().item()),
@@ -4368,17 +4411,17 @@ class Episode:
             f'{prefix}_grid_default_at_star_mean_active': _active_mean(grid["default_at_star"]),
             f'{prefix}_grid_p_child_at_star_mean_active': _active_mean(grid["p_child_at_star"]),
             f'{prefix}_grid_q_issue_at_star_mean_active': _active_mean(grid["q_issue_at_star"]),
-            f'{prefix}_grid_argmax_index_mean': float(grid["argmax_index"].to(torch.float32).mean().item()),
-            f'{prefix}_grid_value_low_bp_mean': float(grid["coarse_value_grid"][:, 0:1].mean().item()),
-            f'{prefix}_grid_value_high_bp_mean': float(grid["coarse_value_grid"][:, -1:].mean().item()),
-            f'{prefix}_grid_default_low_bp_mean': float(grid["coarse_default_grid_mean"][:, 0:1].mean().item()),
-            f'{prefix}_grid_default_high_bp_mean': float(grid["coarse_default_grid_mean"][:, -1:].mean().item()),
-            f'{prefix}_grid_p_child_low_bp_mean': float(grid["coarse_p_child_grid_mean"][:, 0:1].mean().item()),
-            f'{prefix}_grid_p_child_high_bp_mean': float(grid["coarse_p_child_grid_mean"][:, -1:].mean().item()),
-            f'{prefix}_grid_q_issue_low_bp_mean': float(grid["coarse_q_issue_grid"][:, 0:1].mean().item()),
-            f'{prefix}_grid_q_issue_high_bp_mean': float(grid["coarse_q_issue_grid"][:, -1:].mean().item()),
-            f'{prefix}_grid_local_value_left_mean': float(grid["local_value_left"].mean().item()),
-            f'{prefix}_grid_local_value_right_mean': float(grid["local_value_right"].mean().item()),
+            f'{prefix}_grid_argmax_index_mean': _active_mean(grid["argmax_index"].to(torch.float32)),
+            f'{prefix}_grid_value_low_bp_mean': self._finite_diag_mean(grid["coarse_value_grid"][:, 0:1]),
+            f'{prefix}_grid_value_high_bp_mean': self._finite_diag_mean(grid["coarse_value_grid"][:, -1:]),
+            f'{prefix}_grid_default_low_bp_mean': self._finite_diag_mean(grid["coarse_default_grid_mean"][:, 0:1]),
+            f'{prefix}_grid_default_high_bp_mean': self._finite_diag_mean(grid["coarse_default_grid_mean"][:, -1:]),
+            f'{prefix}_grid_p_child_low_bp_mean': self._finite_diag_mean(grid["coarse_p_child_grid_mean"][:, 0:1]),
+            f'{prefix}_grid_p_child_high_bp_mean': self._finite_diag_mean(grid["coarse_p_child_grid_mean"][:, -1:]),
+            f'{prefix}_grid_q_issue_low_bp_mean': self._finite_diag_mean(grid["coarse_q_issue_grid"][:, 0:1]),
+            f'{prefix}_grid_q_issue_high_bp_mean': self._finite_diag_mean(grid["coarse_q_issue_grid"][:, -1:]),
+            f'{prefix}_grid_local_value_left_mean': self._finite_diag_mean(grid["local_value_left"]),
+            f'{prefix}_grid_local_value_right_mean': self._finite_diag_mean(grid["local_value_right"]),
         }
         if extra_terms:
             terms.update(extra_terms)
@@ -4422,8 +4465,8 @@ class Episode:
             f'{prefix}_grid_bp_err_p90': self._safe_quantile(bp_err, 0.90),
             f'{prefix}_grid_regret_mean': float(grid["regret"].mean().item()),
             f'{prefix}_grid_regret_p90': self._safe_quantile(grid["regret"], 0.90),
-            f'{prefix}_grid_top2_margin_mean': float(grid["top2_margin"].mean().item()),
-            f'{prefix}_grid_fine_top2_margin_mean': float(grid["fine_top2_margin"].mean().item()),
+            f'{prefix}_grid_top2_margin_mean': self._finite_diag_mean(grid["top2_margin"]),
+            f'{prefix}_grid_fine_top2_margin_mean': self._finite_diag_mean(grid["fine_top2_margin"]),
             f'{prefix}_grid_top2_margin_p10': self._safe_quantile(grid["top2_margin"], 0.10),
             f'{prefix}_grid_confidence_mean': float(grid["confidence"].mean().item()),
             f'{prefix}_grid_refi_active_share': float(refi_active.detach().mean().item()),
@@ -4460,17 +4503,17 @@ class Episode:
             f'{prefix}_grid_default_at_star_mean_active': _active_mean(grid["default_at_star"]),
             f'{prefix}_grid_p_child_at_star_mean_active': _active_mean(grid["p_child_at_star"]),
             f'{prefix}_grid_q_issue_at_star_mean_active': _active_mean(grid["q_issue_at_star"]),
-            f'{prefix}_grid_argmax_index_mean': float(grid["argmax_index"].to(torch.float32).mean().item()),
-            f'{prefix}_grid_value_low_bp_mean': float(grid["coarse_value_grid"][:, 0:1].mean().item()),
-            f'{prefix}_grid_value_high_bp_mean': float(grid["coarse_value_grid"][:, -1:].mean().item()),
-            f'{prefix}_grid_default_low_bp_mean': float(grid["coarse_default_grid_mean"][:, 0:1].mean().item()),
-            f'{prefix}_grid_default_high_bp_mean': float(grid["coarse_default_grid_mean"][:, -1:].mean().item()),
-            f'{prefix}_grid_p_child_low_bp_mean': float(grid["coarse_p_child_grid_mean"][:, 0:1].mean().item()),
-            f'{prefix}_grid_p_child_high_bp_mean': float(grid["coarse_p_child_grid_mean"][:, -1:].mean().item()),
-            f'{prefix}_grid_q_issue_low_bp_mean': float(grid["coarse_q_issue_grid"][:, 0:1].mean().item()),
-            f'{prefix}_grid_q_issue_high_bp_mean': float(grid["coarse_q_issue_grid"][:, -1:].mean().item()),
-            f'{prefix}_grid_local_value_left_mean': float(grid["local_value_left"].mean().item()),
-            f'{prefix}_grid_local_value_right_mean': float(grid["local_value_right"].mean().item()),
+            f'{prefix}_grid_argmax_index_mean': _active_mean(grid["argmax_index"].to(torch.float32)),
+            f'{prefix}_grid_value_low_bp_mean': self._finite_diag_mean(grid["coarse_value_grid"][:, 0:1]),
+            f'{prefix}_grid_value_high_bp_mean': self._finite_diag_mean(grid["coarse_value_grid"][:, -1:]),
+            f'{prefix}_grid_default_low_bp_mean': self._finite_diag_mean(grid["coarse_default_grid_mean"][:, 0:1]),
+            f'{prefix}_grid_default_high_bp_mean': self._finite_diag_mean(grid["coarse_default_grid_mean"][:, -1:]),
+            f'{prefix}_grid_p_child_low_bp_mean': self._finite_diag_mean(grid["coarse_p_child_grid_mean"][:, 0:1]),
+            f'{prefix}_grid_p_child_high_bp_mean': self._finite_diag_mean(grid["coarse_p_child_grid_mean"][:, -1:]),
+            f'{prefix}_grid_q_issue_low_bp_mean': self._finite_diag_mean(grid["coarse_q_issue_grid"][:, 0:1]),
+            f'{prefix}_grid_q_issue_high_bp_mean': self._finite_diag_mean(grid["coarse_q_issue_grid"][:, -1:]),
+            f'{prefix}_grid_local_value_left_mean': self._finite_diag_mean(grid["local_value_left"]),
+            f'{prefix}_grid_local_value_right_mean': self._finite_diag_mean(grid["local_value_right"]),
         }
 
     def _target_investment_conditional(
@@ -4725,7 +4768,14 @@ class Episode:
         children: List[torch.Tensor],
         bp: torch.Tensor,
         b_parent: torch.Tensor,
+        eta_current: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build child states with leverage realized from the CURRENT parent eta.
+
+        ``b_next = eta_t * bp_t + (1 - eta_t) * b_t``. The child eta_{t+1} is
+        still carried in the child states (column 2) and still used for the
+        expectation, but it never gates realized leverage.
+        """
         if not children:
             raise ValueError(
                 "Policy child vectorization requires at least one child tensor."
@@ -4733,12 +4783,15 @@ class Episode:
 
         children_t = torch.stack(children, dim=1)
         child_state_raw = children_t[..., :7] if children_t.shape[-1] > 7 else children_t
+        n_children = int(child_state_raw.shape[1])
         eta_next = child_state_raw[..., 2:3].clamp(0.0, 1.0)
+        # The realized child leverage is constant along the child axis because it
+        # is driven by the CURRENT parent eta_t, not by eta_{t+1}.
         b_children = apply_refinancing_policy(
-            b_current=b_parent.unsqueeze(1),
-            bp_candidate=bp.unsqueeze(1),
-            eta_next=eta_next,
-        )
+            b_current=b_parent.reshape(-1, 1, 1),
+            bp_candidate=bp.reshape(-1, 1, 1),
+            eta_current=eta_current.reshape(-1, 1, 1),
+        ).expand(-1, n_children, -1)
         child_states = torch.cat(
             [
                 b_children,
@@ -4753,6 +4806,7 @@ class Episode:
         children: List[torch.Tensor],
         bp: torch.Tensor,
         b_parent: torch.Tensor,
+        eta_current: torch.Tensor,
         model,
         target_model,
     ) -> Dict[str, Any]:
@@ -4760,6 +4814,7 @@ class Episode:
             children=children,
             bp=bp,
             b_parent=b_parent,
+            eta_current=eta_current,
         )
         batch_size = int(child_states.shape[0])
         n_children = int(child_states.shape[1])
@@ -4859,6 +4914,7 @@ class Episode:
             children=children,
             bp=bp_for_p0,
             b_parent=b_parent,
+            eta_current=eta_current,
             model=model,
             target_model=target_model,
         )
@@ -4960,15 +5016,17 @@ class Episode:
                 bp=bp_for_p0,
             )
             foc_residuals = self._collapse_policy_eta_pairs(foc_residuals)
+            bp_active_mask = self._eta_current_active_mask(eta_current)
             loss_foc, penalty_z_foc, foc_diag = self._compute_signed_foc_terms(
                 foc_residuals=foc_residuals,
                 z_parent=parent_state[:, 1:2],
                 alpha_z=loss_fn.alpha_z,
                 beta_z=loss_fn.beta_z,
-                z0=loss_fn.z0
+                z0=loss_fn.z0,
+                active_mask=bp_active_mask,
             )
             kkt_penalty_base, kkt_diag = self._compute_bp_kkt_penalty(
-                bp_for_p0, foc_residuals
+                bp_for_p0, foc_residuals, active_mask=bp_active_mask
             )
             p0_kkt_w = float(getattr(self.hyperparams, "p0_kkt_weight", 1.0))
             kkt_penalty = p0_kkt_w * kkt_penalty_base
@@ -5133,6 +5191,7 @@ class Episode:
             children=children,
             bp=bp_for_pi,
             b_parent=b_parent,
+            eta_current=eta_current,
             model=model,
             target_model=target_model,
         )
@@ -5240,15 +5299,17 @@ class Episode:
                 bp=bp_for_pi,
             )
             foc_residuals = self._collapse_policy_eta_pairs(foc_residuals)
+            bp_active_mask = self._eta_current_active_mask(eta_current)
             loss_foc, penalty_z_foc, foc_diag = self._compute_signed_foc_terms(
                 foc_residuals=foc_residuals,
                 z_parent=parent_state[:, 1:2],
                 alpha_z=loss_fn.alpha_z,
                 beta_z=loss_fn.beta_z,
-                z0=loss_fn.z0
+                z0=loss_fn.z0,
+                active_mask=bp_active_mask,
             )
             kkt_penalty_base, kkt_diag = self._compute_bp_kkt_penalty(
-                bp_for_pi, foc_residuals
+                bp_for_pi, foc_residuals, active_mask=bp_active_mask
             )
             pi_kkt_w = float(getattr(self.hyperparams, "pi_kkt_weight", 1.0))
             kkt_penalty = pi_kkt_w * kkt_penalty_base
@@ -5967,7 +6028,7 @@ class Episode:
             child_state[:, 0:1] = apply_refinancing_policy(
                 b_current=b_parent,
                 bp_candidate=bp_for_p0,
-                eta_next=child_state_raw[:, 2:3],
+                eta_current=eta_current,
             )
             output_children.append(model(child_state))
 
@@ -6044,7 +6105,7 @@ class Episode:
             child_state[:, 0:1] = apply_refinancing_policy(
                 b_current=b_parent,
                 bp_candidate=bp_for_pi,
-                eta_next=child_state_raw[:, 2:3],
+                eta_current=eta_current,
             )
             output_children.append(model(child_state))
 
@@ -7685,17 +7746,25 @@ class Episode:
                     [child[:, 2:3] > 0.5 for child in children],
                     dim=1,
                 ).any(dim=1)
+                # BP supervision is conditional on the CURRENT parent eta_t:
+                # ``policy_weight_effective = policy_weight * 1{eta_t = 1}``.
+                # eta_t = 0 rows have no refinancing choice, so they keep a
+                # bookkeeping entry with zero confidence and receive no BP-head
+                # gradient. The teacher already skips the bp grid for them.
+                eta_current = parent_state[:, 2:3].clamp(0.0, 1.0).detach().cpu()
+                refinancing_active = (eta_current > 0.5).to(eta_current.dtype)
                 cache.append({
                     "batch_id": batch_id,
                     "parent": parent_state.detach().cpu(),
                     "source_id": batch["source_id"].detach().cpu() if "source_id" in batch else None,
                     "source_index": batch["source_index"].detach().cpu() if "source_index" in batch else None,
+                    "eta_current": eta_current,
                     "bp0_target": p0_grid["bp_star"].detach().cpu(),
                     "bpi_target": pi_grid["bp_star"].detach().cpu(),
                     "mix_target": mix_grid["bp_star"].detach().cpu(),
-                    "bp0_confidence": p0_grid["confidence"].detach().cpu(),
-                    "bpi_confidence": pi_grid["confidence"].detach().cpu(),
-                    "mix_confidence": mix_grid["confidence"].detach().cpu(),
+                    "bp0_confidence": (p0_grid["confidence"] * refinancing_active).detach().cpu(),
+                    "bpi_confidence": (pi_grid["confidence"] * refinancing_active).detach().cpu(),
+                    "mix_confidence": (mix_grid["confidence"] * refinancing_active).detach().cpu(),
                     # Read-only diagnostics. These values are evaluated at the
                     # policy prediction used when the fixed teacher cache is
                     # built and do not enter the distillation objective.
@@ -7712,105 +7781,32 @@ class Episode:
         self,
         cache: List[Dict[str, Any]],
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """Optionally oversample child-eta-active rows for BP-only distillation."""
+        """Deprecated no-op: child eta_{t+1} is not a BP-availability signal.
+
+        Realized leverage is ``b_{t+1} = eta_t * bp_t + (1 - eta_t) * b_t``, so a
+        BP policy target exists exactly when the CURRENT parent state has
+        eta_t = 1. The child shock eta_{t+1} is still enumerated in the
+        expectation over children, but it never gates leverage and therefore
+        cannot be used to decide which rows deserve BP supervision.
+
+        ``_build_bp_target_cache`` already enforces this by giving eta_t = 0 rows
+        zero BP confidence, so there is no child-eta stratum left to rebalance.
+        The flag and summary keys are kept so existing configs and CLI call sites
+        keep working, and the metadata states explicitly that nothing was done.
+        """
         enabled = bool(getattr(self.hyperparams, "pv_eta_resample_enabled", False))
+        target_share = float(getattr(self.hyperparams, "pv_eta_resample_active_share", 0.25))
         summary: Dict[str, Any] = {
             "enabled": enabled,
             "scope": "bp_distillation_train_cache_only",
             "validation_cache_resampled": False,
             "applied": False,
-            "reason": "disabled" if not enabled else "empty_cache",
-        }
-        if not enabled or not cache:
-            return cache, summary
-
-        active = torch.cat(
-            [item["eta_next_active"].detach().cpu().reshape(-1).bool() for item in cache],
-            dim=0,
-        )
-        n_total = int(active.numel())
-        summary["n_rows"] = n_total
-        summary["active_share_before"] = float(active.float().mean().item()) if n_total else 0.0
-        active_idx = torch.where(active)[0]
-        inactive_idx = torch.where(~active)[0]
-        if n_total <= 1 or active_idx.numel() == 0 or inactive_idx.numel() == 0:
-            summary["reason"] = "single_eta_stratum"
-            summary["active_share_after"] = summary["active_share_before"]
-            return cache, summary
-
-        target_share = float(getattr(self.hyperparams, "pv_eta_resample_active_share", 0.25))
-        target_share = min(max(target_share, 1e-3), 1.0 - 1e-3)
-        if summary["active_share_before"] >= target_share:
-            summary.update({
-                "reason": "already_at_or_above_target",
-                "target_active_share": target_share,
-                "active_share_after": summary["active_share_before"],
-            })
-            return cache, summary
-        n_active = min(max(1, int(round(n_total * target_share))), n_total - 1)
-        n_inactive = n_total - n_active
-        selected = torch.cat(
-            [
-                active_idx[torch.randint(active_idx.numel(), (n_active,))],
-                inactive_idx[torch.randint(inactive_idx.numel(), (n_inactive,))],
-            ],
-            dim=0,
-        )
-        selected = selected[torch.randperm(selected.numel())]
-
-        required_tensor_keys = (
-            "parent",
-            "bp0_target",
-            "bpi_target",
-            "mix_target",
-            "bp0_confidence",
-            "bpi_confidence",
-            "mix_confidence",
-            "mix_sample_weight",
-            "eta_next_active",
-        )
-        flat = {
-            key: torch.cat([item[key].detach().cpu() for item in cache], dim=0)
-            for key in required_tensor_keys
-        }
-        optional_tensor_keys = []
-        for key in (
-            "source_id",
-            "source_index",
-            "bp0_regret",
-            "bpi_regret",
-            "mix_regret",
-        ):
-            present = [isinstance(item.get(key), torch.Tensor) for item in cache]
-            if any(present) and not all(present):
-                raise ValueError(f"BP cache has inconsistent optional field {key!r}")
-            if all(present):
-                optional_tensor_keys.append(key)
-                flat[key] = torch.cat([item[key].detach().cpu() for item in cache], dim=0)
-
-        resampled: List[Dict[str, Any]] = []
-        cursor = 0
-        for batch_id, template in enumerate(cache):
-            batch_rows = int(template["parent"].shape[0])
-            row_index = selected[cursor:cursor + batch_rows]
-            item = dict(template)
-            for key in (*required_tensor_keys, *optional_tensor_keys):
-                item[key] = flat[key][row_index].clone()
-            item["batch_id"] = batch_id
-            resampled.append(item)
-            cursor += batch_rows
-
-        active_after = torch.cat(
-            [item["eta_next_active"].reshape(-1).float() for item in resampled],
-            dim=0,
-        )
-        summary.update({
-            "applied": True,
-            "reason": "target_share_applied",
+            "deprecated": True,
+            "reason": "deprecated_child_eta_next_does_not_gate_bp_availability",
             "target_active_share": target_share,
-            "active_share_after": float(active_after.mean().item()),
-        })
-        return resampled, summary
+            "n_rows": int(sum(int(item["parent"].shape[0]) for item in cache)) if cache else 0,
+        }
+        return cache, summary
 
     @staticmethod
     def _bp_cache_current_eta_counts(
@@ -7869,95 +7865,15 @@ class Episode:
             "current_eta1_share_after": before["current_eta1_share"],
             "target_current_eta1_share": target_share,
         }
-        if not enabled or not cache:
-            return cache, summary
-
-        if bool(getattr(self.hyperparams, "pv_eta_resample_enabled", False)):
-            raise ValueError(
-                "bp_current_eta_resample_enabled cannot be combined with the legacy "
-                "future-eta pv_eta_resample_enabled sampler."
-            )
-
-        base_seed = int(
-            getattr(self.hyperparams, "bp_current_eta_resample_seed", 13579)
-        )
-        episode_seed = base_seed + int(getattr(self, "episode_id", 0)) * 100003
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(episode_seed)
-        summary["resample_seed"] = base_seed
-        summary["episode_resample_seed"] = episode_seed
-
-        eta_current = torch.cat(
-            [
-                (item["parent"][:, 2].detach().cpu() > 0.5).reshape(-1)
-                for item in cache
-            ],
-            dim=0,
-        )
-        n_total = int(eta_current.numel())
-        eta1_index = torch.where(eta_current)[0]
-        eta0_index = torch.where(~eta_current)[0]
-        if n_total <= 1 or eta0_index.numel() == 0 or eta1_index.numel() == 0:
-            summary["reason"] = "single_current_eta_stratum"
-            return cache, summary
-
-        n_eta1 = min(max(int(round(n_total * target_share)), 0), n_total)
-        n_eta0 = n_total - n_eta1
-
-        def _draw(pool: torch.Tensor, count: int) -> torch.Tensor:
-            if count <= 0:
-                return torch.empty(0, dtype=torch.long)
-            return pool[
-                torch.randint(pool.numel(), (count,), generator=generator)
-            ]
-
-        selected = torch.cat(
-            [_draw(eta0_index, n_eta0), _draw(eta1_index, n_eta1)],
-            dim=0,
-        )
-        selected = selected[
-            torch.randperm(selected.numel(), generator=generator)
-        ]
-
-        row_counts = [int(item["parent"].shape[0]) for item in cache]
-        tensor_keys: List[str] = []
-        flat: Dict[str, torch.Tensor] = {}
-        for key, value in cache[0].items():
-            if not isinstance(value, torch.Tensor):
-                continue
-            present = [isinstance(item.get(key), torch.Tensor) for item in cache]
-            if not all(present):
-                raise ValueError(f"BP cache has inconsistent tensor field {key!r}")
-            row_aligned = [
-                item[key].ndim > 0 and int(item[key].shape[0]) == row_count
-                for item, row_count in zip(cache, row_counts)
-            ]
-            if all(row_aligned):
-                tensor_keys.append(key)
-                flat[key] = torch.cat(
-                    [item[key].detach().cpu() for item in cache], dim=0
-                )
-
-        resampled: List[Dict[str, Any]] = []
-        cursor = 0
-        for batch_id, (template, batch_rows) in enumerate(zip(cache, row_counts)):
-            row_index = selected[cursor:cursor + batch_rows]
-            item = dict(template)
-            for key in tensor_keys:
-                item[key] = flat[key][row_index].clone()
-            item["batch_id"] = batch_id
-            resampled.append(item)
-            cursor += batch_rows
-
-        after = self._bp_cache_current_eta_counts(resampled)
-        summary.update({
-            "applied": True,
-            "reason": "target_current_eta_share_applied",
-            "current_eta0_count_after": after["current_eta0_count"],
-            "current_eta1_count_after": after["current_eta1_count"],
-            "current_eta1_share_after": after["current_eta1_share"],
-        })
-        return resampled, summary
+        # Deprecated no-op. Under the current-vs-next refinancing timing, BP
+        # supervision is already conditional on the current parent eta_t:
+        # ``_build_bp_target_cache`` gives eta_t = 0 rows zero BP confidence, so
+        # they receive no BP-head gradient and there is no eta0/eta1 mixture left
+        # to rebalance. The flag is retained so existing configs and CLI calls
+        # keep working, and the metadata says explicitly that nothing was done.
+        summary["deprecated"] = True
+        summary["reason"] = "deprecated_bp_supervision_is_already_eta_current_conditional"
+        return cache, summary
 
     @staticmethod
     def _policy_output_value(output: Any, name: str, idx: int) -> torch.Tensor:

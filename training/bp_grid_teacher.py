@@ -181,10 +181,19 @@ def _expand_grid_children(
     children: Sequence[torch.Tensor] | torch.Tensor,
     bp_grid: torch.Tensor,
     b_parent: torch.Tensor,
+    eta_current: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build candidate child states using each child's eta realization.
+    """Build candidate child states using the current parent refinancing state.
 
-    Children contain next-period exogenous states, including eta_{t+1}.
+    Timing invariant:
+        b_next = eta_current * bp_candidate + (1 - eta_current) * b_current
+
+    ``eta_current`` is ``eta_t`` from the parent state. Child ``eta_next`` is
+    still carried in the child states but never gates realized leverage, so
+    ``child_b_grid`` is constant along the child axis:
+
+    * parent ``eta_t = 1``: ``child_b = bp_candidate`` for every child;
+    * parent ``eta_t = 0``: ``child_b = b_parent`` for every child.
     """
     children_t = _stack_children(children)
     child_state_raw = children_t[..., :7] if children_t.shape[-1] > 7 else children_t
@@ -196,12 +205,13 @@ def _expand_grid_children(
         .expand(batch_size, n_grid, n_children, state_dim)
         .clone()
     )
-    eta_next = child_state_raw[..., 2].clamp(0.0, 1.0)
+    # Realized child leverage is constant along the child axis: it is driven by
+    # the CURRENT parent eta_t, so the candidate axis is the only varying one.
     child_b_grid = apply_refinancing_policy(
         b_current=b_parent.reshape(batch_size, 1, 1),
         bp_candidate=bp_grid.unsqueeze(-1),
-        eta_next=eta_next.unsqueeze(1),
-    )
+        eta_current=eta_current.reshape(batch_size, 1, 1),
+    ).expand(-1, -1, n_children)
     child_states[..., 0] = child_b_grid
     return child_states, child_b_grid
 
@@ -211,8 +221,11 @@ def _forward_equity_grid_children(
     children: Sequence[torch.Tensor] | torch.Tensor,
     bp_grid: torch.Tensor,
     b_parent: torch.Tensor,
+    eta_current: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    child_states, child_b_grid = _expand_grid_children(children, bp_grid, b_parent)
+    child_states, child_b_grid = _expand_grid_children(
+        children, bp_grid, b_parent, eta_current
+    )
     batch_size, n_grid, n_children, state_dim = child_states.shape
     flat_states = child_states.reshape(batch_size * n_grid * n_children, state_dim)
     p_raw, bar_z_raw = _target_equity(model, flat_states)
@@ -445,6 +458,123 @@ class BPGridTeacher:
         if branch == "mix" and mix_weight is None:
             raise ValueError("mix_weight is required for branch='mix'")
 
+        refinancing_active = self._refinancing_active_mask(parent_state)
+        if bool(refinancing_active.all()):
+            return self._compute_grid_batch(
+                parent_state, children, m_list, branch=branch, bp_pred=bp_pred,
+                mix_weight=mix_weight, child_weights=child_weights,
+            )
+        if not bool(refinancing_active.any()):
+            return self._compute_forced_batch(
+                parent_state, children, m_list, branch=branch, bp_pred=bp_pred,
+                mix_weight=mix_weight, child_weights=child_weights,
+            )
+        return self._compute_mixed_batch(
+            parent_state, children, m_list, branch=branch, bp_pred=bp_pred,
+            mix_weight=mix_weight, child_weights=child_weights,
+            refinancing_active=refinancing_active,
+        )
+
+    @staticmethod
+    def _refinancing_active_mask(parent_state: torch.Tensor) -> torch.Tensor:
+        """``eta_t = 1`` rows, i.e. the parents that actually have a bp choice."""
+        return parent_state[:, 2:3].clamp(0.0, 1.0).reshape(-1) > 0.5
+
+    @staticmethod
+    def _select_rows(value: Any, mask: torch.Tensor, n_rows: int) -> Any:
+        """Slice a per-row tensor/list by a boolean mask, leaving shared 1-D weights."""
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            if value.ndim >= 1 and int(value.shape[0]) == n_rows:
+                return value[mask]
+            return value
+        return [item[mask] for item in value]
+
+    @staticmethod
+    def _scatter_rows(
+        active_out: Dict[str, torch.Tensor],
+        active_index: torch.Tensor,
+        forced_out: Dict[str, torch.Tensor],
+        forced_index: torch.Tensor,
+        n_rows: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Merge eta-active and eta-inactive results back into original row order."""
+        if set(active_out) != set(forced_out):
+            raise RuntimeError(
+                "refinancing-active and refinancing-inactive results expose different "
+                f"keys: {sorted(set(active_out) ^ set(forced_out))}"
+            )
+        merged: Dict[str, torch.Tensor] = {}
+        for key, active_value in active_out.items():
+            forced_value = forced_out[key]
+            # The two row groups have different sizes by construction, so only
+            # the per-row tail shapes must agree.
+            if active_value.shape[1:] != forced_value.shape[1:]:
+                raise RuntimeError(
+                    f"refinancing split produced mismatched shapes for {key}: "
+                    f"{tuple(active_value.shape)} vs {tuple(forced_value.shape)}"
+                )
+            out = torch.empty(
+                (n_rows, *active_value.shape[1:]),
+                device=active_value.device,
+                dtype=active_value.dtype,
+            )
+            out[active_index] = active_value
+            out[forced_index] = forced_value
+            merged[key] = out
+        return merged
+
+    def _compute_mixed_batch(
+        self,
+        parent_state: torch.Tensor,
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
+        *,
+        branch: str,
+        refinancing_active: torch.Tensor,
+        bp_pred: Optional[torch.Tensor] = None,
+        mix_weight: Optional[torch.Tensor] = None,
+        child_weights: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Split a batch by parent eta_t: grid search for eta_t=1, forced for eta_t=0."""
+        n_rows = int(parent_state.shape[0])
+        active_index = refinancing_active.nonzero(as_tuple=True)[0]
+        forced_index = (~refinancing_active).nonzero(as_tuple=True)[0]
+        active_out = self._compute_grid_batch(
+            parent_state[active_index],
+            self._select_rows(children, refinancing_active, n_rows),
+            self._select_rows(m_list, refinancing_active, n_rows),
+            branch=branch,
+            bp_pred=self._select_rows(bp_pred, refinancing_active, n_rows),
+            mix_weight=self._select_rows(mix_weight, refinancing_active, n_rows),
+            child_weights=self._select_rows(child_weights, refinancing_active, n_rows),
+        )
+        forced_out = self._compute_forced_batch(
+            parent_state[forced_index],
+            self._select_rows(children, ~refinancing_active, n_rows),
+            self._select_rows(m_list, ~refinancing_active, n_rows),
+            branch=branch,
+            bp_pred=self._select_rows(bp_pred, ~refinancing_active, n_rows),
+            mix_weight=self._select_rows(mix_weight, ~refinancing_active, n_rows),
+            child_weights=self._select_rows(child_weights, ~refinancing_active, n_rows),
+        )
+        return self._scatter_rows(
+            active_out, active_index, forced_out, forced_index, n_rows
+        )
+
+    def _compute_grid_batch(
+        self,
+        parent_state: torch.Tensor,
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
+        *,
+        branch: str,
+        bp_pred: Optional[torch.Tensor] = None,
+        mix_weight: Optional[torch.Tensor] = None,
+        child_weights: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Full coarse/fine bp grid search for refinancing-active (eta_t=1) parents."""
         n_children = int(_stack_children(children).shape[1])
         grid_sizes = {self.coarse_size, self.fine_size} if self.refine else {self.coarse_size}
         plans = [
@@ -496,6 +626,172 @@ class BPGridTeacher:
             child_weights=child_weights,
         )
 
+    def _compute_forced_batch(
+        self,
+        parent_state: torch.Tensor,
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
+        *,
+        branch: str,
+        bp_pred: Optional[torch.Tensor] = None,
+        mix_weight: Optional[torch.Tensor] = None,
+        child_weights: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Forced Bellman backup for refinancing-inactive (eta_t=0) parents.
+
+        No bp grid is evaluated: leverage is forced to ``b_parent``, so the
+        objective is flat in the candidate dimension and one evaluation point is
+        exact.
+        """
+        n_children = int(_stack_children(children).shape[1])
+        plan = resolve_grid_chunk_plan(
+            n_parent=int(parent_state.shape[0]),
+            n_grid=1,
+            n_children=n_children,
+            configured_parent_chunk=self.parent_chunk_size,
+            configured_candidate_chunk=self.candidate_chunk_size,
+            max_expanded_states=self.max_expanded_states,
+        )
+        self._log_grid_chunk_plan(plan)
+        parent_chunk_size = plan.parent_chunk_effective
+        if parent_state.shape[0] > parent_chunk_size:
+            chunks = []
+            for start in range(0, parent_state.shape[0], parent_chunk_size):
+                stop = min(start + parent_chunk_size, parent_state.shape[0])
+                chunks.append(
+                    self._compute_forced_no_parent_chunk(
+                        parent_state[start:stop],
+                        _slice_child_axis(children, start, stop),
+                        _slice_child_axis(m_list, start, stop),
+                        branch=branch,
+                        mix_weight=mix_weight[start:stop] if mix_weight is not None else None,
+                        child_weights=(
+                            child_weights
+                            if child_weights is not None and child_weights.ndim == 1
+                            else child_weights[start:stop] if child_weights is not None else None
+                        ),
+                    )
+                )
+            return _concat_chunk_outputs(chunks)
+        return self._compute_forced_no_parent_chunk(
+            parent_state,
+            children,
+            m_list,
+            branch=branch,
+            mix_weight=mix_weight,
+            child_weights=child_weights,
+        )
+
+    def _compute_forced_no_parent_chunk(
+        self,
+        parent_state: torch.Tensor,
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
+        *,
+        branch: str,
+        mix_weight: Optional[torch.Tensor] = None,
+        child_weights: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        with torch.no_grad():
+            self._record_parent_chunk()
+            forced_grid = parent_state[:, 0:1].detach()
+            forced = self._evaluate_grid(
+                parent_state, children, m_list, forced_grid,
+                branch=branch, mix_weight=mix_weight, child_weights=child_weights,
+            )
+            return self._finalize_forced_result(parent_state, forced, diagnostics=True)
+
+    def _finalize_forced_result(
+        self,
+        parent_state: torch.Tensor,
+        forced: Dict[str, torch.Tensor],
+        *,
+        diagnostics: bool,
+    ) -> Dict[str, torch.Tensor]:
+        """Build a grid-shaped result for eta_t=0 rows without running the grid.
+
+        ``value_star`` is the exact Bellman value at the forced transition
+        ``b_child = b_parent``. Because the eta_t=0 objective is flat in the
+        candidate dimension, that single point is already the maximizer, so the
+        bp grid adds nothing. Grid-only diagnostics are returned as NaN/sentinel
+        so no candidate forward is wasted on them.
+        """
+        b_parent = parent_state[:, 0:1].detach()
+        value_star = forced["value_grid"][:, 0:1].detach()
+        if not diagnostics:
+            return {
+                "value_star": value_star,
+                "bp_star": b_parent,
+                "bp_star_grid": b_parent,
+            }
+
+        coarse_size = max(2, int(self.coarse_size))
+        local_size = max(2, int(self.fine_size)) if self.refine else coarse_size
+        n_rows = int(parent_state.shape[0])
+        device = parent_state.device
+        dtype = parent_state.dtype
+
+        def _nan(rows: int, width: int) -> torch.Tensor:
+            return torch.full((rows, width), float("nan"), device=device, dtype=dtype)
+
+        def _broadcast(value: torch.Tensor, width: int) -> torch.Tensor:
+            return value.expand(n_rows, width).clone()
+
+        forced_value = value_star
+        return {
+            "bp_grid": _broadcast(forced["bp_grid"], local_size),
+            "value_grid": _nan(n_rows, local_size),
+            "cashflow_grid_mean": _nan(n_rows, local_size),
+            "continuation_grid_mean": _nan(n_rows, local_size),
+            "argmax_index": torch.zeros((n_rows, 1), device=device, dtype=torch.long),
+            "q_issue_grid": _nan(n_rows, local_size),
+            "p_child_grid_mean": _nan(n_rows, local_size),
+            "default_grid_mean": _nan(n_rows, local_size),
+            # Row-level (not candidate-shaped) diagnostics keep the ``(n, 1)``
+            # layout used by ``_finalize_grid_result`` so mixed batches can be
+            # scattered back into a single tensor.
+            "eta_next_active_share": forced["eta_next_active_share"][:, 0:1].detach(),
+            "child_b_mean": _broadcast(forced["child_b_mean"], local_size),
+            "child_b_eta0_mean": _broadcast(forced["child_b_eta0_mean"], local_size),
+            "child_b_eta1_mean": _broadcast(forced["child_b_eta1_mean"], local_size),
+            "bp_star": b_parent,
+            "bp_star_grid": b_parent,
+            "value_star": value_star,
+            # No candidate comparison exists, so the margin/confidence are undefined.
+            "top2_margin": _nan(n_rows, 1),
+            "coarse_top2_margin": _nan(n_rows, 1),
+            "fine_top2_margin": _nan(n_rows, 1),
+            "confidence": torch.zeros((n_rows, 1), device=device, dtype=dtype),
+            "boundary_low": torch.zeros((n_rows, 1), device=device, dtype=dtype),
+            "boundary_high": torch.zeros((n_rows, 1), device=device, dtype=dtype),
+            "refi_active": torch.zeros((n_rows, 1), device=device, dtype=dtype),
+            "coarse_bp_grid": _broadcast(forced["bp_grid"], coarse_size),
+            "coarse_value_grid": _nan(n_rows, coarse_size),
+            "coarse_cashflow_grid_mean": _nan(n_rows, coarse_size),
+            "coarse_continuation_grid_mean": _nan(n_rows, coarse_size),
+            "coarse_q_issue_grid": _nan(n_rows, coarse_size),
+            "coarse_p_child_grid_mean": _nan(n_rows, coarse_size),
+            "coarse_default_grid_mean": _nan(n_rows, coarse_size),
+            "coarse_eta_next_active_share": _broadcast(
+                forced["eta_next_active_share"], coarse_size
+            ),
+            "coarse_child_b_mean": _broadcast(forced["child_b_mean"], coarse_size),
+            "coarse_child_b_eta0_mean": _broadcast(
+                forced["child_b_eta0_mean"], coarse_size
+            ),
+            "coarse_child_b_eta1_mean": _broadcast(
+                forced["child_b_eta1_mean"], coarse_size
+            ),
+            "local_value_left": _nan(n_rows, 1),
+            "local_value_right": _nan(n_rows, 1),
+            "q_issue_at_star": forced["q_issue_grid"][:, 0:1].detach(),
+            "p_child_at_star": forced["p_child_grid_mean"][:, 0:1].detach(),
+            "default_at_star": forced["default_grid_mean"][:, 0:1].detach(),
+            # Forced leverage is already the maximizer, so there is no regret.
+            "value_pred": forced_value,
+            "regret": torch.zeros_like(forced_value),
+        }
+
     def compute_value_target(
         self,
         parent_state: torch.Tensor,
@@ -509,6 +805,47 @@ class BPGridTeacher:
         branch = branch.lower()
         if branch not in {"p0", "pi"}:
             raise ValueError(f"compute_value_target only supports p0/pi, got {branch!r}")
+        refinancing_active = self._refinancing_active_mask(parent_state)
+        if bool(refinancing_active.all()):
+            return self._compute_value_target_grid_batch(
+                parent_state, children, m_list, branch=branch,
+                child_weights=child_weights,
+            )
+        if not bool(refinancing_active.any()):
+            return self._compute_value_target_forced_batch(
+                parent_state, children, m_list, branch=branch,
+                child_weights=child_weights,
+            )
+        n_rows = int(parent_state.shape[0])
+        active_index = refinancing_active.nonzero(as_tuple=True)[0]
+        forced_index = (~refinancing_active).nonzero(as_tuple=True)[0]
+        active_out = self._compute_value_target_grid_batch(
+            parent_state[active_index],
+            self._select_rows(children, refinancing_active, n_rows),
+            self._select_rows(m_list, refinancing_active, n_rows),
+            branch=branch,
+            child_weights=self._select_rows(child_weights, refinancing_active, n_rows),
+        )
+        forced_out = self._compute_value_target_forced_batch(
+            parent_state[forced_index],
+            self._select_rows(children, ~refinancing_active, n_rows),
+            self._select_rows(m_list, ~refinancing_active, n_rows),
+            branch=branch,
+            child_weights=self._select_rows(child_weights, ~refinancing_active, n_rows),
+        )
+        return self._scatter_rows(
+            active_out, active_index, forced_out, forced_index, n_rows
+        )
+
+    def _compute_value_target_grid_batch(
+        self,
+        parent_state: torch.Tensor,
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
+        *,
+        branch: str,
+        child_weights: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         n_children = int(_stack_children(children).shape[1])
         grid_sizes = {self.coarse_size, self.fine_size} if self.refine else {self.coarse_size}
         plans = [
@@ -550,6 +887,71 @@ class BPGridTeacher:
             branch=branch,
             child_weights=child_weights,
         )
+
+    def _compute_value_target_forced_batch(
+        self,
+        parent_state: torch.Tensor,
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
+        *,
+        branch: str,
+        child_weights: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Forced Bellman value target for eta_t=0 parents (no bp grid)."""
+        n_children = int(_stack_children(children).shape[1])
+        plan = resolve_grid_chunk_plan(
+            n_parent=int(parent_state.shape[0]),
+            n_grid=1,
+            n_children=n_children,
+            configured_parent_chunk=self.parent_chunk_size,
+            configured_candidate_chunk=self.candidate_chunk_size,
+            max_expanded_states=self.max_expanded_states,
+        )
+        self._log_grid_chunk_plan(plan)
+        parent_chunk_size = plan.parent_chunk_effective
+        if parent_state.shape[0] > parent_chunk_size:
+            chunks = []
+            for start in range(0, parent_state.shape[0], parent_chunk_size):
+                stop = min(start + parent_chunk_size, parent_state.shape[0])
+                chunks.append(
+                    self._compute_value_target_forced_no_parent_chunk(
+                        parent_state[start:stop],
+                        _slice_child_axis(children, start, stop),
+                        _slice_child_axis(m_list, start, stop),
+                        branch=branch,
+                        child_weights=(
+                            child_weights
+                            if child_weights is not None and child_weights.ndim == 1
+                            else child_weights[start:stop] if child_weights is not None else None
+                        ),
+                    )
+                )
+            return _concat_chunk_outputs(chunks)
+        return self._compute_value_target_forced_no_parent_chunk(
+            parent_state,
+            children,
+            m_list,
+            branch=branch,
+            child_weights=child_weights,
+        )
+
+    def _compute_value_target_forced_no_parent_chunk(
+        self,
+        parent_state: torch.Tensor,
+        children: Sequence[torch.Tensor] | torch.Tensor,
+        m_list: Sequence[torch.Tensor] | torch.Tensor,
+        *,
+        branch: str,
+        child_weights: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        with torch.no_grad():
+            self._record_parent_chunk()
+            forced_grid = parent_state[:, 0:1].detach()
+            forced = self._evaluate_grid(
+                parent_state, children, m_list, forced_grid,
+                branch=branch, child_weights=child_weights,
+            )
+            return self._finalize_forced_result(parent_state, forced, diagnostics=False)
 
     def compute_multi_j_branches(
         self,
@@ -610,6 +1012,19 @@ class BPGridTeacher:
                     "compute_multi_j_branches requires identical parent leverage (column 0) "
                     "across branches so the child-equity block can be shared"
                 )
+        # ``bp_t`` is a control only for eta_t = 1 parents. A batch is either
+        # fully refinancing-active (coarse/fine candidate grid) or fully inactive
+        # (one forced candidate ``b_parent``, since the objective is flat in the
+        # candidate dimension there). Mixing both in one shared-forward pass would
+        # need two different candidate axes, so it is rejected explicitly.
+        refinancing_active = self._refinancing_active_mask(states[0])
+        refinancing_inactive = ~refinancing_active
+        if bool(refinancing_active.any()) and bool(refinancing_inactive.any()):
+            raise ValueError(
+                "compute_multi_j_branches requires a uniform parent eta_t batch; got a "
+                "mix of refinancing-active (eta_t = 1) and refinancing-inactive "
+                "(eta_t = 0) parents"
+            )
         children_tensor = _stack_children(children)
         m_tensor = _stack_m(m_list)
         n_children = int(children_tensor.shape[1])
@@ -661,7 +1076,11 @@ class BPGridTeacher:
                     else child_weights
                 )
                 self._record_parent_chunk()
-                coarse_grid = self._uniform_grid(chunk_states[0], self.coarse_size)
+                if bool(refinancing_inactive.any()):
+                    # eta_t = 0: one forced candidate, leverage is b_parent.
+                    coarse_grid = chunk_states[0][:, 0:1].detach()
+                else:
+                    coarse_grid = self._uniform_grid(chunk_states[0], self.coarse_size)
                 n_grid = int(coarse_grid.shape[1])
                 candidate_plan = resolve_grid_chunk_plan(
                     n_parent=stop - start,
@@ -688,7 +1107,10 @@ class BPGridTeacher:
                     grid_stop = min(grid_start + candidate_chunk, n_grid)
                     sub_grid = coarse_grid[:, grid_start:grid_stop]
                     equity = self._child_equity_block(
-                        child_chunk, sub_grid, chunk_states[0][:, 0:1]
+                        child_chunk,
+                        sub_grid,
+                        chunk_states[0][:, 0:1],
+                        chunk_states[0][:, 2:3],
                     )
                     self._record_candidate_chunk(int(equity.p_child.numel()))
                     for index, branch in enumerate(branch_labels):
@@ -758,8 +1180,15 @@ class BPGridTeacher:
                         bp_pred = None
                         if bp_preds is not None and bp_preds[index] is not None:
                             bp_pred = bp_preds[index][start:stop]
-                        collected[index][count].append(
-                            self._finalize_grid_result(
+                        if bool(refinancing_inactive.any()):
+                            # No candidate comparison exists for eta_t = 0, so the
+                            # grid-shaped diagnostics are NaN/sentinel and the star
+                            # is the forced leverage.
+                            result = self._finalize_forced_result(
+                                chunk_states[index], coarse, diagnostics=True
+                            )
+                        else:
+                            result = self._finalize_grid_result(
                                 chunk_states[index],
                                 child_chunk[:, :count],
                                 m_chunk[:, :count],
@@ -774,7 +1203,7 @@ class BPGridTeacher:
                                 bp_pred=bp_pred,
                                 diagnostics=True,
                             )
-                        )
+                        collected[index][count].append(result)
 
         results: List[Dict[int, Dict[str, torch.Tensor]]] = []
         for index in range(len(states)):
@@ -905,7 +1334,11 @@ class BPGridTeacher:
             confidence = (relative_margin / self.margin_scale).clamp(self.confidence_min, 1.0)
         else:
             confidence = (coarse_top2_margin / self.margin_scale).clamp(self.confidence_min, 1.0)
-        target_available = torch.ones_like(bp_star)
+        target_available = (
+            self._refinancing_active_mask(parent_state)
+            .to(parent_state.dtype)
+            .reshape(-1, 1)
+        )
 
         result.update(
             {
@@ -922,7 +1355,9 @@ class BPGridTeacher:
                 "boundary_high": (
                     bp_star_grid >= self.grid_max - 1e-8
                 ).to(parent_state.dtype).detach(),
-                # Compatibility field: every parent now has a meaningful bp target.
+                # ``bp_t`` is a real control only when eta_t = 1. This field is
+                # the parent eta_t indicator, not a statement that a bp target
+                # exists for every row.
                 "refi_active": target_available.detach(),
                 "eta_next_active_share": result["eta_next_active_share"][:, 0:1].detach(),
                 "coarse_bp_grid": coarse["bp_grid"].detach(),
@@ -1070,6 +1505,7 @@ class BPGridTeacher:
         children: Sequence[torch.Tensor] | torch.Tensor,
         bp_grid: torch.Tensor,
         b_parent: torch.Tensor,
+        eta_current: torch.Tensor,
     ) -> _EquityBlock:
         """Branch-independent child equity block for one candidate chunk."""
         children_tensor = _stack_children(children)
@@ -1078,6 +1514,7 @@ class BPGridTeacher:
             children_tensor,
             bp_grid,
             b_parent,
+            eta_current,
         )
         self._record_equity_forward(int(p_child.numel()))
         return _EquityBlock(
@@ -1245,7 +1682,9 @@ class BPGridTeacher:
             q_current = _target_q(self.target_model, parent_state)
             self._record_q_forward()
         if equity is None:
-            equity = self._child_equity_block(children_tensor, bp_grid, parent_state[:, 0:1])
+            equity = self._child_equity_block(
+                children_tensor, bp_grid, parent_state[:, 0:1], parent_state[:, 2:3]
+            )
         self._record_candidate_chunk(int(equity.p_child.numel()))
         q_issue = self._q_issue_grid(parent_state, bp_grid)
         return self._branch_objective_grid(

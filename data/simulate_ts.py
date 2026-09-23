@@ -619,12 +619,15 @@ class SimulateTS:
         parent_state: Dict,
         main_child_state: Dict,
     ) -> None:
-        """Record the realized main-child transition on parent output rows."""
-        alive_idx = torch.nonzero(parent_state['alive'], as_tuple=False).squeeze(-1)
-        eta_next = main_child_state['eta'][alive_idx].reshape(-1)
-        for row, eta_j in zip(parent_rows, eta_next):
+        """Record the realized main-child transition on parent output rows.
+
+        Realized leverage uses the current parent eta (``eta_t``) carried on each
+        parent row, so sibling branches that differ only in the child eta
+        ``eta_{t+1}`` share the same ``b_next``.
+        """
+        for row in parent_rows:
             b_current = torch.tensor(float(row['b']), device=self.device)
-            eta_value = eta_j.to(device=self.device, dtype=b_current.dtype)
+            eta_value = torch.tensor(float(row['ETA']), device=self.device, dtype=b_current.dtype)
             for bp_name, out_name in (
                 ('bp0', 'b_next_p0'),
                 ('bpI', 'b_next_pi'),
@@ -634,7 +637,7 @@ class SimulateTS:
                 row[out_name] = float(apply_refinancing_policy(
                     b_current=b_current,
                     bp_candidate=bp_candidate,
-                    eta_next=eta_value,
+                    eta_current=eta_value,
                 ).item())
 
     def _annotate_parent_next_leverage_tensor(
@@ -643,11 +646,16 @@ class SimulateTS:
         parent_state: Dict,
         main_child_state: Dict,
     ) -> None:
-        """Tensor counterpart of :meth:`_annotate_parent_next_leverage`."""
+        """Tensor counterpart of :meth:`_annotate_parent_next_leverage`.
+
+        Realized leverage uses the current parent eta (``eta_t``) stored on the
+        parent rows, so sibling branches that differ only in the child eta
+        ``eta_{t+1}`` share the same ``b_next``.
+        """
         if parent_rows.numel() == 0:
             return
-        eta_next = main_child_state['eta'][parent_state['alive']].reshape(-1)
         columns = {name: idx for idx, name in enumerate(self.FIRM_COLUMNS)}
+        eta_current = parent_rows[:, columns['ETA']]
         for bp_name, out_name in (
             ('bp0', 'b_next_p0'),
             ('bpI', 'b_next_pi'),
@@ -656,7 +664,7 @@ class SimulateTS:
             parent_rows[:, columns[out_name]] = apply_refinancing_policy(
                 b_current=parent_rows[:, columns['b']],
                 bp_candidate=parent_rows[:, columns[bp_name]],
-                eta_next=eta_next,
+                eta_current=eta_current,
             )
     
     def _resource_accounting(
@@ -702,10 +710,11 @@ class SimulateTS:
             new_state['z'] = sample_ar1(
                 state['z'], self.config.RHO_Z, self.config.SIGMA_Z, self.config.ZBAR
             )
-            new_state['eta'] = sample_bernoulli(state['eta'].numel(), self.config.ZETA, device)
-            new_state['i'] = sample_uniform(state['i'].numel(), 0.0, self.config.I_THRESHOLD, device)
 
+            # Realize b_{t+1} from the current parent eta (eta_t). The child
+            # eta_{t+1} is drawn below and never gates b_t -> b_{t+1}.
             b_prev = state['b'].reshape(-1)
+            eta_prev = state['eta'].reshape(-1)
             bp_prev = state.get('bp')
             if bp_prev is not None:
                 bp_prev = bp_prev.reshape(-1)
@@ -718,10 +727,13 @@ class SimulateTS:
                 new_state['b'] = apply_refinancing_policy(
                     b_current=b_prev,
                     bp_candidate=bp_prev,
-                    eta_next=new_state['eta'].reshape(-1),
+                    eta_current=eta_prev,
                 )
             else:
                 new_state['b'] = b_prev.clone()
+
+            new_state['eta'] = sample_bernoulli(state['eta'].numel(), self.config.ZETA, device)
+            new_state['i'] = sample_uniform(state['i'].numel(), 0.0, self.config.I_THRESHOLD, device)
 
             k_prev = state['K'].reshape(-1)
             bar_i_prev = state.get('bar_i')
@@ -794,11 +806,10 @@ class SimulateTS:
                 self.config.SIGMA_Z,
                 self.config.ZBAR
             )
-            new_state['eta'] = sample_bernoulli(len(state['z']), self.config.ZETA, device)
-            new_state['i'] = sample_uniform(len(state['i']), 0.0, self.config.I_THRESHOLD, device)
             
-            # 更新杠杆
+            # 更新杠杆：realized leverage uses the current parent eta (eta_t).
             b_prev = state['b'].reshape(-1)
+            eta_prev = state['eta'].reshape(-1)
             bp_prev = state.get('bp')
             if bp_prev is not None:
                 bp_prev = bp_prev.reshape(-1)
@@ -810,14 +821,17 @@ class SimulateTS:
                 else:
                     bp_prev = bp_prev[: b_prev.numel()]
             if bp_prev is not None:
-                # Child eta_{t+1} determines whether bp_t is implemented.
                 new_state['b'] = apply_refinancing_policy(
                     b_current=b_prev,
                     bp_candidate=bp_prev,
-                    eta_next=new_state['eta'].reshape(-1),
+                    eta_current=eta_prev,
                 )
             else:
                 new_state['b'] = b_prev.clone()
+
+            # Child eta_{t+1} is a state shock and never gates b_t -> b_{t+1}.
+            new_state['eta'] = sample_bernoulli(len(state['z']), self.config.ZETA, device)
+            new_state['i'] = sample_uniform(len(state['i']), 0.0, self.config.I_THRESHOLD, device)
             
             # 更新资本
             k_prev = state['K'].reshape(-1)

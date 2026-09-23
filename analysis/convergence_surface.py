@@ -269,15 +269,18 @@ class VectorizedBellmanSurfaceBackend:
         eta_current = parent_states[:, idx.ETA:idx.ETA + 1].clamp(0.0, 1.0)
         b_parent = parent_states[:, idx.B:idx.B + 1]
         eta_next = eta_next.clamp(0.0, 1.0)
+        # Realized next leverage is gated by the current parent eta_t; eta_next
+        # remains a child shock that is still enumerated in the child states.
+        eta_current_broadcast = eta_current.unsqueeze(1).expand(-1, n_child, -1)
         b_p0 = apply_refinancing_policy(
             b_current=b_parent.unsqueeze(1),
             bp_candidate=bp0.unsqueeze(1),
-            eta_next=eta_next,
+            eta_current=eta_current_broadcast,
         ).squeeze(-1)
         b_pi = apply_refinancing_policy(
             b_current=b_parent.unsqueeze(1),
             bp_candidate=bpI.unsqueeze(1),
-            eta_next=eta_next,
+            eta_current=eta_current_broadcast,
         ).squeeze(-1)
         multiplier = bar_i * (float(self.economic_config.G) - 1.0) + 1.0
         b_q = b_parent / multiplier.clamp_min(1e-6)

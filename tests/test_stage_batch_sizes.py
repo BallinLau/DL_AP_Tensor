@@ -39,16 +39,33 @@ class StageBatchSizeTest(unittest.TestCase):
                     bar_z=zeros,
                 )
 
-        base = torch.tensor([[0.4, 0.0, 0.0, 0.1, 0.0, -2.0, 4.0]])
+        # Parent eta_t = 1 so refinancing is active and the realized child
+        # leverage equals the chosen bp.  The child eta_{t+1} is a separate
+        # shock supplied explicitly through ``eta_next_assumed``.
+        active = torch.tensor([[0.4, 0.0, 1.0, 0.1, 0.0, -2.0, 4.0]])
+        # Parent eta_t = 0 disables refinancing, so the child keeps b_parent
+        # regardless of the chosen bp.
+        inactive = torch.tensor([[0.4, 0.0, 0.0, 0.1, 0.0, -2.0, 4.0]])
         for surface_fn in (compute_run_utils_surfaces, compute_episode0_surfaces):
             model = RecordingModel()
-            surface_fn(model, None, base, eta_next_assumed=1.0)
+            surface_fn(model, None, active, eta_next_assumed=0.0)
             self.assertEqual(len(model.calls), 3)
             torch.testing.assert_close(model.calls[1][:, 0:1], torch.tensor([[0.2]]))
             torch.testing.assert_close(model.calls[2][:, 0:1], torch.tensor([[0.8]]))
-            torch.testing.assert_close(model.calls[1][:, 2:3], torch.ones_like(base[:, 2:3]))
-            torch.testing.assert_close(model.calls[2][:, 2:3], torch.ones_like(base[:, 2:3]))
-            torch.testing.assert_close(model.calls[0][:, 2:3], base[:, 2:3])
+            torch.testing.assert_close(
+                model.calls[1][:, 2:3], torch.zeros_like(active[:, 2:3])
+            )
+            torch.testing.assert_close(
+                model.calls[2][:, 2:3], torch.zeros_like(active[:, 2:3])
+            )
+            torch.testing.assert_close(model.calls[0][:, 2:3], active[:, 2:3])
+
+            model = RecordingModel()
+            surface_fn(model, None, inactive, eta_next_assumed=0.0)
+            self.assertEqual(len(model.calls), 3)
+            torch.testing.assert_close(model.calls[1][:, 0:1], torch.tensor([[0.4]]))
+            torch.testing.assert_close(model.calls[2][:, 0:1], torch.tensor([[0.4]]))
+            torch.testing.assert_close(model.calls[0][:, 2:3], inactive[:, 2:3])
 
     def test_stage_batch_sizes_fallback(self):
         pv, sdf_fc1 = Episode._resolve_stage_batch_sizes(
@@ -240,6 +257,10 @@ class StageBatchSizeTest(unittest.TestCase):
         self.assertEqual(int((selected_child_eta > 0.5).sum().item()), 1)
 
     def test_child_eta_resampling_is_scoped_to_bp_train_cache(self):
+        # ``_resample_bp_target_cache`` is a deprecated no-op: the child shock
+        # eta_{t+1} never gates leverage, so no child-eta stratum exists to
+        # rebalance.  The cache must be returned untouched with explicit
+        # metadata stating that nothing was done.
         episode = Episode.__new__(Episode)
         episode.hyperparams = SimpleNamespace(
             pv_eta_resample_enabled=True,
@@ -264,15 +285,29 @@ class StageBatchSizeTest(unittest.TestCase):
         }]
 
         torch.manual_seed(1234)
+        rng_before = torch.get_rng_state().clone()
         resampled, summary = episode._resample_bp_target_cache(cache)
+        torch.testing.assert_close(torch.get_rng_state(), rng_before)
 
-        self.assertTrue(summary["applied"])
+        self.assertIs(resampled, cache)
+        self.assertFalse(summary["applied"])
+        self.assertTrue(summary["deprecated"])
+        self.assertTrue(summary["enabled"])
         self.assertEqual(summary["scope"], "bp_distillation_train_cache_only")
         self.assertFalse(summary["validation_cache_resampled"])
-        self.assertEqual(int(resampled[0]["eta_next_active"].sum().item()), 2)
+        self.assertEqual(
+            summary["reason"],
+            "deprecated_child_eta_next_does_not_gate_bp_availability",
+        )
+        # Cache rows are untouched, including the eta_next diagnostic column.
         torch.testing.assert_close(cache[0]["eta_next_active"], active)
 
     def test_current_eta_resampling_reads_parent_column_not_future_eta(self):
+        # ``_resample_bp_target_cache_by_current_eta`` is deprecated: BP
+        # supervision is already conditional on the CURRENT parent eta_t inside
+        # ``_build_bp_target_cache``, so nothing is resampled.  The reported
+        # counts must still be keyed off the parent eta column (never off the
+        # future eta_next diagnostic), and the cache must be left untouched.
         episode = Episode.__new__(Episode)
         episode.hyperparams = SimpleNamespace(
             bp_current_eta_resample_enabled=True,
@@ -309,49 +344,33 @@ class StageBatchSizeTest(unittest.TestCase):
         global_rng_after = torch.get_rng_state().clone()
         repeated, repeated_summary = episode._resample_bp_target_cache_by_current_eta(cache)
 
-        current_eta = resampled[0]["parent"][:, 2] > 0.5
-        repeated_eta = repeated[0]["parent"][:, 2] > 0.5
-        self.assertEqual(int(current_eta.sum().item()), 25)
-        self.assertEqual(int(repeated_eta.sum().item()), 25)
-        self.assertAlmostEqual(float(current_eta.float().mean().item()), 0.25)
-        self.assertEqual(int(resampled[0]["eta_next_active"].sum().item()), 75)
-        torch.testing.assert_close(global_rng_after, global_rng_before)
-        torch.testing.assert_close(torch.get_rng_state(), global_rng_before)
-        torch.testing.assert_close(
-            resampled[0]["source_index"], repeated[0]["source_index"]
+        self.assertIs(resampled, cache)
+        self.assertIs(repeated, cache)
+        self.assertFalse(summary["applied"])
+        self.assertTrue(summary["deprecated"])
+        self.assertTrue(summary["enabled"])
+        self.assertEqual(
+            summary["reason"],
+            "deprecated_bp_supervision_is_already_eta_current_conditional",
         )
         self.assertEqual(summary["eta_field"], "parent[:, 2]")
-        self.assertEqual(summary["resample_seed"], 13579)
-        self.assertEqual(summary["episode_resample_seed"], 13579 + 2 * 100003)
-        self.assertEqual(
-            summary["episode_resample_seed"],
-            repeated_summary["episode_resample_seed"],
-        )
+        # Counts are read from the CURRENT parent eta column (10 of 100), and
+        # are never resampled up to the target share.
         self.assertEqual(summary["current_eta1_count_before"], 10)
-        self.assertEqual(summary["current_eta1_count_after"], 25)
-        self.assertAlmostEqual(summary["current_eta1_share_after"], 0.25)
+        self.assertEqual(summary["current_eta0_count_before"], 90)
+        self.assertEqual(summary["current_eta1_count_after"], 10)
+        self.assertAlmostEqual(summary["current_eta1_share_after"], 0.10)
+        self.assertEqual(summary["target_current_eta1_share"], 0.25)
+        self.assertEqual(
+            repeated_summary["current_eta1_count_after"], 10
+        )
+        # No RNG is consumed and the cache (including the future-eta
+        # diagnostic) is byte-for-byte unchanged.
+        torch.testing.assert_close(global_rng_after, global_rng_before)
+        torch.testing.assert_close(torch.get_rng_state(), global_rng_before)
         self.assertFalse(summary["validation_cache_resampled"])
         torch.testing.assert_close(cache[0]["parent"], parent)
         torch.testing.assert_close(cache[0]["eta_next_active"], eta_next_active)
-
-        episode.episode_id = 3
-        different_episode, _ = episode._resample_bp_target_cache_by_current_eta(cache)
-        self.assertFalse(torch.equal(
-            resampled[0]["source_index"],
-            different_episode[0]["source_index"],
-        ))
-
-        episode.episode_id = 2
-        episode.hyperparams.bp_current_eta_resample_seed = 13580
-        different_seed, _ = episode._resample_bp_target_cache_by_current_eta(cache)
-        self.assertFalse(torch.equal(
-            resampled[0]["source_index"],
-            different_seed[0]["source_index"],
-        ))
-        self.assertEqual(
-            int((different_seed[0]["parent"][:, 2] > 0.5).sum().item()),
-            25,
-        )
 
     def test_disabled_current_eta_resampling_preserves_legacy_cache(self):
         episode = Episode.__new__(Episode)
@@ -365,7 +384,12 @@ class StageBatchSizeTest(unittest.TestCase):
 
         self.assertIs(result, cache)
         self.assertFalse(summary["applied"])
-        self.assertEqual(summary["reason"], "disabled")
+        self.assertTrue(summary["deprecated"])
+        self.assertFalse(summary["enabled"])
+        self.assertEqual(
+            summary["reason"],
+            "deprecated_bp_supervision_is_already_eta_current_conditional",
+        )
 
 
 if __name__ == "__main__":

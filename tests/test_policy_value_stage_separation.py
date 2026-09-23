@@ -14,6 +14,9 @@ from config import Config  # noqa: E402
 from config.hyperparams import HyperParams  # noqa: E402
 from models.policy_value import PolicyValueModel  # noqa: E402
 from training.bp_grid_teacher import BPGridTeacher  # noqa: E402
+from training.bp_policy_loss import (  # noqa: E402
+    compute_target_grid_policy_distillation_loss,
+)
 from training.episode import Episode  # noqa: E402
 from training.pv_mixture import PVParentGroupPool  # noqa: E402
 
@@ -526,6 +529,40 @@ def test_bp_train_without_active_states_skips_stage():
     assert summary["train_active_count"] == 0
     assert summary["validation_active_count"] > 0
     assert summary["optimizer_steps"] == 0
+
+
+def test_bp_distillation_supervises_only_eta_current_active_rows():
+    """TEST F: parent eta_t = 0 rows produce exactly zero BP-head supervision."""
+    episode = _episode()
+    device = episode.device
+    teacher = episode.firm_target
+    cache = episode._build_bp_target_cache([_batch(device)], teacher)
+
+    item = cache[0]
+    # Row 0 has parent eta_t = 1, row 1 has parent eta_t = 0.
+    torch.testing.assert_close(item["eta_current"], torch.tensor([[1.0], [0.0]]))
+    for key in ("bp0_confidence", "bpi_confidence", "mix_confidence"):
+        assert item[key][0, 0].item() > 0.0
+        assert item[key][1, 0].item() == 0.0
+
+    # Zero confidence makes the distillation term exactly zero and leaves no
+    # gradient on the BP prediction, which is how eta_t = 0 rows are excluded.
+    pred = torch.tensor([[0.2], [0.8]], requires_grad=True)
+    target = torch.tensor([[0.9], [0.1]])
+    loss, _, _ = compute_target_grid_policy_distillation_loss(
+        pred, target, torch.zeros(2, 1), huber_delta=0.05,
+    )
+    assert float(loss.detach()) == 0.0
+    loss.backward()
+    assert float(pred.grad.abs().sum()) == 0.0
+
+    # The mixed cache still trains the BP heads, driven by the eta_t = 1 row.
+    bp_params = episode._policy_value_stage_params("bp")
+    snapshot = episode._snapshot_params(bp_params)
+    summary = episode._run_bp_distillation_stage(cache, cache, teacher, n_epochs=1)
+    assert summary["status"] == "accepted"
+    assert summary["train_active_counts"]["unique_parent_active_count"] == 1
+    assert episode._param_max_change_from_snapshot(bp_params, snapshot) > 0.0
 
 
 def test_reduce_signed_branch_residuals_cancellation_and_realized_abs():

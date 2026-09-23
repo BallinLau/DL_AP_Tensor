@@ -1078,6 +1078,11 @@ def _bp_parity_setup():
     hyperparams.pv_use_clipped_m = True
     hyperparams.pv_m_clamp_min = 0.7
     hyperparams.pv_m_clamp_max = 1.3
+    # Keep the teacher confidence in a discriminating (unsaturated) range. With
+    # the default 1e-3 scale the toy's coarse top-2 margins are large enough that
+    # every branch's confidence clamps to 1.0, which would make the aliasing
+    # regression test below blind to a real branch/J axis mix-up.
+    hyperparams.bp_grid_margin_scale = 0.01
     economic = AnalysisEconomicConfig.from_current_config()
     transition_max = build_frozen_transition_data(
         _BpToySDF(), grid.base_states, reference, hyperparams, economic,

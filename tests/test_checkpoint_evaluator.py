@@ -530,31 +530,50 @@ def _transition_fixture(grid, eta_values=(0.0, 1.0)):
     )
 
 
-def test_child_audit_uses_eta_next_and_preserves_candidate_bp_for_eta1():
+def test_child_audit_uses_parent_eta_and_keeps_child_eta_as_shock():
     class ChildModel(torch.nn.Module):
         def forward(self, states):
             b = states[:, 0:1]
             return SimpleNamespace(P=b, Phat=torch.ones_like(b), bar_z=torch.zeros_like(b))
 
-    reference = ReferenceFirmState(
-        eta=0.0, i_low=0.1, i_mid=0.2, i_high=0.3,
-        x=-2.0, hatcf=-2.1, lnkf=4.0, hatc_cal=-2.0, lnk_cal=4.1,
-        n_parent_rows=1, source="fixture", macro_source="fixture",
-    )
-    grid = build_frozen_grid(
-        reference, b_min=0.4, b_max=0.5, b_points=2,
-        z_min=-1.0, z_max=1.0, z_points=2, device=torch.device("cpu"),
-    )
-    audit = build_child_continuation_audit(
-        ChildModel(), grid, _transition_fixture(grid),
-        AnalysisEconomicConfig.from_current_config(), candidate_bp=(0.2, 0.5, 0.8),
-    )
-    rows = audit[(audit["state_label"] == "b_low_z_low") & (audit["branch"] == "p0")]
-    assert rows["child_b_identity_error"].max() == pytest.approx(0.0, abs=1e-7)
+    def _rows(parent_eta: float):
+        reference = ReferenceFirmState(
+            eta=parent_eta, i_low=0.1, i_mid=0.2, i_high=0.3,
+            x=-2.0, hatcf=-2.1, lnkf=4.0, hatc_cal=-2.0, lnk_cal=4.1,
+            n_parent_rows=1, source="fixture", macro_source="fixture",
+        )
+        grid = build_frozen_grid(
+            reference, b_min=0.4, b_max=0.5, b_points=2,
+            z_min=-1.0, z_max=1.0, z_points=2, device=torch.device("cpu"),
+        )
+        audit = build_child_continuation_audit(
+            ChildModel(), grid, _transition_fixture(grid),
+            AnalysisEconomicConfig.from_current_config(), candidate_bp=(0.2, 0.5, 0.8),
+        )
+        return audit[(audit["state_label"] == "b_low_z_low") & (audit["branch"] == "p0")]
+
+    # Parent eta_t = 0: refinancing never triggers, so realized child leverage is
+    # forced to b_parent for every child eta_{t+1}.
+    inactive = _rows(0.0)
+    assert inactive["child_b_identity_error"].max() == pytest.approx(0.0, abs=1e-7)
+    assert set(inactive["eta_next"]) == {0.0, 1.0}
     for candidate in (0.2, 0.5, 0.8):
-        selected = rows[rows["bp_candidate"] == candidate]
-        assert selected.loc[selected["eta_next"] == 0.0, "child_b"].iloc[0] == pytest.approx(0.4)
-        assert selected.loc[selected["eta_next"] == 1.0, "child_b"].iloc[0] == pytest.approx(candidate)
+        selected = inactive[inactive["bp_candidate"] == candidate]
+        for eta_next in (0.0, 1.0):
+            child_b = selected.loc[selected["eta_next"] == eta_next, "child_b"].iloc[0]
+            assert child_b == pytest.approx(0.4)
+
+    # Parent eta_t = 1: refinancing triggers, so realized child leverage equals
+    # the candidate for every child eta_{t+1} (the child eta is only a shock).
+    active = _rows(1.0)
+    assert active["child_b_identity_error"].max() == pytest.approx(0.0, abs=1e-7)
+    for candidate in (0.2, 0.5, 0.8):
+        selected = active[active["bp_candidate"] == candidate]
+        for eta_next in (0.0, 1.0):
+            child_b = selected.loc[selected["eta_next"] == eta_next, "child_b"].iloc[0]
+            assert child_b == pytest.approx(candidate)
+
+    rows = active
     continuation = rows.groupby("bp_candidate")["M_times_P_child"].mean()
     assert continuation.loc[0.2] != pytest.approx(continuation.loc[0.8])
     np.testing.assert_allclose(
@@ -805,7 +824,7 @@ def test_firm_checkpoint_evaluator_smoke_is_read_only_and_deterministic(tmp_path
         "finite Phat>0 and top2_margin>teacher_margin_tol"
     )
     assert metadata["semantics"]["child_leverage_timing"] == (
-        "b_next = eta_next * bp_current + (1-eta_next) * b_current"
+        "b_next = eta_current * bp_current + (1-eta_current) * b_current"
     )
     assert metadata["semantics"]["current_financing_eta"] == "eta_current"
 

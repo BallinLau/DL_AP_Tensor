@@ -81,23 +81,35 @@ def build_policy_value_from_checkpoint_spec(
 
 
 class PolicyValueOutput(NamedTuple):
-    """Policy & Value 模型的输出"""
+    """Policy & Value 模型的输出
+
+    ``bp0``/``bpI``/``bp``/``bp_cond`` are the *conditional* refinancing policy
+    produced by the network heads: they are only meaningful when the current
+    parent state has ``eta_t = 1``. ``bp0_effective``/``bpI_effective``/
+    ``bp_effective`` are the *realized/effective* next-leverage policy: they equal
+    the conditional policy when ``eta_t = 1`` and fall back to ``b_t`` when
+    ``eta_t = 0``, where refinancing is not available and ``bp_t`` is not a
+    control. ``bp_t`` is never a control for ``eta_t = 0``.
+    """
     Q: torch.Tensor          # 债券价值
-    bp0: torch.Tensor        # 不投资时杠杆候选
-    bpI: torch.Tensor        # 投资时杠杆候选
+    bp0: torch.Tensor        # 不投资时杠杆候选（条件策略）
+    bpI: torch.Tensor        # 投资时杠杆候选（条件策略）
     P0: torch.Tensor         # 兼容别名：V0
     PI: torch.Tensor         # 兼容别名：VI
     bar_i: torch.Tensor      # 兼容别名：bar_i_eff
     bar_z: torch.Tensor      # 破产门槛
     P: torch.Tensor          # 综合股票价值
     Phat: torch.Tensor       # P hat (中间值)
-    bp: torch.Tensor         # 综合杠杆候选
+    bp: torch.Tensor         # 综合杠杆候选（条件策略）
     V0: torch.Tensor         # 不投资 branch value
     VI: torch.Tensor         # 投资 branch value
     bar_i_cond: torch.Tensor # 存活条件下投资概率
     bar_i_eff: torch.Tensor  # 考虑当前违约后的有效投资概率
     survival_prob: torch.Tensor
-    bp_cond: torch.Tensor    # 存活条件下混合杠杆候选
+    bp_cond: torch.Tensor    # 存活条件下混合杠杆候选（条件策略）
+    bp0_effective: torch.Tensor = None  # 有效下一期杠杆策略（eta_t = 0 时为 b_t）
+    bpI_effective: torch.Tensor = None  # 有效下一期杠杆策略（eta_t = 0 时为 b_t）
+    bp_effective: torch.Tensor = None   # 有效下一期杠杆策略（eta_t = 0 时为 b_t）
 
 
 class PolicyValueModel(nn.Module):
@@ -392,7 +404,25 @@ class PolicyValueModel(nn.Module):
         bar_i_eff = survival_prob * bar_i_cond
         bp_cond = self.cal_bp(bp0, bpI, bar_i_cond)
         bp = survival_prob * bp_cond + (1.0 - survival_prob) * bp0
-        
+
+        # ``bp0``/``bpI``/``bp`` above are the conditional policy heads and stay
+        # unchanged for checkpoint/logit compatibility.  Realized next leverage
+        # is governed by the CURRENT parent eta_t only:
+        #     b_{t+1} = eta_t * bp_t + (1 - eta_t) * b_t
+        # so the effective exports collapse to ``b_t`` whenever eta_t = 0, where
+        # refinancing is unavailable and ``bp_t`` is not a control.
+        b_current = firm_state[:, SIMMODEL.B:SIMMODEL.B + 1]
+        eta_current = firm_state[:, SIMMODEL.ETA:SIMMODEL.ETA + 1]
+        bp0_effective = apply_refinancing_policy(
+            b_current=b_current, bp_candidate=bp0, eta_current=eta_current
+        )
+        bpI_effective = apply_refinancing_policy(
+            b_current=b_current, bp_candidate=bpI, eta_current=eta_current
+        )
+        bp_effective = apply_refinancing_policy(
+            b_current=b_current, bp_candidate=bp, eta_current=eta_current
+        )
+
         return PolicyValueOutput(
             Q=Q,
             bp0=bp0,
@@ -410,6 +440,9 @@ class PolicyValueModel(nn.Module):
             bar_i_eff=bar_i_eff,
             survival_prob=survival_prob,
             bp_cond=bp_cond,
+            bp0_effective=bp0_effective,
+            bpI_effective=bpI_effective,
+            bp_effective=bp_effective,
         )
     
     def cal_phats(
@@ -471,17 +504,17 @@ class PolicyValueModel(nn.Module):
         self,
         b_old: torch.Tensor,
         bp: torch.Tensor,
-        eta_next: torch.Tensor
+        eta_current: torch.Tensor
     ) -> torch.Tensor:
         """
         更新杠杆
         
-        b_new = η_{t+1} * bp_t + (1 - η_{t+1}) * b_t
+        b_{t+1} = η_t * bp_t + (1 - η_t) * b_t
         
         Args:
             b_old: 旧杠杆
-            bp: 杠杆候选
-            eta_next: child-state refinancing realization
+            bp: 杠杆候选（仅在 η_t = 1 时是真实控制变量）
+            eta_current: 当前父状态的再融资实现 η_t
         
         Returns:
             b_new: 新杠杆
@@ -489,7 +522,7 @@ class PolicyValueModel(nn.Module):
         return apply_refinancing_policy(
             b_current=b_old,
             bp_candidate=bp,
-            eta_next=eta_next,
+            eta_current=eta_current,
         )
     
     def update_capital(

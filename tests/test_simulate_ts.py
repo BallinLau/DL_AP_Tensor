@@ -38,12 +38,12 @@ def build_dummy_models(device: torch.device):
 
 def _assert_effective_debt_identity(
     b: torch.Tensor,
-    eta_next: torch.Tensor,
+    eta_current: torch.Tensor,
     bp: torch.Tensor,
     b_next: torch.Tensor,
     atol: float = 1e-6,
 ) -> None:
-    expected = eta_next * bp + (1.0 - eta_next) * b
+    expected = eta_current * bp + (1.0 - eta_current) * b
     torch.testing.assert_close(b_next, expected, atol=atol, rtol=0.0)
 
 
@@ -64,7 +64,7 @@ def _fake_policy_value_output(firm_state: torch.Tensor):
     )
 
 
-def test_effective_next_debt_uses_child_eta():
+def test_effective_next_debt_uses_parent_eta():
     b = torch.tensor([0.6, 0.4])
     eta = torch.tensor([1.0, 0.0])
     bp = torch.tensor([0.2, 0.9])
@@ -72,14 +72,16 @@ def test_effective_next_debt_uses_child_eta():
     b_next = apply_refinancing_policy(
         b_current=b,
         bp_candidate=bp,
-        eta_next=eta,
+        eta_current=eta,
     )
 
+    # eta_t = 1 -> refinance to bp; eta_t = 0 -> keep b.
     torch.testing.assert_close(b_next, torch.tensor([0.2, 0.4]))
     _assert_effective_debt_identity(b, eta, bp, b_next)
 
 
-def test_parallel_simulation_child_eta_changes_branch_leverage(monkeypatch):
+def test_parallel_simulation_branches_share_parent_eta_leverage(monkeypatch):
+    """Branches differing only in eta_{t+1} must share b_next (set by parent eta_t)."""
     device = torch.device("cpu")
     eta_draws = [
         torch.zeros(2, 1, device=device),
@@ -118,12 +120,16 @@ def test_parallel_simulation_child_eta_changes_branch_leverage(monkeypatch):
 
     branches = simulate_ts_parallel._expand_branches_batched(sim, state)
 
-    torch.testing.assert_close(branches[0]["b"], state["b"])
-    torch.testing.assert_close(branches[1]["b"], state["bp"])
+    # Parent eta_t = [1, 0]: firm 0 refinances (b_next = bp), firm 1 keeps b.
+    expected_b = torch.tensor([[0.2], [0.4]], device=device)
+    torch.testing.assert_close(branches[0]["b"], expected_b)
+    torch.testing.assert_close(branches[1]["b"], expected_b)
+    torch.testing.assert_close(branches[0]["b"], branches[1]["b"])
+    # The child eta_{t+1} is still stored in the child state and still varies.
     assert not torch.equal(branches[0]["eta"], branches[1]["eta"])
 
 
-def test_sample_update_child_leverage_uses_each_child_eta():
+def test_sample_update_child_leverage_uses_parent_eta():
     sample = Sample(models={}, n_samples=0, n_paths=0)
     df = pd.DataFrame(
         [
@@ -140,8 +146,11 @@ def test_sample_update_child_leverage_uses_each_child_eta():
 
     a_children = df[(df["ID"] == "a") & (df["branch"] > 0)]
     b_children = df[(df["ID"] == "b") & (df["branch"] > 0)]
-    assert a_children["b"].round(8).tolist() == [0.2, 0.6]
-    assert b_children["b"].round(8).tolist() == [0.4, 0.9]
+    # Parent "a" has eta_t = 0 -> b_next == b_parent for every child.
+    assert a_children["b"].round(8).tolist() == [0.6, 0.6]
+    # Parent "b" has eta_t = 1 -> b_next == bp_parent for every child.
+    assert b_children["b"].round(8).tolist() == [0.9, 0.9]
+    # The child eta_{t+1} column is untouched and still varies.
     assert a_children["ETA"].tolist() == [1.0, 0.0]
     assert b_children["ETA"].tolist() == [0.0, 1.0]
 
@@ -184,7 +193,7 @@ def _serial_state(device: torch.device):
     }
 
 
-def test_serial_tensor_expand_branches_uses_child_eta(monkeypatch):
+def test_serial_tensor_expand_branches_uses_parent_eta(monkeypatch):
     device = torch.device("cpu")
     eta_draws = [torch.zeros(2, device=device), torch.ones(2, device=device)]
 
@@ -195,8 +204,11 @@ def test_serial_tensor_expand_branches_uses_child_eta(monkeypatch):
     sim = _make_serial_sim(device)
     branches = sim._expand_branches_tensor(_serial_state(device))
 
-    torch.testing.assert_close(branches[0]["b"], torch.tensor([0.6, 0.4], device=device))
-    torch.testing.assert_close(branches[1]["b"], torch.tensor([0.2, 0.9], device=device))
+    # Parent eta_t = [1, 0]: firm 0 refinances (b_next = bp), firm 1 keeps b.
+    expected_b = torch.tensor([0.2, 0.4], device=device)
+    torch.testing.assert_close(branches[0]["b"], expected_b)
+    torch.testing.assert_close(branches[1]["b"], expected_b)
+    torch.testing.assert_close(branches[0]["b"], branches[1]["b"])
     assert not torch.equal(branches[0]["eta"], branches[1]["eta"])
 
 
@@ -274,7 +286,7 @@ def test_parallel_tensor_node_defers_next_debt_until_child_eta_is_drawn(monkeypa
         assert torch.isnan(firm_rows[:, columns[name]]).all()
 
 
-def test_serial_legacy_expand_branches_uses_child_eta(monkeypatch):
+def test_serial_legacy_expand_branches_uses_parent_eta(monkeypatch):
     device = torch.device("cpu")
     eta_draws = [torch.zeros(2, device=device), torch.ones(2, device=device)]
 
@@ -285,8 +297,11 @@ def test_serial_legacy_expand_branches_uses_child_eta(monkeypatch):
     sim = _make_serial_sim(device)
     branches = sim._expand_branches(_serial_state(device), t=0)
 
-    torch.testing.assert_close(branches[0]["b"], torch.tensor([0.6, 0.4], device=device))
-    torch.testing.assert_close(branches[1]["b"], torch.tensor([0.2, 0.9], device=device))
+    # Parent eta_t = [1, 0]: firm 0 refinances (b_next = bp), firm 1 keeps b.
+    expected_b = torch.tensor([0.2, 0.4], device=device)
+    torch.testing.assert_close(branches[0]["b"], expected_b)
+    torch.testing.assert_close(branches[1]["b"], expected_b)
+    torch.testing.assert_close(branches[0]["b"], branches[1]["b"])
     assert not torch.equal(branches[0]["eta"], branches[1]["eta"])
 
 
@@ -324,9 +339,10 @@ def test_simulation_dataframe_reports_effective_next_debt():
     )
     merged = merged[merged["t_child"] == merged["t_parent"] + 1]
     assert not merged.empty
+    # Realized leverage is gated by the parent eta_t, not the child eta_{t+1}.
     expected = (
-        merged["ETA_child"] * merged["bp_parent"]
-        + (1.0 - merged["ETA_child"]) * merged["b_parent"]
+        merged["ETA_parent"] * merged["bp_parent"]
+        + (1.0 - merged["ETA_parent"]) * merged["b_parent"]
     )
     assert (merged["b_next_policy_parent"] - expected).abs().max() < 1e-6
     max_transition_error = (

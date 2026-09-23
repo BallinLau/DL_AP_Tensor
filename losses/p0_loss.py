@@ -219,8 +219,8 @@ class P0Loss(nn.Module):
         - P'_grad^{(j)} = ∂P_children^{(j)}/∂bp
 
         Since ``P'_grad`` is differentiated directly with respect to ``bp``,
-        it already contains db_child/dbp = eta_child. Do not multiply eta a
-        second time.
+        it already contains db_child/dbp = eta_current (the CURRENT parent
+        refinancing realization). Do not multiply eta a second time.
         """
         n_branches = len(P_children)
         cf_grad_missing = 0

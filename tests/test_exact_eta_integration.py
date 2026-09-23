@@ -44,6 +44,21 @@ def _continuous_children(batch_size: int = 2, branch_count: int = 2):
     return children
 
 
+class HighLeverageEtaTarget:
+    """Child equity that depends on both leverage and the child eta_{t+1}."""
+
+    def _q_output(self, state):
+        return torch.zeros_like(state[:, 0:1])
+
+    def forward_equity(self, state):
+        p = state[:, 0:1].clamp(0.0, 1.0) + 2.0 * state[:, 2:3]
+        return {"P": p, "Phat": p, "bar_z": torch.zeros_like(p)}
+
+    def __call__(self, state):
+        equity = self.forward_equity(state)
+        return SimpleNamespace(Q=self._q_output(state), **equity)
+
+
 def _training_episode_and_batch():
     model = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8)
     target = copy.deepcopy(model)
@@ -108,7 +123,9 @@ def test_bp_teacher_exact_eta_matches_large_sampled_eta_benchmark():
             return torch.zeros_like(state[:, 0:1])
 
         def forward_equity(self, state):
-            p = 1.0 + 2.0 * state[:, 0:1]
+            # Depends on the child eta_{t+1} coordinate so the Bernoulli weights
+            # are actually exercised by the expectation.
+            p = 1.0 + 2.0 * state[:, 0:1] + 5.0 * state[:, 2:3]
             return {"P": p, "Phat": p, "bar_z": torch.zeros_like(p)}
 
         def __call__(self, state):
@@ -121,7 +138,8 @@ def test_bp_teacher_exact_eta_matches_large_sampled_eta_benchmark():
         target, P0Loss(), PILoss(), coarse_size=3, refine=False,
         candidate_chunk_size=3, max_expanded_states=100_000,
     )
-    parent = torch.tensor([[0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    # Parent eta_t = 1 so the candidate grid is the active path.
+    parent = torch.tensor([[0.4, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]])
     child = parent.clone()
     exact_children = [child.clone(), child.clone()]
     exact_children[0][:, 2] = 0.0
@@ -153,6 +171,46 @@ def test_bp_teacher_exact_eta_matches_large_sampled_eta_benchmark():
     )
 
 
+def test_child_eta_expectation_keeps_distinct_eta_but_shares_child_leverage():
+    """TEST D: eta_{t+1} stays a distinct child shock with Bernoulli weights, yet
+    a fixed parent/candidate realizes the same child leverage for both draws."""
+    zeta = 0.03
+    target = HighLeverageEtaTarget()
+    teacher = BPGridTeacher(
+        target, P0Loss(), PILoss(), coarse_size=3, refine=False,
+        candidate_chunk_size=3, max_expanded_states=100_000,
+    )
+    parent = torch.tensor([[0.4, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]])
+    child_eta0 = parent.clone()
+    child_eta1 = parent.clone()
+    child_eta0[:, 2] = 0.0
+    child_eta1[:, 2] = 1.0
+
+    out = teacher.compute(
+        parent,
+        [child_eta0, child_eta1],
+        [torch.ones(1, 1), torch.ones(1, 1)],
+        branch="p0",
+        child_weights=torch.tensor([[1.0 - zeta, zeta]]),
+    )
+
+    bp_grid = out["coarse_bp_grid"]
+    # Both child eta_{t+1} draws realize the same candidate leverage ...
+    torch.testing.assert_close(out["coarse_child_b_eta0_mean"], bp_grid)
+    torch.testing.assert_close(out["coarse_child_b_eta1_mean"], bp_grid)
+    # ... while their eta coordinates still carry the correct Bernoulli weight.
+    torch.testing.assert_close(
+        out["eta_next_active_share"],
+        torch.full_like(out["eta_next_active_share"], zeta),
+    )
+    # Child equity depends on eta_{t+1} (p = b + 2*eta), so the expectation is a
+    # genuine Bernoulli mixture over the eta shock at a fixed child leverage.
+    torch.testing.assert_close(
+        out["coarse_continuation_grid_mean"],
+        bp_grid + 2.0 * zeta,
+    )
+
+
 def test_training_expansion_duplicates_m_and_collapse_restores_independent_branch_count():
     episode = _episode()
     children = _continuous_children()
@@ -178,7 +236,7 @@ def test_training_expansion_duplicates_m_and_collapse_restores_independent_branc
 
 
 @pytest.mark.parametrize("loss_fn,growth", [(P0Loss(), 1.0), (PILoss(), 1.02)])
-def test_exact_eta_foc_autograd_has_single_zeta_multiplier(loss_fn, growth):
+def test_exact_eta_foc_autograd_uses_parent_eta_not_child_eta(loss_fn, growth):
     zeta = 0.03
     episode = _episode(zeta=zeta)
     b_parent = torch.tensor([[0.4]], dtype=torch.float64)
@@ -190,11 +248,14 @@ def test_exact_eta_foc_autograd_has_single_zeta_multiplier(loss_fn, growth):
     )
 
     slope = 2.5
+    # The debt-choice gradient is gated by the CURRENT parent eta_t = 1 for every
+    # expanded child; the child eta_{t+1} coordinate no longer enters the chain.
+    eta_current = torch.tensor([[1.0]], dtype=torch.float64)
     p_children = []
     bar_z_children = []
     cashflows = []
-    for child in expanded:
-        b_child = apply_refinancing_policy(b_parent, bp, child[:, 2:3])
+    for _child in expanded:
+        b_child = apply_refinancing_policy(b_parent, bp, eta_current)
         p_children.append(slope * b_child + 1.0)
         bar_z_children.append(torch.zeros_like(b_child))
         cashflows.append(bp * 0.0)
@@ -219,7 +280,9 @@ def test_exact_eta_foc_autograd_has_single_zeta_multiplier(loss_fn, growth):
 
     assert len(foc) == 2
     for actual, m in zip(foc, raw_m):
-        torch.testing.assert_close(actual, zeta * growth * m * slope)
+        # eta_t = 1, so db_child/dbp = 1 for every child and the Bernoulli weight
+        # over eta_{t+1} no longer multiplies the debt-choice gradient.
+        torch.testing.assert_close(actual, growth * m * slope)
 
 
 def test_exact_eta_bellman_residual_is_collapsed_before_aio():

@@ -899,9 +899,13 @@ class Sample:
     
     def _update_child_leverage(self, df: pd.DataFrame):
         """
-        根据每个 child 的 refinancing realization 和 parent 政策更新杠杆。
+        Update child leverage from the parent refinancing realization.
 
-        b_{t+1}^{(j)} = η_{t+1}^{(j)} * bp_t + (1 - η_{t+1}^{(j)}) * b_t
+        b_{t+1}^{(j)} = eta_t * bp_t + (1 - eta_t) * b_t
+
+        Realized leverage depends only on the current parent eta_t, so every
+        child of a given parent receives the same b_{t+1} regardless of its own
+        eta_{t+1}.
         """
         if 'bp' not in df.columns:
             return
@@ -913,15 +917,16 @@ class Sample:
                     continue
                 bp_parent = parent_rows['bp'].values[0]
                 b_parent = parent_rows['b'].values[0]
+                eta_parent = parent_rows['ETA'].values[0]
                 if len(child_rows) == 0:
                     continue
-                eta_next = torch.tensor(
+                child_eta_next = torch.tensor(
                     child_rows['ETA'].to_numpy(), dtype=torch.float64
                 )
                 b_next = apply_refinancing_policy(
-                    b_current=torch.full_like(eta_next, float(b_parent)),
-                    bp_candidate=torch.full_like(eta_next, float(bp_parent)),
-                    eta_next=eta_next,
+                    b_current=torch.full_like(child_eta_next, float(b_parent)),
+                    bp_candidate=torch.full_like(child_eta_next, float(bp_parent)),
+                    eta_current=torch.full_like(child_eta_next, float(eta_parent)),
                 )
                 df.loc[child_rows.index, 'b'] = b_next.numpy()
     

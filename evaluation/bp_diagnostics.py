@@ -510,12 +510,22 @@ def _summarize_bp_branch(
     surfaces: Dict[str, np.ndarray],
     summary: Dict[str, float],
 ) -> None:
-    """Add one branch's surfaces and summary statistics (shared by every BP path)."""
+    """Add one branch's surfaces and summary statistics (shared by every BP path).
+
+    ``bp_t`` is a real control only for parents with ``eta_t = 1``. Rows with
+    ``eta_t = 0`` have a forced transition ``b_child = b_parent``, so their
+    ``bp_grid_star`` is not an economic optimum and is masked out of the star,
+    gap and regret surfaces instead of being reported as a meaningful argmax.
+    """
     shape = grid.shape
     pred = bp_pred.detach().cpu().reshape(shape).numpy().astype(np.float64)
     star = result["bp_star"].detach().cpu().reshape(shape).numpy().astype(np.float64)
     phat_values = phat.detach().cpu().reshape(shape).numpy().astype(np.float64)
     survival_mask = np.isfinite(phat_values) & (phat_values > 0.0)
+    refi_active = (
+        result["refi_active"].detach().cpu().reshape(shape).numpy().astype(np.float64)
+    )
+    refi_active_mask = refi_active > 0.5
     top2_margin = (
         result["top2_margin"].detach().cpu().reshape(shape).numpy().astype(np.float64)
     )
@@ -523,20 +533,27 @@ def _summarize_bp_branch(
         result["confidence"].detach().cpu().reshape(shape).numpy().astype(np.float64)
     )
     regret = result["regret"].detach().cpu().reshape(shape).numpy().astype(np.float64)
-    identified_mask = np.isfinite(top2_margin) & (top2_margin > float(teacher_margin_tol))
+    identified_mask = (
+        refi_active_mask
+        & np.isfinite(top2_margin)
+        & (top2_margin > float(teacher_margin_tol))
+    )
     primary_mask = survival_mask & identified_mask
     gap = np.abs(pred - star)
+    defined_star = np.where(refi_active_mask, star, np.nan)
+    survival_refi_mask = survival_mask & refi_active_mask
     surfaces[f"{label}_bp_pred_raw"] = pred
-    surfaces[f"{label}_bp_grid_star_raw"] = star
-    surfaces[f"{label}_bp_abs_gap_raw"] = gap
+    surfaces[f"{label}_bp_grid_star_raw"] = defined_star
+    surfaces[f"{label}_bp_abs_gap_raw"] = np.where(refi_active_mask, gap, np.nan)
     surfaces[f"{label}_teacher_top2_margin_raw"] = top2_margin
     surfaces[f"{label}_teacher_confidence_raw"] = confidence
     surfaces[f"{label}_teacher_identified_raw"] = identified_mask.astype(np.float64)
-    surfaces[f"{label}_bp_regret_raw"] = regret
+    surfaces[f"{label}_refi_active_raw"] = refi_active
+    surfaces[f"{label}_bp_regret_raw"] = np.where(refi_active_mask, regret, np.nan)
     surfaces[f"{label}_bp_pred_survival"] = np.where(survival_mask, pred, np.nan)
-    surfaces[f"{label}_bp_grid_star_survival"] = np.where(survival_mask, star, np.nan)
-    surfaces[f"{label}_bp_abs_gap_survival"] = np.where(survival_mask, gap, np.nan)
-    surfaces[f"{label}_bp_regret_survival"] = np.where(survival_mask, regret, np.nan)
+    surfaces[f"{label}_bp_grid_star_survival"] = np.where(survival_refi_mask, star, np.nan)
+    surfaces[f"{label}_bp_abs_gap_survival"] = np.where(survival_refi_mask, gap, np.nan)
+    surfaces[f"{label}_bp_regret_survival"] = np.where(survival_refi_mask, regret, np.nan)
     surfaces[f"{label}_bp_pred_survival_identified"] = np.where(primary_mask, pred, np.nan)
     surfaces[f"{label}_bp_grid_star_survival_identified"] = np.where(primary_mask, star, np.nan)
     surfaces[f"{label}_bp_abs_gap_survival_identified"] = np.where(primary_mask, gap, np.nan)
@@ -575,6 +592,47 @@ def _summarize_bp_branch(
     )
     summary[f"{label}_eta_next_active_share"] = float(
         result["eta_next_active_share"].detach().float().mean().item()
+    )
+    summary[f"{label}_refi_active_share"] = float(refi_active_mask.mean())
+    # Child eta_{t+1} no longer gates realized leverage, so at any candidate the
+    # conditional child leverage must agree across child eta values and equal the
+    # candidate itself. For eta_t = 0 rows the forced candidate is b_parent, which
+    # makes this the "realized b_next == b_parent" check as well.
+    coarse_argmax_flat = coarse_argmax.reshape(-1)
+    rows = torch.arange(coarse_argmax_flat.numel())
+    child_b_eta0_at_star = (
+        result["coarse_child_b_eta0_mean"][rows, coarse_argmax_flat]
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float64)
+    )
+    child_b_eta1_at_star = (
+        result["coarse_child_b_eta1_mean"][rows, coarse_argmax_flat]
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float64)
+    )
+    candidate_at_star = (
+        result["coarse_bp_grid"][rows, coarse_argmax_flat]
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float64)
+    )
+    tol = 1e-6
+    eta_consistent = (
+        np.isfinite(child_b_eta0_at_star)
+        & np.isfinite(child_b_eta1_at_star)
+        & (np.abs(child_b_eta0_at_star - child_b_eta1_at_star) <= tol)
+        & (np.abs(child_b_eta0_at_star - candidate_at_star) <= tol)
+    )
+    summary[f"{label}_child_b_eta_independent_share"] = float(eta_consistent.mean())
+    refi_active_flat = refi_active_mask.reshape(-1)
+    n_inactive = int((~refi_active_flat).sum())
+    summary[f"{label}_eta0_child_b_equals_forced_share"] = (
+        float(eta_consistent[~refi_active_flat].mean()) if n_inactive else float("nan")
     )
 
 

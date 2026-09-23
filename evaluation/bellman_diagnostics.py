@@ -42,10 +42,11 @@ def _child_states(
     bp: torch.Tensor,
 ) -> torch.Tensor:
     states = children[..., :7].clone()
+    # Realized child leverage is gated by the parent eta_t, not eta_{t+1}.
     states[..., 0:1] = apply_refinancing_policy(
         b_current=parent_states[:, 0:1].unsqueeze(1),
         bp_candidate=bp.unsqueeze(1),
-        eta_next=states[..., 2:3],
+        eta_current=parent_states[:, 2:3].unsqueeze(1),
     )
     return states
 
@@ -276,11 +277,11 @@ def build_child_continuation_audit(
             child_rows = []
             for child_index, child in enumerate(transition.children):
                 state = child[pos:pos + 1, :7].clone()
-                eta_next = state[:, 2:3].clamp(0.0, 1.0)
+                # Realized child leverage is gated by the parent eta_t.
                 state[:, 0:1] = apply_refinancing_policy(
                     b_current=parent[:, 0:1],
                     bp_candidate=torch.full_like(parent[:, 0:1], float(candidate)),
-                    eta_next=eta_next,
+                    eta_current=parent[:, 2:3].clamp(0.0, 1.0),
                 )
                 child_rows.append(state)
             states = torch.cat(child_rows, dim=0)
@@ -291,7 +292,12 @@ def build_child_continuation_audit(
             for child_index, state in enumerate(child_rows):
                 eta_next = float(state[0, 2].item())
                 child_b = float(state[0, 0].item())
-                expected_b = float(candidate) if eta_next > 0.5 else float(parent[0, 0].item())
+                # Refinancing availability is the parent eta_t, not the child eta.
+                expected_b = (
+                    float(candidate)
+                    if float(parent[0, 2].item()) > 0.5
+                    else float(parent[0, 0].item())
+                )
                 m_raw = float(transition.m_raw_list[child_index][pos].item())
                 m_used = float(transition.m_used_list[child_index][pos].item())
                 p_child = float(output["P"][child_index].item())

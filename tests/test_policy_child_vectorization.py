@@ -38,14 +38,16 @@ def _make_children(batch_size: int = 5, n_children: int = 3):
     return children
 
 
-def _reference_child_states(children, bp, b_parent):
+def _reference_child_states(children, bp, b_parent, eta_current=None):
+    if eta_current is None:
+        eta_current = torch.ones_like(b_parent)
     reference_states = []
     for child in children:
         raw = child[:, :7] if child.shape[1] > 7 else child
         b_next = apply_refinancing_policy(
             b_current=b_parent,
             bp_candidate=bp,
-            eta_next=raw[:, 2:3],
+            eta_current=eta_current,
         )
         state = torch.cat(
             [
@@ -112,7 +114,7 @@ def _reference_target_grid_chunk(teacher, parent_state, children, m_list, bp_gri
         child_b_grid = apply_refinancing_policy(
             b_current=b_parent.unsqueeze(1),
             bp_candidate=bp_grid.unsqueeze(-1),
-            eta_next=child_raw[:, 2:3].unsqueeze(1),
+            eta_current=eta_current.unsqueeze(1),
         )
         child_state[:, 0:1] = child_b_grid.reshape(-1, 1)
         out = teacher.target_model.forward_equity(child_state)
@@ -214,12 +216,14 @@ class PolicyChildVectorizationTest(unittest.TestCase):
         children = _make_children()
         bp = torch.linspace(0.1, 0.5, steps=5, dtype=torch.float64).reshape(-1, 1)
         b_parent = torch.linspace(0.2, 0.6, steps=5, dtype=torch.float64).reshape(-1, 1)
+        eta_current = torch.tensor([[0.0], [1.0], [0.0], [1.0], [1.0]], dtype=torch.float64)
         vectorized_states, eta_children = episode._build_vectorized_policy_child_states(
             children=children,
             bp=bp,
             b_parent=b_parent,
+            eta_current=eta_current,
         )
-        reference_states = _reference_child_states(children, bp, b_parent)
+        reference_states = _reference_child_states(children, bp, b_parent, eta_current)
 
         torch.testing.assert_close(vectorized_states, reference_states, rtol=0.0, atol=0.0)
         torch.testing.assert_close(
@@ -229,15 +233,24 @@ class PolicyChildVectorizationTest(unittest.TestCase):
             atol=0.0,
         )
 
-    def test_canonical_transition_uses_next_eta(self):
+    def test_canonical_transition_uses_current_eta(self):
         b_parent = torch.tensor([[0.6]], dtype=torch.float64)
         bp = torch.tensor([[0.2]], dtype=torch.float64)
 
+        # TEST A: eta_t = 0 keeps b_t, eta_t = 1 applies bp_t.
+        torch.testing.assert_close(
+            apply_refinancing_policy(
+                b_current=torch.tensor([[0.4], [0.4]], dtype=torch.float64),
+                bp_candidate=torch.tensor([[0.2], [0.9]], dtype=torch.float64),
+                eta_current=torch.tensor([[0.0], [1.0]], dtype=torch.float64),
+            ),
+            torch.tensor([[0.4], [0.9]], dtype=torch.float64),
+        )
         torch.testing.assert_close(
             apply_refinancing_policy(
                 b_current=b_parent,
                 bp_candidate=bp,
-                eta_next=torch.tensor([[0.0]], dtype=torch.float64),
+                eta_current=torch.tensor([[0.0]], dtype=torch.float64),
             ),
             b_parent,
         )
@@ -245,33 +258,43 @@ class PolicyChildVectorizationTest(unittest.TestCase):
             apply_refinancing_policy(
                 b_current=b_parent,
                 bp_candidate=bp,
-                eta_next=torch.tensor([[1.0]], dtype=torch.float64),
+                eta_current=torch.tensor([[1.0]], dtype=torch.float64),
             ),
             bp,
         )
 
+        # eta_t = 0 collapses the whole candidate row to b_parent; eta_t = 1
+        # realizes each candidate. The child eta axis must not change either.
         candidate_grid = torch.tensor([[[0.2], [0.5], [0.8]]], dtype=torch.float64)
-        eta_grid = torch.tensor([[[0.0, 1.0]]], dtype=torch.float64)
-        child_b = apply_refinancing_policy(
+        child_b_eta0 = apply_refinancing_policy(
             b_current=torch.tensor([[[0.4]]], dtype=torch.float64),
             bp_candidate=candidate_grid,
-            eta_next=eta_grid,
+            eta_current=torch.tensor([[[0.0]]], dtype=torch.float64),
+        )
+        child_b_eta1 = apply_refinancing_policy(
+            b_current=torch.tensor([[[0.4]]], dtype=torch.float64),
+            bp_candidate=candidate_grid,
+            eta_current=torch.tensor([[[1.0]]], dtype=torch.float64),
         )
         torch.testing.assert_close(
-            child_b[0],
-            torch.tensor([[0.4, 0.2], [0.4, 0.5], [0.4, 0.8]], dtype=torch.float64),
+            child_b_eta0[0],
+            torch.tensor([[0.4], [0.4], [0.4]], dtype=torch.float64),
+        )
+        torch.testing.assert_close(
+            child_b_eta1[0],
+            torch.tensor([[0.2], [0.5], [0.8]], dtype=torch.float64),
         )
 
         model = PolicyValueModel()
-        eta_next = torch.tensor([[0.0], [1.0]], dtype=torch.float64)
+        eta_current = torch.tensor([[0.0], [1.0]], dtype=torch.float64)
         b_current = torch.tensor([[0.4], [0.4]], dtype=torch.float64)
         bp_candidate = torch.tensor([[0.2], [0.8]], dtype=torch.float64)
         torch.testing.assert_close(
-            model.update_leverage(b_current, bp_candidate, eta_next),
-            apply_refinancing_policy(b_current, bp_candidate, eta_next),
+            model.update_leverage(b_current, bp_candidate, eta_current),
+            apply_refinancing_policy(b_current, bp_candidate, eta_current),
         )
 
-    def test_child_eta_controls_each_branch_when_parent_eta_is_zero(self):
+    def test_child_eta_does_not_gate_leverage_when_parent_eta_is_zero(self):
         episode = Episode.__new__(Episode)
         child0 = torch.tensor([[0.0, 0.1, 0.0, 0.2, 0.3, -1.0, 4.0, 0.9]], dtype=torch.float64)
         child1 = torch.tensor([[0.0, 0.2, 1.0, 0.4, 0.5, -1.1, 4.1, 1.1]], dtype=torch.float64)
@@ -279,9 +302,12 @@ class PolicyChildVectorizationTest(unittest.TestCase):
             children=[child0, child1],
             bp=torch.tensor([[0.4]], dtype=torch.float64),
             b_parent=torch.tensor([[0.6]], dtype=torch.float64),
+            eta_current=torch.tensor([[0.0]], dtype=torch.float64),
         )
 
-        torch.testing.assert_close(states[0, :, 0], torch.tensor([0.6, 0.4], dtype=torch.float64))
+        # Both children share b_parent because the CURRENT parent eta_t = 0.
+        torch.testing.assert_close(states[0, :, 0], torch.tensor([0.6, 0.6], dtype=torch.float64))
+        # The child eta_{t+1} shock is still carried for the expectation.
         torch.testing.assert_close(eta_next[0, :, 0], torch.tensor([0.0, 1.0], dtype=torch.float64))
 
     def test_vectorized_forward_matches_reference_loop(self):
@@ -306,6 +332,7 @@ class PolicyChildVectorizationTest(unittest.TestCase):
             children=children,
             bp=bp,
             b_parent=b_parent,
+            eta_current=torch.ones_like(b_parent),
             model=model,
             target_model=target_model,
         )
@@ -352,6 +379,7 @@ class PolicyChildVectorizationTest(unittest.TestCase):
             children=children,
             bp=bp_vectorized,
             b_parent=b_parent,
+            eta_current=torch.ones_like(b_parent),
             model=model_vectorized,
             target_model=target_model,
         )
@@ -380,6 +408,7 @@ class PolicyChildVectorizationTest(unittest.TestCase):
         children = _make_children(batch_size=4, n_children=3)
         bp_grid = torch.linspace(0.05, 0.95, steps=5, dtype=torch.float64).reshape(1, -1).expand(4, -1)
         b_parent = torch.linspace(0.10, 0.40, steps=4, dtype=torch.float64).reshape(-1, 1)
+        eta_current = torch.tensor([[0.0], [1.0], [1.0], [0.0]], dtype=torch.float64)
         model = _CountingTargetModel().to(dtype=torch.float64)
 
         p_child, bar_z_child, child_b_grid = _forward_equity_grid_children(
@@ -387,6 +416,7 @@ class PolicyChildVectorizationTest(unittest.TestCase):
             children,
             bp_grid,
             b_parent,
+            eta_current,
         )
         self.assertEqual(model.equity_calls, 1)
 
@@ -397,7 +427,7 @@ class PolicyChildVectorizationTest(unittest.TestCase):
             states[:, :, 0:1] = apply_refinancing_policy(
                 b_current=b_parent.unsqueeze(1),
                 bp_candidate=bp_grid.unsqueeze(-1),
-                eta_next=raw[:, 2:3].unsqueeze(1),
+                eta_current=eta_current.unsqueeze(1),
             )
             reference_states.append(states)
         reference_states = torch.stack(reference_states, dim=2)
@@ -526,7 +556,7 @@ class PolicyChildVectorizationTest(unittest.TestCase):
         n_children = 4
         parent_state = torch.randn(batch_size, 7, dtype=torch.float64)
         parent_state[:, 0:1] = torch.sigmoid(parent_state[:, 0:1])
-        parent_state[:, 2:3] = torch.sigmoid(parent_state[:, 2:3])
+        parent_state[:, 2:3] = 1.0
         children = _make_children(batch_size=batch_size, n_children=n_children)
         m_list = [
             torch.full((batch_size, 1), 0.92 + 0.01 * index, dtype=torch.float64)
@@ -578,7 +608,9 @@ class PolicyChildVectorizationTest(unittest.TestCase):
         ]
         base_parent = torch.randn(batch_size, 7, dtype=torch.float64)
         base_parent[:, 0:1] = torch.sigmoid(base_parent[:, 0:1])
-        base_parent[:, 2:3] = torch.sigmoid(base_parent[:, 2:3])
+        # compute_multi_j_branches shares one candidate grid, so the parent eta_t
+        # must be uniform; use the refinancing-active case.
+        base_parent[:, 2:3] = 1.0
         branch_states = []
         bp_preds = []
         for i_value in (0.15, 0.35):
@@ -692,7 +724,7 @@ class PolicyChildVectorizationTest(unittest.TestCase):
         m_list = [torch.full((batch_size, 1), 0.9, dtype=torch.float64) for _ in range(8)]
         parent = torch.randn(batch_size, 7, dtype=torch.float64)
         parent[:, 0:1] = torch.sigmoid(parent[:, 0:1])
-        parent[:, 2:3] = torch.sigmoid(parent[:, 2:3])
+        parent[:, 2:3] = 1.0
         bp_pred = torch.linspace(0.1, 0.9, batch_size, dtype=torch.float64).reshape(-1, 1)
         budgeted = small.compute(parent, children, m_list, branch="p0", bp_pred=bp_pred)
         unbudgeted = large.compute(parent, children, m_list, branch="p0", bp_pred=bp_pred)
@@ -703,7 +735,7 @@ class PolicyChildVectorizationTest(unittest.TestCase):
         for key in ("bp_star", "bp_star_grid", "value_star", "regret", "coarse_value_grid"):
             torch.testing.assert_close(budgeted[key], unbudgeted[key], rtol=1e-6, atol=1e-8)
 
-    def test_parent_eta_zero_does_not_mask_target_when_child_eta_can_refinance(self):
+    def test_parent_eta_zero_runs_no_bp_grid_and_forces_child_leverage(self):
         batch_size = 2
         parent_state = torch.tensor(
             [
@@ -738,16 +770,29 @@ class PolicyChildVectorizationTest(unittest.TestCase):
             bp_pred=torch.full((batch_size, 1), 0.9, dtype=torch.float64),
         )
 
-        assert not torch.allclose(
-            grid["continuation_grid_mean"],
-            grid["continuation_grid_mean"][:, :1].expand_as(grid["continuation_grid_mean"]),
+        # eta_t = 0 has no bp choice: no candidate comparison exists, so the
+        # grid-shaped diagnostics are NaN/sentinel and refi_active/confidence are 0.
+        torch.testing.assert_close(grid["refi_active"], torch.zeros_like(grid["refi_active"]))
+        torch.testing.assert_close(grid["confidence"], torch.zeros_like(grid["confidence"]))
+        self.assertTrue(bool(torch.isnan(grid["coarse_value_grid"]).all()))
+        self.assertTrue(bool(torch.isnan(grid["continuation_grid_mean"]).all()))
+        # child eta_{t+1} no longer gates leverage, so both conditional child
+        # leverage means collapse to the forced b_parent on every candidate slot.
+        torch.testing.assert_close(
+            grid["child_b_eta0_mean"],
+            parent_state[:, 0:1].expand_as(grid["child_b_eta0_mean"]),
         )
+        torch.testing.assert_close(
+            grid["child_b_eta1_mean"],
+            parent_state[:, 0:1].expand_as(grid["child_b_eta1_mean"]),
+        )
+        torch.testing.assert_close(grid["bp_star"], parent_state[:, 0:1])
+        # The forced Bellman value target is still a valid target.
+        self.assertTrue(bool(torch.isfinite(grid["value_star"]).all()))
         torch.testing.assert_close(
             grid["eta_next_active_share"],
             torch.full((batch_size, 1), 0.5, dtype=torch.float64),
         )
-        torch.testing.assert_close(grid["refi_active"], torch.ones_like(grid["refi_active"]))
-        assert torch.all(grid["confidence"] > 0)
 
     def test_exact_candidate_child_leverage_matrix_and_gradient(self):
         b_parent = torch.tensor([[0.4]], dtype=torch.float64)
@@ -758,30 +803,45 @@ class PolicyChildVectorizationTest(unittest.TestCase):
 
         from training.bp_grid_teacher import _expand_grid_children
 
-        _, child_b = _expand_grid_children([child0, child1], bp_grid, b_parent)
+        # Parent eta_t = 1: every candidate is realized for BOTH children, even
+        # though the two children carry different eta_{t+1} coordinates.
+        eta_current = torch.tensor([[1.0]], dtype=torch.float64)
+        child_states, child_b = _expand_grid_children(
+            [child0, child1], bp_grid, b_parent, eta_current
+        )
         torch.testing.assert_close(
             child_b[0],
-            torch.tensor([[0.4, 0.2], [0.4, 0.5], [0.4, 0.8]], dtype=torch.float64),
+            torch.tensor([[0.2, 0.2], [0.5, 0.5], [0.8, 0.8]], dtype=torch.float64),
+        )
+        torch.testing.assert_close(
+            child_states[0, :, :, 0],
+            torch.tensor([[0.2, 0.2], [0.5, 0.5], [0.8, 0.8]], dtype=torch.float64),
+        )
+        # Child eta_{t+1} is preserved untouched in the child state.
+        torch.testing.assert_close(
+            child_states[0, :, :, 2],
+            torch.tensor([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]], dtype=torch.float64),
         )
 
-        bp = torch.tensor([[0.3]], dtype=torch.float64, requires_grad=True)
-        eta_next = torch.tensor([[[0.0], [1.0]]], dtype=torch.float64)
+        bp = torch.tensor([[0.3], [0.3]], dtype=torch.float64, requires_grad=True)
+        b_parent_two = torch.tensor([[0.4], [0.4]], dtype=torch.float64)
+        eta_two = torch.tensor([[0.0], [1.0]], dtype=torch.float64)
         b_child = apply_refinancing_policy(
-            b_current=b_parent.unsqueeze(1),
-            bp_candidate=bp.unsqueeze(1),
-            eta_next=eta_next,
+            b_current=b_parent_two,
+            bp_candidate=bp,
+            eta_current=eta_two,
         )
         gradient = torch.autograd.grad(b_child.sum(), bp, retain_graph=True)[0]
-        torch.testing.assert_close(gradient, torch.ones_like(bp))
+        torch.testing.assert_close(gradient, eta_two)
         branch_grad = torch.autograd.grad(
             b_child,
             bp,
-            grad_outputs=torch.tensor([[[1.0], [0.0]]], dtype=torch.float64),
+            grad_outputs=torch.tensor([[1.0], [0.0]], dtype=torch.float64),
             retain_graph=True,
         )[0]
         torch.testing.assert_close(branch_grad, torch.zeros_like(bp))
 
-    def test_all_zero_child_eta_allows_flat_continuation(self):
+    def test_child_eta_zero_does_not_flatten_continuation_when_parent_refinances(self):
         parent = torch.tensor([[0.4, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
         child0 = parent.clone()
         child1 = parent.clone()
@@ -797,32 +857,42 @@ class PolicyChildVectorizationTest(unittest.TestCase):
         grid = teacher.compute(
             parent, [child0, child1], [torch.ones(1, 1), torch.ones(1, 1)], branch="p0"
         )
-        torch.testing.assert_close(
+        # eta_t = 1: leverage follows the candidate grid for both children, so the
+        # continuation varies along the candidate axis even though every child
+        # draws eta_{t+1} = 0.
+        assert not torch.allclose(
             grid["continuation_grid_mean"],
             grid["continuation_grid_mean"][:, :1].expand_as(grid["continuation_grid_mean"]),
         )
         assert grid["eta_next_active_share"].item() == 0.0
 
-    def test_foc_autograd_chain_contains_child_eta_once(self):
+    def test_foc_autograd_chain_uses_current_eta_once(self):
         bp = torch.tensor([[0.3]], dtype=torch.float64, requires_grad=True)
         b_parent = torch.tensor([[0.4]], dtype=torch.float64)
-        eta_children = [
-            torch.tensor([[0.0]], dtype=torch.float64),
-            torch.tensor([[1.0]], dtype=torch.float64),
-        ]
-        p_children = []
-        for eta_next in eta_children:
-            b_child = apply_refinancing_policy(b_parent, bp, eta_next)
-            p_children.append(b_child.square())
-        residuals = P0Loss().compute_foc_residual_from_bp(
-            CF0p=bp * 0.0,
-            M_list=[torch.ones_like(bp), torch.ones_like(bp)],
-            P_children=p_children,
-            bar_z_children=[torch.zeros_like(bp), torch.zeros_like(bp)],
-            bp=bp,
-        )
-        torch.testing.assert_close(residuals[0], torch.zeros_like(bp))
-        torch.testing.assert_close(residuals[1], 2.0 * bp)
+
+        def _residuals(eta_current):
+            p_children = [
+                apply_refinancing_policy(b_parent, bp, eta_current).square()
+                for _ in range(2)
+            ]
+            return P0Loss().compute_foc_residual_from_bp(
+                CF0p=bp * 0.0,
+                M_list=[torch.ones_like(bp), torch.ones_like(bp)],
+                P_children=p_children,
+                bar_z_children=[torch.zeros_like(bp), torch.zeros_like(bp)],
+                bp=bp,
+            )
+
+        # eta_t = 1: db_child/dbp = eta_current = 1 enters the chain exactly once,
+        # so the residual is 2*bp rather than 2*eta*bp or 2*eta^2*bp.
+        active = _residuals(torch.tensor([[1.0]], dtype=torch.float64))
+        torch.testing.assert_close(active[0], 2.0 * bp)
+        torch.testing.assert_close(active[1], 2.0 * bp)
+
+        # eta_t = 0: bp is not a control, so the debt-choice FOC residual vanishes.
+        inactive = _residuals(torch.tensor([[0.0]], dtype=torch.float64))
+        torch.testing.assert_close(inactive[0], torch.zeros_like(bp))
+        torch.testing.assert_close(inactive[1], torch.zeros_like(bp))
 
 
 if __name__ == "__main__":

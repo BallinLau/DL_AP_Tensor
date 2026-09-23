@@ -864,7 +864,7 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
                 "not the historical firm_target training teacher"
             ),
             "child_leverage_timing": (
-                "b_next = eta_next * bp_current + (1-eta_next) * b_current"
+                "b_next = eta_current * bp_current + (1-eta_current) * b_current"
             ),
             "current_financing_eta": "eta_current",
             "bellman_residual": (
@@ -1147,7 +1147,7 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
             for item in case_metadata
         },
         "semantics": {
-            "child_leverage_timing": "b_next = eta_next * bp_current + (1-eta_next) * b_current",
+            "child_leverage_timing": "b_next = eta_current * bp_current + (1-eta_current) * b_current",
             "current_financing_eta": "eta_current",
         },
     }

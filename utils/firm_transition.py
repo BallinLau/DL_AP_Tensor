@@ -134,17 +134,24 @@ def exact_eta_pair_expectation(values: torch.Tensor, *, zeta: float) -> torch.Te
 def apply_refinancing_policy(
     b_current: torch.Tensor,
     bp_candidate: torch.Tensor,
-    eta_next: torch.Tensor,
+    eta_current: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply the child refinancing realization to next-period leverage.
+    """Apply the current refinancing realization to next-period leverage.
 
     Timing invariant:
-        b_{t+1} = eta_{t+1} * bp_t + (1 - eta_{t+1}) * b_t
+        b_{t+1} = eta_t * bp_t + (1 - eta_t) * b_t
 
-    ``eta_next`` belongs to the child state. Current ``eta_t`` remains relevant
-    to current-period financing cash flow, but never determines child leverage.
+    ``eta_current`` is ``eta_t``, the refinancing realization that is already part
+    of the current parent state. It is the only eta that determines realized next
+    leverage:
+
+    * ``eta_t = 1``: refinancing happens, so ``b_{t+1} = bp_t``.
+    * ``eta_t = 0``: no refinancing choice exists, so ``b_{t+1} = b_t``.
+
+    ``eta_{t+1}`` remains a child state shock and is still enumerated in the
+    expectation over children, but it never gates ``b_t -> b_{t+1}``.
     """
-    eta = eta_next.to(
+    eta = eta_current.to(
         device=bp_candidate.device,
         dtype=bp_candidate.dtype,
     ).clamp(0.0, 1.0)

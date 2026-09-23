@@ -283,12 +283,15 @@ def _annotate_parent_next_leverage_rows(
     parent_state: Dict[str, torch.Tensor],
     main_child_state: Dict[str, torch.Tensor],
 ) -> None:
-    """Fill parent diagnostics from the realized main child eta draw."""
+    """Fill parent diagnostics from the current parent eta (``eta_t``).
+
+    Realized leverage depends only on the parent eta, so sibling branches that
+    differ only in the child eta ``eta_{t+1}`` share the same ``b_next``.
+    """
     if parent_rows.numel() == 0:
         return
-    alive_flat = parent_state["alive"].reshape(-1)
-    eta_next = main_child_state["eta"].reshape(-1)[alive_flat]
     columns = {name: idx for idx, name in enumerate(sim.FIRM_COLUMNS)}
+    eta_current = parent_rows[:, columns["ETA"]]
     for bp_name, out_name in (
         ("bp0", "b_next_p0"),
         ("bpI", "b_next_pi"),
@@ -297,7 +300,7 @@ def _annotate_parent_next_leverage_rows(
         parent_rows[:, columns[out_name]] = apply_refinancing_policy(
             b_current=parent_rows[:, columns["b"]],
             bp_candidate=parent_rows[:, columns[bp_name]],
-            eta_next=eta_next,
+            eta_current=eta_current,
         )
 
 
@@ -310,6 +313,15 @@ def _expand_branches_batched(sim, state: Dict[str, torch.Tensor]) -> List[Dict[s
     for _ in range(sim.branch_num):
         x_next = sample_ar1(state["x"], sim.config.RHO_X, sim.config.SIGMA_X, sim.config.XBAR)
         z_next = sample_ar1(state["z"], sim.config.RHO_Z, sim.config.SIGMA_Z, sim.config.ZBAR)
+
+        # Realize b_{t+1} from the current parent eta (eta_t). The child
+        # eta_{t+1} is drawn below and never gates b_t -> b_{t+1}.
+        b_next = apply_refinancing_policy(
+            b_current=b_prev,
+            bp_candidate=bp_prev,
+            eta_current=state["eta"],
+        )
+
         eta_next = sample_bernoulli(state["eta"].numel(), sim.config.ZETA, device).view_as(state["eta"])
         i_next = sample_uniform(state["i"].numel(), 0.0, sim.config.I_THRESHOLD, device).view_as(state["i"])
 
@@ -337,11 +349,6 @@ def _expand_branches_batched(sim, state: Dict[str, torch.Tensor]) -> List[Dict[s
             M_out = state["M"].clone()
 
         active2d = alive_any.unsqueeze(1)
-        b_next = apply_refinancing_policy(
-            b_current=b_prev,
-            bp_candidate=bp_prev,
-            eta_next=eta_next,
-        )
         branches.append(
             {
                 "x": torch.where(alive_any, x_next, state["x"]),

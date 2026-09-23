@@ -520,6 +520,55 @@ def test_policy_value_model_spec_round_trip_covers_all_head_dims():
         assert key in spec
 
 
+def test_policy_value_checkpoint_schema_stays_shape_compatible():
+    """TEST I: the refinancing-timing change adds no parameters or shapes."""
+    spec_kwargs = dict(
+        share_hidden_dims=[7],
+        share_output_dim=9,
+        q_head_dims=[5],
+        p0_head_dims=[6],
+        pi_head_dims=[4],
+        bp0_head_dims=[3],
+        bpi_head_dims=[2],
+        barz_hidden_dims=[8, 4],
+        bari_hidden_dims=[5, 3],
+    )
+    model = PolicyValueModel(**spec_kwargs)
+    state = model.state_dict()
+    # Effective-bp exports are computed, not learned: they must never leak into
+    # the checkpoint schema, so a pre-change checkpoint still loads exactly.
+    assert not any("effective" in key for key in state)
+
+    rebuilt = PolicyValueModel(**spec_kwargs)
+    rebuilt.load_state_dict(state, strict=True)
+    rebuilt_state = rebuilt.state_dict()
+    assert set(rebuilt_state) == set(state)
+    for key, value in state.items():
+        assert rebuilt_state[key].shape == value.shape
+
+
+def test_effective_bp_collapses_to_current_leverage_when_eta_current_zero():
+    torch.manual_seed(3)
+    model = PolicyValueModel(share_hidden_dims=[8], share_output_dim=8)
+    states = _states()
+    out = model(states)
+
+    b = states[:, SIMMODEL.B:SIMMODEL.B + 1]
+    eta = states[:, SIMMODEL.ETA:SIMMODEL.ETA + 1]
+    active = (eta > 0.5).reshape(-1)
+    inactive = ~active
+    assert bool(active.any()) and bool(inactive.any())
+
+    # eta_t = 1 keeps the conditional network policy.
+    torch.testing.assert_close(out.bp0_effective[active], out.bp0[active])
+    torch.testing.assert_close(out.bpI_effective[active], out.bpI[active])
+    torch.testing.assert_close(out.bp_effective[active], out.bp[active])
+    # eta_t = 0 has no refinancing choice, so the effective bp collapses to b_t.
+    torch.testing.assert_close(out.bp0_effective[inactive], b[inactive])
+    torch.testing.assert_close(out.bpI_effective[inactive], b[inactive])
+    torch.testing.assert_close(out.bp_effective[inactive], b[inactive])
+
+
 def _hash_state(state):
     import hashlib
 

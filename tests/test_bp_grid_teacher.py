@@ -49,6 +49,15 @@ class RecordingTarget(ParabolicTarget):
         return super().forward_equity(firm_state)
 
 
+class CountingEquityTarget(ParabolicTarget):
+    def __init__(self):
+        self.equity_rows = 0
+
+    def forward_equity(self, firm_state):
+        self.equity_rows += int(firm_state.shape[0])
+        return super().forward_equity(firm_state)
+
+
 class HighLeverageTarget(ParabolicTarget):
     def forward_equity(self, firm_state):
         b = firm_state[:, 0:1].clamp(0.0, 1.0)
@@ -123,10 +132,14 @@ def test_grid_teacher_debt_state_semantics():
     expected_issue_b = torch.tensor([0.0, 0.5, 1.0])
     assert torch.allclose(issue_b, expected_issue_b, atol=1e-6)
 
+    # Parent eta_t = 1: the candidate is realized for the child, and the child
+    # eta_{t+1} = 0.25 coordinate does not change that.
     child_b = target.equity_b[0].reshape(-1)
-    expected_child_b = torch.tensor([0.15, 0.275, 0.40])
+    expected_child_b = torch.tensor([0.0, 0.5, 1.0])
     assert torch.allclose(child_b, expected_child_b, atol=1e-6)
 
+    # Parent eta_t = 0: no refinancing choice, so leverage stays at b_parent and
+    # no candidate grid is evaluated at all.
     inactive_target = RecordingTarget()
     inactive_teacher = BPGridTeacher(
         inactive_target,
@@ -141,14 +154,16 @@ def test_grid_teacher_debt_state_semantics():
     inactive_parent[:, 2:3] = 0.0
     inactive_child = child.clone()
     inactive_child[:, 2:3] = 1.0
-    inactive_teacher.compute(inactive_parent, [inactive_child], [torch.ones(1, 1)], branch="p0")
-    inactive_issue_b = [x.reshape(-1) for x in inactive_target.q_b if x.numel() == 3][0]
+    inactive_out = inactive_teacher.compute(
+        inactive_parent, [inactive_child], [torch.ones(1, 1)], branch="p0"
+    )
     inactive_child_b = inactive_target.equity_b[0].reshape(-1)
-    assert torch.allclose(inactive_issue_b, expected_issue_b, atol=1e-6)
-    assert torch.allclose(inactive_child_b, expected_issue_b, atol=1e-6)
+    assert torch.allclose(inactive_child_b, torch.full((1,), 0.2), atol=1e-6)
+    assert inactive_out["refi_active"].item() == 0.0
 
 
-def test_parent_eta_zero_keeps_cashflow_flat_but_child_continuation_moves():
+def test_parent_eta_zero_skips_bp_grid_and_keeps_forced_value_target():
+    """TEST B: eta_t = 0 parents get a forced Bellman target and no bp argmax."""
     target = RecordingTarget()
     teacher = BPGridTeacher(
         target,
@@ -172,27 +187,87 @@ def test_parent_eta_zero_keeps_cashflow_flat_but_child_continuation_moves():
         branch="p0",
     )
 
-    torch.testing.assert_close(
-        out["cashflow_grid_mean"],
-        out["cashflow_grid_mean"][:, :1].expand_as(out["cashflow_grid_mean"]),
-    )
-    assert not torch.allclose(
-        out["continuation_grid_mean"],
-        out["continuation_grid_mean"][:, :1].expand_as(out["continuation_grid_mean"]),
-    )
-    torch.testing.assert_close(
-        out["coarse_child_b_eta0_mean"],
-        torch.full((1, 3), 0.4),
-    )
-    torch.testing.assert_close(
-        out["coarse_child_b_eta1_mean"],
-        torch.tensor([[0.0, 0.5, 1.0]]),
-    )
+    # No candidate comparison exists, so refi_active/confidence are 0 and the
+    # grid-only surfaces are NaN/sentinel instead of a fake optimum.
+    assert out["refi_active"].item() == 0.0
+    assert out["confidence"].item() == 0.0
+    assert torch.isnan(out["coarse_value_grid"]).all()
+    assert torch.isnan(out["value_grid"]).all()
+    # bp_star falls back to b_parent purely for tensor compatibility.
+    torch.testing.assert_close(out["bp_star"], parent[:, 0:1])
+    torch.testing.assert_close(out["bp_star_grid"], parent[:, 0:1])
+    # Both child eta_{t+1} coordinates realize the same forced leverage.
+    torch.testing.assert_close(out["coarse_child_b_eta0_mean"], torch.full((1, 3), 0.4))
+    torch.testing.assert_close(out["coarse_child_b_eta1_mean"], torch.full((1, 3), 0.4))
     assert out["eta_next_active_share"].item() == 0.5
-    assert not torch.allclose(out["bp_star"], parent[:, 0:1])
+
+    # Exactly one forced candidate forward is issued: no coarse/fine grid work.
+    assert len(target.equity_b) == 1
+    assert torch.allclose(target.equity_b[0].reshape(-1), torch.full((2,), 0.4), atol=1e-6)
+
+    # value_star is still the exact forced Bellman value at b_child = b_parent.
+    loss_fn = P0Loss()
+    cf0 = loss_fn.compute_cashflow_p0(
+        torch.tensor([[0.0]]),
+        torch.tensor([[0.0]]),
+        torch.tensor([[0.4]]),
+        torch.zeros(1, 1),
+        torch.zeros(1, 1),
+        torch.tensor([[0.0]]),
+    )
+    p_child = 1.0 - (0.4 - 0.32) ** 2
+    torch.testing.assert_close(
+        out["value_star"], cf0 + p_child, rtol=1e-5, atol=1e-6
+    )
 
 
-def test_grid_teacher_uses_exact_eta_weights_and_preserves_conditional_child_b():
+def test_mixed_batch_only_grids_active_rows_and_preserves_order():
+    """TEST E: the bp grid runs only for eta_t = 1 rows, in original row order."""
+    target = CountingEquityTarget()
+    teacher = BPGridTeacher(
+        target,
+        P0Loss(),
+        PILoss(),
+        coarse_size=5,
+        refine=False,
+        candidate_chunk_size=0,
+        margin_scale=1e-4,
+    )
+    parent = torch.tensor(
+        [
+            [0.2, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.6, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    child0 = parent.clone()
+    child1 = parent.clone()
+    child0[:, 2] = 0.0
+    child1[:, 2] = 1.0
+
+    out = teacher.compute(
+        parent,
+        [child0, child1],
+        [torch.ones(3, 1), torch.ones(3, 1)],
+        branch="p0",
+    )
+
+    # Two eta_t = 1 rows run 5 candidates x 2 children; the eta_t = 0 row gets a
+    # single forced candidate x 2 children.
+    assert target.equity_rows == 2 * 5 * 2 + 1 * 2
+    # Row order is preserved: the eta_t = 0 row keeps its sentinels in place.
+    assert out["refi_active"].reshape(-1).tolist() == [1.0, 0.0, 1.0]
+    assert torch.isfinite(out["coarse_value_grid"][0]).all()
+    assert torch.isnan(out["coarse_value_grid"][1]).all()
+    assert torch.isfinite(out["coarse_value_grid"][2]).all()
+    assert out["confidence"][1].item() == 0.0
+    assert torch.all(out["confidence"][[0, 2]] > 0)
+    torch.testing.assert_close(out["bp_star"][1], parent[1, 0:1])
+
+
+
+def test_grid_teacher_uses_exact_eta_weights_but_child_eta_does_not_gate_leverage():
     target = HighLeverageTarget()
     teacher = BPGridTeacher(
         target,
@@ -232,12 +307,13 @@ def test_grid_teacher_uses_exact_eta_weights_and_preserves_conditional_child_b()
     )
 
     bp_grid = weighted["coarse_bp_grid"]
-    expected_child_b = (1.0 - zeta) * parent[:, 0:1] + zeta * bp_grid
-    torch.testing.assert_close(weighted["coarse_child_b_mean"], expected_child_b)
-    torch.testing.assert_close(
-        weighted["coarse_child_b_eta0_mean"], torch.full_like(bp_grid, 0.4)
-    )
+    # TEST C: parent eta_t = 1 realizes the candidate for BOTH child eta_{t+1}
+    # coordinates, so the overall and both conditional child leverage means equal
+    # the candidate leverage.
+    torch.testing.assert_close(weighted["coarse_child_b_mean"], bp_grid)
+    torch.testing.assert_close(weighted["coarse_child_b_eta0_mean"], bp_grid)
     torch.testing.assert_close(weighted["coarse_child_b_eta1_mean"], bp_grid)
+    # Child eta_{t+1} still carries its own Bernoulli weight in the expectation.
     torch.testing.assert_close(
         weighted["eta_next_active_share"],
         torch.full_like(weighted["eta_next_active_share"], zeta),
@@ -416,13 +492,21 @@ def test_candidate_chunk_zero_matches_chunked_grid_outputs():
         "coarse_cashflow_grid_mean",
         "coarse_continuation_grid_mean",
     ]:
-        torch.testing.assert_close(out_chunked[key], out_full[key], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            out_chunked[key], out_full[key], rtol=1e-5, atol=1e-6, equal_nan=True
+        )
     assert torch.equal(out_chunked["argmax_index"], out_full["argmax_index"])
+    # The eta_t = 0 row keeps its forced sentinels in both variants.
+    assert torch.isnan(out_chunked["value_grid"][1]).all()
+    assert out_chunked["refi_active"].reshape(-1).tolist() == [1.0, 0.0, 1.0]
 
 
 if __name__ == "__main__":
     test_bp_grid_teacher_selects_value_maximizing_bp()
     test_grid_teacher_debt_state_semantics()
+    test_parent_eta_zero_skips_bp_grid_and_keeps_forced_value_target()
+    test_mixed_batch_only_grids_active_rows_and_preserves_order()
+    test_grid_teacher_uses_exact_eta_weights_but_child_eta_does_not_gate_leverage()
     test_grid_teacher_mix_branch_and_coarse_confidence()
     test_pi_grid_target_multi_child_boundary_and_refine()
     test_relative_confidence_scales_margin_by_config_threshold()

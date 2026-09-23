@@ -327,14 +327,13 @@ def _bellman_loss_and_metrics(
         p_children_pi = []
         with torch.no_grad():
             for child in children:
-                eta_next = child[:, SIMMODEL.ETA:SIMMODEL.ETA + 1].clamp(0.0, 1.0)
                 child_p0 = child.clone()
                 child_p0[:, SIMMODEL.B:SIMMODEL.B + 1] = apply_refinancing_policy(
-                    b_parent, bp0, eta_next
+                    b_parent, bp0, eta_current
                 )
                 child_pi = child.clone()
                 child_pi[:, SIMMODEL.B:SIMMODEL.B + 1] = apply_refinancing_policy(
-                    b_parent, bpI, eta_next
+                    b_parent, bpI, eta_current
                 )
                 p_children_p0.append(target(child_p0).P.detach())
                 p_children_pi.append(target(child_pi).P.detach())
