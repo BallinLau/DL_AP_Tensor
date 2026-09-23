@@ -16,8 +16,11 @@ from evaluation.bp_diagnostics import (
     FrozenTransitionData,
     _shock_bank_hash,
     build_frozen_transition_data,
+    evaluate_bp_consistency,
+    evaluate_bp_consistency_multi_j,
     slice_frozen_transition_data,
 )
+from config import HyperParams
 from evaluation.full_run_diagnostics import (
     build_config_invariant_snapshot,
     compare_config_invariant_snapshots,
@@ -680,6 +683,75 @@ def test_canonical_bank_max_children_spans_primary_and_robustness():
     assert canonical_bank_max_children(2, []) == 2
 
 
+def test_transition_metadata_separates_canonical_bank_from_evaluated_prefix():
+    """The transition bank max J and the evaluated J prefix must stay distinct."""
+    reference = _reference()
+    grid = build_frozen_grid(
+        reference, b_min=0.2, b_max=0.4, b_points=2,
+        z_min=-0.4, z_max=0.4, z_points=2, device=torch.device("cpu"),
+    )
+    hyperparams = HyperParams()
+    economic = AnalysisEconomicConfig.from_current_config()
+    transition_max = build_frozen_transition_data(
+        StableSDF(), grid.base_states, reference, hyperparams, economic,
+        n_child_shocks=8, shock_seed=12345, shock_bank_max_child_shocks=8,
+    )
+    assert transition_max.metadata["shock_bank_max_child_shocks"] == 8
+    assert transition_max.metadata["source_max_J"] == 8
+
+    # A canonical bank of 8 with only the J=2 prefix evaluated.
+    sliced = slice_frozen_transition_data(transition_max, n_continuous_children=2)
+    assert sliced.metadata["source_max_J"] == 8
+    assert sliced.metadata["requested_J"] == 2
+    assert sliced.metadata["shock_bank_max_child_shocks"] == 8
+    assert sliced.metadata["nested_prefix_from_max_J"] is True
+    assert sliced.metadata["max_bank_sha256"] == transition_max.metadata["shock_bank_sha256"]
+
+    # The prefix hash must be the hash of the requested prefix, not of the full bank.
+    prefix_bank = ConvergenceShockBank(
+        eps_x=transition_max.continuous_shock_bank.eps_x[:, :2],
+        eps_z=transition_max.continuous_shock_bank.eps_z[:, :2],
+        u_eta=transition_max.continuous_shock_bank.u_eta[:, :2],
+        u_i=transition_max.continuous_shock_bank.u_i[:, :2],
+        seed=transition_max.continuous_shock_bank.seed,
+    )
+    assert sliced.metadata["prefix_sha256"] == _shock_bank_hash(prefix_bank)
+    assert sliced.metadata["prefix_sha256"] != sliced.metadata["max_bank_sha256"]
+
+
+def test_transition_children_depend_on_the_canonical_bank_not_the_evaluated_j():
+    """Shrinking the bank to the episode's own max J silently breaks cross-episode CRN."""
+    reference = _reference()
+    grid = build_frozen_grid(
+        reference, b_min=0.2, b_max=0.4, b_points=2,
+        z_min=-0.4, z_max=0.4, z_points=2, device=torch.device("cpu"),
+    )
+    hyperparams = HyperParams()
+    economic = AnalysisEconomicConfig.from_current_config()
+
+    def build(bank_max: int):
+        transition = build_frozen_transition_data(
+            StableSDF(), grid.base_states, reference, hyperparams, economic,
+            n_child_shocks=4, shock_seed=12345, shock_bank_max_child_shocks=bank_max,
+        )
+        return slice_frozen_transition_data(transition, n_continuous_children=4)
+
+    canonical_a = build(8)
+    canonical_b = build(8)
+    shrunken = build(4)
+    torch.testing.assert_close(
+        canonical_a.stacked_children(), canonical_b.stacked_children(), rtol=0, atol=0
+    )
+    assert canonical_a.metadata["prefix_sha256"] == canonical_b.metadata["prefix_sha256"]
+    assert canonical_a.metadata["source_max_J"] == 8
+    # The per-episode bank is *not* equivalent: the four shock tensors are drawn
+    # sequentially from one generator, so a smaller bank shifts every tensor
+    # after the first.
+    assert shrunken.metadata["source_max_J"] == 4
+    assert shrunken.metadata["prefix_sha256"] != canonical_a.metadata["prefix_sha256"]
+    assert not torch.equal(shrunken.stacked_children(), canonical_a.stacked_children())
+
+
 def test_cross_episode_crn_requires_one_canonical_shock_bank():
     """A J=64 episode must draw the same shocks as a J=128 representative episode."""
     parents = torch.tensor([
@@ -815,3 +887,202 @@ def test_component_isolation_keeps_firm_and_sdf_when_fc1_raises(tmp_path, monkey
     assert episode_meta["component_status"]["fc1"] == "error"
     assert episode_meta["component_status"]["firm_structural"] == "ok"
     assert not (output / "episodes" / "ep1" / "fc2").exists()
+
+
+class _BpToySDF(torch.nn.Module):
+    """Deterministic SDF stub whose child draws depend on the parent state."""
+
+    def forward_step(self, x_prev, x_curr, hatcf_prev, lnkf_prev, return_physical=True):
+        batch, children, _ = x_curr.shape
+        w_parent = 10.0 + x_prev
+        w_children = 10.0 + x_curr
+        m = 0.95 + 0.02 * torch.tanh(x_curr)
+        hatc = hatcf_prev.unsqueeze(1).expand(batch, children, 1) + x_curr
+        lnk = lnkf_prev.unsqueeze(1).expand(batch, children, 1) + 0.5 * x_curr
+        return w_parent, w_children, m, hatc, lnk
+
+
+class _BpToyPolicy(torch.nn.Module):
+    """Toy policy/value model: every branch sees a different ``i`` column."""
+
+    def forward(self, states):
+        b = states[:, 0:1]
+        z = states[:, 1:2]
+        i = states[:, 3:4]
+        phat = torch.sigmoid(1.5 * b - 0.5 * z + 0.8 * i)
+        bp0 = (0.30 + 0.15 * b + 0.10 * i).clamp(0.02, 0.95)
+        bp_i = (0.65 + 0.10 * b - 0.08 * i).clamp(0.02, 0.95)
+        return SimpleNamespace(Phat=phat, bp0=bp0, bpI=bp_i)
+
+    def _q_output(self, state):
+        return (
+            0.70
+            + 0.05 * state[:, 0:1]
+            + 0.60 * state[:, 3:4]
+            + 0.02 * state[:, 4:5]
+        )
+
+    def forward_equity(self, state):
+        b = state[:, 0:1]
+        z = state[:, 1:2]
+        i = state[:, 3:4]
+        p = 1.20 + (0.8 + 4.0 * i) * b - 12.0 * b * b - 0.15 * z
+        bar_z = torch.sigmoid(0.40 * z - 0.30 * b + 3.0 * (i - 0.2))
+        return {"P": p, "bar_z": bar_z, "Q": self._q_output(state)}
+
+
+BP_PARITY_J_VALUES = (2, 4, 8)
+
+
+def _bp_parity_setup():
+    reference = ReferenceFirmState(
+        eta=1.0, i_low=0.1, i_mid=0.2, i_high=0.3, x=-2.0,
+        hatcf=-2.1, lnkf=4.0, hatc_cal=-2.0, lnk_cal=4.1,
+        n_parent_rows=2, source="fixture", macro_source="fixture",
+    )
+    grid = build_frozen_grid(
+        reference, b_min=0.2, b_max=0.6, b_points=3,
+        z_min=-0.4, z_max=0.4, z_points=3, device=torch.device("cpu"),
+    )
+    hyperparams = HyperParams()
+    hyperparams.pv_use_clipped_m = True
+    hyperparams.pv_m_clamp_min = 0.7
+    hyperparams.pv_m_clamp_max = 1.3
+    economic = AnalysisEconomicConfig.from_current_config()
+    transition_max = build_frozen_transition_data(
+        _BpToySDF(), grid.base_states, reference, hyperparams, economic,
+        n_child_shocks=max(BP_PARITY_J_VALUES), shock_seed=12345,
+    )
+    return reference, grid, hyperparams, economic, transition_max
+
+
+def _legacy_bp_by_j(tmp_path):
+    reference, grid, hyperparams, economic, transition_max = _bp_parity_setup()
+    legacy = {}
+    for j_value in BP_PARITY_J_VALUES:
+        sliced = slice_frozen_transition_data(
+            transition_max, n_continuous_children=int(j_value)
+        )
+        surfaces, summary, _ = evaluate_bp_consistency(
+            _BpToyPolicy(), _BpToySDF(), grid, reference, hyperparams, economic,
+            output_dir=tmp_path / f"legacy_j{j_value}",
+            n_child_shocks=int(j_value),
+            shock_seed=12345,
+            transition_data=sliced,
+            write_objective_slices=False,
+        )
+        legacy[int(j_value)] = (surfaces, summary)
+    return legacy, (reference, grid, hyperparams, economic, transition_max)
+
+
+def _optimized_bp_by_j(tmp_path, setup):
+    reference, grid, hyperparams, economic, transition_max = setup
+    results_by_j, forward_stats = evaluate_bp_consistency_multi_j(
+        _BpToyPolicy(), _BpToySDF(), grid, reference, hyperparams, economic,
+        output_dir=tmp_path / "optimized",
+        j_values=list(BP_PARITY_J_VALUES),
+        primary_j=4,
+        transition_max=transition_max,
+        shock_seed=12345,
+        write_objective_slices=False,
+    )
+    return results_by_j, forward_stats
+
+
+def test_multi_j_bp_evaluator_matches_legacy_per_j_evaluator(tmp_path):
+    """End-to-end parity: the shared multi-J pass must equal per-J legacy runs."""
+    legacy, setup = _legacy_bp_by_j(tmp_path)
+    results_by_j, forward_stats = _optimized_bp_by_j(tmp_path, setup)
+    assert set(results_by_j) == set(BP_PARITY_J_VALUES)
+
+    compared_surfaces = 0
+    compared_summaries = 0
+    for j_value, (legacy_surfaces, legacy_summary) in legacy.items():
+        optimized = results_by_j[j_value]
+        for key, expected in legacy_surfaces.items():
+            assert key in optimized["surfaces"], f"missing surface {key} at J={j_value}"
+            np.testing.assert_allclose(
+                optimized["surfaces"][key], expected, rtol=1e-5, atol=1e-6, equal_nan=True
+            )
+            compared_surfaces += 1
+        for key, expected in legacy_summary.items():
+            assert key in optimized["summary"], f"missing summary {key} at J={j_value}"
+            actual = optimized["summary"][key]
+            if isinstance(expected, float) and np.isnan(expected):
+                assert np.isnan(actual)
+            else:
+                assert actual == pytest.approx(expected, rel=1e-5, abs=1e-6)
+            compared_summaries += 1
+    assert compared_surfaces > 0 and compared_summaries > 0
+    assert forward_stats["bp_multi_j_reuse_enabled"] is True
+    assert forward_stats["bp_branch_reuse_enabled"] is True
+
+
+def test_multi_j_bp_evaluator_does_not_alias_branches(tmp_path):
+    """Regression: every branch must read its own bundle, never a shared one.
+
+    ``bp_regret``/``teacher_confidence``/``top2_margin`` are derived from the
+    branch's own value grid, so if the J index leaked into the branch axis they
+    would become identical across ``p0``/``pi_low``/``pi_mid``/``pi_high``.
+    """
+    legacy, setup = _legacy_bp_by_j(tmp_path)
+    results_by_j, _ = _optimized_bp_by_j(tmp_path, setup)
+    labels = ("p0", "pi_low", "pi_mid", "pi_high")
+    branch_pairs = tuple(zip(labels, labels[1:]))
+    for j_value in BP_PARITY_J_VALUES:
+        optimized = results_by_j[j_value]
+        surfaces = optimized["surfaces"]
+        summary = optimized["summary"]
+        for left, right in branch_pairs:
+            for surface in (
+                "bp_regret_raw",
+                "teacher_confidence_raw",
+                "teacher_top2_margin_raw",
+            ):
+                assert not np.allclose(
+                    surfaces[f"{left}_{surface}"],
+                    surfaces[f"{right}_{surface}"],
+                    equal_nan=True,
+                ), f"{left} aliased {right} on {surface} at J={j_value}"
+            assert summary[f"{left}_regret_mean"] != pytest.approx(
+                summary[f"{right}_regret_mean"], rel=1e-6, abs=1e-12
+            ), f"{left} aliased {right} on regret_mean at J={j_value}"
+        # The legacy reference must show the same branch separation, so the toy
+        # problem itself cannot be degenerate.
+        legacy_surfaces = legacy[j_value][0]
+        for left, right in branch_pairs:
+            assert not np.allclose(
+                legacy_surfaces[f"{left}_bp_regret_raw"],
+                legacy_surfaces[f"{right}_bp_regret_raw"],
+                equal_nan=True,
+            )
+
+
+def test_multi_j_bp_evaluator_rejects_malformed_branch_bundles(tmp_path, monkeypatch):
+    """A branch-axis/J-axis mix-up must fail loudly instead of silently aliasing."""
+    _legacy_bp_by_j(tmp_path)
+    reference, grid, hyperparams, economic, transition_max = _bp_parity_setup()
+    import evaluation.bp_diagnostics as bp_module
+
+    original = bp_module.BPGridTeacher.compute_multi_j_branches
+
+    def collapsed(self, parent_states, children, m_list, **kwargs):
+        bundles = original(self, parent_states, children, m_list, **kwargs)
+        # Simulate the historical bug: every branch shares branch 0's bundle and
+        # loses the higher prefix counts.
+        smallest = min(bundles[0])
+        return [{smallest: bundle[smallest]} for bundle in bundles]
+
+    monkeypatch.setattr(
+        bp_module.BPGridTeacher, "compute_multi_j_branches", collapsed
+    )
+    with pytest.raises(RuntimeError, match="exposes"):
+        evaluate_bp_consistency_multi_j(
+            _BpToyPolicy(), _BpToySDF(), grid, reference, hyperparams, economic,
+            output_dir=tmp_path / "aliased",
+            j_values=[2, 4],
+            primary_j=4,
+            transition_max=transition_max,
+            shock_seed=12345,
+            write_objective_slices=False,
+        )

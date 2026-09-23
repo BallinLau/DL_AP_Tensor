@@ -852,6 +852,21 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
     j_values = sorted(set(int(value) for value in j_values))
     if any(value < 2 for value in j_values):
         raise ValueError("All robustness child-shock counts must be at least 2")
+    # The canonical shock bank is the single bank every episode draws from, so it
+    # must be at least as large as the largest evaluated J. ``max(j_values)`` is
+    # only a fallback: the full-run driver passes an explicit canonical value that
+    # can exceed the largest evaluated J (canonical 128, evaluated 64).
+    canonical_max_child_shocks = (
+        int(args.shock_bank_max_child_shocks)
+        if getattr(args, "shock_bank_max_child_shocks", None) is not None
+        else max(j_values)
+    )
+    if canonical_max_child_shocks < max(j_values):
+        raise ValueError(
+            "shock_bank_max_child_shocks "
+            f"({canonical_max_child_shocks}) must cover the largest evaluated J "
+            f"({max(j_values)})"
+        )
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     manage_cuda_peak_stats = bool(getattr(args, "manage_cuda_peak_stats", True))
@@ -876,7 +891,7 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
     for loaded_model in loaded.models.values():
         loaded_model.eval()
     evaluation_cache: Dict[str, object] = {
-        "max_child_shocks": max(j_values),
+        "max_child_shocks": canonical_max_child_shocks,
         "loaded": loaded,
     }
     defer_hash_to_outer = bool(getattr(args, "defer_model_state_hash_to_outer", False))
@@ -919,7 +934,7 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
             )
             case_args.eta_values = None
             case_args.robustness_child_shocks = None
-            case_args.shock_bank_max_child_shocks = max(j_values)
+            case_args.shock_bank_max_child_shocks = canonical_max_child_shocks
             case_args._evaluation_cache = evaluation_cache
             case_args.loaded_checkpoint = loaded
             case_args.defer_model_state_hash = True
@@ -1018,7 +1033,10 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
         "shock_seed": int(args.shock_seed),
         "common_random_numbers": True,
         "common_random_numbers_scope": "within_each_eta_grid_and_nested_prefix_across_J",
-        "shock_bank_max_child_shocks": max(j_values),
+        "shock_bank_max_child_shocks": canonical_max_child_shocks,
+        "canonical_shock_bank_max_child_shocks": canonical_max_child_shocks,
+        "max_evaluated_child_shocks": max(j_values),
+        "evaluated_child_shocks": j_values,
         "nested_shock_prefix_across_J": True,
         "formal_evaluator_eta_integration_mode": "exact",
         "formal_eta_integration_independent_of_training_ablation": True,

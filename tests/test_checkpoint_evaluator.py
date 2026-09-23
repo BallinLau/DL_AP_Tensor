@@ -983,3 +983,109 @@ def test_matrix_loads_once_hashes_only_at_boundary_and_uses_primary_metadata(
     assert metadata["model_state_unchanged"] is True
     assert metadata["timing"]["checkpoint_load_count"] == 1
     assert len(metadata["case_metadata_by_eta_j"]) == 6
+
+
+def _matrix_metadata_args(tmp_path, **overrides):
+    args = SimpleNamespace(
+        output_dir=tmp_path / "matrix",
+        eta_values=[1.0],
+        eta=1.0,
+        n_child_shocks=64,
+        robustness_child_shocks=None,
+        shock_bank_max_child_shocks=None,
+        device="cpu",
+        checkpoint=tmp_path / "checkpoint.pt",
+        pv_ckpt=None,
+        sdf_ckpt=None,
+        hyperparams_json=None,
+        config_json=None,
+        model_spec_json=None,
+        allow_default_hyperparams=False,
+        allow_current_config=False,
+        bp_teacher_margin_tol=1e-8,
+        summary_only_all=True,
+        shock_seed=12345,
+        robustness_scope="representative",
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _install_fake_matrix(monkeypatch):
+    loaded = SimpleNamespace(
+        models={
+            "policy_value": torch.nn.Linear(1, 1),
+            "sdf_fc1": torch.nn.Linear(1, 1),
+        },
+        metadata={"loaded_model_keys": ["policy_value", "sdf_fc1"]},
+    )
+    monkeypatch.setattr(evaluator_module, "load_analysis_checkpoint", lambda *a, **k: loaded)
+    monkeypatch.setattr(evaluator_module, "_state_hash", lambda model: f"hash-{id(model)}")
+
+    def fake_evaluate(case_args):
+        case_args.output_dir.mkdir(parents=True, exist_ok=True)
+        return pd.DataFrame([{
+            "eta_parent": case_args.eta,
+            "n_child_shocks": case_args.n_child_shocks,
+        }]), {
+            "training_eta_integration_mode": "exact",
+            "reference_transition_bank": {
+                "shock_bank_max_child_shocks": int(case_args.shock_bank_max_child_shocks),
+                "requested_J": int(case_args.n_child_shocks),
+            },
+            "timing": {"bp_seconds": 0.1},
+        }
+
+    monkeypatch.setattr(evaluator_module, "evaluate", fake_evaluate)
+
+
+def test_matrix_metadata_separates_canonical_and_evaluated_child_shocks(tmp_path, monkeypatch):
+    """Canonical bank max must not be confused with the largest evaluated J."""
+    _install_fake_matrix(monkeypatch)
+
+    # Case A: normal episode, canonical 128 but only J=64 evaluated.
+    args = _matrix_metadata_args(
+        tmp_path / "case_a", robustness_child_shocks=None, shock_bank_max_child_shocks=128,
+    )
+    _, metadata = evaluator_module.evaluate_matrix(args)
+    assert metadata["canonical_shock_bank_max_child_shocks"] == 128
+    assert metadata["max_evaluated_child_shocks"] == 64
+    assert metadata["evaluated_child_shocks"] == [64]
+    assert metadata["shock_bank_max_child_shocks"] == 128
+    assert metadata["robustness_n_child_shocks"] == [64]
+    case_metadata = next(iter(metadata["case_metadata_by_eta_j"].values()))
+    assert case_metadata["reference_transition_bank"]["shock_bank_max_child_shocks"] == 128
+
+    # Case B: representative episode, canonical 128 with J=32/64/128 evaluated.
+    args = _matrix_metadata_args(
+        tmp_path / "case_b",
+        robustness_child_shocks=[32, 64, 128],
+        shock_bank_max_child_shocks=128,
+    )
+    _, metadata = evaluator_module.evaluate_matrix(args)
+    assert metadata["canonical_shock_bank_max_child_shocks"] == 128
+    assert metadata["max_evaluated_child_shocks"] == 128
+    assert metadata["evaluated_child_shocks"] == [32, 64, 128]
+    assert metadata["shock_bank_max_child_shocks"] == 128
+
+    # Fallback: no explicit canonical value means the largest evaluated J.
+    args = _matrix_metadata_args(
+        tmp_path / "case_c",
+        robustness_child_shocks=[32, 64, 128],
+        shock_bank_max_child_shocks=None,
+    )
+    _, metadata = evaluator_module.evaluate_matrix(args)
+    assert metadata["canonical_shock_bank_max_child_shocks"] == 128
+    assert metadata["max_evaluated_child_shocks"] == 128
+
+
+def test_matrix_rejects_canonical_bank_smaller_than_largest_evaluated_j(tmp_path, monkeypatch):
+    _install_fake_matrix(monkeypatch)
+    args = _matrix_metadata_args(
+        tmp_path / "case_bad",
+        robustness_child_shocks=[32, 64, 128],
+        shock_bank_max_child_shocks=64,
+    )
+    with pytest.raises(ValueError, match="must cover the largest evaluated J"):
+        evaluator_module.evaluate_matrix(args)

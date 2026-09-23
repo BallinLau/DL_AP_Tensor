@@ -783,19 +783,36 @@ def evaluate_bp_consistency_multi_j(
     forward_stats = teacher.forward_stats()
     forward_stats["bp_grid_chunk_plans"] = teacher.grid_chunk_plans()
 
+    # ``compute_multi_j_branches`` returns ``bundles[branch_index][prefix_count]``:
+    # the first axis is the branch and the second axis is the exact-eta expanded
+    # child count (2 * J). The two axes are independent, so the J loop must never
+    # index the branch axis.
+    evaluated_counts = {2 * int(value) for value in requested}
+    if len(bundles) != len(labels):
+        raise RuntimeError(
+            "compute_multi_j_branches returned "
+            f"{len(bundles)} branch bundles for {len(labels)} branches"
+        )
+    for branch_index, label in enumerate(labels):
+        if set(bundles[branch_index]) != evaluated_counts:
+            raise RuntimeError(
+                f"compute_multi_j_branches bundle for branch {label!r} exposes "
+                f"{sorted(bundles[branch_index])} instead of {sorted(evaluated_counts)}"
+            )
+
     results_by_j: Dict[int, Dict[str, Any]] = {}
-    for index, j_value in enumerate(requested):
-        count = 2 * j_value
+    for j_value in requested:
+        count = 2 * int(j_value)
         surfaces: Dict[str, np.ndarray] = {}
         summary: Dict[str, float] = {}
         results: Dict[str, Dict[str, torch.Tensor]] = {}
-        for label in labels:
-            result = bundles[index][count]
+        for branch_index, label in enumerate(labels):
+            result = bundles[branch_index][count]
             results[label] = result
             _summarize_bp_branch(
                 label=label,
                 result=result,
-                bp_pred=bp_preds[labels.index(label)],
+                bp_pred=bp_preds[branch_index],
                 phat=model_outputs[label].Phat,
                 grid=grid,
                 teacher_margin_tol=teacher_margin_tol,
