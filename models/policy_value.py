@@ -25,6 +25,7 @@ def default_policy_value_model_spec() -> Dict[str, object]:
         "share_hidden_dims": list(getattr(Config, "SHARE_LAYER_HIDDEN_DIMS", []) or []),
         "share_output_dim": 64,
         "q_head_dims": list(getattr(Config, "Q_HEAD_DIMS", []) or []),
+        "q_parameterization": str(getattr(Config, "Q_PARAMETERIZATION", "direct")),
         "p0_head_dims": list(getattr(Config, "P0_HEAD_DIMS", []) or []),
         "pi_head_dims": list(getattr(Config, "PI_HEAD_DIMS", []) or []),
         "bp0_head_dims": list(getattr(Config, "BP0_HEAD_DIMS", []) or []),
@@ -61,6 +62,9 @@ def build_policy_value_from_checkpoint_spec(
         share_hidden_dims=list(spec.get("share_hidden_dims") or []),
         share_output_dim=int(spec["share_output_dim"]),
         q_head_dims=list(spec.get("q_head_dims") or []),
+        # Missing means a legacy checkpoint whose head produced q_unit and whose
+        # model multiplied it by b. Never reinterpret it as direct-Q.
+        q_parameterization=str(spec.get("q_parameterization", "b_times_unit")),
         p0_head_dims=list(spec.get("p0_head_dims") or []),
         pi_head_dims=list(spec.get("pi_head_dims") or []),
         bp0_head_dims=list(spec.get("bp0_head_dims") or []),
@@ -131,6 +135,7 @@ class PolicyValueModel(nn.Module):
         share_hidden_dims: Optional[list] = None,
         share_output_dim: int = 64,
         q_head_dims: Optional[list] = None,
+        q_parameterization: Optional[str] = None,
         p0_head_dims: Optional[list] = None,
         pi_head_dims: Optional[list] = None,
         bp0_head_dims: Optional[list] = None,
@@ -156,6 +161,16 @@ class PolicyValueModel(nn.Module):
         self.share_hidden_dims = resolved_share_hidden_dims
         self.share_output_dim = int(share_output_dim)
         self.q_head_dims = list(q_head_dims if q_head_dims is not None else getattr(Config, "Q_HEAD_DIMS", []))
+        self.q_parameterization = str(
+            q_parameterization
+            if q_parameterization is not None
+            else getattr(Config, "Q_PARAMETERIZATION", "direct")
+        ).lower()
+        if self.q_parameterization not in {"direct", "b_times_unit"}:
+            raise ValueError(
+                "q_parameterization must be 'direct' or 'b_times_unit', got "
+                f"{self.q_parameterization!r}"
+            )
         self.p0_head_dims = list(p0_head_dims if p0_head_dims is not None else getattr(Config, "P0_HEAD_DIMS", []))
         self.pi_head_dims = list(pi_head_dims if pi_head_dims is not None else getattr(Config, "PI_HEAD_DIMS", []))
         self.bp0_head_dims = list(bp0_head_dims if bp0_head_dims is not None else getattr(Config, "BP0_HEAD_DIMS", []))
@@ -194,7 +209,11 @@ class PolicyValueModel(nn.Module):
             dropout=dropout
         )
 
-        self.q_head = QHead(input_dim=share_output_dim, hidden_dims=self.q_head_dims)
+        self.q_head = QHead(
+            input_dim=share_output_dim,
+            hidden_dims=self.q_head_dims,
+            output_activation=None if self.q_parameterization == "direct" else "softplus",
+        )
         self.v0_head = PHead(input_dim=share_output_dim, hidden_dims=self.p0_head_dims, requires_i=False)
         self.vi_head = PHead(input_dim=share_output_dim, hidden_dims=self.pi_head_dims, requires_i=True)
         self.bp0_head = BpHead(input_dim=share_output_dim, hidden_dims=self.bp0_head_dims, requires_i=False)
@@ -226,6 +245,7 @@ class PolicyValueModel(nn.Module):
             "share_hidden_dims": list(self.share_hidden_dims),
             "share_output_dim": int(self.share_output_dim),
             "q_head_dims": list(self.q_head_dims),
+            "q_parameterization": self.q_parameterization,
             "p0_head_dims": list(self.p0_head_dims),
             "pi_head_dims": list(self.pi_head_dims),
             "bp0_head_dims": list(self.bp0_head_dims),
@@ -319,8 +339,10 @@ class PolicyValueModel(nn.Module):
     def _q_output(self, firm_state: torch.Tensor) -> torch.Tensor:
         base_state, _, b = self._split_state(firm_state)
         h_q = self.q_encoder(base_state)
-        q_unit = self.q_head(h_q)
-        return torch.clamp(b, min=0.0) * q_unit
+        q_raw = self.q_head(h_q)
+        if self.q_parameterization == "b_times_unit":
+            return torch.clamp(b, min=0.0) * q_raw
+        return q_raw
 
     def _policy_logits(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         base_state, i, _ = self._split_state(firm_state)

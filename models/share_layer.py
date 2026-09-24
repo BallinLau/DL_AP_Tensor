@@ -70,7 +70,7 @@ class QHead(nn.Module):
         self,
         input_dim: int = 64,
         hidden_dims: List[int] = None,
-        output_activation: str = 'softplus'
+        output_activation: Optional[str] = 'softplus'
     ):
         super().__init__()
         
@@ -233,7 +233,8 @@ class SharedModel(nn.Module):
         # Q head
         self.q_head = QHead(
             input_dim=actual_share_output_dim,
-            hidden_dims=q_hidden_dims
+            hidden_dims=q_hidden_dims,
+            output_activation=None,
         )
         
         # bp⁰ head（不依赖 i）
@@ -276,10 +277,8 @@ class SharedModel(nn.Module):
         h = self.share_layer(base_state)
         
         # 各 head 输出
-        # Q 采用“总债价值”口径：Q = b * q_unit，结构上保证 b=0 时 Q=0。
-        q_unit = self.q_head(h)
-        b_nonneg = torch.clamp(firm_state[:, SIMMODEL.B:SIMMODEL.B+1], min=0.0)
-        Q = b_nonneg * q_unit
+        # Direct-Q compatibility path. The exact b=0 condition is trained by Q0.
+        Q = self.q_head(h)
         bp0 = self.bp0_head(h)
         bpI = self.bpI_head(h, i)
         
@@ -292,9 +291,7 @@ class SharedModel(nn.Module):
             firm_state[:, SIMMODEL.X:]
         ], dim=-1)
         h = self.share_layer(base_state)
-        q_unit = self.q_head(h)
-        b_nonneg = torch.clamp(firm_state[:, SIMMODEL.B:SIMMODEL.B+1], min=0.0)
-        return b_nonneg * q_unit
+        return self.q_head(h)
 
 
 class CombinedModel(nn.Module):

@@ -130,11 +130,19 @@ class Config:
     #   "legacy_soft_penalty" - 历史行为，Bellman 覆盖全部 parent，
     #                            违约侧只靠 soft bar_z 惩罚项（默认，保证旧实验可复现）
     #   "hard"                - w_survival = 1{Phat_t > 0}，硬切换
-    #   "transition_band"     - |Phat| <= Q_PARENT_DEFAULT_EPS 内用 sigmoid 平滑，
-    #                            带外严格 0/1，深度违约区真正 collapse 到 recovery
+    #   "transition_band"     - |Phat| <= Q_PARENT_DEFAULT_EPS 内用 smoothstep
+    #                            w = 3u^2 - 2u^3, u = (Phat+eps)/(2*eps) 平滑，
+    #                            带外严格 0/1，深度违约区真正 collapse 到 recovery；
+    #                            eps == 0 时退化为 hard gating
     Q_PARENT_DEFAULT_REGIME_MODE = "legacy_soft_penalty"
     Q_PARENT_DEFAULT_EPS = 1e-2
+    # 注意：smoothstep transition_band 不依赖 TAU，该字段仅为配置/元数据保留。
     Q_PARENT_DEFAULT_TAU = 1e-2
+
+    # regime-aware 模式下 low-b boundary penalty 的生效带宽。
+    # Q = b * q_unit 已结构性保证 b = 0 -> Q = 0，因此只需极窄数值稳定区，
+    # 避免在 b <= 0.1 上强推 Q = 0 与 default 区回收要求冲突。
+    Q_BOUNDARY_LOW_MARGIN = 1e-3
 
     # Q 违约回收的归一化口径（单位与 Q 一致）：
     #   "asset_only"           - phi * (1 - delta + exp(x + z))，与 main_4.tex
@@ -180,3 +188,7 @@ class Config:
     def x_stationary_std(cls) -> float:
         """返回x的稳态标准差"""
         return (cls.SIGMA_X**2 / (1 - cls.RHO_X**2)) ** 0.5
+    # Q network output semantics. New training runs use a direct total-debt-value
+    # output. Legacy checkpoints without an explicit model-spec field are treated
+    # as ``b_times_unit`` and must not be loaded into this architecture silently.
+    Q_PARAMETERIZATION = "direct"

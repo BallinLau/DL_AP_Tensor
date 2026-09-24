@@ -325,6 +325,29 @@ def parse_args() -> argparse.Namespace:
         help="Train P0/PI Bellman value residuals divided by parent equity value scale",
     )
     parser.add_argument("--pv-eval-epochs", type=int, default=None, help="P/Q evaluation epochs for staged policy/value flow")
+    parser.add_argument(
+        "--q-parameterization",
+        type=str.lower,
+        default=None,
+        choices=["direct", "b_times_unit"],
+        help="Q network parameterization; formal regime training requires direct",
+    )
+    parser.add_argument("--q-zero-boundary-epochs", type=int, default=None, help="Exact Q(b=0)=0 phase epochs")
+    parser.add_argument("--q-default-pretrain-epochs", type=int, default=None, help="Default-parent recovery phase epochs")
+    parser.add_argument("--q-survival-aio-epochs", type=int, default=None, help="Survival-parent Bellman/AiO phase epochs")
+    parser.add_argument("--q-mixed-polish-epochs", type=int, default=None, help="Regime-exclusive mixed Q polishing epochs")
+    parser.add_argument("--q-zero-sample-share", type=float, default=None, help="Q0 sample share during mixed polishing")
+    parser.add_argument("--q-default-sample-share", type=float, default=None, help="QD sample share during mixed polishing")
+    parser.add_argument("--q-survival-sample-share", type=float, default=None, help="QS sample share during mixed polishing")
+    parser.add_argument("--q-default-phat-eps", type=float, default=None, help="Negative frozen-Phat margin for synthetic QD coverage")
+    parser.add_argument("--q-zero-b-eps", type=float, default=None, help="Debt tolerance classified as the exact-zero Q regime")
+    parser.add_argument("--q-default-candidate-multiplier", type=int, default=None, help="QD candidate oversampling multiplier before frozen-P filtering")
+    parser.add_argument("--q-default-b-bins", type=int, default=None, help="Positive-debt support bins for QD coverage")
+    parser.add_argument("--q-survival-ondist-share", type=float, default=None, help="On-distribution share in QS matched-transition batches")
+    parser.add_argument("--q-zero-loss-weight", type=float, default=None, help="Q0 objective weight")
+    parser.add_argument("--q-default-loss-weight", type=float, default=None, help="QD recovery objective weight")
+    parser.add_argument("--q-survival-loss-weight", type=float, default=None, help="QS Bellman/AiO objective weight")
+    parser.add_argument("--q-nonnegative-weight", type=float, default=None, help="Direct-Q negative-output penalty weight")
     parser.add_argument("--bp-distill-epochs", type=int, default=None, help="BP distillation epochs for staged policy/value flow")
     parser.add_argument("--bp-distill-patience", type=int, default=None, help="BP distillation early-stop patience")
     parser.add_argument("--bp-distill-min-delta", type=float, default=None, help="BP distillation validation min delta")
@@ -584,6 +607,61 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.pv_bellman_normalize_by_value_scale = bool(args.pv_bellman_normalize_by_value_scale)
     if args.pv_eval_epochs is not None:
         hyperparams.pv_eval_epochs = args.pv_eval_epochs
+    if args.q_parameterization is not None:
+        hyperparams.q_parameterization = args.q_parameterization
+    Config.Q_PARAMETERIZATION = str(hyperparams.q_parameterization).lower()
+    q_scalar_overrides = {
+        "q_zero_boundary_epochs": args.q_zero_boundary_epochs,
+        "q_default_pretrain_epochs": args.q_default_pretrain_epochs,
+        "q_survival_aio_epochs": args.q_survival_aio_epochs,
+        "q_mixed_polish_epochs": args.q_mixed_polish_epochs,
+        "q_zero_sample_share": args.q_zero_sample_share,
+        "q_default_sample_share": args.q_default_sample_share,
+        "q_survival_sample_share": args.q_survival_sample_share,
+        "q_default_phat_eps": args.q_default_phat_eps,
+        "q_zero_b_eps": args.q_zero_b_eps,
+        "q_default_candidate_multiplier": args.q_default_candidate_multiplier,
+        "q_default_b_bins": args.q_default_b_bins,
+        "q_survival_ondist_share": args.q_survival_ondist_share,
+        "q_zero_loss_weight": args.q_zero_loss_weight,
+        "q_default_loss_weight": args.q_default_loss_weight,
+        "q_survival_loss_weight": args.q_survival_loss_weight,
+        "q_nonnegative_weight": args.q_nonnegative_weight,
+    }
+    for name, value in q_scalar_overrides.items():
+        if value is not None:
+            setattr(hyperparams, name, value)
+    if str(hyperparams.q_parameterization).lower() != "direct":
+        raise ValueError("Formal staged Q regime training requires q_parameterization='direct'.")
+    for name in (
+        "q_zero_boundary_epochs",
+        "q_default_pretrain_epochs",
+        "q_survival_aio_epochs",
+        "q_mixed_polish_epochs",
+    ):
+        if int(getattr(hyperparams, name)) < 0:
+            raise ValueError(f"{name} must be non-negative")
+    q_shares = [
+        float(getattr(hyperparams, "q_zero_sample_share")),
+        float(getattr(hyperparams, "q_default_sample_share")),
+        float(getattr(hyperparams, "q_survival_sample_share")),
+    ]
+    if any(value < 0.0 for value in q_shares) or not np.isclose(sum(q_shares), 1.0):
+        raise ValueError("Q polishing sample shares must be non-negative and sum to 1.")
+    if float(hyperparams.q_zero_b_eps) < 0.0:
+        raise ValueError("q_zero_b_eps must be non-negative")
+    if int(hyperparams.q_default_candidate_multiplier) <= 0 or int(hyperparams.q_default_b_bins) <= 0:
+        raise ValueError("Q default coverage multiplier and b bins must be positive")
+    if not 0.0 < float(hyperparams.q_survival_ondist_share) <= 1.0:
+        raise ValueError("q_survival_ondist_share must be in (0, 1]")
+    for name in (
+        "q_zero_loss_weight",
+        "q_default_loss_weight",
+        "q_survival_loss_weight",
+        "q_nonnegative_weight",
+    ):
+        if float(getattr(hyperparams, name)) < 0.0:
+            raise ValueError(f"{name} must be non-negative")
     if args.bp_distill_epochs is not None:
         hyperparams.bp_distill_epochs = args.bp_distill_epochs
     if args.bp_distill_patience is not None:

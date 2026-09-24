@@ -362,6 +362,7 @@ class HyperParams:
     allow_modea_sdf_after_pv: bool = False
 
     # ========== Policy/Value: Q 优先训练与形状约束 ==========
+    q_parameterization: str = "direct"
     # 在 policy/value 联合训练前先进行 q-only 预训练轮数
     q_pretrain_epochs: int = 0
     # Q 损失中对 M 的处理（先 detach 并截断，减少 SDF 噪声传导）
@@ -394,6 +395,24 @@ class HyperParams:
     q_warm_alpha_z: float = 0.15
     q_warm_alpha_x: float = 0.15
 
+    # Direct-Q regime-exclusive training schedule.
+    q_zero_boundary_epochs: int = 5
+    q_default_pretrain_epochs: int = 10
+    q_survival_aio_epochs: int = 20
+    q_mixed_polish_epochs: int = 5
+    q_zero_sample_share: float = 0.20
+    q_default_sample_share: float = 0.30
+    q_survival_sample_share: float = 0.50
+    q_default_phat_eps: float = 1e-2
+    q_zero_b_eps: float = 0.0
+    q_default_candidate_multiplier: int = 4
+    q_default_b_bins: int = 10
+    q_survival_ondist_share: float = 0.8
+    q_zero_loss_weight: float = 1.0
+    q_default_loss_weight: float = 1.0
+    q_survival_loss_weight: float = 1.0
+    q_nonnegative_weight: float = 1.0
+
     # ========== Policy/Value: Q parent default regime 与 recovery 口径 ==========
     # None 表示沿用 Config 默认（recovery: "asset_only"；regime: "legacy_soft_penalty"）。
     # 取值见 config/constants.py：
@@ -403,8 +422,13 @@ class HyperParams:
     q_parent_default_eps: float = None
     q_parent_default_tau: float = None
     q_recovery_normalization_mode: str = None
+    # 可选训练诊断：记录 online 与 target 在 default boundary 上的分歧（仅 logging）。
+    q_log_parent_default_disagreement: bool = False
 
     # ========== Policy/Value: 可选 Q-only polishing stage（默认关闭） ==========
+    # NOTE: Q polishing support is scaffolding only; not wired into the training loop yet.
+    # 现有 helper（_set_q_polishing_freeze / build_q_polish_coverage_weights）尚未被
+    # 任何训练 stage 调用；以下配置目前不会生效，仅为后续接入预留。
     # 冻结 value / policy / bp heads / SDF / FC1，只训练 q_encoder + q_head。
     # coverage sample 由三类状态组成：on-distribution / boundary / default。
     enable_q_polishing: bool = False

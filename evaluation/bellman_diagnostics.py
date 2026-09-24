@@ -85,11 +85,16 @@ def evaluate_bellman_residuals(
     parent_default_regime_mode: str | None = None,
     parent_default_eps: float | None = None,
     parent_default_tau: float | None = None,
+    boundary_low_threshold: float = 0.1,
+    boundary_high_threshold: float = 0.9,
 ) -> tuple[Dict[str, np.ndarray], Dict[str, float]]:
     """Evaluate physical conditional-mean P0/PI/Q Bellman residuals.
 
     ``recovery_normalization_mode`` / ``parent_default_regime_mode`` 决定 Q 违约回收
     口径与 parent default regime gating；默认沿用 ``Config``（见 config/constants.py）。
+
+    ``boundary_low_threshold`` / ``boundary_high_threshold`` 只用于诊断 boundary penalty
+    与 default regime 的重叠（``low_b_*_share`` / ``high_b_*_share``）。
     """
     recovery_mode = resolve_recovery_normalization_mode(recovery_normalization_mode)
     regime_mode = resolve_q_parent_default_regime_mode(parent_default_regime_mode)
@@ -185,13 +190,21 @@ def evaluate_bellman_residuals(
             phi=float(economic_config.PHI), delta=float(economic_config.DELTA),
             recovery_normalization_mode=recovery_mode,
         )
-        # Q = b * q_unit 参数化下，default 区隐含的 q_unit 目标为 recovery / b。
+        # q_unit is a derived reporting ratio Q/b, not the direct-Q network output.
+        # The corresponding default-region ratio target is recovery / b.
         b_parent = parent[:, 0:1]
         q_unit_recovery_target = torch.where(
             b_parent > 0.0,
             recovery_current / b_parent.clamp_min(1e-12),
             torch.full_like(recovery_current, float("nan")),
         )
+        # Derived predicted ratio (same reporting convention as firm_surfaces).
+        q_unit_pred = torch.where(
+            b_parent > 0.0,
+            q / b_parent.clamp_min(1e-12),
+            torch.full_like(q, float("nan")),
+        )
+        q_unit_minus_recovery_target = q_unit_pred - q_unit_recovery_target
 
         def residuals_for_m(m_values: torch.Tensor) -> Dict[str, torch.Tensor]:
             continuation0 = (weights * m_values * p_child_p0).sum(dim=1)
@@ -303,7 +316,9 @@ def evaluate_bellman_residuals(
     # Parent 违约 regime 与当期回收（只依赖 parent 状态，与 M 无关）。
     surfaces.update({
         "recovery_current": surface(recovery_current),
+        "q_unit_pred": surface(q_unit_pred),
         "q_unit_recovery_target": surface(q_unit_recovery_target),
+        "q_unit_minus_recovery_target": surface(q_unit_minus_recovery_target),
         "parent_hard_default": surface(hard_default),
         "parent_survival_weight": surface(survival_w),
         "parent_default_weight": surface(default_w),
@@ -334,20 +349,50 @@ def evaluate_bellman_residuals(
             summary[f"{equation}_residual_{key}"] = value
     for key, value in residual_statistics(surfaces["RQ_trainM_scale_normalized"]).items():
         summary[f"q_residual_normalized_{key}"] = value
-    # default-region q_unit 统计：Q = b * q_unit，recovery 不再乘 b 后，
-    # hard-default 区隐含 q_unit = recovery / b。deep-default 样本稀缺，单独报告。
+    # Default-region derived-ratio statistics. The direct network predicts total
+    # Q; q_unit=Q/b is retained only as a reporting ratio for b>0.
+    # deep-default 样本稀缺，单独统计（仅 b > 0 且 hard-default 的点）。
     hard_default_flat = surfaces["parent_hard_default"].reshape(-1) > 0.5
-    q_unit_flat = surfaces["q_unit_recovery_target"].reshape(-1)
-    q_unit_default = q_unit_flat[hard_default_flat]
-    q_unit_default = q_unit_default[np.isfinite(q_unit_default)]
-    summary["q_unit_default_region_count"] = int(q_unit_default.size)
-    for key, value in (
-        ("mean", float(q_unit_default.mean()) if q_unit_default.size else float("nan")),
-        ("p90", float(np.quantile(q_unit_default, 0.90)) if q_unit_default.size else float("nan")),
-        ("p99", float(np.quantile(q_unit_default, 0.99)) if q_unit_default.size else float("nan")),
-        ("max", float(q_unit_default.max()) if q_unit_default.size else float("nan")),
+
+    def _region_values(surface_name: str) -> np.ndarray:
+        values = surfaces[surface_name].reshape(-1)[hard_default_flat]
+        return values[np.isfinite(values)]
+
+    q_unit_pred_default = _region_values("q_unit_pred")
+    q_unit_target_default = _region_values("q_unit_recovery_target")
+    q_unit_error_default = np.abs(_region_values("q_unit_minus_recovery_target"))
+
+    def _write_stats(prefix: str, values: np.ndarray) -> None:
+        summary[f"{prefix}_count"] = int(values.size)
+        for key, value in (
+            ("mean", float(values.mean()) if values.size else float("nan")),
+            ("p90", float(np.quantile(values, 0.90)) if values.size else float("nan")),
+            ("p99", float(np.quantile(values, 0.99)) if values.size else float("nan")),
+            ("max", float(values.max()) if values.size else float("nan")),
+        ):
+            summary[f"{prefix}_{key}"] = value
+
+    _write_stats("q_unit_pred_default", q_unit_pred_default)
+    _write_stats("q_unit_recovery_target_default", q_unit_target_default)
+    _write_stats("q_unit_error_default_abs", q_unit_error_default)
+    # Legacy alias（旧名含糊，实为 recovery target 统计）：保留以兼容旧脚本。
+    for key in ("count", "mean", "p90", "p99", "max"):
+        summary[f"q_unit_default_region_{key}"] = summary[
+            f"q_unit_recovery_target_default_{key}"
+        ]
+
+    # boundary penalty 与 default regime 的重叠诊断（判断两者是否互相冲突）。
+    b_all = grid.b_values.repeat(len(grid.z_values))
+    low_b_mask = b_all <= float(boundary_low_threshold)
+    high_b_mask = b_all >= float(boundary_high_threshold)
+    n_total = max(1, b_all.size)
+    for name, mask in (
+        ("low_b_default_share", low_b_mask & hard_default_flat),
+        ("low_b_survival_share", low_b_mask & ~hard_default_flat),
+        ("high_b_default_share", high_b_mask & hard_default_flat),
+        ("high_b_survival_share", high_b_mask & ~hard_default_flat),
     ):
-        summary[f"q_unit_default_region_{key}"] = value
+        summary[name] = float(mask.sum()) / float(n_total)
     return surfaces, summary
 
 

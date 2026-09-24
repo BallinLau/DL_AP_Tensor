@@ -22,7 +22,7 @@ child default（t+1 违约）始终保留在 ``L_Bellman`` 内部，与 parent r
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import sys
 sys.path.append('..')
@@ -49,6 +49,40 @@ RECOVERY_NORMALIZATION_MODES: Tuple[str, ...] = (
     "asset_only",
 )
 
+# 旧 checkpoint 训练时使用的 recovery 口径（其 hyperparams 中没有新字段）。
+LEGACY_RECOVERY_NORMALIZATION_MODE = "legacy_b_times_unit"
+RECOVERY_NORMALIZATION_MODE_FIELD = "q_recovery_normalization_mode"
+
+
+def classify_q_parent_regimes(
+    b: torch.Tensor,
+    phat: torch.Tensor,
+    *,
+    zero_b_eps: float = 0.0,
+) -> Dict[str, torch.Tensor]:
+    """Return mutually exclusive zero/default/survival parent masks.
+
+    The exact zero-debt condition has priority. Positive-debt states are then
+    classified by a detached frozen-P ``Phat`` snapshot. This helper does not
+    construct children and does not evaluate any Bellman residual.
+    """
+    if b.shape != phat.shape:
+        raise ValueError(f"b and phat shapes must match, got {b.shape} and {phat.shape}")
+    eps = max(float(zero_b_eps), 0.0)
+    zero = b.abs() <= eps if eps > 0.0 else b == 0.0
+    positive = b > eps
+    default = positive & (phat <= 0.0)
+    survival = positive & (phat > 0.0)
+    assigned = zero.to(torch.int8) + default.to(torch.int8) + survival.to(torch.int8)
+    if torch.any(assigned > 1):
+        raise RuntimeError("Q parent regime masks overlap")
+    return {
+        "zero": zero,
+        "default": default,
+        "survival": survival,
+        "unclassified": assigned == 0,
+    }
+
 
 def resolve_q_parent_default_regime_mode(mode: Optional[str] = None) -> str:
     value = mode if mode is not None else getattr(
@@ -74,6 +108,102 @@ def resolve_recovery_normalization_mode(mode: Optional[str] = None) -> str:
             f"expected one of {RECOVERY_NORMALIZATION_MODES}"
         )
     return value
+
+
+def resolve_q_regime_settings(
+    *,
+    cli_recovery_normalization_mode: Optional[str] = None,
+    cli_parent_default_regime_mode: Optional[str] = None,
+    cli_parent_default_eps: Optional[float] = None,
+    cli_parent_default_tau: Optional[float] = None,
+    checkpoint_recovery_normalization_mode: Optional[str] = None,
+    checkpoint_parent_default_regime_mode: Optional[str] = None,
+    checkpoint_parent_default_eps: Optional[float] = None,
+    checkpoint_parent_default_tau: Optional[float] = None,
+    checkpoint_recorded_fields: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """统一解析 Q regime / recovery 口径，返回 resolved value 与 source。
+
+    优先级::
+
+        explicit CLI override
+            > explicit checkpoint semantics
+            > legacy-checkpoint compatibility fallback (仅 recovery)
+            > Config default
+
+    ``checkpoint_recorded_fields`` 必须是**原始 checkpoint hyperparams payload 中真实出现过的
+    字段名集合**；``None`` 表示没有 checkpoint 语义可用（例如纯 CLI 评估）。不能用
+    ``HyperParams`` 实例的当前取值判断旧 checkpoint —— 新 dataclass 的默认字段会掩盖
+    “当时是否真的保存过该字段”，从而把 legacy 口径静默升级成 ``asset_only``。
+
+    source 取值：recovery ∈ {"cli", "checkpoint", "legacy_checkpoint_fallback",
+    "config_default"}；regime / eps / tau ∈ {"cli", "checkpoint", "config_default"}。
+    """
+    recorded = (
+        set(checkpoint_recorded_fields)
+        if checkpoint_recorded_fields is not None
+        else None
+    )
+
+    if cli_recovery_normalization_mode is not None:
+        recovery_mode = resolve_recovery_normalization_mode(cli_recovery_normalization_mode)
+        recovery_source = "cli"
+    elif recorded is not None and RECOVERY_NORMALIZATION_MODE_FIELD not in recorded:
+        # 旧 checkpoint：训练时用的就是 legacy 口径，不能静默解释为 Config.asset_only。
+        recovery_mode = LEGACY_RECOVERY_NORMALIZATION_MODE
+        recovery_source = "legacy_checkpoint_fallback"
+    elif checkpoint_recovery_normalization_mode is not None:
+        recovery_mode = resolve_recovery_normalization_mode(
+            checkpoint_recovery_normalization_mode
+        )
+        recovery_source = "checkpoint"
+    else:
+        recovery_mode = resolve_recovery_normalization_mode(None)
+        recovery_source = "config_default"
+
+    if cli_parent_default_regime_mode is not None:
+        regime_mode = resolve_q_parent_default_regime_mode(cli_parent_default_regime_mode)
+        regime_source = "cli"
+    elif checkpoint_parent_default_regime_mode is not None:
+        regime_mode = resolve_q_parent_default_regime_mode(
+            checkpoint_parent_default_regime_mode
+        )
+        regime_source = "checkpoint"
+    else:
+        # Config 默认即 legacy_soft_penalty，本身可复现旧行为，无需单独 fallback。
+        regime_mode = resolve_q_parent_default_regime_mode(None)
+        regime_source = "config_default"
+
+    def _resolve_scalar(cli_value, checkpoint_value, config_name, fallback):
+        if cli_value is not None:
+            return float(cli_value), "cli"
+        if checkpoint_value is not None:
+            return float(checkpoint_value), "checkpoint"
+        return float(getattr(Config, config_name, fallback)), "config_default"
+
+    eps_resolved, eps_source = _resolve_scalar(
+        cli_parent_default_eps,
+        checkpoint_parent_default_eps,
+        "Q_PARENT_DEFAULT_EPS",
+        1e-2,
+    )
+    tau_resolved, tau_source = _resolve_scalar(
+        cli_parent_default_tau,
+        checkpoint_parent_default_tau,
+        "Q_PARENT_DEFAULT_TAU",
+        1e-2,
+    )
+
+    return {
+        "recovery_normalization_mode": recovery_mode,
+        "recovery_normalization_mode_source": recovery_source,
+        "q_parent_default_regime_mode": regime_mode,
+        "q_parent_default_regime_mode_source": regime_source,
+        "q_parent_default_eps": eps_resolved,
+        "q_parent_default_eps_source": eps_source,
+        "q_parent_default_tau": tau_resolved,
+        "q_parent_default_tau_source": tau_source,
+    }
 
 
 def compute_recovery_unit(
@@ -120,8 +250,19 @@ def compute_parent_default_regime_weights(
     - ``legacy_soft_penalty``：``w_survival = 1``，``w_default = 0``
       （Bellman 覆盖全部 parent，违约侧仅由 soft ``bar_z`` 惩罚项处理）
     - ``hard``：``w_survival = 1{Phat_t > 0}``
-    - ``transition_band``：``|Phat| <= eps`` 内用 ``sigmoid(Phat / tau)`` 平滑，
-      带外严格取 0/1，保证深度 default 区真正 collapse 到 recovery regime
+    - ``transition_band``：``|Phat| <= eps`` 内用 **smoothstep** 平滑，带外严格取 0/1，
+      保证深度 default 区真正 collapse 到 recovery regime。
+
+      smoothstep（``eps > 0``）::
+
+          u = (Phat + eps) / (2 * eps)          # u in [0, 1] inside the band
+          w_survival = 3u^2 - 2u^3
+
+      于是 ``w(-eps) = 0``、``w(0) = 0.5``、``w(+eps) = 1``，band 内单调递增，
+      且两端一阶导为 0（C1 连续，不会在 eps 处跳变）。``eps == 0`` 时退化为 hard gating，
+      且不出现除零。
+
+      ``tau`` 目前只作为配置 / 元数据字段保留，smoothstep 不依赖它。
     """
     resolved = resolve_q_parent_default_regime_mode(mode)
     # regime 权重是纯 gate，必须对 Phat 梯度隔离：Q loss 不允许通过
@@ -139,15 +280,16 @@ def compute_parent_default_regime_weights(
         eps_value = float(
             eps if eps is not None else getattr(Config, "Q_PARENT_DEFAULT_EPS", 1e-2)
         )
-        tau_value = float(
-            tau if tau is not None else getattr(Config, "Q_PARENT_DEFAULT_TAU", 1e-2)
-        )
         eps_value = max(eps_value, 0.0)
-        tau_value = max(tau_value, 1e-8)
-        band = torch.sigmoid(phat / tau_value)
-        survival = torch.where(
-            phat >= eps_value, ones, torch.where(phat <= -eps_value, zeros, band)
-        )
+        if eps_value <= 0.0:
+            # eps == 0 -> hard gating，且避免除零。
+            survival = ones - hard_default
+        else:
+            u = ((phat + eps_value) / (2.0 * eps_value)).clamp(0.0, 1.0)
+            band = u * u * (3.0 - 2.0 * u)
+            survival = torch.where(
+                phat >= eps_value, ones, torch.where(phat <= -eps_value, zeros, band)
+            )
     return {
         "parent_survival_weight": survival,
         "parent_default_weight": ones - survival,
@@ -165,6 +307,9 @@ def build_q_polish_coverage_weights(
     eps_boundary: float,
 ) -> Dict[str, torch.Tensor]:
     """Q-only polishing 的 coverage 分组权重（simulated / boundary / default）。
+
+    NOTE: Q polishing support is scaffolding only; not wired into the training loop yet.
+    本 helper 目前未被任何训练 stage 调用。
 
     分组（``eps = eps_boundary``）：
 
@@ -267,6 +412,7 @@ class QLoss(nn.Module):
         parent_default_regime_mode: Optional[str] = None,
         parent_default_eps: Optional[float] = None,
         parent_default_tau: Optional[float] = None,
+        boundary_low_margin: Optional[float] = None,
     ):
         super().__init__()
         
@@ -295,6 +441,11 @@ class QLoss(nn.Module):
         self.parent_default_tau = float(
             parent_default_tau if parent_default_tau is not None
             else getattr(Config, "Q_PARENT_DEFAULT_TAU", 1e-2)
+        )
+        # regime-aware 模式下 low-b boundary 的生效带宽（只保留数值稳定区）。
+        self.boundary_low_margin = float(
+            boundary_low_margin if boundary_low_margin is not None
+            else getattr(Config, "Q_BOUNDARY_LOW_MARGIN", 1e-3)
         )
     
     def compute_recovery_value(
@@ -369,6 +520,81 @@ class QLoss(nn.Module):
             "q_target_used_for_training": target,
             "recovery_current": recovery_current,
             **weights,
+        }
+
+    @staticmethod
+    def compute_nonnegative_penalty(Q: torch.Tensor) -> torch.Tensor:
+        """Penalty for a direct-Q head; inference remains completely unclamped."""
+        return torch.relu(-Q).pow(2)
+
+    def compute_zero_debt_objective(
+        self,
+        Q: torch.Tensor,
+        *,
+        nonnegative_weight: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        """Exact analytical boundary objective for synthetic ``b == 0`` states.
+
+        This path intentionally has no children, M, SDF, or AiO arguments.
+        """
+        boundary = Q.pow(2)
+        nonnegative = self.compute_nonnegative_penalty(Q)
+        per_sample = boundary + float(nonnegative_weight) * nonnegative
+        return {
+            "per_sample": per_sample,
+            "loss": per_sample.mean(),
+            "boundary_loss": boundary.mean(),
+            "nonnegative_loss": nonnegative.mean(),
+        }
+
+    def compute_default_parent_objective(
+        self,
+        *,
+        Q: torch.Tensor,
+        b: torch.Tensor,
+        x: torch.Tensor,
+        z: torch.Tensor,
+        nonnegative_weight: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        """Current-parent default objective ``Q = asset_only recovery``.
+
+        This path intentionally has no children, M, SDF, or AiO arguments.
+        """
+        recovery = self.compute_current_recovery(b, x, z).detach()
+        recovery_error = (Q - recovery).pow(2)
+        nonnegative = self.compute_nonnegative_penalty(Q)
+        per_sample = recovery_error + float(nonnegative_weight) * nonnegative
+        return {
+            "per_sample": per_sample,
+            "loss": per_sample.mean(),
+            "recovery_loss": recovery_error.mean(),
+            "recovery_current": recovery,
+            "nonnegative_loss": nonnegative.mean(),
+        }
+
+    def compute_survival_parent_objective(
+        self,
+        *,
+        residuals: List[torch.Tensor],
+        Q: torch.Tensor,
+        nonnegative_weight: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        """Survival-parent Bellman AiO objective.
+
+        Only this Q regime accepts branch residuals and calls
+        ``compute_aio_residual``.
+        """
+        if len(residuals) < 2:
+            raise ValueError("Q survival AiO requires at least two independent child shocks")
+        aio = compute_aio_residual(residuals, self.aio_weight)
+        nonnegative = self.compute_nonnegative_penalty(Q)
+        per_sample = aio + float(nonnegative_weight) * nonnegative
+        return {
+            "aio_residual": aio,
+            "per_sample": per_sample,
+            "loss": per_sample.mean(),
+            "bellman_loss": aio.mean(),
+            "nonnegative_loss": nonnegative.mean(),
         }
 
     def compute_regime_aware_objective(
@@ -565,10 +791,7 @@ class QLoss(nn.Module):
             bar_zsp_children, x_children, z_children
         )
 
-        # 边界条件
-        loss4 = self.compute_boundary_loss_low(Q, b)
-        loss5 = self.compute_boundary_loss_high(Q, b, x, z)
-
+        # 边界条件（regime-aware 下由分支内部决定语义，见下）
         if self.parent_default_regime_mode == "legacy_soft_penalty" or phat is None:
             # legacy：Bellman 覆盖全部 parent，违约侧靠 soft bar_z 惩罚项
             main_q = compute_aio_residual(residuals, self.aio_weight)
@@ -581,6 +804,9 @@ class QLoss(nn.Module):
                 (Q - self.compute_total_recovery(b, x, z)).pow(2) * bar_z,
                 z, self.alpha_z, self.beta_z, self.z0
             )
+            # legacy boundary 语义保持不变（保证旧实验可复现）。
+            loss4 = self.compute_boundary_loss_low(Q, b)
+            loss5 = self.compute_boundary_loss_high(Q, b, x, z)
         else:
             # regime-aware：surviving parent 走 Bellman，default parent 走当期回收
             terms = self.compute_regime_aware_objective(
@@ -593,6 +819,17 @@ class QLoss(nn.Module):
             )
             penalty_z_loss3 = compute_z_penalty(
                 terms["recovery_per_sample"], z, self.alpha_z, self.beta_z, self.z0
+            )
+            # Compatibility-only regime objective. Formal direct-Q training uses
+            # the separate exact-b=0 Q0 path and does not call this boundary term.
+            #  - high-b：recovery 约束只应对 default parent 生效，surviving high-b
+            #    不应因为 b 高就被强制等于 recovery。
+            loss4 = self.compute_boundary_loss_low(
+                Q, b, margin=self.boundary_low_margin
+            )
+            loss5 = (
+                self.compute_boundary_loss_high(Q, b, x, z)
+                * terms["parent_default_weight"]
             )
 
         total_loss = main_q + loss3 + loss4 + loss5 + penalty_z_main + penalty_z_loss3

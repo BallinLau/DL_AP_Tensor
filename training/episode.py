@@ -30,6 +30,7 @@ from config import Config, HyperParams, SIMMODEL
 from data import Sample, SimulateTS, TensorTable, TensorSimulationOutput
 from data.data_utils import compute_quantile_features
 from losses import SDFLoss, P0Loss, PILoss, QLoss, FC2Loss
+from losses.q_loss import classify_q_parent_regimes
 from losses.FC2losspipe import FC2LossPipe
 from losses.utils import compute_z_penalty, compute_aio_residual
 from losses.sdf_loss import (
@@ -835,17 +836,30 @@ class Episode:
             getattr(model, "bpi_head", None),
         ]
         value_modules = [
-            getattr(model, "q_encoder", None),
             getattr(model, "value_encoder", None),
-            getattr(model, "q_head", None),
             getattr(model, "v0_head", None),
             getattr(model, "vi_head", None),
             getattr(model, "barz_model", None),
             getattr(model, "bari_model", None),
+            getattr(model, "q_encoder", None),
+            getattr(model, "q_head", None),
         ]
         policy_encoder = getattr(model, "policy_encoder", None)
         if stage == "pq":
             trainable = value_modules
+        elif stage == "p":
+            trainable = [
+                getattr(model, "value_encoder", None),
+                getattr(model, "v0_head", None),
+                getattr(model, "vi_head", None),
+                getattr(model, "barz_model", None),
+                getattr(model, "bari_model", None),
+            ]
+        elif stage == "q":
+            trainable = [
+                getattr(model, "q_encoder", None),
+                getattr(model, "q_head", None),
+            ]
         elif stage == "bp":
             scope = str(getattr(self.hyperparams, "bp_distill_trainable_scope", "heads_only")).lower()
             trainable = bp_modules if scope == "heads_only" else [policy_encoder, *bp_modules]
@@ -889,6 +903,17 @@ class Episode:
     @staticmethod
     def _snapshot_params(params: List[nn.Parameter]) -> Dict[int, torch.Tensor]:
         return {id(param): param.detach().cpu().clone() for param in params}
+
+    @staticmethod
+    def _restore_params(
+        params: List[nn.Parameter],
+        snapshot: Dict[int, torch.Tensor],
+    ) -> None:
+        with torch.no_grad():
+            for param in params:
+                before = snapshot.get(id(param))
+                if before is not None:
+                    param.copy_(before.to(device=param.device, dtype=param.dtype))
 
     def reset_sdf_shock_bank(self) -> None:
         """Drop cached fresh-pair shock bank when episode/data stage changes."""
@@ -2829,6 +2854,9 @@ class Episode:
 
         冻结 policy_value 的 value/policy/bp heads，并冻结 SDF/FC1 与其它模型，
         不改写任何经济方程。由 ``hyperparams.enable_q_polishing`` 显式开启。
+
+        NOTE: Q polishing support is scaffolding only; not wired into the training loop
+        yet. 该方法目前没有被任何训练 stage 调用，仅作为后续接入的预留接口。
         """
         if 'policy_value' not in self.models:
             return
@@ -5426,7 +5454,180 @@ class Episode:
             self._latest_pi_terms.update(getattr(loss_fn, 'latest_foc_diag', {}))
         return total_loss
     
-    def _compute_q_loss(self, batch: Dict[str, torch.Tensor], *, create_graph: bool = True) -> torch.Tensor:
+    @staticmethod
+    def _slice_q_batch(
+        batch: Dict[str, torch.Tensor],
+        mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Slice parent-aligned Q tensors before any child/Bellman construction."""
+        flat = mask.reshape(-1).bool()
+        parent_n = int(batch["parent"].shape[0])
+        if flat.numel() != parent_n:
+            raise ValueError(f"Q regime mask length {flat.numel()} != parent rows {parent_n}")
+        sliced: Dict[str, Any] = {}
+        for key, value in batch.items():
+            if key == "children" and isinstance(value, list):
+                sliced[key] = [child[flat] for child in value]
+            elif key in {"child0", "child1"} and torch.is_tensor(value):
+                sliced[key] = value[flat]
+            elif torch.is_tensor(value) and value.ndim > 0 and int(value.shape[0]) == parent_n:
+                sliced[key] = value[flat]
+            else:
+                sliced[key] = value
+        return sliced
+
+    def _q_frozen_phat(
+        self,
+        parent_state: torch.Tensor,
+        frozen_p_model: nn.Module,
+    ) -> torch.Tensor:
+        """Evaluate the regime classifier through the frozen equity-only path."""
+        frozen_p_model.eval()
+        with torch.no_grad():
+            equity_fn = getattr(frozen_p_model, "forward_equity", None)
+            if callable(equity_fn):
+                return equity_fn(parent_state.detach())["Phat"].detach()
+            output = frozen_p_model(parent_state.detach())
+            return self._policy_get_out(output, "Phat", -1).detach()
+
+    def _compute_q_zero_loss(self, parent_state: torch.Tensor) -> torch.Tensor:
+        """Q0 path: synthetic exact b=0, no children/SDF/AiO."""
+        model = self.models["policy_value"]
+        zero_state = parent_state[:, :7].clone()
+        zero_state[:, 0:1] = 0.0
+        Q = model._q_output(zero_state)
+        terms = self.loss_fns["q"].compute_zero_debt_objective(
+            Q,
+            nonnegative_weight=float(getattr(self.hyperparams, "q_nonnegative_weight", 1.0)),
+        )
+        with torch.no_grad():
+            negative = Q < 0.0
+            q_abs = Q.abs().reshape(-1)
+            self._latest_q_terms = {
+                "q_regime_zero_n": float(Q.numel()),
+                "q_zero_boundary_loss": float(terms["boundary_loss"].item()),
+                "q_zero_abs_mean": float(q_abs.mean().item()),
+                "q_zero_abs_p90": float(torch.quantile(q_abs, 0.9).item()),
+                "q_zero_abs_max": float(q_abs.max().item()),
+                "q_nonnegative": float(terms["nonnegative_loss"].item()),
+                "q_negative_share": float(negative.float().mean().item()),
+                "q_negative_mean_abs": float((-Q[negative]).mean().item()) if negative.any() else 0.0,
+            }
+        return float(getattr(self.hyperparams, "q_zero_loss_weight", 1.0)) * terms["loss"]
+
+    def _compute_q_default_loss(self, parent_state: torch.Tensor) -> torch.Tensor:
+        """QD path: current-parent recovery regression, no children/SDF/AiO."""
+        model = self.models["policy_value"]
+        state = parent_state[:, :7]
+        Q = model._q_output(state)
+        terms = self.loss_fns["q"].compute_default_parent_objective(
+            Q=Q,
+            b=state[:, 0:1],
+            z=state[:, 1:2],
+            x=state[:, 4:5],
+            nonnegative_weight=float(getattr(self.hyperparams, "q_nonnegative_weight", 1.0)),
+        )
+        with torch.no_grad():
+            negative = Q < 0.0
+            recovery = terms["recovery_current"]
+            error_abs = (Q - recovery).abs().reshape(-1)
+            b_values = state[:, 0].reshape(-1)
+            b_bins = max(2, int(getattr(self.hyperparams, "q_default_b_bins", 10)))
+            b_index = torch.clamp((b_values * b_bins).long(), min=0, max=b_bins - 1)
+            by_bin = {}
+            for bin_idx in range(b_bins):
+                bin_mask = b_index == bin_idx
+                by_bin[f"q_default_b_bin_{bin_idx}_n"] = float(bin_mask.sum().item())
+                by_bin[f"q_default_b_bin_{bin_idx}_mae"] = (
+                    float(error_abs[bin_mask].mean().item()) if bin_mask.any() else 0.0
+                )
+            self._latest_q_terms = {
+                "q_regime_default_n": float(Q.numel()),
+                "q_default_recovery_loss": float(terms["recovery_loss"].item()),
+                "q_default_recovery_abs_mean": float(error_abs.mean().item()),
+                "q_default_recovery_abs_p90": float(torch.quantile(error_abs, 0.9).item()),
+                "q_default_recovery_abs_max": float(error_abs.max().item()),
+                "q_default_Q_mean": float(Q.mean().item()),
+                "q_default_R_mean": float(recovery.mean().item()),
+                "q_nonnegative": float(terms["nonnegative_loss"].item()),
+                "q_negative_share": float(negative.float().mean().item()),
+                "q_negative_mean_abs": float((-Q[negative]).mean().item()) if negative.any() else 0.0,
+                **by_bin,
+            }
+        return float(getattr(self.hyperparams, "q_default_loss_weight", 1.0)) * terms["loss"]
+
+    def _compute_q_loss(
+        self,
+        batch: Dict[str, torch.Tensor],
+        *,
+        create_graph: bool = True,
+        regime: str = "mixed",
+        frozen_p_model: Optional[nn.Module] = None,
+        q_target_model: Optional[nn.Module] = None,
+    ) -> torch.Tensor:
+        """Dispatch mutually exclusive Q regimes before constructing Bellman children."""
+        mode = str(regime).lower()
+        parent = batch["parent"]
+        parent_state = parent[:, :7] if parent.shape[1] > 7 else parent
+        if mode == "zero":
+            return self._compute_q_zero_loss(parent_state)
+        if mode == "default":
+            return self._compute_q_default_loss(parent_state)
+        if mode == "survival":
+            return self._compute_q_survival_bellman_loss(
+                batch,
+                create_graph=create_graph,
+                q_target_model=q_target_model,
+            )
+        if mode != "mixed":
+            raise ValueError(f"Unknown Q regime loss path: {regime!r}")
+
+        frozen_p = frozen_p_model or self._target_policy_value()
+        phat = self._q_frozen_phat(parent_state, frozen_p)
+        masks = classify_q_parent_regimes(
+            parent_state[:, 0:1],
+            phat,
+            zero_b_eps=float(getattr(self.hyperparams, "q_zero_b_eps", 0.0)),
+        )
+        losses: List[torch.Tensor] = []
+        counts: Dict[str, int] = {}
+        latest: Dict[str, float] = {}
+        for name in ("zero", "default", "survival"):
+            mask = masks[name].reshape(-1)
+            count = int(mask.sum().item())
+            counts[name] = count
+            if count == 0:
+                continue
+            subset = self._slice_q_batch(batch, mask)
+            if name == "zero":
+                value = self._compute_q_zero_loss(subset["parent"][:, :7])
+            elif name == "default":
+                value = self._compute_q_default_loss(subset["parent"][:, :7])
+            else:
+                value = self._compute_q_survival_bellman_loss(
+                    subset,
+                    create_graph=create_graph,
+                    q_target_model=q_target_model,
+                )
+            losses.append(value * (float(count) / float(parent_state.shape[0])))
+            latest.update(self._latest_q_terms)
+        if not losses:
+            raise ValueError("Q mixed batch has no classified nonnegative-debt states")
+        self._latest_q_terms = {
+            **latest,
+            "q_regime_zero_n": float(counts["zero"]),
+            "q_regime_default_n": float(counts["default"]),
+            "q_regime_survival_n": float(counts["survival"]),
+        }
+        return torch.stack(losses).sum()
+
+    def _compute_q_survival_bellman_loss(
+        self,
+        batch: Dict[str, torch.Tensor],
+        *,
+        create_graph: bool = True,
+        q_target_model: Optional[nn.Module] = None,
+    ) -> torch.Tensor:
         """
         计算 Q 损失（支持任意 N 分支）
         """
@@ -5447,14 +5648,12 @@ class Episode:
         if not children:
             raise ValueError("No children data in batch")
 
-        # Q-only 阶段控制：用于“冻结非 Q 参数 + warm-start”
+        # Q-only stage control. Direct-Q no longer uses the legacy Gaussian
+        # warm-start; Q0 is the only analytical bootstrap boundary.
         q_only_stage = bool(getattr(self, "_q_only_stage", False))
         q_freeze_mode = q_only_stage and bool(
             getattr(self.hyperparams, "q_freeze_non_q_in_pretrain", True)
         )
-        current_epoch = int(getattr(self, "_current_epoch_idx", 0))
-        warm_epochs = max(0, int(getattr(self.hyperparams, "q_warmstart_epochs", 0)))
-        use_warmstart = current_epoch < warm_epochs
 
         # 获取 SDF（优先用 batch 内的 M，避免重复计算）
         if parent.shape[1] > 7:
@@ -5477,7 +5676,7 @@ class Episode:
 
         # 前向传播（Q 形状正则需要对输入求梯度）
         parent_state = strip_extra(parent).clone().detach().requires_grad_(True)
-        target_model = self._target_policy_value()
+        target_model = q_target_model or self._target_policy_value()
 
         def _get_out(out, name: str, idx: int) -> torch.Tensor:
             if isinstance(out, dict):
@@ -5495,22 +5694,11 @@ class Episode:
         with torch.no_grad():
             output_t_target = target_model(parent_state.detach())
 
-        bp0_t = _get_out(output_t_target, 'bp0', 1).detach()
-        bpI_t = _get_out(output_t_target, 'bpI', 2).detach()
         bar_i_t = _get_out(output_t_target, 'bar_i', 5).detach()
-        bp_t = _get_out(output_t_target, 'bp', -1).detach()
-        if bp_t.shape != bp0_t.shape:
-            bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
         b_parent = parent_state[:, 0:1]
-        bar_z_t = _get_out(output_t_target, 'bar_z', 6).detach()
-        # 当期 parent 是否已违约（Phat_t <= 0）决定 Q 方程 regime；
-        # 用 target model 的 Phat（detached）作为 gate，避免对指示函数求梯度。
-        phat_t = _get_out(output_t_target, 'Phat', -1).detach()
         bar_i_use = bar_i_t
         if self._pv_use_fixed_policy():
             bar_i_use = torch.zeros_like(bar_i_t)
-        bp_use = bp_t
-        bar_z_use = bar_z_t
         # 与 q_loss 主方程保持一致：Qsp 输入使用 b' = b / (bar_i*(G-1)+1)
         g_val = float(getattr(loss_fn, "g", 1.0))
         multiplier = bar_i_use * (g_val - 1.0) + 1.0
@@ -5540,41 +5728,17 @@ class Episode:
         )  # List[(batch,1)]
         residuals = self._collapse_policy_eta_pairs(residuals)
 
-        # 其余约束在 episode 层做聚合。
-        # regime-aware：surviving parent 走 Bellman AiO，default parent 走当期回收；
-        # legacy_soft_penalty：Bellman 覆盖全部 parent，违约侧靠 soft bar_z 惩罚项。
-        q_regime_mode = getattr(loss_fn, "parent_default_regime_mode", "legacy_soft_penalty")
-        regime_terms = None
-        if q_regime_mode == "legacy_soft_penalty":
-            aio_residual = compute_aio_residual(residuals, loss_fn.aio_weight)
-            main_loss = aio_residual.mean()
-            loss3 = loss_fn.compute_bar_z_constraint(Q, b_parent, x_parent, z_parent, bar_z_use).mean()
-            penalty_z_main = compute_z_penalty(
-                aio_residual, z_parent,
-                loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
-            )
-            penalty_z_loss3 = compute_z_penalty(
-                (Q - loss_fn.compute_total_recovery(b_parent, x_parent, z_parent)).pow(2) * bar_z_use,
-                z_parent, loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
-            )
-        else:
-            regime_terms = loss_fn.compute_regime_aware_objective(
-                residuals=residuals, Q=Q, b=b_parent, x=x_parent, z=z_parent, phat=phat_t,
-            )
-            aio_residual = regime_terms["aio_residual"]
-            main_loss = regime_terms["bellman_loss"]
-            loss3 = regime_terms["recovery_loss"]
-            penalty_z_main = compute_z_penalty(
-                regime_terms["bellman_per_sample"], z_parent,
-                loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
-            )
-            penalty_z_loss3 = compute_z_penalty(
-                regime_terms["recovery_per_sample"], z_parent,
-                loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
-            )
-
-        loss4 = loss_fn.compute_boundary_loss_low(Q, b_parent).mean()
-        loss5 = loss_fn.compute_boundary_loss_high(Q, b_parent, x_parent, z_parent).mean()
+        survival_terms = loss_fn.compute_survival_parent_objective(
+            residuals=residuals,
+            Q=Q,
+            nonnegative_weight=float(getattr(self.hyperparams, "q_nonnegative_weight", 1.0)),
+        )
+        aio_residual = survival_terms["aio_residual"]
+        main_loss = survival_terms["bellman_loss"]
+        penalty_z_main = compute_z_penalty(
+            aio_residual, z_parent,
+            loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
+        )
 
         # Q 形状正则：
         # 1) dQ/dz > 0
@@ -5609,45 +5773,28 @@ class Episode:
         )
 
         physics_loss = (
-            main_loss + loss3 + loss4 + loss5 +
-            penalty_z_main + penalty_z_loss3 + q_shape_penalty
+            survival_terms["loss"] + penalty_z_main + q_shape_penalty
         )
-        warm_loss = torch.tensor(0.0, device=self.device)
-        warm_weight = 0.0
-        if use_warmstart:
-            warm_weight = float(getattr(self.hyperparams, "q_warmstart_weight", 1.0))
-            A = float(getattr(self.hyperparams, "q_warm_A", 1.0))
-            b_star = float(getattr(self.hyperparams, "q_warm_b_star", 0.05))
-            sigma = max(1e-6, float(getattr(self.hyperparams, "q_warm_sigma", 0.15)))
-            alpha_z = float(getattr(self.hyperparams, "q_warm_alpha_z", 0.15))
-            alpha_x = float(getattr(self.hyperparams, "q_warm_alpha_x", 0.15))
-            b_nonneg = torch.clamp(b_parent, min=0.0)
-            gaussian_peak = torch.exp(-0.5 * ((b_parent - b_star) / sigma).pow(2))
-            risk_term = torch.exp((alpha_z * z_parent + alpha_x * x_parent).clamp(-10.0, 10.0))
-            q_warm_target = (A * b_nonneg * gaussian_peak * risk_term).detach()
-            warm_loss = (Q - q_warm_target).pow(2).mean()
-
-        total_loss = physics_loss + warm_weight * warm_loss
-        if regime_terms is not None:
-            survival_w = regime_terms["parent_survival_weight"]
-            default_w = regime_terms["parent_default_weight"]
-        else:
-            survival_w = torch.ones_like(b_parent)
-            default_w = torch.zeros_like(b_parent)
+        total_loss = float(getattr(self.hyperparams, "q_survival_loss_weight", 1.0)) * physics_loss
         with torch.no_grad():
+            negative = Q < 0.0
+            branch_residual = torch.stack([value.reshape(-1) for value in residuals], dim=1)
+            branch_abs = branch_residual.abs().reshape(-1)
             self._latest_q_terms = {
                 'q_main': float(main_loss.item()),
-                'q_recovery': float(loss3.item()),
-                'q_bdry_low': float(loss4.item()),
-                'q_bdry_high': float(loss5.item()),
+                'q_regime_survival_n': float(Q.numel()),
+                'q_survival_bellman_signed_mean': float(branch_residual.mean().item()),
+                'q_survival_bellman_abs_mean': float(branch_abs.mean().item()),
+                'q_survival_bellman_abs_p90': float(torch.quantile(branch_abs, 0.9).item()),
+                'q_nonnegative': float(survival_terms["nonnegative_loss"].item()),
+                'q_negative_share': float(negative.float().mean().item()),
+                'q_negative_mean_abs': float((-Q[negative]).mean().item()) if negative.any() else 0.0,
                 'q_shape_z': float(q_shape_z.item()),
                 'q_shape_b_low': float(q_shape_b_low.item()),
                 'q_shape_b_high': float(q_shape_b_high.item()),
                 'q_physics': float(physics_loss.item()),
-                'q_warmstart': float(warm_loss.item()),
-                'q_warm_weight': float(warm_weight),
-                'q_parent_survival_weight_mean': float(survival_w.mean().item()),
-                'q_parent_default_weight_mean': float(default_w.mean().item()),
+                'q_parent_survival_weight_mean': 1.0,
+                'q_parent_default_weight_mean': 0.0,
                 'q_pretrain_mode': float(1.0 if q_only_stage else 0.0),
                 'q_freeze_mode': float(1.0 if q_freeze_mode else 0.0),
             }
@@ -7449,7 +7596,7 @@ class Episode:
         teacher: nn.Module,
         n_epochs: int,
     ) -> Dict[str, Any]:
-        params = self._policy_value_stage_params("pq")
+        params = self._policy_value_stage_params("p")
         bp_params = self._policy_value_stage_params("bp")
         bp_snapshot = self._snapshot_params(bp_params)
         if not train_batches:
@@ -7540,7 +7687,7 @@ class Episode:
             train_cache_hash_before = self._pq_value_cache_hash(train_cache)
             val_cache_hash_before = self._pq_value_cache_hash(val_cache)
             model.train()
-            with self._policy_value_train_scope("pq"):
+            with self._policy_value_train_scope("p"):
                 for epoch in range(int(n_epochs)):
                     epoch_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
                     step_count_before_epoch = int(self.step_count)
@@ -7566,7 +7713,7 @@ class Episode:
                             batch,
                             cache_item,
                             q_create_graph=True,
-                            include_q=True,
+                            include_q=False,
                         )
                         if not torch.isfinite(total):
                             nonfinite_count += 1
@@ -7645,7 +7792,7 @@ class Episode:
                             "skip_ratio": skip_ratio,
                         })
                         continue
-                    score, val_summary = self._evaluate_cached_pq_score(val_source, val_cache)
+                    score, val_summary = self._evaluate_cached_p_score(val_source, val_cache)
                     if not np.isfinite(score):
                         self._restore_policy_value_stage_checkpoint(
                             optimizer,
@@ -8321,6 +8468,41 @@ class Episode:
         avg, meta = self._aggregate_metric_records(records)
         return float(avg.get("total", float("inf"))), {**avg, **meta, "validation_batches": len(batches)}
 
+    def _evaluate_cached_p_score(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+        cache: List[PQValueTargetBatch],
+    ) -> Tuple[float, Dict[str, Any]]:
+        """Evaluate the frozen-teacher P stage without evaluating or training Q."""
+        # Preserve instance-level test/instrumentation hooks that historically
+        # replaced the joint scorer, while production always uses the P-only path.
+        legacy_override = self.__dict__.get("_evaluate_cached_pq_score")
+        if callable(legacy_override):
+            return legacy_override(batches, cache)
+        if not batches:
+            return float("inf"), {"validation_batches": 0}
+        if len(batches) != len(cache):
+            raise RuntimeError(
+                f"P validation batches and cache length mismatch: {len(batches)} != {len(cache)}"
+            )
+        model = self.models["policy_value"]
+        was_training = model.training
+        records: List[Dict[str, Any]] = []
+        try:
+            model.eval()
+            with torch.no_grad():
+                for batch, cache_item in zip(batches, cache):
+                    _, losses = self._compute_cached_value_loss(batch, cache_item)
+                    records.append(losses)
+        finally:
+            model.train(was_training)
+        avg, meta = self._aggregate_metric_records(records)
+        return float(avg.get("total", float("inf"))), {
+            **avg,
+            **meta,
+            "validation_batches": len(batches),
+        }
+
     def _bp_cache_hash(self, cache: List[Dict[str, Any]]) -> str:
         tensors: List[torch.Tensor] = []
         for item in cache:
@@ -8966,6 +9148,309 @@ class Episode:
             "train_metrics": {**avg, **meta},
         }
 
+    def _build_q_default_coverage_states(
+        self,
+        parent_state: torch.Tensor,
+        frozen_p_model: nn.Module,
+        *,
+        requested: Optional[int] = None,
+        phat_eps: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Build stratified positive-debt `(b,z)` candidates and keep deep defaults."""
+        base = parent_state[:, :7].detach()
+        if base.shape[0] == 0:
+            return base
+        multiplier = max(1, int(getattr(self.hyperparams, "q_default_candidate_multiplier", 4)))
+        desired_n = max(1, int(requested) if requested is not None else int(base.shape[0]))
+        candidate_n = desired_n * multiplier
+        b_bins = max(2, int(getattr(self.hyperparams, "q_default_b_bins", 10)))
+        device, dtype = base.device, base.dtype
+        b_centers = (torch.arange(b_bins, device=device, dtype=dtype) + 0.5) / float(b_bins)
+        z_std = float(self.config.z_stationary_std())
+        deep_eps = max(0.0, float(
+            getattr(self.hyperparams, "q_default_phat_eps", 1e-2)
+            if phat_eps is None else phat_eps
+        ))
+        result = base[:0]
+        for _ in range(4):
+            source_idx = torch.arange(candidate_n, device=device) % int(base.shape[0])
+            candidates = base[source_idx].clone()
+            z_bins = max(5, min(2 * b_bins + 1, candidate_n))
+            z_grid = torch.linspace(
+                float(self.config.ZBAR) - 4.0 * z_std,
+                float(self.config.ZBAR) + 4.0 * z_std,
+                z_bins,
+                device=device,
+                dtype=dtype,
+            )
+            positions = torch.arange(candidate_n, device=device)
+            candidates[:, 0] = b_centers[positions % b_bins]
+            candidates[:, 1] = z_grid[(positions // b_bins) % z_bins]
+            phat = self._q_frozen_phat(candidates, frozen_p_model)
+            selected = (candidates[:, 0:1] > 0.0) & (phat <= -deep_eps)
+            result = candidates[selected.reshape(-1)]
+            if result.shape[0] >= desired_n:
+                break
+            candidate_n *= 2
+        if result.shape[0] > desired_n:
+            result = result[:desired_n]
+        return result
+
+    @staticmethod
+    def _index_q_batch(
+        batch: Dict[str, torch.Tensor],
+        indices: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        parent_n = int(batch["parent"].shape[0])
+        indexed: Dict[str, Any] = {}
+        for key, value in batch.items():
+            if key == "children" and isinstance(value, list):
+                indexed[key] = [child[indices] for child in value]
+            elif key in {"child0", "child1"} and torch.is_tensor(value):
+                indexed[key] = value[indices]
+            elif torch.is_tensor(value) and value.ndim > 0 and int(value.shape[0]) == parent_n:
+                indexed[key] = value[indices]
+            else:
+                indexed[key] = value
+        return indexed
+
+    def _build_q_survival_batch(
+        self,
+        batch: Dict[str, torch.Tensor],
+        frozen_p_model: nn.Module,
+        *,
+        requested: Optional[int] = None,
+        phat_eps: Optional[float] = None,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Keep matched survival transitions and add deterministic b/z-bin replay."""
+        parent = batch["parent"]
+        state = parent[:, :7] if parent.shape[1] > 7 else parent
+        phat = self._q_frozen_phat(state, frozen_p_model)
+        b_eps = float(getattr(self.hyperparams, "q_zero_b_eps", 0.0))
+        strict_eps = max(0.0, float(
+            getattr(self.hyperparams, "q_default_phat_eps", 1e-2)
+            if phat_eps is None else phat_eps
+        ))
+        keep = ((state[:, 0:1] > b_eps) & (phat > strict_eps)).reshape(-1)
+        if not keep.any():
+            return None
+        subset = self._slice_q_batch(batch, keep)
+        n = int(subset["parent"].shape[0])
+        if requested is not None and n > int(requested):
+            positions = torch.linspace(0, n - 1, int(requested), device=state.device).round().long()
+            subset = self._index_q_batch(subset, positions)
+            n = int(subset["parent"].shape[0])
+        ondist = min(max(float(getattr(self.hyperparams, "q_survival_ondist_share", 0.8)), 1e-6), 1.0)
+        extra_n = max(0, int(round(n * (1.0 - ondist) / ondist)))
+        if extra_n <= 0 or n <= 1:
+            return subset
+        values = subset["parent"][:, :2].detach()
+        # Deterministic coverage replay: sort by a joint normalized b/z key, then
+        # sample evenly across that support. Parent-child rows remain matched.
+        b = values[:, 0]
+        z = values[:, 1]
+        b_norm = (b - b.min()) / (b.max() - b.min()).clamp_min(1e-8)
+        z_norm = (z - z.min()) / (z.max() - z.min()).clamp_min(1e-8)
+        order = torch.argsort(b_norm + 2.0 * z_norm)
+        positions = torch.linspace(0, n - 1, extra_n, device=order.device).round().long()
+        replay = order[positions]
+        indices = torch.cat([torch.arange(n, device=order.device), replay], dim=0)
+        return self._index_q_batch(subset, indices)
+
+    def _run_q_regime_phase(
+        self,
+        *,
+        phase: str,
+        batches: List[Dict[str, torch.Tensor]],
+        frozen_p_model: nn.Module,
+        q_target_model: nn.Module,
+        epochs: int,
+    ) -> Dict[str, Any]:
+        """Run one direct-Q phase while every non-Q parameter remains frozen."""
+        phase = str(phase).lower()
+        if phase not in {"zero", "default", "survival", "polish"}:
+            raise ValueError(f"Unknown Q phase: {phase!r}")
+        if epochs <= 0:
+            return {"phase": phase, "status": "disabled", "optimizer_steps": 0}
+        q_params = self._policy_value_stage_params("q")
+        optimizer = self._make_policy_value_stage_optimizer(q_params)
+        model = self.models["policy_value"]
+        non_q_params = [p for p in model.parameters() if id(p) not in {id(q) for q in q_params}]
+        q_phase_start = self._snapshot_params(q_params)
+        non_q_snapshot = self._snapshot_params(non_q_params)
+        frozen_p_hash_before = self._state_dict_hash(frozen_p_model)
+        records: List[Dict[str, Any]] = []
+        epoch_history: List[Dict[str, Any]] = []
+        optimizer_steps = 0
+        skipped = 0
+        rollback_reason: Optional[str] = None
+        was_training = model.training
+        model.train()
+        try:
+            with self._policy_value_train_scope("q"):
+                for epoch in range(int(epochs)):
+                    epoch_record_start = len(records)
+                    for batch in tqdm(batches, desc=f"Q {phase} {epoch + 1}/{epochs}"):
+                        optimizer.zero_grad(set_to_none=True)
+                        source_parent = batch["parent"]
+                        source_state = source_parent[:, :7] if source_parent.shape[1] > 7 else source_parent
+                        if phase == "zero":
+                            loss = self._compute_q_zero_loss(source_state)
+                        elif phase == "default":
+                            default_states = self._build_q_default_coverage_states(
+                                source_state, frozen_p_model
+                            )
+                            if default_states.shape[0] == 0:
+                                skipped += 1
+                                continue
+                            loss = self._compute_q_default_loss(default_states)
+                        elif phase == "survival":
+                            survival_batch = self._build_q_survival_batch(batch, frozen_p_model)
+                            if survival_batch is None:
+                                skipped += 1
+                                continue
+                            loss = self._compute_q_survival_bellman_loss(
+                                survival_batch,
+                                q_target_model=q_target_model,
+                            )
+                        else:
+                            total_n = max(1, int(source_state.shape[0]))
+                            zero_n = max(1, int(round(total_n * float(getattr(self.hyperparams, "q_zero_sample_share", 0.2)))))
+                            default_n = max(1, int(round(total_n * float(getattr(self.hyperparams, "q_default_sample_share", 0.3)))))
+                            survival_n = max(1, int(round(total_n * float(getattr(self.hyperparams, "q_survival_sample_share", 0.5)))))
+                            polish_terms: List[torch.Tensor] = []
+                            polish_weights: List[float] = []
+                            polish_terms.append(self._compute_q_zero_loss(source_state[:zero_n]))
+                            polish_weights.append(float(getattr(self.hyperparams, "q_zero_sample_share", 0.2)))
+                            default_states = self._build_q_default_coverage_states(
+                                source_state, frozen_p_model, requested=default_n, phat_eps=0.0
+                            )
+                            if default_states.shape[0] > 0:
+                                polish_terms.append(self._compute_q_default_loss(default_states))
+                                polish_weights.append(float(getattr(self.hyperparams, "q_default_sample_share", 0.3)))
+                            survival_batch = self._build_q_survival_batch(
+                                batch, frozen_p_model, requested=survival_n, phat_eps=0.0
+                            )
+                            if survival_batch is not None:
+                                polish_terms.append(self._compute_q_survival_bellman_loss(
+                                    survival_batch,
+                                    q_target_model=q_target_model,
+                                ))
+                                polish_weights.append(float(getattr(self.hyperparams, "q_survival_sample_share", 0.5)))
+                            if not polish_terms:
+                                skipped += 1
+                                continue
+                            weight_sum = max(sum(polish_weights), 1e-12)
+                            loss = sum(
+                                term * (weight / weight_sum)
+                                for term, weight in zip(polish_terms, polish_weights)
+                            )
+                        if not torch.isfinite(loss):
+                            rollback_reason = "nonfinite_loss"
+                            break
+                        loss.backward()
+                        raw_norm, clipped_norm = self._clip_params_with_raw_norm(
+                            q_params,
+                            float(getattr(self.hyperparams, "pv_eval_grad_clip_norm", 10.0)),
+                        )
+                        if not np.isfinite(raw_norm):
+                            optimizer.zero_grad(set_to_none=True)
+                            rollback_reason = "nonfinite_gradient"
+                            break
+                        optimizer.step()
+                        optimizer_steps += 1
+                        self.step_count += 1
+                        records.append({
+                            "total": float(loss.detach().item()),
+                            "q_raw_grad_norm": raw_norm,
+                            "q_clipped_grad_norm": clipped_norm,
+                            **getattr(self, "_latest_q_terms", {}),
+                        })
+                    epoch_records = records[epoch_record_start:]
+                    epoch_avg, epoch_meta = self._aggregate_metric_records(epoch_records)
+                    epoch_history.append({
+                        "epoch": int(epoch + 1),
+                        "optimizer_steps": int(len(epoch_records)),
+                        "metrics": {**epoch_avg, **epoch_meta},
+                    })
+                    if rollback_reason is not None:
+                        break
+        finally:
+            model.train(was_training)
+        if rollback_reason is not None:
+            self._restore_params(q_params, q_phase_start)
+        frozen_p_hash_after = self._state_dict_hash(frozen_p_model)
+        if frozen_p_hash_after != frozen_p_hash_before:
+            raise RuntimeError("Frozen P snapshot changed during Q training")
+        non_q_change = self._param_max_change_from_snapshot(non_q_params, non_q_snapshot)
+        if non_q_change != 0.0:
+            raise RuntimeError(f"Non-Q policy/value parameters changed during Q phase: {non_q_change}")
+        avg, meta = self._aggregate_metric_records(records)
+        return {
+            "phase": phase,
+            "status": (
+                "rejected_numerical"
+                if rollback_reason is not None
+                else ("accepted" if optimizer_steps > 0 else "skipped_no_samples")
+            ),
+            "epochs": int(epochs),
+            "optimizer_steps": int(optimizer_steps),
+            "skipped_batches": int(skipped),
+            "rollback_reason": rollback_reason,
+            "frozen_p_hash_before": frozen_p_hash_before,
+            "frozen_p_hash_after": frozen_p_hash_after,
+            "non_q_parameter_max_change": non_q_change,
+            "metrics": {**avg, **meta},
+            "epoch_history": epoch_history,
+        }
+
+    def _run_q_regime_training(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+        frozen_p_model: nn.Module,
+    ) -> Dict[str, Any]:
+        """Run Q0 -> QD -> QS -> optional polish with one fixed P classifier."""
+        if not batches or any("parent" not in batch for batch in batches):
+            return {
+                "status": "skipped_missing_q_training_batches",
+                "q_parameterization": getattr(self.models["policy_value"], "q_parameterization", None),
+                "phases": [],
+                "optimizer_steps": 0,
+            }
+        frozen_p_model.eval()
+        frozen_p_model.requires_grad_(False)
+        phase_specs = [
+            ("zero", int(getattr(self.hyperparams, "q_zero_boundary_epochs", 5))),
+            ("default", int(getattr(self.hyperparams, "q_default_pretrain_epochs", 10))),
+            ("survival", int(getattr(self.hyperparams, "q_survival_aio_epochs", 20))),
+            ("polish", int(getattr(self.hyperparams, "q_mixed_polish_epochs", 5))),
+        ]
+        summaries: List[Dict[str, Any]] = []
+        for phase, epochs in phase_specs:
+            # The continuation-Q target is fixed within each phase. Refreshing it
+            # between phases never changes the separate frozen-P classifier.
+            q_target_model = deepcopy(self.models["policy_value"]).to(self.device)
+            q_target_model.eval()
+            q_target_model.requires_grad_(False)
+            phase_summary = self._run_q_regime_phase(
+                phase=phase,
+                batches=batches,
+                frozen_p_model=frozen_p_model,
+                q_target_model=q_target_model,
+                epochs=epochs,
+            )
+            summaries.append(phase_summary)
+            if phase_summary.get("status") == "rejected_numerical":
+                break
+        failed = any(item.get("status") == "rejected_numerical" for item in summaries)
+        return {
+            "status": "rejected_numerical" if failed else "accepted",
+            "q_parameterization": getattr(self.models["policy_value"], "q_parameterization", None),
+            "frozen_p_hash": self._state_dict_hash(frozen_p_model),
+            "phases": summaries,
+            "optimizer_steps": int(sum(item.get("optimizer_steps", 0) for item in summaries)),
+        }
+
     def _run_policy_value_staged(
         self,
         pv_train_batches: List[Dict[str, torch.Tensor]],
@@ -9048,6 +9533,17 @@ class Episode:
                     "target_grid_validation_batches": len(validation_batches),
                 }
 
+            # Freeze the P solution once for the entire Q stage. The Q continuation
+            # target is maintained separately inside _run_q_regime_training, so Q
+            # target refreshes can never move this Phat classifier.
+            frozen_p_snapshot = deepcopy(self.models["policy_value"]).to(self.device)
+            frozen_p_snapshot.eval()
+            frozen_p_snapshot.requires_grad_(False)
+            q_summary = self._run_q_regime_training(
+                pv_train_batches,
+                frozen_p_snapshot,
+            )
+
             bp_teacher = deepcopy(self.models["policy_value"]).to(self.device)
             bp_teacher.eval()
             bp_teacher.requires_grad_(False)
@@ -9084,6 +9580,10 @@ class Episode:
             bp_summary["validation_cache_resampled"] = False
             stages_successful = (
                 pq_summary.get("status") == "accepted"
+                and q_summary.get("status") in {
+                    "accepted",
+                    "skipped_missing_q_training_batches",
+                }
                 and bp_summary.get("status") in {"accepted", "skipped_no_active_refinancing"}
             )
             if not stages_successful:
@@ -9097,6 +9597,7 @@ class Episode:
                     "policy_value_training_flow": "staged",
                     "policy_value_stage_status": "failed_bp",
                     "policy_value_evaluation_stage": pq_summary,
+                    "q_regime_training_stage": q_summary,
                     "bp_distillation_stage": bp_summary,
                     "firm_target_stage_update": {
                         "firm_target_update_mode": firm_mode,
@@ -9136,6 +9637,7 @@ class Episode:
                 "policy_value_training_flow": "staged",
                 "policy_value_stage_status": "accepted",
                 "policy_value_evaluation_stage": pq_summary,
+                "q_regime_training_stage": q_summary,
                 "bp_distillation_stage": bp_summary,
                 "firm_target_stage_update": {
                     "firm_target_update_mode": firm_mode,

@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 
 from analysis.checkpoint_loader import load_analysis_checkpoint  # noqa: E402
 from config import Config  # noqa: E402
+from losses.q_loss import resolve_q_regime_settings  # noqa: E402
 from evaluation.boundaries import (  # noqa: E402
     compare_hard_soft_default_boundaries,
     extract_phat_default_boundary,
@@ -325,13 +326,25 @@ def _q_peak_diagnostics_frame(
         "parent_hard_default": pick("parent_hard_default"),
         "parent_survival_weight": pick("parent_survival_weight"),
         "parent_default_weight": pick("parent_default_weight"),
+        "bellman_weight": pick("parent_survival_weight"),
+        "recovery_weight": pick("parent_default_weight"),
         "recovery_current": pick("recovery_current"),
         "Q_target": pick("Q_target"),
         "Q_target_survival": pick("Q_target_survival"),
         "Q_target_recovery": pick("Q_target_recovery"),
+        # 显式 Bellman 口径分解。
+        "Q_target_bellman": pick("Q_target_bellman"),
+        "Q_target_survival_bellman": pick("Q_target_survival_bellman"),
+        "Q_target_recovery_bellman": pick("Q_target_recovery_bellman"),
+        # transition_band 下 AiO 非线性，w*Q_B + (1-w)*R 不是严格 optimizer target，
+        # 只能作为 blended reference；Q_target_training 保留为兼容 alias。
+        "Q_target_blended_reference": pick("Q_target_training"),
+        "Q_target_training": pick("Q_target_training"),
         "Q_minus_recovery": pick("Q_minus_recovery"),
         "Q_minus_Q_target": pick("Q_minus_Q_target"),
         "Q_target_minus_recovery": pick("Q_target_minus_recovery"),
+        "RQ_bellman_signed": pick("RQ_bellman_signed"),
+        "RQ_blended_reference_signed": pick("RQ_training_signed"),
     })
 
 
@@ -384,32 +397,35 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     model.eval()
     sdf_fc1_model.eval()
 
-    def _resolve_q_mode(arg_value, hyperparam_name: str, config_name: str):
-        if arg_value is not None:
-            return arg_value
-        hp_value = getattr(loaded.hyperparams, hyperparam_name, None)
-        if hp_value:
-            return hp_value
-        return getattr(Config, config_name, None)
-
-    recovery_normalization_mode = _resolve_q_mode(
-        getattr(args, "recovery_normalization_mode", None),
-        "q_recovery_normalization_mode", "RECOVERY_NORMALIZATION_MODE",
+    # 统一解析 Q regime / recovery 口径（CLI > checkpoint > legacy fallback > Config）。
+    # 旧 checkpoint 的 hyperparams payload 不含 q_recovery_normalization_mode，
+    # 必须靠 loader 记录的“真实字段集合”判定，否则会被静默解释为 Config.asset_only。
+    recorded_fields = None
+    if isinstance(getattr(loaded, "metadata", None), dict):
+        recorded_fields = loaded.metadata.get("q_semantics_recorded_fields", None)
+    q_settings = resolve_q_regime_settings(
+        cli_recovery_normalization_mode=getattr(args, "recovery_normalization_mode", None),
+        cli_parent_default_regime_mode=getattr(args, "q_parent_default_regime_mode", None),
+        cli_parent_default_eps=getattr(args, "q_parent_default_eps", None),
+        cli_parent_default_tau=getattr(args, "q_parent_default_tau", None),
+        checkpoint_recovery_normalization_mode=getattr(
+            loaded.hyperparams, "q_recovery_normalization_mode", None
+        ),
+        checkpoint_parent_default_regime_mode=getattr(
+            loaded.hyperparams, "q_parent_default_regime_mode", None
+        ),
+        checkpoint_parent_default_eps=getattr(
+            loaded.hyperparams, "q_parent_default_eps", None
+        ),
+        checkpoint_parent_default_tau=getattr(
+            loaded.hyperparams, "q_parent_default_tau", None
+        ),
+        checkpoint_recorded_fields=recorded_fields,
     )
-    q_parent_default_regime_mode = _resolve_q_mode(
-        getattr(args, "q_parent_default_regime_mode", None),
-        "q_parent_default_regime_mode", "Q_PARENT_DEFAULT_REGIME_MODE",
-    )
-    q_parent_default_eps = (
-        args.q_parent_default_eps
-        if getattr(args, "q_parent_default_eps", None) is not None
-        else getattr(loaded.hyperparams, "q_parent_default_eps", None)
-    )
-    q_parent_default_tau = (
-        args.q_parent_default_tau
-        if getattr(args, "q_parent_default_tau", None) is not None
-        else getattr(loaded.hyperparams, "q_parent_default_tau", None)
-    )
+    recovery_normalization_mode = q_settings["recovery_normalization_mode"]
+    q_parent_default_regime_mode = q_settings["q_parent_default_regime_mode"]
+    q_parent_default_eps = q_settings["q_parent_default_eps"]
+    q_parent_default_tau = q_settings["q_parent_default_tau"]
     hash_locally = not bool(getattr(args, "defer_model_state_hash", False))
     before_hashes = (
         {
@@ -857,10 +873,25 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         "firm_data": str(args.firm_data.resolve()),
         "macro_data": reference.macro_source,
         "bp_teacher_model": "policy_value",
+        "q_parameterization": loaded.metadata.get("q_parameterization"),
         "q_parent_default_regime_mode": q_parent_default_regime_mode,
         "eps_default": q_parent_default_eps,
         "tau_parent_default": q_parent_default_tau,
         "recovery_normalization_mode": recovery_normalization_mode,
+        # resolved 参数及其来源（cli / checkpoint / legacy_checkpoint_fallback /
+        # config_default），避免 metadata 写成 None 而实际运行使用了别的值。
+        "recovery_normalization_mode_resolved": q_settings["recovery_normalization_mode"],
+        "recovery_normalization_mode_source": q_settings[
+            "recovery_normalization_mode_source"
+        ],
+        "q_parent_default_regime_mode_source": q_settings[
+            "q_parent_default_regime_mode_source"
+        ],
+        "q_parent_default_eps_source": q_settings["q_parent_default_eps_source"],
+        "q_parent_default_tau_source": q_settings["q_parent_default_tau_source"],
+        "q_boundary_low_margin": float(
+            getattr(Config, "Q_BOUNDARY_LOW_MARGIN", 1e-3)
+        ),
         "parent_eta": float(args.eta),
         "n_child_shocks": int(args.n_child_shocks),
         "eta_integration_mode": transition_meta.get("eta_integration_mode"),
@@ -943,7 +974,8 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
                 "crossings, nonfinite scans, or states outside Phat>0"
             ),
             "Q": "total debt value",
-            "q_unit": "Q/b for b>1e-12; NaN at b=0",
+            "q_parameterization": loaded.metadata.get("q_parameterization"),
+            "q_unit": "derived reporting ratio Q/b for b>1e-12; NaN at b=0; not a direct-Q head output",
             "bp_consistency_masks": (
                 "Raw statistics use the full finite grid; survival statistics require finite Phat(i)>0; "
                 "primary statistics additionally require BPGridTeacher top2_margin above the configured tolerance"
@@ -1232,6 +1264,22 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
         "recovery_normalization_mode": primary_case_metadata.get(
             "recovery_normalization_mode"
         ),
+        "recovery_normalization_mode_resolved": primary_case_metadata.get(
+            "recovery_normalization_mode_resolved"
+        ),
+        "recovery_normalization_mode_source": primary_case_metadata.get(
+            "recovery_normalization_mode_source"
+        ),
+        "q_parent_default_regime_mode_source": primary_case_metadata.get(
+            "q_parent_default_regime_mode_source"
+        ),
+        "q_parent_default_eps_source": primary_case_metadata.get(
+            "q_parent_default_eps_source"
+        ),
+        "q_parent_default_tau_source": primary_case_metadata.get(
+            "q_parent_default_tau_source"
+        ),
+        "q_boundary_low_margin": primary_case_metadata.get("q_boundary_low_margin"),
         "model_state_hash_before": hash_before,
         "model_state_hash_after": hash_after,
         "model_state_hash_scope": "outer_episode" if defer_hash_to_outer else "matrix",

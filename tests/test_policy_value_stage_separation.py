@@ -435,13 +435,21 @@ def test_cached_pq_validation_uses_first_order_q_graph(monkeypatch):
         return original_grad(*args, **kwargs)
 
     monkeypatch.setattr(torch.autograd, "grad", _recording_grad)
-    episode._evaluate_cached_pq_score([batch], cache)
+    episode._compute_q_survival_bellman_loss(
+        batch,
+        create_graph=False,
+        q_target_model=episode.firm_target,
+    )
 
     assert flags
     assert all(flag is False for flag in flags)
 
     flags.clear()
-    episode._compute_cached_pq_loss(batch, cache[0], q_create_graph=True)
+    episode._compute_q_survival_bellman_loss(
+        batch,
+        create_graph=True,
+        q_target_model=episode.firm_target,
+    )
     assert any(flag is True for flag in flags)
 
 

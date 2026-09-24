@@ -15,18 +15,22 @@ import numpy as np
 import pytest
 import torch
 
+from analysis.checkpoint_loader import load_analysis_checkpoint
 from analysis.economic_config import AnalysisEconomicConfig
-from config import Config
+from config import Config, HyperParams
 from evaluation.bellman_diagnostics import evaluate_bellman_residuals
 from evaluation.bp_diagnostics import FrozenTransitionData
 from evaluation.firm_surfaces import evaluate_firm_surfaces
 from evaluation.grids import ReferenceFirmState, build_frozen_grid
+from experiments.run_utils import build_models
 from losses.q_loss import (
+    LEGACY_RECOVERY_NORMALIZATION_MODE,
     QLoss,
     build_q_polish_coverage_weights,
     compute_parent_default_regime_weights,
     compute_q_survival_recovery_components,
     compute_recovery_target,
+    resolve_q_regime_settings,
 )
 from models import PolicyValueModel
 from training.episode import Episode
@@ -408,7 +412,7 @@ def test_q_polishing_freeze_keeps_only_q_encoder_and_head_trainable():
 # ---------------------------------------------------------------------------
 
 def test_regime_weight_isolates_gradient_from_phat():
-    """transition band 内 sigmoid(Phat/tau) 不得把梯度传回 Phat。"""
+    """transition band 内 smoothstep(Phat) 不得把梯度传回 Phat。"""
     phat = torch.tensor([[0.0]], dtype=torch.float64, requires_grad=True)
     weights = compute_parent_default_regime_weights(
         phat, mode="transition_band", eps=1e-2, tau=1e-2,
@@ -547,4 +551,347 @@ def test_evaluator_default_region_q_unit_statistics():
     np.testing.assert_allclose(summary["q_unit_default_region_p90"], np.quantile(sel, 0.90), rtol=1e-6)
     np.testing.assert_allclose(summary["q_unit_default_region_p99"], np.quantile(sel, 0.99), rtol=1e-6)
     np.testing.assert_allclose(summary["q_unit_default_region_max"], sel.max(), rtol=1e-6)
+
+
+# ===========================================================================
+# Part A: 旧 checkpoint recovery semantics（TEST A1-A4）
+# ===========================================================================
+
+def test_A1_legacy_checkpoint_resolves_to_legacy_b_times_unit():
+    """旧 payload 不含 q_recovery_normalization_mode -> legacy fallback。"""
+    settings = resolve_q_regime_settings(checkpoint_recorded_fields=set())
+    assert settings["recovery_normalization_mode"] == LEGACY_RECOVERY_NORMALIZATION_MODE
+    assert settings["recovery_normalization_mode_source"] == "legacy_checkpoint_fallback"
+
+
+def test_A2_new_checkpoint_semantics_win_over_config_default():
+    """新 payload 明确记录 asset_only -> 使用 checkpoint 语义。"""
+    settings = resolve_q_regime_settings(
+        checkpoint_recovery_normalization_mode="asset_only",
+        checkpoint_recorded_fields={"q_recovery_normalization_mode"},
+    )
+    assert settings["recovery_normalization_mode"] == "asset_only"
+    assert settings["recovery_normalization_mode_source"] == "checkpoint"
+
+
+def test_A3_cli_overrides_legacy_checkpoint_fallback():
+    """CLI 显式 override 优先级最高。"""
+    settings = resolve_q_regime_settings(
+        cli_recovery_normalization_mode="asset_only",
+        checkpoint_recorded_fields=set(),
+    )
+    assert settings["recovery_normalization_mode"] == "asset_only"
+    assert settings["recovery_normalization_mode_source"] == "cli"
+
+
+def _small_pv_model() -> PolicyValueModel:
+    return PolicyValueModel(
+        share_hidden_dims=[8], share_output_dim=8, q_head_dims=[4],
+        p0_head_dims=[4], pi_head_dims=[4], bp0_head_dims=[4], bpi_head_dims=[4],
+        barz_hidden_dims=[4], bari_hidden_dims=[4], i_grid_size=5,
+        dropout=0.0, value_scale_mode="none",
+    )
+
+
+def _write_combined_checkpoint(path, *, hyperparams_payload) -> None:
+    torch.manual_seed(23)
+    model = _small_pv_model()
+    sdf_fc1 = build_models(torch.device("cpu"))["sdf_fc1"]
+    torch.save(
+        {
+            "models": {
+                "policy_value": model.state_dict(),
+                "sdf_fc1": sdf_fc1.state_dict(),
+            },
+            "hyperparams": hyperparams_payload,
+            "config_snapshot": AnalysisEconomicConfig.from_current_config().to_dict(),
+            "policy_value_model_spec": model.model_spec(),
+            "value_parameterization": {
+                "mode": "none", "scale_formula": "1",
+                "bellman_normalization": False, "log_max": 20.0,
+            },
+        },
+        path,
+    )
+
+
+def test_A4_loader_metadata_records_q_semantics_fields(tmp_path):
+    """metadata 记录实际 resolved mode/source，且能区分新旧 checkpoint。"""
+    legacy_path = tmp_path / "legacy.pt"
+    hp = HyperParams()
+    legacy_payload = dict(hp.__dict__)
+    legacy_payload.pop("q_recovery_normalization_mode", None)
+    legacy_payload.pop("q_parent_default_regime_mode", None)
+    _write_combined_checkpoint(legacy_path, hyperparams_payload=legacy_payload)
+    legacy = load_analysis_checkpoint(legacy_path, device="cpu")
+    recorded = legacy.metadata["q_semantics_recorded_fields"]
+    assert "q_recovery_normalization_mode" not in recorded
+    settings = resolve_q_regime_settings(
+        checkpoint_recovery_normalization_mode=getattr(
+            legacy.hyperparams, "q_recovery_normalization_mode", None
+        ),
+        checkpoint_recorded_fields=recorded,
+    )
+    assert settings["recovery_normalization_mode"] == LEGACY_RECOVERY_NORMALIZATION_MODE
+    assert settings["recovery_normalization_mode_source"] == "legacy_checkpoint_fallback"
+
+    new_path = tmp_path / "new.pt"
+    new_payload = dict(hp.__dict__)
+    new_payload["q_recovery_normalization_mode"] = "asset_only"
+    _write_combined_checkpoint(new_path, hyperparams_payload=new_payload)
+    new = load_analysis_checkpoint(new_path, device="cpu")
+    assert "q_recovery_normalization_mode" in new.metadata["q_semantics_recorded_fields"]
+    new_settings = resolve_q_regime_settings(
+        checkpoint_recovery_normalization_mode=new.hyperparams.q_recovery_normalization_mode,
+        checkpoint_recorded_fields=new.metadata["q_semantics_recorded_fields"],
+    )
+    assert new_settings["recovery_normalization_mode"] == "asset_only"
+    assert new_settings["recovery_normalization_mode_source"] == "checkpoint"
+
+
+# ===========================================================================
+# Part B: transition band 连续性（TEST B1-B5）
+# ===========================================================================
+
+def _survival(phat_values, *, eps=1e-2, mode="transition_band"):
+    phat = torch.tensor(phat_values, dtype=torch.float64).reshape(-1, 1)
+    return compute_parent_default_regime_weights(
+        phat, mode=mode, eps=eps,
+    )["parent_survival_weight"].flatten()
+
+
+def test_B1_smoothstep_endpoints():
+    eps = 1e-2
+    w = _survival([[-eps], [0.0], [eps]], eps=eps)
+    assert w[0].item() == 0.0
+    assert w[1].item() == pytest.approx(0.5)
+    assert w[2].item() == 1.0
+
+
+def test_B2_smoothstep_is_continuous_at_band_edges():
+    eps, h = 1e-2, 1e-6
+    w = _survival([[-eps + h], [eps - h]], eps=eps)
+    assert w[0].item() < 1e-3
+    assert w[1].item() > 1.0 - 1e-3
+
+
+def test_B3_smoothstep_is_monotone_inside_band():
+    eps = 1e-2
+    xs = torch.linspace(-eps, eps, 201, dtype=torch.float64).reshape(-1, 1)
+    w = compute_parent_default_regime_weights(
+        xs, mode="transition_band", eps=eps,
+    )["parent_survival_weight"].flatten()
+    assert bool((w.diff() >= 0).all())
+
+
+def test_B4_transition_band_weight_requires_no_grad():
+    phat = torch.tensor([[0.0]], dtype=torch.float64, requires_grad=True)
+    weight = compute_parent_default_regime_weights(
+        phat, mode="transition_band", eps=1e-2,
+    )["parent_survival_weight"]
+    assert weight.requires_grad is False
+
+
+def test_B5_eps_zero_matches_hard_gating():
+    values = [[-1.0], [-0.0], [0.0], [1.0]]
+    band = _survival(values, eps=0.0)
+    hard = _survival(values, mode="hard")
+    torch.testing.assert_close(band, hard)
+
+
+# ===========================================================================
+# Part C: resolved metadata（TEST C1-C3）
+# ===========================================================================
+
+def test_C1_defaults_follow_config():
+    settings = resolve_q_regime_settings()
+    assert settings["q_parent_default_eps"] == pytest.approx(float(Config.Q_PARENT_DEFAULT_EPS))
+    assert settings["q_parent_default_tau"] == pytest.approx(float(Config.Q_PARENT_DEFAULT_TAU))
+    assert settings["recovery_normalization_mode"] == Config.RECOVERY_NORMALIZATION_MODE
+    assert settings["recovery_normalization_mode_source"] == "config_default"
+    assert settings["q_parent_default_eps_source"] == "config_default"
+    assert settings["q_parent_default_tau_source"] == "config_default"
+
+
+def test_C2_checkpoint_values_win_over_config():
+    settings = resolve_q_regime_settings(
+        checkpoint_parent_default_eps=0.03,
+        checkpoint_parent_default_tau=0.05,
+        checkpoint_recorded_fields={"q_parent_default_eps", "q_parent_default_tau"},
+    )
+    assert settings["q_parent_default_eps"] == pytest.approx(0.03)
+    assert settings["q_parent_default_eps_source"] == "checkpoint"
+    assert settings["q_parent_default_tau"] == pytest.approx(0.05)
+    assert settings["q_parent_default_tau_source"] == "checkpoint"
+
+
+def test_C3_cli_values_win_over_checkpoint():
+    settings = resolve_q_regime_settings(
+        cli_parent_default_eps=0.07,
+        checkpoint_parent_default_eps=0.03,
+        checkpoint_recorded_fields={"q_parent_default_eps"},
+    )
+    assert settings["q_parent_default_eps"] == pytest.approx(0.07)
+    assert settings["q_parent_default_eps_source"] == "cli"
+
+
+# ===========================================================================
+# Part D: boundary loss 与 regime equation（TEST D1-D4）
+# ===========================================================================
+
+def _q_inputs(b, z, x):
+    zeros = torch.zeros_like(b)
+    return torch.cat([b, z, zeros, zeros, x, zeros, zeros], dim=1)
+
+
+def _q_forward_terms(loss_fn, Q, b, x, z, phat, *, M=0.9, Qsp=0.5, bar_z=0.3):
+    ones = torch.ones_like(b)
+    M_list = [M * ones]
+    Qsp_children = [Qsp * ones]
+    bar_zsp = [0.2 * ones]
+    return loss_fn(
+        Q=Q, inputs=_q_inputs(b, z, x), bar_i=torch.zeros_like(b),
+        M_list=M_list, Qsp_children=Qsp_children, bar_z=bar_z * ones,
+        bar_zsp_children=bar_zsp, x_children=[x], z_children=[z], phat=phat,
+    )
+
+
+def test_D1_hard_mode_low_b_default_has_no_boundary_conflict():
+    loss_fn = QLoss(parent_default_regime_mode="hard")
+    b = torch.tensor([[0.05]], dtype=torch.float64)
+    x = torch.tensor([[0.2]], dtype=torch.float64)
+    z = torch.tensor([[-0.5]], dtype=torch.float64)
+    Q = torch.full_like(b, 0.2)
+    _, terms = _q_forward_terms(loss_fn, Q, b, x, z, phat=torch.full_like(b, -1.0))
+    # low-b penalty 已收窄到数值稳定区，不再与 default 回收要求冲突。
+    assert terms["loss4"].item() == 0.0
+    # 主方程仍然把 default parent 拉向当期回收。
+    assert terms["loss3"].item() > 0.0
+
+
+def test_D2_hard_mode_high_b_survival_boundary_is_zero():
+    loss_fn = QLoss(parent_default_regime_mode="hard")
+    b = torch.tensor([[0.95]], dtype=torch.float64)
+    x = torch.tensor([[0.2]], dtype=torch.float64)
+    z = torch.tensor([[0.1]], dtype=torch.float64)
+    Q = torch.full_like(b, 0.5)
+    _, terms = _q_forward_terms(loss_fn, Q, b, x, z, phat=torch.full_like(b, 1.0))
+    assert terms["loss5"].item() == 0.0
+
+
+def test_D3_hard_mode_high_b_default_boundary_is_active():
+    loss_fn = QLoss(parent_default_regime_mode="hard")
+    b = torch.tensor([[0.95]], dtype=torch.float64)
+    x = torch.tensor([[0.2]], dtype=torch.float64)
+    z = torch.tensor([[-0.5]], dtype=torch.float64)
+    Q = torch.full_like(b, 0.5)
+    _, terms = _q_forward_terms(loss_fn, Q, b, x, z, phat=torch.full_like(b, -1.0))
+    assert terms["loss5"].item() > 0.0
+
+
+def test_D4_legacy_mode_keeps_old_boundary_semantics():
+    loss_fn = QLoss(parent_default_regime_mode="legacy_soft_penalty")
+    x = torch.tensor([[0.2]], dtype=torch.float64)
+    z = torch.tensor([[0.1]], dtype=torch.float64)
+    # low-b：旧行为在 b <= 0.1 上强推 Q = 0（即使 parent 已 default）。
+    b_low = torch.tensor([[0.05]], dtype=torch.float64)
+    _, low_terms = _q_forward_terms(
+        loss_fn, torch.full_like(b_low, 0.2), b_low, x, z, phat=torch.full_like(b_low, -1.0)
+    )
+    assert low_terms["loss4"].item() > 0.0
+    assert low_terms["loss5"].item() == 0.0
+    # high-b：旧行为对 surviving parent 也强推 Q = recovery。
+    b_high = torch.tensor([[0.95]], dtype=torch.float64)
+    _, high_terms = _q_forward_terms(
+        loss_fn, torch.full_like(b_high, 0.5), b_high, x, z, phat=torch.full_like(b_high, 1.0)
+    )
+    assert high_terms["loss5"].item() > 0.0
+
+
+def test_evaluator_boundary_regime_overlap_shares():
+    grid = _grid()
+    _, summary = evaluate_bellman_residuals(
+        _QRegimeModel(phat_value=-1.0, bar_z_value=0.9),
+        grid, _transition(grid), AnalysisEconomicConfig.from_current_config(),
+        parent_default_regime_mode="hard",
+        boundary_low_threshold=0.5, boundary_high_threshold=0.5,
+    )
+    # 全 default fixture：boundary 区全部落在 default regime，无 survival 重叠。
+    assert summary["low_b_default_share"] > 0.0
+    assert summary["low_b_survival_share"] == 0.0
+    assert summary["high_b_default_share"] > 0.0
+    assert summary["high_b_survival_share"] == 0.0
+
+
+# ===========================================================================
+# Part E: q_unit 三组统计（TEST E1-E4）
+# ===========================================================================
+
+def test_E1_q_unit_pred_is_two_for_q_equals_two_b():
+    grid = _grid()
+    surfaces, summary = evaluate_bellman_residuals(
+        _QRegimeModel(phat_value=-1.0, bar_z_value=0.9),
+        grid, _transition(grid), AnalysisEconomicConfig.from_current_config(),
+        parent_default_regime_mode="hard",
+    )
+    np.testing.assert_allclose(surfaces["q_unit_pred"], 2.0, rtol=1e-9, atol=1e-12)
+    assert summary["q_unit_pred_default_mean"] == pytest.approx(2.0)
+    assert summary["q_unit_pred_default_max"] == pytest.approx(2.0)
+
+
+def test_E2_recovery_target_q_unit_is_recovery_over_b():
+    grid = _grid()
+    surfaces, _ = evaluate_bellman_residuals(
+        _QRegimeModel(phat_value=-1.0, bar_z_value=0.9),
+        grid, _transition(grid), AnalysisEconomicConfig.from_current_config(),
+        parent_default_regime_mode="hard", recovery_normalization_mode="asset_only",
+    )
+    b = np.asarray(grid.mesh_b)
+    np.testing.assert_allclose(
+        surfaces["q_unit_recovery_target"], surfaces["recovery_current"] / b,
+        rtol=1e-5, atol=1e-6,
+    )
+
+
+def test_E3_q_unit_error_is_pred_minus_target():
+    grid = _grid()
+    surfaces, _ = evaluate_bellman_residuals(
+        _QRegimeModel(phat_value=-1.0, bar_z_value=0.9),
+        grid, _transition(grid), AnalysisEconomicConfig.from_current_config(),
+        parent_default_regime_mode="hard",
+    )
+    np.testing.assert_allclose(
+        surfaces["q_unit_minus_recovery_target"],
+        surfaces["q_unit_pred"] - surfaces["q_unit_recovery_target"],
+        rtol=1e-5, atol=1e-6,
+    )
+
+
+def test_E4_q_unit_summary_matches_manual_numpy():
+    grid = _grid()
+    surfaces, summary = evaluate_bellman_residuals(
+        _QRegimeModel(phat_value=-1.0, bar_z_value=0.9),
+        grid, _transition(grid), AnalysisEconomicConfig.from_current_config(),
+        parent_default_regime_mode="hard",
+    )
+    mask = surfaces["parent_hard_default"].reshape(-1) > 0.5
+
+    def region(name):
+        values = surfaces[name].reshape(-1)[mask]
+        return values[np.isfinite(values)]
+
+    pred = region("q_unit_pred")
+    target = region("q_unit_recovery_target")
+    error = np.abs(region("q_unit_minus_recovery_target"))
+    assert summary["q_unit_pred_default_count"] == pred.size
+    assert summary["q_unit_pred_default_mean"] == pytest.approx(pred.mean())
+    assert summary["q_unit_pred_default_p90"] == pytest.approx(np.quantile(pred, 0.90))
+    assert summary["q_unit_recovery_target_default_mean"] == pytest.approx(target.mean())
+    assert summary["q_unit_recovery_target_default_p99"] == pytest.approx(np.quantile(target, 0.99))
+    assert summary["q_unit_error_default_abs_mean"] == pytest.approx(error.mean())
+    assert summary["q_unit_error_default_abs_max"] == pytest.approx(error.max())
+    # legacy alias 指向 recovery target 统计。
+    assert summary["q_unit_default_region_mean"] == pytest.approx(
+        summary["q_unit_recovery_target_default_mean"]
+    )
 

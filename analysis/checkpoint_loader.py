@@ -47,14 +47,32 @@ def _hyperparams_from_dict(values: Dict[str, Any]) -> HyperParams:
     return hp
 
 
-def _load_hyperparams_json(path: Path) -> HyperParams:
+def _hyperparams_payload_from_json(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
     if isinstance(payload, dict) and "hyperparams" in payload and isinstance(payload["hyperparams"], dict):
         payload = payload["hyperparams"]
     if not isinstance(payload, dict):
         raise ValueError(f"hyperparams_json must contain a JSON object: {path}")
-    return _hyperparams_from_dict(payload)
+    return payload
+
+
+def _load_hyperparams_json(path: Path) -> HyperParams:
+    return _hyperparams_from_dict(_hyperparams_payload_from_json(path))
+
+
+def _recorded_hyperparam_fields(hp_payload: Any) -> set:
+    """原始 hyperparams payload 中**真实出现过**的字段名集合。
+
+    旧 checkpoint 的 payload 里没有新字段（例如 q_recovery_normalization_mode）。
+    必须靠这个集合判断“当时是否真的保存过该字段”，而不能看 HyperParams 实例的当前值 ——
+    新 dataclass 的默认字段会把缺失字段补成 None，掩盖旧 checkpoint 的真实训练口径。
+    """
+    if isinstance(hp_payload, HyperParams):
+        return set(vars(hp_payload).keys())
+    if isinstance(hp_payload, dict):
+        return set(hp_payload.keys())
+    return set()
 
 
 @dataclass
@@ -158,6 +176,7 @@ def load_analysis_checkpoint(
     checkpoint_value_parameterization: Optional[Dict[str, Any]] = None
     policy_path_for_meta = policy_checkpoint
     sdf_path_for_meta = sdf_checkpoint
+    hp_recorded_fields: set = set()
 
     if checkpoint_path is not None:
         checkpoint_path = Path(checkpoint_path)
@@ -195,6 +214,7 @@ def load_analysis_checkpoint(
                 hp_source = "checkpoint"
             else:
                 raise ValueError("unsupported hyperparams payload in combined checkpoint")
+            hp_recorded_fields = _recorded_hyperparam_fields(hp_payload)
         else:
             checkpoint_format = "raw_policy_state_dict"
             payload_for_config = None
@@ -208,8 +228,10 @@ def load_analysis_checkpoint(
                 sdf_checkpoint = Path(sdf_checkpoint)
                 sdf_state = torch.load(sdf_checkpoint, map_location=device)
             if hyperparams_json is not None:
-                hyperparams = _load_hyperparams_json(Path(hyperparams_json))
+                hp_payload_json = _hyperparams_payload_from_json(Path(hyperparams_json))
+                hyperparams = _hyperparams_from_dict(hp_payload_json)
                 hp_source = "json"
+                hp_recorded_fields = set(hp_payload_json.keys())
             else:
                 hyperparams = HyperParams()
                 hp_source = "default"
@@ -230,8 +252,10 @@ def load_analysis_checkpoint(
             sdf_path_for_meta = sdf_checkpoint
             sdf_state = torch.load(sdf_checkpoint, map_location=device)
         if hyperparams_json is not None:
-            hyperparams = _load_hyperparams_json(Path(hyperparams_json))
+            hp_payload_json = _hyperparams_payload_from_json(Path(hyperparams_json))
+            hyperparams = _hyperparams_from_dict(hp_payload_json)
             hp_source = "json"
+            hp_recorded_fields = set(hp_payload_json.keys())
         else:
             hyperparams = HyperParams()
             hp_source = "default"
@@ -341,6 +365,11 @@ def load_analysis_checkpoint(
             + (["firm_target"] if firm_target_state is not None else [])
         ),
         "hyperparameter_source": hp_source,
+        # 原始 payload 中真实出现过的 q_* 字段。旧 checkpoint 不含
+        # q_recovery_normalization_mode，据此可判定其训练时用的是 legacy 口径。
+        "q_semantics_recorded_fields": sorted(
+            field for field in hp_recorded_fields if field.startswith("q_")
+        ),
         "config_source": config_source,
         "config_snapshot": economic_config.to_dict(),
         "missing_optional_fields": missing_optional_fields,
@@ -358,6 +387,7 @@ def load_analysis_checkpoint(
             },
         },
         "policy_value_model_spec": checkpoint_spec,
+        "q_parameterization": getattr(models["policy_value"], "q_parameterization", None),
     }
     return AnalysisCheckpoint(
         models=models,

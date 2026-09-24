@@ -100,6 +100,35 @@ class Trainer:
                 snapshot[key] = float(getattr(self.config, key))
         return snapshot
 
+    def _apply_legacy_q_recovery_fallback(self, checkpoint: Dict) -> None:
+        """从旧 checkpoint resume 时保持其训练时的 recovery 口径。
+
+        旧 checkpoint 的 hyperparams payload 里没有 ``q_recovery_normalization_mode``，
+        而当前 Config 默认是 ``asset_only``。若不做处理，继续训练会静默改变正在优化的
+        Q 经济方程。这里只在用户未显式指定时回落到 legacy 口径，并给出 warning。
+        """
+        hp_payload = checkpoint.get("hyperparams")
+        if isinstance(hp_payload, dict):
+            recorded = set(hp_payload.keys())
+        elif hp_payload is None:
+            recorded = set()
+        else:
+            # HyperParams 实例 = 新 checkpoint，字段齐全，无需 fallback。
+            return
+        if "q_recovery_normalization_mode" in recorded:
+            return
+        if getattr(self.hyperparams, "q_recovery_normalization_mode", None) is not None:
+            return
+        from losses.q_loss import LEGACY_RECOVERY_NORMALIZATION_MODE
+
+        self.hyperparams.q_recovery_normalization_mode = LEGACY_RECOVERY_NORMALIZATION_MODE
+        logger.warning(
+            "Legacy checkpoint has no q_recovery_normalization_mode; "
+            "resuming with recovery_normalization_mode=%r to preserve its training-time "
+            "Q equation instead of the current Config default.",
+            LEGACY_RECOVERY_NORMALIZATION_MODE,
+        )
+
     def _assert_checkpoint_config_snapshot(
         self,
         checkpoint: Dict,
@@ -161,6 +190,30 @@ class Trainer:
             configure = getattr(model, "configure_value_parameterization", None)
             if callable(configure):
                 configure(mode=str(spec["mode"]), log_max=float(spec["log_max"]))
+        expected_q = str(getattr(self.hyperparams, "q_parameterization", "direct")).lower()
+        for model in modules:
+            actual_q = getattr(model, "q_parameterization", None)
+            if actual_q is not None and str(actual_q).lower() != expected_q:
+                raise ValueError(
+                    "policy_value q_parameterization mismatch: "
+                    f"model={actual_q!r}, hyperparams={expected_q!r}"
+                )
+
+    def _assert_checkpoint_q_parameterization(self, checkpoint: Dict) -> None:
+        spec = checkpoint.get("policy_value_model_spec")
+        actual = (
+            str(spec.get("q_parameterization", "b_times_unit")).lower()
+            if isinstance(spec, dict)
+            else "b_times_unit"
+        )
+        expected = str(getattr(self.hyperparams, "q_parameterization", "direct")).lower()
+        if actual != expected:
+            raise ValueError(
+                "checkpoint q_parameterization mismatch: "
+                f"checkpoint={actual!r}, current={expected!r}. "
+                "Explicit migration is required; legacy q_unit weights cannot be "
+                "loaded as direct-Q."
+            )
 
     def _assert_checkpoint_value_parameterization(self, checkpoint: Dict) -> None:
         expected = self._current_value_parameterization()
@@ -467,12 +520,14 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         
         checkpoint = torch.load(path, map_location=self.device)
+        self._assert_checkpoint_q_parameterization(checkpoint)
         self._assert_checkpoint_value_parameterization(checkpoint)
         self._assert_checkpoint_config_snapshot(
             checkpoint,
             evaluation_only=bool(evaluation_only),
             allow_config_mismatch=bool(allow_config_mismatch),
         )
+        self._apply_legacy_q_recovery_fallback(checkpoint)
         self._configure_policy_value_parameterization()
         
         for model_name, state_dict in checkpoint['models'].items():
