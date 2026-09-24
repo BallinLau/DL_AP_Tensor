@@ -227,6 +227,8 @@ class Episode:
         self._fc1_teacher_forcing_stage = False
         self._policy_q_freeze_active = False
         self._policy_value_grad_backup = {}
+        self._q_polishing_active = False
+        self._q_polishing_grad_backup = {}
         self._policy_bp_freeze_active = False
         self._policy_bp_grad_backup = {}
         self._sdf_fc1_teacher_freeze_active = False
@@ -1353,7 +1355,20 @@ class Episode:
             ),
             'p0': P0Loss(),
             'pi': PILoss(b_penalty_weight=0.0),
-            'q': QLoss(),
+            'q': QLoss(
+                recovery_normalization_mode=getattr(
+                    self.hyperparams, "q_recovery_normalization_mode", None
+                ),
+                parent_default_regime_mode=getattr(
+                    self.hyperparams, "q_parent_default_regime_mode", None
+                ),
+                parent_default_eps=getattr(
+                    self.hyperparams, "q_parent_default_eps", None
+                ),
+                parent_default_tau=getattr(
+                    self.hyperparams, "q_parent_default_tau", None
+                ),
+            ),
             'fc2': FC2Loss() if 'fc2' in self.models else None
         }
 
@@ -2808,6 +2823,49 @@ class Episode:
                     p.requires_grad = self._policy_value_grad_backup[name]
             self._policy_value_grad_backup = {}
             self._policy_q_freeze_active = False
+
+    def _set_q_polishing_freeze(self, enable: bool):
+        """Q-only polishing 阶段：只训练 q_encoder + q_head。
+
+        冻结 policy_value 的 value/policy/bp heads，并冻结 SDF/FC1 与其它模型，
+        不改写任何经济方程。由 ``hyperparams.enable_q_polishing`` 显式开启。
+        """
+        if 'policy_value' not in self.models:
+            return
+        model = self.models['policy_value']
+        if enable:
+            if self._q_polishing_active:
+                return
+            self._q_polishing_grad_backup = {
+                name: p.requires_grad for name, p in model.named_parameters()
+            }
+            for name, p in model.named_parameters():
+                p.requires_grad = name.startswith("q_encoder.") or name.startswith("q_head.")
+            for model_name, other in self.models.items():
+                if model_name == 'policy_value' or other is None:
+                    continue
+                self._q_polishing_grad_backup.update({
+                    f"{model_name}::{name}": p.requires_grad
+                    for name, p in other.named_parameters()
+                })
+                for p in other.parameters():
+                    p.requires_grad = False
+            self._q_polishing_active = True
+        else:
+            if not self._q_polishing_active:
+                return
+            for name, p in model.named_parameters():
+                if name in self._q_polishing_grad_backup:
+                    p.requires_grad = self._q_polishing_grad_backup[name]
+            for model_name, other in self.models.items():
+                if model_name == 'policy_value' or other is None:
+                    continue
+                for name, p in other.named_parameters():
+                    key = f"{model_name}::{name}"
+                    if key in self._q_polishing_grad_backup:
+                        p.requires_grad = self._q_polishing_grad_backup[key]
+            self._q_polishing_grad_backup = {}
+            self._q_polishing_active = False
 
     def _set_policy_bp_only_freeze(self, enable: bool):
         """
@@ -5445,6 +5503,9 @@ class Episode:
             bp_t = bar_i_t * bpI_t + (1 - bar_i_t) * bp0_t
         b_parent = parent_state[:, 0:1]
         bar_z_t = _get_out(output_t_target, 'bar_z', 6).detach()
+        # 当期 parent 是否已违约（Phat_t <= 0）决定 Q 方程 regime；
+        # 用 target model 的 Phat（detached）作为 gate，避免对指示函数求梯度。
+        phat_t = _get_out(output_t_target, 'Phat', -1).detach()
         bar_i_use = bar_i_t
         if self._pv_use_fixed_policy():
             bar_i_use = torch.zeros_like(bar_i_t)
@@ -5478,21 +5539,42 @@ class Episode:
             bar_zsp_children, x_children, z_children
         )  # List[(batch,1)]
         residuals = self._collapse_policy_eta_pairs(residuals)
-        aio_residual = compute_aio_residual(residuals, loss_fn.aio_weight)
-        main_loss = aio_residual.mean()
 
-        # 其余约束在 episode 层做聚合
-        loss3 = loss_fn.compute_bar_z_constraint(Q, b_parent, x_parent, z_parent, bar_z_use).mean()
+        # 其余约束在 episode 层做聚合。
+        # regime-aware：surviving parent 走 Bellman AiO，default parent 走当期回收；
+        # legacy_soft_penalty：Bellman 覆盖全部 parent，违约侧靠 soft bar_z 惩罚项。
+        q_regime_mode = getattr(loss_fn, "parent_default_regime_mode", "legacy_soft_penalty")
+        regime_terms = None
+        if q_regime_mode == "legacy_soft_penalty":
+            aio_residual = compute_aio_residual(residuals, loss_fn.aio_weight)
+            main_loss = aio_residual.mean()
+            loss3 = loss_fn.compute_bar_z_constraint(Q, b_parent, x_parent, z_parent, bar_z_use).mean()
+            penalty_z_main = compute_z_penalty(
+                aio_residual, z_parent,
+                loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
+            )
+            penalty_z_loss3 = compute_z_penalty(
+                (Q - loss_fn.compute_total_recovery(b_parent, x_parent, z_parent)).pow(2) * bar_z_use,
+                z_parent, loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
+            )
+        else:
+            regime_terms = loss_fn.compute_regime_aware_objective(
+                residuals=residuals, Q=Q, b=b_parent, x=x_parent, z=z_parent, phat=phat_t,
+            )
+            aio_residual = regime_terms["aio_residual"]
+            main_loss = regime_terms["bellman_loss"]
+            loss3 = regime_terms["recovery_loss"]
+            penalty_z_main = compute_z_penalty(
+                regime_terms["bellman_per_sample"], z_parent,
+                loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
+            )
+            penalty_z_loss3 = compute_z_penalty(
+                regime_terms["recovery_per_sample"], z_parent,
+                loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
+            )
+
         loss4 = loss_fn.compute_boundary_loss_low(Q, b_parent).mean()
         loss5 = loss_fn.compute_boundary_loss_high(Q, b_parent, x_parent, z_parent).mean()
-        penalty_z_main = compute_z_penalty(
-            aio_residual, z_parent,
-            loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
-        )
-        penalty_z_loss3 = compute_z_penalty(
-            (Q - loss_fn.compute_total_recovery(b_parent, x_parent, z_parent)).pow(2) * bar_z_use,
-            z_parent, loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
-        )
 
         # Q 形状正则：
         # 1) dQ/dz > 0
@@ -5546,9 +5628,16 @@ class Episode:
             warm_loss = (Q - q_warm_target).pow(2).mean()
 
         total_loss = physics_loss + warm_weight * warm_loss
+        if regime_terms is not None:
+            survival_w = regime_terms["parent_survival_weight"]
+            default_w = regime_terms["parent_default_weight"]
+        else:
+            survival_w = torch.ones_like(b_parent)
+            default_w = torch.zeros_like(b_parent)
         with torch.no_grad():
             self._latest_q_terms = {
                 'q_main': float(main_loss.item()),
+                'q_recovery': float(loss3.item()),
                 'q_bdry_low': float(loss4.item()),
                 'q_bdry_high': float(loss5.item()),
                 'q_shape_z': float(q_shape_z.item()),
@@ -5557,6 +5646,8 @@ class Episode:
                 'q_physics': float(physics_loss.item()),
                 'q_warmstart': float(warm_loss.item()),
                 'q_warm_weight': float(warm_weight),
+                'q_parent_survival_weight_mean': float(survival_w.mean().item()),
+                'q_parent_default_weight_mean': float(default_w.mean().item()),
                 'q_pretrain_mode': float(1.0 if q_only_stage else 0.0),
                 'q_freeze_mode': float(1.0 if q_freeze_mode else 0.0),
             }

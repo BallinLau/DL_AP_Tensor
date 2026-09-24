@@ -394,6 +394,26 @@ class HyperParams:
     q_warm_alpha_z: float = 0.15
     q_warm_alpha_x: float = 0.15
 
+    # ========== Policy/Value: Q parent default regime 与 recovery 口径 ==========
+    # None 表示沿用 Config 默认（recovery: "asset_only"；regime: "legacy_soft_penalty"）。
+    # 取值见 config/constants.py：
+    #   q_parent_default_regime_mode in {"legacy_soft_penalty", "hard", "transition_band"}
+    #   q_recovery_normalization_mode in {"asset_only", "legacy_b_times_unit"}
+    q_parent_default_regime_mode: str = None
+    q_parent_default_eps: float = None
+    q_parent_default_tau: float = None
+    q_recovery_normalization_mode: str = None
+
+    # ========== Policy/Value: 可选 Q-only polishing stage（默认关闭） ==========
+    # 冻结 value / policy / bp heads / SDF / FC1，只训练 q_encoder + q_head。
+    # coverage sample 由三类状态组成：on-distribution / boundary / default。
+    enable_q_polishing: bool = False
+    q_polish_sim_share: float = 0.5
+    q_polish_boundary_share: float = 0.25
+    q_polish_default_share: float = 0.25
+    q_polish_boundary_eps: float = 1e-2
+    q_polish_epochs: int = 0
+
     # ========== Policy/Value: bp KKT 约束（P0/PI） ==========
     # bp 训练模式：
     # - target_grid: 训练时用 frozen firm target 在 bp-grid 上做经济价值 argmax，

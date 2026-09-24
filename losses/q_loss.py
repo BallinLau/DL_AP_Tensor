@@ -8,19 +8,199 @@ Q Loss: 债券价格损失
 - parent: (Q_t, b_t, ...) → t 期父节点
 - children: [(Qsp_{t+1}^{(j)}, bar_z_{t+1}^{(j)}, ...)] → N 条模拟路径
 
-L_Q = main_q + loss3 + loss4 + loss5 + penalty_z_all
+legacy_soft_penalty 模式（历史行为）：
+    L_Q = main_q + loss3 + loss4 + loss5 + penalty_z_all
+
+regime-aware 模式（hard / transition_band）：
+    L_Q = w_survival_parent * L_Bellman + w_default_parent * (Q - R_current)^2
+          + loss4 + loss5 + penalty_z_all
+
+其中 parent regime 由 ``Phat_t`` 决定，``w_survival_parent + w_default_parent = 1``。
+child default（t+1 违约）始终保留在 ``L_Bellman`` 内部，与 parent regime 无关。
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import sys
 sys.path.append('..')
 from config import Config
 
 from .utils import compute_aio_residual, compute_z_penalty
+
+
+# ---------------------------------------------------------------------------
+# 口径解析：parent default regime 与 recovery 归一化
+# ---------------------------------------------------------------------------
+
+Q_PARENT_DEFAULT_REGIME_MODES: Tuple[str, ...] = (
+    "legacy_soft_penalty",
+    "hard",
+    "transition_band",
+)
+
+RECOVERY_NORMALIZATION_MODES: Tuple[str, ...] = (
+    # 历史行为：recovery_total = b_+ * phi * (1 - delta + exp(x + z))
+    "legacy_b_times_unit",
+    # main_4.tex / Gomes 口径：违约回收是资产回收，不乘债务面值 b
+    # recovery_unit = phi * (1 - delta + exp(x + z))
+    "asset_only",
+)
+
+
+def resolve_q_parent_default_regime_mode(mode: Optional[str] = None) -> str:
+    value = mode if mode is not None else getattr(
+        Config, "Q_PARENT_DEFAULT_REGIME_MODE", "legacy_soft_penalty"
+    )
+    value = str(value).strip().lower()
+    if value not in Q_PARENT_DEFAULT_REGIME_MODES:
+        raise ValueError(
+            f"Unsupported q_parent_default_regime_mode: {value!r}; "
+            f"expected one of {Q_PARENT_DEFAULT_REGIME_MODES}"
+        )
+    return value
+
+
+def resolve_recovery_normalization_mode(mode: Optional[str] = None) -> str:
+    value = mode if mode is not None else getattr(
+        Config, "RECOVERY_NORMALIZATION_MODE", "legacy_b_times_unit"
+    )
+    value = str(value).strip().lower()
+    if value not in RECOVERY_NORMALIZATION_MODES:
+        raise ValueError(
+            f"Unsupported recovery_normalization_mode: {value!r}; "
+            f"expected one of {RECOVERY_NORMALIZATION_MODES}"
+        )
+    return value
+
+
+def compute_recovery_unit(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    *,
+    phi: float,
+    delta: float,
+) -> torch.Tensor:
+    """归一化违约回收单位：phi * (1 - delta + exp(x + z))。"""
+    return phi * (1.0 - delta + torch.exp(x + z))
+
+
+def compute_recovery_target(
+    b: torch.Tensor,
+    x: torch.Tensor,
+    z: torch.Tensor,
+    *,
+    phi: float,
+    delta: float,
+    recovery_normalization_mode: Optional[str] = None,
+) -> torch.Tensor:
+    """违约回收目标（与 Q 同一单位）。
+
+    ``asset_only``：``phi * (1 - delta + exp(x + z))``（main_4.tex:344 / :968-969）
+    ``legacy_b_times_unit``：``b_+ * phi * (1 - delta + exp(x + z))``
+    """
+    mode = resolve_recovery_normalization_mode(recovery_normalization_mode)
+    unit = compute_recovery_unit(x, z, phi=phi, delta=delta)
+    if mode == "asset_only":
+        return unit
+    return torch.clamp(b, min=0.0) * unit
+
+
+def compute_parent_default_regime_weights(
+    phat: torch.Tensor,
+    *,
+    mode: Optional[str] = None,
+    eps: Optional[float] = None,
+    tau: Optional[float] = None,
+) -> Dict[str, torch.Tensor]:
+    """按当期 parent 是否已违约（``Phat_t <= 0``）构造 regime 权重。
+
+    - ``legacy_soft_penalty``：``w_survival = 1``，``w_default = 0``
+      （Bellman 覆盖全部 parent，违约侧仅由 soft ``bar_z`` 惩罚项处理）
+    - ``hard``：``w_survival = 1{Phat_t > 0}``
+    - ``transition_band``：``|Phat| <= eps`` 内用 ``sigmoid(Phat / tau)`` 平滑，
+      带外严格取 0/1，保证深度 default 区真正 collapse 到 recovery regime
+    """
+    resolved = resolve_q_parent_default_regime_mode(mode)
+    # regime 权重是纯 gate，必须对 Phat 梯度隔离：Q loss 不允许通过
+    # w_survival(Phat) 反传到 P / Phat / value network。
+    phat = phat.detach().reshape(phat.shape[0], -1)[:, :1]
+    ones = torch.ones_like(phat)
+    zeros = torch.zeros_like(phat)
+    hard_default = (phat <= 0.0).to(phat.dtype)
+
+    if resolved == "legacy_soft_penalty":
+        survival = ones
+    elif resolved == "hard":
+        survival = ones - hard_default
+    else:
+        eps_value = float(
+            eps if eps is not None else getattr(Config, "Q_PARENT_DEFAULT_EPS", 1e-2)
+        )
+        tau_value = float(
+            tau if tau is not None else getattr(Config, "Q_PARENT_DEFAULT_TAU", 1e-2)
+        )
+        eps_value = max(eps_value, 0.0)
+        tau_value = max(tau_value, 1e-8)
+        band = torch.sigmoid(phat / tau_value)
+        survival = torch.where(
+            phat >= eps_value, ones, torch.where(phat <= -eps_value, zeros, band)
+        )
+    return {
+        "parent_survival_weight": survival,
+        "parent_default_weight": ones - survival,
+        "parent_hard_default": hard_default,
+        "parent_default_regime_mode": resolved,
+    }
+
+
+def build_q_polish_coverage_weights(
+    phat: torch.Tensor,
+    *,
+    sim_share: float,
+    boundary_share: float,
+    default_share: float,
+    eps_boundary: float,
+) -> Dict[str, torch.Tensor]:
+    """Q-only polishing 的 coverage 分组权重（simulated / boundary / default）。
+
+    分组（``eps = eps_boundary``）：
+
+        default   : Phat <  -eps
+        boundary  : |Phat| <= eps
+        sim       : 其余
+
+    组权重 = share_g * N / n_g，使每组对 loss 的有效质量正比于其 share。
+    deep-default 区天然样本不足（default firm 会退出），因此需要显式过采样。
+    """
+    phat = phat.reshape(phat.shape[0], -1)[:, :1]
+    total = float(sim_share) + float(boundary_share) + float(default_share)
+    if total <= 0.0:
+        raise ValueError("q polish shares must sum to a positive value")
+    shares = (
+        float(sim_share) / total,
+        float(boundary_share) / total,
+        float(default_share) / total,
+    )
+    eps = max(float(eps_boundary), 0.0)
+    is_default = phat < -eps
+    is_boundary = (~is_default) & (phat.abs() <= eps)
+    is_sim = ~(is_default | is_boundary)
+    n_states = float(phat.shape[0])
+    weights = torch.zeros_like(phat)
+    for mask, share in zip((is_sim, is_boundary, is_default), shares):
+        count = int(mask.sum().item())
+        if count == 0:
+            continue
+        weights = torch.where(mask, torch.full_like(phat, share * n_states / count), weights)
+    return {
+        "coverage_weight": weights,
+        "sim_mask": is_sim.to(phat.dtype),
+        "boundary_mask": is_boundary.to(phat.dtype),
+        "default_mask": is_default.to(phat.dtype),
+    }
 
 
 def compute_q_survival_recovery_components(
@@ -36,10 +216,18 @@ def compute_q_survival_recovery_components(
     g: float,
     delta: float,
     phi: float,
+    recovery_normalization_mode: Optional[str] = None,
 ) -> Dict[str, torch.Tensor]:
     multiplier = bar_i * (g - 1) + 1
     b_nonneg = torch.clamp(b, min=0.0)
-    recovery_total = b_nonneg * phi * (1 - delta + torch.exp(x_child + z_child))
+    recovery_total = compute_recovery_target(
+        b_nonneg,
+        x_child,
+        z_child,
+        phi=phi,
+        delta=delta,
+        recovery_normalization_mode=recovery_normalization_mode,
+    )
     q_target_survival = M * (b_nonneg + Qsp * multiplier) * (1 - bar_z)
     q_target_recovery = M * recovery_total * multiplier * bar_z
     q_target_total = q_target_survival + q_target_recovery
@@ -74,7 +262,11 @@ class QLoss(nn.Module):
         aio_weight: float = None,
         alpha_z: float = None,
         beta_z: float = None,
-        z0: float = None
+        z0: float = None,
+        recovery_normalization_mode: Optional[str] = None,
+        parent_default_regime_mode: Optional[str] = None,
+        parent_default_eps: Optional[float] = None,
+        parent_default_tau: Optional[float] = None,
     ):
         super().__init__()
         
@@ -88,6 +280,22 @@ class QLoss(nn.Module):
         self.alpha_z = alpha_z if alpha_z is not None else Config.ALPHA_Z
         self.beta_z = beta_z if beta_z is not None else Config.BETA_Z
         self.z0 = z0 if z0 is not None else Config.Z0
+
+        # 口径：recovery 归一化 + parent default regime
+        self.recovery_normalization_mode = resolve_recovery_normalization_mode(
+            recovery_normalization_mode
+        )
+        self.parent_default_regime_mode = resolve_q_parent_default_regime_mode(
+            parent_default_regime_mode
+        )
+        self.parent_default_eps = float(
+            parent_default_eps if parent_default_eps is not None
+            else getattr(Config, "Q_PARENT_DEFAULT_EPS", 1e-2)
+        )
+        self.parent_default_tau = float(
+            parent_default_tau if parent_default_tau is not None
+            else getattr(Config, "Q_PARENT_DEFAULT_TAU", 1e-2)
+        )
     
     def compute_recovery_value(
         self,
@@ -95,11 +303,14 @@ class QLoss(nn.Module):
         z: torch.Tensor
     ) -> torch.Tensor:
         """
-        计算违约时的回收价值
-        
-        recovery = φ * (1 - δ + exp(x+z))
+        计算违约时的回收价值（与 Q 同一单位）
+
+        recovery_unit = φ * (1 - δ + exp(x+z))
+
+        对应 main_4.tex Bondprice 公式里的 φ(1 - δ + exp(x' + z'))·(k'/k)，
+        即资产回收，不含债务面值 b。
         """
-        return self.phi * (1 - self.delta + torch.exp(x + z))
+        return compute_recovery_unit(x, z, phi=self.phi, delta=self.delta)
 
     def compute_total_recovery(
         self,
@@ -108,11 +319,92 @@ class QLoss(nn.Module):
         z: torch.Tensor
     ) -> torch.Tensor:
         """
-        计算“总债价值”口径下的违约回收目标：
-        Q_default_target = b_+ * recovery_unit
+        违约回收目标（与 Q 同一单位），按 ``recovery_normalization_mode`` 解析：
+
+        - ``asset_only``（默认，理论口径）：φ * (1 - δ + exp(x+z))
+        - ``legacy_b_times_unit``：b_+ * φ * (1 - δ + exp(x+z))
         """
-        b_nonneg = torch.clamp(b, min=0.0)
-        return b_nonneg * self.compute_recovery_value(x, z)
+        return compute_recovery_target(
+            b, x, z, phi=self.phi, delta=self.delta,
+            recovery_normalization_mode=self.recovery_normalization_mode,
+        )
+
+    def compute_current_recovery(
+        self,
+        b: torch.Tensor,
+        x: torch.Tensor,
+        z: torch.Tensor
+    ) -> torch.Tensor:
+        """当期 parent 违约时的回收（R_current），与 ``compute_total_recovery`` 同口径。"""
+        return self.compute_total_recovery(b, x, z)
+
+    def compute_regime_weights(self, phat: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """当期 parent default regime 权重（见 ``compute_parent_default_regime_weights``）。"""
+        return compute_parent_default_regime_weights(
+            phat,
+            mode=self.parent_default_regime_mode,
+            eps=self.parent_default_eps,
+            tau=self.parent_default_tau,
+        )
+
+    def compute_regime_aware_q_target(
+        self,
+        *,
+        q_target_bellman: torch.Tensor,
+        recovery_current: torch.Tensor,
+        phat: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """训练用 Q target：surviving parent 用 Bellman，default parent 用当期回收。
+
+            Q_target_used_for_training
+                = w_survival * q_target_bellman + w_default * recovery_current
+
+        ``legacy_soft_penalty`` 下 w_survival ≡ 1，退化为纯 Bellman target。
+        """
+        weights = self.compute_regime_weights(phat)
+        w_survival = weights["parent_survival_weight"]
+        w_default = weights["parent_default_weight"]
+        target = w_survival * q_target_bellman + w_default * recovery_current
+        return {
+            "q_target_used_for_training": target,
+            "recovery_current": recovery_current,
+            **weights,
+        }
+
+    def compute_regime_aware_objective(
+        self,
+        *,
+        residuals: List[torch.Tensor],
+        Q: torch.Tensor,
+        b: torch.Tensor,
+        x: torch.Tensor,
+        z: torch.Tensor,
+        phat: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """构造 regime-aware 的 Q 主目标（sample-level gating）。
+
+            L_Bellman  = mean(w_survival ⊙ AiO(branch residuals))
+            L_recovery = mean(w_default ⊙ (R_current - Q)²)
+
+        AiO 在 **未加 mask** 的 branch residual 上计算，再逐样本乘 regime 权重，
+        避免把 default parent 的 Bellman residual 置零后污染 AiO 的乘积项。
+        """
+        aio_residual = compute_aio_residual(residuals, self.aio_weight)
+        weights = self.compute_regime_weights(phat)
+        w_survival = weights["parent_survival_weight"]
+        w_default = weights["parent_default_weight"]
+        recovery_current = self.compute_current_recovery(b, x, z)
+        bellman_per_sample = w_survival * aio_residual
+        recovery_per_sample = w_default * (recovery_current - Q).pow(2)
+        return {
+            "aio_residual": aio_residual,
+            "bellman_per_sample": bellman_per_sample,
+            "recovery_per_sample": recovery_per_sample,
+            "bellman_loss": bellman_per_sample.mean(),
+            "recovery_loss": recovery_per_sample.mean(),
+            "recovery_current": recovery_current,
+            **weights,
+        }
     
     def compute_main_residual(
         self,
@@ -148,6 +440,7 @@ class QLoss(nn.Module):
                 g=self.g,
                 delta=self.delta,
                 phi=self.phi,
+                recovery_normalization_mode=self.recovery_normalization_mode,
             )
             residual = components["q_training_residual"]
             
@@ -238,11 +531,12 @@ class QLoss(nn.Module):
         bar_z: torch.Tensor,
         bar_zsp_children: List[torch.Tensor],
         x_children: List[torch.Tensor],
-        z_children: List[torch.Tensor]
+        z_children: List[torch.Tensor],
+        phat: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         计算 Q 损失（支持任意分支数）
-        
+
         Args:
             Q: 当前债券价格
             inputs: 输入状态
@@ -252,7 +546,8 @@ class QLoss(nn.Module):
             bar_z: 当期违约阈值
             bar_zsp_children: List[torch.Tensor] - 各路径的违约阈值
             x_children, z_children: 各路径的未来状态
-        
+            phat: 当期 parent 的 Phat；仅在非 legacy regime 下需要（默认 None 退化为 legacy）
+
         Returns:
             total_loss: 总损失
             loss_dict: 各分量损失字典
@@ -261,36 +556,47 @@ class QLoss(nn.Module):
         b = inputs[:, 0:1]
         z = inputs[:, 1:2]
         x = inputs[:, 4:5]
-        
+
         loss_dict = {}
-        
+
         # 主残差
         residuals = self.compute_main_residual(
             Q, b, bar_i, M_list, Qsp_children,
             bar_zsp_children, x_children, z_children
         )
-        
-        main_q = compute_aio_residual(residuals, self.aio_weight)
-        
-        # bar_z 约束
-        loss3 = self.compute_bar_z_constraint(Q, b, x, z, bar_z)
-        
+
         # 边界条件
         loss4 = self.compute_boundary_loss_low(Q, b)
         loss5 = self.compute_boundary_loss_high(Q, b, x, z)
-        
-        # z 惩罚
-        penalty_z_main = compute_z_penalty(
-            compute_aio_residual(residuals, self.aio_weight), 
-            z, self.alpha_z, self.beta_z, self.z0
-        )
-        penalty_z_loss3 = compute_z_penalty(
-            (Q - self.compute_total_recovery(b, x, z)).pow(2) * bar_z,
-            z, self.alpha_z, self.beta_z, self.z0
-        )
-        
+
+        if self.parent_default_regime_mode == "legacy_soft_penalty" or phat is None:
+            # legacy：Bellman 覆盖全部 parent，违约侧靠 soft bar_z 惩罚项
+            main_q = compute_aio_residual(residuals, self.aio_weight)
+            loss3 = self.compute_bar_z_constraint(Q, b, x, z, bar_z)
+            penalty_z_main = compute_z_penalty(
+                compute_aio_residual(residuals, self.aio_weight),
+                z, self.alpha_z, self.beta_z, self.z0
+            )
+            penalty_z_loss3 = compute_z_penalty(
+                (Q - self.compute_total_recovery(b, x, z)).pow(2) * bar_z,
+                z, self.alpha_z, self.beta_z, self.z0
+            )
+        else:
+            # regime-aware：surviving parent 走 Bellman，default parent 走当期回收
+            terms = self.compute_regime_aware_objective(
+                residuals=residuals, Q=Q, b=b, x=x, z=z, phat=phat,
+            )
+            main_q = terms["bellman_loss"]
+            loss3 = terms["recovery_loss"]
+            penalty_z_main = compute_z_penalty(
+                terms["bellman_per_sample"], z, self.alpha_z, self.beta_z, self.z0
+            )
+            penalty_z_loss3 = compute_z_penalty(
+                terms["recovery_per_sample"], z, self.alpha_z, self.beta_z, self.z0
+            )
+
         total_loss = main_q + loss3 + loss4 + loss5 + penalty_z_main + penalty_z_loss3
-        
+
         loss_dict = {
             'main_q': main_q,
             'loss3': loss3,
@@ -300,7 +606,7 @@ class QLoss(nn.Module):
             'penalty_z_loss3': penalty_z_loss3,
             'total_loss': total_loss
         }
-        
+
         return total_loss, loss_dict
     
     def forward_legacy(

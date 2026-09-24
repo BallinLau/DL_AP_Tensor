@@ -190,6 +190,26 @@ def parse_args() -> argparse.Namespace:
             "Falls back to the BP_EVAL_MAX_EXPANDED_STATES environment variable."
         ),
     )
+    parser.add_argument(
+        "--recovery-normalization-mode",
+        choices=["asset_only", "legacy_b_times_unit"],
+        default=None,
+        help=(
+            "Q 违约回收归一化口径。默认沿用 checkpoint hyperparams，再回落到 "
+            "Config.RECOVERY_NORMALIZATION_MODE（asset_only，与 main_4.tex 一致）。"
+        ),
+    )
+    parser.add_argument(
+        "--q-parent-default-regime-mode",
+        choices=["legacy_soft_penalty", "hard", "transition_band"],
+        default=None,
+        help=(
+            "Q parent default regime gating 口径。默认沿用 checkpoint hyperparams，"
+            "再回落到 Config.Q_PARENT_DEFAULT_REGIME_MODE（legacy_soft_penalty）。"
+        ),
+    )
+    parser.add_argument("--q-parent-default-eps", type=float, default=None)
+    parser.add_argument("--q-parent-default-tau", type=float, default=None)
     return parser.parse_args()
 
 
@@ -280,6 +300,41 @@ def _write_selected_surfaces(
             )
 
 
+def _q_peak_diagnostics_frame(
+    surfaces: Dict[str, np.ndarray],
+    bellman_surfaces: Dict[str, np.ndarray],
+    grid,
+    peak_idx: np.ndarray,
+) -> pd.DataFrame:
+    """每个 z 的 Q peak 点上的 Q / recovery / regime 分解（自包含，免手工 join）。"""
+    z_values = np.asarray(grid.z_values)
+    columns = np.arange(len(z_values))
+
+    def pick(name: str) -> np.ndarray:
+        values = bellman_surfaces.get(name)
+        if values is None:
+            return np.full(len(z_values), np.nan, dtype=np.float64)
+        return values[peak_idx, columns]
+
+    return pd.DataFrame({
+        "z": z_values,
+        "b_peak": grid.b_values[peak_idx],
+        "Q": surfaces["Q"][peak_idx, columns],
+        "Phat": surfaces["Phat"][peak_idx, columns],
+        "bar_z": surfaces["bar_z"][peak_idx, columns],
+        "parent_hard_default": pick("parent_hard_default"),
+        "parent_survival_weight": pick("parent_survival_weight"),
+        "parent_default_weight": pick("parent_default_weight"),
+        "recovery_current": pick("recovery_current"),
+        "Q_target": pick("Q_target"),
+        "Q_target_survival": pick("Q_target_survival"),
+        "Q_target_recovery": pick("Q_target_recovery"),
+        "Q_minus_recovery": pick("Q_minus_recovery"),
+        "Q_minus_Q_target": pick("Q_minus_Q_target"),
+        "Q_target_minus_recovery": pick("Q_target_minus_recovery"),
+    })
+
+
 def _bp_boundary_summary(surfaces: Dict[str, np.ndarray]) -> Dict[str, float]:
     summary: Dict[str, float] = {}
     for name in ("bp0", "bpI_low", "bpI_mid", "bpI_high", "bp"):
@@ -328,6 +383,33 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     sdf_fc1_model = loaded.models["sdf_fc1"]
     model.eval()
     sdf_fc1_model.eval()
+
+    def _resolve_q_mode(arg_value, hyperparam_name: str, config_name: str):
+        if arg_value is not None:
+            return arg_value
+        hp_value = getattr(loaded.hyperparams, hyperparam_name, None)
+        if hp_value:
+            return hp_value
+        return getattr(Config, config_name, None)
+
+    recovery_normalization_mode = _resolve_q_mode(
+        getattr(args, "recovery_normalization_mode", None),
+        "q_recovery_normalization_mode", "RECOVERY_NORMALIZATION_MODE",
+    )
+    q_parent_default_regime_mode = _resolve_q_mode(
+        getattr(args, "q_parent_default_regime_mode", None),
+        "q_parent_default_regime_mode", "Q_PARENT_DEFAULT_REGIME_MODE",
+    )
+    q_parent_default_eps = (
+        args.q_parent_default_eps
+        if getattr(args, "q_parent_default_eps", None) is not None
+        else getattr(loaded.hyperparams, "q_parent_default_eps", None)
+    )
+    q_parent_default_tau = (
+        args.q_parent_default_tau
+        if getattr(args, "q_parent_default_tau", None) is not None
+        else getattr(loaded.hyperparams, "q_parent_default_tau", None)
+    )
     hash_locally = not bool(getattr(args, "defer_model_state_hash", False))
     before_hashes = (
         {
@@ -546,11 +628,18 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
     bellman_surfaces, bellman_summary = evaluate_bellman_residuals(
         model, grid, transition_data, loaded.economic_config,
         chunk_size=args.forward_chunk_size,
+        recovery_normalization_mode=recovery_normalization_mode,
+        parent_default_regime_mode=q_parent_default_regime_mode,
+        parent_default_eps=q_parent_default_eps,
+        parent_default_tau=q_parent_default_tau,
     )
     _sync_cuda(device)
     phase_timing["bellman_seconds"] = time.perf_counter() - bellman_started
     if not summary_only:
         save_surface_csvs(output / "bellman", bellman_surfaces, grid.b_values, grid.z_values)
+        _q_peak_diagnostics_frame(
+            surfaces, bellman_surfaces, grid, peak_idx
+        ).to_csv(output / "q" / "Q_peak_diagnostics.csv", index=False)
         if detailed_output:
             for name, values in bellman_surfaces.items():
                 plot_heatmap(
@@ -768,6 +857,10 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
         "firm_data": str(args.firm_data.resolve()),
         "macro_data": reference.macro_source,
         "bp_teacher_model": "policy_value",
+        "q_parent_default_regime_mode": q_parent_default_regime_mode,
+        "eps_default": q_parent_default_eps,
+        "tau_parent_default": q_parent_default_tau,
+        "recovery_normalization_mode": recovery_normalization_mode,
         "parent_eta": float(args.eta),
         "n_child_shocks": int(args.n_child_shocks),
         "eta_integration_mode": transition_meta.get("eta_integration_mode"),
@@ -1131,6 +1224,14 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
         "reference_transition_bank": primary_case_metadata.get("reference_transition_bank"),
         "m_mode": primary_case_metadata.get("m_mode"),
         "m_clamp_bounds": primary_case_metadata.get("m_clamp_bounds"),
+        "q_parent_default_regime_mode": primary_case_metadata.get(
+            "q_parent_default_regime_mode"
+        ),
+        "eps_default": primary_case_metadata.get("eps_default"),
+        "tau_parent_default": primary_case_metadata.get("tau_parent_default"),
+        "recovery_normalization_mode": primary_case_metadata.get(
+            "recovery_normalization_mode"
+        ),
         "model_state_hash_before": hash_before,
         "model_state_hash_after": hash_after,
         "model_state_hash_scope": "outer_episode" if defer_hash_to_outer else "matrix",

@@ -8,7 +8,13 @@ import torch
 
 from analysis.economic_config import AnalysisEconomicConfig
 from losses import P0Loss, PILoss
-from losses.q_loss import compute_q_survival_recovery_components
+from losses.q_loss import (
+    compute_parent_default_regime_weights,
+    compute_q_survival_recovery_components,
+    compute_recovery_target,
+    resolve_q_parent_default_regime_mode,
+    resolve_recovery_normalization_mode,
+)
 from utils.firm_transition import apply_refinancing_policy
 
 from .bp_diagnostics import FrozenTransitionData
@@ -75,8 +81,18 @@ def evaluate_bellman_residuals(
     economic_config: AnalysisEconomicConfig,
     *,
     chunk_size: int = 8192,
+    recovery_normalization_mode: str | None = None,
+    parent_default_regime_mode: str | None = None,
+    parent_default_eps: float | None = None,
+    parent_default_tau: float | None = None,
 ) -> tuple[Dict[str, np.ndarray], Dict[str, float]]:
-    """Evaluate physical conditional-mean P0/PI/Q Bellman residuals."""
+    """Evaluate physical conditional-mean P0/PI/Q Bellman residuals.
+
+    ``recovery_normalization_mode`` / ``parent_default_regime_mode`` 决定 Q 违约回收
+    口径与 parent default regime gating；默认沿用 ``Config``（见 config/constants.py）。
+    """
+    recovery_mode = resolve_recovery_normalization_mode(recovery_normalization_mode)
+    regime_mode = resolve_q_parent_default_regime_mode(parent_default_regime_mode)
     parent = grid.base_states
     p0_loss = P0Loss(
         delta=economic_config.DELTA, tau=economic_config.TAU,
@@ -102,6 +118,10 @@ def evaluate_bellman_residuals(
             bar_i = _get(parent_out, "bar_i")
         except (AttributeError, KeyError):
             bar_i = torch.zeros_like(q)
+        try:
+            phat = _get(parent_out, "Phat")
+        except (AttributeError, KeyError):
+            phat = torch.zeros_like(q)
 
         issue_p0 = parent.clone()
         issue_p0[:, 0:1] = bp0
@@ -153,6 +173,26 @@ def evaluate_bellman_residuals(
             bar_zsp = torch.zeros_like(qsp)
         x_child = q_child_states[..., 4:5]
         z_child = q_child_states[..., 1:2]
+        # Parent default regime gating 与当期回收（均与 M 无关，只依赖 parent 状态）。
+        regime = compute_parent_default_regime_weights(
+            phat, mode=regime_mode, eps=parent_default_eps, tau=parent_default_tau,
+        )
+        survival_w = regime["parent_survival_weight"]
+        default_w = regime["parent_default_weight"]
+        hard_default = regime["parent_hard_default"]
+        recovery_current = compute_recovery_target(
+            parent[:, 0:1], parent[:, 4:5], parent[:, 1:2],
+            phi=float(economic_config.PHI), delta=float(economic_config.DELTA),
+            recovery_normalization_mode=recovery_mode,
+        )
+        # Q = b * q_unit 参数化下，default 区隐含的 q_unit 目标为 recovery / b。
+        b_parent = parent[:, 0:1]
+        q_unit_recovery_target = torch.where(
+            b_parent > 0.0,
+            recovery_current / b_parent.clamp_min(1e-12),
+            torch.full_like(recovery_current, float("nan")),
+        )
+
         def residuals_for_m(m_values: torch.Tensor) -> Dict[str, torch.Tensor]:
             continuation0 = (weights * m_values * p_child_p0).sum(dim=1)
             continuationi = float(economic_config.G) * (
@@ -170,13 +210,21 @@ def evaluate_bellman_residuals(
                 g=float(economic_config.G),
                 delta=float(economic_config.DELTA),
                 phi=float(economic_config.PHI),
+                recovery_normalization_mode=recovery_mode,
             )
-            q_target = (weights * q_components["q_target_total"]).sum(dim=1)
+            q_target_survival = (weights * q_components["q_target_survival"]).sum(dim=1)
+            q_target_recovery = (weights * q_components["q_target_recovery"]).sum(dim=1)
+            q_target = q_target_survival + q_target_recovery
             return {
                 "r0": p0 - cf0 - continuation0,
                 "ri": pi - cfi - continuationi,
                 "rq": (weights * q_components["q_training_residual"]).sum(dim=1),
                 "q_target": q_target,
+                "q_target_survival": q_target_survival,
+                "q_target_recovery": q_target_recovery,
+                "q_target_used_for_training": (
+                    survival_w * q_target + default_w * recovery_current
+                ),
                 "continuation0": continuation0,
                 "continuationi": continuationi,
             }
@@ -209,6 +257,25 @@ def evaluate_bellman_residuals(
             f"RQ_{label}_scale_normalized": surface(values["rq"] / q_scale),
             f"abs_RQ_{label}_scale_normalized": surface((values["rq"] / q_scale).abs()),
             f"Q_target_{label}": surface(values["q_target"]),
+            f"Q_target_survival_{label}": surface(values["q_target_survival"]),
+            f"Q_target_recovery_{label}": surface(values["q_target_recovery"]),
+            f"Q_target_used_for_training_{label}": surface(
+                values["q_target_used_for_training"]
+            ),
+            # 显式口径命名（不改动旧 Q_target 的经济含义）：
+            #   Q_target_bellman        = continuation Bellman target
+            #   Q_target_*_bellman      = 其 survival / recovery 分解
+            #   Q_target_training       = w_survival * bellman + w_default * recovery
+            #   RQ_bellman_signed       = Q_target_bellman - Q
+            #   RQ_training_signed      = Q_target_training - Q
+            f"Q_target_bellman_{label}": surface(values["q_target"]),
+            f"Q_target_survival_bellman_{label}": surface(values["q_target_survival"]),
+            f"Q_target_recovery_bellman_{label}": surface(values["q_target_recovery"]),
+            f"Q_target_training_{label}": surface(values["q_target_used_for_training"]),
+            f"RQ_bellman_signed_{label}": surface(values["rq"]),
+            f"RQ_training_signed_{label}": surface(
+                values["q_target_used_for_training"] - q
+            ),
         })
     # Backward-compatible canonical files and fields retain training-M semantics.
     surfaces.update({
@@ -223,6 +290,26 @@ def evaluate_bellman_residuals(
         "RQ_scale_normalized": surfaces["RQ_trainM_scale_normalized"],
         "abs_RQ_scale_normalized": surfaces["abs_RQ_trainM_scale_normalized"],
         "Q_target": surfaces["Q_target_trainM"],
+        "Q_target_survival": surfaces["Q_target_survival_trainM"],
+        "Q_target_recovery": surfaces["Q_target_recovery_trainM"],
+        "Q_target_used_for_training": surfaces["Q_target_used_for_training_trainM"],
+        "Q_target_bellman": surfaces["Q_target_bellman_trainM"],
+        "Q_target_survival_bellman": surfaces["Q_target_survival_bellman_trainM"],
+        "Q_target_recovery_bellman": surfaces["Q_target_recovery_bellman_trainM"],
+        "Q_target_training": surfaces["Q_target_training_trainM"],
+        "RQ_bellman_signed": surfaces["RQ_bellman_signed_trainM"],
+        "RQ_training_signed": surfaces["RQ_training_signed_trainM"],
+    })
+    # Parent 违约 regime 与当期回收（只依赖 parent 状态，与 M 无关）。
+    surfaces.update({
+        "recovery_current": surface(recovery_current),
+        "q_unit_recovery_target": surface(q_unit_recovery_target),
+        "parent_hard_default": surface(hard_default),
+        "parent_survival_weight": surface(survival_w),
+        "parent_default_weight": surface(default_w),
+        "Q_minus_recovery": surface(q - recovery_current),
+        "Q_target_minus_recovery": surface(train_m["q_target"] - recovery_current),
+        "Q_minus_Q_target": surface(q - train_m["q_target"]),
     })
     summary: Dict[str, float] = {}
     for prefix, values in (
@@ -247,6 +334,20 @@ def evaluate_bellman_residuals(
             summary[f"{equation}_residual_{key}"] = value
     for key, value in residual_statistics(surfaces["RQ_trainM_scale_normalized"]).items():
         summary[f"q_residual_normalized_{key}"] = value
+    # default-region q_unit 统计：Q = b * q_unit，recovery 不再乘 b 后，
+    # hard-default 区隐含 q_unit = recovery / b。deep-default 样本稀缺，单独报告。
+    hard_default_flat = surfaces["parent_hard_default"].reshape(-1) > 0.5
+    q_unit_flat = surfaces["q_unit_recovery_target"].reshape(-1)
+    q_unit_default = q_unit_flat[hard_default_flat]
+    q_unit_default = q_unit_default[np.isfinite(q_unit_default)]
+    summary["q_unit_default_region_count"] = int(q_unit_default.size)
+    for key, value in (
+        ("mean", float(q_unit_default.mean()) if q_unit_default.size else float("nan")),
+        ("p90", float(np.quantile(q_unit_default, 0.90)) if q_unit_default.size else float("nan")),
+        ("p99", float(np.quantile(q_unit_default, 0.99)) if q_unit_default.size else float("nan")),
+        ("max", float(q_unit_default.max()) if q_unit_default.size else float("nan")),
+    ):
+        summary[f"q_unit_default_region_{key}"] = value
     return surfaces, summary
 
 

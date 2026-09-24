@@ -124,6 +124,23 @@ class Config:
     ALPHA_Z = 1.0
     BETA_Z = 5.0
     Z0 = 1.0
+
+    # ========== Q parent default regime / recovery normalization ==========
+    # parent 违约 regime 的 Q 方程口径：
+    #   "legacy_soft_penalty" - 历史行为，Bellman 覆盖全部 parent，
+    #                            违约侧只靠 soft bar_z 惩罚项（默认，保证旧实验可复现）
+    #   "hard"                - w_survival = 1{Phat_t > 0}，硬切换
+    #   "transition_band"     - |Phat| <= Q_PARENT_DEFAULT_EPS 内用 sigmoid 平滑，
+    #                            带外严格 0/1，深度违约区真正 collapse 到 recovery
+    Q_PARENT_DEFAULT_REGIME_MODE = "legacy_soft_penalty"
+    Q_PARENT_DEFAULT_EPS = 1e-2
+    Q_PARENT_DEFAULT_TAU = 1e-2
+
+    # Q 违约回收的归一化口径（单位与 Q 一致）：
+    #   "asset_only"           - phi * (1 - delta + exp(x + z))，与 main_4.tex
+    #                            Bondprice 公式 / L_Q^(1) / L_Q^(b=1) 一致（默认）
+    #   "legacy_b_times_unit"  - b_+ * phi * (1 - delta + exp(x + z))，历史行为
+    RECOVERY_NORMALIZATION_MODE = "asset_only"
     
     # SDF 矩约束
     MU_LO = -0.025
