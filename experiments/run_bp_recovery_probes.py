@@ -29,7 +29,11 @@ from experiments.run_bp_fixed_teacher_refit_probe import (  # noqa: E402
     require_file,
     split_indices,
 )
-from experiments.run_utils import build_hyperparams, build_models  # noqa: E402
+from experiments.run_utils import (  # noqa: E402
+    add_raw_q_parameterization_argument,
+    build_hyperparams,
+    build_models,
+)
 from training.bp_policy_loss import (  # noqa: E402
     compute_target_grid_policy_distillation_loss,
     huber_element,
@@ -66,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--episode", type=int, required=True)
+    add_raw_q_parameterization_argument(parser)
     parser.add_argument("--firm-pkl", type=Path, required=True)
     parser.add_argument("--decomposition-summary", type=Path, required=True)
     parser.add_argument("--device", type=str, default="cpu")
@@ -947,8 +952,8 @@ def main() -> None:
 
     models = build_models(
         device=device, ckpt_dir=ckpt_dir, ckpt_prefix=f"ep{args.episode}", strict=True,
-        # 裸 state_dict（旧 run root 无 metadata/）：显式 opt-in，避免 legacy/direct 语义错配。
-        allow_unsafe_raw_checkpoint=True,
+        # 无 metadata 时必须由 CLI 显式声明这组 q-head 权重代表 Q 还是 q_unit。
+        raw_q_parameterization=args.raw_q_parameterization,
     )
     online_model = models["policy_value"].eval()
     tensors = make_episode_batches(firm_pkl, online_model, hp, device, args.batch_size, args.n_branches)

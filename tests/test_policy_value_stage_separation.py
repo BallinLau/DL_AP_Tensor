@@ -440,6 +440,8 @@ def test_cached_pq_validation_uses_first_order_q_graph(monkeypatch):
         flags.append(bool(kwargs.get("create_graph", False)))
         return original_grad(*args, **kwargs)
 
+    # shape derivative 只在 weight > 0 时才计算（见 episode._compute_q_survival_bellman_loss）。
+    episode.hyperparams.q_shape_weight_z = 1.0
     monkeypatch.setattr(torch.autograd, "grad", _recording_grad)
     episode._compute_q_survival_bellman_loss(
         batch,

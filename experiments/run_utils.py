@@ -19,6 +19,7 @@ from utils.firm_transition import apply_refinancing_policy
 
 POLICY_VALUE_SPEC_FILENAME = "policy_value_model_spec.json"
 METADATA_DIRNAME = "metadata"
+Q_PARAMETERIZATION_MODES = ("direct", "b_times_unit")
 
 
 def resolve_base_dir(run_root: Optional[Path], project_root: Path) -> Path:
@@ -57,13 +58,78 @@ def load_policy_value_model_spec(
     return None
 
 
+def add_raw_q_parameterization_argument(parser) -> None:
+    """Register the shared ``--raw-q-parameterization`` CLI flag on a parser."""
+    parser.add_argument(
+        "--raw-q-parameterization",
+        type=str,
+        default=None,
+        choices=list(Q_PARAMETERIZATION_MODES),
+        help=(
+            "Q semantics of a metadata-less raw policy_value checkpoint. Required when "
+            "metadata/policy_value_model_spec.json is absent; ignored when it is present."
+        ),
+    )
+
+
+def resolve_raw_q_parameterization(mode: Optional[str]) -> Optional[str]:
+    """Validate an explicit ``q_parameterization`` for a metadata-less checkpoint."""
+    if mode is None:
+        return None
+    resolved = str(mode).strip().lower()
+    if resolved not in Q_PARAMETERIZATION_MODES:
+        raise ValueError(
+            f"raw_q_parameterization must be one of {Q_PARAMETERIZATION_MODES}, got {mode!r}"
+        )
+    return resolved
+
+
+def resolve_expected_q_parameterization(mode: Optional[str]) -> Optional[str]:
+    """Validate an explicit ``expected_q_parameterization`` (resume-training guard)."""
+    if mode is None:
+        return None
+    resolved = str(mode).strip().lower()
+    if resolved not in Q_PARAMETERIZATION_MODES:
+        raise ValueError(
+            f"expected_q_parameterization must be one of {Q_PARAMETERIZATION_MODES}, got {mode!r}"
+        )
+    return resolved
+
+
 def build_models(
     device: torch.device,
     ckpt_dir: Optional[Path | str] = None,
     ckpt_prefix: str | None = None,
     strict: bool = True,
     allow_unsafe_raw_checkpoint: bool = False,
+    raw_q_parameterization: Optional[str] = None,
+    expected_q_parameterization: Optional[str] = None,
 ):
+    """Build the run models, optionally loading a checkpoint with verified Q semantics.
+
+    ``policy_value`` 的 q-head 在 ``direct`` 与 ``b_times_unit`` 下 shape 相同，因此
+    裸 state_dict 无法自证语义。这里把两个职责分开：
+
+    - **evaluation / diagnostics**：``expected_q_parameterization=None``（默认）。
+      有 ``policy_value_model_spec`` 时完全相信 checkpoint，按 spec 的
+      ``q_parameterization`` 构造模型，**不要求**与 ``Config.Q_PARAMETERIZATION`` 一致。
+    - **resume training**：显式传入 ``expected_q_parameterization``。checkpoint 的
+      resolved 语义（spec 或 ``raw_q_parameterization``）必须与它相等，否则拒绝。
+
+    无 spec 的裸 checkpoint 仍必须显式给出 ``raw_q_parameterization``，不猜测。
+    ``Config.Q_PARAMETERIZATION`` 只决定**未加载 checkpoint 时** fresh model 的默认
+    architecture。``allow_unsafe_raw_checkpoint`` 仅为向后兼容保留，不能单独决定语义。
+    """
+    raw_mode = resolve_raw_q_parameterization(raw_q_parameterization)
+    expected_mode = resolve_expected_q_parameterization(expected_q_parameterization)
+    spec = load_policy_value_model_spec(ckpt_dir, ckpt_prefix) if ckpt_dir is not None else None
+    spec_q = None
+    if spec is not None:
+        # spec 决定 architecture；缺失 q_parameterization 视为 legacy b_times_unit。
+        spec_q = str(spec.get("q_parameterization", "b_times_unit")).lower()
+    # checkpoint 自己的语义优先；Config 只在没有 checkpoint 语义时决定 fresh model。
+    resolved_q = spec_q if spec_q is not None else raw_mode
+
     models = {
         "sdf_fc1": SDFFC1Combined(
             sdf_input_dim=Config.FC1_INPUT_DIM,
@@ -72,7 +138,11 @@ def build_models(
             fc1_hidden_dims=Config.FC1_HIDDEN_DIMS,
             w_hidden_dims=Config.SDF_HIDDEN_DIMS,
         ).to(device),
-        "policy_value": PolicyValueModel().to(device),
+        "policy_value": (
+            PolicyValueModel(q_parameterization=resolved_q).to(device)
+            if resolved_q is not None
+            else PolicyValueModel().to(device)
+        ),
         "fc2": FC2Model(
             input_dim=Config.FC2_INPUT_DIM,
             hidden_dims=Config.FC2_HIDDEN_DIMS,
@@ -84,31 +154,41 @@ def build_models(
         ckpt_dir = Path(ckpt_dir)
         prefix = f"{ckpt_prefix}_" if ckpt_prefix else ""
         pv_ckpt_path = ckpt_dir / f"{prefix}policy_value.pt"
-        expected_q = str(getattr(Config, "Q_PARAMETERIZATION", "direct")).lower()
-        spec = load_policy_value_model_spec(ckpt_dir, ckpt_prefix)
-        if spec is not None:
-            # 语义安全路径：checkpoint 自带 model spec，直接核对 q_parameterization。
-            spec_q = str(spec.get("q_parameterization", "b_times_unit")).lower()
-            if spec_q != expected_q:
-                raise ValueError(
-                    "policy_value q_parameterization mismatch: checkpoint spec declares "
-                    f"{spec_q!r} but this run is configured for {expected_q!r} "
-                    f"({pv_ckpt_path}). Explicit migration is required."
+        if spec_q is None and pv_ckpt_path.exists() and raw_mode is None:
+            # 不许猜：legacy b_times_unit 与 direct-Q 的 q-head shape 相同，
+            # 按当前 Config 强行 load 会静默改变 Q 的经济含义。
+            raise ValueError(
+                "Raw policy_value checkpoint without policy_value_model_spec: "
+                f"{pv_ckpt_path}. The q-head of a legacy b_times_unit state_dict is "
+                "shape-compatible with direct-Q, so the semantic mode must be stated "
+                "explicitly. Pass raw_q_parameterization='direct' or "
+                "raw_q_parameterization='b_times_unit'"
+                + (
+                    " (allow_unsafe_raw_checkpoint=True alone is not sufficient)."
+                    if allow_unsafe_raw_checkpoint
+                    else ", or save metadata/policy_value_model_spec.json."
                 )
-        elif pv_ckpt_path.exists():
-            # 裸 state_dict：b_times_unit 与 direct-Q 的 q-head 张量 shape 相同，
-            # 仅靠 load_state_dict(strict=True) 无法发现语义错配。
-            if expected_q == "direct" and not allow_unsafe_raw_checkpoint:
-                raise ValueError(
-                    "Raw policy_value checkpoint without policy_value_model_spec: "
-                    f"{pv_ckpt_path}. A legacy b_times_unit state_dict is shape-compatible "
-                    "with direct-Q, so loading it silently would change the economic meaning "
-                    "of Q. Save metadata/policy_value_model_spec.json, or pass "
-                    "allow_unsafe_raw_checkpoint=True to load it as legacy/unknown."
-                )
+            )
+        # resume-training guard：只有显式给出 expected 时才检查，evaluation 不受 Config 影响。
+        if expected_mode is not None and resolved_q is not None and resolved_q != expected_mode:
+            source = "checkpoint spec" if spec_q is not None else "raw_q_parameterization"
+            raise ValueError(
+                f"policy_value q_parameterization mismatch: {source} declares "
+                f"{resolved_q!r} but expected_q_parameterization={expected_mode!r} "
+                f"({pv_ckpt_path}). Resuming training across a Q semantic change is not "
+                "allowed; explicit migration is required."
+            )
+        if spec_q is not None:
             print(
-                "[build_models] WARNING: raw policy_value checkpoint has no "
-                f"policy_value_model_spec ({pv_ckpt_path}); treating it as legacy/unknown."
+                "[build_models] policy_value_model_spec declares "
+                f"q_parameterization={spec_q!r}; using the checkpoint semantics "
+                f"({pv_ckpt_path})."
+            )
+        elif pv_ckpt_path.exists():
+            print(
+                "[build_models] raw policy_value checkpoint without "
+                f"policy_value_model_spec ({pv_ckpt_path}); using explicit "
+                f"raw_q_parameterization={raw_mode!r}."
             )
         mapping = {
             "sdf_fc1": "sdf_fc1",
@@ -374,13 +454,16 @@ def save_checkpoint_metadata(
     if config_snapshot is None:
         config_snapshot = AnalysisEconomicConfig.from_current_config().to_dict()
     if value_parameterization is None:
-        mode = str(getattr(Config, "PV_VALUE_SCALE_MODE", "none")).lower()
-        log_max = float(getattr(Config, "PV_VALUE_SCALE_LOG_MAX", 20.0))
+        # 实际训练的 value parameterization 由 HyperParams 配置给 PolicyValueModel /
+        # Episode；Config 上的 PV_VALUE_SCALE_* 从不被 configure_hyperparams 回写，
+        # 用 Config 推断会写出自相矛盾的 metadata（hyperparams=exp_xz / mode=none）。
+        mode = str(getattr(hyperparams, "pv_value_scale_mode", "none")).lower()
+        log_max = float(getattr(hyperparams, "pv_value_scale_log_max", 20.0))
         value_parameterization = {
             "mode": mode,
             "scale_formula": f"1+exp(clamp(x+z,max={log_max:g}))" if mode == "exp_xz" else "1",
             "bellman_normalization": bool(
-                getattr(Config, "PV_BELLMAN_NORMALIZE_BY_VALUE_SCALE", False)
+                getattr(hyperparams, "pv_bellman_normalize_by_value_scale", False)
             ),
             "log_max": log_max,
         }

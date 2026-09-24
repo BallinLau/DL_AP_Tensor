@@ -72,6 +72,9 @@ def test_exporter_branch_loop_wires_mix_survival_weight(tmp_path):
         str(run_root),
         "--episode",
         "0",
+        # fixture 写的是裸 state_dict（run root 无 metadata/），且模型为默认 direct-Q。
+        "--raw-q-parameterization",
+        "direct",
         "--firm-pkl",
         str(firm_pkl),
         "--n-states",

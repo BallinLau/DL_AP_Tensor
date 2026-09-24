@@ -15,7 +15,11 @@ if str(ROOT) not in sys.path:
 
 from config import Config  # noqa: E402
 from experiments.export_bp_deep_diagnostics import make_episode_batches  # noqa: E402
-from experiments.run_utils import build_hyperparams, build_models  # noqa: E402
+from experiments.run_utils import (  # noqa: E402
+    add_raw_q_parameterization_argument,
+    build_hyperparams,
+    build_models,
+)
 from losses.q_loss import compute_q_survival_recovery_components  # noqa: E402
 
 
@@ -142,6 +146,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export continuation and Q decomposition surfaces.")
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--episode", type=int, required=True)
+    add_raw_q_parameterization_argument(parser)
     parser.add_argument("--base-state-source-index", type=int, required=True)
     parser.add_argument("--firm-pkl", type=Path, required=True)
     parser.add_argument("--b-grid-size", type=int, default=21)
@@ -219,8 +224,8 @@ def main() -> None:
     hp.max_firm_train_units = 0
     models = build_models(
         device=device, ckpt_dir=ckpt_dir, ckpt_prefix=f"ep{args.episode}", strict=True,
-        # 裸 state_dict（旧 run root 无 metadata/）：显式 opt-in，避免 legacy/direct 语义错配。
-        allow_unsafe_raw_checkpoint=True,
+        # 无 metadata 时必须由 CLI 显式声明这组 q-head 权重代表 Q 还是 q_unit。
+        raw_q_parameterization=args.raw_q_parameterization,
     )
     model = models["policy_value"].eval()
     target_model = copy.deepcopy(model).to(device).eval()

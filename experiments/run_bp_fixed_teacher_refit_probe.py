@@ -20,7 +20,11 @@ from experiments.export_bp_deep_diagnostics import (  # noqa: E402
     select_exported_states,
     stable_logit_with_censoring,
 )
-from experiments.run_utils import build_hyperparams, build_models  # noqa: E402
+from experiments.run_utils import (  # noqa: E402
+    add_raw_q_parameterization_argument,
+    build_hyperparams,
+    build_models,
+)
 from training.bp_policy_loss import compute_target_grid_policy_distillation_loss  # noqa: E402
 
 
@@ -38,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fixed-teacher BP policy refit probe.")
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--episode", type=int, required=True)
+    add_raw_q_parameterization_argument(parser)
     parser.add_argument("--firm-pkl", type=Path, required=True)
     parser.add_argument("--decomposition-summary", type=Path, required=True)
     parser.add_argument("--device", type=str, default="cpu")
@@ -232,8 +237,8 @@ def main() -> None:
 
     models = build_models(
         device=device, ckpt_dir=ckpt_dir, ckpt_prefix=f"ep{args.episode}", strict=True,
-        # 裸 state_dict（旧 run root 无 metadata/）：显式 opt-in，避免 legacy/direct 语义错配。
-        allow_unsafe_raw_checkpoint=True,
+        # 无 metadata 时必须由 CLI 显式声明这组 q-head 权重代表 Q 还是 q_unit。
+        raw_q_parameterization=args.raw_q_parameterization,
     )
     online_model = models["policy_value"].eval()
     probe_model = copy.deepcopy(online_model).to(device).eval()

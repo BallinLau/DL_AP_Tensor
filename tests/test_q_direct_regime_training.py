@@ -1,3 +1,4 @@
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -454,6 +455,81 @@ def test_E_polish_skip_does_not_reject_q_stage(monkeypatch):
     assert summary["status"] == "accepted"
     assert summary["q_stage_required_gate_passed"] is True
     assert summary["q_polish_status"] == "skipped_no_samples"
+
+
+# ===========================================================================
+# TEST 5/6: shape penalty execution short-circuit
+# ===========================================================================
+
+def _shape_episode_and_batch():
+    episode = _episode()
+    episode.hyperparams.policy_lr = 1e-3
+    episode.hyperparams.q_survival_aio_epochs = 1
+    target = deepcopy(episode.models["policy_value"])
+    parent = torch.tensor(
+        [
+            [0.10, 0.20, 1.00, 0.20, 0.10, -2.00, 4.00],
+            [0.30, 0.10, 0.00, 0.40, 0.00, -1.80, 4.20],
+        ],
+        dtype=torch.float32,
+    )
+    child0 = parent.clone()
+    child1 = parent.clone()
+    child0[:, 1:2] += 0.05
+    child1[:, 1:2] -= 0.03
+    child0[:, 2:3] = torch.tensor([[1.0], [0.0]])
+    child1[:, 2:3] = torch.tensor([[0.0], [1.0]])
+    batch = {
+        "parent": torch.cat([parent, torch.ones(2, 1)], dim=1),
+        "children": [
+            torch.cat([child0, torch.full((2, 1), 0.98)], dim=1),
+            torch.cat([child1, torch.full((2, 1), 1.02)], dim=1),
+        ],
+    }
+    return episode, batch, target, batch["parent"][:, :7]
+
+
+def _spy_shape_grad(monkeypatch, parent_state, calls, *, raise_on_hit=True):
+    real_grad = torch.autograd.grad
+
+    def _grad(outputs, inputs, **kwargs):
+        if isinstance(inputs, torch.Tensor) and inputs.shape == parent_state.shape:
+            calls.append(tuple(inputs.shape))
+            if raise_on_hit:
+                raise AssertionError(
+                    "shape-specific torch.autograd.grad must not run when all shape weights are 0"
+                )
+        return real_grad(outputs, inputs, **kwargs)
+
+    monkeypatch.setattr(torch.autograd, "grad", _grad)
+
+
+def test_T5_zero_shape_weights_skip_shape_derivative(monkeypatch):
+    episode, batch, target, parent_state = _shape_episode_and_batch()
+    calls = []
+    _spy_shape_grad(monkeypatch, parent_state, calls)
+    episode.hyperparams.q_shape_weight_z = 0.0
+    episode.hyperparams.q_shape_weight_b_low = 0.0
+    episode.hyperparams.q_shape_weight_b_high = 0.0
+    episode._compute_q_survival_bellman_loss(batch, create_graph=False, q_target_model=target)
+    assert calls == []
+    terms = dict(episode._latest_q_terms)
+    assert terms["q_shape_z"] == 0.0
+    assert terms["q_shape_b_low"] == 0.0
+    assert terms["q_shape_b_high"] == 0.0
+
+
+def test_T6_positive_shape_weight_still_computes_shape_derivative(monkeypatch):
+    episode, batch, target, parent_state = _shape_episode_and_batch()
+    calls = []
+    _spy_shape_grad(monkeypatch, parent_state, calls, raise_on_hit=False)
+    episode.hyperparams.q_shape_weight_z = 1.0
+    episode.hyperparams.q_shape_weight_b_low = 0.0
+    episode.hyperparams.q_shape_weight_b_high = 0.0
+    episode._compute_q_survival_bellman_loss(batch, create_graph=False, q_target_model=target)
+    assert calls == [tuple(parent_state.shape)]
+    terms = dict(episode._latest_q_terms)
+    assert terms["q_shape_z"] >= 0.0
 
 
 def test_E2_required_phase_flags_can_disable_the_gate(monkeypatch):

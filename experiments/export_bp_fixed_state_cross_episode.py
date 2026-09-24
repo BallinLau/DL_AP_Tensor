@@ -17,7 +17,11 @@ if str(ROOT) not in sys.path:
 from config import Config  # noqa: E402
 from analysis.checkpoint_loader import load_analysis_economic_config  # noqa: E402
 from experiments.export_bp_deep_diagnostics import make_episode_batches, stable_logit_with_censoring  # noqa: E402
-from experiments.run_utils import build_hyperparams, build_models  # noqa: E402
+from experiments.run_utils import (  # noqa: E402
+    add_raw_q_parameterization_argument,
+    build_hyperparams,
+    build_models,
+)
 from losses import P0Loss, PILoss  # noqa: E402
 from training.bp_grid_teacher import BPGridTeacher  # noqa: E402
 from utils.firm_transition import expand_children_exact_eta  # noqa: E402
@@ -32,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--episodes", type=parse_episodes, default=parse_episodes("0 1 2"))
     parser.add_argument("--reference-episode", type=int, default=2)
+    add_raw_q_parameterization_argument(parser)
     parser.add_argument("--reference-firm-pkl", type=Path, required=True)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -152,9 +157,8 @@ def compute_episode_rows(
         ckpt_dir=ckpt_dir,
         ckpt_prefix=f"ep{episode}",
         strict=True,
-        # 诊断脚本读取的是裸 state_dict（旧 run root 没有 metadata/）；
-        # 显式 opt-in，避免把 legacy b_times_unit 误当成 direct-Q。
-        allow_unsafe_raw_checkpoint=True,
+        # 无 metadata 时必须由 CLI 显式声明这组 q-head 权重代表 Q 还是 q_unit。
+        raw_q_parameterization=args.raw_q_parameterization,
     )
     model = models["policy_value"].eval()
     target_model = copy.deepcopy(model).to(device).eval()
@@ -319,7 +323,8 @@ def main() -> None:
         ckpt_dir=run_root / "checkpoints",
         ckpt_prefix=f"ep{args.reference_episode}",
         strict=True,
-        allow_unsafe_raw_checkpoint=True,
+        # 无 metadata 时必须由 CLI 显式声明这组 q-head 权重代表 Q 还是 q_unit。
+        raw_q_parameterization=args.raw_q_parameterization,
     )
     tensors = make_episode_batches(
         reference_firm,

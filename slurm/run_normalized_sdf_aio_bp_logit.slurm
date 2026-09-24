@@ -118,6 +118,20 @@ PV_EXACT_ETA_INTEGRATION_ENABLED="${PV_EXACT_ETA_INTEGRATION_ENABLED:-1}"
 FIRM_TARGET_UPDATE="${FIRM_TARGET_UPDATE:-stage_hard}"
 # Full normalized residual run: Treatment B by default.
 MODEB_RESIMULATE_AFTER_PV="${MODEB_RESIMULATE_AFTER_PV:-1}"
+# Direct-Q baseline：三项人为 Q 形状先验（Q 单调增于 z / low-b 增于 b / high-b 减于 b）
+# 默认全部关闭。需要复现旧 baseline 时显式覆盖为 1。
+Q_SHAPE_WEIGHT_Z="${Q_SHAPE_WEIGHT_Z:-0}"
+Q_SHAPE_WEIGHT_B_LOW="${Q_SHAPE_WEIGHT_B_LOW:-0}"
+Q_SHAPE_WEIGHT_B_HIGH="${Q_SHAPE_WEIGHT_B_HIGH:-0}"
+# Episode-0 direct-Q cold-start bootstrap（只做 shell -> CLI 透传，不重复 Python 默认值）。
+Q_BOOTSTRAP_EPOCHS="${Q_BOOTSTRAP_EPOCHS:-5}"
+Q_BOOTSTRAP_MODE="${Q_BOOTSTRAP_MODE:-constant_unit}"
+Q_BOOTSTRAP_UNIT_VALUE="${Q_BOOTSTRAP_UNIT_VALUE:-1.0}"
+Q_BOOTSTRAP_NONNEGATIVE_WEIGHT="${Q_BOOTSTRAP_NONNEGATIVE_WEIGHT:-1.0}"
+# Q0/QD/QS required-phase gate。
+Q_REQUIRE_ZERO_PHASE="${Q_REQUIRE_ZERO_PHASE:-true}"
+Q_REQUIRE_DEFAULT_PHASE="${Q_REQUIRE_DEFAULT_PHASE:-true}"
+Q_REQUIRE_SURVIVAL_PHASE="${Q_REQUIRE_SURVIVAL_PHASE:-true}"
 
 mkdir -p "$LOG_DIR" "$RUN_ROOT" "$WORK_ROOT/cachedir" "$WORK_ROOT/.mplcache"
 cd "$REPO_DIR"
@@ -333,6 +347,16 @@ print(f"  ECONOMIC_ZETA={Config.ZETA}")
 PY
 echo "  FIRM_TARGET_UPDATE=$FIRM_TARGET_UPDATE"
 echo "  MODEB_RESIMULATE_AFTER_PV=$MODEB_RESIMULATE_AFTER_PV"
+echo "  Q_SHAPE_WEIGHT_Z=$Q_SHAPE_WEIGHT_Z"
+echo "  Q_SHAPE_WEIGHT_B_LOW=$Q_SHAPE_WEIGHT_B_LOW"
+echo "  Q_SHAPE_WEIGHT_B_HIGH=$Q_SHAPE_WEIGHT_B_HIGH"
+echo "  Q_BOOTSTRAP_EPOCHS=$Q_BOOTSTRAP_EPOCHS"
+echo "  Q_BOOTSTRAP_MODE=$Q_BOOTSTRAP_MODE"
+echo "  Q_BOOTSTRAP_UNIT_VALUE=$Q_BOOTSTRAP_UNIT_VALUE"
+echo "  Q_BOOTSTRAP_NONNEGATIVE_WEIGHT=$Q_BOOTSTRAP_NONNEGATIVE_WEIGHT"
+echo "  Q_REQUIRE_ZERO_PHASE=$Q_REQUIRE_ZERO_PHASE"
+echo "  Q_REQUIRE_DEFAULT_PHASE=$Q_REQUIRE_DEFAULT_PHASE"
+echo "  Q_REQUIRE_SURVIVAL_PHASE=$Q_REQUIRE_SURVIVAL_PHASE"
 
 python3 -u experiments/run_multi_episode_job.py \
   --run-root "$RUN_ROOT" \
@@ -402,6 +426,16 @@ python3 -u experiments/run_multi_episode_job.py \
   --q-default-loss-weight "$Q_DEFAULT_LOSS_WEIGHT" \
   --q-survival-loss-weight "$Q_SURVIVAL_LOSS_WEIGHT" \
   --q-nonnegative-weight "$Q_NONNEGATIVE_WEIGHT" \
+  --q-shape-weight-z "$Q_SHAPE_WEIGHT_Z" \
+  --q-shape-weight-b-low "$Q_SHAPE_WEIGHT_B_LOW" \
+  --q-shape-weight-b-high "$Q_SHAPE_WEIGHT_B_HIGH" \
+  --q-bootstrap-epochs "$Q_BOOTSTRAP_EPOCHS" \
+  --q-bootstrap-mode "$Q_BOOTSTRAP_MODE" \
+  --q-bootstrap-unit-value "$Q_BOOTSTRAP_UNIT_VALUE" \
+  --q-bootstrap-nonnegative-weight "$Q_BOOTSTRAP_NONNEGATIVE_WEIGHT" \
+  --q-require-zero-phase "$Q_REQUIRE_ZERO_PHASE" \
+  --q-require-default-phase "$Q_REQUIRE_DEFAULT_PHASE" \
+  --q-require-survival-phase "$Q_REQUIRE_SURVIVAL_PHASE" \
   --bp-distill-epochs "$BP_DISTILL_EPOCHS" \
   --bp-distill-patience "$BP_DISTILL_PATIENCE" \
   --bp-distill-min-delta "$BP_DISTILL_MIN_DELTA" \
