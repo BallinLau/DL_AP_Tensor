@@ -3,7 +3,8 @@ Utilities for multi-episode runs: model/optimizer/hparam builders, I/O helpers, 
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
+import json
 import os
 import torch
 import pandas as pd
@@ -16,12 +17,53 @@ from losses import P0Loss, PILoss
 from utils.firm_transition import apply_refinancing_policy
 
 
+POLICY_VALUE_SPEC_FILENAME = "policy_value_model_spec.json"
+METADATA_DIRNAME = "metadata"
+
+
 def resolve_base_dir(run_root: Optional[Path], project_root: Path) -> Path:
     """Return run_root if provided; otherwise fall back to project_root."""
     return run_root if run_root is not None else project_root
 
 
-def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ckpt_prefix: str | None = None, strict: bool = True):
+def _policy_value_spec_candidates(ckpt_dir: Path, ckpt_prefix: Optional[str]) -> list:
+    prefix = f"{ckpt_prefix}_" if ckpt_prefix else ""
+    return [
+        ckpt_dir / f"{prefix}{POLICY_VALUE_SPEC_FILENAME}",
+        ckpt_dir.parent / METADATA_DIRNAME / f"{prefix}{POLICY_VALUE_SPEC_FILENAME}",
+        ckpt_dir.parent / METADATA_DIRNAME / POLICY_VALUE_SPEC_FILENAME,
+    ]
+
+
+def load_policy_value_model_spec(
+    ckpt_dir: Optional[Path | str],
+    ckpt_prefix: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Load the saved ``policy_value`` model spec for a checkpoint directory.
+
+    Returns ``None`` when no spec file exists (raw / legacy checkpoint layout).
+    """
+    if ckpt_dir is None:
+        return None
+    ckpt_dir = Path(ckpt_dir)
+    for candidate in _policy_value_spec_candidates(ckpt_dir, ckpt_prefix):
+        if not candidate.exists():
+            continue
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and isinstance(payload.get("policy_value_model_spec"), dict):
+            return payload["policy_value_model_spec"]
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def build_models(
+    device: torch.device,
+    ckpt_dir: Optional[Path | str] = None,
+    ckpt_prefix: str | None = None,
+    strict: bool = True,
+    allow_unsafe_raw_checkpoint: bool = False,
+):
     models = {
         "sdf_fc1": SDFFC1Combined(
             sdf_input_dim=Config.FC1_INPUT_DIM,
@@ -41,6 +83,33 @@ def build_models(device: torch.device, ckpt_dir: Optional[Path | str] = None, ck
     if ckpt_dir is not None:
         ckpt_dir = Path(ckpt_dir)
         prefix = f"{ckpt_prefix}_" if ckpt_prefix else ""
+        pv_ckpt_path = ckpt_dir / f"{prefix}policy_value.pt"
+        expected_q = str(getattr(Config, "Q_PARAMETERIZATION", "direct")).lower()
+        spec = load_policy_value_model_spec(ckpt_dir, ckpt_prefix)
+        if spec is not None:
+            # 语义安全路径：checkpoint 自带 model spec，直接核对 q_parameterization。
+            spec_q = str(spec.get("q_parameterization", "b_times_unit")).lower()
+            if spec_q != expected_q:
+                raise ValueError(
+                    "policy_value q_parameterization mismatch: checkpoint spec declares "
+                    f"{spec_q!r} but this run is configured for {expected_q!r} "
+                    f"({pv_ckpt_path}). Explicit migration is required."
+                )
+        elif pv_ckpt_path.exists():
+            # 裸 state_dict：b_times_unit 与 direct-Q 的 q-head 张量 shape 相同，
+            # 仅靠 load_state_dict(strict=True) 无法发现语义错配。
+            if expected_q == "direct" and not allow_unsafe_raw_checkpoint:
+                raise ValueError(
+                    "Raw policy_value checkpoint without policy_value_model_spec: "
+                    f"{pv_ckpt_path}. A legacy b_times_unit state_dict is shape-compatible "
+                    "with direct-Q, so loading it silently would change the economic meaning "
+                    "of Q. Save metadata/policy_value_model_spec.json, or pass "
+                    "allow_unsafe_raw_checkpoint=True to load it as legacy/unknown."
+                )
+            print(
+                "[build_models] WARNING: raw policy_value checkpoint has no "
+                f"policy_value_model_spec ({pv_ckpt_path}); treating it as legacy/unknown."
+            )
         mapping = {
             "sdf_fc1": "sdf_fc1",
             "policy_value": "policy_value",
@@ -243,10 +312,148 @@ def ensure_dirs(base_dir: Path):
     (base_dir / "experiments" / "figs").mkdir(parents=True, exist_ok=True)
 
 
-def save_models(models, episode: int, base_dir: Path):
-    torch.save(models["sdf_fc1"].state_dict(), base_dir / "checkpoints" / f"ep{episode}_sdf_fc1.pt")
-    torch.save(models["policy_value"].state_dict(), base_dir / "checkpoints" / f"ep{episode}_policy_value.pt")
-    torch.save(models["fc2"].state_dict(), base_dir / "checkpoints" / f"ep{episode}_fc2.pt")
+def _jsonable(value):
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _git_commit_hash() -> Optional[str]:
+    try:
+        import subprocess
+
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(Path(__file__).resolve().parent),
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return None
+
+
+def save_checkpoint_metadata(
+    models,
+    episode: int,
+    base_dir: Path,
+    *,
+    hyperparams: Optional[HyperParams] = None,
+    config_snapshot: Optional[Dict[str, Any]] = None,
+    value_parameterization: Optional[Dict[str, Any]] = None,
+    extra_models: Optional[Dict[str, Any]] = None,
+    extra_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    """Write ``metadata/`` (hyperparams / config snapshot / model spec) + combined checkpoint.
+
+    裸 state_dict 无法定义 direct-Q 与 legacy ``b q_unit`` 的区别（q-head shape 相同），
+    因此 strict resume / evaluation 需要这里保存的 ``policy_value_model_spec``。
+    """
+    from analysis.economic_config import AnalysisEconomicConfig
+
+    base_dir = Path(base_dir)
+    meta_dir = base_dir / METADATA_DIRNAME
+    ckpt_dir = base_dir / "checkpoints"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    if hyperparams is None:
+        hyperparams = HyperParams()
+    if config_snapshot is None:
+        config_snapshot = AnalysisEconomicConfig.from_current_config().to_dict()
+    if value_parameterization is None:
+        mode = str(getattr(Config, "PV_VALUE_SCALE_MODE", "none")).lower()
+        log_max = float(getattr(Config, "PV_VALUE_SCALE_LOG_MAX", 20.0))
+        value_parameterization = {
+            "mode": mode,
+            "scale_formula": f"1+exp(clamp(x+z,max={log_max:g}))" if mode == "exp_xz" else "1",
+            "bellman_normalization": bool(
+                getattr(Config, "PV_BELLMAN_NORMALIZE_BY_VALUE_SCALE", False)
+            ),
+            "log_max": log_max,
+        }
+
+    model_spec = models["policy_value"].model_spec()
+    hyperparams_path = meta_dir / "hyperparams.json"
+    config_path = meta_dir / "config_snapshot.json"
+    spec_path = meta_dir / POLICY_VALUE_SPEC_FILENAME
+    combined_path = ckpt_dir / f"ep{episode}_combined.pt"
+
+    hyperparams_path.write_text(
+        json.dumps(_jsonable(vars(hyperparams)), indent=2), encoding="utf-8"
+    )
+    config_path.write_text(
+        json.dumps(_jsonable(config_snapshot), indent=2), encoding="utf-8"
+    )
+    spec_path.write_text(
+        json.dumps({"policy_value_model_spec": model_spec}, indent=2), encoding="utf-8"
+    )
+
+    payload_models = {
+        name: model.state_dict()
+        for name, model in {**models, **(extra_models or {})}.items()
+        if model is not None
+    }
+    payload = {
+        "models": payload_models,
+        "hyperparams": vars(hyperparams),
+        "config_snapshot": config_snapshot,
+        "policy_value_model_spec": model_spec,
+        "value_parameterization": value_parameterization,
+        "episode": int(episode),
+        "git_commit": _git_commit_hash(),
+    }
+    if extra_metadata:
+        payload.update(extra_metadata)
+    torch.save(payload, combined_path)
+    return {
+        "hyperparams": str(hyperparams_path),
+        "config_snapshot": str(config_path),
+        "policy_value_model_spec": str(spec_path),
+        "combined_checkpoint": str(combined_path),
+    }
+
+
+def save_models(
+    models,
+    episode: int,
+    base_dir: Path,
+    *,
+    hyperparams: Optional[HyperParams] = None,
+    config_snapshot: Optional[Dict[str, Any]] = None,
+    value_parameterization: Optional[Dict[str, Any]] = None,
+    extra_models: Optional[Dict[str, Any]] = None,
+    extra_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    """Save raw module checkpoints **and** the semantic metadata that defines them."""
+    base_dir = Path(base_dir)
+    ckpt_dir = base_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(models["sdf_fc1"].state_dict(), ckpt_dir / f"ep{episode}_sdf_fc1.pt")
+    torch.save(models["policy_value"].state_dict(), ckpt_dir / f"ep{episode}_policy_value.pt")
+    torch.save(models["fc2"].state_dict(), ckpt_dir / f"ep{episode}_fc2.pt")
+    return save_checkpoint_metadata(
+        models,
+        episode,
+        base_dir,
+        hyperparams=hyperparams,
+        config_snapshot=config_snapshot,
+        value_parameterization=value_parameterization,
+        extra_models=extra_models,
+        extra_metadata=extra_metadata,
+    )
 
 
 def save_stage_df(ep: int, name: str, base_dir: Path, df_firm: pd.DataFrame = None, df_macro: pd.DataFrame = None, df_sdf: pd.DataFrame = None):

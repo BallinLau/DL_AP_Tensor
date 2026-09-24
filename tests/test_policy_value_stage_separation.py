@@ -41,6 +41,12 @@ def _small_hyperparams() -> HyperParams:
     hp.bp_distill_patience = 1
     hp.pv_eval_epochs = 1
     hp.policy_lr = 1e-3
+    # 本文件测试 staged 编排 / rollback / RNG 中性，不测试 Q required-phase gate。
+    # Q gate 由 tests/test_q_direct_regime_training.py 单独覆盖，这里关闭以免
+    # 因 fixture 的 frozen P 覆盖不足而走 failed_q 分支。
+    hp.q_require_zero_phase = False
+    hp.q_require_default_phase = False
+    hp.q_require_survival_phase = False
     return hp
 
 
@@ -2054,6 +2060,10 @@ def test_staged_current_eta_sampler_changes_only_bp_train_cache(monkeypatch):
         return {"status": "accepted"}
 
     monkeypatch.setattr(episode, "_run_policy_value_evaluation_stage", _pq_stage)
+    monkeypatch.setattr(
+        episode, "_run_q_regime_training",
+        lambda *_args, **_kwargs: {"status": "accepted", "q_stage_required_gate_passed": True},
+    )
     monkeypatch.setattr(episode, "_build_bp_target_cache", _cache)
     monkeypatch.setattr(episode, "_run_bp_distillation_stage", _bp_stage)
     monkeypatch.setattr(episode, "_update_firm_target_now", lambda *_args: None)

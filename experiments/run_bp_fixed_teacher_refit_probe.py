@@ -230,7 +230,11 @@ def main() -> None:
     hp.max_firm_train_units = 0
     lr = float(args.learning_rate if args.learning_rate is not None else getattr(hp, "policy_lr", 1e-3))
 
-    models = build_models(device=device, ckpt_dir=ckpt_dir, ckpt_prefix=f"ep{args.episode}", strict=True)
+    models = build_models(
+        device=device, ckpt_dir=ckpt_dir, ckpt_prefix=f"ep{args.episode}", strict=True,
+        # 裸 state_dict（旧 run root 无 metadata/）：显式 opt-in，避免 legacy/direct 语义错配。
+        allow_unsafe_raw_checkpoint=True,
+    )
     online_model = models["policy_value"].eval()
     probe_model = copy.deepcopy(online_model).to(device).eval()
     before_state = {name: p.detach().cpu().clone() for name, p in online_model.named_parameters()}

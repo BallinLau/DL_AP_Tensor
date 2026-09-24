@@ -200,3 +200,23 @@ Q phase summary 按 epoch 输出：
 - 默认 Q phase epoch 数是第一版配置，尚未通过正式 multi-episode GPU run 校准。
 - P/Q outer iteration 的收敛速度与旧 joint P/Q 不可直接比较，需要新 run root 和新
   checkpoint 语义进行实验。
+
+## 第二轮修复（follow-up）
+
+详见 `reports/q_direct_regime_training_followup.md`。要点：
+
+1. **Episode-0 direct-Q cold-start bootstrap**：在第一次 P stage **之前**运行，
+   只更新 `q_encoder + q_head`，把随机 direct-Q 初始化到有限、平滑、非随机状态，
+   切断 $Q_{\rm random}^{(0)}\to P^{(1)}\to\widehat P^{T}\to\mathcal D/\mathcal S$
+   的污染链。
+2. **Q0/QD/QS required-phase gate**：`skipped_no_samples` 不再被吞成 accepted；
+   QS 没有 Bellman optimizer step 时 Q stage 显式失败，且不进入 BP。
+3. **checkpoint / model-spec semantic metadata**：formal runner 现在写
+   `metadata/{hyperparams,config_snapshot,policy_value_model_spec}.json` 与
+   `epX_combined.pt`；`build_models(..., ckpt_dir=...)` 在没有 spec 且目标是
+   direct-Q 时拒绝静默加载裸 state_dict。
+4. **Q shape prior 默认置 0**：`q_shape_weight_{z,b_low,b_high}` 默认 0.0，
+   并接入 CLI / Slurm，便于做 shape-prior ablation。
+
+主体（direct-Q、frozen-P 分类、Q0/QD/QS 分流、asset_only recovery、child-default
+recovery、old-bond continuation $b_{sp}=b/[1+\bar i(G-1)]$）未改动。

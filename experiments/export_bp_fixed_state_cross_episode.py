@@ -147,7 +147,15 @@ def compute_episode_rows(
 ) -> List[Dict[str, object]]:
     ckpt_dir = run_root / "checkpoints"
     require_file(ckpt_dir / f"ep{episode}_policy_value.pt", f"EP{episode} policy/value checkpoint")
-    models = build_models(device=device, ckpt_dir=ckpt_dir, ckpt_prefix=f"ep{episode}", strict=True)
+    models = build_models(
+        device=device,
+        ckpt_dir=ckpt_dir,
+        ckpt_prefix=f"ep{episode}",
+        strict=True,
+        # 诊断脚本读取的是裸 state_dict（旧 run root 没有 metadata/）；
+        # 显式 opt-in，避免把 legacy b_times_unit 误当成 direct-Q。
+        allow_unsafe_raw_checkpoint=True,
+    )
     model = models["policy_value"].eval()
     target_model = copy.deepcopy(model).to(device).eval()
     for p in target_model.parameters():
@@ -311,6 +319,7 @@ def main() -> None:
         ckpt_dir=run_root / "checkpoints",
         ckpt_prefix=f"ep{args.reference_episode}",
         strict=True,
+        allow_unsafe_raw_checkpoint=True,
     )
     tensors = make_episode_batches(
         reference_firm,

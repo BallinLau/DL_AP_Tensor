@@ -73,6 +73,8 @@ class Trainer:
         self.optimizers = self._init_optimizers()
         self.firm_target = self._init_firm_target()
         self._configure_policy_value_parameterization()
+        # 是否已加载过已训练的 direct-Q。episode-0 cold-start bootstrap 只在 False 时执行。
+        self._q_checkpoint_loaded = False
         
         # 训练状态
         self.current_episode = 0
@@ -339,7 +341,8 @@ class Trainer:
                 hyperparams=self.hyperparams,
                 device=self.device,
                 episode_id=ep,
-                firm_target=self.firm_target
+                firm_target=self.firm_target,
+                q_checkpoint_loaded=bool(getattr(self, "_q_checkpoint_loaded", False)),
             )
             
             # 生成数据
@@ -528,6 +531,14 @@ class Trainer:
             allow_config_mismatch=bool(allow_config_mismatch),
         )
         self._apply_legacy_q_recovery_fallback(checkpoint)
+        # checkpoint 语义已通过 _assert_checkpoint_q_parameterization 校验：只有
+        # spec 明确声明 direct-Q 时才认为已加载了已训练的 direct-Q。
+        spec = checkpoint.get("policy_value_model_spec")
+        spec_mode = str(spec.get("q_parameterization", "")).lower() if isinstance(spec, dict) else ""
+        self._q_checkpoint_loaded = (
+            str(getattr(self.hyperparams, "q_parameterization", "direct")).lower() == "direct"
+            and spec_mode == "direct"
+        )
         self._configure_policy_value_parameterization()
         
         for model_name, state_dict in checkpoint['models'].items():

@@ -266,3 +266,211 @@ def test_q_mixed_dispatch_is_sample_level_regime_exclusive(monkeypatch):
     torch.testing.assert_close(observed["zero"], torch.tensor([[0.0, 1.0]]))
     torch.testing.assert_close(observed["default"], torch.tensor([[0.4, -1.0]]))
     torch.testing.assert_close(observed["survival"], torch.tensor([[0.6, 1.0]]))
+
+
+# ===========================================================================
+# Episode-0 cold-start bootstrap + required-phase gate
+# ===========================================================================
+
+class _AlwaysDefaultP(torch.nn.Module):
+    """frozen P：所有状态的 Phat <= 0（完全没有 survival 区）。"""
+
+    def forward_equity(self, state):
+        return {"Phat": torch.full_like(state[:, 0:1], -1.0)}
+
+
+class _AlwaysSurvivalP(torch.nn.Module):
+    """frozen P：所有状态的 Phat > 0（完全没有 default 区）。"""
+
+    def forward_equity(self, state):
+        return {"Phat": torch.full_like(state[:, 0:1], 1.0)}
+
+
+def _staged_episode():
+    episode = _episode()
+    episode.hyperparams.pv_training_flow = "staged"
+    episode.hyperparams.firm_target_update = "none"
+    episode.hyperparams.q_bootstrap_epochs = 1
+    return episode
+
+
+def _patch_staged_stages(episode, monkeypatch, order):
+    monkeypatch.setattr(
+        episode, "_run_q_bootstrap_stage",
+        lambda batches: order.append("bootstrap") or {
+            "status": "accepted", "optimizer_steps": 1, "q_bootstrap_optimizer_steps": 1,
+        },
+    )
+    monkeypatch.setattr(
+        episode, "_run_policy_value_evaluation_stage",
+        lambda *a, **k: order.append("p_stage") or {"status": "accepted"},
+    )
+    monkeypatch.setattr(
+        episode, "_run_q_regime_training",
+        lambda *a, **k: order.append("q_regime") or {
+            "status": "accepted", "q_stage_required_gate_passed": True,
+            "q_stage_rejection_reason": None,
+        },
+    )
+    monkeypatch.setattr(episode, "_build_bp_target_cache", lambda *a, **k: {})
+    monkeypatch.setattr(episode, "_resample_bp_target_cache", lambda cache: (cache, {}))
+    monkeypatch.setattr(
+        episode, "_resample_bp_target_cache_by_current_eta", lambda cache: (cache, {})
+    )
+    monkeypatch.setattr(
+        episode, "_bp_cache_current_eta_counts",
+        lambda cache: {"current_eta0_count": 0, "current_eta1_count": 0, "current_eta1_share": 0.0},
+    )
+    monkeypatch.setattr(
+        episode, "_run_bp_distillation_stage",
+        lambda *a, **k: order.append("bp") or {"status": "accepted"},
+    )
+    monkeypatch.setattr(
+        episode, "evaluate_bellman_convergence",
+        lambda *a, **k: order.append("convergence") or {"enabled": False},
+    )
+
+
+def test_A_cold_start_bootstrap_runs_before_p_stage(monkeypatch):
+    episode = _staged_episode()
+    order = []
+    _patch_staged_stages(episode, monkeypatch, order)
+    result = episode._run_policy_value_staged([_batch()], [], 1)
+    assert order[:4] == ["bootstrap", "p_stage", "q_regime", "bp"]
+    assert result["metadata"]["policy_value_stage_status"] == "accepted"
+    assert result["metadata"]["q_bootstrap_stage"]["status"] == "accepted"
+
+
+def test_A2_bootstrap_updates_only_q_encoder_and_head():
+    episode = _episode()
+    episode.hyperparams.q_bootstrap_epochs = 2
+    model = episode.models["policy_value"]
+    q_params = episode._policy_value_stage_params("q")
+    non_q = [p for p in model.parameters() if id(p) not in {id(q) for q in q_params}]
+    q_before = episode._snapshot_params(q_params)
+    non_q_before = episode._snapshot_params(non_q)
+    summary = episode._run_q_bootstrap_stage([_batch()])
+    assert summary["status"] == "accepted"
+    assert summary["optimizer_steps"] == 2
+    assert episode._param_max_change_from_snapshot(q_params, q_before) > 0.0
+    assert episode._param_max_change_from_snapshot(non_q, non_q_before) == 0.0
+    assert summary["metrics"]["q_bootstrap_optimizer_steps"] == 2
+    assert "q_bootstrap_Q_mean" in summary["metrics"]
+
+
+def test_A3_bootstrap_target_is_b_times_unit_and_zero_at_zero_debt():
+    episode = _episode()
+    episode.hyperparams.q_bootstrap_unit_value = 1.0
+    state = torch.zeros((3, 7))
+    state[:, 0] = torch.tensor([0.0, 0.5, 1.5])
+    target = episode._q_bootstrap_target(state, mode="constant_unit")
+    torch.testing.assert_close(target.reshape(-1), torch.tensor([0.0, 0.5, 1.5]))
+
+
+def test_B_episode_after_zero_does_not_bootstrap_again():
+    episode = _episode()
+    episode.episode_id = 1
+    summary = episode._run_q_bootstrap_stage([_batch()])
+    assert summary["status"] == "skipped_not_cold_start"
+    assert summary["q_bootstrap_optimizer_steps"] == 0
+
+
+def test_B2_loaded_direct_q_checkpoint_skips_bootstrap():
+    episode = _episode()
+    episode.q_checkpoint_loaded = True
+    summary = episode._run_q_bootstrap_stage([_batch()])
+    assert summary["status"] == "skipped_not_cold_start"
+    assert summary["q_bootstrap_optimizer_steps"] == 0
+
+
+def _gate_episode():
+    episode = _episode()
+    episode.hyperparams.q_zero_boundary_epochs = 1
+    episode.hyperparams.q_default_pretrain_epochs = 1
+    episode.hyperparams.q_survival_aio_epochs = 1
+    episode.hyperparams.q_mixed_polish_epochs = 0
+    return episode
+
+
+def test_C_no_survival_samples_rejects_q_stage():
+    episode = _gate_episode()
+    summary = episode._run_q_regime_training([_batch()], _AlwaysDefaultP())
+    assert summary["status"] == "rejected_no_survival_bellman"
+    assert summary["q_stage_required_gate_passed"] is False
+    assert summary["q_survival_optimizer_steps"] == 0
+    assert summary["q_survival_coverage"]["survival_parent_count"] == 0
+
+
+def test_C2_rejected_q_stage_skips_bp_distillation(monkeypatch):
+    episode = _staged_episode()
+    order = []
+    _patch_staged_stages(episode, monkeypatch, order)
+    monkeypatch.setattr(
+        episode, "_run_q_regime_training",
+        lambda *a, **k: order.append("q_regime") or {
+            "status": "rejected_no_survival_bellman",
+            "q_stage_required_gate_passed": False,
+            "q_stage_rejection_reason": "rejected_no_survival_bellman",
+        },
+    )
+    result = episode._run_policy_value_staged([_batch()], [], 1)
+    assert "bp" not in order
+    assert result["metadata"]["policy_value_stage_status"] == "failed_q"
+    assert result["metadata"]["bp_distillation_stage"]["status"] == "skipped_q_stage_rejected"
+    assert result["metadata"]["q_stage_rejection_reason"] == "rejected_no_survival_bellman"
+
+
+def test_D_no_default_coverage_is_explicit_failure():
+    episode = _gate_episode()
+    summary = episode._run_q_regime_training([_batch()], _AlwaysSurvivalP())
+    assert summary["status"] == "rejected_insufficient_default_coverage"
+    coverage = summary["q_default_coverage"]
+    assert coverage["default_candidates_selected"] == 0
+    assert coverage["default_candidates_generated"] > 0
+    assert coverage["min_phat"] > 0.0
+    assert coverage["fraction_phat_le_0"] == 0.0
+    assert "min_phat" in coverage and "max_phat" in coverage
+
+
+def test_E_polish_skip_does_not_reject_q_stage(monkeypatch):
+    episode = _episode()
+    canned = {
+        "zero": {"phase": "zero", "status": "accepted", "optimizer_steps": 1, "coverage": {}},
+        "default": {
+            "phase": "default", "status": "accepted", "optimizer_steps": 1,
+            "coverage": {"default_candidates_selected": 3},
+        },
+        "survival": {
+            "phase": "survival", "status": "accepted", "optimizer_steps": 1,
+            "coverage": {"survival_parent_count": 4},
+        },
+        "polish": {
+            "phase": "polish", "status": "skipped_no_samples", "optimizer_steps": 0,
+            "coverage": {},
+        },
+    }
+    monkeypatch.setattr(episode, "_run_q_regime_phase", lambda *, phase, **k: canned[phase])
+    summary = episode._run_q_regime_training([_batch()], episode.firm_target)
+    assert summary["status"] == "accepted"
+    assert summary["q_stage_required_gate_passed"] is True
+    assert summary["q_polish_status"] == "skipped_no_samples"
+
+
+def test_E2_required_phase_flags_can_disable_the_gate(monkeypatch):
+    episode = _episode()
+    episode.hyperparams.q_require_survival_phase = False
+    canned = {
+        "zero": {"phase": "zero", "status": "accepted", "optimizer_steps": 1, "coverage": {}},
+        "default": {
+            "phase": "default", "status": "accepted", "optimizer_steps": 1,
+            "coverage": {"default_candidates_selected": 2},
+        },
+        "survival": {
+            "phase": "survival", "status": "skipped_no_samples", "optimizer_steps": 0,
+            "coverage": {"survival_parent_count": 0},
+        },
+        "polish": {"phase": "polish", "status": "disabled", "optimizer_steps": 0, "coverage": {}},
+    }
+    monkeypatch.setattr(episode, "_run_q_regime_phase", lambda *, phase, **k: canned[phase])
+    summary = episode._run_q_regime_training([_batch()], episode.firm_target)
+    assert summary["status"] == "accepted"

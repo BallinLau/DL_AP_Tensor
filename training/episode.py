@@ -155,7 +155,8 @@ class Episode:
         device: torch.device = None,
         episode_id: int = 0,
         gpu_monitor = None,
-        firm_target: Optional[nn.Module] = None
+        firm_target: Optional[nn.Module] = None,
+        q_checkpoint_loaded: bool = False,
     ):
         """
         Args:
@@ -170,6 +171,8 @@ class Episode:
             episode_id: Episode 编号
             gpu_monitor: GPU 监控器（可选，用于共享监控数据）
             firm_target: 冻结的 policy_value target network（可选）
+            q_checkpoint_loaded: 是否已加载过一个已训练的 direct-Q checkpoint。
+                episode-0 cold-start bootstrap 只在未加载时执行。
         """
         self.models = models
         self.optimizers = optimizers
@@ -179,6 +182,7 @@ class Episode:
         self._validate_sdf_fresh_pair_config()
         self.device = device or config.DEVICE
         self.episode_id = episode_id
+        self.q_checkpoint_loaded = bool(q_checkpoint_loaded)
         self.firm_target = self._init_firm_target(firm_target)
         self._configure_policy_value_parameterization()
         
@@ -5763,9 +5767,10 @@ class Episode:
         q_shape_z = torch.relu(-dQ_dz).mean()
         q_shape_b_low = _masked_mean(torch.relu(-dQ_db), low_mask)
         q_shape_b_high = _masked_mean(torch.relu(dQ_db), high_mask)
-        w_shape_z = float(getattr(self.hyperparams, "q_shape_weight_z", 1.0))
-        w_shape_b_low = float(getattr(self.hyperparams, "q_shape_weight_b_low", 1.0))
-        w_shape_b_high = float(getattr(self.hyperparams, "q_shape_weight_b_high", 1.0))
+        # 默认 0：Direct-Q baseline 关闭人为形状先验（见 config/hyperparams.py）。
+        w_shape_z = float(getattr(self.hyperparams, "q_shape_weight_z", 0.0))
+        w_shape_b_low = float(getattr(self.hyperparams, "q_shape_weight_b_low", 0.0))
+        w_shape_b_high = float(getattr(self.hyperparams, "q_shape_weight_b_high", 0.0))
         q_shape_penalty = (
             w_shape_z * q_shape_z +
             w_shape_b_low * q_shape_b_low +
@@ -9155,11 +9160,14 @@ class Episode:
         *,
         requested: Optional[int] = None,
         phat_eps: Optional[float] = None,
-    ) -> torch.Tensor:
-        """Build stratified positive-debt `(b,z)` candidates and keep deep defaults."""
+        return_diagnostics: bool = False,
+    ):
+        """Build stratified positive-debt `(b,z)` candidates and keep deep defaults.
+
+        ``return_diagnostics=True`` 时额外返回 coverage 诊断，用于区分
+        sampler 有问题 / frozen P 根本没有破产区域 / default region 太小。
+        """
         base = parent_state[:, :7].detach()
-        if base.shape[0] == 0:
-            return base
         multiplier = max(1, int(getattr(self.hyperparams, "q_default_candidate_multiplier", 4)))
         desired_n = max(1, int(requested) if requested is not None else int(base.shape[0]))
         candidate_n = desired_n * multiplier
@@ -9171,6 +9179,16 @@ class Episode:
             getattr(self.hyperparams, "q_default_phat_eps", 1e-2)
             if phat_eps is None else phat_eps
         ))
+        diagnostics: Dict[str, Any] = {
+            "default_candidates_generated": 0,
+            "default_candidates_selected": 0,
+            "min_phat": float("nan"),
+            "max_phat": float("nan"),
+            "fraction_phat_le_0": 0.0,
+            "fraction_phat_le_minus_eps": 0.0,
+        }
+        if base.shape[0] == 0:
+            return (base, diagnostics) if return_diagnostics else base
         result = base[:0]
         for _ in range(4):
             source_idx = torch.arange(candidate_n, device=device) % int(base.shape[0])
@@ -9189,12 +9207,24 @@ class Episode:
             phat = self._q_frozen_phat(candidates, frozen_p_model)
             selected = (candidates[:, 0:1] > 0.0) & (phat <= -deep_eps)
             result = candidates[selected.reshape(-1)]
+            with torch.no_grad():
+                phat_flat = phat.detach().reshape(-1)
+                diagnostics["default_candidates_generated"] = int(candidate_n)
+                diagnostics["min_phat"] = float(phat_flat.min().item())
+                diagnostics["max_phat"] = float(phat_flat.max().item())
+                diagnostics["fraction_phat_le_0"] = float(
+                    (phat_flat <= 0.0).float().mean().item()
+                )
+                diagnostics["fraction_phat_le_minus_eps"] = float(
+                    (phat_flat <= -deep_eps).float().mean().item()
+                )
             if result.shape[0] >= desired_n:
                 break
             candidate_n *= 2
         if result.shape[0] > desired_n:
             result = result[:desired_n]
-        return result
+        diagnostics["default_candidates_selected"] = int(result.shape[0])
+        return (result, diagnostics) if return_diagnostics else result
 
     @staticmethod
     def _index_q_batch(
@@ -9257,6 +9287,165 @@ class Episode:
         indices = torch.cat([torch.arange(n, device=order.device), replay], dim=0)
         return self._index_q_batch(subset, indices)
 
+    # Bootstrap 只实现不依赖旧 checkpoint 的 cold start。
+    Q_BOOTSTRAP_MODES: Tuple[str, ...] = ("constant_unit",)
+
+    def _q_bootstrap_enabled(self) -> bool:
+        """Cold-start bootstrap 触发条件。
+
+        ``direct`` 参数化 AND 未加载已训练 direct-Q checkpoint AND ``episode_id == 0``。
+        """
+        if str(getattr(self.hyperparams, "q_parameterization", "direct")).lower() != "direct":
+            return False
+        if int(self.episode_id) != 0:
+            return False
+        if bool(getattr(self, "q_checkpoint_loaded", False)):
+            return False
+        return True
+
+    def _q_bootstrap_target(self, state: torch.Tensor, *, mode: str) -> torch.Tensor:
+        """Bootstrap 的 direct-Q 数值初始化 target（不是最终经济方程）。
+
+        - ``b == 0`` -> ``Q* = 0``
+        - ``b > 0``  -> ``Q* = b * q_bootstrap_unit_value``
+
+        刻意不依赖未训练 P 的 default classification，也不使用 recovery / default label。
+        """
+        b = state[:, 0:1]
+        if mode == "constant_unit":
+            unit = float(getattr(self.hyperparams, "q_bootstrap_unit_value", 1.0))
+            return b * unit
+        raise ValueError(
+            f"Unsupported q_bootstrap_mode {mode!r}; supported: {self.Q_BOOTSTRAP_MODES}. "
+            "A legacy direct-Q distillation mode would require a migration tool that is "
+            "not implemented yet."
+        )
+
+    def _run_q_bootstrap_stage(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+    ) -> Dict[str, Any]:
+        """Episode-0 cold-start bootstrap：把随机 direct-Q 初始化到有限、平滑、非随机状态。
+
+        必须在第一次 P stage **之前**运行，因为 P 的 cashflow/target 会消费 Q 的数值
+        （``CF0p = prod + ((1 - kappa_b) Qp - Q) eta``），随机 Q 会先污染第一轮 P，
+        再污染之后被冻结的 ``Phat`` / default region。
+
+        只更新 ``q_encoder + q_head``，其他所有模块冻结；目标函数
+        ``E[(Q - Q*)^2] + lambda_+ E[ReLU(-Q)^2]``。
+        """
+        mode = str(getattr(self.hyperparams, "q_bootstrap_mode", "constant_unit")).lower()
+        epochs = max(0, int(getattr(self.hyperparams, "q_bootstrap_epochs", 5)))
+        lambda_plus = float(getattr(self.hyperparams, "q_bootstrap_nonnegative_weight", 1.0))
+        unit_value = float(getattr(self.hyperparams, "q_bootstrap_unit_value", 1.0))
+        summary: Dict[str, Any] = {
+            "status": "disabled",
+            "mode": mode,
+            "epochs": int(epochs),
+            "unit_value": unit_value,
+            "optimizer_steps": 0,
+            "q_bootstrap_optimizer_steps": 0,
+            "metrics": {},
+            "epoch_history": [],
+        }
+        if not self._q_bootstrap_enabled():
+            summary["status"] = "skipped_not_cold_start"
+            return summary
+        if epochs <= 0:
+            return summary
+        if not batches or any("parent" not in batch for batch in batches):
+            summary["status"] = "skipped_missing_q_training_batches"
+            return summary
+
+        model = self.models["policy_value"]
+        q_params = self._policy_value_stage_params("q")
+        optimizer = self._make_policy_value_stage_optimizer(q_params)
+        non_q_params = [
+            param for param in model.parameters()
+            if id(param) not in {id(q_param) for q_param in q_params}
+        ]
+        non_q_snapshot = self._snapshot_params(non_q_params)
+        grad_clip = float(getattr(self.hyperparams, "pv_eval_grad_clip_norm", 10.0))
+        records: List[Dict[str, Any]] = []
+        epoch_history: List[Dict[str, Any]] = []
+        optimizer_steps = 0
+        rollback_reason: Optional[str] = None
+        was_training = model.training
+        model.train()
+        try:
+            with self._policy_value_train_scope("q"):
+                for epoch in range(int(epochs)):
+                    epoch_record_start = len(records)
+                    for batch in tqdm(batches, desc=f"Q bootstrap {epoch + 1}/{epochs}"):
+                        state = batch["parent"][:, :7].detach()
+                        optimizer.zero_grad(set_to_none=True)
+                        Q = model._q_output(state)
+                        target = self._q_bootstrap_target(state, mode=mode)
+                        regression = (Q - target).pow(2).mean()
+                        nonnegative = torch.relu(-Q).pow(2).mean()
+                        loss = regression + lambda_plus * nonnegative
+                        if not torch.isfinite(loss):
+                            rollback_reason = "nonfinite_loss"
+                            break
+                        loss.backward()
+                        raw_norm, clipped_norm = self._clip_params_with_raw_norm(
+                            q_params, grad_clip
+                        )
+                        if not np.isfinite(raw_norm):
+                            optimizer.zero_grad(set_to_none=True)
+                            rollback_reason = "nonfinite_gradient"
+                            break
+                        optimizer.step()
+                        optimizer_steps += 1
+                        self.step_count += 1
+                        with torch.no_grad():
+                            q_flat = Q.detach().reshape(-1)
+                            target_flat = target.detach().reshape(-1)
+                            records.append({
+                                "q_bootstrap_loss": float(loss.detach().item()),
+                                "q_bootstrap_Q_mean": float(q_flat.mean().item()),
+                                "q_bootstrap_Q_std": float(q_flat.std(unbiased=False).item()),
+                                "q_bootstrap_target_mean": float(target_flat.mean().item()),
+                                "q_bootstrap_target_std": float(
+                                    target_flat.std(unbiased=False).item()
+                                ),
+                                "q_bootstrap_negative_share": float(
+                                    (q_flat < 0.0).float().mean().item()
+                                ),
+                                "q_raw_grad_norm": raw_norm,
+                                "q_clipped_grad_norm": clipped_norm,
+                            })
+                    epoch_records = records[epoch_record_start:]
+                    epoch_avg, epoch_meta = self._aggregate_metric_records(epoch_records)
+                    epoch_history.append({
+                        "epoch": int(epoch + 1),
+                        "optimizer_steps": int(len(epoch_records)),
+                        "metrics": {**epoch_avg, **epoch_meta},
+                    })
+                    if rollback_reason is not None:
+                        break
+        finally:
+            model.train(was_training)
+
+        non_q_change = self._param_max_change_from_snapshot(non_q_params, non_q_snapshot)
+        if non_q_change != 0.0:
+            raise RuntimeError(
+                f"Non-Q policy/value parameters changed during Q bootstrap: {non_q_change}"
+            )
+        avg, meta = self._aggregate_metric_records(records)
+        metrics = {**avg, **meta}
+        metrics["q_bootstrap_optimizer_steps"] = int(optimizer_steps)
+        summary.update({
+            "status": "rejected_numerical" if rollback_reason is not None else "accepted",
+            "optimizer_steps": int(optimizer_steps),
+            "q_bootstrap_optimizer_steps": int(optimizer_steps),
+            "rollback_reason": rollback_reason,
+            "non_q_parameter_max_change": non_q_change,
+            "metrics": metrics,
+            "epoch_history": epoch_history,
+        })
+        return summary
+
     def _run_q_regime_phase(
         self,
         *,
@@ -9281,6 +9470,8 @@ class Episode:
         frozen_p_hash_before = self._state_dict_hash(frozen_p_model)
         records: List[Dict[str, Any]] = []
         epoch_history: List[Dict[str, Any]] = []
+        coverage_diagnostics: List[Dict[str, Any]] = []
+        survival_parent_count = 0
         optimizer_steps = 0
         skipped = 0
         rollback_reason: Optional[str] = None
@@ -9297,9 +9488,10 @@ class Episode:
                         if phase == "zero":
                             loss = self._compute_q_zero_loss(source_state)
                         elif phase == "default":
-                            default_states = self._build_q_default_coverage_states(
-                                source_state, frozen_p_model
+                            default_states, default_diag = self._build_q_default_coverage_states(
+                                source_state, frozen_p_model, return_diagnostics=True
                             )
+                            coverage_diagnostics.append(default_diag)
                             if default_states.shape[0] == 0:
                                 skipped += 1
                                 continue
@@ -9309,6 +9501,7 @@ class Episode:
                             if survival_batch is None:
                                 skipped += 1
                                 continue
+                            survival_parent_count += int(survival_batch["parent"].shape[0])
                             loss = self._compute_q_survival_bellman_loss(
                                 survival_batch,
                                 q_target_model=q_target_model,
@@ -9386,6 +9579,9 @@ class Episode:
         if non_q_change != 0.0:
             raise RuntimeError(f"Non-Q policy/value parameters changed during Q phase: {non_q_change}")
         avg, meta = self._aggregate_metric_records(records)
+        coverage = self._aggregate_q_coverage_diagnostics(coverage_diagnostics)
+        if phase == "survival":
+            coverage["survival_parent_count"] = int(survival_parent_count)
         return {
             "phase": phase,
             "status": (
@@ -9400,8 +9596,46 @@ class Episode:
             "frozen_p_hash_before": frozen_p_hash_before,
             "frozen_p_hash_after": frozen_p_hash_after,
             "non_q_parameter_max_change": non_q_change,
+            "coverage": coverage,
             "metrics": {**avg, **meta},
             "epoch_history": epoch_history,
+        }
+
+    @staticmethod
+    def _aggregate_q_coverage_diagnostics(
+        diagnostics: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Aggregate per-batch QD coverage diagnostics (candidates / phat support)."""
+        if not diagnostics:
+            return {}
+        generated = sum(int(item.get("default_candidates_generated", 0)) for item in diagnostics)
+        selected = sum(int(item.get("default_candidates_selected", 0)) for item in diagnostics)
+        min_phat = min(
+            (float(item["min_phat"]) for item in diagnostics if np.isfinite(item.get("min_phat", float("nan")))),
+            default=float("nan"),
+        )
+        max_phat = max(
+            (float(item["max_phat"]) for item in diagnostics if np.isfinite(item.get("max_phat", float("nan")))),
+            default=float("nan"),
+        )
+        weight = max(generated, 1)
+        fraction_le_0 = sum(
+            float(item.get("fraction_phat_le_0", 0.0))
+            * int(item.get("default_candidates_generated", 0))
+            for item in diagnostics
+        ) / weight
+        fraction_le_minus_eps = sum(
+            float(item.get("fraction_phat_le_minus_eps", 0.0))
+            * int(item.get("default_candidates_generated", 0))
+            for item in diagnostics
+        ) / weight
+        return {
+            "default_candidates_generated": int(generated),
+            "default_candidates_selected": int(selected),
+            "min_phat": float(min_phat),
+            "max_phat": float(max_phat),
+            "fraction_phat_le_0": float(fraction_le_0),
+            "fraction_phat_le_minus_eps": float(fraction_le_minus_eps),
         }
 
     def _run_q_regime_training(
@@ -9442,13 +9676,54 @@ class Episode:
             summaries.append(phase_summary)
             if phase_summary.get("status") == "rejected_numerical":
                 break
-        failed = any(item.get("status") == "rejected_numerical" for item in summaries)
+        by_phase = {item.get("phase"): item for item in summaries}
+
+        def _steps(name: str) -> int:
+            return int(by_phase.get(name, {}).get("optimizer_steps", 0))
+
+        def _coverage(name: str) -> Dict[str, Any]:
+            return dict(by_phase.get(name, {}).get("coverage", {}))
+
+        # Required-phase gate：QS 是唯一训练 Q recursive pricing equation 的正式阶段，
+        # 没有 QS optimizer step 时本轮 Q 不能算成功训练；QD 完全无 default coverage
+        # 时必须显式失败，不能静默 skip。polish 不是 required phase。
+        rejection_reason: Optional[str] = None
+        if any(item.get("status") == "rejected_numerical" for item in summaries):
+            rejection_reason = "rejected_numerical"
+        if rejection_reason is None and bool(getattr(self.hyperparams, "q_require_zero_phase", True)):
+            if _steps("zero") < int(getattr(self.hyperparams, "q_min_zero_optimizer_steps", 1)):
+                rejection_reason = "rejected_insufficient_zero_boundary"
+        if rejection_reason is None and bool(getattr(self.hyperparams, "q_require_default_phase", True)):
+            default_coverage = _coverage("default")
+            if (
+                _steps("default") < int(getattr(self.hyperparams, "q_min_default_optimizer_steps", 1))
+                or int(default_coverage.get("default_candidates_selected", 0))
+                < int(getattr(self.hyperparams, "q_min_default_samples", 1))
+            ):
+                rejection_reason = "rejected_insufficient_default_coverage"
+        if rejection_reason is None and bool(getattr(self.hyperparams, "q_require_survival_phase", True)):
+            survival_coverage = _coverage("survival")
+            if (
+                _steps("survival") < int(getattr(self.hyperparams, "q_min_survival_optimizer_steps", 1))
+                or int(survival_coverage.get("survival_parent_count", 0))
+                < int(getattr(self.hyperparams, "q_min_survival_samples", 1))
+            ):
+                rejection_reason = "rejected_no_survival_bellman"
+
         return {
-            "status": "rejected_numerical" if failed else "accepted",
+            "status": rejection_reason or "accepted",
             "q_parameterization": getattr(self.models["policy_value"], "q_parameterization", None),
             "frozen_p_hash": self._state_dict_hash(frozen_p_model),
             "phases": summaries,
             "optimizer_steps": int(sum(item.get("optimizer_steps", 0) for item in summaries)),
+            "q_stage_required_gate_passed": rejection_reason is None,
+            "q_stage_rejection_reason": rejection_reason,
+            "q_zero_optimizer_steps": _steps("zero"),
+            "q_default_optimizer_steps": _steps("default"),
+            "q_survival_optimizer_steps": _steps("survival"),
+            "q_polish_status": by_phase.get("polish", {}).get("status"),
+            "q_default_coverage": _coverage("default"),
+            "q_survival_coverage": _coverage("survival"),
         }
 
     def _run_policy_value_staged(
@@ -9510,6 +9785,27 @@ class Episode:
             else None
         )
         try:
+            # Episode-0 cold-start bootstrap 必须在第一次 P stage 之前：P 的
+            # cashflow/target 会消费 Q 的数值，随机 direct-Q 会先污染第一轮 P，
+            # 再污染之后被冻结的 Phat / default region。
+            q_bootstrap_summary = self._run_q_bootstrap_stage(pv_train_batches)
+            if q_bootstrap_summary.get("status") == "rejected_numerical":
+                _restore_full_staged_start()
+                self._last_policy_value_stage_summary = {
+                    "policy_value_training_flow": "staged",
+                    "policy_value_stage_status": "failed_q_bootstrap",
+                    "q_bootstrap_stage": q_bootstrap_summary,
+                }
+                return {
+                    "final_losses": {},
+                    "metadata": self._last_policy_value_stage_summary,
+                    "convergence": {
+                        "enabled": False,
+                        "skip_reason": "staged_training_failed",
+                    },
+                    "target_grid_validation_batches": len(validation_batches),
+                }
+
             pq_summary = self._run_policy_value_evaluation_stage(
                 pv_train_batches,
                 validation_batches,
@@ -9521,6 +9817,7 @@ class Episode:
                 self._last_policy_value_stage_summary = {
                     "policy_value_training_flow": "staged",
                     "policy_value_stage_status": "failed_pq",
+                    "q_bootstrap_stage": q_bootstrap_summary,
                     "policy_value_evaluation_stage": pq_summary,
                 }
                 return {
@@ -9543,6 +9840,30 @@ class Episode:
                 pv_train_batches,
                 frozen_p_snapshot,
             )
+            if q_summary.get("status") != "accepted":
+                # Required-phase gate 未通过（例如 QS 没有 Bellman optimizer step）
+                # 时不得进入 BP distillation。
+                _restore_full_staged_start()
+                metadata = {
+                    "policy_value_training_flow": "staged",
+                    "policy_value_stage_status": "failed_q",
+                    "q_bootstrap_stage": q_bootstrap_summary,
+                    "policy_value_evaluation_stage": pq_summary,
+                    "q_regime_training_stage": q_summary,
+                    "q_stage_required_gate_passed": False,
+                    "q_stage_rejection_reason": q_summary.get("q_stage_rejection_reason"),
+                    "bp_distillation_stage": {"status": "skipped_q_stage_rejected"},
+                }
+                self._last_policy_value_stage_summary = metadata
+                return {
+                    "final_losses": {},
+                    "metadata": metadata,
+                    "convergence": {
+                        "enabled": False,
+                        "skip_reason": "staged_training_failed",
+                    },
+                    "target_grid_validation_batches": len(validation_batches),
+                }
 
             bp_teacher = deepcopy(self.models["policy_value"]).to(self.device)
             bp_teacher.eval()
@@ -9580,10 +9901,7 @@ class Episode:
             bp_summary["validation_cache_resampled"] = False
             stages_successful = (
                 pq_summary.get("status") == "accepted"
-                and q_summary.get("status") in {
-                    "accepted",
-                    "skipped_missing_q_training_batches",
-                }
+                and q_summary.get("status") == "accepted"
                 and bp_summary.get("status") in {"accepted", "skipped_no_active_refinancing"}
             )
             if not stages_successful:
@@ -9596,6 +9914,7 @@ class Episode:
                 metadata = {
                     "policy_value_training_flow": "staged",
                     "policy_value_stage_status": "failed_bp",
+                    "q_bootstrap_stage": q_bootstrap_summary,
                     "policy_value_evaluation_stage": pq_summary,
                     "q_regime_training_stage": q_summary,
                     "bp_distillation_stage": bp_summary,
@@ -9636,8 +9955,13 @@ class Episode:
             metadata = {
                 "policy_value_training_flow": "staged",
                 "policy_value_stage_status": "accepted",
+                "q_bootstrap_stage": q_bootstrap_summary,
                 "policy_value_evaluation_stage": pq_summary,
                 "q_regime_training_stage": q_summary,
+                "q_stage_required_gate_passed": bool(
+                    q_summary.get("q_stage_required_gate_passed", True)
+                ),
+                "q_stage_rejection_reason": q_summary.get("q_stage_rejection_reason"),
                 "bp_distillation_stage": bp_summary,
                 "firm_target_stage_update": {
                     "firm_target_update_mode": firm_mode,

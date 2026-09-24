@@ -374,10 +374,12 @@ class HyperParams:
     pv_m_clamp_min: float = 0.7
     pv_m_clamp_max: float = 1.3
     pv_sdf_clip_ratio_gate: float = 1.0
-    # Q 对 b/z 的形状正则权重与区间
-    q_shape_weight_z: float = 1.0
-    q_shape_weight_b_low: float = 1.0
-    q_shape_weight_b_high: float = 1.0
+    # Q 对 b/z 的形状正则权重与区间。
+    # Direct-Q baseline 默认关闭这三项人为形状先验（Q 单调增于 z / low-b 增于 b /
+    # high-b 减于 b），以便检验 regime 重构本身的效果。需要复现旧 baseline 时显式设为 1。
+    q_shape_weight_z: float = 0.0
+    q_shape_weight_b_low: float = 0.0
+    q_shape_weight_b_high: float = 0.0
     q_shape_b_low: float = 0.2
     q_shape_b_high: float = 0.8
     # Q-only 阶段是否冻结非 Q 分支参数（保持经济方程不改写）
@@ -412,6 +414,30 @@ class HyperParams:
     q_default_loss_weight: float = 1.0
     q_survival_loss_weight: float = 1.0
     q_nonnegative_weight: float = 1.0
+
+    # ========== Direct-Q: episode-0 cold-start bootstrap ==========
+    # Fresh run 的 episode 0 中 q_encoder/q_head 是随机初始化的，而 P stage 的
+    # cashflow/target 会消费 Q 的数值，因此随机 Q 会先污染第一轮 P，再污染被冻结的
+    # Phat / default region。bootstrap 在第一次 P 训练之前把 direct-Q 初始化到
+    # 有限、平滑、非随机状态。只更新 q_encoder + q_head，不使用 default/recovery label。
+    q_bootstrap_epochs: int = 5
+    # 目前仅实现 "constant_unit"：b == 0 -> Q* = 0；b > 0 -> Q* = b * q_bootstrap_unit_value。
+    q_bootstrap_mode: str = "constant_unit"
+    q_bootstrap_unit_value: float = 1.0
+    q_bootstrap_nonnegative_weight: float = 1.0
+
+    # ========== Direct-Q: Q0/QD/QS required-phase gate ==========
+    # QS 是唯一训练 Q recursive pricing equation 的正式阶段；没有 QS optimizer step
+    # 时本轮 Q 不能被判定为成功训练。QD 完全找不到 default coverage 时必须显式失败，
+    # 不能静默 skip。polish 不是 required phase。
+    q_require_zero_phase: bool = True
+    q_require_default_phase: bool = True
+    q_require_survival_phase: bool = True
+    q_min_zero_optimizer_steps: int = 1
+    q_min_default_samples: int = 1
+    q_min_default_optimizer_steps: int = 1
+    q_min_survival_samples: int = 1
+    q_min_survival_optimizer_steps: int = 1
 
     # ========== Policy/Value: Q parent default regime 与 recovery 口径 ==========
     # None 表示沿用 Config 默认（recovery: "asset_only"；regime: "legacy_soft_penalty"）。

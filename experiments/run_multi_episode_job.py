@@ -348,6 +348,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--q-default-loss-weight", type=float, default=None, help="QD recovery objective weight")
     parser.add_argument("--q-survival-loss-weight", type=float, default=None, help="QS Bellman/AiO objective weight")
     parser.add_argument("--q-nonnegative-weight", type=float, default=None, help="Direct-Q negative-output penalty weight")
+    parser.add_argument(
+        "--q-shape-weight-z", type=float, default=None,
+        help="Q monotone-in-z shape prior weight (set 0 for the direct-Q baseline ablation)",
+    )
+    parser.add_argument(
+        "--q-shape-weight-b-low", type=float, default=None,
+        help="Q increasing-in-b at low b shape prior weight (set 0 for the ablation)",
+    )
+    parser.add_argument(
+        "--q-shape-weight-b-high", type=float, default=None,
+        help="Q decreasing-in-b at high b shape prior weight (set 0 for the ablation)",
+    )
+    parser.add_argument("--q-bootstrap-epochs", type=int, default=None, help="Episode-0 direct-Q cold-start bootstrap epochs")
+    parser.add_argument(
+        "--q-bootstrap-mode", type=str, default=None, choices=["constant_unit"],
+        help="Episode-0 bootstrap target mode (constant_unit: b=0 -> 0, b>0 -> b * unit value)",
+    )
+    parser.add_argument("--q-bootstrap-unit-value", type=float, default=None, help="Bootstrap target unit value for positive debt")
+    parser.add_argument("--q-bootstrap-nonnegative-weight", type=float, default=None, help="Bootstrap ReLU(-Q)^2 penalty weight")
+    parser.add_argument(
+        "--q-require-zero-phase", type=_str2bool, default=None,
+        help="Treat a missing Q0 optimizer step as a Q-stage failure",
+    )
+    parser.add_argument(
+        "--q-require-default-phase", type=_str2bool, default=None,
+        help="Treat missing QD default coverage as an explicit Q-stage failure",
+    )
+    parser.add_argument(
+        "--q-require-survival-phase", type=_str2bool, default=None,
+        help="Treat a missing QS Bellman optimizer step as a Q-stage failure",
+    )
     parser.add_argument("--bp-distill-epochs", type=int, default=None, help="BP distillation epochs for staged policy/value flow")
     parser.add_argument("--bp-distill-patience", type=int, default=None, help="BP distillation early-stop patience")
     parser.add_argument("--bp-distill-min-delta", type=float, default=None, help="BP distillation validation min delta")
@@ -456,6 +487,17 @@ def parse_args() -> argparse.Namespace:
         help="Treatment B: resimulate Mode B data after Policy/Value training and before SDF/FC1 Stage 2",
     )
     return parser.parse_args()
+
+
+def _str2bool(value):
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
 
 
 def configure_hyperparams(args: argparse.Namespace):
@@ -627,6 +669,16 @@ def configure_hyperparams(args: argparse.Namespace):
         "q_default_loss_weight": args.q_default_loss_weight,
         "q_survival_loss_weight": args.q_survival_loss_weight,
         "q_nonnegative_weight": args.q_nonnegative_weight,
+        "q_shape_weight_z": args.q_shape_weight_z,
+        "q_shape_weight_b_low": args.q_shape_weight_b_low,
+        "q_shape_weight_b_high": args.q_shape_weight_b_high,
+        "q_bootstrap_epochs": args.q_bootstrap_epochs,
+        "q_bootstrap_mode": args.q_bootstrap_mode,
+        "q_bootstrap_unit_value": args.q_bootstrap_unit_value,
+        "q_bootstrap_nonnegative_weight": args.q_bootstrap_nonnegative_weight,
+        "q_require_zero_phase": args.q_require_zero_phase,
+        "q_require_default_phase": args.q_require_default_phase,
+        "q_require_survival_phase": args.q_require_survival_phase,
     }
     for name, value in q_scalar_overrides.items():
         if value is not None:
@@ -662,6 +714,41 @@ def configure_hyperparams(args: argparse.Namespace):
     ):
         if float(getattr(hyperparams, name)) < 0.0:
             raise ValueError(f"{name} must be non-negative")
+    for name in (
+        "q_shape_weight_z",
+        "q_shape_weight_b_low",
+        "q_shape_weight_b_high",
+    ):
+        if float(getattr(hyperparams, name)) < 0.0:
+            raise ValueError(f"{name} must be non-negative")
+    if int(getattr(hyperparams, "q_bootstrap_epochs", 0)) < 0:
+        raise ValueError("q_bootstrap_epochs must be non-negative")
+    if float(getattr(hyperparams, "q_bootstrap_nonnegative_weight", 0.0)) < 0.0:
+        raise ValueError("q_bootstrap_nonnegative_weight must be non-negative")
+    if str(getattr(hyperparams, "q_bootstrap_mode", "constant_unit")).lower() != "constant_unit":
+        raise ValueError(
+            "Only q_bootstrap_mode='constant_unit' is implemented; a legacy direct-Q "
+            "distillation mode would require a migration tool that does not exist yet."
+        )
+    print(
+        "[q-baseline] q_shape_weight_z={:g} q_shape_weight_b_low={:g} "
+        "q_shape_weight_b_high={:g} (shape priors are OFF only when all three are 0)".format(
+            float(hyperparams.q_shape_weight_z),
+            float(hyperparams.q_shape_weight_b_low),
+            float(hyperparams.q_shape_weight_b_high),
+        )
+    )
+    print(
+        "[q-baseline] q_bootstrap_epochs={} mode={} unit_value={:g} | "
+        "required-phase gate zero/default/survival={}/{}/{}".format(
+            int(hyperparams.q_bootstrap_epochs),
+            hyperparams.q_bootstrap_mode,
+            float(hyperparams.q_bootstrap_unit_value),
+            bool(hyperparams.q_require_zero_phase),
+            bool(hyperparams.q_require_default_phase),
+            bool(hyperparams.q_require_survival_phase),
+        )
+    )
     if args.bp_distill_epochs is not None:
         hyperparams.bp_distill_epochs = args.bp_distill_epochs
     if args.bp_distill_patience is not None:
@@ -967,7 +1054,17 @@ def main():
         ep_summary = summary.get("module_summaries", summary)
         save_stage_df(ep, episode_mode, resolve_base_dir(run_root, ROOT), episode.df, episode.df_macro, episode.df_sdf)
 
-        save_models(models, ep, resolve_base_dir(run_root, ROOT))
+        # 裸 state_dict 无法区分 direct-Q 与 legacy `b * q_unit`（q-head shape 相同），
+        # 因此同时落盘 metadata/（hyperparams / config snapshot / model spec）与 combined ckpt。
+        saved_paths = save_models(
+            models,
+            ep,
+            resolve_base_dir(run_root, ROOT),
+            hyperparams=hyperparams,
+            extra_models={"firm_target": episode.firm_target},
+            extra_metadata={"episode_mode": episode_mode},
+        )
+        print(f"Checkpoint metadata written: {saved_paths}")
 
         parent_df = episode.df[episode.df["branch"] <= 0] if "branch" in episode.df.columns else episode.df
         ref_state = {

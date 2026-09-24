@@ -44,6 +44,15 @@ EPISODE0_SDF_FINITE_RATIO_MIN="${EPISODE0_SDF_FINITE_RATIO_MIN:-1.0}"
 FC1_JACOBIAN_PENALTY_INTERVAL="${FC1_JACOBIAN_PENALTY_INTERVAL:-10}"
 # Default to Treatment B for formal Mode B runs; set MODEB_RESIMULATE_AFTER_PV=0 for Treatment A.
 MODEB_RESIMULATE_AFTER_PV="${MODEB_RESIMULATE_AFTER_PV:-1}"
+# Direct-Q baseline：三项人为 Q 形状先验（Q 单调增于 z / low-b 增于 b / high-b 减于 b）
+# 默认全部关闭，以便检验 regime 重构本身的效果。需要复现旧 baseline 时显式覆盖为 1。
+Q_SHAPE_WEIGHT_Z="${Q_SHAPE_WEIGHT_Z:-0}"
+Q_SHAPE_WEIGHT_B_LOW="${Q_SHAPE_WEIGHT_B_LOW:-0}"
+Q_SHAPE_WEIGHT_B_HIGH="${Q_SHAPE_WEIGHT_B_HIGH:-0}"
+# Episode-0 direct-Q cold-start bootstrap。
+Q_BOOTSTRAP_EPOCHS="${Q_BOOTSTRAP_EPOCHS:-5}"
+Q_BOOTSTRAP_MODE="${Q_BOOTSTRAP_MODE:-constant_unit}"
+Q_BOOTSTRAP_UNIT_VALUE="${Q_BOOTSTRAP_UNIT_VALUE:-1.0}"
 
 mkdir -p "$LOG_DIR" "$RUN_ROOT" "$WORK_ROOT/cachedir" "$WORK_ROOT/.mplcache"
 cd "$REPO_DIR"
@@ -120,6 +129,12 @@ echo "  EPISODE0_SDF_CLIP_LOW_RATIO_MAX=$EPISODE0_SDF_CLIP_LOW_RATIO_MAX"
 echo "  EPISODE0_SDF_FINITE_RATIO_MIN=$EPISODE0_SDF_FINITE_RATIO_MIN"
 echo "  FC1_JACOBIAN_PENALTY_INTERVAL=$FC1_JACOBIAN_PENALTY_INTERVAL"
 echo "  MODEB_RESIMULATE_AFTER_PV=$MODEB_RESIMULATE_AFTER_PV"
+echo "  Q_SHAPE_WEIGHT_Z=$Q_SHAPE_WEIGHT_Z"
+echo "  Q_SHAPE_WEIGHT_B_LOW=$Q_SHAPE_WEIGHT_B_LOW"
+echo "  Q_SHAPE_WEIGHT_B_HIGH=$Q_SHAPE_WEIGHT_B_HIGH"
+echo "  Q_BOOTSTRAP_EPOCHS=$Q_BOOTSTRAP_EPOCHS"
+echo "  Q_BOOTSTRAP_MODE=$Q_BOOTSTRAP_MODE"
+echo "  Q_BOOTSTRAP_UNIT_VALUE=$Q_BOOTSTRAP_UNIT_VALUE"
 
 python3 -u experiments/run_multi_episode_job.py \
   --run-root "$RUN_ROOT" \
@@ -143,6 +158,12 @@ python3 -u experiments/run_multi_episode_job.py \
   --episode0-sdf-clip-low-ratio-max "$EPISODE0_SDF_CLIP_LOW_RATIO_MAX" \
   --episode0-sdf-finite-ratio-min "$EPISODE0_SDF_FINITE_RATIO_MIN" \
   --fc1-jacobian-penalty-interval "$FC1_JACOBIAN_PENALTY_INTERVAL" \
+  --q-shape-weight-z "$Q_SHAPE_WEIGHT_Z" \
+  --q-shape-weight-b-low "$Q_SHAPE_WEIGHT_B_LOW" \
+  --q-shape-weight-b-high "$Q_SHAPE_WEIGHT_B_HIGH" \
+  --q-bootstrap-epochs "$Q_BOOTSTRAP_EPOCHS" \
+  --q-bootstrap-mode "$Q_BOOTSTRAP_MODE" \
+  --q-bootstrap-unit-value "$Q_BOOTSTRAP_UNIT_VALUE" \
   "${EXTRA_ARGS[@]}"
 
 echo "Job finished on $(date)"

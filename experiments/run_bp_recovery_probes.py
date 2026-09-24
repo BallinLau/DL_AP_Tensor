@@ -945,7 +945,11 @@ def main() -> None:
         probes=parse_probes(args.probes),
     )
 
-    models = build_models(device=device, ckpt_dir=ckpt_dir, ckpt_prefix=f"ep{args.episode}", strict=True)
+    models = build_models(
+        device=device, ckpt_dir=ckpt_dir, ckpt_prefix=f"ep{args.episode}", strict=True,
+        # 裸 state_dict（旧 run root 无 metadata/）：显式 opt-in，避免 legacy/direct 语义错配。
+        allow_unsafe_raw_checkpoint=True,
+    )
     online_model = models["policy_value"].eval()
     tensors = make_episode_batches(firm_pkl, online_model, hp, device, args.batch_size, args.n_branches)
     summary_df = pd.read_csv(summary_path)

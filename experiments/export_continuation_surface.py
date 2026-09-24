@@ -217,7 +217,11 @@ def main() -> None:
     hp = build_hyperparams()
     hp.pv_eta_resample_enabled = False
     hp.max_firm_train_units = 0
-    models = build_models(device=device, ckpt_dir=ckpt_dir, ckpt_prefix=f"ep{args.episode}", strict=True)
+    models = build_models(
+        device=device, ckpt_dir=ckpt_dir, ckpt_prefix=f"ep{args.episode}", strict=True,
+        # 裸 state_dict（旧 run root 无 metadata/）：显式 opt-in，避免 legacy/direct 语义错配。
+        allow_unsafe_raw_checkpoint=True,
+    )
     model = models["policy_value"].eval()
     target_model = copy.deepcopy(model).to(device).eval()
     for p in target_model.parameters():
