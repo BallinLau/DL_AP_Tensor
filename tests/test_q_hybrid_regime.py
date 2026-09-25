@@ -70,6 +70,45 @@ def test_hybrid_default_value_is_independent_of_q_head_weights():
     torch.testing.assert_close(after, model._q_recovery_output(state))
 
 
+@pytest.mark.parametrize("branch", ["p0", "pi"])
+def test_hybrid_teacher_mixed_current_eta_preserves_claim_diagnostics(branch):
+    model = _small_model("hybrid_regime")
+    teacher = BPGridTeacher(
+        model,
+        P0Loss(),
+        PILoss(),
+        q_target_model=model,
+        coarse_size=3,
+        refine=False,
+    )
+    parent = _state((0.2, 0.4, 0.6))
+    parent[:, 2] = torch.tensor([1.0, 0.0, 1.0])
+    child0 = parent.clone()
+    child1 = parent.clone()
+    child0[:, 2] = 0.0
+    child1[:, 2] = 1.0
+
+    result = teacher.compute(
+        parent,
+        [child0, child1],
+        [torch.ones(3, 1), torch.ones(3, 1)],
+        branch=branch,
+    )
+
+    assert result["q_current_claim"].shape == (3, 1)
+    assert torch.isfinite(result["q_current_claim"][1]).all()
+    torch.testing.assert_close(
+        result["q_current_claim"],
+        model._q_claim_output(parent),
+    )
+    coarse_claim = result["coarse_q_issue_claim_grid"]
+    assert coarse_claim.shape == (3, 3)
+    assert torch.isfinite(coarse_claim[[0, 2]]).all()
+    assert torch.isnan(coarse_claim[1]).all()
+    assert result["confidence"][1].item() == 0.0
+    assert result["refi_active"].reshape(-1).tolist() == [1.0, 0.0, 1.0]
+
+
 class _CandidateGate(torch.nn.Module):
     def forward_equity(self, state):
         # Low candidate debt survives; high candidate debt defaults.

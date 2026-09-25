@@ -820,6 +820,8 @@ class BPGridTeacher:
             "regret": torch.zeros_like(forced_value),
         }
         if "q_issue_unit_grid" in forced:
+            result["q_current_claim"] = forced["q_current_claim"][:, 0:1].detach()
+            result["coarse_q_issue_claim_grid"] = _nan(n_rows, coarse_size)
             for key in (
                 "q_issue_claim_grid",
                 "q_issue_unit_grid",
