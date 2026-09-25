@@ -166,9 +166,10 @@ class PolicyValueModel(nn.Module):
             if q_parameterization is not None
             else getattr(Config, "Q_PARAMETERIZATION", "direct")
         ).lower()
-        if self.q_parameterization not in {"direct", "b_times_unit"}:
+        if self.q_parameterization not in {"direct", "b_times_unit", "hybrid_regime"}:
             raise ValueError(
-                "q_parameterization must be 'direct' or 'b_times_unit', got "
+                "q_parameterization must be 'direct', 'b_times_unit', or "
+                "'hybrid_regime', got "
                 f"{self.q_parameterization!r}"
             )
         self.p0_head_dims = list(p0_head_dims if p0_head_dims is not None else getattr(Config, "P0_HEAD_DIMS", []))
@@ -336,13 +337,92 @@ class PolicyValueModel(nn.Module):
         components = self.forward_value_components(firm_state)
         return components["V0_physical"], components["VI_physical"]
 
-    def _q_output(self, firm_state: torch.Tensor) -> torch.Tensor:
+    def _q_unit_output(self, firm_state: torch.Tensor) -> torch.Tensor:
+        """Return the raw Q-head output.
+
+        It is a direct total-debt value in ``direct`` mode and a nonnegative
+        unit bond price in ``b_times_unit``/``hybrid_regime`` modes.
+        """
         base_state, _, b = self._split_state(firm_state)
         h_q = self.q_encoder(base_state)
-        q_raw = self.q_head(h_q)
-        if self.q_parameterization == "b_times_unit":
-            return torch.clamp(b, min=0.0) * q_raw
-        return q_raw
+        return self.q_head(h_q)
+
+    def _q_claim_output(self, firm_state: torch.Tensor) -> torch.Tensor:
+        """Return the live debt-claim value used by P/BP and Q Bellman.
+
+        In ``hybrid_regime`` this is always ``b * q_unit``.  It is conditional
+        on a live firm issuing/holding the claim, so a current-state equity
+        default classifier must never replace it with realized recovery.
+        """
+        q_unit = self._q_unit_output(firm_state)
+        if self.q_parameterization in {"b_times_unit", "hybrid_regime"}:
+            b = firm_state[:, SIMMODEL.B:SIMMODEL.B + 1]
+            return torch.clamp(b, min=0.0) * q_unit
+        return q_unit
+
+    def _q_survival_output(self, firm_state: torch.Tensor) -> torch.Tensor:
+        """Backward-compatible alias for :meth:`_q_claim_output`."""
+        return self._q_claim_output(firm_state)
+
+    def _q_recovery_output(self, firm_state: torch.Tensor) -> torch.Tensor:
+        """Structural default recovery; deliberately contains no division by b."""
+        x = firm_state[:, SIMMODEL.X:SIMMODEL.X + 1]
+        z = firm_state[:, SIMMODEL.Z:SIMMODEL.Z + 1]
+        return self.phi.to(dtype=firm_state.dtype) * (
+            1.0 - self.delta.to(dtype=firm_state.dtype) + torch.exp(x + z)
+        )
+
+    def _q_effective_output(
+        self,
+        firm_state: torch.Tensor,
+        *,
+        q_claim: Optional[torch.Tensor] = None,
+        phat: Optional[torch.Tensor] = None,
+        default_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return realized-state Q for settlement, simulation, and plotting.
+
+        This realized-default hard gate is not a candidate-issuance pricing
+        rule. P/BP/Q Bellman code must call ``_q_claim_output`` instead. The
+        public ``forward`` path supplies its already-computed ``Phat`` so it
+        never evaluates equity twice.
+        """
+        if self.q_parameterization != "hybrid_regime":
+            return self._q_claim_output(firm_state)
+        if default_mask is None:
+            if phat is None:
+                raise ValueError(
+                    "hybrid_regime effective Q requires explicit phat or default_mask"
+                )
+            default_mask = phat <= 0.0
+        default_mask = default_mask.to(dtype=torch.bool)
+        b = firm_state[:, SIMMODEL.B:SIMMODEL.B + 1]
+        zero_mask = b <= 0.0
+        claim_q = self._q_claim_output(firm_state) if q_claim is None else q_claim
+        recovery = self._q_recovery_output(firm_state)
+        return torch.where(
+            zero_mask,
+            torch.zeros_like(claim_q),
+            torch.where(default_mask, recovery, claim_q),
+        )
+
+    def _q_output(
+        self,
+        firm_state: torch.Tensor,
+        *,
+        phat: Optional[torch.Tensor] = None,
+        default_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compatibility Q API with mode-specific public semantics."""
+        if self.q_parameterization != "hybrid_regime":
+            return self._q_claim_output(firm_state)
+        if phat is None and default_mask is None:
+            phat = self.forward_equity(firm_state)["Phat"]
+        return self._q_effective_output(
+            firm_state,
+            phat=phat,
+            default_mask=default_mask,
+        )
 
     def _policy_logits(self, firm_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         base_state, i, _ = self._split_state(firm_state)
@@ -417,11 +497,18 @@ class PolicyValueModel(nn.Module):
         Returns:
             PolicyValueOutput: 包含所有输出的命名元组
         """
-        Q = self._q_output(firm_state)
+        q_claim = (
+            self._q_claim_output(firm_state)
+            if self.q_parameterization == "hybrid_regime"
+            else None
+        )
+        Q = None if q_claim is not None else self._q_output(firm_state)
         bp0, bpI = self._policy_outputs(firm_state)
         V0, VI = self._value_outputs(firm_state)
 
         Phat, P, bar_z, survival_prob = self.cal_phats(firm_state)
+        if Q is None:
+            Q = self._q_effective_output(firm_state, q_claim=q_claim, phat=Phat)
         bar_i_cond = self.derived.investment_conditional(V0, VI)
         bar_i_eff = survival_prob * bar_i_cond
         bp_cond = self.cal_bp(bp0, bpI, bar_i_cond)

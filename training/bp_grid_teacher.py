@@ -102,11 +102,29 @@ def _get_out(out: Any, name: str, idx: int) -> torch.Tensor:
     return out[:, idx:idx + 1]
 
 
-def _target_q(model: Any, firm_state: torch.Tensor) -> torch.Tensor:
+def _target_q_claim(
+    model: Any,
+    firm_state: torch.Tensor,
+    *,
+    equity_model: Optional[Any] = None,
+) -> torch.Tensor:
+    """Return the debt-claim price used by conditional-survival P objectives.
+
+    ``equity_model`` remains in the signature for non-hybrid compatibility,
+    but hybrid issuance prices deliberately ignore current/candidate Phat.
+    Realized-default settlement is handled only by ``_q_effective_output``.
+    """
+    claim_fn = getattr(model, "_q_claim_output", None)
+    if callable(claim_fn) and getattr(model, "q_parameterization", None) == "hybrid_regime":
+        return claim_fn(firm_state)
     q_fn = getattr(model, "_q_output", None)
     if callable(q_fn):
         return q_fn(firm_state)
     return _get_out(model(firm_state), "Q", 0)
+
+
+# Compatibility alias for diagnostics/tests importing the old private helper.
+_target_q = _target_q_claim
 
 
 def _target_equity(model: Any, firm_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -305,6 +323,7 @@ class BPGridTeacher:
         p0_loss_fn,
         pi_loss_fn,
         *,
+        q_target_model=None,
         grid_min: float = 0.0,
         grid_max: float = 1.0,
         coarse_size: int = 21,
@@ -317,8 +336,10 @@ class BPGridTeacher:
         margin_scale: float = 1e-3,
         confidence_relative: bool = True,
         confidence_min: float = 0.0,
+        boundary_match_phat_eps: float = 1e-2,
     ):
         self.target_model = target_model
+        self.q_target_model = q_target_model if q_target_model is not None else target_model
         self.p0_loss_fn = p0_loss_fn
         self.pi_loss_fn = pi_loss_fn
         self.grid_min = float(grid_min)
@@ -333,12 +354,13 @@ class BPGridTeacher:
         self.margin_scale = max(float(margin_scale), 1e-12)
         self.confidence_relative = bool(confidence_relative)
         self.confidence_min = min(max(float(confidence_min), 0.0), 1.0)
+        self.boundary_match_phat_eps = max(float(boundary_match_phat_eps), 0.0)
         self._logged_grid_chunk_plans: set[tuple[int, int]] = set()
         self._recorded_grid_chunk_plans: Dict[tuple[int, int], Dict[str, int]] = {}
         self._forward_stats: Dict[str, Any] = self._empty_forward_stats()
 
     def _empty_forward_stats(self) -> Dict[str, Any]:
-        return {
+        result = {
             "bp_model_forward_calls": 0,
             "bp_child_equity_forward_calls": 0,
             "bp_q_forward_calls": 0,
@@ -349,6 +371,7 @@ class BPGridTeacher:
             "bp_multi_j_reuse_enabled": False,
             "bp_branch_reuse_enabled": False,
         }
+        return result
 
     def reset_forward_stats(self) -> None:
         self._forward_stats = self._empty_forward_stats()
@@ -418,6 +441,7 @@ class BPGridTeacher:
         pi_loss_fn,
         hyperparams,
         *,
+        q_target_model=None,
         max_expanded_states_override: Optional[int] = None,
     ) -> "BPGridTeacher":
         max_expanded_states = int(getattr(hyperparams, "bp_grid_max_expanded_states", 65536))
@@ -427,6 +451,7 @@ class BPGridTeacher:
             target_model,
             p0_loss_fn,
             pi_loss_fn,
+            q_target_model=q_target_model,
             grid_min=float(getattr(hyperparams, "bp_grid_min", 0.0)),
             grid_max=float(getattr(hyperparams, "bp_grid_max", 1.0)),
             coarse_size=int(getattr(hyperparams, "bp_grid_coarse_size", 21)),
@@ -439,6 +464,9 @@ class BPGridTeacher:
             margin_scale=float(getattr(hyperparams, "bp_grid_margin_scale", 1e-3)),
             confidence_relative=bool(getattr(hyperparams, "bp_grid_confidence_relative", True)),
             confidence_min=float(getattr(hyperparams, "bp_grid_confidence_min", 0.0)),
+            boundary_match_phat_eps=float(
+                getattr(hyperparams, "q_boundary_match_phat_eps", 1e-2)
+            ),
         )
 
     def compute(
@@ -738,7 +766,7 @@ class BPGridTeacher:
             return value.expand(n_rows, width).clone()
 
         forced_value = value_star
-        return {
+        result = {
             "bp_grid": _broadcast(forced["bp_grid"], local_size),
             "value_grid": _nan(n_rows, local_size),
             "cashflow_grid_mean": _nan(n_rows, local_size),
@@ -791,6 +819,27 @@ class BPGridTeacher:
             "value_pred": forced_value,
             "regret": torch.zeros_like(forced_value),
         }
+        if "q_issue_unit_grid" in forced:
+            for key in (
+                "q_issue_claim_grid",
+                "q_issue_unit_grid",
+                "q_issue_realized_default_mask_grid",
+                "q_issue_recovery_grid",
+                "q_issue_candidate_phat_grid",
+                "candidate_phat_gate_used_for_q_issue",
+            ):
+                result[key] = _nan(n_rows, local_size)
+            for key in (
+                "q_issue_max_abs_dq_db",
+                "q_issue_candidate_default_share",
+                "q_issue_boundary_gap_mean",
+                "q_issue_unit_mean",
+                "q_issue_unit_p50",
+                "q_issue_unit_p95",
+                "q_issue_unit_max",
+            ):
+                result[key] = _nan(n_rows, 1)
+        return result
 
     def compute_value_target(
         self,
@@ -1116,9 +1165,13 @@ class BPGridTeacher:
                     for index, branch in enumerate(branch_labels):
                         state_chunk = chunk_states[index]
                         if q_current_by_branch[index] is None:
-                            q_current_by_branch[index] = _target_q(self.target_model, state_chunk)
+                            q_current_by_branch[index] = _target_q_claim(
+                                self.q_target_model,
+                                state_chunk,
+                                equity_model=self.target_model,
+                            )
                             self._record_q_forward()
-                        q_issue = self._q_issue_grid(state_chunk, sub_grid)
+                        q_issue, q_diagnostics = self._q_issue_grid(state_chunk, sub_grid)
                         for count in counts:
                             coarse_parts[index][count].append(
                                 self._branch_objective_grid(
@@ -1132,6 +1185,7 @@ class BPGridTeacher:
                                     m_tensor=m_chunk[:, :count, :],
                                     q_current=q_current_by_branch[index],
                                     q_issue=q_issue,
+                                    q_diagnostics=q_diagnostics,
                                     mix_weight=(
                                         mix_weights[index][start:stop]
                                         if mix_weights is not None and mix_weights[index] is not None
@@ -1379,6 +1433,46 @@ class BPGridTeacher:
             }
         )
 
+        if "q_issue_unit_grid" in result:
+            q_claim = result["q_issue_claim_grid"]
+            q_recovery = result["q_issue_recovery_grid"]
+            q_phat = result["q_issue_candidate_phat_grid"]
+            q_unit = result["q_issue_unit_grid"]
+            if q_claim.shape[1] > 1:
+                db = result["bp_grid"][:, 1:] - result["bp_grid"][:, :-1]
+                dq = q_claim[:, 1:] - q_claim[:, :-1]
+                max_abs_dq_db = (dq / db.clamp_min(1e-12)).abs().amax(dim=1, keepdim=True)
+            else:
+                max_abs_dq_db = torch.zeros_like(q_claim[:, :1])
+            boundary_mask = q_phat.abs() <= self.boundary_match_phat_eps
+            boundary_gap = (q_claim - q_recovery).abs()
+            boundary_count = boundary_mask.sum(dim=1, keepdim=True)
+            boundary_mean = (
+                (boundary_gap * boundary_mask.to(boundary_gap.dtype)).sum(dim=1, keepdim=True)
+                / boundary_count.clamp_min(1).to(boundary_gap.dtype)
+            )
+            boundary_mean = torch.where(
+                boundary_count > 0,
+                boundary_mean,
+                torch.full_like(boundary_mean, float("nan")),
+            )
+            result.update({
+                "q_current_claim": result["q_current_claim"].detach(),
+                "coarse_q_issue_claim_grid": coarse["q_issue_claim_grid"].detach(),
+                "candidate_phat_gate_used_for_q_issue": result[
+                    "candidate_phat_gate_used_for_q_issue"
+                ].detach(),
+                "q_issue_max_abs_dq_db": max_abs_dq_db.detach(),
+                "q_issue_candidate_default_share": result[
+                    "q_issue_realized_default_mask_grid"
+                ].mean(dim=1, keepdim=True).detach(),
+                "q_issue_boundary_gap_mean": boundary_mean.detach(),
+                "q_issue_unit_mean": q_unit.mean(dim=1, keepdim=True).detach(),
+                "q_issue_unit_p50": torch.quantile(q_unit, 0.50, dim=1, keepdim=True).detach(),
+                "q_issue_unit_p95": torch.quantile(q_unit, 0.95, dim=1, keepdim=True).detach(),
+                "q_issue_unit_max": q_unit.max(dim=1, keepdim=True).values.detach(),
+            })
+
         if bp_pred is not None:
             pred_grid = bp_pred.detach().clamp(self.grid_min, self.grid_max).reshape(-1, 1)
             pred_eval = self._evaluate_grid(
@@ -1448,7 +1542,11 @@ class BPGridTeacher:
         children_tensor = _stack_children(children)
         m_tensor = _stack_m(m_list)
         n_children = int(children_tensor.shape[1])
-        q_current = _target_q(self.target_model, parent_state)
+        q_current = _target_q_claim(
+            self.q_target_model,
+            parent_state,
+            equity_model=self.target_model,
+        )
         plan = resolve_grid_chunk_plan(
             n_parent=batch_size,
             n_grid=n_grid,
@@ -1485,7 +1583,7 @@ class BPGridTeacher:
                     q_current=q_current,
                 )
             )
-        return {
+        merged = {
             "bp_grid": torch.cat([c["bp_grid"] for c in chunks], dim=1),
             "value_grid": torch.cat([c["value_grid"] for c in chunks], dim=1),
             "cashflow_grid_mean": torch.cat([c["cashflow_grid_mean"] for c in chunks], dim=1),
@@ -1499,6 +1597,19 @@ class BPGridTeacher:
             "child_b_eta1_mean": torch.cat([c["child_b_eta1_mean"] for c in chunks], dim=1),
             "argmax_index": torch.cat([c["value_grid"] for c in chunks], dim=1).argmax(dim=1, keepdim=True),
         }
+        for key in (
+            "q_issue_claim_grid",
+            "q_issue_unit_grid",
+            "q_issue_realized_default_mask_grid",
+            "q_issue_recovery_grid",
+            "q_issue_candidate_phat_grid",
+            "candidate_phat_gate_used_for_q_issue",
+        ):
+            if key in chunks[0]:
+                merged[key] = torch.cat([chunk[key] for chunk in chunks], dim=1)
+        if "q_current_claim" in chunks[0]:
+            merged["q_current_claim"] = chunks[0]["q_current_claim"]
+        return merged
 
     def _child_equity_block(
         self,
@@ -1521,13 +1632,48 @@ class BPGridTeacher:
             p_child=p_child, bar_z_child=bar_z_child, child_b_grid=child_b_grid
         )
 
-    def _q_issue_grid(self, parent_state: torch.Tensor, bp_grid: torch.Tensor) -> torch.Tensor:
+    def _q_issue_grid(
+        self,
+        parent_state: torch.Tensor,
+        bp_grid: torch.Tensor,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         batch_size, n_grid = bp_grid.shape
         issue_state = _expand_candidates(parent_state, bp_grid)
         issue_state[:, 0:1] = _candidate_flat(bp_grid)
-        q_issue = _target_q(self.target_model, issue_state).reshape(batch_size, n_grid)
+        if getattr(self.q_target_model, "q_parameterization", None) == "hybrid_regime":
+            # P0/PI are conditional-survival value functions. Candidate Phat is
+            # diagnostic only: issuance is priced as a live debt claim and is
+            # never replaced by realized-default recovery at this point.
+            equity_fn = getattr(self.target_model, "forward_equity", None)
+            if callable(equity_fn):
+                phat = equity_fn(issue_state)["Phat"]
+            else:
+                phat = _get_out(self.target_model(issue_state), "Phat", 8)
+            q_unit = self.q_target_model._q_unit_output(issue_state)
+            q_claim = self.q_target_model._q_claim_output(issue_state)
+            recovery = self.q_target_model._q_recovery_output(issue_state)
+            diagnostics = {
+                "q_issue_claim_grid": q_claim.reshape(batch_size, n_grid),
+                "q_issue_unit_grid": q_unit.reshape(batch_size, n_grid),
+                "q_issue_realized_default_mask_grid": (
+                    (phat <= 0.0).to(q_unit.dtype).reshape(batch_size, n_grid)
+                ),
+                "q_issue_recovery_grid": recovery.reshape(batch_size, n_grid),
+                "q_issue_candidate_phat_grid": phat.reshape(batch_size, n_grid),
+                "candidate_phat_gate_used_for_q_issue": torch.zeros(
+                    (batch_size, n_grid), device=q_claim.device, dtype=q_claim.dtype
+                ),
+            }
+            q_issue = diagnostics["q_issue_claim_grid"]
+        else:
+            q_issue = _target_q_claim(
+                self.q_target_model,
+                issue_state,
+                equity_model=self.target_model,
+            ).reshape(batch_size, n_grid)
+            diagnostics = {}
         self._record_q_forward()
-        return q_issue
+        return q_issue, diagnostics
 
     def _branch_objective_grid(
         self,
@@ -1542,6 +1688,7 @@ class BPGridTeacher:
         m_tensor: torch.Tensor,
         q_current: torch.Tensor,
         q_issue: torch.Tensor,
+        q_diagnostics: Optional[Dict[str, torch.Tensor]] = None,
         mix_weight: Optional[torch.Tensor] = None,
         child_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -1648,7 +1795,7 @@ class BPGridTeacher:
         child_b_eta1_mean = _conditional_child_b((eta_next > 0.5).to(child_b_grid.dtype))
         argmax_index = value_grid.argmax(dim=1, keepdim=True)
 
-        return {
+        result = {
             "bp_grid": bp_grid,
             "value_grid": value_grid,
             "cashflow_grid_mean": cashflow_grid_mean,
@@ -1662,6 +1809,10 @@ class BPGridTeacher:
             "child_b_eta0_mean": child_b_eta0_mean,
             "child_b_eta1_mean": child_b_eta1_mean,
         }
+        if q_diagnostics:
+            result["q_current_claim"] = q_current.detach()
+            result.update(q_diagnostics)
+        return result
 
     def _evaluate_grid_chunk(
         self,
@@ -1679,14 +1830,18 @@ class BPGridTeacher:
         children_tensor = _stack_children(children)
         m_tensor = _stack_m(m_list)
         if q_current is None:
-            q_current = _target_q(self.target_model, parent_state)
+            q_current = _target_q_claim(
+                self.q_target_model,
+                parent_state,
+                equity_model=self.target_model,
+            )
             self._record_q_forward()
         if equity is None:
             equity = self._child_equity_block(
                 children_tensor, bp_grid, parent_state[:, 0:1], parent_state[:, 2:3]
             )
         self._record_candidate_chunk(int(equity.p_child.numel()))
-        q_issue = self._q_issue_grid(parent_state, bp_grid)
+        q_issue, q_diagnostics = self._q_issue_grid(parent_state, bp_grid)
         return self._branch_objective_grid(
             parent_state,
             bp_grid,
@@ -1698,6 +1853,7 @@ class BPGridTeacher:
             m_tensor=m_tensor,
             q_current=q_current,
             q_issue=q_issue,
+            q_diagnostics=q_diagnostics,
             mix_weight=mix_weight,
             child_weights=child_weights,
         )

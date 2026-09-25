@@ -1,0 +1,59 @@
+#!/bin/bash
+#SBATCH -J dl-scaled-hybrid-q
+#SBATCH -N 1
+#SBATCH -p a01
+#SBATCH -o /home/fit/zhuyingz/WORK/LiuHao/logs/dl_scaled_hybrid_q_output.%j
+#SBATCH -e /home/fit/zhuyingz/WORK/LiuHao/logs/dl_scaled_hybrid_q_error.%j
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=1-00:00:00
+
+set -euo pipefail
+
+WORK_ROOT="${WORK_ROOT:-/home/fit/zhuyingz/WORK/LiuHao}"
+REPO_DIR="${REPO_DIR:-$WORK_ROOT/DL_AP_Tensor}"
+STAMP=$(date +%Y%m%d_%H%M%S)
+EXPERIMENT_SCRIPT="slurm/run_normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500_hybrid_q.slurm"
+DEFAULT_REQUIRED_COMMIT="$(git -C "$REPO_DIR" log -1 --format=%H -- "$EXPERIMENT_SCRIPT")"
+if [[ -z "$DEFAULT_REQUIRED_COMMIT" ]]; then
+  echo "ERROR: cannot resolve the committed experiment revision for $EXPERIMENT_SCRIPT"
+  exit 1
+fi
+export REQUIRED_COMMIT="${REQUIRED_COMMIT:-$DEFAULT_REQUIRED_COMMIT}"
+
+# Matched against the eta25/bp500 direct-Q experiment except for Q semantics.
+export RUN_ROOT="${RUN_ROOT:-$WORK_ROOT/cachedir/normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500_hybrid_q_${STAMP}}"
+export BP_CURRENT_ETA_RESAMPLE_ENABLED=1
+export BP_CURRENT_ETA1_TRAIN_SHARE=0.25
+export BP_CURRENT_ETA_RESAMPLE_SEED=13579
+export BP_DISTILL_MAX_OPTIMIZER_STEPS="${BP_DISTILL_MAX_OPTIMIZER_STEPS:-500}"
+export BP_DISTILL_PATIENCE=1000000
+export BP_DISTILL_TRAINABLE_SCOPE=heads_only
+export PV_ETA_RESAMPLE_ENABLED=0
+export PV_EXACT_ETA_INTEGRATION_ENABLED=1
+export PV_MIXTURE_ENABLED=1
+
+export Q_PARAMETERIZATION=hybrid_regime
+export Q_SURVIVAL_ONDIST_SHARE="${Q_SURVIVAL_ONDIST_SHARE:-0.80}"
+export Q_CLAIM_COVERAGE_ENABLED="${Q_CLAIM_COVERAGE_ENABLED:-true}"
+export Q_CLAIM_COVERAGE_B_BINS="${Q_CLAIM_COVERAGE_B_BINS:-10}"
+export Q_CLAIM_COVERAGE_START_EPISODE="${Q_CLAIM_COVERAGE_START_EPISODE:-0}"
+export Q_STRUCTURAL_ZERO_TOL="${Q_STRUCTURAL_ZERO_TOL:-1e-8}"
+export Q_STRUCTURAL_RECOVERY_TOL="${Q_STRUCTURAL_RECOVERY_TOL:-1e-6}"
+export Q_BOUNDARY_MATCH_WEIGHT="${Q_BOUNDARY_MATCH_WEIGHT:-0.0}"
+export Q_BOUNDARY_MATCH_PHAT_EPS="${Q_BOUNDARY_MATCH_PHAT_EPS:-1e-2}"
+export Q_BOUNDARY_MATCH_MIN_SAMPLES="${Q_BOUNDARY_MATCH_MIN_SAMPLES:-0}"
+
+echo "Dispatching matched scaled-value hybrid-regime Q experiment"
+echo "RUN_ROOT=$RUN_ROOT"
+echo "REQUIRED_COMMIT=$REQUIRED_COMMIT"
+echo "Q_PARAMETERIZATION=$Q_PARAMETERIZATION"
+echo "Q_SURVIVAL_ONDIST_SHARE=$Q_SURVIVAL_ONDIST_SHARE"
+echo "Q_CLAIM_COVERAGE_ENABLED=$Q_CLAIM_COVERAGE_ENABLED"
+echo "Q_CLAIM_COVERAGE_B_BINS=$Q_CLAIM_COVERAGE_B_BINS"
+echo "Q_BOUNDARY_MATCH_WEIGHT=$Q_BOUNDARY_MATCH_WEIGHT"
+echo "BP_CURRENT_ETA1_TRAIN_SHARE=$BP_CURRENT_ETA1_TRAIN_SHARE"
+echo "BP_DISTILL_MAX_OPTIMIZER_STEPS=$BP_DISTILL_MAX_OPTIMIZER_STEPS"
+
+exec bash "$REPO_DIR/slurm/run_normalized_sdf_aio_bp_logit_scaled_value_pilot.slurm"

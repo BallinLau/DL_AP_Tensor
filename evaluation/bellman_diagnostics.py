@@ -42,6 +42,24 @@ def _forward_fields(
     return {name: torch.cat(parts, dim=0) for name, parts in result.items()}
 
 
+def _forward_model_method(
+    model: torch.nn.Module,
+    states: torch.Tensor,
+    method_name: str,
+    *,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Evaluate a model semantic helper without routing through public ``Q``."""
+    module = model.module if hasattr(model, "module") else model
+    method = getattr(module, method_name)
+    parts = []
+    for start in range(0, states.shape[0], max(1, int(chunk_size))):
+        parts.append(
+            method(states[start:start + max(1, int(chunk_size))]).detach()
+        )
+    return torch.cat(parts, dim=0)
+
+
 def _child_states(
     parent_states: torch.Tensor,
     children: torch.Tensor,
@@ -116,7 +134,19 @@ def evaluate_bellman_residuals(
         parent_out = model(parent)
         bp0 = _get(parent_out, "bp0")
         bpi = _get(parent_out, "bpI")
-        q = _get(parent_out, "Q")
+        q_effective = _get(parent_out, "Q")
+        semantic_model = model.module if hasattr(model, "module") else model
+        hybrid_claim_q = (
+            str(getattr(semantic_model, "q_parameterization", "direct"))
+            == "hybrid_regime"
+        )
+        q = (
+            _forward_model_method(
+                model, parent, "_q_claim_output", chunk_size=chunk_size
+            )
+            if hybrid_claim_q
+            else q_effective
+        )
         p0 = _get(parent_out, "P0")
         pi = _get(parent_out, "PI")
         try:
@@ -132,8 +162,20 @@ def evaluate_bellman_residuals(
         issue_p0[:, 0:1] = bp0
         issue_pi = parent.clone()
         issue_pi[:, 0:1] = bpi
-        q_issue_p0 = _forward_fields(model, issue_p0, ("Q",), chunk_size=chunk_size)["Q"]
-        q_issue_pi = _forward_fields(model, issue_pi, ("Q",), chunk_size=chunk_size)["Q"]
+        if hybrid_claim_q:
+            q_issue_p0 = _forward_model_method(
+                model, issue_p0, "_q_claim_output", chunk_size=chunk_size
+            )
+            q_issue_pi = _forward_model_method(
+                model, issue_pi, "_q_claim_output", chunk_size=chunk_size
+            )
+        else:
+            q_issue_p0 = _forward_fields(
+                model, issue_p0, ("Q",), chunk_size=chunk_size
+            )["Q"]
+            q_issue_pi = _forward_fields(
+                model, issue_pi, ("Q",), chunk_size=chunk_size
+            )["Q"]
         eta_current = parent[:, 2:3].clamp(0.0, 1.0)
         cf0 = p0_loss.compute_cashflow_p0(
             parent[:, 4:5], parent[:, 1:2], parent[:, 0:1], q, q_issue_p0, eta_current
@@ -161,12 +203,21 @@ def evaluate_bellman_residuals(
         b_sp = parent[:, 0:1] / multiplier.clamp_min(1e-6)
         q_child_states = children_tensor[..., :7].clone()
         q_child_states[..., 0:1] = b_sp.unsqueeze(1)
-        qsp = _forward_fields(
-            model,
-            q_child_states.reshape(-1, q_child_states.shape[-1]),
-            ("Q",),
-            chunk_size=chunk_size,
-        )["Q"].reshape(n_parent, n_child, 1)
+        flat_q_child_states = q_child_states.reshape(-1, q_child_states.shape[-1])
+        if hybrid_claim_q:
+            qsp = _forward_model_method(
+                model,
+                flat_q_child_states,
+                "_q_claim_output",
+                chunk_size=chunk_size,
+            ).reshape(n_parent, n_child, 1)
+        else:
+            qsp = _forward_fields(
+                model,
+                flat_q_child_states,
+                ("Q",),
+                chunk_size=chunk_size,
+            )["Q"].reshape(n_parent, n_child, 1)
         try:
             bar_zsp = _forward_fields(
                 model,
@@ -190,21 +241,29 @@ def evaluate_bellman_residuals(
             phi=float(economic_config.PHI), delta=float(economic_config.DELTA),
             recovery_normalization_mode=recovery_mode,
         )
-        # q_unit is a derived reporting ratio Q/b, not the direct-Q network output.
-        # The corresponding default-region ratio target is recovery / b.
+        # In hybrid mode q_unit is a network output and Bellman/P diagnostics use
+        # Q_claim=b*q_unit.  Recovery/b has no claim-pricing interpretation, so
+        # it is deliberately undefined.  Direct/legacy diagnostics retain their
+        # historical derived-ratio reporting contract.
         b_parent = parent[:, 0:1]
-        q_unit_recovery_target = torch.where(
-            b_parent > 0.0,
-            recovery_current / b_parent.clamp_min(1e-12),
-            torch.full_like(recovery_current, float("nan")),
-        )
-        # Derived predicted ratio (same reporting convention as firm_surfaces).
-        q_unit_pred = torch.where(
-            b_parent > 0.0,
-            q / b_parent.clamp_min(1e-12),
-            torch.full_like(q, float("nan")),
-        )
-        q_unit_minus_recovery_target = q_unit_pred - q_unit_recovery_target
+        if hybrid_claim_q:
+            q_unit_pred = _forward_model_method(
+                model, parent, "_q_unit_output", chunk_size=chunk_size
+            )
+            q_unit_recovery_target = torch.full_like(q_unit_pred, float("nan"))
+            q_unit_minus_recovery_target = torch.full_like(q_unit_pred, float("nan"))
+        else:
+            q_unit_recovery_target = torch.where(
+                b_parent > 0.0,
+                recovery_current / b_parent.clamp_min(1e-12),
+                torch.full_like(recovery_current, float("nan")),
+            )
+            q_unit_pred = torch.where(
+                b_parent > 0.0,
+                q / b_parent.clamp_min(1e-12),
+                torch.full_like(q, float("nan")),
+            )
+            q_unit_minus_recovery_target = q_unit_pred - q_unit_recovery_target
 
         def residuals_for_m(m_values: torch.Tensor) -> Dict[str, torch.Tensor]:
             continuation0 = (weights * m_values * p_child_p0).sum(dim=1)
@@ -236,7 +295,9 @@ def evaluate_bellman_residuals(
                 "q_target_survival": q_target_survival,
                 "q_target_recovery": q_target_recovery,
                 "q_target_used_for_training": (
-                    survival_w * q_target + default_w * recovery_current
+                    q_target
+                    if hybrid_claim_q
+                    else survival_w * q_target + default_w * recovery_current
                 ),
                 "continuation0": continuation0,
                 "continuationi": continuationi,
@@ -255,6 +316,8 @@ def evaluate_bellman_residuals(
         "CFI": surface(cfi),
         "continuation_P0": surface(train_m["continuation0"]),
         "continuation_PI": surface(train_m["continuationi"]),
+        "Q_claim": surface(q),
+        "Q_effective": surface(q_effective),
     }
     for label, values in (("trainM", train_m), ("rawM", raw_m)):
         q_scale = torch.maximum(q.abs(), values["q_target"].abs()).clamp_min(1e-8)
@@ -322,7 +385,8 @@ def evaluate_bellman_residuals(
         "parent_hard_default": surface(hard_default),
         "parent_survival_weight": surface(survival_w),
         "parent_default_weight": surface(default_w),
-        "Q_minus_recovery": surface(q - recovery_current),
+        "Q_minus_recovery": surface(q_effective - recovery_current),
+        "Q_claim_minus_recovery": surface(q - recovery_current),
         "Q_target_minus_recovery": surface(train_m["q_target"] - recovery_current),
         "Q_minus_Q_target": surface(q - train_m["q_target"]),
     })

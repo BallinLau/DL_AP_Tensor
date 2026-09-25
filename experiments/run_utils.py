@@ -19,7 +19,7 @@ from utils.firm_transition import apply_refinancing_policy
 
 POLICY_VALUE_SPEC_FILENAME = "policy_value_model_spec.json"
 METADATA_DIRNAME = "metadata"
-Q_PARAMETERIZATION_MODES = ("direct", "b_times_unit")
+Q_PARAMETERIZATION_MODES = ("direct", "b_times_unit", "hybrid_regime")
 
 
 def resolve_base_dir(run_root: Optional[Path], project_root: Path) -> Path:

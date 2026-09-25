@@ -97,6 +97,9 @@ def make_long_rows(
     q_issue = result["coarse_q_issue_grid"]
     p_child = result["coarse_p_child_grid_mean"]
     default = result["coarse_default_grid_mean"]
+    q_issue_claim = result.get("coarse_q_issue_claim_grid")
+    q_current_claim = result.get("q_current_claim")
+    phat_gate_used = result.get("candidate_phat_gate_used_for_q_issue")
 
     rows: List[Dict[str, object]] = []
     bp_pred_flat = bp_pred.reshape(-1)
@@ -122,6 +125,21 @@ def make_long_rows(
                     "continuation": float(continuation[state_pos, grid_pos].item()),
                     "value": float(value[state_pos, grid_pos].item()),
                     "q_issue": float(q_issue[state_pos, grid_pos].item()),
+                    "q_issue_claim": (
+                        float(q_issue_claim[state_pos, grid_pos].item())
+                        if q_issue_claim is not None
+                        else float(q_issue[state_pos, grid_pos].item())
+                    ),
+                    "q_current_claim": (
+                        float(q_current_claim[state_pos].item())
+                        if q_current_claim is not None
+                        else float("nan")
+                    ),
+                    "candidate_phat_gate_used_for_q_issue": (
+                        bool(phat_gate_used[state_pos, grid_pos].item())
+                        if phat_gate_used is not None
+                        else False
+                    ),
                     "p_child_mean": float(p_child[state_pos, grid_pos].item()),
                     "default_mean": float(default[state_pos, grid_pos].item()),
                 }
@@ -144,6 +162,8 @@ def make_summary_rows(
     q_issue = result["coarse_q_issue_grid"]
     p_child = result["coarse_p_child_grid_mean"]
     default = result["coarse_default_grid_mean"]
+    q_current_claim = result.get("q_current_claim")
+    phat_gate_used = result.get("candidate_phat_gate_used_for_q_issue")
     bp_star_teacher = result["bp_star"].reshape(-1)
     value_star_teacher = result["value_star"].reshape(-1)
     regret_at_pred = result["regret"].reshape(-1)
@@ -199,6 +219,16 @@ def make_summary_rows(
                 "hatcf": float(parent_state[state_pos, 5].item()),
                 "lnkf": float(parent_state[state_pos, 6].item()),
                 "bp_pred": float(bp_pred_flat[state_pos].item()),
+                "q_current_claim": (
+                    float(q_current_claim[state_pos].item())
+                    if q_current_claim is not None
+                    else float("nan")
+                ),
+                "candidate_phat_gate_used_for_q_issue": (
+                    bool(phat_gate_used[state_pos].any().item())
+                    if phat_gate_used is not None
+                    else False
+                ),
                 "bp_star_coarse": float(grid[state_pos, j_star].item()),
                 "bp_star_teacher": float(bp_star_teacher[state_pos].item()),
                 "argmax_index": j_star,
@@ -222,9 +252,11 @@ def make_summary_rows(
                 "delta_continuation_low_to_coarse_star": float(delta_cont.item()),
                 "delta_value_low_to_coarse_star": float(delta_value.item()),
                 "q_issue_coarse_star": float(q_issue[state_pos, j_star].item()),
+                "q_issue_claim_coarse_star": float(q_issue[state_pos, j_star].item()),
                 "p_child_coarse_star": float(p_child[state_pos, j_star].item()),
                 "default_coarse_star": float(default[state_pos, j_star].item()),
                 "q_issue_teacher_star": float(q_issue_teacher_star[state_pos].item()),
+                "q_issue_claim_teacher_star": float(q_issue_teacher_star[state_pos].item()),
                 "p_child_teacher_star": float(p_child_teacher_star[state_pos].item()),
                 "default_teacher_star": float(default_teacher_star[state_pos].item()),
                 "identity_error_max": float(identity_error.item()),
@@ -433,13 +465,15 @@ def main() -> None:
         "bp_star_coarse",
         "bp_star_teacher",
         "regret_at_pred",
+        "q_current_claim",
+        "candidate_phat_gate_used_for_q_issue",
         "delta_cashflow_low_to_coarse_star",
         "delta_continuation_low_to_coarse_star",
         "delta_value_low_to_coarse_star",
-        "q_issue_coarse_star",
+        "q_issue_claim_coarse_star",
         "p_child_coarse_star",
         "default_coarse_star",
-        "q_issue_teacher_star",
+        "q_issue_claim_teacher_star",
         "p_child_teacher_star",
         "default_teacher_star",
         "dominant_component",

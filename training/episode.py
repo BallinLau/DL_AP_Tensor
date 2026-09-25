@@ -4689,6 +4689,11 @@ class Episode:
             self.loss_fns['p0'],
             self.loss_fns['pi'],
             self.hyperparams,
+            q_target_model=getattr(
+                self,
+                "_policy_value_stage_q_target_model",
+                None,
+            ),
         )
         grid = teacher.compute(
             parent_state=parent_state,
@@ -5499,7 +5504,13 @@ class Episode:
         model = self.models["policy_value"]
         zero_state = parent_state[:, :7].clone()
         zero_state[:, 0:1] = 0.0
-        Q = model._q_output(zero_state)
+        if getattr(model, "q_parameterization", None) == "hybrid_regime":
+            Q = model._q_effective_output(
+                zero_state,
+                default_mask=torch.zeros_like(zero_state[:, 0:1], dtype=torch.bool),
+            )
+        else:
+            Q = model._q_output(zero_state)
         terms = self.loss_fns["q"].compute_zero_debt_objective(
             Q,
             nonnegative_weight=float(getattr(self.hyperparams, "q_nonnegative_weight", 1.0)),
@@ -5519,11 +5530,22 @@ class Episode:
             }
         return float(getattr(self.hyperparams, "q_zero_loss_weight", 1.0)) * terms["loss"]
 
-    def _compute_q_default_loss(self, parent_state: torch.Tensor) -> torch.Tensor:
+    def _compute_q_default_loss(
+        self,
+        parent_state: torch.Tensor,
+        *,
+        frozen_p_model: Optional[nn.Module] = None,
+    ) -> torch.Tensor:
         """QD path: current-parent recovery regression, no children/SDF/AiO."""
         model = self.models["policy_value"]
         state = parent_state[:, :7]
-        Q = model._q_output(state)
+        if getattr(model, "q_parameterization", None) == "hybrid_regime":
+            if frozen_p_model is None:
+                raise ValueError("hybrid_regime QD requires the frozen P classifier")
+            phat = self._q_frozen_phat(state, frozen_p_model)
+            Q = model._q_effective_output(state, phat=phat)
+        else:
+            Q = model._q_output(state)
         terms = self.loss_fns["q"].compute_default_parent_objective(
             Q=Q,
             b=state[:, 0:1],
@@ -5576,15 +5598,35 @@ class Episode:
         if mode == "zero":
             return self._compute_q_zero_loss(parent_state)
         if mode == "default":
+            if getattr(self.models["policy_value"], "q_parameterization", None) == "hybrid_regime":
+                return self._compute_q_default_loss(
+                    parent_state,
+                    frozen_p_model=frozen_p_model,
+                )
             return self._compute_q_default_loss(parent_state)
         if mode == "survival":
             return self._compute_q_survival_bellman_loss(
                 batch,
                 create_graph=create_graph,
+                frozen_p_model=frozen_p_model,
                 q_target_model=q_target_model,
             )
         if mode != "mixed":
             raise ValueError(f"Unknown Q regime loss path: {regime!r}")
+
+        if getattr(self.models["policy_value"], "q_parameterization", None) == "hybrid_regime":
+            frozen_p = frozen_p_model or self._target_policy_value()
+            claim_batch = self._build_q_survival_batch(batch, frozen_p)
+            if claim_batch is None:
+                raise ValueError(
+                    "Hybrid Q mixed batch has no realized-survival claim states"
+                )
+            return self._compute_q_survival_bellman_loss(
+                claim_batch,
+                create_graph=create_graph,
+                frozen_p_model=frozen_p,
+                q_target_model=q_target_model,
+            )
 
         frozen_p = frozen_p_model or self._target_policy_value()
         phat = self._q_frozen_phat(parent_state, frozen_p)
@@ -5606,11 +5648,18 @@ class Episode:
             if name == "zero":
                 value = self._compute_q_zero_loss(subset["parent"][:, :7])
             elif name == "default":
-                value = self._compute_q_default_loss(subset["parent"][:, :7])
+                if getattr(self.models["policy_value"], "q_parameterization", None) == "hybrid_regime":
+                    value = self._compute_q_default_loss(
+                        subset["parent"][:, :7],
+                        frozen_p_model=frozen_p,
+                    )
+                else:
+                    value = self._compute_q_default_loss(subset["parent"][:, :7])
             else:
                 value = self._compute_q_survival_bellman_loss(
                     subset,
                     create_graph=create_graph,
+                    frozen_p_model=frozen_p,
                     q_target_model=q_target_model,
                 )
             losses.append(value * (float(count) / float(parent_state.shape[0])))
@@ -5630,6 +5679,7 @@ class Episode:
         batch: Dict[str, torch.Tensor],
         *,
         create_graph: bool = True,
+        frozen_p_model: Optional[nn.Module] = None,
         q_target_model: Optional[nn.Module] = None,
     ) -> torch.Tensor:
         """
@@ -5689,14 +5739,18 @@ class Episode:
                 return getattr(out, name)
             return out[:, idx:idx + 1]
 
-        q_fn = getattr(model, "_q_output", None)
+        q_fn = getattr(model, "_q_claim_output", None)
         if callable(q_fn):
             Q = q_fn(parent_state)
         else:
             output_t = model(parent_state)
             Q = _get_out(output_t, 'Q', 0)
+        if getattr(model, "q_parameterization", None) == "hybrid_regime":
+            p_model = frozen_p_model or target_model
+        else:
+            p_model = target_model
         with torch.no_grad():
-            output_t_target = target_model(parent_state.detach())
+            output_t_target = p_model(parent_state.detach())
 
         bar_i_t = _get_out(output_t_target, 'bar_i', 5).detach()
         b_parent = parent_state[:, 0:1]
@@ -5708,17 +5762,34 @@ class Episode:
         multiplier = bar_i_use * (g_val - 1.0) + 1.0
         b_sp = b_parent / multiplier.clamp_min(1e-6)
 
-        outputsp_children = []
+        qsp_children = []
+        psp_children = []
+        b_sp_reconstruction_max_error = 0.0
         for child in children:
             child_state_raw = strip_extra(child)
             childsp_state = child_state_raw.clone()
             childsp_state[:, 0:1] = b_sp
+            b_sp_reconstruction_max_error = max(
+                b_sp_reconstruction_max_error,
+                float((childsp_state[:, 0:1] - b_sp).abs().max().detach().item()),
+            )
             with torch.no_grad():
-                outputsp_children.append(target_model(childsp_state.detach()))
+                q_survival_fn = getattr(target_model, "_q_claim_output", None)
+                qsp_children.append(
+                    q_survival_fn(childsp_state.detach())
+                    if callable(q_survival_fn)
+                    else _get_out(target_model(childsp_state.detach()), "Q", 0)
+                )
+                equity_fn = getattr(p_model, "forward_equity", None)
+                psp_children.append(
+                    equity_fn(childsp_state.detach())
+                    if callable(equity_fn)
+                    else p_model(childsp_state.detach())
+                )
 
         # 提取 Q 和所需变量
-        Qsp_children = [_get_out(out, 'Q', 0).detach() for out in outputsp_children]
-        bar_zsp_children = [_get_out(out, 'bar_z', 6).detach() for out in outputsp_children]
+        Qsp_children = [value.detach() for value in qsp_children]
+        bar_zsp_children = [_get_out(out, 'bar_z', 6).detach() for out in psp_children]
         x_children = [child[:, 4:5] for child in children]
         z_children = [child[:, 1:2] for child in children]
 
@@ -5788,20 +5859,66 @@ class Episode:
             q_shape_b_high = torch.zeros((), device=Q.device, dtype=Q.dtype)
             q_shape_penalty = torch.zeros((), device=Q.device, dtype=Q.dtype)
 
+        boundary_loss = torch.zeros((), device=Q.device, dtype=Q.dtype)
+        boundary_diag = {
+            "q_boundary_match_count": 0.0,
+            "q_boundary_match_gap_mean": 0.0,
+            "q_boundary_match_gap_p95": 0.0,
+            "q_boundary_match_gap_max": 0.0,
+        }
+        boundary_weight = float(
+            getattr(self.hyperparams, "q_boundary_match_weight", 0.0)
+        )
+        if getattr(model, "q_parameterization", None) == "hybrid_regime":
+            if frozen_p_model is None:
+                raise ValueError("hybrid boundary matching requires frozen_p_model")
+            boundary_phat = self._q_frozen_phat(parent_state.detach(), frozen_p_model)
+            boundary_eps = float(
+                getattr(self.hyperparams, "q_boundary_match_phat_eps", 1e-2)
+            )
+            boundary_mask = (
+                (b_parent > 0.0) & (boundary_phat.abs() <= boundary_eps)
+            ).reshape(-1)
+            boundary_count = int(boundary_mask.sum().item())
+            min_samples = int(
+                getattr(self.hyperparams, "q_boundary_match_min_samples", 0)
+            )
+            if boundary_count >= max(1, min_samples):
+                recovery = model._q_recovery_output(parent_state)
+                gap = (Q - recovery)[boundary_mask].abs().reshape(-1)
+                boundary_loss = gap.pow(2).mean()
+                boundary_diag = {
+                    "q_boundary_match_count": float(boundary_count),
+                    "q_boundary_match_gap_mean": float(gap.mean().detach().item()),
+                    "q_boundary_match_gap_p95": float(
+                        torch.quantile(gap.detach(), 0.95).item()
+                    ),
+                    "q_boundary_match_gap_max": float(gap.max().detach().item()),
+                }
+
         physics_loss = (
             survival_terms["loss"] + penalty_z_main + q_shape_penalty
+            + boundary_weight * boundary_loss
         )
         total_loss = float(getattr(self.hyperparams, "q_survival_loss_weight", 1.0)) * physics_loss
         with torch.no_grad():
             negative = Q < 0.0
+            q_unit_values = (
+                model._q_unit_output(parent_state.detach()).reshape(-1)
+                if getattr(model, "q_parameterization", None) == "hybrid_regime"
+                else None
+            )
             branch_residual = torch.stack([value.reshape(-1) for value in residuals], dim=1)
             branch_abs = branch_residual.abs().reshape(-1)
             self._latest_q_terms = {
                 'q_main': float(main_loss.item()),
                 'q_regime_survival_n': float(Q.numel()),
+                'q_regime_claim_n': float(Q.numel()) if getattr(model, "q_parameterization", None) == "hybrid_regime" else 0.0,
                 'q_survival_bellman_signed_mean': float(branch_residual.mean().item()),
                 'q_survival_bellman_abs_mean': float(branch_abs.mean().item()),
                 'q_survival_bellman_abs_p90': float(torch.quantile(branch_abs, 0.9).item()),
+                'q_claim_bellman_signed_mean': float(branch_residual.mean().item()),
+                'q_claim_bellman_abs_mean': float(branch_abs.mean().item()),
                 'q_nonnegative': float(survival_terms["nonnegative_loss"].item()),
                 'q_negative_share': float(negative.float().mean().item()),
                 'q_negative_mean_abs': float((-Q[negative]).mean().item()) if negative.any() else 0.0,
@@ -5813,7 +5930,17 @@ class Episode:
                 'q_parent_default_weight_mean': 0.0,
                 'q_pretrain_mode': float(1.0 if q_only_stage else 0.0),
                 'q_freeze_mode': float(1.0 if q_freeze_mode else 0.0),
+                'q_boundary_match_loss': float(boundary_loss.detach().item()),
+                'q_child_b_sp_reconstruction_max_error': b_sp_reconstruction_max_error,
+                **boundary_diag,
             }
+            if q_unit_values is not None:
+                self._latest_q_terms.update({
+                    "q_unit_mean": float(q_unit_values.mean().item()),
+                    "q_unit_p50": float(torch.quantile(q_unit_values, 0.50).item()),
+                    "q_unit_p95": float(torch.quantile(q_unit_values, 0.95).item()),
+                    "q_unit_max": float(q_unit_values.max().item()),
+                })
         return total_loss
     
     def _compute_fc2_loss(self, batch) -> torch.Tensor:
@@ -7611,6 +7738,8 @@ class Episode:
         val_batches: List[Dict[str, torch.Tensor]],
         teacher: nn.Module,
         n_epochs: int,
+        *,
+        q_target_model: Optional[nn.Module] = None,
     ) -> Dict[str, Any]:
         params = self._policy_value_stage_params("p")
         bp_params = self._policy_value_stage_params("bp")
@@ -7635,7 +7764,13 @@ class Episode:
             }
         optimizer = self._make_policy_value_stage_optimizer(params)
         stage_start_checkpoint = self._policy_value_stage_checkpoint(optimizer, None)
-        teacher_hash_before = self._state_dict_hash(teacher)
+        q_target_model = q_target_model if q_target_model is not None else teacher
+        def _combined_teacher_hash() -> str:
+            equity_hash = self._state_dict_hash(teacher)
+            q_hash = equity_hash if q_target_model is teacher else self._state_dict_hash(q_target_model)
+            return hashlib.sha256(f"{equity_hash}:{q_hash}".encode("utf-8")).hexdigest()
+
+        teacher_hash_before = _combined_teacher_hash()
         grid_config_hash = self._pq_grid_config_hash()
         integrity_mode = str(getattr(self.hyperparams, "pq_cache_integrity_check", "metadata")).lower()
         if integrity_mode not in {"off", "metadata", "full"}:
@@ -7643,6 +7778,7 @@ class Episode:
                 "pq_cache_integrity_check must be one of: off, metadata, full"
             )
         previous_teacher = getattr(self, "_policy_value_stage_target_model", None)
+        previous_q_teacher = getattr(self, "_policy_value_stage_q_target_model", None)
         best_score = float("inf")
         best_epoch: Optional[int] = None
         best_checkpoint: Optional[Dict[str, Any]] = None
@@ -7661,9 +7797,11 @@ class Episode:
         was_training = model.training
         try:
             self._policy_value_stage_target_model = teacher
+            self._policy_value_stage_q_target_model = q_target_model
             train_cache, train_cache_summary = self._build_pq_value_target_cache(
                 train_batches,
                 teacher,
+                q_target_model=q_target_model,
                 teacher_hash=teacher_hash_before,
                 grid_config_hash=grid_config_hash,
             )
@@ -7673,6 +7811,7 @@ class Episode:
                 val_cache, val_cache_summary = self._build_pq_value_target_cache(
                     val_source,
                     teacher,
+                    q_target_model=q_target_model,
                     teacher_hash=teacher_hash_before,
                     grid_config_hash=grid_config_hash,
                 )
@@ -7854,6 +7993,7 @@ class Episode:
                         }
         finally:
             self._policy_value_stage_target_model = previous_teacher
+            self._policy_value_stage_q_target_model = previous_q_teacher
             model.train(was_training)
 
         restored = False
@@ -7870,7 +8010,7 @@ class Episode:
                 self._restore_rng_state(best_runtime_state.get("rng_state"))
             restored = True
         avg, meta = self._aggregate_metric_records(records)
-        teacher_hash_after = self._state_dict_hash(teacher)
+        teacher_hash_after = _combined_teacher_hash()
         train_cache_hash_after = self._pq_value_cache_hash(train_cache)
         val_cache_hash_after = self._pq_value_cache_hash(val_cache)
         bp_head_max_change = self._param_max_change_from_snapshot(bp_params, bp_snapshot)
@@ -8203,6 +8343,7 @@ class Episode:
         batches: List[Dict[str, torch.Tensor]],
         teacher_model: nn.Module,
         *,
+        q_target_model: Optional[nn.Module] = None,
         teacher_hash: Optional[str] = None,
         grid_config_hash: Optional[str] = None,
     ) -> Tuple[List[PQValueTargetBatch], Dict[str, Any]]:
@@ -8212,6 +8353,7 @@ class Episode:
             self.loss_fns["p0"],
             self.loss_fns["pi"],
             self.hyperparams,
+            q_target_model=q_target_model,
         )
         teacher_hash = teacher_hash or self._state_dict_hash(teacher_model)
         grid_config_hash = grid_config_hash or self._pq_grid_config_hash()
@@ -9262,19 +9404,164 @@ class Episode:
         *,
         requested: Optional[int] = None,
         phat_eps: Optional[float] = None,
-    ) -> Optional[Dict[str, torch.Tensor]]:
-        """Keep matched survival transitions and add deterministic b/z-bin replay."""
+        return_diagnostics: bool = False,
+    ):
+        """Build the recursive-Q batch without changing direct-Q semantics.
+
+        Direct-Q keeps its historical parent-survival filter. Hybrid-Q admits
+        observed parents only when they are realized survivors, then augments
+        those survivor contexts with deterministic synthetic-b replay. The
+        synthetic candidate Phat is diagnostic only and never filters claim
+        training.
+        """
         parent = batch["parent"]
         state = parent[:, :7] if parent.shape[1] > 7 else parent
-        phat = self._q_frozen_phat(state, frozen_p_model)
         b_eps = float(getattr(self.hyperparams, "q_zero_b_eps", 0.0))
+        hybrid = (
+            getattr(self.models["policy_value"], "q_parameterization", None)
+            == "hybrid_regime"
+        )
+        if hybrid:
+            positive = (state[:, 0:1] > b_eps).reshape(-1)
+            realized_phat = self._q_frozen_phat(state, frozen_p_model).reshape(-1)
+            realized_survival = positive & (realized_phat > 0.0)
+            realized_default = positive & (realized_phat <= 0.0)
+            realized_zero = ~positive
+            # Realized current survival decides whether an observed parent may
+            # enter the claim Bellman sample set. Counterfactual candidate Phat
+            # does not decide whether Q_claim exists or is trainable.
+            ondist_indices = torch.nonzero(
+                realized_survival, as_tuple=False
+            ).reshape(-1)
+            if requested is not None and ondist_indices.numel() > int(requested):
+                positions = torch.linspace(
+                    0,
+                    ondist_indices.numel() - 1,
+                    int(requested),
+                    device=state.device,
+                ).round().long()
+                ondist_indices = ondist_indices[positions]
+
+            coverage_enabled = bool(
+                getattr(self.hyperparams, "q_claim_coverage_enabled", True)
+            ) and int(self.episode_id) >= int(
+                getattr(self.hyperparams, "q_claim_coverage_start_episode", 0)
+            )
+            ondist_share = min(
+                max(float(getattr(self.hyperparams, "q_survival_ondist_share", 0.8)), 1e-6),
+                1.0,
+            )
+            synthetic_n = 0
+            if coverage_enabled and ondist_share < 1.0 and ondist_indices.numel() > 0:
+                base_n = int(ondist_indices.numel())
+                synthetic_n = int(round(base_n * (1.0 - ondist_share) / ondist_share))
+
+            if synthetic_n > 0:
+                source_positions = torch.linspace(
+                    0,
+                    ondist_indices.numel() - 1,
+                    synthetic_n,
+                    device=state.device,
+                ).round().long()
+                synthetic_source_indices = ondist_indices[source_positions]
+                indices = torch.cat([ondist_indices, synthetic_source_indices], dim=0)
+            else:
+                synthetic_source_indices = torch.empty(
+                    0, device=state.device, dtype=torch.long
+                )
+                indices = ondist_indices
+            if indices.numel() == 0:
+                empty_diag = {
+                    "realized_parent_survival_count": int(realized_survival.sum().item()),
+                    "realized_parent_default_count": int(realized_default.sum().item()),
+                    "realized_parent_zero_b_count": int(realized_zero.sum().item()),
+                    "claim_parent_count": 0,
+                    "claim_parent_default_count": int(realized_default.sum().item()),
+                    "claim_parent_default_share": 0.0,
+                    "claim_ondist_sample_count": 0,
+                    "claim_synthetic_sample_count": 0,
+                    "claim_total_sample_count": 0,
+                    "synthetic_source_context_count": 0,
+                    "synthetic_candidate_phat_positive_share": float("nan"),
+                    "synthetic_candidate_phat_negative_share": float("nan"),
+                    "synthetic_candidate_phat_used_for_filter": False,
+                    "claim_coverage_b_bins": int(
+                        getattr(self.hyperparams, "q_claim_coverage_b_bins", 10)
+                    ),
+                    "claim_coverage_bins_occupied": 0,
+                    "claim_coverage_fraction_bins_occupied": 0.0,
+                    "claim_coverage_b_min": float("nan"),
+                    "claim_coverage_b_max": float("nan"),
+                }
+                return (None, empty_diag) if return_diagnostics else None
+
+            result = self._index_q_batch(batch, indices)
+            result["parent"] = result["parent"].clone()
+            synthetic_b = torch.empty(0, device=state.device, dtype=state.dtype)
+            bins = max(2, int(getattr(self.hyperparams, "q_claim_coverage_b_bins", 10)))
+            if synthetic_n > 0:
+                grid_min = float(getattr(self.hyperparams, "bp_grid_min", 0.0))
+                grid_max = float(getattr(self.hyperparams, "bp_grid_max", 1.0))
+                centers = grid_min + (
+                    torch.arange(bins, device=state.device, dtype=state.dtype) + 0.5
+                ) * ((grid_max - grid_min) / float(bins))
+                center_positions = torch.linspace(
+                    0, bins - 1, synthetic_n, device=state.device
+                ).round().long()
+                synthetic_b = centers[center_positions]
+                result["parent"][-synthetic_n:, 0] = synthetic_b
+
+            result_state = result["parent"][:, :7]
+            synthetic_phat = (
+                self._q_frozen_phat(result_state[-synthetic_n:], frozen_p_model)
+                if synthetic_n > 0
+                else torch.empty(0, 1, device=state.device, dtype=state.dtype)
+            )
+            occupied = int(torch.unique(synthetic_b).numel()) if synthetic_n > 0 else 0
+            diagnostics = {
+                "realized_parent_survival_count": int(realized_survival.sum().item()),
+                "realized_parent_default_count": int(realized_default.sum().item()),
+                "realized_parent_zero_b_count": int(realized_zero.sum().item()),
+                "claim_parent_count": int(result_state.shape[0]),
+                "claim_parent_default_count": int(realized_default.sum().item()),
+                "claim_parent_default_share": float(
+                    realized_default.float().mean().item()
+                ),
+                "claim_ondist_sample_count": int(ondist_indices.numel()),
+                "claim_synthetic_sample_count": int(synthetic_n),
+                "claim_total_sample_count": int(result_state.shape[0]),
+                "synthetic_source_context_count": int(
+                    torch.unique(synthetic_source_indices).numel()
+                ),
+                "synthetic_candidate_phat_positive_share": (
+                    float((synthetic_phat > 0.0).float().mean().item())
+                    if synthetic_n > 0 else float("nan")
+                ),
+                "synthetic_candidate_phat_negative_share": (
+                    float((synthetic_phat <= 0.0).float().mean().item())
+                    if synthetic_n > 0 else float("nan")
+                ),
+                "synthetic_candidate_phat_used_for_filter": False,
+                "claim_coverage_b_bins": int(bins),
+                "claim_coverage_bins_occupied": int(occupied),
+                "claim_coverage_fraction_bins_occupied": float(occupied / bins),
+                "claim_coverage_b_min": (
+                    float(synthetic_b.min().item()) if synthetic_n > 0 else float("nan")
+                ),
+                "claim_coverage_b_max": (
+                    float(synthetic_b.max().item()) if synthetic_n > 0 else float("nan")
+                ),
+            }
+            return (result, diagnostics) if return_diagnostics else result
+
+        phat = self._q_frozen_phat(state, frozen_p_model)
         strict_eps = max(0.0, float(
             getattr(self.hyperparams, "q_default_phat_eps", 1e-2)
             if phat_eps is None else phat_eps
         ))
         keep = ((state[:, 0:1] > b_eps) & (phat > strict_eps)).reshape(-1)
         if not keep.any():
-            return None
+            return (None, {}) if return_diagnostics else None
         subset = self._slice_q_batch(batch, keep)
         n = int(subset["parent"].shape[0])
         if requested is not None and n > int(requested):
@@ -9284,7 +9571,7 @@ class Episode:
         ondist = min(max(float(getattr(self.hyperparams, "q_survival_ondist_share", 0.8)), 1e-6), 1.0)
         extra_n = max(0, int(round(n * (1.0 - ondist) / ondist)))
         if extra_n <= 0 or n <= 1:
-            return subset
+            return (subset, {}) if return_diagnostics else subset
         values = subset["parent"][:, :2].detach()
         # Deterministic coverage replay: sort by a joint normalized b/z key, then
         # sample evenly across that support. Parent-child rows remain matched.
@@ -9296,7 +9583,8 @@ class Episode:
         positions = torch.linspace(0, n - 1, extra_n, device=order.device).round().long()
         replay = order[positions]
         indices = torch.cat([torch.arange(n, device=order.device), replay], dim=0)
-        return self._index_q_batch(subset, indices)
+        result = self._index_q_batch(subset, indices)
+        return (result, {}) if return_diagnostics else result
 
     # Bootstrap 只实现不依赖旧 checkpoint 的 cold start。
     Q_BOOTSTRAP_MODES: Tuple[str, ...] = ("constant_unit",)
@@ -9304,9 +9592,12 @@ class Episode:
     def _q_bootstrap_enabled(self) -> bool:
         """Cold-start bootstrap 触发条件。
 
-        ``direct`` 参数化 AND 未加载已训练 direct-Q checkpoint AND ``episode_id == 0``。
+        ``direct``/``hybrid_regime`` fresh Q AND ``episode_id == 0``。
         """
-        if str(getattr(self.hyperparams, "q_parameterization", "direct")).lower() != "direct":
+        if str(getattr(self.hyperparams, "q_parameterization", "direct")).lower() not in {
+            "direct",
+            "hybrid_regime",
+        }:
             return False
         if int(self.episode_id) != 0:
             return False
@@ -9389,9 +9680,18 @@ class Episode:
                     epoch_record_start = len(records)
                     for batch in tqdm(batches, desc=f"Q bootstrap {epoch + 1}/{epochs}"):
                         state = batch["parent"][:, :7].detach()
+                        hybrid = getattr(model, "q_parameterization", None) == "hybrid_regime"
+                        if hybrid:
+                            state = state[state[:, 0] > 0.0]
+                            if state.shape[0] == 0:
+                                continue
                         optimizer.zero_grad(set_to_none=True)
-                        Q = model._q_output(state)
-                        target = self._q_bootstrap_target(state, mode=mode)
+                        if hybrid:
+                            Q = model._q_unit_output(state)
+                            target = torch.full_like(Q, unit_value)
+                        else:
+                            Q = model._q_output(state)
+                            target = self._q_bootstrap_target(state, mode=mode)
                         regression = (Q - target).pow(2).mean()
                         nonnegative = torch.relu(-Q).pow(2).mean()
                         loss = regression + lambda_plus * nonnegative
@@ -9466,15 +9766,105 @@ class Episode:
         q_target_model: nn.Module,
         epochs: int,
     ) -> Dict[str, Any]:
-        """Run one direct-Q phase while every non-Q parameter remains frozen."""
+        """Run one regime-exclusive Q phase while every non-Q parameter is frozen."""
         phase = str(phase).lower()
         if phase not in {"zero", "default", "survival", "polish"}:
             raise ValueError(f"Unknown Q phase: {phase!r}")
         if epochs <= 0:
             return {"phase": phase, "status": "disabled", "optimizer_steps": 0}
+        model = self.models["policy_value"]
+        hybrid = getattr(model, "q_parameterization", None) == "hybrid_regime"
+        if hybrid and phase in {"zero", "default"}:
+            # Q0/QD are structural identities in hybrid mode. They deliberately
+            # never construct children/SDF/AiO and never create an optimizer.
+            records: List[Dict[str, Any]] = []
+            coverage_diagnostics: List[Dict[str, Any]] = []
+            skipped = 0
+            frozen_hash = self._state_dict_hash(frozen_p_model)
+            with torch.no_grad():
+                for batch in batches:
+                    source_parent = batch["parent"]
+                    state = source_parent[:, :7] if source_parent.shape[1] > 7 else source_parent
+                    if phase == "zero":
+                        check_state = state.clone()
+                        check_state[:, 0:1] = 0.0
+                        q_value = model._q_effective_output(
+                            check_state,
+                            default_mask=torch.zeros_like(
+                                check_state[:, 0:1], dtype=torch.bool
+                            ),
+                        )
+                        error = q_value.abs().reshape(-1)
+                        records.append({
+                            "q_structural_sample_count": float(error.numel()),
+                            "q_structural_abs_mean": float(error.mean().item()),
+                            "q_structural_abs_max": float(error.max().item()),
+                        })
+                    else:
+                        phat = self._q_frozen_phat(state, frozen_p_model)
+                        realized_default = (
+                            (state[:, 0:1] > float(
+                                getattr(self.hyperparams, "q_zero_b_eps", 0.0)
+                            ))
+                            & (phat <= 0.0)
+                        ).reshape(-1)
+                        check_state = state[realized_default]
+                        coverage_diagnostics.append({
+                            "realized_parent_default_count": int(
+                                realized_default.sum().item()
+                            ),
+                            "default_candidates_selected": int(
+                                realized_default.sum().item()
+                            ),
+                        })
+                        if check_state.shape[0] == 0:
+                            skipped += 1
+                            continue
+                        check_phat = phat[realized_default]
+                        q_value = model._q_effective_output(
+                            check_state, phat=check_phat
+                        )
+                        recovery = model._q_recovery_output(check_state)
+                        error = (q_value - recovery).abs().reshape(-1)
+                        records.append({
+                            "q_structural_sample_count": float(error.numel()),
+                            "q_structural_abs_mean": float(error.mean().item()),
+                            "q_structural_abs_max": float(error.max().item()),
+                        })
+            if self._state_dict_hash(frozen_p_model) != frozen_hash:
+                raise RuntimeError("Frozen P snapshot changed during structural Q checks")
+            avg, meta = self._aggregate_metric_records(records)
+            if records:
+                avg["q_structural_abs_max"] = max(
+                    float(item["q_structural_abs_max"]) for item in records
+                )
+                avg["q_structural_sample_count"] = sum(
+                    float(item["q_structural_sample_count"]) for item in records
+                )
+            return {
+                "phase": phase,
+                "status": (
+                    "structural_verified"
+                    if records
+                    else (
+                        "no_realized_default_observed"
+                        if phase == "default"
+                        else "skipped_no_samples"
+                    )
+                ),
+                "epochs": int(epochs),
+                "optimizer_steps": 0,
+                "skipped_batches": int(skipped),
+                "rollback_reason": None,
+                "frozen_p_hash_before": frozen_hash,
+                "frozen_p_hash_after": frozen_hash,
+                "non_q_parameter_max_change": 0.0,
+                "coverage": self._aggregate_q_coverage_diagnostics(coverage_diagnostics),
+                "metrics": {**avg, **meta},
+                "epoch_history": [],
+            }
         q_params = self._policy_value_stage_params("q")
         optimizer = self._make_policy_value_stage_optimizer(q_params)
-        model = self.models["policy_value"]
         non_q_params = [p for p in model.parameters() if id(p) not in {id(q) for q in q_params}]
         q_phase_start = self._snapshot_params(q_params)
         non_q_snapshot = self._snapshot_params(non_q_params)
@@ -9506,49 +9896,84 @@ class Episode:
                             if default_states.shape[0] == 0:
                                 skipped += 1
                                 continue
-                            loss = self._compute_q_default_loss(default_states)
+                            loss = self._compute_q_default_loss(
+                                default_states,
+                                frozen_p_model=frozen_p_model,
+                            )
                         elif phase == "survival":
-                            survival_batch = self._build_q_survival_batch(batch, frozen_p_model)
+                            if hybrid:
+                                survival_batch, claim_diag = self._build_q_survival_batch(
+                                    batch,
+                                    frozen_p_model,
+                                    return_diagnostics=True,
+                                )
+                                coverage_diagnostics.append(claim_diag)
+                            else:
+                                survival_batch = self._build_q_survival_batch(
+                                    batch, frozen_p_model
+                                )
                             if survival_batch is None:
                                 skipped += 1
                                 continue
                             survival_parent_count += int(survival_batch["parent"].shape[0])
                             loss = self._compute_q_survival_bellman_loss(
                                 survival_batch,
+                                frozen_p_model=frozen_p_model,
                                 q_target_model=q_target_model,
                             )
                         else:
-                            total_n = max(1, int(source_state.shape[0]))
-                            zero_n = max(1, int(round(total_n * float(getattr(self.hyperparams, "q_zero_sample_share", 0.2)))))
-                            default_n = max(1, int(round(total_n * float(getattr(self.hyperparams, "q_default_sample_share", 0.3)))))
-                            survival_n = max(1, int(round(total_n * float(getattr(self.hyperparams, "q_survival_sample_share", 0.5)))))
-                            polish_terms: List[torch.Tensor] = []
-                            polish_weights: List[float] = []
-                            polish_terms.append(self._compute_q_zero_loss(source_state[:zero_n]))
-                            polish_weights.append(float(getattr(self.hyperparams, "q_zero_sample_share", 0.2)))
-                            default_states = self._build_q_default_coverage_states(
-                                source_state, frozen_p_model, requested=default_n, phat_eps=0.0
-                            )
-                            if default_states.shape[0] > 0:
-                                polish_terms.append(self._compute_q_default_loss(default_states))
-                                polish_weights.append(float(getattr(self.hyperparams, "q_default_sample_share", 0.3)))
-                            survival_batch = self._build_q_survival_batch(
-                                batch, frozen_p_model, requested=survival_n, phat_eps=0.0
-                            )
-                            if survival_batch is not None:
-                                polish_terms.append(self._compute_q_survival_bellman_loss(
+                            if hybrid:
+                                survival_batch, claim_diag = self._build_q_survival_batch(
+                                    batch,
+                                    frozen_p_model,
+                                    phat_eps=0.0,
+                                    return_diagnostics=True,
+                                )
+                                coverage_diagnostics.append(claim_diag)
+                                if survival_batch is None:
+                                    skipped += 1
+                                    continue
+                                survival_parent_count += int(
+                                    survival_batch["parent"].shape[0]
+                                )
+                                loss = self._compute_q_survival_bellman_loss(
                                     survival_batch,
+                                    frozen_p_model=frozen_p_model,
                                     q_target_model=q_target_model,
-                                ))
-                                polish_weights.append(float(getattr(self.hyperparams, "q_survival_sample_share", 0.5)))
-                            if not polish_terms:
-                                skipped += 1
-                                continue
-                            weight_sum = max(sum(polish_weights), 1e-12)
-                            loss = sum(
-                                term * (weight / weight_sum)
-                                for term, weight in zip(polish_terms, polish_weights)
-                            )
+                                )
+                            else:
+                                total_n = max(1, int(source_state.shape[0]))
+                                zero_n = max(1, int(round(total_n * float(getattr(self.hyperparams, "q_zero_sample_share", 0.2)))))
+                                default_n = max(1, int(round(total_n * float(getattr(self.hyperparams, "q_default_sample_share", 0.3)))))
+                                survival_n = max(1, int(round(total_n * float(getattr(self.hyperparams, "q_survival_sample_share", 0.5)))))
+                                polish_terms: List[torch.Tensor] = []
+                                polish_weights: List[float] = []
+                                polish_terms.append(self._compute_q_zero_loss(source_state[:zero_n]))
+                                polish_weights.append(float(getattr(self.hyperparams, "q_zero_sample_share", 0.2)))
+                                default_states = self._build_q_default_coverage_states(
+                                    source_state, frozen_p_model, requested=default_n, phat_eps=0.0
+                                )
+                                if default_states.shape[0] > 0:
+                                    polish_terms.append(self._compute_q_default_loss(default_states))
+                                    polish_weights.append(float(getattr(self.hyperparams, "q_default_sample_share", 0.3)))
+                                survival_batch = self._build_q_survival_batch(
+                                    batch, frozen_p_model, requested=survival_n, phat_eps=0.0
+                                )
+                                if survival_batch is not None:
+                                    polish_terms.append(self._compute_q_survival_bellman_loss(
+                                        survival_batch,
+                                        frozen_p_model=frozen_p_model,
+                                        q_target_model=q_target_model,
+                                    ))
+                                    polish_weights.append(float(getattr(self.hyperparams, "q_survival_sample_share", 0.5)))
+                                if not polish_terms:
+                                    skipped += 1
+                                    continue
+                                weight_sum = max(sum(polish_weights), 1e-12)
+                                loss = sum(
+                                    term * (weight / weight_sum)
+                                    for term, weight in zip(polish_terms, polish_weights)
+                                )
                         if not torch.isfinite(loss):
                             rollback_reason = "nonfinite_loss"
                             break
@@ -9610,6 +10035,7 @@ class Episode:
             "coverage": coverage,
             "metrics": {**avg, **meta},
             "epoch_history": epoch_history,
+            "hybrid_learned_object": "claim_q" if hybrid else None,
         }
 
     @staticmethod
@@ -9640,6 +10066,27 @@ class Episode:
             * int(item.get("default_candidates_generated", 0))
             for item in diagnostics
         ) / weight
+
+        def _weighted_mean(value_key: str, count_key: str) -> float:
+            weighted_sum = 0.0
+            total_count = 0
+            for item in diagnostics:
+                value = float(item.get(value_key, float("nan")))
+                count = int(item.get(count_key, 0))
+                if count > 0 and np.isfinite(value):
+                    weighted_sum += value * count
+                    total_count += count
+            return weighted_sum / total_count if total_count > 0 else float("nan")
+
+        occupied_fraction = float(
+            max(
+                (
+                    float(item.get("claim_coverage_fraction_bins_occupied", 0.0))
+                    for item in diagnostics
+                ),
+                default=0.0,
+            )
+        )
         return {
             "default_candidates_generated": int(generated),
             "default_candidates_selected": int(selected),
@@ -9647,6 +10094,96 @@ class Episode:
             "max_phat": float(max_phat),
             "fraction_phat_le_0": float(fraction_le_0),
             "fraction_phat_le_minus_eps": float(fraction_le_minus_eps),
+            "realized_parent_survival_count": int(
+                sum(
+                    int(item.get("realized_parent_survival_count", 0))
+                    for item in diagnostics
+                )
+            ),
+            "realized_parent_default_count": int(
+                sum(
+                    int(item.get("realized_parent_default_count", 0))
+                    for item in diagnostics
+                )
+            ),
+            "realized_parent_zero_b_count": int(
+                sum(
+                    int(item.get("realized_parent_zero_b_count", 0))
+                    for item in diagnostics
+                )
+            ),
+            "claim_parent_count": int(
+                sum(int(item.get("claim_parent_count", 0)) for item in diagnostics)
+            ),
+            "claim_parent_default_count": int(
+                sum(int(item.get("claim_parent_default_count", 0)) for item in diagnostics)
+            ),
+            "claim_parent_default_share": float(
+                sum(int(item.get("claim_parent_default_count", 0)) for item in diagnostics)
+                / max(
+                    sum(
+                        int(item.get("realized_parent_survival_count", 0))
+                        + int(item.get("realized_parent_default_count", 0))
+                        for item in diagnostics
+                    ),
+                    1,
+                )
+            ),
+            "claim_ondist_sample_count": int(
+                sum(int(item.get("claim_ondist_sample_count", 0)) for item in diagnostics)
+            ),
+            "claim_synthetic_sample_count": int(
+                sum(int(item.get("claim_synthetic_sample_count", 0)) for item in diagnostics)
+            ),
+            "claim_total_sample_count": int(
+                sum(int(item.get("claim_total_sample_count", 0)) for item in diagnostics)
+            ),
+            "synthetic_source_context_count": int(
+                sum(
+                    int(item.get("synthetic_source_context_count", 0))
+                    for item in diagnostics
+                )
+            ),
+            "synthetic_candidate_phat_positive_share": _weighted_mean(
+                "synthetic_candidate_phat_positive_share",
+                "claim_synthetic_sample_count",
+            ),
+            "synthetic_candidate_phat_negative_share": _weighted_mean(
+                "synthetic_candidate_phat_negative_share",
+                "claim_synthetic_sample_count",
+            ),
+            "synthetic_candidate_phat_used_for_filter": False,
+            "claim_coverage_b_bins": int(
+                max((int(item.get("claim_coverage_b_bins", 0)) for item in diagnostics), default=0)
+            ),
+            "claim_coverage_bins_occupied": int(
+                max(
+                    (int(item.get("claim_coverage_bins_occupied", 0)) for item in diagnostics),
+                    default=0,
+                )
+            ),
+            "claim_coverage_fraction_bins_occupied": occupied_fraction,
+            "claim_coverage_bin_fraction": occupied_fraction,
+            "claim_coverage_b_min": float(
+                min(
+                    (
+                        float(item["claim_coverage_b_min"])
+                        for item in diagnostics
+                        if np.isfinite(item.get("claim_coverage_b_min", float("nan")))
+                    ),
+                    default=float("nan"),
+                )
+            ),
+            "claim_coverage_b_max": float(
+                max(
+                    (
+                        float(item["claim_coverage_b_max"])
+                        for item in diagnostics
+                        if np.isfinite(item.get("claim_coverage_b_max", float("nan")))
+                    ),
+                    default=float("nan"),
+                )
+            ),
         }
 
     def _run_q_regime_training(
@@ -9695,18 +10232,39 @@ class Episode:
         def _coverage(name: str) -> Dict[str, Any]:
             return dict(by_phase.get(name, {}).get("coverage", {}))
 
-        # Required-phase gate：QS 是唯一训练 Q recursive pricing equation 的正式阶段，
-        # 没有 QS optimizer step 时本轮 Q 不能算成功训练；QD 完全无 default coverage
-        # 时必须显式失败，不能静默 skip。polish 不是 required phase。
+        q_mode = str(getattr(self.models["policy_value"], "q_parameterization", "direct"))
+        # Required-phase gate: direct 保留 QS 语义；hybrid 的同名 legacy phase
+        # 只从 realized-survival parents 取得真实/coverage contexts。Synthetic
+        # candidate Phat 不过滤 claim replay。QD 仅验证 observed realized-default
+        # settlement 恒等式，不更新 q_unit；未观察到 default 不构成失败。
         rejection_reason: Optional[str] = None
         if any(item.get("status") == "rejected_numerical" for item in summaries):
             rejection_reason = "rejected_numerical"
         if rejection_reason is None and bool(getattr(self.hyperparams, "q_require_zero_phase", True)):
-            if _steps("zero") < int(getattr(self.hyperparams, "q_min_zero_optimizer_steps", 1)):
+            if q_mode == "hybrid_regime":
+                zero_metrics = by_phase.get("zero", {}).get("metrics", {})
+                if (
+                    by_phase.get("zero", {}).get("status") != "structural_verified"
+                    or float(zero_metrics.get("q_structural_abs_max", float("inf")))
+                    > float(getattr(self.hyperparams, "q_structural_zero_tol", 1e-8))
+                ):
+                    rejection_reason = "rejected_structural_zero_identity"
+            elif _steps("zero") < int(getattr(self.hyperparams, "q_min_zero_optimizer_steps", 1)):
                 rejection_reason = "rejected_insufficient_zero_boundary"
         if rejection_reason is None and bool(getattr(self.hyperparams, "q_require_default_phase", True)):
             default_coverage = _coverage("default")
-            if (
+            if q_mode == "hybrid_regime":
+                default_metrics = by_phase.get("default", {}).get("metrics", {})
+                observed_default = int(
+                    default_coverage.get("realized_parent_default_count", 0)
+                )
+                if observed_default > 0 and (
+                    by_phase.get("default", {}).get("status") != "structural_verified"
+                    or float(default_metrics.get("q_structural_abs_max", float("inf")))
+                    > float(getattr(self.hyperparams, "q_structural_recovery_tol", 1e-6))
+                ):
+                    rejection_reason = "rejected_structural_recovery_identity"
+            elif (
                 _steps("default") < int(getattr(self.hyperparams, "q_min_default_optimizer_steps", 1))
                 or int(default_coverage.get("default_candidates_selected", 0))
                 < int(getattr(self.hyperparams, "q_min_default_samples", 1))
@@ -9714,12 +10272,26 @@ class Episode:
                 rejection_reason = "rejected_insufficient_default_coverage"
         if rejection_reason is None and bool(getattr(self.hyperparams, "q_require_survival_phase", True)):
             survival_coverage = _coverage("survival")
+            required_parent_count = (
+                int(survival_coverage.get("claim_total_sample_count", 0))
+                if q_mode == "hybrid_regime"
+                else int(survival_coverage.get("survival_parent_count", 0))
+            )
             if (
                 _steps("survival") < int(getattr(self.hyperparams, "q_min_survival_optimizer_steps", 1))
-                or int(survival_coverage.get("survival_parent_count", 0))
-                < int(getattr(self.hyperparams, "q_min_survival_samples", 1))
+                or required_parent_count < int(getattr(self.hyperparams, "q_min_survival_samples", 1))
+                or (
+                    q_mode == "hybrid_regime"
+                    and int(
+                        survival_coverage.get("realized_parent_survival_count", 0)
+                    ) <= 0
+                )
             ):
-                rejection_reason = "rejected_no_survival_bellman"
+                rejection_reason = (
+                    "rejected_no_claim_bellman"
+                    if q_mode == "hybrid_regime"
+                    else "rejected_no_survival_bellman"
+                )
 
         return {
             "status": rejection_reason or "accepted",
@@ -9732,6 +10304,7 @@ class Episode:
             "q_zero_optimizer_steps": _steps("zero"),
             "q_default_optimizer_steps": _steps("default"),
             "q_survival_optimizer_steps": _steps("survival"),
+            "hybrid_learned_object": "claim_q" if q_mode == "hybrid_regime" else None,
             "q_polish_status": by_phase.get("polish", {}).get("status"),
             "q_default_coverage": _coverage("default"),
             "q_survival_coverage": _coverage("survival"),
@@ -9817,11 +10390,24 @@ class Episode:
                     "target_grid_validation_batches": len(validation_batches),
                 }
 
+            # P continuation remains the old episode-frozen equity teacher, while
+            # all Q values consumed by the P/BP objective come from the post-
+            # bootstrap online Q snapshot. This separation is essential on a
+            # fresh episode-0 hybrid/direct run.
+            q_teacher_source = (
+                self.models["policy_value"]
+                if int(q_bootstrap_summary.get("optimizer_steps", 0)) > 0
+                else episode_teacher
+            )
+            q_pricing_teacher = deepcopy(q_teacher_source).to(self.device)
+            q_pricing_teacher.eval()
+            q_pricing_teacher.requires_grad_(False)
             pq_summary = self._run_policy_value_evaluation_stage(
                 pv_train_batches,
                 validation_batches,
                 episode_teacher,
                 eval_epochs,
+                q_target_model=q_pricing_teacher,
             )
             if pq_summary.get("status") != "accepted":
                 _restore_full_staged_start()

@@ -531,13 +531,16 @@ class Trainer:
             allow_config_mismatch=bool(allow_config_mismatch),
         )
         self._apply_legacy_q_recovery_fallback(checkpoint)
-        # checkpoint 语义已通过 _assert_checkpoint_q_parameterization 校验：只有
-        # spec 明确声明 direct-Q 时才认为已加载了已训练的 direct-Q。
+        # checkpoint 语义已通过 _assert_checkpoint_q_parameterization 校验；fresh
+        # bootstrap 只应在没有同语义 direct/hybrid Q checkpoint 时触发。
         spec = checkpoint.get("policy_value_model_spec")
         spec_mode = str(spec.get("q_parameterization", "")).lower() if isinstance(spec, dict) else ""
+        current_q_mode = str(
+            getattr(self.hyperparams, "q_parameterization", "direct")
+        ).lower()
         self._q_checkpoint_loaded = (
-            str(getattr(self.hyperparams, "q_parameterization", "direct")).lower() == "direct"
-            and spec_mode == "direct"
+            current_q_mode in {"direct", "hybrid_regime"}
+            and spec_mode == current_q_mode
         )
         self._configure_policy_value_parameterization()
         

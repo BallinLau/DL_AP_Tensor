@@ -271,7 +271,10 @@ def _write_selected_surfaces(
             "bar_i_cond", "bar_i_cond_low", "bar_i_cond_mid", "bar_i_cond_high",
             "bar_i_eff", "bar_i_eff_low", "bar_i_eff_mid", "bar_i_eff_high",
         ],
-        "q": ["Q", "q_unit"],
+        "q": [
+            "Q", "Q_effective", "Q_claim", "q_unit", "recovery",
+            "realized_default_mask",
+        ],
         "bp": [
             "bp0_raw", "bp0_survival",
             "bpI_raw", "bpI_survival",
@@ -975,7 +978,13 @@ def evaluate(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, object]]
             ),
             "Q": "total debt value",
             "q_parameterization": loaded.metadata.get("q_parameterization"),
-            "q_unit": "derived reporting ratio Q/b for b>1e-12; NaN at b=0; not a direct-Q head output",
+            "q_unit": (
+                "raw nonnegative q-head output for hybrid_regime; derived reporting ratio "
+                "Q/b for b>1e-12 in direct mode"
+            ),
+            "Q_claim": "live debt-claim market value used by P/BP and Q Bellman",
+            "Q_effective": "realized current-state settlement value used by simulation/plotting",
+            "candidate_phat_gate_used_for_q_issue": False,
             "bp_consistency_masks": (
                 "Raw statistics use the full finite grid; survival statistics require finite Phat(i)>0; "
                 "primary statistics additionally require BPGridTeacher top2_margin above the configured tolerance"

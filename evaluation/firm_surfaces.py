@@ -57,6 +57,22 @@ def _reshape(tensor: torch.Tensor, shape: tuple[int, int]) -> np.ndarray:
     return tensor.detach().cpu().reshape(shape).numpy().astype(np.float64, copy=False)
 
 
+def _forward_hybrid_q_components(
+    model: torch.nn.Module,
+    states: torch.Tensor,
+    *,
+    chunk_size: int,
+) -> Dict[str, torch.Tensor]:
+    collected = {name: [] for name in ("q_unit", "Q_claim", "recovery")}
+    with torch.no_grad():
+        for start in range(0, states.shape[0], int(chunk_size)):
+            chunk = states[start:start + int(chunk_size)]
+            collected["q_unit"].append(model._q_unit_output(chunk).detach())
+            collected["Q_claim"].append(model._q_claim_output(chunk).detach())
+            collected["recovery"].append(model._q_recovery_output(chunk).detach())
+    return {name: torch.cat(parts, dim=0) for name, parts in collected.items()}
+
+
 def evaluate_firm_surfaces(
     model: torch.nn.Module,
     grid: FrozenFirmGrid,
@@ -100,11 +116,29 @@ def evaluate_firm_surfaces(
 
     b = grid.mesh_b
     q = surfaces["Q"]
-    q_unit = np.full_like(q, np.nan, dtype=np.float64)
-    valid_b = b > float(q_unit_eps)
-    q_unit[valid_b] = q[valid_b] / b[valid_b]
-    surfaces["q_unit"] = q_unit
+    surfaces["Q_effective"] = q.copy()
+    if getattr(model, "q_parameterization", None) == "hybrid_regime":
+        mid_states = grid.base_states.clone()
+        mid_states[:, 3] = float(reference.i_mid)
+        components = _forward_hybrid_q_components(
+            model, mid_states, chunk_size=chunk_size
+        )
+        for name, tensor in components.items():
+            surfaces[name] = _reshape(tensor, grid.shape)
+    else:
+        q_unit = np.full_like(q, np.nan, dtype=np.float64)
+        valid_b = b > float(q_unit_eps)
+        q_unit[valid_b] = q[valid_b] / b[valid_b]
+        surfaces["q_unit"] = q_unit
+        surfaces["Q_claim"] = q.copy()
+        recovery_fn = getattr(model, "_q_recovery_output", None)
+        if callable(recovery_fn):
+            with torch.no_grad():
+                surfaces["recovery"] = _reshape(
+                    recovery_fn(grid.base_states), grid.shape
+                )
     surfaces["default_region"] = (surfaces["Phat"] <= 0.0).astype(np.float64)
+    surfaces["realized_default_mask"] = surfaces["default_region"].copy()
     slice_masks = {
         label: np.isfinite(surfaces[f"Phat_{label}"]) & (surfaces[f"Phat_{label}"] > 0.0)
         for label in i_slices

@@ -410,6 +410,12 @@ class HyperParams:
     q_default_candidate_multiplier: int = 4
     q_default_b_bins: int = 10
     q_survival_ondist_share: float = 0.8
+    # Hybrid claim-Q replay: keep the existing on-distribution share and fill
+    # the remainder with deterministic synthetic leverage candidates. These
+    # are live-claim pricing states and are never filtered by parent Phat.
+    q_claim_coverage_enabled: bool = True
+    q_claim_coverage_b_bins: int = 10
+    q_claim_coverage_start_episode: int = 0
     q_zero_loss_weight: float = 1.0
     q_default_loss_weight: float = 1.0
     q_survival_loss_weight: float = 1.0
@@ -425,6 +431,13 @@ class HyperParams:
     q_bootstrap_mode: str = "constant_unit"
     q_bootstrap_unit_value: float = 1.0
     q_bootstrap_nonnegative_weight: float = 1.0
+
+    # Hybrid-regime structural checks and optional survival/recovery boundary match.
+    q_structural_zero_tol: float = 1e-8
+    q_structural_recovery_tol: float = 1e-6
+    q_boundary_match_weight: float = 0.0
+    q_boundary_match_phat_eps: float = 1e-2
+    q_boundary_match_min_samples: int = 0
 
     # ========== Direct-Q: Q0/QD/QS required-phase gate ==========
     # QS 是唯一训练 Q recursive pricing equation 的正式阶段；没有 QS optimizer step

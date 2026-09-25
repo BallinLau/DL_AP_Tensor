@@ -329,8 +329,8 @@ def parse_args() -> argparse.Namespace:
         "--q-parameterization",
         type=str.lower,
         default=None,
-        choices=["direct", "b_times_unit"],
-        help="Q network parameterization; formal regime training requires direct",
+        choices=["direct", "b_times_unit", "hybrid_regime"],
+        help="Q network parameterization; formal regime training supports direct and hybrid_regime",
     )
     parser.add_argument("--q-zero-boundary-epochs", type=int, default=None, help="Exact Q(b=0)=0 phase epochs")
     parser.add_argument("--q-default-pretrain-epochs", type=int, default=None, help="Default-parent recovery phase epochs")
@@ -344,6 +344,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--q-default-candidate-multiplier", type=int, default=None, help="QD candidate oversampling multiplier before frozen-P filtering")
     parser.add_argument("--q-default-b-bins", type=int, default=None, help="Positive-debt support bins for QD coverage")
     parser.add_argument("--q-survival-ondist-share", type=float, default=None, help="On-distribution share in QS matched-transition batches")
+    parser.add_argument(
+        "--q-claim-coverage-enabled",
+        type=_str2bool,
+        default=None,
+        help="Hybrid-only deterministic synthetic-b replay for live claim-Q pricing",
+    )
+    parser.add_argument(
+        "--q-claim-coverage-b-bins",
+        type=int,
+        default=None,
+        help="Number of leverage bins used by hybrid claim-Q coverage replay",
+    )
+    parser.add_argument(
+        "--q-claim-coverage-start-episode",
+        type=int,
+        default=None,
+        help="First episode that enables hybrid claim-Q coverage replay",
+    )
     parser.add_argument("--q-zero-loss-weight", type=float, default=None, help="Q0 objective weight")
     parser.add_argument("--q-default-loss-weight", type=float, default=None, help="QD recovery objective weight")
     parser.add_argument("--q-survival-loss-weight", type=float, default=None, help="QS Bellman/AiO objective weight")
@@ -367,6 +385,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--q-bootstrap-unit-value", type=float, default=None, help="Bootstrap target unit value for positive debt")
     parser.add_argument("--q-bootstrap-nonnegative-weight", type=float, default=None, help="Bootstrap ReLU(-Q)^2 penalty weight")
+    parser.add_argument("--q-structural-zero-tol", type=float, default=None, help="Hybrid Q0 structural identity tolerance")
+    parser.add_argument("--q-structural-recovery-tol", type=float, default=None, help="Hybrid QD recovery identity tolerance")
+    parser.add_argument("--q-boundary-match-weight", type=float, default=None, help="Optional hybrid survival/recovery boundary matching weight")
+    parser.add_argument("--q-boundary-match-phat-eps", type=float, default=None, help="Frozen-Phat band used by optional hybrid boundary matching")
+    parser.add_argument("--q-boundary-match-min-samples", type=int, default=None, help="Minimum boundary rows before applying optional hybrid boundary matching")
     parser.add_argument(
         "--q-require-zero-phase", type=_str2bool, default=None,
         help="Treat a missing Q0 optimizer step as a Q-stage failure",
@@ -665,6 +688,9 @@ def configure_hyperparams(args: argparse.Namespace):
         "q_default_candidate_multiplier": args.q_default_candidate_multiplier,
         "q_default_b_bins": args.q_default_b_bins,
         "q_survival_ondist_share": args.q_survival_ondist_share,
+        "q_claim_coverage_enabled": args.q_claim_coverage_enabled,
+        "q_claim_coverage_b_bins": args.q_claim_coverage_b_bins,
+        "q_claim_coverage_start_episode": args.q_claim_coverage_start_episode,
         "q_zero_loss_weight": args.q_zero_loss_weight,
         "q_default_loss_weight": args.q_default_loss_weight,
         "q_survival_loss_weight": args.q_survival_loss_weight,
@@ -676,6 +702,11 @@ def configure_hyperparams(args: argparse.Namespace):
         "q_bootstrap_mode": args.q_bootstrap_mode,
         "q_bootstrap_unit_value": args.q_bootstrap_unit_value,
         "q_bootstrap_nonnegative_weight": args.q_bootstrap_nonnegative_weight,
+        "q_structural_zero_tol": args.q_structural_zero_tol,
+        "q_structural_recovery_tol": args.q_structural_recovery_tol,
+        "q_boundary_match_weight": args.q_boundary_match_weight,
+        "q_boundary_match_phat_eps": args.q_boundary_match_phat_eps,
+        "q_boundary_match_min_samples": args.q_boundary_match_min_samples,
         "q_require_zero_phase": args.q_require_zero_phase,
         "q_require_default_phase": args.q_require_default_phase,
         "q_require_survival_phase": args.q_require_survival_phase,
@@ -683,8 +714,11 @@ def configure_hyperparams(args: argparse.Namespace):
     for name, value in q_scalar_overrides.items():
         if value is not None:
             setattr(hyperparams, name, value)
-    if str(hyperparams.q_parameterization).lower() != "direct":
-        raise ValueError("Formal staged Q regime training requires q_parameterization='direct'.")
+    if str(hyperparams.q_parameterization).lower() not in {"direct", "hybrid_regime"}:
+        raise ValueError(
+            "Formal staged Q regime training requires q_parameterization='direct' "
+            "or 'hybrid_regime'."
+        )
     for name in (
         "q_zero_boundary_epochs",
         "q_default_pretrain_epochs",
@@ -704,8 +738,22 @@ def configure_hyperparams(args: argparse.Namespace):
         raise ValueError("q_zero_b_eps must be non-negative")
     if int(hyperparams.q_default_candidate_multiplier) <= 0 or int(hyperparams.q_default_b_bins) <= 0:
         raise ValueError("Q default coverage multiplier and b bins must be positive")
+    for name in (
+        "q_structural_zero_tol",
+        "q_structural_recovery_tol",
+        "q_boundary_match_weight",
+        "q_boundary_match_phat_eps",
+    ):
+        if float(getattr(hyperparams, name)) < 0.0:
+            raise ValueError(f"{name} must be non-negative")
+    if int(hyperparams.q_boundary_match_min_samples) < 0:
+        raise ValueError("q_boundary_match_min_samples must be non-negative")
     if not 0.0 < float(hyperparams.q_survival_ondist_share) <= 1.0:
         raise ValueError("q_survival_ondist_share must be in (0, 1]")
+    if int(hyperparams.q_claim_coverage_b_bins) < 2:
+        raise ValueError("q_claim_coverage_b_bins must be at least 2")
+    if int(hyperparams.q_claim_coverage_start_episode) < 0:
+        raise ValueError("q_claim_coverage_start_episode must be non-negative")
     for name in (
         "q_zero_loss_weight",
         "q_default_loss_weight",
