@@ -94,6 +94,56 @@ class SDFTrainingPhase(str, Enum):
     JOINT_DISABLED = "joint_disabled"
 
 
+def _select_q_claim_coverage_anchors(
+    low_b_anchors: torch.Tensor,
+    base_anchors: torch.Tensor,
+    synthetic_n: int,
+) -> torch.Tensor:
+    """Allocate a deterministic synthetic-Q budget across low-b and global anchors."""
+    synthetic_n = max(0, int(synthetic_n))
+    low_b_anchors = low_b_anchors.reshape(-1)
+    base_anchors = base_anchors.reshape(-1)
+    if synthetic_n == 0:
+        return base_anchors.new_empty((0,))
+
+    def _spread(values: torch.Tensor, count: int) -> torch.Tensor:
+        if count <= 0 or values.numel() == 0:
+            return values.new_empty((0,))
+        if count == 1:
+            positions = torch.tensor(
+                [(int(values.numel()) - 1) // 2],
+                device=values.device,
+                dtype=torch.long,
+            )
+        else:
+            positions = torch.linspace(
+                0,
+                int(values.numel()) - 1,
+                count,
+                device=values.device,
+            ).round().long()
+        return values[positions]
+
+    low_count = int(low_b_anchors.numel())
+    if synthetic_n < low_count:
+        return low_b_anchors[:synthetic_n]
+
+    all_anchors = torch.unique(
+        torch.cat([low_b_anchors, base_anchors]), sorted=True
+    )
+    if synthetic_n < int(all_anchors.numel()):
+        return torch.cat(
+            [
+                low_b_anchors,
+                _spread(base_anchors, synthetic_n - low_count),
+            ],
+            dim=0,
+        )
+
+    remaining = synthetic_n - int(all_anchors.numel())
+    return torch.cat([all_anchors, _spread(all_anchors, remaining)], dim=0)
+
+
 def convert_tree_fast(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -7977,6 +8027,7 @@ class Episode:
                         "soft_spikes": epoch_soft,
                         "hard_spikes": epoch_hard,
                         "nonfinite_batches": epoch_nonfinite,
+                        "validation_metrics": val_summary,
                     })
                     if score < best_score:
                         best_score = score
@@ -8063,6 +8114,11 @@ class Episode:
             "bp_head_parameter_max_change": bp_head_max_change,
             "epoch_summaries": epoch_summaries,
             "train_metrics": {**avg, **meta},
+            "best_validation_metrics": (
+                best_checkpoint.get("validation_summary", {})
+                if best_checkpoint is not None
+                else {}
+            ),
         }
 
     def _build_bp_target_cache(
@@ -8530,8 +8586,21 @@ class Episode:
         p0_target = cache_item.p0_value_target.to(self.device)
         pi_target = cache_item.pi_value_target.to(self.device)
         value_delta = float(getattr(self.hyperparams, "bp_grid_value_huber_delta", 1.0))
-        p0_elem = self._huber_element(p0_pred, p0_target, value_delta)
-        pi_elem = self._huber_element(pi_pred, pi_target, value_delta)
+        diagnostic_scale = (
+            self._pv_value_scale(self.models["policy_value"], parent_state)
+            .detach()
+            .clamp_min(1e-8)
+        )
+        normalize = bool(
+            getattr(self.hyperparams, "pv_bellman_normalize_by_value_scale", False)
+        )
+        loss_scale = diagnostic_scale if normalize else torch.ones_like(diagnostic_scale)
+        p0_pred_loss = p0_pred / loss_scale
+        p0_target_loss = p0_target / loss_scale
+        pi_pred_loss = pi_pred / loss_scale
+        pi_target_loss = pi_target / loss_scale
+        p0_elem = self._huber_element(p0_pred_loss, p0_target_loss, value_delta)
+        pi_elem = self._huber_element(pi_pred_loss, pi_target_loss, value_delta)
         p0_value_loss = p0_elem.mean()
         pi_value_loss = pi_elem.mean()
         p0_penalty_z = compute_z_penalty(
@@ -8550,7 +8619,9 @@ class Episode:
         )
         pi_penalty_b = (
             self.loss_fns["pi"].b_penalty_weight
-            * self.loss_fns["pi"].compute_b_penalty(pi_pred, parent_state[:, 0:1]).mean()
+            * self.loss_fns["pi"].compute_b_penalty(
+                pi_pred_loss, parent_state[:, 0:1]
+            ).mean()
         )
         p0_total = p0_value_loss + p0_penalty_z
         pi_total = pi_value_loss + pi_penalty_z + pi_penalty_b
@@ -8567,6 +8638,36 @@ class Episode:
             "p0_cached_penalty_z": float(p0_penalty_z.detach().item()),
             "pi_cached_penalty_z": float(pi_penalty_z.detach().item()),
             "pi_cached_penalty_b": float(pi_penalty_b.detach().item()),
+            "p0_physical_abs_residual_mean": float(
+                (p0_pred - p0_target).abs().mean().detach().item()
+            ),
+            "pi_physical_abs_residual_mean": float(
+                (pi_pred - pi_target).abs().mean().detach().item()
+            ),
+            "p0_normalized_abs_residual_mean": float(
+                ((p0_pred - p0_target) / diagnostic_scale).abs().mean().detach().item()
+            ),
+            "pi_normalized_abs_residual_mean": float(
+                ((pi_pred - pi_target) / diagnostic_scale).abs().mean().detach().item()
+            ),
+            "p0_base_huber": float(p0_value_loss.detach().item()),
+            "pi_base_huber": float(pi_value_loss.detach().item()),
+            "p0_z_penalty": float(p0_penalty_z.detach().item()),
+            "pi_z_penalty": float(pi_penalty_z.detach().item()),
+            "pi_b_penalty": float(pi_penalty_b.detach().item()),
+            "p0_z_penalty_to_base": float(
+                p0_penalty_z.detach().item()
+                / max(abs(p0_value_loss.detach().item()), 1e-12)
+            ),
+            "pi_z_penalty_to_base": float(
+                pi_penalty_z.detach().item()
+                / max(abs(pi_value_loss.detach().item()), 1e-12)
+            ),
+            "pi_b_penalty_to_base": float(
+                pi_penalty_b.detach().item()
+                / max(abs(pi_value_loss.detach().item()), 1e-12)
+            ),
+            "pv_bellman_normalized_by_value_scale": normalize,
         }
         return total, losses
 
@@ -9471,6 +9572,32 @@ class Episode:
                 )
                 indices = ondist_indices
             if indices.numel() == 0:
+                low_b_enabled = bool(
+                    getattr(self.hyperparams, "q_claim_coverage_low_b_enabled", False)
+                )
+                low_b_anchors = tuple(
+                    float(value)
+                    for value in getattr(
+                        self.hyperparams, "q_claim_coverage_low_b_anchors", ()
+                    )
+                )
+                empty_bins = max(
+                    2, int(getattr(self.hyperparams, "q_claim_coverage_b_bins", 10))
+                )
+                empty_grid_min = float(getattr(self.hyperparams, "bp_grid_min", 0.0))
+                empty_grid_max = float(getattr(self.hyperparams, "bp_grid_max", 1.0))
+                empty_base_anchors = [
+                    empty_grid_min
+                    + (index + 0.5)
+                    * ((empty_grid_max - empty_grid_min) / float(empty_bins))
+                    for index in range(empty_bins)
+                ]
+                empty_combined_anchors = sorted(
+                    set(
+                        empty_base_anchors
+                        + (list(low_b_anchors) if low_b_enabled else [])
+                    )
+                )
                 empty_diag = {
                     "realized_parent_survival_count": int(realized_survival.sum().item()),
                     "realized_parent_default_count": int(realized_default.sum().item()),
@@ -9488,8 +9615,23 @@ class Episode:
                     "claim_coverage_b_bins": int(
                         getattr(self.hyperparams, "q_claim_coverage_b_bins", 10)
                     ),
+                    "claim_coverage_base_b_bins": int(
+                        getattr(self.hyperparams, "q_claim_coverage_b_bins", 10)
+                    ),
                     "claim_coverage_bins_occupied": 0,
                     "claim_coverage_fraction_bins_occupied": 0.0,
+                    "claim_coverage_anchor_count": len(empty_combined_anchors),
+                    "claim_coverage_anchors_occupied": 0,
+                    "claim_coverage_fraction_anchors_occupied": 0.0,
+                    "claim_coverage_low_b_enabled": low_b_enabled,
+                    "claim_coverage_low_b_anchor_count": (
+                        len(low_b_anchors) if low_b_enabled else 0
+                    ),
+                    "claim_coverage_low_b_anchors": (
+                        list(low_b_anchors) if low_b_enabled else []
+                    ),
+                    "claim_coverage_low_b_sample_count": 0,
+                    "claim_coverage_low_b_sample_share": 0.0,
                     "claim_coverage_b_min": float("nan"),
                     "claim_coverage_b_max": float("nan"),
                 }
@@ -9499,16 +9641,57 @@ class Episode:
             result["parent"] = result["parent"].clone()
             synthetic_b = torch.empty(0, device=state.device, dtype=state.dtype)
             bins = max(2, int(getattr(self.hyperparams, "q_claim_coverage_b_bins", 10)))
+            grid_min = float(getattr(self.hyperparams, "bp_grid_min", 0.0))
+            grid_max = float(getattr(self.hyperparams, "bp_grid_max", 1.0))
+            centers = grid_min + (
+                torch.arange(bins, device=state.device, dtype=state.dtype) + 0.5
+            ) * ((grid_max - grid_min) / float(bins))
+            low_b_enabled = bool(
+                getattr(self.hyperparams, "q_claim_coverage_low_b_enabled", False)
+            )
+            configured_low = tuple(
+                float(value)
+                for value in getattr(
+                    self.hyperparams, "q_claim_coverage_low_b_anchors", ()
+                )
+            )
+            if low_b_enabled:
+                if any(
+                    not np.isfinite(value)
+                    or value <= max(0.0, grid_min)
+                    or value > grid_max
+                    for value in configured_low
+                ):
+                    raise ValueError(
+                        "q_claim_coverage_low_b_anchors must be finite, strictly "
+                        "positive, and inside the configured BP grid"
+                    )
+                low_b_anchors = torch.tensor(
+                    sorted(set(configured_low)),
+                    device=state.device,
+                    dtype=state.dtype,
+                )
+                combined_anchors = torch.unique(
+                    torch.cat([low_b_anchors, centers]), sorted=True
+                )
+            else:
+                low_b_anchors = torch.empty(
+                    0, device=state.device, dtype=state.dtype
+                )
+                combined_anchors = centers
             if synthetic_n > 0:
-                grid_min = float(getattr(self.hyperparams, "bp_grid_min", 0.0))
-                grid_max = float(getattr(self.hyperparams, "bp_grid_max", 1.0))
-                centers = grid_min + (
-                    torch.arange(bins, device=state.device, dtype=state.dtype) + 0.5
-                ) * ((grid_max - grid_min) / float(bins))
-                center_positions = torch.linspace(
-                    0, bins - 1, synthetic_n, device=state.device
-                ).round().long()
-                synthetic_b = centers[center_positions]
+                if not low_b_enabled:
+                    # Exact legacy assignment for backward compatibility.
+                    center_positions = torch.linspace(
+                        0, bins - 1, synthetic_n, device=state.device
+                    ).round().long()
+                    synthetic_b = centers[center_positions]
+                else:
+                    synthetic_b = _select_q_claim_coverage_anchors(
+                        low_b_anchors,
+                        centers,
+                        synthetic_n,
+                    )
                 result["parent"][-synthetic_n:, 0] = synthetic_b
 
             result_state = result["parent"][:, :7]
@@ -9517,7 +9700,29 @@ class Episode:
                 if synthetic_n > 0
                 else torch.empty(0, 1, device=state.device, dtype=state.dtype)
             )
-            occupied = int(torch.unique(synthetic_b).numel()) if synthetic_n > 0 else 0
+            def _occupied_count(anchor_values: torch.Tensor) -> int:
+                if synthetic_n <= 0 or anchor_values.numel() == 0:
+                    return 0
+                matches = torch.isclose(
+                    synthetic_b.reshape(-1, 1),
+                    anchor_values.reshape(1, -1),
+                    rtol=1e-6,
+                    atol=1e-8,
+                )
+                return int(matches.any(dim=0).sum().item())
+
+            base_occupied = _occupied_count(centers)
+            anchor_occupied = _occupied_count(combined_anchors)
+            low_b_sample_count = 0
+            if synthetic_n > 0 and low_b_anchors.numel() > 0:
+                low_b_sample_count = int(
+                    torch.isclose(
+                        synthetic_b.reshape(-1, 1),
+                        low_b_anchors.reshape(1, -1),
+                        rtol=1e-6,
+                        atol=1e-8,
+                    ).any(dim=1).sum().item()
+                )
             diagnostics = {
                 "realized_parent_survival_count": int(realized_survival.sum().item()),
                 "realized_parent_default_count": int(realized_default.sum().item()),
@@ -9543,8 +9748,23 @@ class Episode:
                 ),
                 "synthetic_candidate_phat_used_for_filter": False,
                 "claim_coverage_b_bins": int(bins),
-                "claim_coverage_bins_occupied": int(occupied),
-                "claim_coverage_fraction_bins_occupied": float(occupied / bins),
+                "claim_coverage_base_b_bins": int(bins),
+                "claim_coverage_bins_occupied": int(base_occupied),
+                "claim_coverage_fraction_bins_occupied": float(base_occupied / bins),
+                "claim_coverage_anchor_count": int(combined_anchors.numel()),
+                "claim_coverage_anchors_occupied": int(anchor_occupied),
+                "claim_coverage_fraction_anchors_occupied": float(
+                    anchor_occupied / max(int(combined_anchors.numel()), 1)
+                ),
+                "claim_coverage_low_b_enabled": low_b_enabled,
+                "claim_coverage_low_b_anchor_count": int(low_b_anchors.numel()),
+                "claim_coverage_low_b_anchors": [
+                    float(value) for value in low_b_anchors.detach().cpu().tolist()
+                ],
+                "claim_coverage_low_b_sample_count": int(low_b_sample_count),
+                "claim_coverage_low_b_sample_share": float(
+                    low_b_sample_count / max(synthetic_n, 1)
+                ),
                 "claim_coverage_b_min": (
                     float(synthetic_b.min().item()) if synthetic_n > 0 else float("nan")
                 ),
@@ -10087,6 +10307,32 @@ class Episode:
                 default=0.0,
             )
         )
+        anchor_fraction = float(
+            max(
+                (
+                    float(item.get("claim_coverage_fraction_anchors_occupied", 0.0))
+                    for item in diagnostics
+                ),
+                default=0.0,
+            )
+        )
+        low_b_sample_count = int(
+            sum(
+                int(item.get("claim_coverage_low_b_sample_count", 0))
+                for item in diagnostics
+            )
+        )
+        synthetic_sample_count = int(
+            sum(int(item.get("claim_synthetic_sample_count", 0)) for item in diagnostics)
+        )
+        low_b_anchor_values = next(
+            (
+                list(item.get("claim_coverage_low_b_anchors", []))
+                for item in diagnostics
+                if item.get("claim_coverage_low_b_anchors")
+            ),
+            [],
+        )
         return {
             "default_candidates_generated": int(generated),
             "default_candidates_selected": int(selected),
@@ -10156,6 +10402,12 @@ class Episode:
             "claim_coverage_b_bins": int(
                 max((int(item.get("claim_coverage_b_bins", 0)) for item in diagnostics), default=0)
             ),
+            "claim_coverage_base_b_bins": int(
+                max(
+                    (int(item.get("claim_coverage_base_b_bins", 0)) for item in diagnostics),
+                    default=0,
+                )
+            ),
             "claim_coverage_bins_occupied": int(
                 max(
                     (int(item.get("claim_coverage_bins_occupied", 0)) for item in diagnostics),
@@ -10164,6 +10416,29 @@ class Episode:
             ),
             "claim_coverage_fraction_bins_occupied": occupied_fraction,
             "claim_coverage_bin_fraction": occupied_fraction,
+            "claim_coverage_anchor_count": int(
+                max(
+                    (int(item.get("claim_coverage_anchor_count", 0)) for item in diagnostics),
+                    default=0,
+                )
+            ),
+            "claim_coverage_anchors_occupied": int(
+                max(
+                    (int(item.get("claim_coverage_anchors_occupied", 0)) for item in diagnostics),
+                    default=0,
+                )
+            ),
+            "claim_coverage_fraction_anchors_occupied": anchor_fraction,
+            "claim_coverage_low_b_enabled": any(
+                bool(item.get("claim_coverage_low_b_enabled", False))
+                for item in diagnostics
+            ),
+            "claim_coverage_low_b_anchor_count": int(len(low_b_anchor_values)),
+            "claim_coverage_low_b_anchors": low_b_anchor_values,
+            "claim_coverage_low_b_sample_count": low_b_sample_count,
+            "claim_coverage_low_b_sample_share": float(
+                low_b_sample_count / max(synthetic_sample_count, 1)
+            ),
             "claim_coverage_b_min": float(
                 min(
                     (
@@ -10342,6 +10617,61 @@ class Episode:
             "rng_state": self._capture_rng_state(),
         }
 
+        p_train_batches, p_train_eta_summary = self._balance_p_current_eta_batches(
+            pv_train_batches,
+            stream="train",
+        )
+        balance_validation = bool(
+            getattr(self.hyperparams, "pv_current_eta_balance_validation", True)
+        )
+        if balance_validation:
+            p_validation_batches, p_validation_eta_summary = (
+                self._balance_p_current_eta_batches(
+                    validation_batches,
+                    stream="validation",
+                )
+            )
+            if not validation_batches:
+                p_validation_eta_summary = dict(p_train_eta_summary)
+                p_validation_eta_summary["stream"] = "train_fallback"
+        else:
+            p_validation_batches = validation_batches
+            validation_counts = self._current_eta_counts_from_batches(
+                validation_batches
+            )
+            p_validation_eta_summary = {
+                "enabled": False,
+                "stream": "validation",
+                **validation_counts,
+                "eta0_count_after": validation_counts["eta0_count"],
+                "eta1_count_after": validation_counts["eta1_count"],
+                "eta1_share_after": validation_counts["eta1_share"],
+            }
+        original_counts = self._current_eta_counts_from_batches(pv_train_batches)
+        p_eta_balance_summary = {
+            "p_eta_balance_enabled": bool(
+                getattr(self.hyperparams, "pv_current_eta_balance_enabled", False)
+            ),
+            "p_eta_target_share": float(
+                getattr(self.hyperparams, "pv_current_eta1_train_share", 0.50)
+            ),
+            "p_eta_balance_seed": int(
+                getattr(self.hyperparams, "pv_current_eta_balance_seed", 97531)
+            ),
+            "p_train_eta0_count_before": p_train_eta_summary["eta0_count"],
+            "p_train_eta1_count_before": p_train_eta_summary["eta1_count"],
+            "p_train_eta1_share_before": p_train_eta_summary["eta1_share"],
+            "p_train_eta0_count_after": p_train_eta_summary["eta0_count_after"],
+            "p_train_eta1_count_after": p_train_eta_summary["eta1_count_after"],
+            "p_train_eta1_share_after": p_train_eta_summary["eta1_share_after"],
+            "p_validation_eta1_share_before": p_validation_eta_summary["eta1_share"],
+            "p_validation_eta1_share_after": p_validation_eta_summary["eta1_share_after"],
+            "q_batches_eta_rebalanced": False,
+            "bp_batches_eta_rebalanced": False,
+            "q_train_current_eta1_share": original_counts["eta1_share"],
+            "bp_train_current_eta1_share": original_counts["eta1_share"],
+        }
+
         def _restore_full_staged_start() -> None:
             self._restore_module_state(
                 self.models["policy_value"],
@@ -10403,12 +10733,13 @@ class Episode:
             q_pricing_teacher.eval()
             q_pricing_teacher.requires_grad_(False)
             pq_summary = self._run_policy_value_evaluation_stage(
-                pv_train_batches,
-                validation_batches,
+                p_train_batches,
+                p_validation_batches,
                 episode_teacher,
                 eval_epochs,
                 q_target_model=q_pricing_teacher,
             )
+            pq_summary.update(p_eta_balance_summary)
             if pq_summary.get("status") != "accepted":
                 _restore_full_staged_start()
                 self._last_policy_value_stage_summary = {
@@ -10577,6 +10908,87 @@ class Episode:
         except Exception:
             _restore_full_staged_start()
             raise
+
+    @staticmethod
+    def _current_eta_counts_from_batches(
+        batches: List[Dict[str, torch.Tensor]],
+    ) -> Dict[str, Any]:
+        eta0_count = 0
+        eta1_count = 0
+        for batch in batches:
+            parent = batch.get("parent")
+            if not torch.is_tensor(parent) or parent.ndim < 2 or parent.shape[1] < 3:
+                continue
+            eta1 = int((parent[:, 2] > 0.5).sum().item())
+            eta1_count += eta1
+            eta0_count += int(parent.shape[0]) - eta1
+        total = eta0_count + eta1_count
+        return {
+            "eta0_count": int(eta0_count),
+            "eta1_count": int(eta1_count),
+            "eta1_share": float(eta1_count / total) if total > 0 else float("nan"),
+        }
+
+    def _balance_p_current_eta_batches(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+        *,
+        stream: str,
+    ) -> Tuple[List[Dict[str, torch.Tensor]], Dict[str, Any]]:
+        """Build deterministic P-only collocation copies with balanced eta_t."""
+        before = self._current_eta_counts_from_batches(batches)
+        enabled = bool(
+            getattr(self.hyperparams, "pv_current_eta_balance_enabled", False)
+        )
+        target_share = float(
+            getattr(self.hyperparams, "pv_current_eta1_train_share", 0.50)
+        )
+        if not 0.0 <= target_share <= 1.0:
+            raise ValueError("pv_current_eta1_train_share must be in [0, 1]")
+        if not enabled or not batches:
+            return batches, {
+                "enabled": enabled,
+                "stream": stream,
+                **before,
+                "eta0_count_after": before["eta0_count"],
+                "eta1_count_after": before["eta1_count"],
+                "eta1_share_after": before["eta1_share"],
+            }
+
+        stream_offset = {"train": 0, "validation": 1}.get(stream)
+        if stream_offset is None:
+            raise ValueError(f"Unknown P eta-balance stream: {stream!r}")
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(
+            int(getattr(self.hyperparams, "pv_current_eta_balance_seed", 97531))
+            + int(self.episode_id) * 100003
+            + stream_offset * 1000003
+        )
+        balanced: List[Dict[str, torch.Tensor]] = []
+        for batch in batches:
+            parent = batch.get("parent")
+            if not torch.is_tensor(parent) or parent.ndim < 2 or parent.shape[1] < 3:
+                balanced.append(batch)
+                continue
+            n_rows = int(parent.shape[0])
+            n_eta1 = int(round(n_rows * target_share))
+            order = torch.randperm(n_rows, generator=generator)
+            eta_cpu = torch.zeros(n_rows, dtype=parent.dtype)
+            eta_cpu[order[:n_eta1]] = 1.0
+            cloned = dict(batch)
+            cloned_parent = parent.clone()
+            cloned_parent[:, 2] = eta_cpu.to(parent.device)
+            cloned["parent"] = cloned_parent
+            balanced.append(cloned)
+        after = self._current_eta_counts_from_batches(balanced)
+        return balanced, {
+            "enabled": True,
+            "stream": stream,
+            **before,
+            "eta0_count_after": after["eta0_count"],
+            "eta1_count_after": after["eta1_count"],
+            "eta1_share_after": after["eta1_share"],
+        }
 
     def _run_batches(
         self,

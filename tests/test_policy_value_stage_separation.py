@@ -12,12 +12,14 @@ sys.path.append(str(ROOT))
 
 from config import Config  # noqa: E402
 from config.hyperparams import HyperParams  # noqa: E402
+from losses import P0Loss, PILoss  # noqa: E402
 from models.policy_value import PolicyValueModel  # noqa: E402
 from training.bp_grid_teacher import BPGridTeacher  # noqa: E402
 from training.bp_policy_loss import (  # noqa: E402
     compute_target_grid_policy_distillation_loss,
 )
 from training.episode import Episode  # noqa: E402
+from training.pq_value_cache import PQValueTargetBatch  # noqa: E402
 from training.pv_mixture import PVParentGroupPool  # noqa: E402
 
 
@@ -2084,6 +2086,412 @@ def test_staged_current_eta_sampler_changes_only_bp_train_cache(monkeypatch):
     assert observed["val_eta1_share"] == pytest.approx(0.50)
     assert bp_summary["validation_cache_resampled"] is False
     assert bp_summary["validation_current_eta1_share"] == pytest.approx(0.50)
+
+
+def test_p_current_eta_balance_changes_only_parent_eta_and_preserves_rng():
+    episode = _episode()
+    episode.hyperparams.pv_current_eta_balance_enabled = True
+    episode.hyperparams.pv_current_eta1_train_share = 0.50
+    episode.hyperparams.pv_current_eta_balance_seed = 97531
+    batch = _batch(episode.device)
+    batch["source_id"] = torch.tensor([3, 4])
+    original_parent = batch["parent"].clone()
+    original_children = [child.clone() for child in batch["children"]]
+    rng_before = torch.random.get_rng_state().clone()
+
+    balanced, summary = episode._balance_p_current_eta_batches(
+        [batch], stream="train"
+    )
+    repeated, _ = episode._balance_p_current_eta_batches([batch], stream="train")
+
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    assert balanced is not [batch]
+    assert balanced[0] is not batch
+    assert torch.equal(batch["parent"], original_parent)
+    assert torch.equal(balanced[0]["parent"][:, [0, 1, 3, 4, 5, 6, 7]],
+                       original_parent[:, [0, 1, 3, 4, 5, 6, 7]])
+    assert torch.equal(balanced[0]["parent"], repeated[0]["parent"])
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(balanced[0]["children"], original_children)
+    )
+    assert torch.equal(balanced[0]["source_id"], batch["source_id"])
+    assert summary["eta1_share_after"] == pytest.approx(0.50)
+    assert summary["eta0_count_after"] + summary["eta1_count_after"] == 2
+
+
+def test_disabled_p_current_eta_balance_returns_original_batches():
+    episode = _episode()
+    episode.hyperparams.pv_current_eta_balance_enabled = False
+    batches = [_batch(episode.device)]
+    result, summary = episode._balance_p_current_eta_batches(
+        batches, stream="train"
+    )
+    assert result is batches
+    assert summary["eta1_share_after"] == summary["eta1_share"]
+
+
+def test_balanced_parent_eta_is_used_to_rebuild_physical_p_targets(monkeypatch):
+    episode = _episode()
+    episode.hyperparams.pv_current_eta_balance_enabled = True
+    episode.hyperparams.pv_current_eta1_train_share = 0.50
+    batch = _batch(episode.device)
+    batch["parent"][:, 2] = 0.0
+    balanced, _ = episode._balance_p_current_eta_batches([batch], stream="train")
+    observed_eta = []
+
+    class _Teacher:
+        def compute_value_target(self, parent_state, **_kwargs):
+            observed_eta.append(parent_state[:, 2:3].detach().clone())
+            return {"value_star": 10.0 + parent_state[:, 2:3]}
+
+    monkeypatch.setattr(
+        BPGridTeacher,
+        "from_hyperparams",
+        classmethod(lambda cls, *_args, **_kwargs: _Teacher()),
+    )
+    cache, _ = episode._build_pq_value_target_cache(
+        balanced, episode.firm_target
+    )
+
+    assert len(observed_eta) == 2
+    assert all(float(value.mean()) == pytest.approx(0.50) for value in observed_eta)
+    assert sorted(cache[0].p0_value_target.reshape(-1).tolist()) == [10.0, 11.0]
+    assert sorted(cache[0].pi_value_target.reshape(-1).tolist()) == [10.0, 11.0]
+    assert torch.equal(batch["parent"][:, 2], torch.zeros(2))
+
+
+def test_balanced_parent_eta_recomputes_q_financing_and_teacher_operator(monkeypatch):
+    episode = _episode()
+    episode.hyperparams.pv_current_eta_balance_enabled = True
+    episode.hyperparams.pv_current_eta1_train_share = 0.50
+    batch = _batch(episode.device)
+    batch["parent"][:, 2] = 0.0
+    original_parent = batch["parent"].clone()
+    original_children = [child.clone() for child in batch["children"]]
+    balanced, _ = episode._balance_p_current_eta_batches([batch], stream="train")
+    balanced_parent = balanced[0]["parent"][:, :7]
+
+    class _EtaSensitiveHybridTarget:
+        q_parameterization = "hybrid_regime"
+
+        def __init__(self):
+            self.claim_inputs = []
+
+        def _q_claim_output(self, state):
+            self.claim_inputs.append(state.detach().clone())
+            return 1.0 + state[:, 2:3]
+
+        def _q_unit_output(self, state):
+            return torch.ones_like(state[:, :1])
+
+        def _q_recovery_output(self, state):
+            return torch.zeros_like(state[:, :1])
+
+        def forward_equity(self, state):
+            b = state[:, :1]
+            p = 2.0 - (b - 0.75).square()
+            return {"P": p, "Phat": p, "bar_z": torch.zeros_like(p)}
+
+    class _RecordingP0Loss(P0Loss):
+        def __init__(self):
+            super().__init__()
+            self.financing_records = []
+
+        def compute_cashflow_p0(self, x, z, b, q_current, q_issue, eta):
+            debt_adjustment = ((1.0 - self.kappa_b) * q_issue - q_current) * eta
+            self.financing_records.append(
+                (eta.detach().clone(), debt_adjustment.detach().clone())
+            )
+            return super().compute_cashflow_p0(
+                x, z, b, q_current, q_issue, eta
+            )
+
+    target = _EtaSensitiveHybridTarget()
+    p0_loss = _RecordingP0Loss()
+    teacher = BPGridTeacher(
+        target,
+        p0_loss,
+        PILoss(),
+        q_target_model=target,
+        coarse_size=3,
+        refine=False,
+        candidate_chunk_size=3,
+    )
+    monkeypatch.setattr(
+        BPGridTeacher,
+        "from_hyperparams",
+        classmethod(lambda cls, *_args, **_kwargs: teacher),
+    )
+
+    # Cache construction happens after eta reassignment and therefore runs the
+    # actual teacher on the balanced parent state, not on a relabelled old cache.
+    cache, _ = episode._build_pq_value_target_cache(
+        balanced, episode.firm_target
+    )
+    assert len(cache) == 1
+    assert any(bool((state[:, 2] == 1.0).all()) for state in target.claim_inputs)
+    assert any(bool((state[:, 2] == 0.0).all()) for state in target.claim_inputs)
+
+    parent_state, children, m_list, *_ = episode._policy_batch_hash_components(
+        balanced[0]
+    )
+    result = teacher.compute(
+        parent_state,
+        children,
+        m_list,
+        branch="p0",
+    )
+    eta = balanced_parent[:, 2]
+    eta0 = eta == 0.0
+    eta1 = eta == 1.0
+    torch.testing.assert_close(result["q_current_claim"], 1.0 + eta.reshape(-1, 1))
+    torch.testing.assert_close(
+        result["bp_star"][eta0], balanced_parent[eta0, 0:1]
+    )
+    assert torch.isnan(result["coarse_value_grid"][eta0]).all()
+    assert torch.isfinite(result["coarse_value_grid"][eta1]).all()
+    assert result["refi_active"].reshape(-1).tolist() == eta.tolist()
+
+    eta0_debt = [
+        debt
+        for eta_used, debt in p0_loss.financing_records
+        if bool((eta_used == 0.0).all())
+    ]
+    eta1_debt = [
+        debt
+        for eta_used, debt in p0_loss.financing_records
+        if bool((eta_used == 1.0).all())
+    ]
+    assert eta0_debt and all(torch.equal(value, torch.zeros_like(value)) for value in eta0_debt)
+    assert eta1_debt and any(bool((value != 0.0).any()) for value in eta1_debt)
+
+    torch.testing.assert_close(target._q_claim_output(original_parent[:, :7]), torch.ones(2, 1))
+    torch.testing.assert_close(
+        target._q_claim_output(balanced_parent), 1.0 + eta.reshape(-1, 1)
+    )
+    assert torch.equal(batch["parent"], original_parent)
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(batch["children"], original_children)
+    )
+
+
+def test_p_validation_balance_can_be_disabled(monkeypatch):
+    episode = _episode()
+    episode.hyperparams.pv_current_eta_balance_enabled = True
+    episode.hyperparams.pv_current_eta1_train_share = 0.50
+    episode.hyperparams.pv_current_eta_balance_validation = False
+    train = _batch(episode.device)
+    validation = _batch(episode.device)
+    train["parent"][:, 2] = 0.0
+    validation["parent"][:, 2] = 0.0
+    observed = {}
+
+    monkeypatch.setattr(
+        episode,
+        "_run_q_bootstrap_stage",
+        lambda batches: {"status": "accepted", "optimizer_steps": 0},
+    )
+
+    def _p_stage(p_train, p_val, *_args, **_kwargs):
+        observed["train_share"] = float(p_train[0]["parent"][:, 2].mean())
+        observed["validation_identity"] = p_val[0] is validation
+        observed["validation_share"] = float(p_val[0]["parent"][:, 2].mean())
+        return {"status": "failed"}
+
+    monkeypatch.setattr(episode, "_run_policy_value_evaluation_stage", _p_stage)
+    result = episode._run_policy_value_staged([train], [validation], n_epochs=1)
+
+    assert result["metadata"]["policy_value_stage_status"] == "failed_pq"
+    assert observed["train_share"] == pytest.approx(0.50)
+    assert observed["validation_identity"] is True
+    assert observed["validation_share"] == 0.0
+
+
+def test_staged_p_eta_balance_does_not_reach_q_or_bp(monkeypatch):
+    episode = _episode()
+    episode.hyperparams.pv_current_eta_balance_enabled = True
+    episode.hyperparams.pv_current_eta1_train_share = 0.50
+    episode.hyperparams.pv_current_eta_balance_validation = True
+    train = _batch(episode.device)
+    train["parent"][:, 2] = 0.0
+    validation = _batch(episode.device)
+    validation["parent"][:, 2] = 0.0
+    train_batches = [train]
+    validation_batches = [validation]
+    observed = {}
+
+    def _bootstrap(batches):
+        observed["bootstrap_original"] = batches is train_batches
+        return {"status": "accepted", "optimizer_steps": 0}
+
+    def _p_stage(p_train, p_val, *_args, **_kwargs):
+        observed["p_train_balanced"] = p_train is not train_batches
+        observed["p_val_balanced"] = p_val is not validation_batches
+        observed["p_train_share"] = float(p_train[0]["parent"][:, 2].mean())
+        observed["p_val_share"] = float(p_val[0]["parent"][:, 2].mean())
+        return {"status": "accepted"}
+
+    def _q_stage(batches, _frozen_p):
+        observed["q_original"] = batches is train_batches
+        observed["q_share"] = float(batches[0]["parent"][:, 2].mean())
+        return {"status": "accepted", "q_stage_required_gate_passed": True}
+
+    def _bp_cache(batches, _teacher):
+        observed.setdefault("bp_inputs", []).append(batches)
+        parent = batches[0]["parent"][:, :7].detach().cpu()
+        return [{"batch_id": 0, "parent": parent}]
+
+    monkeypatch.setattr(episode, "_run_q_bootstrap_stage", _bootstrap)
+    monkeypatch.setattr(episode, "_run_policy_value_evaluation_stage", _p_stage)
+    monkeypatch.setattr(episode, "_run_q_regime_training", _q_stage)
+    monkeypatch.setattr(episode, "_build_bp_target_cache", _bp_cache)
+    monkeypatch.setattr(
+        episode,
+        "_run_bp_distillation_stage",
+        lambda *_args, **_kwargs: {"status": "accepted"},
+    )
+    monkeypatch.setattr(episode, "_update_firm_target_now", lambda *_args: None)
+
+    result = episode._run_policy_value_staged(
+        train_batches, validation_batches, n_epochs=1
+    )
+
+    assert result["metadata"]["policy_value_stage_status"] == "accepted"
+    assert observed["bootstrap_original"] is True
+    assert observed["p_train_balanced"] is True
+    assert observed["p_val_balanced"] is True
+    assert observed["p_train_share"] == pytest.approx(0.50)
+    assert observed["p_val_share"] == pytest.approx(0.50)
+    assert observed["q_original"] is True
+    assert observed["q_share"] == 0.0
+    assert observed["bp_inputs"][0] is train_batches
+    assert observed["bp_inputs"][1] is validation_batches
+    p_summary = result["metadata"]["policy_value_evaluation_stage"]
+    assert p_summary["q_batches_eta_rebalanced"] is False
+    assert p_summary["bp_batches_eta_rebalanced"] is False
+
+
+def _value_cache_for_batch(batch, p0_target, pi_target):
+    n_rows = int(batch["parent"].shape[0])
+    return PQValueTargetBatch(
+        batch_id=0,
+        p0_value_target=torch.full((n_rows, 1), float(p0_target)),
+        pi_value_target=torch.full((n_rows, 1), float(pi_target)),
+        teacher_hash="teacher",
+        parent_hash="parent",
+        children_hash="children",
+        m_hash="m",
+        grid_config_hash="grid",
+    )
+
+
+@pytest.mark.parametrize(
+    ("normalize", "expected_huber"),
+    [(True, 0.005), (False, 0.5)],
+)
+def test_cached_p_loss_respects_value_scale_flag(monkeypatch, normalize, expected_huber):
+    episode = _episode()
+    episode.hyperparams.pv_bellman_normalize_by_value_scale = normalize
+    episode.loss_fns["p0"].alpha_z = 0.0
+    episode.loss_fns["pi"].alpha_z = 0.0
+    episode.loss_fns["pi"].b_penalty_weight = 0.0
+    model = episode.models["policy_value"]
+    monkeypatch.setattr(
+        model,
+        "_value_outputs",
+        lambda state: (torch.full((state.shape[0], 1), 2.0),
+                       torch.full((state.shape[0], 1), 2.0)),
+    )
+    monkeypatch.setattr(
+        model,
+        "equity_value_scale",
+        lambda state: torch.full((state.shape[0], 1), 10.0),
+    )
+    batch = _batch(episode.device)
+    _, losses = episode._compute_cached_value_loss(
+        batch, _value_cache_for_batch(batch, 1.0, 1.0)
+    )
+    assert losses["p0_base_huber"] == pytest.approx(expected_huber)
+    assert losses["pi_base_huber"] == pytest.approx(expected_huber)
+    assert losses["p0_physical_abs_residual_mean"] == pytest.approx(1.0)
+    assert losses["p0_normalized_abs_residual_mean"] == pytest.approx(0.1)
+
+
+def test_cached_p_penalties_use_normalized_units(monkeypatch):
+    episode = _episode()
+    episode.hyperparams.pv_bellman_normalize_by_value_scale = True
+    episode.loss_fns["pi"].b_penalty_weight = 1.0
+    model = episode.models["policy_value"]
+    monkeypatch.setattr(
+        model,
+        "_value_outputs",
+        lambda state: (torch.full((state.shape[0], 1), 2.0),
+                       torch.full((state.shape[0], 1), 2.0)),
+    )
+    monkeypatch.setattr(
+        model,
+        "equity_value_scale",
+        lambda state: torch.full((state.shape[0], 1), 10.0),
+    )
+    captured = {}
+
+    def _b_penalty(value, _b):
+        captured["pi"] = value.detach().clone()
+        return value.square()
+
+    monkeypatch.setattr(episode.loss_fns["pi"], "compute_b_penalty", _b_penalty)
+    z_inputs = []
+
+    def _z_penalty(value, *_args, **_kwargs):
+        z_inputs.append(value.detach().clone())
+        return value.mean() * 0.0
+
+    monkeypatch.setattr("training.episode.compute_z_penalty", _z_penalty)
+    batch = _batch(episode.device)
+    cache = _value_cache_for_batch(batch, 1.0, 1.0)
+    p0_target_before = cache.p0_value_target.clone()
+    pi_target_before = cache.pi_value_target.clone()
+    _, losses = episode._compute_cached_value_loss(batch, cache)
+    torch.testing.assert_close(captured["pi"], torch.full((2, 1), 0.2))
+    assert len(z_inputs) == 2
+    torch.testing.assert_close(z_inputs[0], torch.full((2, 1), 0.005))
+    torch.testing.assert_close(z_inputs[1], torch.full((2, 1), 0.005))
+    torch.testing.assert_close(cache.p0_value_target, p0_target_before)
+    torch.testing.assert_close(cache.pi_value_target, pi_target_before)
+    assert losses["pi_b_penalty"] == pytest.approx(0.04)
+    assert losses["p0_z_penalty"] == pytest.approx(
+        losses["p0_cached_penalty_z"]
+    )
+
+
+def test_cached_p_normalized_loss_has_finite_gradients():
+    episode = _episode()
+    episode.hyperparams.pv_bellman_normalize_by_value_scale = True
+    batch = _batch(episode.device)
+    total, _ = episode._compute_cached_value_loss(
+        batch, _value_cache_for_batch(batch, 1.0, 1.0)
+    )
+    total.backward()
+    gradients = [
+        parameter.grad
+        for parameter in episode._policy_value_stage_params("p")
+        if parameter.grad is not None
+    ]
+    assert gradients
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+def test_cached_p_normalization_flag_does_not_change_model_forward():
+    episode = _episode()
+    state = _batch(episode.device)["parent"][:, :7]
+    episode.hyperparams.pv_bellman_normalize_by_value_scale = False
+    before = episode.models["policy_value"](state)
+    episode.hyperparams.pv_bellman_normalize_by_value_scale = True
+    after = episode.models["policy_value"](state)
+    torch.testing.assert_close(before.P0, after.P0, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(before.PI, after.PI, rtol=0.0, atol=0.0)
 
 
 def test_bp_exception_restores_stage_start_runtime():

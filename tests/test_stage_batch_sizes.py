@@ -166,6 +166,37 @@ class StageBatchSizeTest(unittest.TestCase):
         self.assertEqual(hp.bp_distill_max_optimizer_steps, 500)
         self.assertFalse(hp.pv_eta_resample_enabled)
 
+    def test_cli_training_conditioning_controls_are_wired(self):
+        argv = [
+            "run_multi_episode_job.py",
+            "--pv-training-flow",
+            "staged",
+            "--firm-target-update",
+            "stage_hard",
+            "--q-parameterization",
+            "hybrid_regime",
+            "--q-claim-coverage-low-b-enabled",
+            "--q-claim-coverage-low-b-anchors",
+            "0.005,0.01,0.025",
+            "--pv-current-eta-balance-enabled",
+            "--pv-current-eta1-train-share",
+            "0.50",
+            "--pv-current-eta-balance-validation",
+            "--pv-current-eta-balance-seed",
+            "97531",
+        ]
+
+        with patch.object(sys, "argv", argv):
+            args = parse_args()
+        hp = configure_hyperparams(args)
+
+        self.assertTrue(hp.q_claim_coverage_low_b_enabled)
+        self.assertEqual(hp.q_claim_coverage_low_b_anchors, (0.005, 0.01, 0.025))
+        self.assertTrue(hp.pv_current_eta_balance_enabled)
+        self.assertEqual(hp.pv_current_eta1_train_share, 0.50)
+        self.assertTrue(hp.pv_current_eta_balance_validation)
+        self.assertEqual(hp.pv_current_eta_balance_seed, 97531)
+
     def test_tensor_pv_batches_do_not_resample_realized_child_eta(self):
         episode = Episode.__new__(Episode)
         episode.hyperparams = SimpleNamespace(

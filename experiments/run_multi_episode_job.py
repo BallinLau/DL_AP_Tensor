@@ -362,6 +362,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="First episode that enables hybrid claim-Q coverage replay",
     )
+    parser.add_argument(
+        "--q-claim-coverage-low-b-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Add explicit positive low-debt anchors to hybrid claim-Q replay",
+    )
+    parser.add_argument(
+        "--q-claim-coverage-low-b-anchors",
+        type=_parse_float_csv,
+        default=None,
+        help="Comma-separated positive low-debt anchors for hybrid claim-Q replay",
+    )
     parser.add_argument("--q-zero-loss-weight", type=float, default=None, help="Q0 objective weight")
     parser.add_argument("--q-default-loss-weight", type=float, default=None, help="QD recovery objective weight")
     parser.add_argument("--q-survival-loss-weight", type=float, default=None, help="QS Bellman/AiO objective weight")
@@ -428,6 +440,30 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Deterministic CPU RNG seed for current parent eta_t BP resampling",
+    )
+    parser.add_argument(
+        "--pv-current-eta-balance-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Balance current parent eta_t only in staged P collocation batches",
+    )
+    parser.add_argument(
+        "--pv-current-eta1-train-share",
+        type=float,
+        default=None,
+        help="Target eta_t=1 share in staged P-only train/validation collocation",
+    )
+    parser.add_argument(
+        "--pv-current-eta-balance-validation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply current-eta balance to staged P-only validation batches",
+    )
+    parser.add_argument(
+        "--pv-current-eta-balance-seed",
+        type=int,
+        default=None,
+        help="Deterministic CPU RNG seed for staged P-only eta balancing",
     )
     parser.add_argument(
         "--pv-rollback-on-soft-spikes",
@@ -521,6 +557,20 @@ def _str2bool(value):
     if lowered in {"0", "false", "f", "no", "n", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+
+
+def _parse_float_csv(value):
+    if isinstance(value, (tuple, list)):
+        return tuple(float(item) for item in value)
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("Expected at least one comma-separated float")
+    try:
+        return tuple(float(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Expected comma-separated floats, got {value!r}"
+        ) from exc
 
 
 def configure_hyperparams(args: argparse.Namespace):
@@ -691,6 +741,8 @@ def configure_hyperparams(args: argparse.Namespace):
         "q_claim_coverage_enabled": args.q_claim_coverage_enabled,
         "q_claim_coverage_b_bins": args.q_claim_coverage_b_bins,
         "q_claim_coverage_start_episode": args.q_claim_coverage_start_episode,
+        "q_claim_coverage_low_b_enabled": args.q_claim_coverage_low_b_enabled,
+        "q_claim_coverage_low_b_anchors": args.q_claim_coverage_low_b_anchors,
         "q_zero_loss_weight": args.q_zero_loss_weight,
         "q_default_loss_weight": args.q_default_loss_weight,
         "q_survival_loss_weight": args.q_survival_loss_weight,
@@ -754,6 +806,12 @@ def configure_hyperparams(args: argparse.Namespace):
         raise ValueError("q_claim_coverage_b_bins must be at least 2")
     if int(hyperparams.q_claim_coverage_start_episode) < 0:
         raise ValueError("q_claim_coverage_start_episode must be non-negative")
+    low_b_anchors = tuple(
+        float(value)
+        for value in getattr(hyperparams, "q_claim_coverage_low_b_anchors", ())
+    )
+    if any(not np.isfinite(value) or value <= 0.0 for value in low_b_anchors):
+        raise ValueError("q_claim_coverage_low_b_anchors must be finite and positive")
     for name in (
         "q_zero_loss_weight",
         "q_default_loss_weight",
@@ -817,6 +875,22 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.bp_current_eta_resample_seed = int(
             args.bp_current_eta_resample_seed
         )
+    if args.pv_current_eta_balance_enabled is not None:
+        hyperparams.pv_current_eta_balance_enabled = bool(
+            args.pv_current_eta_balance_enabled
+        )
+    if args.pv_current_eta1_train_share is not None:
+        hyperparams.pv_current_eta1_train_share = float(
+            args.pv_current_eta1_train_share
+        )
+    if args.pv_current_eta_balance_validation is not None:
+        hyperparams.pv_current_eta_balance_validation = bool(
+            args.pv_current_eta_balance_validation
+        )
+    if args.pv_current_eta_balance_seed is not None:
+        hyperparams.pv_current_eta_balance_seed = int(
+            args.pv_current_eta_balance_seed
+        )
     if int(getattr(hyperparams, "bp_distill_max_optimizer_steps", 0)) < 0:
         raise ValueError("bp_distill_max_optimizer_steps must be non-negative")
     current_eta_share = float(
@@ -824,6 +898,11 @@ def configure_hyperparams(args: argparse.Namespace):
     )
     if not 0.0 <= current_eta_share <= 1.0:
         raise ValueError("bp_current_eta1_train_share must be in [0, 1]")
+    p_current_eta_share = float(
+        getattr(hyperparams, "pv_current_eta1_train_share", 0.50)
+    )
+    if not 0.0 <= p_current_eta_share <= 1.0:
+        raise ValueError("pv_current_eta1_train_share must be in [0, 1]")
     if args.pv_rollback_on_soft_spikes is not None:
         hyperparams.pv_rollback_on_soft_spikes = bool(args.pv_rollback_on_soft_spikes)
     if args.bp_distill_trainable_scope is not None:

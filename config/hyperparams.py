@@ -4,7 +4,7 @@
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import math
 import torch
 
@@ -168,6 +168,12 @@ class HyperParams:
     bp_current_eta_resample_enabled: bool = False
     bp_current_eta1_train_share: float = 0.25
     bp_current_eta_resample_seed: int = 13579
+    # P-only collocation balance. This changes current parent eta_t only for
+    # staged P fitting/validation and never mutates the natural Q/BP batches.
+    pv_current_eta_balance_enabled: bool = False
+    pv_current_eta1_train_share: float = 0.50
+    pv_current_eta_balance_validation: bool = True
+    pv_current_eta_balance_seed: int = 97531
     pv_eval_grad_clip_norm: float = 10.0
     bp_distill_grad_clip_norm: float = 10.0
     pv_rollback_on_soft_spikes: bool = False
@@ -416,6 +422,8 @@ class HyperParams:
     q_claim_coverage_enabled: bool = True
     q_claim_coverage_b_bins: int = 10
     q_claim_coverage_start_episode: int = 0
+    q_claim_coverage_low_b_enabled: bool = False
+    q_claim_coverage_low_b_anchors: Tuple[float, ...] = (0.005, 0.01, 0.025)
     q_zero_loss_weight: float = 1.0
     q_default_loss_weight: float = 1.0
     q_survival_loss_weight: float = 1.0

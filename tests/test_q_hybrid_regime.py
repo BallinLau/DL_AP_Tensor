@@ -14,7 +14,7 @@ from experiments.run_utils import resolve_raw_q_parameterization
 from losses import P0Loss, PILoss
 from models.policy_value import PolicyValueModel
 from training.bp_grid_teacher import BPGridTeacher, _target_q_claim
-from training.episode import Episode
+from training.episode import Episode, _select_q_claim_coverage_anchors
 
 
 def _state(b_values=(0.0, 0.2, 0.8)) -> torch.Tensor:
@@ -414,6 +414,94 @@ def test_hybrid_claim_coverage_spans_bins_and_produces_q_gradient():
     )
     assert torch.isfinite(loss)
     assert grad_total > 0.0
+
+
+def test_hybrid_claim_coverage_low_b_disabled_keeps_exact_legacy_centers():
+    episode = _episode_for_gate()
+    episode.hyperparams.q_claim_coverage_enabled = True
+    episode.hyperparams.q_claim_coverage_low_b_enabled = False
+    episode.hyperparams.q_survival_ondist_share = 0.5
+    episode.hyperparams.q_claim_coverage_b_bins = 4
+    batch = _q_batch((0.1, 0.2, 0.3, 0.4))
+
+    result, diagnostics = episode._build_q_survival_batch(
+        batch, _CandidateGate(), return_diagnostics=True
+    )
+
+    torch.testing.assert_close(
+        result["parent"][-4:, 0],
+        torch.tensor([0.125, 0.375, 0.625, 0.875]),
+    )
+    assert diagnostics["claim_coverage_bins_occupied"] == 4
+    assert diagnostics["claim_coverage_anchor_count"] == 4
+    assert diagnostics["claim_coverage_low_b_sample_count"] == 0
+
+
+def test_hybrid_claim_coverage_adds_low_b_anchors_without_zero():
+    episode = _episode_for_gate()
+    episode.hyperparams.q_claim_coverage_enabled = True
+    episode.hyperparams.q_claim_coverage_low_b_enabled = True
+    episode.hyperparams.q_claim_coverage_low_b_anchors = (0.005, 0.01, 0.025)
+    episode.hyperparams.q_survival_ondist_share = 0.5
+    episode.hyperparams.q_claim_coverage_b_bins = 10
+    batch = _q_batch(tuple([0.1] * 13))
+
+    result, diagnostics = episode._build_q_survival_batch(
+        batch, _CandidateGate(), return_diagnostics=True
+    )
+
+    synthetic_b = result["parent"][-13:, 0]
+    expected = torch.tensor(
+        [0.005, 0.01, 0.025, 0.05, 0.15, 0.25, 0.35,
+         0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
+    )
+    torch.testing.assert_close(synthetic_b, expected)
+    assert torch.isfinite(synthetic_b).all()
+    assert bool((synthetic_b[1:] > synthetic_b[:-1]).all())
+    assert not bool((synthetic_b == 0.0).any())
+    assert diagnostics["claim_coverage_base_b_bins"] == 10
+    assert diagnostics["claim_coverage_bins_occupied"] == 10
+    assert diagnostics["claim_coverage_anchor_count"] == 13
+    assert diagnostics["claim_coverage_anchors_occupied"] == 13
+    assert diagnostics["claim_coverage_low_b_sample_count"] == 3
+    assert diagnostics["claim_coverage_b_min"] == pytest.approx(0.005)
+    assert diagnostics["claim_coverage_b_max"] == pytest.approx(0.95)
+
+
+@pytest.mark.parametrize("synthetic_n", [1, 2, 3, 4, 5, 13, 20])
+def test_hybrid_claim_anchor_selector_preserves_low_b_and_global_support(
+    synthetic_n,
+):
+    low = torch.tensor([0.005, 0.01, 0.025])
+    base = torch.linspace(0.05, 0.95, 10)
+    configured = torch.unique(torch.cat([low, base]), sorted=True)
+
+    selected = _select_q_claim_coverage_anchors(low, base, synthetic_n)
+    repeated = _select_q_claim_coverage_anchors(low, base, synthetic_n)
+
+    assert selected.shape == (synthetic_n,)
+    assert torch.equal(selected, repeated)
+    assert not bool((selected == 0.0).any())
+    assert bool(
+        torch.isclose(
+            selected.reshape(-1, 1),
+            configured.reshape(1, -1),
+            rtol=1e-6,
+            atol=1e-8,
+        ).any(dim=1).all()
+    )
+    if synthetic_n >= 3:
+        assert all(bool(torch.isclose(selected, value).any()) for value in low)
+    if synthetic_n == 3:
+        torch.testing.assert_close(selected, low)
+    if synthetic_n == 5:
+        assert bool((selected >= 0.85).any())
+    if synthetic_n >= 13:
+        assert all(
+            bool(torch.isclose(selected, value).any()) for value in configured
+        )
+    if synthetic_n == 13:
+        torch.testing.assert_close(selected, configured)
 
 
 def test_hybrid_synthetic_sources_only_use_realized_survivor_contexts():
