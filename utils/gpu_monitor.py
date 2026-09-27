@@ -68,6 +68,7 @@ class GPUMonitor:
     def reset_peak_stats(self):
         """重置峰值统计"""
         if self.enabled:
+            torch.cuda.set_device(self.device)
             torch.cuda.reset_peak_memory_stats(self.device)
     
     def get_summary(self) -> Dict[str, Any]:

@@ -642,6 +642,9 @@ def main() -> None:
         for counter_name in BP_TIMING_COUNTERS:
             episode_timing[counter_name] = 0
         if device.type == "cuda":
+            # Initialize the primary context before resetting peak-memory
+            # stats; on torch 2.5.x a bare reset raises "Invalid device argument".
+            torch.cuda.set_device(device)
             torch.cuda.reset_peak_memory_stats(device)
         episode_root = output / "episodes" / f"ep{episode}"
         for name in ("firm", "sdf", "fc1", "simulation", "training_log"):

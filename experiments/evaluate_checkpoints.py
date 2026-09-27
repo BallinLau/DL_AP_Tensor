@@ -1056,6 +1056,10 @@ def evaluate_matrix(args: argparse.Namespace) -> tuple[pd.DataFrame, Dict[str, o
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     manage_cuda_peak_stats = bool(getattr(args, "manage_cuda_peak_stats", True))
     if device.type == "cuda" and manage_cuda_peak_stats:
+        # Initialize the primary context on the target device before resetting
+        # peak-memory stats. On torch 2.5.x reset_peak_memory_stats() as the
+        # first CUDA call raises "Invalid device argument".
+        torch.cuda.set_device(device)
         torch.cuda.reset_peak_memory_stats(device)
     matrix_started = time.perf_counter()
     loaded = getattr(args, "loaded_checkpoint", None)

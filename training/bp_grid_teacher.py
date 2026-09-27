@@ -1230,6 +1230,24 @@ class BPGridTeacher:
                                 [part["child_b_eta1_mean"] for part in parts], dim=1
                             ),
                         }
+                        # Hybrid Q diagnostics are grid-shaped and must be
+                        # forwarded from the grid-column parts, mirroring the
+                        # chunk merge in ``_evaluate_grid``. Without these keys
+                        # ``_finalize_grid_result`` raises KeyError for
+                        # refinancing-active (eta_t=1) multi-J batches.
+                        if "q_issue_claim_grid" in parts[0]:
+                            for _key in (
+                                "q_issue_claim_grid",
+                                "q_issue_unit_grid",
+                                "q_issue_realized_default_mask_grid",
+                                "q_issue_recovery_grid",
+                                "q_issue_candidate_phat_grid",
+                                "candidate_phat_gate_used_for_q_issue",
+                            ):
+                                coarse[_key] = torch.cat(
+                                    [part[_key] for part in parts], dim=1
+                                )
+                            coarse["q_current_claim"] = parts[0]["q_current_claim"]
                         coarse["argmax_index"] = coarse["value_grid"].argmax(
                             dim=1, keepdim=True
                         )
