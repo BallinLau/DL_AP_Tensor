@@ -375,6 +375,9 @@ def compute_q_survival_recovery_components(
     )
     q_target_survival = M * (b_nonneg + Qsp * multiplier) * (1 - bar_z)
     q_target_recovery = M * recovery_total * multiplier * bar_z
+    coupon_component = M * b_nonneg * (1 - bar_z)
+    continuation_q_component = M * Qsp * multiplier * (1 - bar_z)
+    recursion_gain = M * multiplier * (1 - bar_z)
     q_target_total = q_target_survival + q_target_recovery
     return {
         "q_target_survival": q_target_survival,
@@ -385,7 +388,22 @@ def compute_q_survival_recovery_components(
         "q_pricing_residual": q_target_total - Q,
         "multiplier": multiplier,
         "recovery_total": recovery_total,
+        "coupon_component": coupon_component,
+        "continuation_q_component": continuation_q_component,
+        "recursion_gain": recursion_gain,
     }
+
+
+def normalize_q_bellman_residuals(
+    residuals: List[torch.Tensor],
+    target_totals: List[torch.Tensor],
+) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """Normalize child residuals by one detached parent-common target scale."""
+    if not residuals or len(residuals) != len(target_totals):
+        raise ValueError("Q residuals and targets must be non-empty and aligned")
+    target_stack = torch.stack(target_totals, dim=1)
+    scale = (1.0 + target_stack.abs().mean(dim=1)).detach().clamp_min(1e-8)
+    return [residual / scale for residual in residuals], scale
 
 
 class QLoss(nn.Module):
@@ -632,7 +650,7 @@ class QLoss(nn.Module):
             **weights,
         }
     
-    def compute_main_residual(
+    def compute_main_components(
         self,
         Q: torch.Tensor,
         b: torch.Tensor,
@@ -642,17 +660,10 @@ class QLoss(nn.Module):
         bar_z_children: List[torch.Tensor],
         x_children: List[torch.Tensor],
         z_children: List[torch.Tensor]
-    ) -> List[torch.Tensor]:
-        """
-        计算核心债券定价残差（支持任意分支数）
-        
-        基于修改后债务 b' = b / (bar_i * (G-1) + 1)
-        """
-        # 乘数
-        multiplier = bar_i * (self.g - 1) + 1
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Return the unchanged economic Q components for every child branch."""
         b_nonneg = torch.clamp(b, min=0.0)
-        
-        residuals = []
+        components_by_child = []
         for M, Qsp, bar_z, x, z in zip(M_list, Qsp_children, bar_z_children, x_children, z_children):
             components = compute_q_survival_recovery_components(
                 Q=Q,
@@ -668,11 +679,34 @@ class QLoss(nn.Module):
                 phi=self.phi,
                 recovery_normalization_mode=self.recovery_normalization_mode,
             )
-            residual = components["q_training_residual"]
-            
-            residuals.append(residual)
-        
-        return residuals
+            components_by_child.append(components)
+        return components_by_child
+
+    def compute_main_residual(
+        self,
+        Q: torch.Tensor,
+        b: torch.Tensor,
+        bar_i: torch.Tensor,
+        M_list: List[torch.Tensor],
+        Qsp_children: List[torch.Tensor],
+        bar_z_children: List[torch.Tensor],
+        x_children: List[torch.Tensor],
+        z_children: List[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        """Compute the unchanged physical Bellman residual for each child."""
+        return [
+            item["q_training_residual"]
+            for item in self.compute_main_components(
+                Q,
+                b,
+                bar_i,
+                M_list,
+                Qsp_children,
+                bar_z_children,
+                x_children,
+                z_children,
+            )
+        ]
     
     def compute_main_residual_legacy(
         self,

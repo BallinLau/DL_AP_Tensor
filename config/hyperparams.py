@@ -408,6 +408,17 @@ class HyperParams:
     q_default_pretrain_epochs: int = 10
     q_survival_aio_epochs: int = 20
     q_mixed_polish_epochs: int = 5
+    # Q solver controls. Defaults reproduce the legacy phase-refresh objective.
+    q_target_refresh_mode: str = "phase"
+    q_bellman_normalize_by_target_scale: bool = False
+    q_stage_lr: Optional[float] = None
+    q_epoch_validation_enabled: bool = False
+    q_validation_max_batches: int = 8
+    q_validation_min_delta: float = 0.0
+    q_restore_best_checkpoint: bool = True
+    q_no_improvement_patience_episodes: int = 0
+    save_episode_diagnostics: bool = False
+    save_intermediate_stage_checkpoints: bool = False
     q_zero_sample_share: float = 0.20
     q_default_sample_share: float = 0.30
     q_survival_sample_share: float = 0.50

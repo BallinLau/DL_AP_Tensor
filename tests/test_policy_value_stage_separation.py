@@ -2333,8 +2333,11 @@ def test_staged_p_eta_balance_does_not_reach_q_or_bp(monkeypatch):
         observed["p_val_share"] = float(p_val[0]["parent"][:, 2].mean())
         return {"status": "accepted"}
 
-    def _q_stage(batches, _frozen_p):
+    def _q_stage(batches, _frozen_p, **kwargs):
         observed["q_original"] = batches is train_batches
+        observed["q_validation_original"] = (
+            kwargs.get("validation_batches") is validation_batches
+        )
         observed["q_share"] = float(batches[0]["parent"][:, 2].mean())
         return {"status": "accepted", "q_stage_required_gate_passed": True}
 
@@ -2365,6 +2368,7 @@ def test_staged_p_eta_balance_does_not_reach_q_or_bp(monkeypatch):
     assert observed["p_train_share"] == pytest.approx(0.50)
     assert observed["p_val_share"] == pytest.approx(0.50)
     assert observed["q_original"] is True
+    assert observed["q_validation_original"] is True
     assert observed["q_share"] == 0.0
     assert observed["bp_inputs"][0] is train_batches
     assert observed["bp_inputs"][1] is validation_batches

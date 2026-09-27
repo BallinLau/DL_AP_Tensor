@@ -30,7 +30,10 @@ from config import Config, HyperParams, SIMMODEL
 from data import Sample, SimulateTS, TensorTable, TensorSimulationOutput
 from data.data_utils import compute_quantile_features
 from losses import SDFLoss, P0Loss, PILoss, QLoss, FC2Loss
-from losses.q_loss import classify_q_parent_regimes
+from losses.q_loss import (
+    classify_q_parent_regimes,
+    normalize_q_bellman_residuals,
+)
 from losses.FC2losspipe import FC2LossPipe
 from losses.utils import compute_z_penalty, compute_aio_residual
 from losses.sdf_loss import (
@@ -296,6 +299,9 @@ class Episode:
         self._policy_value_stage_target_model: Optional[nn.Module] = None
         self._target_grid_loss_component_mode = "joint"
         self._last_partial_module_summaries: Dict[str, Any] = {}
+        self._intermediate_stage_states: Dict[str, Dict[str, torch.Tensor]] = {}
+        self._stage_component_hashes: Dict[str, Dict[str, str]] = {}
+        self._q_no_improvement_streak = 0
         self._last_failed_stage_diagnostics: Dict[str, Any] = {}
         self._sdf_shock_bank: Optional[SDFShockBank] = None
         self._sdf_shock_bank_n_parents: int = 0
@@ -5847,11 +5853,39 @@ class Episode:
         z_parent = parent[:, 1:2]
         x_parent = parent[:, 4:5]
 
-        residuals = loss_fn.compute_main_residual(
+        q_components = loss_fn.compute_main_components(
             Q, b_parent, bar_i_use, M_list, Qsp_children,
             bar_zsp_children, x_children, z_children
-        )  # List[(batch,1)]
-        residuals = self._collapse_policy_eta_pairs(residuals)
+        )
+        component_keys = (
+            "q_training_residual",
+            "q_target_total",
+            "q_target_survival",
+            "q_target_recovery",
+            "coupon_component",
+            "continuation_q_component",
+            "recursion_gain",
+            "multiplier",
+        )
+        collapsed_components = {
+            key: self._collapse_policy_eta_pairs(
+                [component[key] for component in q_components]
+            )
+            for key in component_keys
+        }
+        residuals_raw = collapsed_components["q_training_residual"]
+        residuals_normalized, q_bellman_scale = normalize_q_bellman_residuals(
+            residuals_raw,
+            collapsed_components["q_target_total"],
+        )
+        normalize_q = bool(
+            getattr(
+                self.hyperparams,
+                "q_bellman_normalize_by_target_scale",
+                False,
+            )
+        )
+        residuals = residuals_normalized if normalize_q else residuals_raw
 
         survival_terms = loss_fn.compute_survival_parent_objective(
             residuals=residuals,
@@ -5958,17 +5992,100 @@ class Episode:
                 if getattr(model, "q_parameterization", None) == "hybrid_regime"
                 else None
             )
-            branch_residual = torch.stack([value.reshape(-1) for value in residuals], dim=1)
-            branch_abs = branch_residual.abs().reshape(-1)
+            branch_residual_raw = torch.stack(
+                [value.reshape(-1) for value in residuals_raw], dim=1
+            )
+            branch_residual_normalized = torch.stack(
+                [value.reshape(-1) for value in residuals_normalized], dim=1
+            )
+            branch_abs_raw = branch_residual_raw.abs().reshape(-1)
+            branch_abs_normalized = branch_residual_normalized.abs().reshape(-1)
+
+            def _flat_component(name: str) -> torch.Tensor:
+                return torch.stack(
+                    [value.reshape(-1) for value in collapsed_components[name]],
+                    dim=1,
+                ).reshape(-1)
+
+            def _qstat(values: torch.Tensor, quantile: float) -> float:
+                flat = values.detach().reshape(-1)
+                return float(torch.quantile(flat, quantile).item())
+
+            target_total = _flat_component("q_target_total")
+            target_survival = _flat_component("q_target_survival")
+            target_recovery = _flat_component("q_target_recovery")
+            coupon_component = _flat_component("coupon_component")
+            continuation_component = _flat_component("continuation_q_component")
+            recursion_gain = _flat_component("recursion_gain")
+            growth_multiplier = _flat_component("multiplier")
+            scale_flat = q_bellman_scale.reshape(-1)
+            q_claim_values = Q.detach().reshape(-1)
             self._latest_q_terms = {
                 'q_main': float(main_loss.item()),
                 'q_regime_survival_n': float(Q.numel()),
                 'q_regime_claim_n': float(Q.numel()) if getattr(model, "q_parameterization", None) == "hybrid_regime" else 0.0,
-                'q_survival_bellman_signed_mean': float(branch_residual.mean().item()),
-                'q_survival_bellman_abs_mean': float(branch_abs.mean().item()),
-                'q_survival_bellman_abs_p90': float(torch.quantile(branch_abs, 0.9).item()),
-                'q_claim_bellman_signed_mean': float(branch_residual.mean().item()),
-                'q_claim_bellman_abs_mean': float(branch_abs.mean().item()),
+                'q_survival_bellman_signed_mean': float(branch_residual_raw.mean().item()),
+                'q_survival_bellman_abs_mean': float(branch_abs_raw.mean().item()),
+                'q_survival_bellman_abs_p90': _qstat(branch_abs_raw, 0.90),
+                'q_claim_bellman_signed_mean': float(branch_residual_raw.mean().item()),
+                'q_claim_bellman_abs_mean': float(branch_abs_raw.mean().item()),
+                'q_claim_bellman_signed_mean_raw': float(branch_residual_raw.mean().item()),
+                'q_claim_bellman_abs_mean_raw': float(branch_abs_raw.mean().item()),
+                'q_claim_bellman_abs_p50_raw': _qstat(branch_abs_raw, 0.50),
+                'q_claim_bellman_abs_p90_raw': _qstat(branch_abs_raw, 0.90),
+                'q_claim_bellman_abs_p95_raw': _qstat(branch_abs_raw, 0.95),
+                'q_claim_bellman_abs_p99_raw': _qstat(branch_abs_raw, 0.99),
+                'q_claim_bellman_abs_max_raw': float(branch_abs_raw.max().item()),
+                'q_claim_bellman_signed_mean_normalized': float(
+                    branch_residual_normalized.mean().item()
+                ),
+                'q_claim_bellman_abs_mean_normalized': float(
+                    branch_abs_normalized.mean().item()
+                ),
+                'q_claim_bellman_abs_p50_normalized': _qstat(branch_abs_normalized, 0.50),
+                'q_claim_bellman_abs_p90_normalized': _qstat(branch_abs_normalized, 0.90),
+                'q_claim_bellman_abs_p95_normalized': _qstat(branch_abs_normalized, 0.95),
+                'q_claim_bellman_abs_p99_normalized': _qstat(branch_abs_normalized, 0.99),
+                'q_claim_bellman_abs_max_normalized': float(branch_abs_normalized.max().item()),
+                'q_bellman_scale_mean': float(scale_flat.mean().item()),
+                'q_bellman_scale_p50': _qstat(scale_flat, 0.50),
+                'q_bellman_scale_p90': _qstat(scale_flat, 0.90),
+                'q_bellman_scale_p95': _qstat(scale_flat, 0.95),
+                'q_bellman_scale_p99': _qstat(scale_flat, 0.99),
+                'q_bellman_scale_max': float(scale_flat.max().item()),
+                'q_claim_value_mean': float(q_claim_values.mean().item()),
+                'q_claim_value_p50': _qstat(q_claim_values, 0.50),
+                'q_claim_value_p90': _qstat(q_claim_values, 0.90),
+                'q_claim_value_p95': _qstat(q_claim_values, 0.95),
+                'q_claim_value_p99': _qstat(q_claim_values, 0.99),
+                'q_claim_value_max': float(q_claim_values.max().item()),
+                'q_target_total_mean': float(target_total.mean().item()),
+                'q_target_total_p50': _qstat(target_total, 0.50),
+                'q_target_total_p90': _qstat(target_total, 0.90),
+                'q_target_total_p95': _qstat(target_total, 0.95),
+                'q_target_total_p99': _qstat(target_total, 0.99),
+                'q_target_survival_mean': float(target_survival.mean().item()),
+                'q_target_survival_p95': _qstat(target_survival, 0.95),
+                'q_target_survival_p99': _qstat(target_survival, 0.99),
+                'q_target_recovery_mean': float(target_recovery.mean().item()),
+                'q_target_recovery_p95': _qstat(target_recovery, 0.95),
+                'q_target_recovery_p99': _qstat(target_recovery, 0.99),
+                'q_coupon_component_mean': float(coupon_component.mean().item()),
+                'q_coupon_component_p95': _qstat(coupon_component, 0.95),
+                'q_continuation_component_mean': float(continuation_component.mean().item()),
+                'q_continuation_component_p95': _qstat(continuation_component, 0.95),
+                'q_continuation_component_p99': _qstat(continuation_component, 0.99),
+                'q_recursion_gain_mean': float(recursion_gain.mean().item()),
+                'q_recursion_gain_p50': _qstat(recursion_gain, 0.50),
+                'q_recursion_gain_p90': _qstat(recursion_gain, 0.90),
+                'q_recursion_gain_p95': _qstat(recursion_gain, 0.95),
+                'q_recursion_gain_p99': _qstat(recursion_gain, 0.99),
+                'q_recursion_gain_max': float(recursion_gain.max().item()),
+                'q_recursion_gain_gt1_share': float((recursion_gain > 1.0).float().mean().item()),
+                'q_growth_multiplier_mean': float(growth_multiplier.mean().item()),
+                'q_growth_multiplier_p95': _qstat(growth_multiplier, 0.95),
+                'q_growth_multiplier_p99': _qstat(growth_multiplier, 0.99),
+                'q_bellman_normalized': normalize_q,
                 'q_nonnegative': float(survival_terms["nonnegative_loss"].item()),
                 'q_negative_share': float(negative.float().mean().item()),
                 'q_negative_mean_abs': float((-Q[negative]).mean().item()) if negative.any() else 0.0,
@@ -5988,7 +6105,9 @@ class Episode:
                 self._latest_q_terms.update({
                     "q_unit_mean": float(q_unit_values.mean().item()),
                     "q_unit_p50": float(torch.quantile(q_unit_values, 0.50).item()),
+                    "q_unit_p90": float(torch.quantile(q_unit_values, 0.90).item()),
                     "q_unit_p95": float(torch.quantile(q_unit_values, 0.95).item()),
+                    "q_unit_p99": float(torch.quantile(q_unit_values, 0.99).item()),
                     "q_unit_max": float(q_unit_values.max().item()),
                 })
         return total_loss
@@ -7734,6 +7853,51 @@ class Episode:
             lr=float(getattr(self.hyperparams, "policy_lr", 1e-3)),
             weight_decay=float(getattr(self.hyperparams, "policy_weight_decay", 0.0)),
         )
+
+    def _make_q_regime_optimizer(
+        self,
+        params: List[nn.Parameter],
+    ) -> torch.optim.Optimizer:
+        if not params:
+            raise RuntimeError("Q regime optimizer received no parameters.")
+        configured = getattr(self.hyperparams, "q_stage_lr", None)
+        lr = (
+            float(getattr(self.hyperparams, "policy_lr", 1e-3))
+            if configured is None
+            else float(configured)
+        )
+        if lr <= 0.0:
+            raise ValueError("q_stage_lr must be positive when configured")
+        return torch.optim.AdamW(
+            params,
+            lr=lr,
+            weight_decay=float(getattr(self.hyperparams, "policy_weight_decay", 0.0)),
+        )
+
+    @staticmethod
+    def _params_content_hash(params: List[nn.Parameter]) -> str:
+        digest = hashlib.sha256()
+        for index, param in enumerate(params):
+            value = param.detach().cpu().contiguous()
+            digest.update(str(index).encode("utf-8"))
+            digest.update(str(tuple(value.shape)).encode("utf-8"))
+            digest.update(value.numpy().tobytes())
+        return digest.hexdigest()
+
+    def _policy_value_component_hashes(self) -> Dict[str, str]:
+        model = self.models["policy_value"]
+        return {
+            "model_hash": self._state_dict_hash(model),
+            "p_hash": self._params_content_hash(
+                self._policy_value_stage_params("p")
+            ),
+            "q_hash": self._params_content_hash(
+                self._policy_value_stage_params("q")
+            ),
+            "bp_hash": self._params_content_hash(
+                self._policy_value_stage_params("bp")
+            ),
+        }
 
     @staticmethod
     def _clip_params_with_raw_norm(
@@ -9977,6 +10141,91 @@ class Episode:
         })
         return summary
 
+    def _build_q_validation_bank(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+        frozen_p_model: nn.Module,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Materialize one deterministic natural-distribution QS validation bank."""
+        limit = max(1, int(getattr(self.hyperparams, "q_validation_max_batches", 8)))
+        bank: List[Dict[str, torch.Tensor]] = []
+        rng_state = self._capture_rng_state()
+        try:
+            for batch in batches[:limit]:
+                fixed = self._build_q_survival_batch(
+                    batch,
+                    frozen_p_model,
+                    return_diagnostics=False,
+                )
+                if fixed is not None:
+                    bank.append(fixed)
+        finally:
+            self._restore_rng_state(rng_state)
+        return bank
+
+    def _evaluate_q_validation_bank(
+        self,
+        bank: List[Dict[str, torch.Tensor]],
+        *,
+        frozen_p_model: nn.Module,
+        q_target_model: nn.Module,
+    ) -> Dict[str, Any]:
+        """Evaluate fixed QS rows without resampling states, shocks, or targets."""
+        model = self.models["policy_value"]
+        was_training = model.training
+        records: List[Dict[str, Any]] = []
+        model.eval()
+        try:
+            for batch in bank:
+                with torch.enable_grad():
+                    self._compute_q_survival_bellman_loss(
+                        batch,
+                        create_graph=False,
+                        frozen_p_model=frozen_p_model,
+                        q_target_model=q_target_model,
+                    )
+                records.append(dict(self._latest_q_terms))
+        finally:
+            model.train(was_training)
+
+        count_key = (
+            "q_regime_claim_n"
+            if getattr(model, "q_parameterization", None) == "hybrid_regime"
+            else "q_regime_survival_n"
+        )
+        count = sum(float(item.get(count_key, 0.0)) for item in records)
+
+        def _weighted(key: str) -> float:
+            if count <= 0.0:
+                return float("inf")
+            return float(
+                sum(
+                    float(item.get(key, 0.0))
+                    * float(item.get(count_key, 0.0))
+                    for item in records
+                )
+                / count
+            )
+
+        raw = _weighted("q_claim_bellman_abs_mean_raw")
+        normalized = _weighted("q_claim_bellman_abs_mean_normalized")
+        normalize_q = bool(
+            getattr(
+                self.hyperparams,
+                "q_bellman_normalize_by_target_scale",
+                False,
+            )
+        )
+        avg, meta = self._aggregate_metric_records(records)
+        return {
+            "score_primary": normalized if normalize_q else raw,
+            "score_raw_abs": raw,
+            "score_normalized_abs": normalized,
+            "sample_count": int(count),
+            "batch_count": int(len(records)),
+            "metrics": {**avg, **meta},
+        }
+
     def _run_q_regime_phase(
         self,
         *,
@@ -9985,6 +10234,7 @@ class Episode:
         frozen_p_model: nn.Module,
         q_target_model: nn.Module,
         epochs: int,
+        validation_bank: Optional[List[Dict[str, torch.Tensor]]] = None,
     ) -> Dict[str, Any]:
         """Run one regime-exclusive Q phase while every non-Q parameter is frozen."""
         phase = str(phase).lower()
@@ -10084,9 +10334,10 @@ class Episode:
                 "epoch_history": [],
             }
         q_params = self._policy_value_stage_params("q")
-        optimizer = self._make_policy_value_stage_optimizer(q_params)
+        optimizer = self._make_q_regime_optimizer(q_params)
         non_q_params = [p for p in model.parameters() if id(p) not in {id(q) for q in q_params}]
         q_phase_start = self._snapshot_params(q_params)
+        q_online_hash_before = self._params_content_hash(q_params)
         non_q_snapshot = self._snapshot_params(non_q_params)
         frozen_p_hash_before = self._state_dict_hash(frozen_p_model)
         records: List[Dict[str, Any]] = []
@@ -10096,11 +10347,43 @@ class Episode:
         optimizer_steps = 0
         skipped = 0
         rollback_reason: Optional[str] = None
+        validation_enabled = bool(
+            getattr(self.hyperparams, "q_epoch_validation_enabled", False)
+        ) and phase in {"survival", "polish"}
+        validation_bank = validation_bank or []
+        validation_history: List[Dict[str, Any]] = []
+        validation_start: Optional[Dict[str, Any]] = None
+        validation_best: Optional[Dict[str, Any]] = None
+        best_q_snapshot: Optional[Dict[int, torch.Tensor]] = None
+        best_epoch: Optional[int] = None
+        if validation_enabled:
+            validation_start = self._evaluate_q_validation_bank(
+                validation_bank,
+                frozen_p_model=frozen_p_model,
+                q_target_model=q_target_model,
+            )
+            validation_best = dict(validation_start)
+            best_q_snapshot = self._snapshot_params(q_params)
+            if not np.isfinite(float(validation_start["score_primary"])):
+                rollback_reason = "nonfinite_validation_start"
+            validation_history.append({
+                "phase": phase,
+                "epoch": 0,
+                **{key: value for key, value in validation_start.items() if key != "metrics"},
+                **validation_start.get("metrics", {}),
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                "target_hash": self._state_dict_hash(q_target_model),
+                "online_q_hash": self._params_content_hash(q_params),
+                "is_best": True,
+                "restored": False,
+            })
         was_training = model.training
         model.train()
         try:
             with self._policy_value_train_scope("q"):
                 for epoch in range(int(epochs)):
+                    if rollback_reason is not None:
+                        break
                     epoch_record_start = len(records)
                     for batch in tqdm(batches, desc=f"Q {phase} {epoch + 1}/{epochs}"):
                         optimizer.zero_grad(set_to_none=True)
@@ -10224,10 +10507,88 @@ class Episode:
                     })
                     if rollback_reason is not None:
                         break
+                    if validation_enabled:
+                        validation = self._evaluate_q_validation_bank(
+                            validation_bank,
+                            frozen_p_model=frozen_p_model,
+                            q_target_model=q_target_model,
+                        )
+                        if not np.isfinite(float(validation["score_primary"])):
+                            rollback_reason = "nonfinite_validation_score"
+                            break
+                        is_best = bool(
+                            validation_best is None
+                            or float(validation["score_primary"])
+                            < float(validation_best["score_primary"])
+                        )
+                        if is_best:
+                            validation_best = dict(validation)
+                            best_q_snapshot = self._snapshot_params(q_params)
+                            best_epoch = int(epoch + 1)
+                        validation_history.append({
+                            "phase": phase,
+                            "epoch": int(epoch + 1),
+                            **{key: value for key, value in validation.items() if key != "metrics"},
+                            **validation.get("metrics", {}),
+                            "lr": float(optimizer.param_groups[0]["lr"]),
+                            "target_hash": self._state_dict_hash(q_target_model),
+                            "online_q_hash": self._params_content_hash(q_params),
+                            "is_best": is_best,
+                            "restored": False,
+                        })
         finally:
             model.train(was_training)
+        validation_end_before_restore: Optional[Dict[str, Any]] = None
+        validation_after_restore: Optional[Dict[str, Any]] = None
+        phase_status: str
         if rollback_reason is not None:
             self._restore_params(q_params, q_phase_start)
+            phase_status = "rejected_numerical"
+        elif optimizer_steps <= 0:
+            phase_status = "skipped_no_samples"
+        elif validation_enabled:
+            validation_end_before_restore = self._evaluate_q_validation_bank(
+                validation_bank,
+                frozen_p_model=frozen_p_model,
+                q_target_model=q_target_model,
+            )
+            start_score = float(validation_start["score_primary"])
+            best_score = float(validation_best["score_primary"])
+            min_delta = float(
+                getattr(self.hyperparams, "q_validation_min_delta", 0.0)
+            )
+            improved = bool(best_score < start_score - min_delta)
+            if improved:
+                if bool(
+                    getattr(self.hyperparams, "q_restore_best_checkpoint", True)
+                ) and best_q_snapshot is not None:
+                    self._restore_params(q_params, best_q_snapshot)
+                phase_status = "accepted_improved"
+            else:
+                self._restore_params(q_params, q_phase_start)
+                phase_status = "accepted_reverted"
+            validation_after_restore = self._evaluate_q_validation_bank(
+                validation_bank,
+                frozen_p_model=frozen_p_model,
+                q_target_model=q_target_model,
+            )
+            validation_history.append({
+                "phase": phase,
+                "epoch": int(epochs),
+                **{
+                    key: value
+                    for key, value in validation_after_restore.items()
+                    if key != "metrics"
+                },
+                **validation_after_restore.get("metrics", {}),
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                "target_hash": self._state_dict_hash(q_target_model),
+                "online_q_hash": self._params_content_hash(q_params),
+                "is_best": improved,
+                "restored": True,
+            })
+        else:
+            phase_status = "accepted"
         frozen_p_hash_after = self._state_dict_hash(frozen_p_model)
         if frozen_p_hash_after != frozen_p_hash_before:
             raise RuntimeError("Frozen P snapshot changed during Q training")
@@ -10240,11 +10601,7 @@ class Episode:
             coverage["survival_parent_count"] = int(survival_parent_count)
         return {
             "phase": phase,
-            "status": (
-                "rejected_numerical"
-                if rollback_reason is not None
-                else ("accepted" if optimizer_steps > 0 else "skipped_no_samples")
-            ),
+            "status": phase_status,
             "epochs": int(epochs),
             "optimizer_steps": int(optimizer_steps),
             "skipped_batches": int(skipped),
@@ -10255,6 +10612,17 @@ class Episode:
             "coverage": coverage,
             "metrics": {**avg, **meta},
             "epoch_history": epoch_history,
+            "validation_enabled": validation_enabled,
+            "validation_start": validation_start,
+            "validation_best": validation_best,
+            "validation_end_before_restore": validation_end_before_restore,
+            "validation_after_restore": validation_after_restore,
+            "validation_best_epoch": best_epoch,
+            "validation_history": validation_history,
+            "q_stage_lr_effective": float(optimizer.param_groups[0]["lr"]),
+            "q_target_hash": self._state_dict_hash(q_target_model),
+            "q_online_hash_before": q_online_hash_before,
+            "q_online_hash_after": self._params_content_hash(q_params),
             "hybrid_learned_object": "claim_q" if hybrid else None,
         }
 
@@ -10465,6 +10833,7 @@ class Episode:
         self,
         batches: List[Dict[str, torch.Tensor]],
         frozen_p_model: nn.Module,
+        validation_batches: Optional[List[Dict[str, torch.Tensor]]] = None,
     ) -> Dict[str, Any]:
         """Run Q0 -> QD -> QS -> optional polish with one fixed P classifier."""
         if not batches or any("parent" not in batch for batch in batches):
@@ -10476,6 +10845,21 @@ class Episode:
             }
         frozen_p_model.eval()
         frozen_p_model.requires_grad_(False)
+        frozen_p_hash_before = self._state_dict_hash(frozen_p_model)
+        q_params = self._policy_value_stage_params("q")
+        q_online_hash_stage_start = self._params_content_hash(q_params)
+        refresh_mode = str(
+            getattr(self.hyperparams, "q_target_refresh_mode", "phase")
+        ).lower()
+        if refresh_mode not in {"phase", "stage"}:
+            raise ValueError("q_target_refresh_mode must be 'phase' or 'stage'")
+        stage_target = None
+        validation_source = validation_batches or batches
+        validation_bank = (
+            self._build_q_validation_bank(validation_source, frozen_p_model)
+            if bool(getattr(self.hyperparams, "q_epoch_validation_enabled", False))
+            else []
+        )
         phase_specs = [
             ("zero", int(getattr(self.hyperparams, "q_zero_boundary_epochs", 5))),
             ("default", int(getattr(self.hyperparams, "q_default_pretrain_epochs", 10))),
@@ -10484,19 +10868,43 @@ class Episode:
         ]
         summaries: List[Dict[str, Any]] = []
         for phase, epochs in phase_specs:
-            # The continuation-Q target is fixed within each phase. Refreshing it
-            # between phases never changes the separate frozen-P classifier.
-            q_target_model = deepcopy(self.models["policy_value"]).to(self.device)
-            q_target_model.eval()
-            q_target_model.requires_grad_(False)
+            # In stage mode, survival and polish share the Q snapshot taken
+            # before survival. Phase mode preserves the historical refresh.
+            if refresh_mode == "stage" and phase == "survival":
+                stage_target = deepcopy(self.models["policy_value"]).to(self.device)
+                stage_target.eval()
+                stage_target.requires_grad_(False)
+            q_target_model = stage_target
+            if q_target_model is None:
+                q_target_model = deepcopy(self.models["policy_value"]).to(self.device)
+                q_target_model.eval()
+                q_target_model.requires_grad_(False)
             phase_summary = self._run_q_regime_phase(
                 phase=phase,
                 batches=batches,
                 frozen_p_model=frozen_p_model,
                 q_target_model=q_target_model,
                 epochs=epochs,
+                validation_bank=validation_bank,
             )
             summaries.append(phase_summary)
+            if (
+                phase == "survival"
+                and bool(
+                    getattr(
+                        self.hyperparams,
+                        "save_intermediate_stage_checkpoints",
+                        False,
+                    )
+                )
+            ):
+                self._intermediate_stage_states["post_q_survival"] = (
+                    self._state_dict_to_cpu(self.models["policy_value"])
+                )
+            if phase == "survival":
+                self._stage_component_hashes["post_q_survival"] = (
+                    self._policy_value_component_hashes()
+                )
             if phase_summary.get("status") == "rejected_numerical":
                 break
         by_phase = {item.get("phase"): item for item in summaries}
@@ -10513,8 +10921,10 @@ class Episode:
         # candidate Phat 不过滤 claim replay。QD 仅验证 observed realized-default
         # settlement 恒等式，不更新 q_unit；未观察到 default 不构成失败。
         rejection_reason: Optional[str] = None
+        rejection_status: Optional[str] = None
         if any(item.get("status") == "rejected_numerical" for item in summaries):
             rejection_reason = "rejected_numerical"
+            rejection_status = "rejected_numerical"
         if rejection_reason is None and bool(getattr(self.hyperparams, "q_require_zero_phase", True)):
             if q_mode == "hybrid_regime":
                 zero_metrics = by_phase.get("zero", {}).get("metrics", {})
@@ -10524,8 +10934,10 @@ class Episode:
                     > float(getattr(self.hyperparams, "q_structural_zero_tol", 1e-8))
                 ):
                     rejection_reason = "rejected_structural_zero_identity"
+                    rejection_status = "rejected_structural"
             elif _steps("zero") < int(getattr(self.hyperparams, "q_min_zero_optimizer_steps", 1)):
-                rejection_reason = "rejected_insufficient_zero_boundary"
+                    rejection_reason = "rejected_insufficient_zero_boundary"
+                    rejection_status = "rejected_missing_required_samples"
         if rejection_reason is None and bool(getattr(self.hyperparams, "q_require_default_phase", True)):
             default_coverage = _coverage("default")
             if q_mode == "hybrid_regime":
@@ -10539,12 +10951,14 @@ class Episode:
                     > float(getattr(self.hyperparams, "q_structural_recovery_tol", 1e-6))
                 ):
                     rejection_reason = "rejected_structural_recovery_identity"
+                    rejection_status = "rejected_structural"
             elif (
                 _steps("default") < int(getattr(self.hyperparams, "q_min_default_optimizer_steps", 1))
                 or int(default_coverage.get("default_candidates_selected", 0))
                 < int(getattr(self.hyperparams, "q_min_default_samples", 1))
             ):
                 rejection_reason = "rejected_insufficient_default_coverage"
+                rejection_status = "rejected_missing_required_samples"
         if rejection_reason is None and bool(getattr(self.hyperparams, "q_require_survival_phase", True)):
             survival_coverage = _coverage("survival")
             required_parent_count = (
@@ -10567,15 +10981,81 @@ class Episode:
                     if q_mode == "hybrid_regime"
                     else "rejected_no_survival_bellman"
                 )
+                rejection_status = "rejected_missing_required_samples"
+
+        validation_enabled = bool(
+            getattr(self.hyperparams, "q_epoch_validation_enabled", False)
+        )
+        if rejection_reason is None and validation_enabled and not validation_bank:
+            rejection_reason = "rejected_missing_q_validation_samples"
+            rejection_status = "rejected_missing_required_samples"
+
+        q_online_hash_stage_end = self._params_content_hash(q_params)
+        q_changed = q_online_hash_stage_end != q_online_hash_stage_start
+        if rejection_status is None:
+            if q_changed:
+                self._q_no_improvement_streak = 0
+            else:
+                self._q_no_improvement_streak += 1
+        frozen_p_hash_after = self._state_dict_hash(frozen_p_model)
+        if frozen_p_hash_after != frozen_p_hash_before:
+            raise RuntimeError("Frozen P snapshot changed across the Q stage")
+
+        learned_statuses = {
+            name: by_phase.get(name, {}).get("status")
+            for name in ("survival", "polish")
+        }
+        if rejection_status is not None:
+            stage_status = rejection_status
+        elif not validation_enabled:
+            # Exact compatibility status for the historical no-validation path.
+            stage_status = "accepted"
+        elif q_changed:
+            stage_status = "accepted_improved"
+        else:
+            stage_status = "accepted_reverted"
 
         return {
-            "status": rejection_reason or "accepted",
+            "status": stage_status,
             "q_parameterization": getattr(self.models["policy_value"], "q_parameterization", None),
-            "frozen_p_hash": self._state_dict_hash(frozen_p_model),
+            "frozen_p_hash": frozen_p_hash_after,
+            "frozen_p_hash_before": frozen_p_hash_before,
+            "frozen_p_hash_after": frozen_p_hash_after,
             "phases": summaries,
             "optimizer_steps": int(sum(item.get("optimizer_steps", 0) for item in summaries)),
             "q_stage_required_gate_passed": rejection_reason is None,
             "q_stage_rejection_reason": rejection_reason,
+            "q_target_refresh_mode": refresh_mode,
+            "q_target_hash_survival": by_phase.get("survival", {}).get("q_target_hash"),
+            "q_target_hash_polish": by_phase.get("polish", {}).get("q_target_hash"),
+            "q_online_hash_before_survival": by_phase.get("survival", {}).get(
+                "q_online_hash_before"
+            ),
+            "q_online_hash_after_survival": by_phase.get("survival", {}).get(
+                "q_online_hash_after"
+            ),
+            "q_online_hash_after_polish": by_phase.get("polish", {}).get(
+                "q_online_hash_after"
+            ),
+            "q_online_hash_stage_start": q_online_hash_stage_start,
+            "q_online_hash_stage_end": q_online_hash_stage_end,
+            "q_stage_changed": q_changed,
+            "q_no_improvement_streak": int(self._q_no_improvement_streak),
+            "q_stage_lr_effective": (
+                float(getattr(self.hyperparams, "policy_lr", 1e-3))
+                if getattr(self.hyperparams, "q_stage_lr", None) is None
+                else float(getattr(self.hyperparams, "q_stage_lr"))
+            ),
+            "q_validation_bank_batches": int(len(validation_bank)),
+            "q_validation_source": (
+                "natural_validation" if validation_batches else "natural_train_fallback"
+            ),
+            "q_validation_history": [
+                row
+                for item in summaries
+                for row in item.get("validation_history", [])
+            ],
+            "q_survival_status": learned_statuses["survival"],
             "q_zero_optimizer_steps": _steps("zero"),
             "q_default_optimizer_steps": _steps("default"),
             "q_survival_optimizer_steps": _steps("survival"),
@@ -10699,6 +11179,10 @@ class Episode:
             else None
         )
         try:
+            self._intermediate_stage_states = {}
+            self._stage_component_hashes = {
+                "episode_start": self._policy_value_component_hashes()
+            }
             # Episode-0 cold-start bootstrap 必须在第一次 P stage 之前：P 的
             # cashflow/target 会消费 Q 的数值，随机 direct-Q 会先污染第一轮 P，
             # 再污染之后被冻结的 Phat / default region。
@@ -10757,6 +11241,19 @@ class Episode:
                     },
                     "target_grid_validation_batches": len(validation_batches),
                 }
+            if bool(
+                getattr(
+                    self.hyperparams,
+                    "save_intermediate_stage_checkpoints",
+                    False,
+                )
+            ):
+                self._intermediate_stage_states["post_p"] = self._state_dict_to_cpu(
+                    self.models["policy_value"]
+                )
+            self._stage_component_hashes["post_p"] = (
+                self._policy_value_component_hashes()
+            )
 
             # Freeze the P solution once for the entire Q stage. The Q continuation
             # target is maintained separately inside _run_q_regime_training, so Q
@@ -10767,10 +11264,17 @@ class Episode:
             q_summary = self._run_q_regime_training(
                 pv_train_batches,
                 frozen_p_snapshot,
+                validation_batches=validation_batches,
             )
-            if q_summary.get("status") != "accepted":
-                # Required-phase gate 未通过（例如 QS 没有 Bellman optimizer step）
-                # 时不得进入 BP distillation。
+            q_soft_accept_statuses = {
+                "accepted",
+                "accepted_improved",
+                "accepted_reverted",
+            }
+            if q_summary.get("status") not in q_soft_accept_statuses:
+                # Only numerical, structural, or missing-required-sample failures
+                # roll the full staged update back. Validation no-improvement has
+                # already restored Q only and must preserve the accepted P update.
                 _restore_full_staged_start()
                 metadata = {
                     "policy_value_training_flow": "staged",
@@ -10792,6 +11296,19 @@ class Episode:
                     },
                     "target_grid_validation_batches": len(validation_batches),
                 }
+            if bool(
+                getattr(
+                    self.hyperparams,
+                    "save_intermediate_stage_checkpoints",
+                    False,
+                )
+            ):
+                self._intermediate_stage_states["post_q_final"] = (
+                    self._state_dict_to_cpu(self.models["policy_value"])
+                )
+            self._stage_component_hashes["post_q_final"] = (
+                self._policy_value_component_hashes()
+            )
 
             bp_teacher = deepcopy(self.models["policy_value"]).to(self.device)
             bp_teacher.eval()
@@ -10827,9 +11344,22 @@ class Episode:
                 "current_eta1_share"
             ]
             bp_summary["validation_cache_resampled"] = False
+            if bool(
+                getattr(
+                    self.hyperparams,
+                    "save_intermediate_stage_checkpoints",
+                    False,
+                )
+            ):
+                self._intermediate_stage_states["post_bp"] = self._state_dict_to_cpu(
+                    self.models["policy_value"]
+                )
+            self._stage_component_hashes["post_bp"] = (
+                self._policy_value_component_hashes()
+            )
             stages_successful = (
                 pq_summary.get("status") == "accepted"
-                and q_summary.get("status") == "accepted"
+                and q_summary.get("status") in q_soft_accept_statuses
                 and bp_summary.get("status") in {"accepted", "skipped_no_active_refinancing"}
             )
             if not stages_successful:
@@ -10891,6 +11421,7 @@ class Episode:
                 ),
                 "q_stage_rejection_reason": q_summary.get("q_stage_rejection_reason"),
                 "bp_distillation_stage": bp_summary,
+                "stage_component_hashes": deepcopy(self._stage_component_hashes),
                 "firm_target_stage_update": {
                     "firm_target_update_mode": firm_mode,
                     "firm_target_update_count": target_update_count,

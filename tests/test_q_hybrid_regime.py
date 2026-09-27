@@ -728,9 +728,15 @@ def _episode_for_gate() -> Episode:
     )
 
 
-@pytest.mark.parametrize("survival_steps,expected", [(1, "accepted"), (0, "rejected_no_claim_bellman")])
+@pytest.mark.parametrize(
+    "survival_steps,expected,reason",
+    [
+        (1, "accepted", None),
+        (0, "rejected_missing_required_samples", "rejected_no_claim_bellman"),
+    ],
+)
 def test_hybrid_required_gate_accepts_structural_zero_step_phases(
-    survival_steps, expected
+    survival_steps, expected, reason
 ):
     episode = _episode_for_gate()
 
@@ -768,6 +774,7 @@ def test_hybrid_required_gate_accepts_structural_zero_step_phases(
     dummy = {"parent": _state((0.2, 0.4))}
     result = episode._run_q_regime_training([dummy], deepcopy(episode.firm_target))
     assert result["status"] == expected
+    assert result["q_stage_rejection_reason"] == reason
     assert result["q_zero_optimizer_steps"] == 0
     assert result["q_default_optimizer_steps"] == 0
 

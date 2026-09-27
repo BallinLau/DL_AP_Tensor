@@ -396,7 +396,8 @@ def _gate_episode():
 def test_C_no_survival_samples_rejects_q_stage():
     episode = _gate_episode()
     summary = episode._run_q_regime_training([_batch()], _AlwaysDefaultP())
-    assert summary["status"] == "rejected_no_survival_bellman"
+    assert summary["status"] == "rejected_missing_required_samples"
+    assert summary["q_stage_rejection_reason"] == "rejected_no_survival_bellman"
     assert summary["q_stage_required_gate_passed"] is False
     assert summary["q_survival_optimizer_steps"] == 0
     assert summary["q_survival_coverage"]["survival_parent_count"] == 0
@@ -421,10 +422,40 @@ def test_C2_rejected_q_stage_skips_bp_distillation(monkeypatch):
     assert result["metadata"]["q_stage_rejection_reason"] == "rejected_no_survival_bellman"
 
 
+def test_C3_soft_q_revert_preserves_post_p_and_runs_bp(monkeypatch):
+    episode = _staged_episode()
+    order = []
+    _patch_staged_stages(episode, monkeypatch, order)
+    p_parameter = next(episode.models["policy_value"].v0_head.parameters())
+    before = p_parameter.detach().clone()
+
+    def p_stage(*_args, **_kwargs):
+        order.append("p_stage")
+        with torch.no_grad():
+            p_parameter.add_(0.25)
+        return {"status": "accepted"}
+
+    monkeypatch.setattr(episode, "_run_policy_value_evaluation_stage", p_stage)
+    monkeypatch.setattr(
+        episode,
+        "_run_q_regime_training",
+        lambda *a, **k: order.append("q_regime") or {
+            "status": "accepted_reverted",
+            "q_stage_required_gate_passed": True,
+            "q_stage_rejection_reason": None,
+        },
+    )
+    result = episode._run_policy_value_staged([_batch()], [], 1)
+    assert result["metadata"]["policy_value_stage_status"] == "accepted"
+    assert "bp" in order
+    assert not torch.equal(p_parameter.detach(), before)
+
+
 def test_D_no_default_coverage_is_explicit_failure():
     episode = _gate_episode()
     summary = episode._run_q_regime_training([_batch()], _AlwaysSurvivalP())
-    assert summary["status"] == "rejected_insufficient_default_coverage"
+    assert summary["status"] == "rejected_missing_required_samples"
+    assert summary["q_stage_rejection_reason"] == "rejected_insufficient_default_coverage"
     coverage = summary["q_default_coverage"]
     assert coverage["default_candidates_selected"] == 0
     assert coverage["default_candidates_generated"] > 0

@@ -39,6 +39,7 @@ from experiments.run_utils import (  # noqa: E402
     plot_firm_b_window_distribution,
 )
 from utils.gpu_monitor import get_monitor, reset_monitor
+from evaluation.episode_diagnostics import save_episode_diagnostics
 
 
 def validate_sdf_fresh_pair_config(hyperparams):
@@ -336,6 +337,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--q-default-pretrain-epochs", type=int, default=None, help="Default-parent recovery phase epochs")
     parser.add_argument("--q-survival-aio-epochs", type=int, default=None, help="Survival-parent Bellman/AiO phase epochs")
     parser.add_argument("--q-mixed-polish-epochs", type=int, default=None, help="Regime-exclusive mixed Q polishing epochs")
+    parser.add_argument(
+        "--q-target-refresh-mode",
+        type=str.lower,
+        default=None,
+        choices=["phase", "stage"],
+        help="Refresh Q continuation target per phase or once before survival",
+    )
+    parser.add_argument(
+        "--q-bellman-normalize-by-target-scale",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Normalize Q Bellman residuals by a detached parent-common target scale",
+    )
+    parser.add_argument("--q-stage-lr", type=float, default=None, help="Q-only stage LR; omitted falls back to policy_lr")
+    parser.add_argument(
+        "--q-epoch-validation-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Validate learned-Q phases on one fixed natural-distribution bank",
+    )
+    parser.add_argument("--q-validation-max-batches", type=int, default=None)
+    parser.add_argument("--q-validation-min-delta", type=float, default=None)
+    parser.add_argument(
+        "--q-restore-best-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--q-no-improvement-patience-episodes", type=int, default=None)
+    parser.add_argument(
+        "--save-episode-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--save-intermediate-stage-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--q-zero-sample-share", type=float, default=None, help="Q0 sample share during mixed polishing")
     parser.add_argument("--q-default-sample-share", type=float, default=None, help="QD sample share during mixed polishing")
     parser.add_argument("--q-survival-sample-share", type=float, default=None, help="QS sample share during mixed polishing")
@@ -730,6 +769,16 @@ def configure_hyperparams(args: argparse.Namespace):
         "q_default_pretrain_epochs": args.q_default_pretrain_epochs,
         "q_survival_aio_epochs": args.q_survival_aio_epochs,
         "q_mixed_polish_epochs": args.q_mixed_polish_epochs,
+        "q_target_refresh_mode": args.q_target_refresh_mode,
+        "q_bellman_normalize_by_target_scale": args.q_bellman_normalize_by_target_scale,
+        "q_stage_lr": args.q_stage_lr,
+        "q_epoch_validation_enabled": args.q_epoch_validation_enabled,
+        "q_validation_max_batches": args.q_validation_max_batches,
+        "q_validation_min_delta": args.q_validation_min_delta,
+        "q_restore_best_checkpoint": args.q_restore_best_checkpoint,
+        "q_no_improvement_patience_episodes": args.q_no_improvement_patience_episodes,
+        "save_episode_diagnostics": args.save_episode_diagnostics,
+        "save_intermediate_stage_checkpoints": args.save_intermediate_stage_checkpoints,
         "q_zero_sample_share": args.q_zero_sample_share,
         "q_default_sample_share": args.q_default_sample_share,
         "q_survival_sample_share": args.q_survival_sample_share,
@@ -779,6 +828,16 @@ def configure_hyperparams(args: argparse.Namespace):
     ):
         if int(getattr(hyperparams, name)) < 0:
             raise ValueError(f"{name} must be non-negative")
+    if str(hyperparams.q_target_refresh_mode).lower() not in {"phase", "stage"}:
+        raise ValueError("q_target_refresh_mode must be 'phase' or 'stage'")
+    if hyperparams.q_stage_lr is not None and float(hyperparams.q_stage_lr) <= 0.0:
+        raise ValueError("q_stage_lr must be positive when provided")
+    if int(hyperparams.q_validation_max_batches) <= 0:
+        raise ValueError("q_validation_max_batches must be positive")
+    if float(hyperparams.q_validation_min_delta) < 0.0:
+        raise ValueError("q_validation_min_delta must be non-negative")
+    if int(hyperparams.q_no_improvement_patience_episodes) < 0:
+        raise ValueError("q_no_improvement_patience_episodes must be non-negative")
     q_shares = [
         float(getattr(hyperparams, "q_zero_sample_share")),
         float(getattr(hyperparams, "q_default_sample_share")),
@@ -1033,6 +1092,7 @@ def main():
 
     summaries = []
     failure_report = None
+    canonical_diagnostic_reference = None
     episode = Episode(
             models=models,
             optimizers=optimizers,
@@ -1180,6 +1240,33 @@ def main():
             break
         ep_summary = summary.get("module_summaries", summary)
         save_stage_df(ep, episode_mode, resolve_base_dir(run_root, ROOT), episode.df, episode.df_macro, episode.df_sdf)
+        if bool(getattr(hyperparams, "save_episode_diagnostics", False)):
+            canonical_diagnostic_reference = save_episode_diagnostics(
+                run_root=resolve_base_dir(run_root, ROOT),
+                episode=ep,
+                model=models["policy_value"],
+                firm_df=episode.df,
+                module_summary=ep_summary,
+                canonical_reference=canonical_diagnostic_reference,
+            )
+        if bool(
+            getattr(hyperparams, "save_intermediate_stage_checkpoints", False)
+        ):
+            stage_dir = (
+                resolve_base_dir(run_root, ROOT)
+                / "episode_diagnostics"
+                / f"ep_{ep:03d}"
+            )
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            for stage_name, state in episode._intermediate_stage_states.items():
+                torch.save(
+                    {
+                        "episode": ep,
+                        "stage": stage_name,
+                        "models": {"policy_value": state},
+                    },
+                    stage_dir / f"{stage_name}.pt",
+                )
 
         # 裸 state_dict 无法区分 direct-Q 与 legacy `b * q_unit`（q-head shape 相同），
         # 因此同时落盘 metadata/（hyperparams / config snapshot / model spec）与 combined ckpt。
