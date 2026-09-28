@@ -8,6 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=01:00:00
+#SBATCH --exclude=g85,g05
 
 set -euo pipefail
 
