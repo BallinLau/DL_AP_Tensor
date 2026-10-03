@@ -49,17 +49,24 @@ The experiment calls production `Episode._compute_bp_cache_loss()` directly. It 
 
 The default main comparison is `last` versus `last` after 500 successful optimizer updates. `best.pt` is selected only as a supplemental checkpoint using the maximum branch-level confidence-weighted validation MAE. There is no early stopping.
 
+Train/validation monitoring is evaluated in bounded chunks. `--eval-batch-size`
+controls the largest evaluation forward; by default it is
+`min(resolved training batch size, 4096)`. Losses are aggregated with the
+production current-`eta_t` active-row denominator, weighted MAE uses global
+numerator/denominator sums, and the P90 gap is computed from all eligible
+row-level errors rather than averaged batch quantiles.
+
 The fixed schedule includes batches without active refinancing supervision. Both arms skip the same such batches and do not count them as successful optimizer updates.
 
 ## External Evaluation
 
-Formal execution reconstructs only the existing on-distribution bank from the baseline diagnostic metadata. It requires the reconstructed ordered `source_index` sequence and shock-bank hash to match saved provenance. It evaluates:
+Formal execution reconstructs only the existing on-distribution bank from the baseline diagnostic metadata. It requires the reconstructed ordered `source_index` sequence and shock-bank hash to match saved provenance. Before either arm takes an optimizer step, it evaluates and validates the initial checkpoint against the saved baseline. Structural `top2_margin=NaN` values are allowed only on matching refinancing-inactive rows; masks, identities, finite fields, shock hashes, and applicable margins remain strict. Only after that gate passes are the two arms trained. It evaluates:
 
 - initial checkpoint;
 - `frozen_encoder/last.pt` state;
 - `trainable_encoder/last.pt` state.
 
-The student supplies BP predictions only. The unchanged baseline teacher supplies objectives, `Phat` masks, value scales, action targets, and regrets. The initial high-error tail IDs are fixed before A/B comparison. Dense-grid and presentation diagnostics are not run.
+The student supplies BP predictions only. The unchanged baseline teacher supplies objectives, `Phat` masks, value scales, action targets, and regrets. The validated initial result is saved and reused; it is not recomputed after training. Two baseline-fixed ID sets are reported separately: Primary large-gap rows, and Primary rows that are both large-gap and high-relative-regret. Dense-grid and presentation diagnostics are not run.
 
 ## Outputs
 
@@ -82,8 +89,10 @@ external_eval/initial_state_level.csv
 external_eval/frozen_encoder_last_state_level.csv
 external_eval/trainable_encoder_last_state_level.csv
 external_eval/comparison.csv
-external_eval/fixed_initial_tail_ids.csv
-external_eval/fixed_tail_comparison.csv
+external_eval/fixed_initial_large_gap_tail_ids.csv
+external_eval/fixed_large_gap_tail_comparison.csv
+external_eval/fixed_initial_large_gap_high_regret_tail_ids.csv
+external_eval/fixed_large_gap_high_regret_tail_comparison.csv
 external_eval/metadata.json
 ```
 
@@ -111,6 +120,16 @@ sbatch --export=ALL,RUN_PREFLIGHT_ONLY=1,REQUIRED_COMMIT="$(git -C DL_AP_Tensor 
   DL_AP_Tensor/slurm/run_bp_encoder_freeze_ablation_ep2.slurm
 ```
 
+This checks paths, checkpoint metadata, and CLI configuration only. It does
+**not** claim that the full baseline evaluator has reproduced successfully.
+
+Two-step smoke with the full initial-reproduction gate enabled:
+
+```bash
+sbatch --export=ALL,STEPS=2,REQUIRED_COMMIT="$(git -C DL_AP_Tensor rev-parse HEAD)" \
+  DL_AP_Tensor/slurm/run_bp_encoder_freeze_ablation_ep2.slurm
+```
+
 Formal submission using cache reconstruction from the saved EP2 dataframe:
 
 ```bash
@@ -125,7 +144,7 @@ sbatch --export=ALL,CACHE_MODE=saved,TRAIN_CACHE=/absolute/train.pt,VAL_CACHE=/a
   DL_AP_Tensor/slurm/run_bp_encoder_freeze_ablation_ep2.slurm
 ```
 
-Important environment overrides include `REPO_DIR`, `SOURCE_RUN_ROOT`, `BASELINE_DIAG_DIR`, `OUTPUT_DIR`, `EPISODE`, `STEPS`, `SEED`, `CHECKPOINT`, `TEACHER_CHECKPOINT`, `COMBINED_CHECKPOINT`, `TRAIN_CACHE`, `VAL_CACHE`, `CACHE_MODE`, `LEARNING_RATE`, `BATCH_SIZE`, and `REQUIRED_COMMIT`. Empty optional learning-rate or batch-size values are not passed; the checkpoint hyperparameters are then used. If both `checkpoints/ep2_combined.pt` and `checkpoints_analysis/ep2_combined.pt` exist, set `COMBINED_CHECKPOINT` explicitly instead of allowing an arbitrary choice.
+Important environment overrides include `REPO_DIR`, `SOURCE_RUN_ROOT`, `BASELINE_DIAG_DIR`, `OUTPUT_DIR`, `EPISODE`, `STEPS`, `SEED`, `CHECKPOINT`, `TEACHER_CHECKPOINT`, `COMBINED_CHECKPOINT`, `TRAIN_CACHE`, `VAL_CACHE`, `CACHE_MODE`, `LEARNING_RATE`, `BATCH_SIZE`, `EVAL_BATCH_SIZE`, and `REQUIRED_COMMIT`. Empty optional learning-rate or batch-size values are not passed; the checkpoint hyperparameters are then used. If both `checkpoints/ep2_combined.pt` and `checkpoints_analysis/ep2_combined.pt` exist, set `COMBINED_CHECKPOINT` explicitly instead of allowing an arbitrary choice.
 
 ## Local Validation
 

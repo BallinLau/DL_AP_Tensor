@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import sys
 
 import pytest
+import pandas as pd
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,10 +22,13 @@ from experiments.run_bp_encoder_freeze_ablation import (
     cache_hash,
     clone_paired_students,
     configure_trainable_parameters,
+    evaluate_cache,
+    execute_after_initial_reproduction_gate,
     make_loss_adapter,
     optimizer_parameter_names,
     resolve_checkpoint,
     run_arm,
+    validate_initial_evaluator_reproduction,
     validate_stage_checkpoint_metadata,
     validate_cache_teacher,
     validate_cache,
@@ -207,6 +211,7 @@ def test_arm_training_updates_exact_modules_and_preserves_teacher_cache(tmp_path
         val_cache=val_cache,
         schedule=schedule,
         record_steps=[0, 1, 2],
+        evaluation_max_batch_rows=2,
         learning_rate=1e-3,
         weight_decay=0.0,
         output_dir=tmp_path,
@@ -225,6 +230,7 @@ def test_arm_training_updates_exact_modules_and_preserves_teacher_cache(tmp_path
         val_cache=val_cache,
         schedule=schedule,
         record_steps=[0, 1, 2],
+        evaluation_max_batch_rows=2,
         learning_rate=1e-3,
         weight_decay=0.0,
         output_dir=tmp_path,
@@ -300,3 +306,141 @@ def test_stage_checkpoint_episode_and_stage_mismatch_fail_clearly(tmp_path: Path
         expected_stage="post_bp",
         label="student initialization checkpoint",
     )
+
+
+def _identity_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "branch": ["p0", "p0", "pi_low"],
+            "bank_row": [0, 1, 2],
+            "source_index": [10, 11, 12],
+            "refi_active": [True, False, True],
+            "primary_mask": [True, False, True],
+            "survival": [True, False, True],
+            "numerical_identified": [True, False, True],
+            "bp_pred": [0.2, 0.3, 0.4],
+            "bp_star": [0.21, 0.31, 0.39],
+            "regret": [0.01, 0.02, 0.03],
+            "top2_margin": [0.4, float("nan"), 0.7],
+        }
+    )
+
+
+def test_initial_reproduction_accepts_matching_structural_eta0_margin_nan():
+    saved = _identity_frame()
+    reproduced = saved.copy(deep=True)
+    errors = validate_initial_evaluator_reproduction(saved, reproduced)
+    assert errors == {
+        "bp_pred": 0.0,
+        "bp_star": 0.0,
+        "regret": 0.0,
+        "top2_margin": 0.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda frame: frame.__setitem__("top2_margin", [0.4, 0.0, 0.7]), "structural NaN"),
+        (lambda frame: frame.__setitem__("top2_margin", [float("nan"), float("nan"), 0.7]), "refi_active"),
+        (lambda frame: frame.__setitem__("refi_active", [True, True, True]), "mask 'refi_active'"),
+        (lambda frame: frame.__setitem__("bp_pred", [0.2, 0.3, 0.5]), "does not reproduce"),
+        (lambda frame: frame.__setitem__("top2_margin", [0.4, float("nan"), float("inf")]), "contains Inf"),
+        (lambda frame: frame.__setitem__("source_index", [10, 11, 99]), "different row count"),
+    ],
+)
+def test_initial_reproduction_rejects_invalid_nan_mask_or_value(mutation, message):
+    saved = _identity_frame()
+    reproduced = saved.copy(deep=True)
+    mutation(reproduced)
+    with pytest.raises(RuntimeError, match=message):
+        validate_initial_evaluator_reproduction(saved, reproduced)
+
+
+def _merge_cache(cache: list[dict]) -> dict:
+    merged = {}
+    n_rows = [int(item["parent"].shape[0]) for item in cache]
+    for key in cache[0]:
+        values = [item[key] for item in cache]
+        if all(
+            torch.is_tensor(value)
+            and value.ndim > 0
+            and int(value.shape[0]) == rows
+            for value, rows in zip(values, n_rows)
+        ):
+            merged[key] = torch.cat(values, dim=0)
+        else:
+            merged[key] = values[0]
+    return merged
+
+
+def test_evaluate_cache_chunked_global_aggregation_matches_one_shot_reference():
+    hp = _hyperparams()
+    model = _model()
+    full = _cache(model)[0]
+    first = {
+        key: value[:3] if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == 4 else value
+        for key, value in full.items()
+    }
+    second = {
+        key: value[3:] if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == 4 else value
+        for key, value in full.items()
+    }
+    cache = [first, second]
+    adapter = make_loss_adapter(model, hp, torch.device("cpu"))
+    observed_batch_sizes = []
+
+    def record_encoder_batch(_module, inputs):
+        observed_batch_sizes.append(int(inputs[0].shape[0]))
+
+    handle = model.policy_encoder.register_forward_pre_hook(record_encoder_batch)
+    try:
+        chunked = evaluate_cache(
+            adapter,
+            cache,
+            split="validation",
+            arm="chunked",
+            step=0,
+            max_batch_rows=2,
+        )
+    finally:
+        handle.remove()
+    reference = evaluate_cache(
+        adapter,
+        [_merge_cache(cache)],
+        split="validation",
+        arm="reference",
+        step=0,
+        max_batch_rows=100,
+    )
+    assert observed_batch_sizes
+    assert max(observed_batch_sizes) <= 2
+    for left, right in zip(chunked, reference):
+        assert left["branch"] == right["branch"]
+        for key in (
+            "total_loss",
+            "branch_loss",
+            "unweighted_mae",
+            "signed_bias",
+            "p90_absolute_action_gap",
+            "confidence_weighted_mae",
+            "confidence_weight_sum",
+            "active_n",
+            "loss_active_count",
+        ):
+            assert left[key] == pytest.approx(right[key], abs=1e-7, rel=1e-7)
+
+
+def test_initial_reproduction_failure_prevents_any_training_update():
+    calls = {"training": 0}
+
+    def fail_reproduction():
+        raise RuntimeError("baseline reproduction failed")
+
+    def would_train():
+        calls["training"] += 1
+        return "trained"
+
+    with pytest.raises(RuntimeError, match="baseline reproduction failed"):
+        execute_after_initial_reproduction_gate(fail_reproduction, would_train)
+    assert calls["training"] == 0

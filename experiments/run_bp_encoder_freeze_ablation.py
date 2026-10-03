@@ -14,7 +14,7 @@ import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import matplotlib
 
@@ -311,6 +311,31 @@ def _policy_predictions(adapter: Episode, item: Mapping[str, Any]) -> dict[str, 
     return {"bp0": bp0, "bpi": bpi, "mix": bp_mix}
 
 
+def _iter_cache_chunks(
+    cache: Sequence[Mapping[str, Any]],
+    max_batch_rows: int,
+) -> Sequence[dict[str, Any]]:
+    if int(max_batch_rows) <= 0:
+        raise ValueError("evaluation max_batch_rows must be positive")
+    chunks: list[dict[str, Any]] = []
+    for item in cache:
+        n_rows = int(item["parent"].shape[0])
+        for start in range(0, n_rows, int(max_batch_rows)):
+            stop = min(start + int(max_batch_rows), n_rows)
+            chunk = {
+                key: (
+                    value[start:stop]
+                    if torch.is_tensor(value)
+                    and value.ndim > 0
+                    and int(value.shape[0]) == n_rows
+                    else value
+                )
+                for key, value in item.items()
+            }
+            chunks.append(chunk)
+    return chunks
+
+
 def evaluate_cache(
     adapter: Episode,
     cache: Sequence[Mapping[str, Any]],
@@ -318,11 +343,14 @@ def evaluate_cache(
     split: str,
     arm: str,
     step: int,
+    max_batch_rows: int,
     module_diagnostics: Mapping[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     model = adapter.models["policy_value"]
     was_training = model.training
-    loss_item: dict[str, Any]
+    loss_numerator = 0.0
+    loss_denominator = 0
+    branch_loss_numerators = {name: 0.0 for name in ("bp0", "bpi", "mix")}
     branch_values: dict[str, dict[str, list[torch.Tensor]]] = {
         name: {key: [] for key in ("pred", "target", "confidence", "active")}
         for name in ("bp0", "bpi", "mix")
@@ -330,14 +358,17 @@ def evaluate_cache(
     try:
         model.eval()
         with torch.no_grad():
-            merged = {
-                key: torch.cat([item[key].detach().cpu() for item in cache], dim=0)
-                for key in REQUIRED_CACHE_FIELDS
-                if key != "teacher_snapshot_hash"
-            }
-            merged["teacher_snapshot_hash"] = cache[0]["teacher_snapshot_hash"]
-            _, loss_item = adapter._compute_bp_cache_loss(merged)
-            for item in cache:
+            for item in _iter_cache_chunks(cache, max_batch_rows):
+                _, loss_item = adapter._compute_bp_cache_loss(item)
+                current_eta = item.get("eta_current", item["parent"][:, 2:3])
+                active_count = int((current_eta.detach().cpu() > 0.5).sum().item())
+                if active_count > 0:
+                    loss_denominator += active_count
+                    loss_numerator += float(loss_item["total"]) * active_count
+                    for branch in branch_loss_numerators:
+                        branch_loss_numerators[branch] += (
+                            float(loss_item[f"{branch}_loss"]) * active_count
+                        )
                 predictions = _policy_predictions(adapter, item)
                 active = item.get("eta_current", item["parent"][:, 2:3]).detach().cpu() > 0.5
                 for branch, target_key, confidence_key in (
@@ -356,9 +387,15 @@ def evaluate_cache(
         model.train(was_training)
 
     rows = []
-    total_loss = float(loss_item["total"])
+    total_loss = (
+        loss_numerator / loss_denominator
+        if loss_denominator > 0 else 0.0
+    )
     loss_by_branch = {
-        branch: float(loss_item[f"{branch}_loss"])
+        branch: (
+            branch_loss_numerators[branch] / loss_denominator
+            if loss_denominator > 0 else 0.0
+        )
         for branch in ("bp0", "bpi", "mix")
     }
     for branch, values in branch_values.items():
@@ -389,6 +426,8 @@ def evaluate_cache(
                 if weighted_denom > 0.0 else float("nan")
             ),
             "confidence_weight_sum": weighted_denom,
+            "loss_active_count": int(loss_denominator),
+            "evaluation_max_batch_rows": int(max_batch_rows),
             **dict(module_diagnostics or {}),
         }
         rows.append(row)
@@ -499,6 +538,7 @@ def run_arm(
     val_cache: list[dict[str, Any]],
     schedule: Sequence[int],
     record_steps: Sequence[int],
+    evaluation_max_batch_rows: int,
     learning_rate: float,
     weight_decay: float,
     output_dir: Path,
@@ -543,8 +583,24 @@ def run_arm(
             "nonfinite_failures": nonfinite,
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
         }
-        records.extend(evaluate_cache(adapter, train_cache, split="train", arm=arm, step=step, module_diagnostics=diagnostics))
-        val_rows = evaluate_cache(adapter, val_cache, split="validation", arm=arm, step=step, module_diagnostics=diagnostics)
+        records.extend(evaluate_cache(
+            adapter,
+            train_cache,
+            split="train",
+            arm=arm,
+            step=step,
+            max_batch_rows=evaluation_max_batch_rows,
+            module_diagnostics=diagnostics,
+        ))
+        val_rows = evaluate_cache(
+            adapter,
+            val_cache,
+            split="validation",
+            arm=arm,
+            step=step,
+            max_batch_rows=evaluation_max_batch_rows,
+            module_diagnostics=diagnostics,
+        )
         records.extend(val_rows)
         score = max(
             float(row["confidence_weighted_mae"])
@@ -1036,21 +1092,144 @@ def evaluate_external_fixed_teacher(
     }
 
 
-def run_external_evaluation(
+def _strict_bool_array(frame: pd.DataFrame, column: str) -> np.ndarray:
+    if column not in frame:
+        raise ValueError(f"initial evaluator reproduction is missing mask column {column!r}")
+    values = frame[column]
+    if values.isna().any():
+        raise RuntimeError(f"initial evaluator mask {column!r} contains missing values")
+    unique = set(values.unique().tolist())
+    if not unique.issubset({True, False, 1, 0}):
+        raise RuntimeError(
+            f"initial evaluator mask {column!r} is not boolean: {sorted(map(str, unique))}"
+        )
+    return values.to_numpy(dtype=bool)
+
+
+def validate_initial_evaluator_reproduction(
+    saved: pd.DataFrame,
+    reproduced: pd.DataFrame,
+    *,
+    tolerance: float = 1e-5,
+) -> dict[str, float]:
+    identity_keys = ["branch", "bank_row", "source_index"]
+    required = set(identity_keys) | {
+        "refi_active", "primary_mask", "bp_pred", "bp_star", "regret", "top2_margin"
+    }
+    for label, frame in (("saved", saved), ("reproduced", reproduced)):
+        missing = sorted(required - set(frame.columns))
+        if missing:
+            raise ValueError(f"{label} initial evaluator rows are missing columns: {missing}")
+        if frame.duplicated(identity_keys).any():
+            raise RuntimeError(
+                f"{label} initial evaluator rows are not unique on {identity_keys}"
+            )
+    aligned = saved.merge(
+        reproduced,
+        on=identity_keys,
+        how="outer",
+        suffixes=("_saved", "_reproduced"),
+        indicator=True,
+        validate="one_to_one",
+    )
+    if len(aligned) != len(saved) or len(aligned) != len(reproduced):
+        raise RuntimeError("initial evaluator reproduction has a different row count")
+    if not bool((aligned["_merge"] == "both").all()):
+        raise RuntimeError(
+            "initial evaluator reproduction did not align every branch/bank_row/source_index"
+        )
+
+    mask_columns = ["refi_active", "primary_mask"]
+    mask_columns.extend(
+        column
+        for column in ("survival", "numerical_identified")
+        if column in saved.columns or column in reproduced.columns
+    )
+    for column in mask_columns:
+        saved_mask = _strict_bool_array(aligned, f"{column}_saved")
+        reproduced_mask = _strict_bool_array(aligned, f"{column}_reproduced")
+        if not np.array_equal(saved_mask, reproduced_mask):
+            raise RuntimeError(f"initial evaluator mask {column!r} does not reproduce")
+
+    errors: dict[str, float] = {}
+    for column in ("bp_pred", "bp_star", "regret"):
+        left = aligned[f"{column}_saved"].to_numpy(dtype=np.float64)
+        right = aligned[f"{column}_reproduced"].to_numpy(dtype=np.float64)
+        if not np.isfinite(left).all() or not np.isfinite(right).all():
+            raise RuntimeError(
+                f"initial evaluator identity column {column!r} contains NaN or Inf"
+            )
+        errors[column] = float(np.max(np.abs(left - right))) if len(left) else 0.0
+
+    left_margin = aligned["top2_margin_saved"].to_numpy(dtype=np.float64)
+    right_margin = aligned["top2_margin_reproduced"].to_numpy(dtype=np.float64)
+    if np.isinf(left_margin).any() or np.isinf(right_margin).any():
+        raise RuntimeError("initial evaluator top2_margin contains Inf")
+    refi_active = _strict_bool_array(aligned, "refi_active_saved")
+    if not np.isfinite(left_margin[refi_active]).all() or not np.isfinite(
+        right_margin[refi_active]
+    ).all():
+        raise RuntimeError("initial evaluator top2_margin is non-finite on refi_active rows")
+    inactive = ~refi_active
+    if not np.array_equal(np.isnan(left_margin[inactive]), np.isnan(right_margin[inactive])):
+        raise RuntimeError("initial evaluator top2_margin has a one-sided structural NaN")
+    if inactive.any() and (
+        not np.isnan(left_margin[inactive]).all()
+        or not np.isnan(right_margin[inactive]).all()
+    ):
+        raise RuntimeError(
+            "initial evaluator top2_margin must be structural NaN on refinancing-inactive rows"
+        )
+    errors["top2_margin"] = (
+        float(np.max(np.abs(left_margin[refi_active] - right_margin[refi_active])))
+        if refi_active.any() else 0.0
+    )
+    excessive = {key: value for key, value in errors.items() if value > float(tolerance)}
+    if excessive:
+        raise RuntimeError(
+            f"initial fixed evaluator does not reproduce saved baseline: {excessive}"
+        )
+    return errors
+
+
+def _write_external_result(
+    external_root: Path,
+    label: str,
+    state: pd.DataFrame,
+    summary: pd.DataFrame,
+) -> None:
+    state.to_csv(external_root / f"{label}_state_level.csv", index=False)
+    summary.to_csv(external_root / f"{label}_summary.csv", index=False)
+    build_binned_summary(
+        state, column="b", edges=B_BIN_EDGES, bin_column="b_bin"
+    ).to_csv(external_root / f"{label}_by_b_bin.csv", index=False)
+    build_binned_summary(
+        state, column="z", edges=Z_BIN_EDGES, bin_column="z_bin"
+    ).to_csv(external_root / f"{label}_by_z_bin.csv", index=False)
+
+
+@dataclass
+class ExternalEvaluationContext:
+    bank: StateBank
+    baseline_rows: pd.DataFrame
+    baseline_meta: dict[str, Any]
+    initial_state: pd.DataFrame
+    initial_summary: pd.DataFrame
+    metadata: dict[str, Any]
+
+
+def prepare_initial_external_evaluation(
     *,
     args: argparse.Namespace,
     output_dir: Path,
     initial: torch.nn.Module,
-    arms: Mapping[str, ArmResult],
     teacher: torch.nn.Module,
     loaded: Any,
-    train_cache: Sequence[Mapping[str, Any]],
-    val_cache: Sequence[Mapping[str, Any]],
-) -> pd.DataFrame:
+) -> ExternalEvaluationContext:
     bank, baseline_rows, baseline_meta, _firm, _macro = _fixed_external_bank(
         args.baseline_diag_dir.resolve(), device=next(initial.parameters()).device
     )
-    baseline_bank_meta = baseline_meta["banks"]["on_distribution"]
+    bank_meta = baseline_meta["banks"]["on_distribution"]
     expected_policy_hash = baseline_meta.get("hashes", {}).get("policy_value_before")
     expected_sdf_hash = baseline_meta.get("hashes", {}).get("sdf_fc1_before")
     actual_policy_hash = model_state_hash(initial)
@@ -1060,20 +1239,91 @@ def run_external_evaluation(
             "initial post_bp policy checkpoint does not match baseline evaluator provenance"
         )
     if expected_sdf_hash is not None and actual_sdf_hash != expected_sdf_hash:
-        raise RuntimeError(
-            "SDF/FC1 checkpoint does not match baseline evaluator provenance"
-        )
-    expected_shock_hash = baseline_bank_meta.get("shock_bank_sha256")
+        raise RuntimeError("SDF/FC1 checkpoint does not match baseline evaluator provenance")
     thresholds = baseline_meta.get("thresholds", {})
     for key in ("large_gap", "high_regret_relative", "weak_margin_relative"):
         if key not in thresholds:
             raise ValueError(f"baseline metadata is missing thresholds.{key}")
+
+    state, summary, initial_meta = evaluate_external_fixed_teacher(
+        label="initial",
+        student=initial,
+        teacher_model=teacher,
+        sdf_fc1=loaded.models["sdf_fc1"],
+        loaded=loaded,
+        bank=bank,
+        n_child_shocks=int(bank_meta["n_child_shocks"]),
+        shock_seed=int(bank_meta["shock_seed"]),
+        teacher_margin_tol=float(baseline_meta["teacher_margin_tol"]),
+        large_gap_threshold=float(thresholds["large_gap"]),
+        high_regret_relative_threshold=float(thresholds["high_regret_relative"]),
+        weak_margin_relative_threshold=float(thresholds["weak_margin_relative"]),
+    )
+    expected_shock_hash = bank_meta.get("shock_bank_sha256")
+    if expected_shock_hash is not None and initial_meta["shock_bank_sha256"] != expected_shock_hash:
+        raise RuntimeError("initial: evaluator shock bank hash differs from saved baseline")
+    state.insert(0, "student", "initial")
+    summary.insert(0, "student", "initial")
+    identity_errors = validate_initial_evaluator_reproduction(baseline_rows, state)
     external_root = output_dir / "external_eval"
     external_root.mkdir(parents=True, exist_ok=True)
-    models = {"initial": initial, **{f"{arm}_last": result.model for arm, result in arms.items()}}
-    summaries = []
-    state_frames = {}
-    metadata = {}
+    _write_external_result(external_root, "initial", state, summary)
+    metadata = {
+        "initial": initial_meta,
+        "initial_reproduction_max_abs_error": identity_errors,
+        "initial_reproduction_status": "passed_before_ab_training",
+        "provenance": {
+            "policy_hash_expected": expected_policy_hash,
+            "policy_hash_actual": actual_policy_hash,
+            "sdf_hash_expected": expected_sdf_hash,
+            "sdf_hash_actual": actual_sdf_hash,
+            "rebuilt_bank_identity_sha256": baseline_meta[
+                "ablation_rebuilt_bank_identity_sha256"
+            ],
+        },
+    }
+    print("Full baseline evaluator reproduction passed before A/B training.", flush=True)
+    return ExternalEvaluationContext(
+        bank=bank,
+        baseline_rows=baseline_rows,
+        baseline_meta=baseline_meta,
+        initial_state=state,
+        initial_summary=summary,
+        metadata=metadata,
+    )
+
+
+def execute_after_initial_reproduction_gate(
+    pretraining_gate: Callable[[], Any] | None,
+    paired_training: Callable[[], Any],
+) -> tuple[Any, Any]:
+    context = pretraining_gate() if pretraining_gate is not None else None
+    return context, paired_training()
+
+
+def run_external_evaluation(
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    context: ExternalEvaluationContext,
+    arms: Mapping[str, ArmResult],
+    teacher: torch.nn.Module,
+    loaded: Any,
+    train_cache: Sequence[Mapping[str, Any]],
+    val_cache: Sequence[Mapping[str, Any]],
+) -> pd.DataFrame:
+    bank = context.bank
+    baseline_rows = context.baseline_rows
+    baseline_meta = context.baseline_meta
+    baseline_bank_meta = baseline_meta["banks"]["on_distribution"]
+    expected_shock_hash = baseline_bank_meta.get("shock_bank_sha256")
+    thresholds = baseline_meta["thresholds"]
+    external_root = output_dir / "external_eval"
+    external_root.mkdir(parents=True, exist_ok=True)
+    models = {f"{arm}_last": result.model for arm, result in arms.items()}
+    summaries = [context.initial_summary]
+    state_frames = {"initial": context.initial_state}
+    metadata = dict(context.metadata)
     for label, model in models.items():
         state, summary, meta = evaluate_external_fixed_teacher(
             label=label,
@@ -1095,62 +1345,45 @@ def run_external_evaluation(
             )
         state.insert(0, "student", label)
         summary.insert(0, "student", label)
-        state.to_csv(external_root / f"{label}_state_level.csv", index=False)
-        summary.to_csv(external_root / f"{label}_summary.csv", index=False)
-        build_binned_summary(
-            state, column="b", edges=B_BIN_EDGES, bin_column="b_bin"
-        ).to_csv(external_root / f"{label}_by_b_bin.csv", index=False)
-        build_binned_summary(
-            state, column="z", edges=Z_BIN_EDGES, bin_column="z_bin"
-        ).to_csv(external_root / f"{label}_by_z_bin.csv", index=False)
+        _write_external_result(external_root, label, state, summary)
         state_frames[label] = state
         summaries.append(summary)
         metadata[label] = meta
-    identity_columns = ("bp_pred", "bp_star", "regret", "top2_margin")
-    saved_initial = baseline_rows[["branch", "bank_row", *identity_columns]].copy()
-    reproduced_initial = state_frames["initial"][["branch", "bank_row", *identity_columns]].copy()
-    identity = saved_initial.merge(
-        reproduced_initial,
-        on=["branch", "bank_row"],
-        suffixes=("_saved", "_reproduced"),
-        validate="one_to_one",
-    )
-    if len(identity) != len(saved_initial):
-        raise RuntimeError("initial evaluator reproduction did not cover every saved state row")
-    identity_errors = {}
-    for column in identity_columns:
-        saved = identity[f"{column}_saved"].to_numpy(dtype=np.float64)
-        reproduced = identity[f"{column}_reproduced"].to_numpy(dtype=np.float64)
-        if not np.isfinite(saved).all() or not np.isfinite(reproduced).all():
-            raise RuntimeError(f"initial evaluator identity column {column} is non-finite")
-        identity_errors[column] = float(np.max(np.abs(saved - reproduced)))
-    if any(value > 1e-5 for value in identity_errors.values()):
-        raise RuntimeError(
-            f"initial fixed evaluator does not reproduce saved baseline: {identity_errors}"
-        )
-    metadata["initial_reproduction_max_abs_error"] = identity_errors
-    metadata["provenance"] = {
-        "policy_hash_expected": expected_policy_hash,
-        "policy_hash_actual": actual_policy_hash,
-        "sdf_hash_expected": expected_sdf_hash,
-        "sdf_hash_actual": actual_sdf_hash,
-        "rebuilt_bank_identity_sha256": baseline_meta[
-            "ablation_rebuilt_bank_identity_sha256"
-        ],
-    }
-    fixed_tail = baseline_rows[
+
+    fixed_large_gap_tail = baseline_rows[
         baseline_rows["primary_mask"].astype(bool)
         & (baseline_rows["bp_gap"] >= float(baseline_meta["thresholds"]["large_gap"]))
     ][["branch", "bank_row", "source_index"]].drop_duplicates()
-    fixed_tail.to_csv(external_root / "fixed_initial_tail_ids.csv", index=False)
-    tail_frames = []
-    for label, state in state_frames.items():
-        selected = state.merge(fixed_tail, on=["branch", "bank_row", "source_index"], how="inner")
-        selected.to_csv(external_root / f"{label}_fixed_tail.csv", index=False)
-        tail_frames.append(selected)
-    pd.concat(tail_frames, ignore_index=True).to_csv(
-        external_root / "fixed_tail_comparison.csv", index=False
-    )
+    fixed_high_regret_tail = baseline_rows[
+        baseline_rows["primary_mask"].astype(bool)
+        & (baseline_rows["bp_gap"] >= float(thresholds["large_gap"]))
+        & (
+            baseline_rows["regret_relative"]
+            >= float(thresholds["high_regret_relative"])
+        )
+    ][["branch", "bank_row", "source_index"]].drop_duplicates()
+    tail_definitions = {
+        "large_gap": fixed_large_gap_tail,
+        "large_gap_high_regret": fixed_high_regret_tail,
+    }
+    for tail_name, fixed_ids in tail_definitions.items():
+        fixed_ids.to_csv(
+            external_root / f"fixed_initial_{tail_name}_tail_ids.csv", index=False
+        )
+        tail_frames = []
+        for label, state in state_frames.items():
+            selected = state.merge(
+                fixed_ids,
+                on=["branch", "bank_row", "source_index"],
+                how="inner",
+            )
+            selected.to_csv(
+                external_root / f"{label}_fixed_{tail_name}_tail.csv", index=False
+            )
+            tail_frames.append(selected)
+        pd.concat(tail_frames, ignore_index=True).to_csv(
+            external_root / f"fixed_{tail_name}_tail_comparison.csv", index=False
+        )
     training_ids = set()
     for item in [*train_cache, *val_cache]:
         source_index = item.get("source_index")
@@ -1204,6 +1437,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--record-steps", type=int, nargs="+", default=list(DEFAULT_RECORD_STEPS))
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -1303,6 +1537,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         if resolved_batch_size <= 0:
             raise ValueError("batch size is missing/non-positive; pass --batch-size explicitly")
         args.resolved_batch_size = resolved_batch_size
+        resolved_eval_batch_size = (
+            int(args.eval_batch_size)
+            if args.eval_batch_size is not None
+            else min(resolved_batch_size, 4096)
+        )
+        if resolved_eval_batch_size <= 0:
+            raise ValueError("evaluation batch size must be positive")
         record_steps = resolve_record_steps(args.steps, args.record_steps)
         resolved = {
             "source_run_root": run_root,
@@ -1316,6 +1557,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "learning_rate": resolved_lr,
             "weight_decay": float(getattr(loaded.hyperparams, "policy_weight_decay", 0.0)),
             "batch_size": resolved_batch_size,
+            "evaluation_batch_size": resolved_eval_batch_size,
             "seed": int(args.seed),
             "device": str(device),
             "loss_space": str(getattr(loaded.hyperparams, "bp_grid_policy_loss_space", "output")),
@@ -1335,7 +1577,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         write_json(output_dir / "resolved_config.json", resolved)
         print(json.dumps(_json_value(resolved), indent=2), flush=True)
         if args.dry_run:
-            print("Dry-run preflight passed; cache construction and training were not executed.")
+            print(
+                "Path/checkpoint preflight passed. Full baseline evaluator reproduction, "
+                "cache construction, and A/B training were not executed."
+            )
             return
 
         random.seed(args.seed)
@@ -1371,9 +1616,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         if not torch.equal(initial_predictions["frozen_encoder"], initial_predictions["trainable_encoder"]):
             raise RuntimeError("paired students have different step-0 predictions")
         schedule = build_step_schedule(train_cache, args.steps, args.seed)
-        results = {}
-        all_metrics = []
-        checks = {
+        base_checks = {
             "step0_state_hash_equal": True,
             "step0_prediction_equal": True,
             "schedule_sha256": tensor_hash(torch.tensor(schedule, dtype=torch.long)),
@@ -1381,32 +1624,56 @@ def main(argv: Sequence[str] | None = None) -> None:
         }
         paired_cpu_rng = torch.random.get_rng_state()
         paired_cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        for arm in ("frozen_encoder", "trainable_encoder"):
-            torch.random.set_rng_state(paired_cpu_rng)
-            if paired_cuda_rng is not None:
-                torch.cuda.set_rng_state_all(paired_cuda_rng)
-            result = run_arm(
-                arm=arm,
-                model=students[arm],
-                hyperparams=loaded.hyperparams,
-                train_cache=train_cache,
-                val_cache=val_cache,
-                schedule=schedule,
-                record_steps=record_steps,
-                learning_rate=resolved_lr,
-                weight_decay=float(getattr(loaded.hyperparams, "policy_weight_decay", 0.0)),
+
+        def _paired_training() -> tuple[dict[str, ArmResult], list[dict[str, Any]], dict[str, Any]]:
+            results: dict[str, ArmResult] = {}
+            all_metrics: list[dict[str, Any]] = []
+            checks = dict(base_checks)
+            for arm in ("frozen_encoder", "trainable_encoder"):
+                torch.random.set_rng_state(paired_cpu_rng)
+                if paired_cuda_rng is not None:
+                    torch.cuda.set_rng_state_all(paired_cuda_rng)
+                result = run_arm(
+                    arm=arm,
+                    model=students[arm],
+                    hyperparams=loaded.hyperparams,
+                    train_cache=train_cache,
+                    val_cache=val_cache,
+                    schedule=schedule,
+                    record_steps=record_steps,
+                    evaluation_max_batch_rows=resolved_eval_batch_size,
+                    learning_rate=resolved_lr,
+                    weight_decay=float(
+                        getattr(loaded.hyperparams, "policy_weight_decay", 0.0)
+                    ),
+                    output_dir=output_dir,
+                    loaded=loaded,
+                    source_checkpoint=stage_checkpoint,
+                    teacher_hash_before=teacher_hash,
+                    teacher_model=cache_teacher,
+                    train_cache_hash_before=train_hash,
+                    val_cache_hash_before=val_hash,
+                    episode=args.episode,
+                )
+                results[arm] = result
+                all_metrics.extend(result.metrics)
+                checks[arm] = result.checks
+            return results, all_metrics, checks
+
+        pretraining_gate = None
+        if not args.skip_external_eval:
+            pretraining_gate = lambda: prepare_initial_external_evaluation(
+                args=args,
                 output_dir=output_dir,
+                initial=baseline,
+                teacher=external_teacher,
                 loaded=loaded,
-                source_checkpoint=stage_checkpoint,
-                teacher_hash_before=teacher_hash,
-                teacher_model=cache_teacher,
-                train_cache_hash_before=train_hash,
-                val_cache_hash_before=val_hash,
-                episode=args.episode,
             )
-            results[arm] = result
-            all_metrics.extend(result.metrics)
-            checks[arm] = result.checks
+        external_context, training_payload = execute_after_initial_reproduction_gate(
+            pretraining_gate,
+            _paired_training,
+        )
+        results, all_metrics, checks = training_payload
         metrics = pd.DataFrame(all_metrics)
         metrics.to_csv(output_dir / "training_metrics.csv", index=False)
         write_training_plot(metrics, output_dir)
@@ -1426,10 +1693,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         external = None
         if not args.skip_external_eval:
+            if external_context is None:
+                raise RuntimeError("external evaluation context was not prepared before training")
             external = run_external_evaluation(
                 args=args,
                 output_dir=output_dir,
-                initial=baseline,
+                context=external_context,
                 arms=results,
                 teacher=external_teacher,
                 loaded=loaded,

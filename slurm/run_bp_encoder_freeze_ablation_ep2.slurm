@@ -30,6 +30,7 @@ COMBINED_CHECKPOINT="${COMBINED_CHECKPOINT:-}"
 FIRM_DATA="${FIRM_DATA:-$SOURCE_RUN_ROOT/data/outputs/ep${EPISODE}_stage_modeb.pkl}"
 LEARNING_RATE="${LEARNING_RATE:-}"
 BATCH_SIZE="${BATCH_SIZE:-}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-}"
 REQUIRED_COMMIT="${REQUIRED_COMMIT:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-$WORK_ROOT/cachedir/bp_encoder_freeze_ablation_ep${EPISODE}_${SLURM_JOB_ID:-manual}_$(date +%Y%m%d_%H%M%S)}"
 RUN_PREFLIGHT_ONLY="${RUN_PREFLIGHT_ONLY:-0}"
@@ -80,6 +81,7 @@ echo "Train cache: ${TRAIN_CACHE:-<not provided>}"
 echo "Validation cache: ${VAL_CACHE:-<not provided>}"
 echo "Cache mode: $CACHE_MODE"
 echo "Episode/steps/seed: $EPISODE/$STEPS/$SEED"
+echo "Evaluation batch size: ${EVAL_BATCH_SIZE:-<auto: min(training batch, 4096)>}"
 echo "Output: $OUTPUT_DIR"
 echo "============================================================"
 
@@ -158,6 +160,9 @@ if [[ -n "$LEARNING_RATE" ]]; then
 fi
 if [[ -n "$BATCH_SIZE" ]]; then
   ARGS+=(--batch-size "$BATCH_SIZE")
+fi
+if [[ -n "$EVAL_BATCH_SIZE" ]]; then
+  ARGS+=(--eval-batch-size "$EVAL_BATCH_SIZE")
 fi
 if [[ "$SKIP_EXTERNAL_EVAL" == "1" ]]; then
   ARGS+=(--skip-external-eval)
