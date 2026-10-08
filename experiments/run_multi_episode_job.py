@@ -280,6 +280,31 @@ def parse_args() -> argparse.Namespace:
         choices=["target_grid", "legacy_foc_kkt"],
         help="bp training mode: target_grid distillation or legacy FOC/KKT",
     )
+    parser.add_argument(
+        "--pv-bp-head-training-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Train BP policy heads; disable for a diagnostic-only grid reference run",
+    )
+    parser.add_argument(
+        "--simulation-bp-action-source",
+        type=str.lower,
+        choices=["head", "grid"],
+        default=None,
+        help="Actual leverage action used by Episode>0 simulation",
+    )
+    parser.add_argument(
+        "--simulation-bp-grid-n-child-shocks",
+        type=int,
+        default=None,
+        help="Continuous child shocks used by the vectorized simulation grid policy",
+    )
+    parser.add_argument(
+        "--simulation-bp-grid-shock-seed",
+        type=int,
+        default=None,
+        help="Independent fixed shock-bank seed for simulation grid policy",
+    )
     parser.add_argument("--bp-grid-coarse-size", type=int, default=None, help="Coarse bp-grid size for target_grid mode")
     parser.add_argument("--bp-grid-fine-size", type=int, default=None, help="Local fine bp-grid size for target_grid mode")
     parser.add_argument(
@@ -723,6 +748,20 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.fc1_jacobian_penalty_interval = args.fc1_jacobian_penalty_interval
     if args.pv_bp_training_mode is not None:
         hyperparams.pv_bp_training_mode = args.pv_bp_training_mode
+    if args.pv_bp_head_training_enabled is not None:
+        hyperparams.pv_bp_head_training_enabled = bool(
+            args.pv_bp_head_training_enabled
+        )
+    if args.simulation_bp_action_source is not None:
+        hyperparams.simulation_bp_action_source = args.simulation_bp_action_source
+    if args.simulation_bp_grid_n_child_shocks is not None:
+        hyperparams.simulation_bp_grid_n_child_shocks = int(
+            args.simulation_bp_grid_n_child_shocks
+        )
+    if args.simulation_bp_grid_shock_seed is not None:
+        hyperparams.simulation_bp_grid_shock_seed = int(
+            args.simulation_bp_grid_shock_seed
+        )
     if args.bp_grid_coarse_size is not None:
         hyperparams.bp_grid_coarse_size = args.bp_grid_coarse_size
     if args.bp_grid_fine_size is not None:
@@ -747,6 +786,10 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.bp_grid_candidate_chunk_size = args.bp_grid_candidate_chunk_size
     if args.bp_grid_max_expanded_states is not None:
         hyperparams.bp_grid_max_expanded_states = args.bp_grid_max_expanded_states
+    if str(hyperparams.simulation_bp_action_source).lower() not in {"head", "grid"}:
+        raise ValueError("simulation_bp_action_source must be 'head' or 'grid'")
+    if int(hyperparams.simulation_bp_grid_n_child_shocks) < 1:
+        raise ValueError("simulation_bp_grid_n_child_shocks must be positive")
     if args.bp_grid_confidence_relative is not None:
         hyperparams.bp_grid_confidence_relative = bool(args.bp_grid_confidence_relative)
     if args.pv_target_grid_val_fraction is not None:
@@ -1208,6 +1251,10 @@ def main():
                     "sdf_collapse_log_mean_error": hyperparams.sdf_collapse_log_mean_error,
                     "sdf_collapse_mean_ratio": hyperparams.sdf_collapse_mean_ratio,
                     "pv_bp_training_mode": hyperparams.pv_bp_training_mode,
+                    "pv_bp_head_training_enabled": hyperparams.pv_bp_head_training_enabled,
+                    "simulation_bp_action_source": hyperparams.simulation_bp_action_source,
+                    "simulation_bp_grid_n_child_shocks": hyperparams.simulation_bp_grid_n_child_shocks,
+                    "simulation_bp_grid_shock_seed": hyperparams.simulation_bp_grid_shock_seed,
                     "pv_training_flow": hyperparams.pv_training_flow,
                     "pv_eval_epochs": hyperparams.pv_eval_epochs,
                     "bp_distill_epochs": hyperparams.bp_distill_epochs,
@@ -1310,6 +1357,8 @@ def main():
             "episode_mode": episode_mode,
             "sdf_wealth_loss_mode": hyperparams.sdf_wealth_loss_mode,
             "pv_bp_training_mode": hyperparams.pv_bp_training_mode,
+            "pv_bp_head_training_enabled": hyperparams.pv_bp_head_training_enabled,
+            "simulation_bp_action_source": hyperparams.simulation_bp_action_source,
             "pv_training_flow": hyperparams.pv_training_flow,
             "firm_target_update": hyperparams.firm_target_update,
             "module_summaries": ep_summary,
@@ -1325,6 +1374,8 @@ def main():
             f"horizon={hyperparams.simulate_horizon} "
             f"sdf_wealth_loss_mode={hyperparams.sdf_wealth_loss_mode} "
             f"pv_bp_training_mode={hyperparams.pv_bp_training_mode} "
+            f"pv_bp_head_training_enabled={hyperparams.pv_bp_head_training_enabled} "
+            f"simulation_bp_action_source={hyperparams.simulation_bp_action_source} "
             f"pv_training_flow={hyperparams.pv_training_flow} "
             f"firm_target_update={hyperparams.firm_target_update}"
         )
@@ -1348,6 +1399,7 @@ def main():
     if failure_report is not None:
         return
 
+    final_sim_kwargs = episode._prepare_simulation_kwargs({})
     final_sim = SimulateTS(
         models=models,
         config=Config,
@@ -1356,6 +1408,7 @@ def main():
         branch_num=Config.BRANCH_NUM,
         horizon=hyperparams.simulate_horizon,
         device=device,
+        **final_sim_kwargs,
     )
     df_firm_sim, df_macro_sim = final_sim.simulate()
     out_dir = resolve_base_dir(run_root, ROOT) / "data" / "outputs"

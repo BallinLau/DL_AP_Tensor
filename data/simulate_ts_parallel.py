@@ -170,6 +170,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
 
     firm_state = torch.stack([b, z, eta, i, x, hatcf, lnkf], dim=1)
     pv_model = sim.models.get("policy_value")
+    output = None
     if pv_model is not None:
         with torch.no_grad():
             output = forward_policy_value_for_simulation(pv_model, firm_state)
@@ -245,6 +246,40 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     Hatc = torch.where(alive_any, Hatc_raw, torch.full_like(C_total, -10.0))
     state["hatc_cal"] = Hatc.detach()
     state["lnk_cal"] = LnK.detach()
+
+    use_resolved_bp = (
+        getattr(sim, "bp_action_override", None) is not None
+        or getattr(sim, "bp_action_source", "head") == "grid"
+    )
+    if use_resolved_bp:
+        if output is None:
+            raise RuntimeError(
+                "resolved BP action requires a policy_value model output"
+            )
+        overridden = sim._resolve_bp_action(
+            sim=sim,
+            firm_state=firm_state.detach(),
+            model_output=output,
+            bp_head=bp.detach().reshape(-1, 1),
+            hatc_cal=Hatc[path_idx].detach().reshape(-1, 1),
+            lnk_cal=LnK[path_idx].detach().reshape(-1, 1),
+            path_index=path_idx.detach(),
+            firm_id=firm_id.detach(),
+            t=int(t),
+            branch=int(branch_k),
+        )
+        if not torch.is_tensor(overridden):
+            raise TypeError("resolved BP action must return a torch.Tensor")
+        overridden = overridden.to(device=bp.device, dtype=bp.dtype).reshape(-1)
+        if overridden.shape != bp.shape:
+            raise ValueError(
+                "resolved BP action returned shape "
+                f"{tuple(overridden.shape)}, expected {tuple(bp.shape)}"
+            )
+        if not torch.isfinite(overridden).all():
+            raise FloatingPointError("resolved BP action returned non-finite values")
+        bp = overridden
+        firm_rows[:, sim.FIRM_COLUMNS.index("bp")] = bp.to(firm_rows.dtype)
 
     macro_rows = torch.stack(
         [

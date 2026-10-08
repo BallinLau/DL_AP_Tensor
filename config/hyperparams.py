@@ -186,6 +186,12 @@ class HyperParams:
     # shapes.
     pq_cache_integrity_check: str = "metadata"
     bp_distill_trainable_scope: str = "heads_only"
+    # Reference-solver controls. Defaults preserve the historical training and
+    # rollout behavior; the dedicated reference Slurm selects False/grid.
+    pv_bp_head_training_enabled: bool = True
+    simulation_bp_action_source: str = "head"
+    simulation_bp_grid_n_child_shocks: int = 2
+    simulation_bp_grid_shock_seed: int = 314159
     # Optional Policy/Value mixture sampling for episode e>0.  When enabled,
     # refreshed SimulateTS parent groups are mixed with coverage Sample parent
     # groups after the post-refresh SDF/FC1 safety gate and before P/Q-BP

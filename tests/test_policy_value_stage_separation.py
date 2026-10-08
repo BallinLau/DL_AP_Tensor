@@ -155,6 +155,60 @@ def test_pq_stage_keeps_bp_heads_fixed():
     assert summary["policy_value_eval_step_count"] > 0
 
 
+def test_reference_mode_updates_p_but_keeps_bp_heads_bitwise_fixed(monkeypatch):
+    episode = _episode()
+    episode.hyperparams.pv_bp_head_training_enabled = False
+    batch = _batch(episode.device)
+    model = episode.models["policy_value"]
+    bp_head_params = list(model.bp0_head.parameters()) + list(model.bpi_head.parameters())
+    p_params = list(model.value_encoder.parameters()) + list(model.v0_head.parameters())
+    bp_before = [value.detach().clone() for value in bp_head_params]
+    p_before = [value.detach().clone() for value in p_params]
+
+    monkeypatch.setattr(
+        episode,
+        "_run_q_bootstrap_stage",
+        lambda *_args, **_kwargs: {"status": "accepted", "optimizer_steps": 0},
+    )
+    monkeypatch.setattr(
+        episode,
+        "_run_q_regime_training",
+        lambda *_args, **_kwargs: {
+            "status": "accepted",
+            "q_stage_required_gate_passed": True,
+        },
+    )
+    monkeypatch.setattr(episode, "_update_firm_target_now", lambda *_args: None)
+
+    result = episode._run_policy_value_staged([batch], [batch], n_epochs=1)
+
+    assert result["metadata"]["policy_value_stage_status"] == "accepted"
+    bp_stage = result["metadata"]["bp_distillation_stage"]
+    assert bp_stage["status"] == "diagnostic_only_training_disabled"
+    assert bp_stage["optimizer_steps"] == 0
+    assert all(torch.equal(before, after) for before, after in zip(bp_before, bp_head_params))
+    assert any(not torch.equal(before, after) for before, after in zip(p_before, p_params))
+
+
+def test_simulation_source_is_grid_only_after_episode_zero(monkeypatch):
+    episode = _episode()
+    episode.hyperparams.simulation_bp_action_source = "grid"
+    sentinel = object()
+    monkeypatch.setattr(
+        episode, "_build_simulation_bp_grid_policy", lambda: sentinel
+    )
+
+    episode.episode_id = 0
+    ep0 = episode._prepare_simulation_kwargs({"bp_action_source": "grid"})
+    assert ep0["bp_action_source"] == "head"
+    assert "bp_grid_policy" not in ep0
+
+    episode.episode_id = 1
+    ep1 = episode._prepare_simulation_kwargs({"bp_action_source": "head"})
+    assert ep1["bp_action_source"] == "grid"
+    assert ep1["bp_grid_policy"] is sentinel
+
+
 def test_bp_stage_uses_fixed_cache_and_keeps_non_bp_params_fixed():
     episode = _episode()
     batch = _batch(episode.device)

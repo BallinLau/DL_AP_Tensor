@@ -11,8 +11,9 @@ SimulateTS 类：树状分支模拟器
 import torch
 import pandas as pd
 import numpy as np
+import time
 import uuid
-from typing import Dict, Optional, Tuple, List
+from typing import Callable, Dict, Optional, Tuple, List
 from tqdm import tqdm
 
 import sys
@@ -63,7 +64,10 @@ class SimulateTS:
         main_branch: int = 0,
         enable_entry: bool = True,
         enable_exit: bool = True,
-        device: torch.device = None
+        device: torch.device = None,
+        bp_action_override: Optional[Callable[..., torch.Tensor]] = None,
+        bp_action_source: str = "head",
+        bp_grid_policy: Optional[Callable[..., torch.Tensor]] = None,
     ):
         """
         Args:
@@ -82,6 +86,9 @@ class SimulateTS:
             enable_entry: 是否启用公司进入
             enable_exit: 是否启用公司退出
             device: 设备
+            bp_action_override: 可选实验回调；优先于配置的 action source。
+            bp_action_source: ``head`` 沿用网络 BP，``grid`` 使用正式 grid policy。
+            bp_grid_policy: 复用整个 rollout 的冻结 grid-policy resolver。
         """
         self.models = models
         self.config = config
@@ -93,6 +100,16 @@ class SimulateTS:
         self.enable_entry = enable_entry
         self.enable_exit = enable_exit
         self.device = device or config.DEVICE
+        self.bp_action_override = bp_action_override
+        self.bp_action_source = str(bp_action_source).strip().lower()
+        if self.bp_action_source not in {"head", "grid"}:
+            raise ValueError(
+                "bp_action_source must be 'head' or 'grid', "
+                f"got {bp_action_source!r}"
+            )
+        self.bp_grid_policy = bp_grid_policy
+        if self.bp_action_source == "grid" and self.bp_grid_policy is None:
+            raise ValueError("bp_action_source='grid' requires bp_grid_policy")
         
         # 设置模型为 eval 模式
         self._set_models_eval()
@@ -145,7 +162,46 @@ class SimulateTS:
         - 时间维度仍按递推顺序推进
         - path 与 firm 维度在设备上并行批量计算
         """
-        return simulate_tensor_parallel(self)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            memory_before = int(torch.cuda.memory_allocated(self.device))
+        else:
+            memory_before = 0
+        started = time.perf_counter()
+        output = simulate_tensor_parallel(self)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            memory_after = int(torch.cuda.memory_allocated(self.device))
+            peak_memory = int(torch.cuda.max_memory_allocated(self.device))
+        else:
+            memory_after = 0
+            peak_memory = 0
+        elapsed = time.perf_counter() - started
+        verifier = getattr(self.bp_grid_policy, "verify_immutable", None)
+        if callable(verifier):
+            verifier()
+        instrumentation = getattr(self.bp_grid_policy, "instrumentation", None)
+        bp_metrics = instrumentation() if callable(instrumentation) else {}
+        parent_steps = int(bp_metrics.get("num_parent_states", 0))
+        output.meta.update({
+            "simulation_bp_source": self.bp_action_source,
+            "runtime_total": float(elapsed),
+            "runtime_per_firm_step": float(elapsed / max(parent_steps, 1)),
+            "gpu_memory_before_bytes": memory_before,
+            "gpu_memory_after_bytes": memory_after,
+            "peak_gpu_memory_bytes": peak_memory,
+            "bp_grid": bp_metrics,
+        })
+        self.last_simulation_meta = dict(output.meta)
+        return output
+
+    def _resolve_bp_action(self, **context) -> torch.Tensor:
+        """Resolve the actual leverage action at one vectorized node."""
+        if self.bp_action_override is not None:
+            return self.bp_action_override(**context)
+        if self.bp_action_source == "grid":
+            return self.bp_grid_policy(**context)
+        return context["bp_head"]
     
     def _simulate_path(self, path_idx: int) -> Tuple[List, List]:
         """
@@ -605,6 +661,40 @@ class SimulateTS:
         }
         state['hatc_cal'] = macro_row['Hatc']
         state['lnk_cal'] = macro_row['LnK']
+
+        use_resolved_bp = (
+            self.bp_action_override is not None
+            or self.bp_action_source == "grid"
+        )
+        if use_resolved_bp:
+            resolved = self._resolve_bp_action(
+                sim=self,
+                firm_state=firm_state.detach(),
+                model_output=output,
+                bp_head=bp.detach().reshape(-1, 1),
+                hatc_cal=torch.full(
+                    (n, 1), macro_row['Hatc'], device=device, dtype=firm_state.dtype
+                ),
+                lnk_cal=torch.full(
+                    (n, 1), macro_row['LnK'], device=device, dtype=firm_state.dtype
+                ),
+                path_index=torch.full((n,), int(path_idx), device=device),
+                firm_id=alive_idx.detach(),
+                t=int(t),
+                branch=int(branch_k),
+            )
+            if not torch.is_tensor(resolved):
+                raise TypeError("resolved BP action must return a torch.Tensor")
+            bp = resolved.to(device=device, dtype=firm_state.dtype).reshape(-1)
+            if bp.shape != b.shape:
+                raise ValueError(
+                    f"resolved BP action returned shape {tuple(bp.shape)}, "
+                    f"expected {tuple(b.shape)}"
+                )
+            if not torch.isfinite(bp).all():
+                raise FloatingPointError("resolved BP action returned non-finite values")
+            for row, value in zip(firm_data, bp):
+                row['bp'] = float(value.item())
         
         # 更新内生状态（杠杆和资本）
         state['bar_i'] = output.bar_i.reshape(-1)

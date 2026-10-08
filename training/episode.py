@@ -51,6 +51,7 @@ from .sdf_shock_bank import (
     shocks_to_x_children,
 )
 from .bp_grid_teacher import BPGridTeacher
+from .bp_simulation_policy import GridBPSimulationPolicy
 from .bp_policy_loss import (
     compute_target_grid_policy_logit_distillation_loss,
     compute_target_grid_policy_distillation_loss,
@@ -296,6 +297,7 @@ class Episode:
         self._last_nonfinite_grad_params: Dict[str, List[str]] = {}
         self._last_policy_value_stage_summary: Optional[Dict[str, float]] = None
         self._last_policy_value_gate_context: Dict[str, float] = {}
+        self._last_simulation_meta: Dict[str, Any] = {}
         self._policy_value_stage_target_model: Optional[nn.Module] = None
         self._target_grid_loss_component_mode = "joint"
         self._last_partial_module_summaries: Dict[str, Any] = {}
@@ -1075,6 +1077,64 @@ class Episode:
     def _pv_use_target_grid_bp(self) -> bool:
         mode = self._pv_bp_training_mode()
         return mode in {"target_grid", "grid", "grid_b", "full_grid"}
+
+    def _bp_head_training_enabled(self) -> bool:
+        return bool(
+            getattr(self.hyperparams, "pv_bp_head_training_enabled", True)
+        )
+
+    def _simulation_bp_action_source(self) -> str:
+        source = str(
+            getattr(self.hyperparams, "simulation_bp_action_source", "head")
+        ).strip().lower()
+        if source not in {"head", "grid"}:
+            raise ValueError(
+                "simulation_bp_action_source must be 'head' or 'grid', "
+                f"got {source!r}"
+            )
+        # Episode 0 remains the bootstrap/data-calibration episode. The grid
+        # reference policy is an outer-loop intervention for Episode > 0.
+        return "head" if int(self.episode_id) <= 0 else source
+
+    def _build_simulation_bp_grid_policy(self) -> GridBPSimulationPolicy:
+        target = self._target_policy_value()
+        return GridBPSimulationPolicy(
+            target_model=target,
+            sdf_fc1_model=self.models.get("sdf_fc1"),
+            p0_loss=self.loss_fns["p0"],
+            pi_loss=self.loss_fns["pi"],
+            hyperparams=self.hyperparams,
+            economic_config=self.config,
+            n_child_shocks=int(
+                getattr(self.hyperparams, "simulation_bp_grid_n_child_shocks", 2)
+            ),
+            shock_seed=int(
+                getattr(self.hyperparams, "simulation_bp_grid_shock_seed", 314159)
+            ),
+            require_cuda=True,
+        )
+
+    def _prepare_simulation_kwargs(self, simulate_kwargs: Dict) -> Dict:
+        sim_kwargs = dict(simulate_kwargs)
+        source = self._simulation_bp_action_source()
+        # The formal source is controlled only by HyperParams. This prevents a
+        # stale caller-provided kwarg from silently switching a replay back to
+        # the BP head (or opting Episode 0 into the grid intervention).
+        sim_kwargs["bp_action_source"] = source
+        if source == "grid":
+            sim_kwargs.setdefault(
+                "bp_grid_policy", self._build_simulation_bp_grid_policy()
+            )
+        else:
+            sim_kwargs.pop("bp_grid_policy", None)
+        logger.info(
+            "Simulation policy | episode=%d BP head training=%s actual leverage source=%s "
+            "BP diagnostics=enabled",
+            int(self.episode_id),
+            "ENABLED" if self._bp_head_training_enabled() else "DISABLED",
+            str(sim_kwargs["bp_action_source"]).upper(),
+        )
+        return sim_kwargs
 
     def _ablation_mode(self) -> str:
         return str(getattr(self.hyperparams, "ablation_mode", "baseline")).lower()
@@ -4762,7 +4822,11 @@ class Episode:
 
         value_delta = float(getattr(self.hyperparams, "bp_grid_value_huber_delta", 1.0))
         policy_delta = float(getattr(self.hyperparams, "bp_grid_policy_huber_delta", 0.05))
-        policy_weight = float(getattr(self.hyperparams, "bp_grid_policy_weight", 1.0))
+        bp_training_enabled = self._bp_head_training_enabled()
+        policy_weight = (
+            float(getattr(self.hyperparams, "bp_grid_policy_weight", 1.0))
+            if bp_training_enabled else 0.0
+        )
         policy_loss_space = self._bp_grid_policy_loss_space()
 
         value_scale = self._pv_bellman_residual_scale(self.models['policy_value'], parent_state)
@@ -4827,7 +4891,10 @@ class Episode:
                 mix_weight=mix_weight,
                 child_weights=child_weights,
             )
-            mix_policy_weight = float(getattr(self.hyperparams, "bp_grid_mix_policy_weight", 1.0))
+            mix_policy_weight = (
+                float(getattr(self.hyperparams, "bp_grid_mix_policy_weight", 1.0))
+                if bp_training_enabled else 0.0
+            )
             mix_sample_weight = mix_policy_sample_weight
             mix_total, mix_policy_loss, mix_policy_loss_elem = compute_target_grid_policy_distillation_loss(
                 bp_mix_pred,
@@ -4876,6 +4943,7 @@ class Episode:
                     f'{prefix}_grid_value_star_train_mean': float(value_star_train.detach().mean().item()),
                     f'{prefix}_grid_policy_loss_space_logit': float(policy_loss_space == "logit"),
                     f'{prefix}_grid_policy_training_loss': float(policy_loss.detach().item()),
+                    f'{prefix}_bp_head_training_enabled': float(bp_training_enabled),
                     f'{prefix}_grid_bp_logit_mean': float(
                         bp_logit_pred.detach().mean().item()
                         if bp_logit_pred is not None
@@ -4914,7 +4982,11 @@ class Episode:
         if mode == "value":
             return components["value_loss"] + components["penalty_loss"]
         if mode == "policy":
+            if not self._bp_head_training_enabled():
+                return components["value_loss"] * 0.0
             return components["policy_loss"] + components["mix_policy_loss"]
+        if not self._bp_head_training_enabled():
+            return components["value_loss"] + components["penalty_loss"]
         return components["total_loss"]
 
     def _build_vectorized_policy_child_states(
@@ -5147,7 +5219,10 @@ class Episode:
             bellman_residual, parent_state[:, 1:2],
             loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
         )
-        bellman_only = self._policy_value_bellman_only()
+        bellman_only = (
+            self._policy_value_bellman_only()
+            or not self._bp_head_training_enabled()
+        )
         if bellman_only:
             zero = torch.tensor(0.0, device=self.device)
             loss_foc = zero
@@ -5430,7 +5505,10 @@ class Episode:
             loss_fn.alpha_z, loss_fn.beta_z, loss_fn.z0
         )
         penalty_b = loss_fn.b_penalty_weight * loss_fn.compute_b_penalty(PI, parent_state[:, 0:1]).mean()
-        bellman_only = self._policy_value_bellman_only()
+        bellman_only = (
+            self._policy_value_bellman_only()
+            or not self._bp_head_training_enabled()
+        )
         if bellman_only:
             zero = torch.tensor(0.0, device=self.device)
             loss_foc = zero
@@ -9180,6 +9258,55 @@ class Episode:
         score = max(global_maes.values()) if global_maes else float("inf")
         return float(score), {**avg, **meta, "validation_batches": len(cache)}
 
+    def _run_bp_diagnostic_only_stage(
+        self,
+        train_cache: List[Dict[str, Any]],
+        val_cache: List[Dict[str, Any]],
+        teacher_snapshot: nn.Module,
+    ) -> Dict[str, Any]:
+        """Evaluate the retained BP heads without creating an optimizer."""
+        bp_params = self._policy_value_stage_params("bp")
+        snapshot = self._snapshot_params(bp_params)
+        train_hash = self._bp_cache_hash(train_cache)
+        val_hash = self._bp_cache_hash(val_cache)
+        train_counts = self._bp_cache_active_counts(train_cache)
+        val_counts = self._bp_cache_active_counts(val_cache)
+        score_cache = val_cache if val_counts["total_active_count"] > 0 else train_cache
+        score, diagnostics = self._evaluate_bp_cache_score(score_cache)
+        max_change = self._param_max_change_from_snapshot(bp_params, snapshot)
+        if max_change != 0.0:
+            raise RuntimeError(
+                "BP diagnostic-only stage changed policy-path parameters"
+            )
+        return {
+            "status": "diagnostic_only_training_disabled",
+            "bp_head_training_enabled": False,
+            "optimizer_steps": 0,
+            "bp_optimizer_steps": 0,
+            "successful_optimizer_steps": 0,
+            "attempted_optimizer_steps": 0,
+            "accepted_optimizer_steps_total": 0,
+            "best_checkpoint_optimizer_steps": None,
+            "stop_reason": "bp_head_training_disabled",
+            "restored_best_checkpoint": False,
+            "teacher_snapshot_hash": self._state_dict_hash(teacher_snapshot),
+            "train_cache_hash": train_hash,
+            "train_cache_hash_after": self._bp_cache_hash(train_cache),
+            "validation_cache_hash": val_hash,
+            "validation_cache_hash_after": self._bp_cache_hash(val_cache),
+            "train_active_count": train_counts["total_active_count"],
+            "validation_active_count": val_counts["total_active_count"],
+            "train_active_counts": train_counts,
+            "validation_active_counts": val_counts,
+            "validation_source": (
+                "holdout" if val_counts["total_active_count"] > 0 else "train_fallback"
+            ),
+            "validation_informative": bool(val_counts["total_active_count"] > 0),
+            "validation_score": score if np.isfinite(score) else None,
+            "validation_metrics": diagnostics,
+            "bp_parameter_max_change": max_change,
+        }
+
     def _run_bp_distillation_stage(
         self,
         train_cache: List[Dict[str, Any]],
@@ -11314,18 +11441,45 @@ class Episode:
             bp_teacher.eval()
             bp_teacher.requires_grad_(False)
             train_cache = self._build_bp_target_cache(pv_train_batches, bp_teacher)
-            train_cache, bp_eta_resample_summary = self._resample_bp_target_cache(train_cache)
-            train_cache, bp_current_eta_summary = (
-                self._resample_bp_target_cache_by_current_eta(train_cache)
-            )
             val_cache = self._build_bp_target_cache(validation_batches or pv_train_batches, bp_teacher)
             validation_current_eta = self._bp_cache_current_eta_counts(val_cache)
-            bp_summary = self._run_bp_distillation_stage(
-                train_cache,
-                val_cache,
-                bp_teacher,
-                bp_epochs,
-            )
+            if self._bp_head_training_enabled():
+                train_cache, bp_eta_resample_summary = self._resample_bp_target_cache(train_cache)
+                train_cache, bp_current_eta_summary = (
+                    self._resample_bp_target_cache_by_current_eta(train_cache)
+                )
+                bp_summary = self._run_bp_distillation_stage(
+                    train_cache,
+                    val_cache,
+                    bp_teacher,
+                    bp_epochs,
+                )
+            else:
+                natural_counts = self._bp_cache_current_eta_counts(train_cache)
+                bp_eta_resample_summary = {
+                    "enabled": False,
+                    "applied": False,
+                    "reason": "bp_head_training_disabled",
+                }
+                bp_current_eta_summary = {
+                    "enabled": False,
+                    "applied": False,
+                    "reason": "bp_head_training_disabled",
+                    "current_eta0_count_before": natural_counts["current_eta0_count"],
+                    "current_eta1_count_before": natural_counts["current_eta1_count"],
+                    "current_eta1_share_before": natural_counts["current_eta1_share"],
+                    "current_eta0_count_after": natural_counts["current_eta0_count"],
+                    "current_eta1_count_after": natural_counts["current_eta1_count"],
+                    "current_eta1_share_after": natural_counts["current_eta1_share"],
+                    "target_current_eta1_share": float(
+                        getattr(self.hyperparams, "bp_current_eta1_train_share", 0.25)
+                    ),
+                }
+                bp_summary = self._run_bp_diagnostic_only_stage(
+                    train_cache,
+                    val_cache,
+                    bp_teacher,
+                )
             bp_summary["eta_resampling"] = bp_eta_resample_summary
             bp_summary["current_eta_resampling"] = bp_current_eta_summary
             bp_summary.update({
@@ -11360,7 +11514,11 @@ class Episode:
             stages_successful = (
                 pq_summary.get("status") == "accepted"
                 and q_summary.get("status") in q_soft_accept_statuses
-                and bp_summary.get("status") in {"accepted", "skipped_no_active_refinancing"}
+                and bp_summary.get("status") in {
+                    "accepted",
+                    "skipped_no_active_refinancing",
+                    "diagnostic_only_training_disabled",
+                }
             )
             if not stages_successful:
                 _restore_full_staged_start()
@@ -11656,6 +11814,7 @@ class Episode:
             if (
                 'policy_value' in train_modules and
                 not self._q_only_stage and
+                self._bp_head_training_enabled() and
                 bp_refine_steps > 0 and
                 len(pv_train_batches) > 0
             ):
@@ -11735,7 +11894,7 @@ class Episode:
         horizon: int,
         simulate_kwargs: Dict
     ) -> None:
-        sim_kwargs = dict(simulate_kwargs)
+        sim_kwargs = self._prepare_simulation_kwargs(simulate_kwargs)
         simulator = SimulateTS(
             models=self.models,
             config=self.config,
@@ -11746,6 +11905,9 @@ class Episode:
             **sim_kwargs
         )
         self.df, self.df_macro = simulator.simulate()
+        self._last_simulation_meta = dict(
+            getattr(simulator, "last_simulation_meta", {})
+        )
         self.tensor_firm = None
         self.tensor_macro = None
 
@@ -11758,7 +11920,7 @@ class Episode:
         simulate_kwargs: Dict,
         export_df: bool = False
     ) -> None:
-        sim_kwargs = dict(simulate_kwargs)
+        sim_kwargs = self._prepare_simulation_kwargs(simulate_kwargs)
         simulator = SimulateTS(
             models=self.models,
             config=self.config,
@@ -11769,6 +11931,7 @@ class Episode:
             **sim_kwargs
         )
         out: TensorSimulationOutput = simulator.simulate_tensor()
+        self._last_simulation_meta = dict(out.meta)
         self.tensor_firm = out.firm
         self.tensor_macro = out.macro
         if export_df:
@@ -15667,6 +15830,18 @@ class Episode:
 
         if 'sdf_fc1' not in module_summaries and 'sdf_fc1_stage1' in module_summaries:
             module_summaries['sdf_fc1'] = module_summaries['sdf_fc1_stage1']
+
+        module_summaries["bp_reference_solver"] = {
+            "bp_head_training_enabled": self._bp_head_training_enabled(),
+            "requested_simulation_bp_source": str(
+                getattr(self.hyperparams, "simulation_bp_action_source", "head")
+            ).strip().lower(),
+            "effective_simulation_bp_source": self._simulation_bp_action_source(),
+            "bp_head_diagnostics_enabled": True,
+            "latest_simulation": deepcopy(
+                getattr(self, "_last_simulation_meta", {})
+            ),
+        }
 
         # 训练结束后再导出 DataFrame，兼容现有实验脚本的可视化/落盘逻辑
         if self.df is None and self.tensor_firm is not None:
