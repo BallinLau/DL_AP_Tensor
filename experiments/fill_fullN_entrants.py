@@ -112,6 +112,7 @@ def fill_df_to_fullN(
     cfg: type = Config,
     device: torch.device | None = None,
     entry_num: Optional[int] = None,
+    entry_mode: str = "legacy",
 ) -> pd.DataFrame:
     """Ensure each path has exactly `full_N` companies shared across parent and all child branches.
 
@@ -122,6 +123,11 @@ def fill_df_to_fullN(
       of the newly added companies as Entry=1 (others set 0). Existing child rows keep
       their original Entry flags.
     """
+    if str(entry_mode).strip().lower() != "legacy":
+        raise RuntimeError(
+            "fill_df_to_fullN creates masked numerical coverage rows, not economic "
+            "value_cost entrants; entry_mode must remain 'legacy'"
+        )
     device = device or cfg.DEVICE
 
     required_cols = {'path', 'branch', 'x', 'Hatcf', 'LnKF'}

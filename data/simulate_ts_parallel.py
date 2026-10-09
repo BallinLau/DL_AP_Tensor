@@ -6,9 +6,63 @@ import torch
 from tqdm import tqdm
 
 from .data_utils import sample_ar1, sample_bernoulli, sample_stationary_ar1, sample_uniform
+from .entry import (
+    aggregate_node_resources,
+    capital_growth_decomposition,
+    compute_entry_reference,
+    draw_value_cost_candidates,
+    evaluate_entry_cutoff,
+    summarize_candidate_values,
+)
 from .simulation_forward import forward_policy_value_for_simulation
 from .tensor_data import TensorSimulationOutput, TensorTable, cat_rows
 from utils.firm_transition import apply_refinancing_policy
+
+
+def _draw_transition_shock(sim, child_t: int, branch_index: int, tag: int, draw):
+    """Optionally isolate one transition shock stream for matched smoke runs."""
+    base_seed = getattr(sim, "common_transition_seed", None)
+    if base_seed is None:
+        return draw()
+    device = sim.device
+    cuda_devices = []
+    if device.type == "cuda":
+        cuda_devices = [device.index or torch.cuda.current_device()]
+    with torch.random.fork_rng(devices=cuda_devices):
+        seed = int(base_seed) + int(child_t) * 1_000_003 + int(branch_index) * 10_007 + int(tag)
+        torch.manual_seed(seed)
+        if cuda_devices:
+            torch.cuda.manual_seed_all(seed)
+        return draw()
+
+
+def _ensure_entry_state_fields(state: Dict[str, torch.Tensor]) -> None:
+    """Add zero-cost provenance fields to legacy/test states in place."""
+    b = state["b"]
+    n_paths = int(b.shape[0]) if b.ndim == 2 else 1
+    device = b.device
+    if b.ndim != 2:
+        return
+    state.setdefault("initial_cohort", state["alive"].to(torch.float32))
+    state.setdefault("birth_time", torch.full_like(b, -1.0))
+    state.setdefault("entry_cost", torch.zeros_like(b))
+    state.setdefault("K_birth", torch.where(state["alive"], state["K"], torch.zeros_like(state["K"])))
+    state.setdefault("economic_node_id", torch.zeros(n_paths, dtype=torch.long, device=device))
+    state.setdefault("economic_time", torch.zeros(n_paths, dtype=torch.long, device=device))
+    state.setdefault("accounting_valid", torch.zeros(n_paths, dtype=torch.bool, device=device))
+    for name in (
+        "event_I_entry", "event_potential_count", "event_accepted_count",
+        "event_reference_K", "event_reference_N", "event_mean_K_ref",
+        "event_K_per_entrant", "event_potential_capital_nominal",
+        "event_candidate_capital_realized", "event_K_entry_gross",
+        "event_same_node_entrant_exit_count", "event_K_entry_same_node_exit",
+        "event_K_entry_surviving",
+        "event_entry_cutoff_mean", "event_entry_cutoff_p10",
+        "event_entry_cutoff_p50", "event_entry_cutoff_p90",
+        "event_entry_cost_mean", "event_entry_cost_p10",
+        "event_entry_cost_p50", "event_entry_cost_p90",
+    ):
+        state.setdefault(name, torch.zeros(n_paths, device=device))
 
 
 def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
@@ -20,8 +74,15 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
     """
     device = sim.device
     n_potential = max(20, int(sim.group_size * 0.1))
-    max_firms = sim.group_size + sim.horizon * n_potential
+    # Legacy keeps its historical static bound. Value-cost entry expands on
+    # demand, so tensor capacity is never an economic quota.
+    max_firms = (
+        sim.group_size + sim.horizon * n_potential
+        if sim.entry_mode == "legacy"
+        else sim.group_size
+    )
     state = _initialize_batched_state(sim, max_firms)
+    sim._max_firms_observed = max(int(sim._max_firms_observed), int(max_firms))
 
     firm_rows: List[torch.Tensor] = []
     macro_rows: List[torch.Tensor] = []
@@ -31,7 +92,7 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
         firm_rows.append(parent_firm)
         macro_rows.append(parent_macro)
 
-        branch_states = _expand_branches_batched(sim, state)
+        branch_states = _expand_branches_batched(sim, state, child_t=t + 1)
         _annotate_parent_next_leverage_rows(
             sim, parent_firm, state, branch_states[sim.main_branch]
         )
@@ -58,7 +119,9 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
             "horizon": sim.horizon,
             "branch_num": sim.branch_num,
             "simulation_mode": "tensor_path_parallel",
-            "max_firms": max_firms,
+            "max_firms_initial": max_firms,
+            "max_firms": int(sim._max_firms_observed),
+            "firm_id_float32_exact_guard": int(2 ** 24),
         },
     )
 
@@ -99,7 +162,7 @@ def _initialize_batched_state(sim, max_firms: int) -> Dict[str, torch.Tensor]:
     i[:, :n0] = i0
     K[:, :n0] = K0
     alive[:, :n0] = True
-    entry[:, :n0] = 1.0
+    entry[:, :n0] = 1.0 if sim.entry_mode == "legacy" else 0.0
     firm_id[:, :n0] = torch.arange(n0, device=device, dtype=torch.long).unsqueeze(0).expand(n_paths, -1)
 
     return {
@@ -114,15 +177,44 @@ def _initialize_batched_state(sim, max_firms: int) -> Dict[str, torch.Tensor]:
         "M": torch.ones(n_paths, device=device),
         "alive": alive,
         "entry": entry,
+        "initial_cohort": alive.to(torch.float32),
+        "birth_time": torch.full_like(K, -1.0),
+        "entry_cost": torch.zeros_like(K),
+        "K_birth": torch.where(alive, K, torch.zeros_like(K)),
         "firm_id": firm_id,
         "next_firm_id": torch.full((n_paths,), n0, dtype=torch.long, device=device),
         "bar_i": torch.zeros_like(b),
         "bar_z": torch.zeros_like(b),
         "bp": b.clone(),
+        "economic_node_id": torch.zeros(n_paths, dtype=torch.long, device=device),
+        "economic_time": torch.zeros(n_paths, dtype=torch.long, device=device),
+        "accounting_valid": torch.zeros(n_paths, dtype=torch.bool, device=device),
+        "event_I_entry": torch.zeros(n_paths, device=device),
+        "event_potential_count": torch.zeros(n_paths, device=device),
+        "event_accepted_count": torch.zeros(n_paths, device=device),
+        "event_reference_K": torch.zeros(n_paths, device=device),
+        "event_reference_N": torch.zeros(n_paths, device=device),
+        "event_mean_K_ref": torch.zeros(n_paths, device=device),
+        "event_K_per_entrant": torch.zeros(n_paths, device=device),
+        "event_potential_capital_nominal": torch.zeros(n_paths, device=device),
+        "event_candidate_capital_realized": torch.zeros(n_paths, device=device),
+        "event_K_entry_gross": torch.zeros(n_paths, device=device),
+        "event_same_node_entrant_exit_count": torch.zeros(n_paths, device=device),
+        "event_K_entry_same_node_exit": torch.zeros(n_paths, device=device),
+        "event_K_entry_surviving": torch.zeros(n_paths, device=device),
+        "event_entry_cutoff_mean": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_cutoff_p10": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_cutoff_p50": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_cutoff_p90": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_cost_mean": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_cost_p10": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_cost_p50": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_cost_p90": torch.full((n_paths,), float("nan"), device=device),
     }
 
 
 def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    _ensure_entry_state_fields(state)
     device = sim.device
     n_paths, n_firms = state["b"].shape
     alive = state["alive"]
@@ -133,10 +225,14 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     path_grid = torch.arange(n_paths, device=device, dtype=torch.long).unsqueeze(1).expand(n_paths, n_firms)
 
     if alive_pos.numel() == 0:
+        if getattr(sim, "entry_mode", "legacy") == "value_cost":
+            raise RuntimeError(
+                f"value_cost entry encountered an extinct economic node at t={t}; "
+                "no synthetic firms or macro floor are created"
+            )
         state["hatc_cal"] = torch.full((n_paths,), -10.0, device=device)
         state["lnk_cal"] = torch.full((n_paths,), -10.0, device=device)
-        macro_rows = torch.stack(
-            [
+        legacy_prefix = [
                 torch.arange(n_paths, device=device, dtype=torch.float32),
                 torch.full((n_paths,), float(t), device=device),
                 torch.full((n_paths,), float(branch_k), device=device),
@@ -149,9 +245,12 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                 state["x"].to(torch.float32),
                 state["hatcf"].to(torch.float32),
                 state["lnkf"].to(torch.float32),
-            ],
+        ]
+        macro_rows = torch.stack(
+            legacy_prefix
+            + [torch.zeros(n_paths, device=device) for _ in sim.MACRO_COLUMNS[len(legacy_prefix):]],
             dim=1,
-        )
+        ).to(torch.float32)
         firm_empty = torch.empty((0, len(sim.FIRM_COLUMNS)), device=device, dtype=torch.float32)
         return firm_empty, macro_rows
 
@@ -162,6 +261,10 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     i = state["i"].reshape(-1)[alive_flat]
     K = state["K"].reshape(-1)[alive_flat]
     entry = state["entry"].reshape(-1)[alive_flat]
+    initial_cohort = state["initial_cohort"].reshape(-1)[alive_flat]
+    birth_time = state["birth_time"].reshape(-1)[alive_flat]
+    entry_cost = state["entry_cost"].reshape(-1)[alive_flat]
+    K_birth = state["K_birth"].reshape(-1)[alive_flat]
     firm_id = state["firm_id"].reshape(-1)[alive_flat].to(torch.float32)
     x = state["x"][path_idx]
     hatcf = state["hatcf"][path_idx]
@@ -200,6 +303,153 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
 
     Y, I, Phi, C = sim._resource_accounting(K, z, x, bar_i, bar_z, i)
 
+    K_total_computed = torch.zeros(n_paths, device=device)
+    I_oper_computed = torch.zeros(n_paths, device=device)
+    K_total_computed.index_add_(0, path_idx, K)
+    I_oper_computed.index_add_(0, path_idx, I)
+    I_entry_event = state.get("event_I_entry", torch.zeros(n_paths, device=device))
+    resources = aggregate_node_resources(
+        C,
+        path_idx,
+        n_paths=n_paths,
+        I_entry=I_entry_event,
+        mode=getattr(sim, "consumption_aggregation_mode", "legacy_per_firm_clamp"),
+    )
+    cache_valid = state.get(
+        "accounting_valid", torch.zeros(n_paths, dtype=torch.bool, device=device)
+    )
+    if bool(cache_valid.any()) and not bool(cache_valid.all()):
+        raise RuntimeError("economic-node accounting cache must be path-complete")
+    reused_account = bool(cache_valid.all())
+    if reused_account:
+        K_total = state["accounting_K_total"]
+        C_total = state["accounting_C_raw"]
+        C_oper_total = state["accounting_C_oper"]
+        I_oper_total = state["accounting_I_oper"]
+        I_entry_total = state["accounting_I_entry"]
+        resource_residual = state["accounting_resource_residual"]
+        resource_feasible = state["accounting_resource_feasible"]
+        LnK = state["accounting_LnK"]
+        Hatc = state["accounting_Hatc"]
+        n_firms_accounted = state["accounting_n_firms"]
+    else:
+        K_total = K_total_computed
+        C_total = resources["C_raw"]
+        C_oper_total = resources["C_oper"]
+        I_oper_total = I_oper_computed
+        I_entry_total = resources["I_entry"]
+        resource_residual = resources["resource_accounting_residual"]
+        resource_feasible = resources["resource_feasible"]
+        n_firms_accounted = n_alive_per_path.to(torch.float32)
+        if getattr(sim, "consumption_aggregation_mode", "legacy_per_firm_clamp") == "raw" and not bool(resource_feasible.all()):
+            bad = torch.nonzero(~resource_feasible, as_tuple=False).reshape(-1).tolist()
+            raise RuntimeError(
+                "raw node resource account is infeasible (C_raw<=0); "
+                f"t={t}, branch={branch_k}, paths={bad[:20]}, "
+                "no positive floor was applied"
+            )
+        alive_any = n_alive_per_path > 0
+        LnK = torch.where(
+            alive_any,
+            torch.log(K_total + 1e-8),
+            torch.full_like(K_total, float("nan")),
+        )
+        if getattr(sim, "consumption_aggregation_mode", "legacy_per_firm_clamp") == "legacy_per_firm_clamp":
+            # Preserve the exact historical macro transform in legacy mode.
+            Hatc = torch.where(
+                alive_any,
+                torch.log(C_total / (K_total + 1e-8) + 1e-5),
+                torch.full_like(C_total, -10.0),
+            )
+        else:
+            Hatc = torch.where(
+                resource_feasible,
+                torch.log(C_total / (K_total + 1e-8)),
+                torch.full_like(C_total, float("nan")),
+            )
+        state["accounting_valid"] = torch.ones(n_paths, dtype=torch.bool, device=device)
+        state["accounting_K_total"] = K_total.detach()
+        state["accounting_C_raw"] = C_total.detach()
+        state["accounting_C_oper"] = C_oper_total.detach()
+        state["accounting_I_oper"] = I_oper_total.detach()
+        state["accounting_I_entry"] = I_entry_total.detach()
+        state["accounting_resource_residual"] = resource_residual.detach()
+        state["accounting_resource_feasible"] = resource_feasible.detach()
+        state["accounting_LnK"] = LnK.detach()
+        state["accounting_Hatc"] = Hatc.detach()
+        state["accounting_n_firms"] = n_firms_accounted.detach()
+    state["hatc_cal"] = Hatc.detach()
+    state["lnk_cal"] = LnK.detach()
+
+    # Endpoint capital uses the post-default survivor set. Once a child node is
+    # promoted to parent, its full-node account remains authoritative even
+    # though the live firm view has already removed same-node exits.
+    if reused_account:
+        deltaK_incumbent = state["accounting_deltaK_incumbent"]
+        K_entry_endpoint = state["accounting_K_entry_endpoint"]
+        K_exit_old = state["accounting_K_exit_old"]
+        capital_residual = state["accounting_capital_residual"]
+        state["event_same_node_entrant_exit_count"] = state[
+            "accounting_same_node_entrant_exit_count"
+        ]
+        state["event_K_entry_same_node_exit"] = state[
+            "accounting_K_entry_same_node_exit"
+        ]
+        state["event_K_entry_surviving"] = state[
+            "accounting_K_entry_surviving"
+        ]
+    else:
+        full_bar_z_preview = torch.zeros_like(state["b"])
+        full_bar_z_preview.reshape(-1)[alive_pos] = bar_z.detach()
+        endpoint_alive = state["alive"] & (full_bar_z_preview < 0.5)
+        same_node_exit = state["alive"] & (state["entry"] > 0.5) & ~endpoint_alive
+        entry_survives = state["alive"] & (state["entry"] > 0.5) & endpoint_alive
+        state["event_same_node_entrant_exit_count"] = same_node_exit.sum(dim=1).to(torch.float32)
+        state["event_K_entry_same_node_exit"] = torch.where(
+            same_node_exit, state["K"], torch.zeros_like(state["K"])
+        ).sum(dim=1)
+        state["event_K_entry_surviving"] = torch.where(
+            entry_survives, state["K"], torch.zeros_like(state["K"])
+        ).sum(dim=1)
+        capital_rows = []
+        for path in range(n_paths):
+            prev_alive = state.get("transition_previous_alive")
+            if prev_alive is None:
+                zero = K_total.new_zeros(())
+                capital_rows.append((zero, zero, zero, zero))
+                continue
+            previous_mask = prev_alive[path]
+            next_mask = endpoint_alive[path]
+            decomposition = capital_growth_decomposition(
+                state["transition_previous_ids"][path][previous_mask],
+                state["transition_previous_K"][path][previous_mask],
+                state["firm_id"][path][next_mask],
+                state["K"][path][next_mask],
+            )
+            capital_rows.append((
+                decomposition["deltaK_incumbent"],
+                decomposition["K_entry_endpoint"],
+                decomposition["K_exit_old"],
+                decomposition["capital_accounting_residual"],
+            ))
+        deltaK_incumbent = torch.stack([row[0] for row in capital_rows])
+        K_entry_endpoint = torch.stack([row[1] for row in capital_rows])
+        K_exit_old = torch.stack([row[2] for row in capital_rows])
+        capital_residual = torch.stack([row[3] for row in capital_rows])
+        state["accounting_deltaK_incumbent"] = deltaK_incumbent.detach()
+        state["accounting_K_entry_endpoint"] = K_entry_endpoint.detach()
+        state["accounting_K_exit_old"] = K_exit_old.detach()
+        state["accounting_capital_residual"] = capital_residual.detach()
+        state["accounting_same_node_entrant_exit_count"] = state[
+            "event_same_node_entrant_exit_count"
+        ].detach()
+        state["accounting_K_entry_same_node_exit"] = state[
+            "event_K_entry_same_node_exit"
+        ].detach()
+        state["accounting_K_entry_surviving"] = state[
+            "event_K_entry_surviving"
+        ].detach()
+
     firm_rows = torch.stack(
         [
             path_idx.to(torch.float32),
@@ -232,20 +482,16 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             I,
             Phi,
             C,
+            initial_cohort,
+            birth_time,
+            entry_cost,
+            K_birth,
+            state["economic_node_id"][path_idx].to(torch.float32),
+            torch.full_like(b, 0.0 if branch_k == -1 else 1.0),
+            torch.full_like(b, 1.0 if reused_account else 0.0),
         ],
         dim=1,
     ).to(torch.float32)
-
-    K_total = torch.zeros(n_paths, device=device)
-    C_total = torch.zeros(n_paths, device=device)
-    K_total.index_add_(0, path_idx, K)
-    C_total.index_add_(0, path_idx, C.clamp(min=0.0))
-    alive_any = n_alive_per_path > 0
-    LnK = torch.where(alive_any, torch.log(K_total + 1e-8), torch.full_like(K_total, -10.0))
-    Hatc_raw = torch.log(C_total / (K_total + 1e-8) + 1e-5)
-    Hatc = torch.where(alive_any, Hatc_raw, torch.full_like(C_total, -10.0))
-    state["hatc_cal"] = Hatc.detach()
-    state["lnk_cal"] = LnK.detach()
 
     use_resolved_bp = (
         getattr(sim, "bp_action_override", None) is not None
@@ -281,6 +527,13 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         bp = overridden
         firm_rows[:, sim.FIRM_COLUMNS.index("bp")] = bp.to(firm_rows.dtype)
 
+    potential_count = state.get("event_potential_count", torch.zeros(n_paths, device=device))
+    accepted_count = state.get("event_accepted_count", torch.zeros(n_paths, device=device))
+    acceptance_rate = torch.where(
+        potential_count > 0,
+        accepted_count / potential_count,
+        torch.zeros_like(potential_count),
+    )
     macro_rows = torch.stack(
         [
             torch.arange(n_paths, device=device, dtype=torch.float32),
@@ -290,11 +543,47 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             C_total,
             LnK,
             Hatc,
-            n_alive_per_path.to(torch.float32),
+            n_firms_accounted,
             state["M"].to(torch.float32),
             state["x"].to(torch.float32),
             state["hatcf"].to(torch.float32),
             state["lnkf"].to(torch.float32),
+            state["economic_node_id"].to(torch.float32),
+            torch.full((n_paths,), 0.0 if branch_k == -1 else 1.0, device=device),
+            torch.full((n_paths,), 1.0 if reused_account else 0.0, device=device),
+            I_oper_total,
+            I_entry_total,
+            I_oper_total + I_entry_total,
+            C_oper_total,
+            C_total,
+            resource_residual,
+            resource_feasible.to(torch.float32),
+            state.get("event_reference_K", torch.zeros(n_paths, device=device)),
+            state.get("event_reference_N", torch.zeros(n_paths, device=device)),
+            state.get("event_mean_K_ref", torch.zeros(n_paths, device=device)),
+            state.get("event_K_per_entrant", torch.zeros(n_paths, device=device)),
+            potential_count,
+            accepted_count,
+            acceptance_rate,
+            state.get("event_entry_cutoff_mean", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_cutoff_p10", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_cutoff_p50", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_cutoff_p90", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_cost_mean", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_cost_p10", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_cost_p50", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_cost_p90", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_potential_capital_nominal", torch.zeros(n_paths, device=device)),
+            state.get("event_candidate_capital_realized", torch.zeros(n_paths, device=device)),
+            state.get("event_K_entry_gross", torch.zeros(n_paths, device=device)),
+            state.get("event_same_node_entrant_exit_count", torch.zeros(n_paths, device=device)),
+            state.get("event_K_entry_same_node_exit", torch.zeros(n_paths, device=device)),
+            state.get("event_K_entry_surviving", torch.zeros(n_paths, device=device)),
+            deltaK_incumbent,
+            K_entry_endpoint,
+            K_exit_old,
+            capital_residual,
+            torch.full((n_paths,), float(state["b"].shape[1]), device=device),
         ],
         dim=1,
     ).to(torch.float32)
@@ -339,15 +628,33 @@ def _annotate_parent_next_leverage_rows(
         )
 
 
-def _expand_branches_batched(sim, state: Dict[str, torch.Tensor]) -> List[Dict[str, torch.Tensor]]:
+def _expand_branches_batched(
+    sim,
+    state: Dict[str, torch.Tensor],
+    *,
+    child_t: int = 1,
+) -> List[Dict[str, torch.Tensor]]:
+    _ensure_entry_state_fields(state)
     device = sim.device
     alive_any = state["alive"].any(dim=1)
     branches: List[Dict[str, torch.Tensor]] = []
     b_prev = state["b"]
     bp_prev = state.get("bp", b_prev)
-    for _ in range(sim.branch_num):
-        x_next = sample_ar1(state["x"], sim.config.RHO_X, sim.config.SIGMA_X, sim.config.XBAR)
-        z_next = sample_ar1(state["z"], sim.config.RHO_Z, sim.config.SIGMA_Z, sim.config.ZBAR)
+    entry_reference = compute_entry_reference(
+        state["K"],
+        state["alive"],
+        entry_capital_ratio=float(getattr(sim, "entry_capital_ratio", 0.10)),
+        entry_size_ratio=float(getattr(sim, "entry_size_ratio", 0.10)),
+    )
+    for branch_index in range(sim.branch_num):
+        x_next = _draw_transition_shock(
+            sim, child_t, branch_index, 1,
+            lambda: sample_ar1(state["x"], sim.config.RHO_X, sim.config.SIGMA_X, sim.config.XBAR),
+        )
+        z_next = _draw_transition_shock(
+            sim, child_t, branch_index, 2,
+            lambda: sample_ar1(state["z"], sim.config.RHO_Z, sim.config.SIGMA_Z, sim.config.ZBAR),
+        )
 
         # Realize b_{t+1} from the current parent eta (eta_t). The child
         # eta_{t+1} is drawn below and never gates b_t -> b_{t+1}.
@@ -357,8 +664,14 @@ def _expand_branches_batched(sim, state: Dict[str, torch.Tensor]) -> List[Dict[s
             eta_current=state["eta"],
         )
 
-        eta_next = sample_bernoulli(state["eta"].numel(), sim.config.ZETA, device).view_as(state["eta"])
-        i_next = sample_uniform(state["i"].numel(), 0.0, sim.config.I_THRESHOLD, device).view_as(state["i"])
+        eta_next = _draw_transition_shock(
+            sim, child_t, branch_index, 3,
+            lambda: sample_bernoulli(state["eta"].numel(), sim.config.ZETA, device).view_as(state["eta"]),
+        )
+        i_next = _draw_transition_shock(
+            sim, child_t, branch_index, 4,
+            lambda: sample_uniform(state["i"].numel(), 0.0, sim.config.I_THRESHOLD, device).view_as(state["i"]),
+        )
 
         k_prev = state["K"]
         bar_i_prev = state.get("bar_i")
@@ -397,11 +710,54 @@ def _expand_branches_batched(sim, state: Dict[str, torch.Tensor]) -> List[Dict[s
                 "M": M_out,
                 "alive": state["alive"].clone(),
                 "entry": torch.zeros_like(state["entry"]),
+                "initial_cohort": state["initial_cohort"].clone(),
+                "birth_time": state["birth_time"].clone(),
+                "entry_cost": state["entry_cost"].clone(),
+                "K_birth": state["K_birth"].clone(),
                 "firm_id": state["firm_id"].clone(),
                 "next_firm_id": state["next_firm_id"].clone(),
                 "bar_i": state.get("bar_i", torch.zeros_like(state["b"])) .clone(),
                 "bar_z": state.get("bar_z", torch.zeros_like(state["b"])) .clone(),
                 "bp": state.get("bp", state["b"]).clone(),
+                "economic_node_id": torch.full(
+                    (state["b"].shape[0],),
+                    int(child_t * (sim.branch_num + 1) + branch_index + 1),
+                    dtype=torch.long,
+                    device=device,
+                ),
+                "economic_time": torch.full(
+                    (state["b"].shape[0],),
+                    int(child_t),
+                    dtype=torch.long,
+                    device=device,
+                ),
+                "accounting_valid": torch.zeros(
+                    state["b"].shape[0], dtype=torch.bool, device=device
+                ),
+                "event_I_entry": torch.zeros(state["b"].shape[0], device=device),
+                "event_potential_count": torch.zeros(state["b"].shape[0], device=device),
+                "event_accepted_count": torch.zeros(state["b"].shape[0], device=device),
+                "event_reference_K": entry_reference.reference_K.clone(),
+                "event_reference_N": entry_reference.reference_N.to(torch.float32),
+                "event_mean_K_ref": entry_reference.mean_K_ref.clone(),
+                "event_K_per_entrant": entry_reference.K_per_entrant.clone(),
+                "event_potential_capital_nominal": entry_reference.potential_capital_nominal.clone(),
+                "event_candidate_capital_realized": torch.zeros(state["b"].shape[0], device=device),
+                "event_K_entry_gross": torch.zeros(state["b"].shape[0], device=device),
+                "event_same_node_entrant_exit_count": torch.zeros(state["b"].shape[0], device=device),
+                "event_K_entry_same_node_exit": torch.zeros(state["b"].shape[0], device=device),
+                "event_K_entry_surviving": torch.zeros(state["b"].shape[0], device=device),
+                "event_entry_cutoff_mean": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_cutoff_p10": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_cutoff_p50": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_cutoff_p90": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_cost_mean": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_cost_p10": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_cost_p50": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_cost_p90": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "transition_previous_ids": state["firm_id"].clone(),
+                "transition_previous_K": state["K"].clone(),
+                "transition_previous_alive": state["alive"].clone(),
             }
         )
     return branches
@@ -434,6 +790,28 @@ def _apply_exit_batched(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tenso
 
 
 def _apply_entry_batched(sim, state: Dict[str, torch.Tensor], n_potential: int) -> Dict[str, torch.Tensor]:
+    if getattr(sim, "entry_mode", "legacy") == "value_cost":
+        return _apply_value_cost_entry_batched(sim, state)
+    if getattr(sim, "preserve_global_rng_around_entry", False):
+        cuda_devices = []
+        if state["b"].device.type == "cuda":
+            cuda_devices = [state["b"].device.index or torch.cuda.current_device()]
+        with torch.random.fork_rng(devices=cuda_devices):
+            event_seed = int(sim.entry_rng_seed) + int(sim._entry_event_counter) * 100003
+            torch.manual_seed(event_seed)
+            if cuda_devices:
+                torch.cuda.manual_seed_all(event_seed)
+            result = _apply_legacy_entry_batched(sim, state, n_potential)
+        sim._entry_event_counter += 1
+        return result
+    return _apply_legacy_entry_batched(sim, state, n_potential)
+
+
+def _apply_legacy_entry_batched(
+    sim,
+    state: Dict[str, torch.Tensor],
+    n_potential: int,
+) -> Dict[str, torch.Tensor]:
     device = sim.device
     n_paths, max_firms = state["b"].shape
 
@@ -452,6 +830,32 @@ def _apply_entry_batched(sim, state: Dict[str, torch.Tensor], n_potential: int) 
     enter_counts = enter_mask.sum(dim=1)
 
     state["entry"] = torch.zeros_like(state["entry"], dtype=torch.float32)
+    previous_alive = state.get("transition_previous_alive", state["alive"])
+    previous_K = state.get("transition_previous_K", state["K"])
+    legacy_reference_K = torch.where(
+        previous_alive, previous_K, torch.zeros_like(previous_K)
+    ).sum(dim=1)
+    legacy_reference_N = previous_alive.sum(dim=1).to(torch.float32)
+    state["event_reference_K"] = legacy_reference_K
+    state["event_reference_N"] = legacy_reference_N
+    state["event_mean_K_ref"] = torch.where(
+        legacy_reference_N > 0,
+        legacy_reference_K / legacy_reference_N.clamp_min(1.0),
+        torch.zeros_like(legacy_reference_K),
+    )
+    state["event_K_per_entrant"] = torch.ones(n_paths, device=device)
+    state["event_potential_count"] = torch.full(
+        (n_paths,), float(n_potential), device=device
+    )
+    state["event_accepted_count"] = enter_counts.to(torch.float32)
+    state["event_potential_capital_nominal"] = torch.full(
+        (n_paths,), float(n_potential), device=device
+    )
+    state["event_candidate_capital_realized"] = torch.full(
+        (n_paths,), float(n_potential), device=device
+    )
+    state["event_K_entry_gross"] = enter_counts.to(torch.float32)
+    state["event_I_entry"] = torch.zeros(n_paths, device=device)
     if int(enter_counts.sum().item()) == 0:
         return state
 
@@ -476,6 +880,12 @@ def _apply_entry_batched(sim, state: Dict[str, torch.Tensor], n_potential: int) 
     state["K"][path_idx, slot_idx] = K_new[valid]
     state["alive"][path_idx, slot_idx] = True
     state["entry"][path_idx, slot_idx] = 1.0
+    state["initial_cohort"][path_idx, slot_idx] = 0.0
+    state["birth_time"][path_idx, slot_idx] = state["economic_time"][path_idx].to(
+        state["birth_time"].dtype
+    )
+    state["entry_cost"][path_idx, slot_idx] = 0.0
+    state["K_birth"][path_idx, slot_idx] = K_new[valid]
     state["firm_id"][path_idx, slot_idx] = new_id
 
     for key in ["bar_i", "bar_z", "bp"]:
@@ -484,4 +894,136 @@ def _apply_entry_batched(sim, state: Dict[str, torch.Tensor], n_potential: int) 
             state[key][path_idx, slot_idx] = fill_val
 
     state["next_firm_id"] = torch.clamp(state["next_firm_id"] + enter_counts, max=max_firms)
+    return state
+
+
+def _expand_firm_capacity(
+    sim,
+    state: Dict[str, torch.Tensor],
+    required_capacity: int,
+) -> Dict[str, torch.Tensor]:
+    current = int(state["b"].shape[1])
+    if required_capacity <= current:
+        return state
+    new_capacity = max(required_capacity, max(current * 2, 1))
+    if new_capacity >= 2 ** 24:
+        raise RuntimeError(
+            "firm identity exceeds exact float32 export range; refusing invisible ID precision loss"
+        )
+    for key, value in list(state.items()):
+        if not torch.is_tensor(value) or value.ndim != 2 or value.shape[1] != current:
+            continue
+        fill = False if value.dtype == torch.bool else -1 if key == "firm_id" else 0
+        expanded = torch.full(
+            (value.shape[0], new_capacity),
+            fill,
+            dtype=value.dtype,
+            device=value.device,
+        )
+        expanded[:, :current] = value
+        state[key] = expanded
+    sim._max_firms_observed = max(int(sim._max_firms_observed), new_capacity)
+    return state
+
+
+def _apply_value_cost_entry_batched(sim, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    n_paths = int(state["b"].shape[0])
+    device = state["b"].device
+    reference = compute_entry_reference(
+        state["transition_previous_K"],
+        state["transition_previous_alive"],
+        entry_capital_ratio=sim.entry_capital_ratio,
+        entry_size_ratio=sim.entry_size_ratio,
+    )
+    candidates = draw_value_cost_candidates(
+        reference,
+        rho_z=float(sim.config.RHO_Z),
+        sigma_z=float(sim.config.SIGMA_Z),
+        zbar=float(sim.config.ZBAR),
+        entry_cost_max=sim.entry_cost_max,
+        generator=sim.entry_generator,
+    )
+    screened = evaluate_entry_cutoff(
+        sim.models.get("policy_value"),
+        candidates,
+        x=state["x"],
+        hatcf=state["hatcf"],
+        lnkf=state["lnkf"],
+        zeta=float(sim.config.ZETA),
+        dummy_i=sim.entry_dummy_i,
+        chunk_size=sim.entry_inference_chunk_size,
+    )
+    accepted = screened["accepted"] & candidates.mask
+    accepted_counts = accepted.sum(dim=1).to(torch.long)
+    required = int((state["next_firm_id"] + accepted_counts).max().item()) if n_paths else 0
+    _expand_firm_capacity(sim, state, required)
+
+    state["entry"].zero_()
+    state["event_potential_count"] = candidates.counts.to(torch.float32)
+    state["event_accepted_count"] = accepted_counts.to(torch.float32)
+    state["event_reference_K"] = reference.reference_K
+    state["event_reference_N"] = reference.reference_N.to(torch.float32)
+    state["event_mean_K_ref"] = reference.mean_K_ref
+    state["event_K_per_entrant"] = reference.K_per_entrant
+    state["event_potential_capital_nominal"] = candidates.potential_capital_nominal
+    state["event_candidate_capital_realized"] = candidates.candidate_capital_realized
+    cutoff_summary = summarize_candidate_values(
+        screened["entry_cutoff"], candidates.mask
+    )
+    cost_summary = summarize_candidate_values(
+        candidates.entry_cost, candidates.mask
+    )
+    for statistic, values in cutoff_summary.items():
+        state[f"event_entry_cutoff_{statistic}"] = values
+    for statistic, values in cost_summary.items():
+        state[f"event_entry_cost_{statistic}"] = values
+    state["event_I_entry"] = torch.where(
+        accepted,
+        candidates.entry_cost * candidates.K_birth,
+        torch.zeros_like(candidates.entry_cost),
+    ).sum(dim=1)
+    state["event_K_entry_gross"] = torch.where(
+        accepted, candidates.K_birth, torch.zeros_like(candidates.K_birth)
+    ).sum(dim=1)
+    if not bool(accepted.any()):
+        return state
+
+    path_grid = torch.arange(n_paths, device=device).unsqueeze(1).expand_as(accepted)
+    rank = torch.cumsum(accepted.to(torch.long), dim=1) - 1
+    destination = state["next_firm_id"].unsqueeze(1) + rank
+    path_idx = path_grid[accepted]
+    slot_idx = destination[accepted]
+    z_new = candidates.z[accepted]
+    K_new = candidates.K_birth[accepted]
+    cost_new = candidates.entry_cost[accepted]
+    n_accepted = int(path_idx.numel())
+    # Draw eta and ordinary investment cost only after the entry screen.
+    eta_draw = (
+        torch.rand(n_accepted, generator=sim.entry_generator, dtype=torch.float64)
+        < float(sim.config.ZETA)
+    ).to(device=device, dtype=state["eta"].dtype)
+    i_draw = (
+        torch.rand(n_accepted, generator=sim.entry_generator, dtype=torch.float64)
+        * float(sim.config.I_THRESHOLD)
+    ).to(device=device, dtype=state["i"].dtype)
+    new_id = destination[accepted].to(torch.long)
+
+    state["b"][path_idx, slot_idx] = 0.0
+    state["z"][path_idx, slot_idx] = z_new
+    state["eta"][path_idx, slot_idx] = eta_draw
+    state["i"][path_idx, slot_idx] = i_draw
+    state["K"][path_idx, slot_idx] = K_new
+    state["alive"][path_idx, slot_idx] = True
+    state["entry"][path_idx, slot_idx] = 1.0
+    state["initial_cohort"][path_idx, slot_idx] = 0.0
+    state["birth_time"][path_idx, slot_idx] = state["economic_time"][path_idx].to(
+        state["birth_time"].dtype
+    )
+    state["entry_cost"][path_idx, slot_idx] = cost_new
+    state["K_birth"][path_idx, slot_idx] = K_new
+    state["firm_id"][path_idx, slot_idx] = new_id
+    state["bar_i"][path_idx, slot_idx] = 0.0
+    state["bar_z"][path_idx, slot_idx] = 0.0
+    state["bp"][path_idx, slot_idx] = 0.0
+    state["next_firm_id"] = state["next_firm_id"] + accepted_counts
     return state

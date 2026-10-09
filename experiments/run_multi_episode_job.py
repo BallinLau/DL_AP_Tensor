@@ -82,6 +82,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--simulate-group-size", type=int, default=None, help="Override firm count per simulated path for episodes > 0")
     parser.add_argument("--simulate-horizon", type=int, default=None, help="Override simulate horizon")
+    parser.add_argument("--entry-mode", choices=["legacy", "value_cost"], default=None)
+    parser.add_argument("--entry-capital-ratio", type=float, default=None)
+    parser.add_argument("--entry-size-ratio", type=float, default=None)
+    parser.add_argument("--entry-cost-max", type=float, default=None)
+    parser.add_argument("--entry-dummy-i", type=float, default=None)
+    parser.add_argument("--entry-inference-chunk-size", type=int, default=None)
+    parser.add_argument("--entry-rng-seed", type=int, default=None)
+    parser.add_argument(
+        "--consumption-aggregation-mode",
+        choices=["legacy_per_firm_clamp", "raw"],
+        default=None,
+    )
     parser.add_argument("--device", type=str, default=None, help="Force device, e.g. cuda:0 or cpu")
     parser.add_argument("--quick-test", action="store_true", help="Shrink workload for smoke tests (n_paths=10, epochs=20, horizon=20)")
     parser.add_argument(
@@ -673,6 +685,29 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.epochs = args.epochs
     if args.simulate_horizon is not None:
         hyperparams.simulate_horizon = args.simulate_horizon
+    for arg_name, hp_name, cast in (
+        ("entry_mode", "entry_mode", str),
+        ("entry_capital_ratio", "entry_capital_ratio", float),
+        ("entry_size_ratio", "entry_size_ratio", float),
+        ("entry_cost_max", "entry_cost_max", float),
+        ("entry_dummy_i", "entry_dummy_i", float),
+        ("entry_inference_chunk_size", "entry_inference_chunk_size", int),
+        ("entry_rng_seed", "entry_rng_seed", int),
+        ("consumption_aggregation_mode", "consumption_aggregation_mode", str),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            setattr(hyperparams, hp_name, cast(value))
+    if hyperparams.entry_mode == "value_cost" and hyperparams.consumption_aggregation_mode != "raw":
+        raise ValueError("entry_mode='value_cost' requires consumption_aggregation_mode='raw'")
+    if hyperparams.entry_capital_ratio < 0.0:
+        raise ValueError("entry_capital_ratio must be nonnegative")
+    if not 0.0 < hyperparams.entry_size_ratio <= 1.0:
+        raise ValueError("entry_size_ratio must be in (0, 1]")
+    if hyperparams.entry_cost_max <= 0.0:
+        raise ValueError("entry_cost_max must be positive")
+    if hyperparams.entry_inference_chunk_size <= 0:
+        raise ValueError("entry_inference_chunk_size must be positive")
     hyperparams.ablation_mode = args.ablation_mode
     hyperparams.sdf_wealth_loss_mode = args.sdf_wealth_loss_mode
     hyperparams.sdf_fresh_pair_enabled = bool(args.sdf_fresh_pair_enabled)
@@ -1124,6 +1159,23 @@ def main():
 
     hyperparams = configure_hyperparams(args)
     print(f"Global random seed: {args.seed}")
+    print(
+        "Entry configuration: "
+        + json.dumps(
+            {
+                "entry_mode": hyperparams.entry_mode,
+                "entry_spec_version": hyperparams.entry_spec_version,
+                "entry_capital_ratio": hyperparams.entry_capital_ratio,
+                "entry_size_ratio": hyperparams.entry_size_ratio,
+                "entry_cost_max": hyperparams.entry_cost_max,
+                "entry_dummy_i": hyperparams.entry_dummy_i,
+                "entry_inference_chunk_size": hyperparams.entry_inference_chunk_size,
+                "entry_rng_seed": hyperparams.entry_rng_seed,
+                "consumption_aggregation_mode": hyperparams.consumption_aggregation_mode,
+            },
+            sort_keys=True,
+        )
+    )
     models = build_models(device)
     optimizers = build_optimizers(models, hyperparams)
     post0_n_paths = args.post0_n_paths if args.post0_n_paths is not None else hyperparams.n_paths
@@ -1277,6 +1329,15 @@ def main():
                     "firm_target_update": hyperparams.firm_target_update,
                     "modeb_resimulate_after_pv": args.modeb_resimulate_after_pv,
                     "max_firm_train_units": hyperparams.max_firm_train_units,
+                    "entry_mode": hyperparams.entry_mode,
+                    "entry_spec_version": hyperparams.entry_spec_version,
+                    "entry_capital_ratio": hyperparams.entry_capital_ratio,
+                    "entry_size_ratio": hyperparams.entry_size_ratio,
+                    "entry_cost_max": hyperparams.entry_cost_max,
+                    "entry_dummy_i": hyperparams.entry_dummy_i,
+                    "entry_inference_chunk_size": hyperparams.entry_inference_chunk_size,
+                    "entry_rng_seed": hyperparams.entry_rng_seed,
+                    "consumption_aggregation_mode": hyperparams.consumption_aggregation_mode,
                 },
             }
             failure_path = resolve_base_dir(run_root, ROOT) / "failure_report.json"

@@ -25,7 +25,15 @@ class FC2Pipeline:
     """
     OOP pipeline aligned with losses/FC2losspipe.py
     """
-    def __init__(self, pkl_path=None, df=None, full_N=2000, entry_num=None, device='cpu'):
+    def __init__(
+        self,
+        pkl_path=None,
+        df=None,
+        full_N=2000,
+        entry_num=None,
+        device='cpu',
+        entry_mode="legacy",
+    ):
         self.device = torch.device(device)
         self.full_N = full_N
         self.branch_num = 2
@@ -40,7 +48,16 @@ class FC2Pipeline:
         if 'K' not in df.columns:
             df = df.copy(); df['K'] = 1.0
 
-        df_filled = fill_df_to_fullN(df, full_N=full_N, device=self.device, entry_num=entry_num)
+        # This historical FC2 helper creates synthetic full-N rows. It is not
+        # a valid economic value-cost entry path and therefore rejects that
+        # mode rather than silently substituting the old profit screen.
+        df_filled = fill_df_to_fullN(
+            df,
+            full_N=full_N,
+            device=self.device,
+            entry_num=entry_num,
+            entry_mode=entry_mode,
+        )
         df_filled.sort_values(by=['path', 'ID', 'branch'], inplace=True)
         self.df_filled = df_filled
         

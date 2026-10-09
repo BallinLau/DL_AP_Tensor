@@ -74,7 +74,8 @@ class Sample:
         sampling_mode: str = 'uniform',
         enable_entry: bool = None,
         entry_rate: float = 0.1,
-        device: torch.device = None
+        device: torch.device = None,
+        entry_mode: str = "legacy",
     ):
         """
         Args:
@@ -94,6 +95,7 @@ class Sample:
             enable_entry: 是否启用公司进入（None 时 simulate 模式自动启用）
             entry_rate: 进入率（潜在进入者占现有公司数的比例）
             device: 设备
+            entry_mode: 进入机制；Sample 只支持 legacy 经济进入
         """
         self.models = models or {}
         self.config = config
@@ -103,6 +105,9 @@ class Sample:
         self.data_mode = data_mode
         self.sampling_mode = sampling_mode
         self.entry_rate = entry_rate
+        self.entry_mode = str(entry_mode).strip().lower()
+        if self.entry_mode not in {"legacy", "value_cost"}:
+            raise ValueError("entry_mode must be 'legacy' or 'value_cost'")
         self.device = device or config.DEVICE
         
         # simulate 模式默认启用 entry
@@ -110,6 +115,11 @@ class Sample:
             self.enable_entry = (data_mode == 'simulate')
         else:
             self.enable_entry = enable_entry
+        if self.enable_entry and self.entry_mode == "value_cost":
+            raise RuntimeError(
+                "Sample is a bootstrap/coverage generator and cannot create economic "
+                "value_cost entrants; use the formal SimulateTS path"
+            )
         
         # 根据 data_mode 设置 group_size
         if group_size is not None:

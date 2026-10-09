@@ -1116,6 +1116,20 @@ class Episode:
 
     def _prepare_simulation_kwargs(self, simulate_kwargs: Dict) -> Dict:
         sim_kwargs = dict(simulate_kwargs)
+        # Entry semantics are part of the effective economic configuration;
+        # callers cannot silently override the checkpoint/run HyperParams.
+        for name in (
+            "entry_mode",
+            "entry_spec_version",
+            "entry_capital_ratio",
+            "entry_size_ratio",
+            "entry_cost_max",
+            "entry_dummy_i",
+            "entry_inference_chunk_size",
+            "entry_rng_seed",
+            "consumption_aggregation_mode",
+        ):
+            sim_kwargs[name] = getattr(self.hyperparams, name)
         source = self._simulation_bp_action_source()
         # The formal source is controlled only by HyperParams. This prevents a
         # stale caller-provided kwarg from silently switching a replay back to
@@ -6221,6 +6235,7 @@ class Episode:
             full_N=full_N,
             entry_num=entry_num,
             device=self.device,
+            entry_mode=str(getattr(self.hyperparams, "entry_mode", "legacy")),
         )
         # keep for inspection/debugging
         self._last_fc2_pipe = pipe
@@ -8600,6 +8615,18 @@ class Episode:
             "pv_m_clamp_min",
             "pv_m_clamp_max",
             "bp_grid_value_huber_delta",
+            # Simulation economics provenance. Parent/child tensors are also
+            # hashed, but including these fields prevents a cache produced
+            # under a different entry specification from being considered
+            # compatible even when a tiny fixture happens to match exactly.
+            "entry_mode",
+            "entry_spec_version",
+            "entry_capital_ratio",
+            "entry_size_ratio",
+            "entry_cost_max",
+            "entry_dummy_i",
+            "entry_rng_seed",
+            "consumption_aggregation_mode",
         ]
         payload: Dict[str, Any] = {
             key: getattr(hp, key, None)

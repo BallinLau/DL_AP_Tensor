@@ -221,6 +221,18 @@ class HyperParams:
     n_samples: int = 100000
     n_paths: int = 2000
     simulate_horizon: int = 200
+    # Firm-entry experiment. ``legacy`` preserves the historical profit/i
+    # screen. ``value_cost`` uses a no-old-debt, relative-size candidate pool
+    # and an equity-value cutoff with a separate creation cost.
+    entry_mode: str = "legacy"
+    entry_spec_version: str = "value_cost_v1"
+    entry_capital_ratio: float = 0.10
+    entry_size_ratio: float = 0.10
+    entry_cost_max: float = 1.0
+    entry_dummy_i: float = 0.0
+    entry_inference_chunk_size: int = 65536
+    entry_rng_seed: int = 86420
+    consumption_aggregation_mode: str = "legacy_per_firm_clamp"
     # 训练数据批次是否优先走 tensor 管线（避免训练前 pandas 拼装）
     use_tensor_pipeline: bool = True
     # firm-level 训练每个 stage 最多使用多少 parent transitions；<=0 表示不截断。

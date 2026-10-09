@@ -46,11 +46,25 @@ class SimulateTS:
         'K', 'M', 'Q', 'P0', 'PI', 'Bar_i', 'Bar_z', 'P',
         'bp0', 'bpI', 'bp',
         'b_next_p0', 'b_next_pi', 'b_next_policy',
-        'Y', 'I', 'Phi', 'C'
+        'Y', 'I', 'Phi', 'C',
+        'initial_cohort', 'birth_time', 'entry_cost', 'K_birth',
+        'economic_node_id', 'node_view', 'accounting_stage'
     ]
     MACRO_COLUMNS = [
         'path', 't', 'branch', 'K', 'C', 'LnK', 'Hatc',
-        'n_firms', 'M', 'x', 'hatcf', 'lnkf'
+        'n_firms', 'M', 'x', 'hatcf', 'lnkf',
+        'economic_node_id', 'node_view', 'accounting_stage',
+        'I_oper', 'I_entry', 'I_total', 'C_oper', 'C_raw',
+        'resource_accounting_residual', 'resource_feasible',
+        'reference_K', 'reference_N', 'mean_K_ref', 'K_per_entrant',
+        'potential_count', 'accepted_count', 'acceptance_rate',
+        'entry_cutoff_mean', 'entry_cutoff_p10', 'entry_cutoff_p50', 'entry_cutoff_p90',
+        'entry_cost_mean', 'entry_cost_p10', 'entry_cost_p50', 'entry_cost_p90',
+        'potential_capital_nominal', 'candidate_capital_realized',
+        'K_entry_gross', 'same_node_entrant_exit_count',
+        'K_entry_same_node_exit', 'K_entry_surviving',
+        'deltaK_incumbent', 'K_entry_endpoint', 'K_exit_old',
+        'capital_accounting_residual', 'tensor_capacity'
     ]
 
     def __init__(
@@ -68,6 +82,17 @@ class SimulateTS:
         bp_action_override: Optional[Callable[..., torch.Tensor]] = None,
         bp_action_source: str = "head",
         bp_grid_policy: Optional[Callable[..., torch.Tensor]] = None,
+        entry_mode: str = "legacy",
+        entry_spec_version: str = "value_cost_v1",
+        entry_capital_ratio: float = 0.10,
+        entry_size_ratio: float = 0.10,
+        entry_cost_max: float = 1.0,
+        entry_dummy_i: float = 0.0,
+        entry_inference_chunk_size: int = 65536,
+        entry_rng_seed: int = 86420,
+        consumption_aggregation_mode: str = "legacy_per_firm_clamp",
+        preserve_global_rng_around_entry: bool = False,
+        common_transition_seed: Optional[int] = None,
     ):
         """
         Args:
@@ -110,6 +135,67 @@ class SimulateTS:
         self.bp_grid_policy = bp_grid_policy
         if self.bp_action_source == "grid" and self.bp_grid_policy is None:
             raise ValueError("bp_action_source='grid' requires bp_grid_policy")
+        self.entry_mode = str(entry_mode).strip().lower()
+        self.entry_spec_version = str(entry_spec_version)
+        self.entry_capital_ratio = float(entry_capital_ratio)
+        self.entry_size_ratio = float(entry_size_ratio)
+        self.entry_cost_max = float(entry_cost_max)
+        self.entry_dummy_i = float(entry_dummy_i)
+        self.entry_inference_chunk_size = int(entry_inference_chunk_size)
+        self.entry_rng_seed = int(entry_rng_seed)
+        self.consumption_aggregation_mode = str(consumption_aggregation_mode).strip().lower()
+        self.preserve_global_rng_around_entry = bool(preserve_global_rng_around_entry)
+        self.common_transition_seed = (
+            None if common_transition_seed is None else int(common_transition_seed)
+        )
+        self._entry_event_counter = 0
+        if self.entry_mode not in {"legacy", "value_cost"}:
+            raise ValueError("entry_mode must be 'legacy' or 'value_cost'")
+        if self.entry_mode == "value_cost":
+            if self.entry_spec_version != "value_cost_v1":
+                raise ValueError(f"unsupported entry_spec_version={self.entry_spec_version!r}")
+            if self.entry_capital_ratio < 0.0:
+                raise ValueError("entry_capital_ratio must be nonnegative")
+            if not 0.0 < self.entry_size_ratio <= 1.0:
+                raise ValueError("entry_size_ratio must be in (0, 1]")
+            if self.entry_cost_max <= 0.0:
+                raise ValueError("entry_cost_max must be positive")
+            if self.entry_inference_chunk_size <= 0:
+                raise ValueError("entry_inference_chunk_size must be positive")
+            if self.consumption_aggregation_mode != "raw":
+                raise ValueError("value_cost entry requires raw consumption aggregation")
+            if self.models.get("policy_value") is None:
+                raise RuntimeError("value_cost entry requires a policy_value model")
+        elif self.consumption_aggregation_mode not in {"legacy_per_firm_clamp", "raw"}:
+            raise ValueError("unknown consumption_aggregation_mode")
+        from .entry import (
+            entry_configuration_fingerprint,
+            entry_configuration_snapshot,
+            make_entry_generator,
+        )
+        self.entry_generator = make_entry_generator(self.entry_rng_seed)
+        self.entry_configuration = entry_configuration_snapshot(
+            entry_mode=self.entry_mode,
+            entry_spec_version=self.entry_spec_version,
+            entry_capital_ratio=self.entry_capital_ratio,
+            entry_size_ratio=self.entry_size_ratio,
+            entry_cost_max=self.entry_cost_max,
+            entry_dummy_i=self.entry_dummy_i,
+            entry_inference_chunk_size=self.entry_inference_chunk_size,
+            entry_rng_seed=self.entry_rng_seed,
+            consumption_aggregation_mode=self.consumption_aggregation_mode,
+            economic_config=self.config,
+        )
+        self.entry_configuration.update(
+            {
+                "preserve_global_rng_around_entry": self.preserve_global_rng_around_entry,
+                "common_transition_seed": self.common_transition_seed,
+            }
+        )
+        self.entry_configuration_fingerprint = entry_configuration_fingerprint(
+            self.entry_configuration
+        )
+        self._max_firms_observed = int(group_size)
         
         # 设置模型为 eval 模式
         self._set_models_eval()
@@ -191,6 +277,14 @@ class SimulateTS:
             "gpu_memory_after_bytes": memory_after,
             "peak_gpu_memory_bytes": peak_memory,
             "bp_grid": bp_metrics,
+            "entry": {
+                "base_commit": "4b236eaacf47b2ac7cb506508e54b21a199e89b0",
+                **self.entry_configuration,
+                "entry_configuration_fingerprint": self.entry_configuration_fingerprint,
+                "preserve_global_rng_around_entry": self.preserve_global_rng_around_entry,
+                "common_transition_seed": self.common_transition_seed,
+                "max_firms_observed": self._max_firms_observed,
+            },
         })
         self.last_simulation_meta = dict(output.meta)
         return output
@@ -211,6 +305,11 @@ class SimulateTS:
         - t 期数据：branch_k = -1 (父节点)
         - t+1 期数据：branch_k = 0, 1, ..., N-1 (各分支)
         """
+        if self.entry_mode == "value_cost":
+            raise RuntimeError(
+                "value_cost entry is supported only by the formal tensor-path-parallel "
+                "SimulateTS.simulate()/simulate_tensor() path"
+            )
         firm_data = []
         macro_data = []
         
@@ -257,6 +356,11 @@ class SimulateTS:
         """
         单条 path 的 tensor-native 模拟。
         """
+        if self.entry_mode == "value_cost":
+            raise RuntimeError(
+                "value_cost entry is supported only by the formal tensor-path-parallel "
+                "SimulateTS.simulate()/simulate_tensor() path"
+            )
         firm_rows: List[torch.Tensor] = []
         macro_rows: List[torch.Tensor] = []
         state = self._initialize_path_tensor(path_idx)
@@ -350,7 +454,7 @@ class SimulateTS:
             x = state['x'] if torch.is_tensor(state['x']) else torch.tensor(state['x'], device=device)
             hatcf = state['hatcf'] if torch.is_tensor(state['hatcf']) else torch.tensor(state['hatcf'], device=device)
             lnkf = state['lnkf'] if torch.is_tensor(state['lnkf']) else torch.tensor(state['lnkf'], device=device)
-            macro_row = torch.tensor(
+            macro_prefix = torch.tensor(
                 [[
                     float(path_idx), float(t), float(branch_k),
                     0.0, 0.0, -10.0, -10.0, 0.0,
@@ -361,6 +465,17 @@ class SimulateTS:
                 ]],
                 device=device,
                 dtype=torch.float32
+            )
+            macro_row = torch.cat(
+                [
+                    macro_prefix,
+                    torch.zeros(
+                        (1, len(self.MACRO_COLUMNS) - macro_prefix.shape[1]),
+                        device=device,
+                        dtype=torch.float32,
+                    ),
+                ],
+                dim=1,
             )
             firm_empty = torch.empty((0, len(self.FIRM_COLUMNS)), device=device, dtype=torch.float32)
             return firm_empty, macro_row
@@ -449,6 +564,13 @@ class SimulateTS:
                 I,
                 Phi,
                 C,
+                torch.ones_like(K),
+                torch.full_like(K, -1.0),
+                torch.zeros_like(K),
+                K,
+                torch.full_like(K, float(t)),
+                torch.full_like(K, 0.0 if branch_k == -1 else 1.0),
+                torch.zeros_like(K),
             ],
             dim=1
         ).to(torch.float32)
@@ -459,7 +581,7 @@ class SimulateTS:
         Hatc = torch.log(C_total / (K_total + 1e-8) + 1e-5)
         state['hatc_cal'] = Hatc.detach()
         state['lnk_cal'] = LnK.detach()
-        macro_row = torch.stack(
+        macro_prefix = torch.stack(
             [
                 torch.tensor(float(path_idx), device=device),
                 torch.tensor(float(t), device=device),
@@ -476,6 +598,17 @@ class SimulateTS:
             ],
             dim=0
         ).reshape(1, -1).to(torch.float32)
+        macro_row = torch.cat(
+            [
+                macro_prefix,
+                torch.zeros(
+                    (1, len(self.MACRO_COLUMNS) - macro_prefix.shape[1]),
+                    device=device,
+                    dtype=torch.float32,
+                ),
+            ],
+            dim=1,
+        )
 
         full_bar_i = torch.zeros_like(state['b'])
         full_bar_z = torch.zeros_like(state['b'])
@@ -1042,6 +1175,11 @@ class SimulateTS:
         
         生成潜在进入者，筛选后加入
         """
+        if self.entry_mode == "value_cost":
+            raise RuntimeError(
+                "legacy per-path entry cannot implement entry_mode='value_cost'; "
+                "use SimulateTS.simulate()/simulate_tensor()"
+            )
         device = self.device
         for key in ['b', 'z', 'eta', 'i', 'K', 'alive', 'entry']:
             if key in state and torch.is_tensor(state[key]) and state[key].dim() == 0:
@@ -1094,6 +1232,11 @@ class SimulateTS:
         """
         应用进入规则（全 tensor 版本）。
         """
+        if self.entry_mode == "value_cost":
+            raise RuntimeError(
+                "legacy single-path tensor entry cannot implement entry_mode='value_cost'; "
+                "use SimulateTS.simulate()/simulate_tensor()"
+            )
         device = self.device
         n_potential = max(20, int(self.group_size * 0.1))
         z_new = sample_stationary_ar1(
