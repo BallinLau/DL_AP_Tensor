@@ -23,6 +23,46 @@ import torch
 
 BATCH_BANK_FORMAT = "frozen_pq_batch_bank_v1"
 REQUIRED_PANEL_STAGE = "post_sdf_refresh_pre_pv"
+GRID_PQ_MAPPING_COMMIT = "4b236eaacf47b2ac7cb506508e54b21a199e89b0"
+RELEVANT_PQ_HYPERPARAMETER_FIELDS = (
+    "pv_training_flow",
+    "pv_batch_size",
+    "pv_eval_epochs",
+    "pv_value_scale_mode",
+    "pv_value_scale_log_max",
+    "pv_bellman_normalize_by_value_scale",
+    "pv_mixture_enabled",
+    "pv_mixture_ratio",
+    "pv_mixture_start_episode",
+    "pv_mixture_budget_mode",
+    "pv_mixture_sampling_mode",
+    "pv_mixture_coverage_group_size",
+    "pv_mixture_seed",
+    "pv_mixture_stratified_validation",
+    "pv_exact_eta_integration_enabled",
+    "pv_bp_training_mode",
+    "pv_bp_head_training_enabled",
+    "simulation_bp_action_source",
+    "q_parameterization",
+    "q_target_refresh_mode",
+    "q_bellman_normalize_by_target_scale",
+    "q_zero_boundary_epochs",
+    "q_default_pretrain_epochs",
+    "q_survival_aio_epochs",
+    "q_mixed_polish_epochs",
+    "q_zero_sample_share",
+    "q_default_sample_share",
+    "q_survival_sample_share",
+    "q_survival_ondist_share",
+    "q_claim_coverage_enabled",
+    "q_claim_coverage_b_bins",
+    "q_claim_coverage_start_episode",
+    "bp_grid_coarse_size",
+    "bp_grid_fine_size",
+    "bp_grid_refine_enabled",
+    "entry_mode",
+    "entry_spec_version",
+)
 PRODUCTION_PQ_METHOD_FINGERPRINTS = {
     "_build_pq_value_target_cache": "d14786049af942ca976bbc8eb45690c603fb00162cf99cfd3fc11a0bdf1f0485",
     "_compute_cached_pq_loss": "50f96721a22d3cf89c6cabba9f5717cf8336b4e7830fa26385fe09678fb02bdd",
@@ -60,6 +100,157 @@ def object_sha256(value: Any) -> str:
 
 def model_state_sha256(module: torch.nn.Module) -> str:
     return object_sha256(module.state_dict())
+
+
+def cpu_detached_tree(value: Any) -> Any:
+    """Clone a nested training object onto CPU without mutating the source."""
+    if torch.is_tensor(value):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: cpu_detached_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [cpu_detached_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(cpu_detached_tree(item) for item in value)
+    return value
+
+
+def relevant_pq_hyperparameter_payload(hyperparams: Any) -> Dict[str, Any]:
+    source = hyperparams if isinstance(hyperparams, Mapping) else vars(hyperparams)
+    return {
+        name: source.get(name)
+        for name in RELEVANT_PQ_HYPERPARAMETER_FIELDS
+    }
+
+
+def relevant_pq_hyperparameter_fingerprint(hyperparams: Any) -> str:
+    return object_sha256(relevant_pq_hyperparameter_payload(hyperparams))
+
+
+def make_frozen_batch_bank_payload(
+    *,
+    train_batches: Sequence[Mapping[str, Any]],
+    validation_batches: Sequence[Mapping[str, Any]],
+    provenance: Mapping[str, Any],
+) -> Dict[str, Any]:
+    train_cpu = cpu_detached_tree(list(train_batches))
+    validation_cpu = cpu_detached_tree(list(validation_batches))
+    payload = {
+        "format": BATCH_BANK_FORMAT,
+        "provenance": dict(provenance),
+        "train_batches": train_cpu,
+        "validation_batches": validation_cpu,
+    }
+    payload["hashes"] = {
+        "train_batches_sha256": object_sha256(train_cpu),
+        "validation_batches_sha256": object_sha256(validation_cpu),
+        "dataset_sha256": object_sha256(
+            {"train": train_cpu, "validation": validation_cpu}
+        ),
+    }
+    validate_frozen_batch_bank(payload)
+    return payload
+
+
+def save_frozen_batch_bank(
+    path: str | Path,
+    *,
+    train_batches: Sequence[Mapping[str, Any]],
+    validation_batches: Sequence[Mapping[str, Any]],
+    provenance: Mapping[str, Any],
+) -> Dict[str, Any]:
+    target = Path(path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = make_frozen_batch_bank_payload(
+        train_batches=train_batches,
+        validation_batches=validation_batches,
+        provenance=provenance,
+    )
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(target)
+    return {**payload["hashes"], "path": str(target)}
+
+
+def checkpoint_provenance(path: str | Path) -> Dict[str, Any]:
+    checkpoint_path = Path(path).expanduser().resolve()
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(payload, Mapping):
+        raise ValueError("checkpoint must contain a mapping")
+    models = payload.get("models")
+    if not isinstance(models, Mapping):
+        raise ValueError("checkpoint is missing models")
+    hyperparams = payload.get("hyperparams")
+    config = payload.get("config_snapshot")
+    if not isinstance(hyperparams, Mapping):
+        raise ValueError("checkpoint is missing hyperparams")
+    if not isinstance(config, Mapping):
+        raise ValueError("checkpoint is missing config_snapshot")
+    if "policy_value" not in models or "sdf_fc1" not in models:
+        raise ValueError("checkpoint must contain policy_value and sdf_fc1")
+    run_root = checkpoint_path.parent.parent
+    return {
+        "episode": int(payload.get("episode", -1)),
+        "source_run_commit": payload.get("git_commit"),
+        "run_root": str(run_root),
+        "source_run_identity": str(run_root),
+        "policy_value_checkpoint_hash": object_sha256(models["policy_value"]),
+        "sdf_fc1_hash": object_sha256(models["sdf_fc1"]),
+        "economic_config_hash": object_sha256(dict(config)),
+        "hyperparameter_fingerprint": relevant_pq_hyperparameter_fingerprint(
+            hyperparams
+        ),
+        "pv_training_flow": hyperparams.get("pv_training_flow"),
+        "q_target_refresh_mode": hyperparams.get("q_target_refresh_mode"),
+        "simulation_bp_action_source": hyperparams.get(
+            "simulation_bp_action_source"
+        ),
+        "pv_bp_head_training_enabled": hyperparams.get(
+            "pv_bp_head_training_enabled"
+        ),
+    }
+
+
+def validate_checkpoint_bank_provenance(
+    checkpoint: Mapping[str, Any],
+    bank: Mapping[str, Any],
+) -> Dict[str, Any]:
+    hard_equal = (
+        "episode",
+        "source_run_commit",
+        "source_run_identity",
+        "sdf_fc1_hash",
+        "economic_config_hash",
+        "hyperparameter_fingerprint",
+        "pv_training_flow",
+        "q_target_refresh_mode",
+        "simulation_bp_action_source",
+        "pv_bp_head_training_enabled",
+    )
+    unavailable = [
+        key
+        for key in hard_equal
+        if checkpoint.get(key) is None or bank.get(key) is None
+    ]
+    if unavailable:
+        raise ValueError(
+            "checkpoint/bank provenance hard requirements unavailable: "
+            + ", ".join(unavailable)
+        )
+    mismatches = {
+        key: {"checkpoint": checkpoint.get(key), "bank": bank.get(key)}
+        for key in hard_equal
+        if checkpoint.get(key) != bank.get(key)
+    }
+    if mismatches:
+        raise ValueError(f"checkpoint/bank provenance mismatch: {mismatches}")
+    if checkpoint.get("episode") != 2:
+        raise ValueError("fixed-point checkpoint and bank must both be episode 2")
+    if checkpoint.get("simulation_bp_action_source") != "grid":
+        raise ValueError("fixed-point checkpoint must use GRID simulation BP actions")
+    if checkpoint.get("pv_bp_head_training_enabled") is not False:
+        raise ValueError("fixed-point checkpoint must disable BP-head training")
+    return {"passed": True, "checked_fields": list(hard_equal)}
 
 
 def production_pq_method_fingerprints(episode_cls: type) -> Dict[str, str]:
@@ -157,6 +348,29 @@ def validate_frozen_batch_bank(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 f"frozen batch bank provenance {key!r} must be {expected!r}, "
                 f"got {actual!r}"
             )
+    required_provenance_fields = (
+        "source_commit",
+        "source_run_commit",
+        "source_run_identity",
+        "run_root",
+        "seed",
+        "policy_value_checkpoint_hash_pre_pv",
+        "sdf_fc1_hash",
+        "economic_config_hash",
+        "hyperparameter_fingerprint",
+        "pv_training_flow",
+        "q_target_refresh_mode",
+        "simulation_bp_action_source",
+        "pv_bp_head_training_enabled",
+    )
+    unavailable = [
+        key for key in required_provenance_fields if provenance.get(key) is None
+    ]
+    if unavailable:
+        raise ValueError(
+            "frozen batch bank hard provenance unavailable: "
+            + ", ".join(unavailable)
+        )
     if provenance.get("source_is_post_pv_output", False):
         raise ValueError(
             "post-PV simulation output cannot reproduce the EP2 pre-PV P/Q environment"
@@ -268,6 +482,30 @@ def absolute_gap_summary(prediction: np.ndarray, target: np.ndarray) -> Dict[str
     return distribution_summary(np.abs(prediction[finite] - target[finite]))
 
 
+def fixed_rms_scale(*values: np.ndarray, eps: float = 1e-6) -> float:
+    flattened = [np.asarray(value, dtype=np.float64).reshape(-1) for value in values]
+    combined = np.concatenate(flattened)
+    finite = combined[np.isfinite(combined)]
+    if finite.size == 0:
+        raise ValueError("cycle-0 scale has no finite observations")
+    return max(float(np.sqrt(np.mean(np.square(finite)))), float(eps))
+
+
+def normalized_rms_error(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    *,
+    fixed_scale: float,
+) -> float:
+    prediction = np.asarray(prediction, dtype=np.float64).reshape(-1)
+    target = np.asarray(target, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(prediction) & np.isfinite(target)
+    if not finite.any():
+        return float("nan")
+    rms = float(np.sqrt(np.mean(np.square(prediction[finite] - target[finite]))))
+    return rms / max(float(fixed_scale), 1e-12)
+
+
 @dataclass(frozen=True)
 class DriftResult:
     p_stats: Dict[str, float]
@@ -332,43 +570,221 @@ def normalized_state_distance(
 def choose_verdict(
     rows: Sequence[Mapping[str, Any]],
     *,
-    fit_tolerance: float,
+    fit_normalized_tolerance: float,
     distance_tolerance: float,
-) -> tuple[str, str]:
+    residual_improvement_ratio: float,
+    boundary_drift_tolerance: float,
+    two_cycle_ratio_threshold: float,
+) -> Dict[str, Any]:
+    """Classify fitted mapping behavior without equating fit and residual gaps."""
+    labels = {
+        "A": "Convergent",
+        "B": "Fitted-update failure",
+        "C": "Coverage/projection failure",
+        "D": "Oscillatory",
+        "E": "Expansive/divergent",
+        "F": "Plateau/inconclusive",
+    }
+    thresholds = {
+        "fit_normalized_tolerance": float(fit_normalized_tolerance),
+        "distance_tolerance": float(distance_tolerance),
+        "residual_improvement_ratio": float(residual_improvement_ratio),
+        "boundary_drift_tolerance": float(boundary_drift_tolerance),
+        "two_cycle_ratio_threshold": float(two_cycle_ratio_threshold),
+    }
     if not rows:
-        return "F", "no completed cycles"
-    fit_keys = (
-        "P_stage_fit_on_mean",
-        "Q_stage_fit_on_mean",
+        return {
+            "primary": "F",
+            "label": labels["F"],
+            "reason": "no completed cycles",
+            "conditions": {},
+            "thresholds": thresholds,
+            "statistics": {},
+        }
+
+    n_rows = len(rows)
+    window = 3 if n_rows >= 6 else max(1, n_rows // 2)
+    early = list(rows[:window])
+    tail = list(rows[-window:])
+
+    def _values(items: Sequence[Mapping[str, Any]], key: str) -> np.ndarray:
+        values = np.asarray([float(item.get(key, np.nan)) for item in items])
+        return values[np.isfinite(values)]
+
+    def _mean(items: Sequence[Mapping[str, Any]], key: str) -> float:
+        values = _values(items, key)
+        return float(values.mean()) if values.size else float("nan")
+
+    def _median(items: Sequence[Mapping[str, Any]], key: str) -> float:
+        values = _values(items, key)
+        return float(np.median(values)) if values.size else float("nan")
+
+    def _ratio(tail_value: float, early_value: float) -> float:
+        if not np.isfinite(tail_value) or not np.isfinite(early_value):
+            return float("nan")
+        return float(tail_value / max(abs(early_value), 1e-12))
+
+    statistics: Dict[str, Any] = {
+        "n_completed_cycles": n_rows,
+        "early_window": [int(row.get("cycle", index + 1)) for index, row in enumerate(early)],
+        "tail_window": [int(row.get("cycle", n_rows - window + index + 1)) for index, row in enumerate(tail)],
+    }
+    for prefix, key in (
+        ("d_joint", "d_joint"),
+        ("P_residual", "P_fixed_point_residual_mean"),
+        ("Q_residual", "Q_fixed_point_residual_mean"),
+        ("boundary_switch", "boundary_switch_share"),
+        ("bar_z_drift", "bar_z_mean_abs_drift"),
+        ("boundary_drift", "boundary_drift"),
+    ):
+        early_mean = _mean(early, key)
+        tail_mean = _mean(tail, key)
+        statistics[f"{prefix}_early_mean"] = early_mean
+        statistics[f"{prefix}_tail_mean"] = tail_mean
+        statistics[f"{prefix}_tail_over_early"] = _ratio(tail_mean, early_mean)
+    statistics.update(
+        {
+            "rho_tail_median": _median(tail, "rho"),
+            "cos_tail_median": _median(tail, "cos_theta"),
+            "two_step_tail_median": _median(tail, "two_step_distance"),
+            "one_step_tail_median": _median(tail, "d_joint"),
+            "P_stage_fit_on_norm_tail_max": float(max(
+                _values(tail, "P_stage_fit_on_norm"), default=float("nan")
+            )),
+            "Q_stage_fit_on_norm_tail_max": float(max(
+                _values(tail, "Q_stage_fit_on_norm"), default=float("nan")
+            )),
+            "P_stage_fit_canonical_norm_tail_max": float(max(
+                _values(tail, "P_stage_fit_canonical_norm"), default=float("nan")
+            )),
+            "Q_stage_fit_canonical_norm_tail_max": float(max(
+                _values(tail, "Q_stage_fit_canonical_norm"), default=float("nan")
+            )),
+        }
     )
-    tail = list(rows[max(0, len(rows) // 2):])
-    fit_values = [float(row.get(key, np.nan)) for row in tail for key in fit_keys]
-    if not fit_values or not np.isfinite(fit_values).all() or max(fit_values) > fit_tolerance:
-        return "B", "on-distribution fitted-stage error is not controlled"
-    canonical_fit = [
-        float(row.get(key, np.nan))
-        for row in tail
-        for key in ("P_stage_fit_canonical_mean", "Q_stage_fit_canonical_mean")
-    ]
-    if np.isfinite(canonical_fit).all() and max(canonical_fit) > fit_tolerance * 5.0:
-        return "C", "on-distribution fit is controlled but canonical fit is materially worse"
-    distances = np.asarray([float(row.get("d_joint", np.nan)) for row in rows])
-    rhos = np.asarray([float(row.get("rho", np.nan)) for row in tail])
-    cosines = np.asarray([float(row.get("cos_theta", np.nan)) for row in tail])
-    two_step = np.asarray([float(row.get("two_step_distance", np.nan)) for row in tail])
-    if np.isfinite(distances[-1]) and distances[-1] <= distance_tolerance:
-        return "A", "joint function distance reached the configured fixed-point tolerance"
-    finite_cos = cosines[np.isfinite(cosines)]
-    finite_two = two_step[np.isfinite(two_step)]
-    if finite_cos.size and np.median(finite_cos) < -0.5:
-        if finite_two.size and np.median(finite_two) < np.nanmedian(distances[-len(finite_two):]):
-            return "D", "updates reverse direction and two-step distance is smaller"
-    finite_rho = rhos[np.isfinite(rhos)]
-    if finite_rho.size and np.median(finite_rho) > 1.0 and distances[-1] > distances[0]:
-        return "E", "tail contraction ratios exceed one and joint distance grows"
-    if finite_rho.size and np.median(finite_rho) < 1.0 and distances[-1] < distances[0]:
-        return "A", "tail contraction ratios are below one and joint distance declines"
-    return "F", "joint distance and residual evidence plateau or remain inconclusive"
+    on_fit = np.asarray(
+        [
+            statistics["P_stage_fit_on_norm_tail_max"],
+            statistics["Q_stage_fit_on_norm_tail_max"],
+        ],
+        dtype=np.float64,
+    )
+    canonical_fit = np.asarray(
+        [
+            statistics["P_stage_fit_canonical_norm_tail_max"],
+            statistics["Q_stage_fit_canonical_norm_tail_max"],
+        ],
+        dtype=np.float64,
+    )
+    stage_fit_controlled = bool(
+        np.isfinite(on_fit).all()
+        and float(on_fit.max()) <= float(fit_normalized_tolerance)
+    )
+    joint_distance_shrinking = bool(
+        np.isfinite(statistics["d_joint_tail_mean"])
+        and (
+            statistics["d_joint_tail_mean"] <= distance_tolerance
+            or statistics["d_joint_tail_over_early"] < residual_improvement_ratio
+        )
+    )
+    tail_rho_below_one = bool(
+        np.isfinite(statistics["rho_tail_median"])
+        and statistics["rho_tail_median"] < 1.0
+    )
+    p_residual_improving = bool(
+        np.isfinite(statistics["P_residual_tail_over_early"])
+        and statistics["P_residual_tail_over_early"] < residual_improvement_ratio
+    )
+    q_residual_improving = bool(
+        np.isfinite(statistics["Q_residual_tail_over_early"])
+        and statistics["Q_residual_tail_over_early"] < residual_improvement_ratio
+    )
+    two_step_ratio = _ratio(
+        statistics["two_step_tail_median"],
+        statistics["one_step_tail_median"],
+    )
+    statistics["two_step_over_one_step_tail"] = two_step_ratio
+    oscillatory = bool(
+        np.isfinite(statistics["cos_tail_median"])
+        and statistics["cos_tail_median"] < -0.5
+        and np.isfinite(two_step_ratio)
+        and two_step_ratio < two_cycle_ratio_threshold
+    )
+    boundary_switch_ok = bool(
+        np.isfinite(statistics["boundary_switch_tail_mean"])
+        and (
+            statistics["boundary_switch_tail_mean"] <= boundary_drift_tolerance
+            or statistics["boundary_switch_tail_over_early"] < residual_improvement_ratio
+        )
+    )
+    bar_z_ok = bool(
+        np.isfinite(statistics["bar_z_drift_tail_mean"])
+        and (
+            statistics["bar_z_drift_tail_mean"] <= boundary_drift_tolerance
+            or statistics["bar_z_drift_tail_over_early"] < residual_improvement_ratio
+        )
+    )
+    boundary_stabilizing = boundary_switch_ok and bar_z_ok
+    canonical_bad = bool(
+        np.isfinite(canonical_fit).all()
+        and float(canonical_fit.max()) > float(fit_normalized_tolerance) * 5.0
+    )
+    expansive = bool(
+        np.isfinite(statistics["rho_tail_median"])
+        and statistics["rho_tail_median"] > 1.0
+        and statistics["d_joint_tail_over_early"] > 1.0
+        and statistics["P_residual_tail_over_early"] > 1.0
+        and statistics["Q_residual_tail_over_early"] > 1.0
+    )
+    conditions = {
+        "stage_fit_controlled": stage_fit_controlled,
+        "joint_distance_shrinking": joint_distance_shrinking,
+        "tail_rho_below_one": tail_rho_below_one,
+        "p_residual_improving": p_residual_improving,
+        "q_residual_improving": q_residual_improving,
+        "no_two_cycle": not oscillatory,
+        "boundary_stabilizing": boundary_stabilizing,
+        "canonical_fit_materially_worse": canonical_bad,
+        "expansive": expansive,
+    }
+
+    if not stage_fit_controlled:
+        primary = "B"
+        reason = "on-distribution normalized fitted-stage error is not controlled"
+    elif canonical_bad and not boundary_stabilizing:
+        primary = "C"
+        reason = "on-distribution fit is controlled but canonical projection and boundary drift are not"
+    elif oscillatory:
+        primary = "D"
+        reason = "tail updates reverse direction and two-step distance is comparatively small"
+    elif expansive:
+        primary = "E"
+        reason = "controlled fitted updates expand joint distance and fixed-point residuals"
+    elif all(
+        conditions[key]
+        for key in (
+            "stage_fit_controlled",
+            "joint_distance_shrinking",
+            "tail_rho_below_one",
+            "p_residual_improving",
+            "q_residual_improving",
+            "no_two_cycle",
+            "boundary_stabilizing",
+        )
+    ):
+        primary = "A"
+        reason = "all fitted-update, contraction, residual, oscillation, and boundary conditions pass"
+    else:
+        primary = "F"
+        reason = "fixed-point evidence plateaus or remains incomplete"
+    return {
+        "primary": primary,
+        "label": labels[primary],
+        "reason": reason,
+        "conditions": conditions,
+        "thresholds": thresholds,
+        "statistics": statistics,
+    }
 
 
 def write_json(path: str | Path, payload: Mapping[str, Any]) -> None:

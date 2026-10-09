@@ -27,6 +27,11 @@ CYCLES="${CYCLES:-10}"
 FIXED_POINT_SEED="${FIXED_POINT_SEED:-24681357}"
 N_CHILD_SHOCKS="${N_CHILD_SHOCKS:-64}"
 SHOCK_SEED="${SHOCK_SEED:-12345}"
+FIT_NORMALIZED_TOLERANCE="${FIT_NORMALIZED_TOLERANCE:-0.05}"
+DISTANCE_TOLERANCE="${DISTANCE_TOLERANCE:-0.001}"
+RESIDUAL_IMPROVEMENT_RATIO="${RESIDUAL_IMPROVEMENT_RATIO:-0.8}"
+BOUNDARY_DRIFT_TOLERANCE="${BOUNDARY_DRIFT_TOLERANCE:-0.001}"
+TWO_CYCLE_RATIO_THRESHOLD="${TWO_CYCLE_RATIO_THRESHOLD:-0.5}"
 
 mkdir -p "$WORK_ROOT/logs" "$OUTPUT_DIR" "$WORK_ROOT/.mplcache"
 cd "$REPO_DIR"
@@ -62,6 +67,30 @@ export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export PYTHONUNBUFFERED=1
 export MPLCONFIGDIR="$WORK_ROOT/.mplcache"
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export CHECKPOINT FROZEN_BATCH_BANK
+
+python3 - <<'PY'
+import json
+import os
+import torch
+
+from evaluation.pq_fixed_point import (
+    checkpoint_provenance,
+    validate_checkpoint_bank_provenance,
+    validate_frozen_batch_bank,
+)
+
+checkpoint = checkpoint_provenance(os.environ["CHECKPOINT"])
+bank_payload = torch.load(os.environ["FROZEN_BATCH_BANK"], map_location="cpu")
+bank = validate_frozen_batch_bank(bank_payload)
+guard = validate_checkpoint_bank_provenance(checkpoint, bank["provenance"])
+print("Checkpoint provenance:")
+print(json.dumps(checkpoint, indent=2, sort_keys=True))
+print("Bank provenance:")
+print(json.dumps(bank["provenance"], indent=2, sort_keys=True))
+print("Dataset hash:", bank["dataset_sha256"])
+print("Provenance guard:", json.dumps(guard, sort_keys=True))
+PY
 
 python3 - <<'PY'
 import torch
@@ -85,6 +114,11 @@ python3 -u experiments/frozen_env_pq_fixed_point.py \
   --z-points 41 \
   --n-child-shocks "$N_CHILD_SHOCKS" \
   --shock-seed "$SHOCK_SEED" \
+  --fit-normalized-tolerance "$FIT_NORMALIZED_TOLERANCE" \
+  --distance-tolerance "$DISTANCE_TOLERANCE" \
+  --residual-improvement-ratio "$RESIDUAL_IMPROVEMENT_RATIO" \
+  --boundary-drift-tolerance "$BOUNDARY_DRIFT_TOLERANCE" \
+  --two-cycle-ratio-threshold "$TWO_CYCLE_RATIO_THRESHOLD" \
   --device cuda:0
 
 echo "Completed: $(date)"

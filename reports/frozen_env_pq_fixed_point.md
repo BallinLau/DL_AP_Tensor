@@ -28,6 +28,23 @@ source_commit = 4b236eaacf47b2ac7cb506508e54b21a199e89b0
 
 Using `ep2_stage_modeb.pkl` to reconstruct the bank would violate the frozen-environment definition and is deliberately rejected.
 
+The formal training runner now has an opt-in producer. Set
+`SAVE_FROZEN_PQ_BATCH_BANK=1` (or pass `--save-frozen-pq-batch-bank`) on a
+staged, mixture-enabled run. Episode 2 saves the already-finalized train and
+validation objects immediately before `_run_policy_value_staged()` to:
+
+```text
+<run_root>/diagnostics/frozen_pq_batch_banks/ep2_pre_pv_frozen_batch_bank.pt
+```
+
+The default is disabled. The capture performs one CPU-detached copy only when
+enabled and records batch hashes plus run, checkpoint-state, SDF/FC1, economic,
+and P/Q hyperparameter provenance. `recover_ep2_pre_pv_frozen_batch_bank.py`
+does not approximate missing historical data: without a formal capture it exits
+with `historical_exact_recovery_not_possible`. Therefore the historical
+`scaled_value_grid_reference_ep0_ep4_4b236ea_20261008_210439` bank cannot be
+recovered exactly and must be rerun through the Episode-2 capture point.
+
 ## Run
 
 ```bash
@@ -36,6 +53,19 @@ sbatch slurm/run_frozen_env_pq_fixed_point_gpu.slurm
 ```
 
 The runner requires CUDA, uses a fixed cycle RNG seed, performs a cycle-1 deterministic replica check, hashes all immutable components, and writes per-cycle checkpoints, stage-fit diagnostics, contemporaneous fixed-point residuals, drift/contraction/oscillation metrics, plots, and an A-F verdict.
+
+Before model loading, the runner requires the checkpoint and bank to agree on
+episode, run identity/commit, SDF/FC1 hash, economic-config hash, relevant P/Q
+hyperparameter fingerprint, staged-flow/Q-refresh settings, and GRID/no-BP-head
+semantics. Missing hard provenance is an error rather than an implicit waiver.
+
+Normalized stage fit uses scales fixed once from cycle 0. P uses the combined
+cycle-0 `P0/PI` RMS because these are the formal fitted targets; Q uses cycle-0
+`Q` RMS. Raw mean/quantile fields remain in the CSV. The A verdict additionally
+requires controlled normalized fit, shrinking joint drift, tail rho below one,
+improving P and Q fixed-point residuals, no two-cycle signal, and stabilizing
+default-boundary state switches. Thresholds and early/tail windows are written
+to both `config.json` and `verdict.json`.
 
 Q stage-fit quantiles are the production fixed-validation-bank phase metrics (the production helper aggregates its per-batch diagnostics). They remain separate from canonical post-cycle Bellman self-consistency residuals; the runner never relabels the latter as phase target fit.
 

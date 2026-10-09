@@ -41,7 +41,9 @@ from evaluation.bp_diagnostics import (  # noqa: E402
 from evaluation.grids import build_frozen_grid, load_reference_state  # noqa: E402
 from evaluation.pq_fixed_point import (  # noqa: E402
     absolute_gap_summary,
+    checkpoint_provenance,
     choose_verdict,
+    fixed_rms_scale,
     function_drift,
     load_frozen_batch_bank,
     model_state_sha256,
@@ -50,6 +52,7 @@ from evaluation.pq_fixed_point import (  # noqa: E402
     parameter_subset_sha256,
     seed_fixed_mapping,
     update_cosine,
+    validate_checkpoint_bank_provenance,
     validate_cycle_teacher_hash,
     verify_production_pq_method_fingerprints,
     write_json,
@@ -78,8 +81,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shock-seed", type=int, default=12345)
     parser.add_argument("--eval-chunk-size", type=int, default=8192)
     parser.add_argument("--determinism-tolerance", type=float, default=1e-7)
-    parser.add_argument("--fit-tolerance", type=float, default=1e-2)
+    parser.add_argument("--fit-normalized-tolerance", type=float, default=5e-2)
     parser.add_argument("--distance-tolerance", type=float, default=1e-3)
+    parser.add_argument("--residual-improvement-ratio", type=float, default=0.8)
+    parser.add_argument("--boundary-drift-tolerance", type=float, default=1e-3)
+    parser.add_argument("--two-cycle-ratio-threshold", type=float, default=0.5)
     parser.add_argument("--skip-determinism-replica", action="store_true")
     parser.add_argument("--allow-code-commit-mismatch", action="store_true")
     return parser.parse_args()
@@ -216,7 +222,11 @@ def _cache_fit(
     pi = absolute_gap_summary(np.concatenate(pi_pred), np.concatenate(pi_target))
     both_pred = np.concatenate([np.concatenate(p0_pred), np.concatenate(pi_pred)])
     both_target = np.concatenate([np.concatenate(p0_target), np.concatenate(pi_target)])
-    return {"p0": p0, "pi": pi, "combined": absolute_gap_summary(both_pred, both_target)}
+    combined = absolute_gap_summary(both_pred, both_target)
+    combined["rms"] = float(
+        np.sqrt(np.mean(np.square(both_pred.reshape(-1) - both_target.reshape(-1))))
+    )
+    return {"p0": p0, "pi": pi, "combined": combined}
 
 
 def _build_p_caches(
@@ -324,7 +334,7 @@ def _q_fit_from_records(records: list[dict[str, Any]], bank: str) -> Dict[str, f
     if not usable:
         return {
             key: float("nan")
-            for key in ("mean", "p50", "p90", "p99", "max")
+            for key in ("mean", "p50", "p90", "p99", "max", "rms", "rms_raw")
         }
     selected = next(
         (item for item in reversed(usable) if item["phase"] == "polish"),
@@ -334,12 +344,26 @@ def _q_fit_from_records(records: list[dict[str, Any]], bank: str) -> Dict[str, f
     mean = float(selected.get("score_primary", float("nan")))
     normalize = bool(metrics.get("q_bellman_normalized_by_target_scale", False))
     suffix = "normalized" if normalize else "raw"
+    mean_square = float(
+        metrics.get(f"q_claim_bellman_mean_square_{suffix}", float("nan"))
+    )
+    mean_square_raw = float(
+        metrics.get("q_claim_bellman_mean_square_raw", float("nan"))
+    )
+    rms = float(np.sqrt(mean_square)) if np.isfinite(mean_square) and mean_square >= 0 else float("nan")
+    rms_raw = (
+        float(np.sqrt(mean_square_raw))
+        if np.isfinite(mean_square_raw) and mean_square_raw >= 0
+        else float("nan")
+    )
     return {
         "mean": mean,
         "p50": float(metrics.get(f"q_claim_bellman_abs_p50_{suffix}", float("nan"))),
         "p90": float(metrics.get(f"q_claim_bellman_abs_p90_{suffix}", float("nan"))),
         "p99": float(metrics.get(f"q_claim_bellman_abs_p99_{suffix}", float("nan"))),
         "max": float(metrics.get(f"q_claim_bellman_abs_max_{suffix}", float("nan"))),
+        "rms": rms,
+        "rms_raw": rms_raw,
     }
 
 
@@ -472,7 +496,12 @@ def _run_cycle(
     return result, {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
 
-def _report(output: Path, verdict: str, reason: str, audit: Mapping[str, Any], blocker: str | None = None) -> None:
+def _report(
+    output: Path,
+    verdict: Mapping[str, Any],
+    audit: Mapping[str, Any],
+    blocker: str | None = None,
+) -> None:
     lines = [
         "# Frozen-Environment P-Q Fixed-Point Test",
         "",
@@ -518,7 +547,19 @@ def _report(output: Path, verdict: str, reason: str, audit: Mapping[str, Any], b
         "",
         "## 10. Final verdict",
         "",
-        f"**{verdict}: {reason}.**",
+        f"**{verdict['primary']}. {verdict['label']}: {verdict['reason']}.**",
+        "",
+        "Thresholds:",
+        "",
+        "```json",
+        json.dumps(verdict["thresholds"], indent=2, sort_keys=True),
+        "```",
+        "",
+        "Early/tail statistics:",
+        "",
+        "```json",
+        json.dumps(verdict["statistics"], indent=2, sort_keys=True),
+        "```",
     ]
     if blocker:
         lines.extend(["", "## Provenance blocker", "", blocker])
@@ -555,6 +596,11 @@ def main() -> None:
     )
     if dataset_meta["provenance"].get("source_commit") != EXPECTED_CODE_COMMIT:
         raise SystemExit("frozen batch bank source_commit does not match the fixed code commit")
+    checkpoint_meta = checkpoint_provenance(args.checkpoint)
+    provenance_guard = validate_checkpoint_bank_provenance(
+        checkpoint_meta,
+        dataset_meta["provenance"],
+    )
     loaded = load_analysis_checkpoint(args.checkpoint, device=device)
     _, reference = load_reference_state(
         args.reference_firm_data,
@@ -606,6 +652,9 @@ def main() -> None:
             "production_pq_method_fingerprints": pq_method_fingerprints,
             "checkpoint": str(args.checkpoint.resolve()),
             "frozen_batch_bank": str(args.frozen_batch_bank.resolve()),
+            "checkpoint_provenance": checkpoint_meta,
+            "bank_provenance": dataset_meta["provenance"],
+            "provenance_guard": provenance_guard,
             "cycles": args.cycles,
             "fixed_point_seed": args.fixed_point_seed,
             "canonical_grid": {"b": [0.0, 1.0, args.b_points], "z": [-2.0, 2.0, args.z_points]},
@@ -615,6 +664,13 @@ def main() -> None:
             "audit": audit,
             "hyperparams": vars(loaded.hyperparams),
             "economic_config": loaded.economic_config.to_dict(),
+            "verdict_thresholds": {
+                "fit_normalized_tolerance": args.fit_normalized_tolerance,
+                "distance_tolerance": args.distance_tolerance,
+                "residual_improvement_ratio": args.residual_improvement_ratio,
+                "boundary_drift_tolerance": args.boundary_drift_tolerance,
+                "two_cycle_ratio_threshold": args.two_cycle_ratio_threshold,
+            },
         }
         write_json(output / "config.json", config)
         write_json(output / "dataset_hashes.json", dataset_meta)
@@ -635,8 +691,15 @@ def main() -> None:
             {"cycle": 0, "models": {"policy_value": initial_policy.state_dict()}, "config": config},
             output / "checkpoints" / "cycle_00.pt",
         )
-        p_scale = max(float(np.sqrt(np.mean(np.square(surfaces[0]["P"])))), 1e-6)
-        q_scale = max(float(np.sqrt(np.mean(np.square(surfaces[0]["Q"])))), 1e-6)
+        p_scale = fixed_rms_scale(surfaces[0]["P"])
+        q_scale = fixed_rms_scale(surfaces[0]["Q"])
+        p_stage_scale = fixed_rms_scale(surfaces[0]["P0"], surfaces[0]["PI"])
+        config["fixed_cycle0_scales"] = {
+            "P_function_drift_scale": p_scale,
+            "P_stage_fit_scale_from_P0_PI": p_stage_scale,
+            "Q_stage_and_drift_scale": q_scale,
+        }
+        write_json(output / "config.json", config)
         np.savez_compressed(output / "canonical_surfaces" / "cycle_00.npz", **surfaces[0])
         rows: list[dict[str, Any]] = []
         residual_rows: list[dict[str, Any]] = []
@@ -740,18 +803,22 @@ def main() -> None:
                 "two_step_distance": two_step,
                 "P_stage_fit_on_mean": result["p_fit_on"]["combined"]["mean"],
                 "P_stage_fit_on_p90": result["p_fit_on"]["combined"]["p90"],
+                "P_stage_fit_on_norm": result["p_fit_on"]["combined"]["rms"] / p_stage_scale,
                 "P_stage_fit_canonical_mean": result["p_fit_canonical"]["combined"]["mean"],
                 "P_stage_fit_canonical_p90": result["p_fit_canonical"]["combined"]["p90"],
+                "P_stage_fit_canonical_norm": result["p_fit_canonical"]["combined"]["rms"] / p_stage_scale,
                 "Q_stage_fit_on_mean": result["q_fit_on"]["mean"],
                 "Q_stage_fit_on_p50": result["q_fit_on"]["p50"],
                 "Q_stage_fit_on_p90": result["q_fit_on"]["p90"],
                 "Q_stage_fit_on_p99": result["q_fit_on"]["p99"],
                 "Q_stage_fit_on_max": result["q_fit_on"]["max"],
+                "Q_stage_fit_on_norm": result["q_fit_on"]["rms_raw"] / q_scale,
                 "Q_stage_fit_canonical_mean": result["q_fit_canonical"]["mean"],
                 "Q_stage_fit_canonical_p50": result["q_fit_canonical"]["p50"],
                 "Q_stage_fit_canonical_p90": result["q_fit_canonical"]["p90"],
                 "Q_stage_fit_canonical_p99": result["q_fit_canonical"]["p99"],
                 "Q_stage_fit_canonical_max": result["q_fit_canonical"]["max"],
+                "Q_stage_fit_canonical_norm": result["q_fit_canonical"]["rms_raw"] / q_scale,
                 "P_fixed_point_residual_mean": np.mean([
                     residual_summary["p0_residual_abs_mean"],
                     residual_summary["pi_residual_abs_mean"],
@@ -765,10 +832,17 @@ def main() -> None:
                 "DefaultShare": float(default.mean()),
                 "D_to_S_share": float((previous_default & ~default).mean()),
                 "S_to_D_share": float((~previous_default & default).mean()),
+                "boundary_switch_share": float(
+                    ((previous_default & ~default) | (~previous_default & default)).mean()
+                ),
                 "bar_z_mean_abs_drift": float(bar_z_drift.mean()),
                 "runtime_sec": runtime,
                 "peak_gpu_memory": int(torch.cuda.max_memory_allocated(device)),
             }
+            row["boundary_drift"] = max(
+                float(row["boundary_switch_share"]),
+                float(row["bar_z_mean_abs_drift"]),
+            )
             rows.append(row)
             residual_rows.append({"cycle": cycle + 1, **residual_summary})
             stage_rows.append({
@@ -827,14 +901,17 @@ def main() -> None:
         _plot_lines(frame, ("cos_theta",), output / "figs" / "update_cosine.png", hline=0.0)
         _plot_lines(frame, ("DefaultShare", "D_to_S_share", "S_to_D_share"),
                     output / "figs" / "default_share_by_cycle.png")
-        verdict, reason = choose_verdict(
+        verdict = choose_verdict(
             rows,
-            fit_tolerance=args.fit_tolerance,
+            fit_normalized_tolerance=args.fit_normalized_tolerance,
             distance_tolerance=args.distance_tolerance,
+            residual_improvement_ratio=args.residual_improvement_ratio,
+            boundary_drift_tolerance=args.boundary_drift_tolerance,
+            two_cycle_ratio_threshold=args.two_cycle_ratio_threshold,
         )
-        write_json(output / "verdict.json", {"primary": verdict, "reason": reason})
-        _report(output, verdict, reason, audit)
-        print(json.dumps({"verdict": verdict, "reason": reason, "output_dir": str(output)}, indent=2))
+        write_json(output / "verdict.json", verdict)
+        _report(output, verdict, audit)
+        print(json.dumps({"verdict": verdict, "output_dir": str(output)}, indent=2))
 
 
 if __name__ == "__main__":

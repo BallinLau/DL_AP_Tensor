@@ -437,6 +437,9 @@ class HyperParams:
     q_no_improvement_patience_episodes: int = 0
     save_episode_diagnostics: bool = False
     save_intermediate_stage_checkpoints: bool = False
+    # One-shot, opt-in export of the exact Episode-2 post-SDF/pre-PV batches.
+    # Disabled by default so ordinary training performs no extra CPU copies.
+    save_frozen_pq_batch_bank: bool = False
     q_zero_sample_share: float = 0.20
     q_default_sample_share: float = 0.30
     q_survival_sample_share: float = 0.50

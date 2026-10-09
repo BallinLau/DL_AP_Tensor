@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 import sys
 import json
+import subprocess
 import warnings
 
 import numpy as np
@@ -411,6 +412,12 @@ def parse_args() -> argparse.Namespace:
         "--save-intermediate-stage-checkpoints",
         action=argparse.BooleanOptionalAction,
         default=None,
+    )
+    parser.add_argument(
+        "--save-frozen-pq-batch-bank",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Export the exact Episode-2 post-SDF-refresh/pre-PV staged batch bank",
     )
     parser.add_argument("--q-zero-sample-share", type=float, default=None, help="Q0 sample share during mixed polishing")
     parser.add_argument("--q-default-sample-share", type=float, default=None, help="QD sample share during mixed polishing")
@@ -857,6 +864,7 @@ def configure_hyperparams(args: argparse.Namespace):
         "q_no_improvement_patience_episodes": args.q_no_improvement_patience_episodes,
         "save_episode_diagnostics": args.save_episode_diagnostics,
         "save_intermediate_stage_checkpoints": args.save_intermediate_stage_checkpoints,
+        "save_frozen_pq_batch_bank": args.save_frozen_pq_batch_bank,
         "q_zero_sample_share": args.q_zero_sample_share,
         "q_default_sample_share": args.q_default_sample_share,
         "q_survival_sample_share": args.q_survival_sample_share,
@@ -1196,6 +1204,13 @@ def main():
             device=device,
             episode_id=0,
             gpu_monitor=gpu_monitor,
+            frozen_pq_capture_context={
+                "run_root": str(resolve_base_dir(run_root, ROOT).resolve()),
+                "seed": int(args.seed),
+                "source_run_commit": subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+                ).strip(),
+            },
         )
     for ep in range(args.n_episodes):
         episode.episode_id = ep  # update episode ID for logging/saving

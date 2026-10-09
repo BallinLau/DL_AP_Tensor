@@ -19,7 +19,8 @@ from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
 from numbers import Number
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 from tqdm import tqdm
 import logging
 
@@ -211,6 +212,7 @@ class Episode:
         gpu_monitor = None,
         firm_target: Optional[nn.Module] = None,
         q_checkpoint_loaded: bool = False,
+        frozen_pq_capture_context: Optional[Mapping[str, Any]] = None,
     ):
         """
         Args:
@@ -237,6 +239,7 @@ class Episode:
         self.device = device or config.DEVICE
         self.episode_id = episode_id
         self.q_checkpoint_loaded = bool(q_checkpoint_loaded)
+        self.frozen_pq_capture_context = dict(frozen_pq_capture_context or {})
         self.firm_target = self._init_firm_target(firm_target)
         self._configure_policy_value_parameterization()
         
@@ -323,6 +326,93 @@ class Episode:
         configure_target = getattr(getattr(self, "firm_target", None), "configure_value_parameterization", None)
         if callable(configure_target):
             configure_target(mode=mode, log_max=log_max)
+
+    def _capture_frozen_pq_batch_bank_if_enabled(
+        self,
+        train_batches: List[Dict[str, Any]],
+        validation_batches: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Export the exact objects immediately before Episode-2 staged P/Q."""
+        if not bool(
+            getattr(self.hyperparams, "save_frozen_pq_batch_bank", False)
+        ):
+            return None
+        if int(self.episode_id) != 2:
+            return None
+        if str(getattr(self.hyperparams, "pv_training_flow", "joint")).lower() != "staged":
+            raise RuntimeError("frozen P/Q batch capture requires staged PV training")
+        if not train_batches or not validation_batches:
+            raise RuntimeError(
+                "frozen P/Q batch capture requires final non-empty train and validation batches"
+            )
+        context = dict(self.frozen_pq_capture_context)
+        run_root = context.get("run_root")
+        source_run_commit = context.get("source_run_commit")
+        seed = context.get("seed")
+        if run_root is None or source_run_commit is None or seed is None:
+            raise RuntimeError(
+                "frozen P/Q batch capture requires run_root, source_run_commit, and seed"
+            )
+
+        from analysis.economic_config import AnalysisEconomicConfig
+        from evaluation.pq_fixed_point import (
+            GRID_PQ_MAPPING_COMMIT,
+            model_state_sha256,
+            object_sha256,
+            relevant_pq_hyperparameter_fingerprint,
+            save_frozen_batch_bank,
+            verify_production_pq_method_fingerprints,
+        )
+
+        economic_config = AnalysisEconomicConfig.from_current_config().to_dict()
+        mapping_fingerprints = verify_production_pq_method_fingerprints(type(self))
+        provenance = {
+            "episode": 2,
+            "panel_stage": "post_sdf_refresh_pre_pv",
+            "simulation_reused_without_rerun": True,
+            "batch_composition_frozen": True,
+            "batch_order_frozen": True,
+            "validation_split_frozen": True,
+            # The fixed-point mapping is pinned by audited AST fingerprints to
+            # this GRID commit; capture_code_commit records the actual runner.
+            "source_commit": GRID_PQ_MAPPING_COMMIT,
+            "source_run_commit": str(source_run_commit),
+            "capture_code_commit": str(source_run_commit),
+            "production_pq_method_fingerprints": mapping_fingerprints,
+            "run_root": str(Path(run_root).expanduser().resolve()),
+            "source_run_identity": str(Path(run_root).expanduser().resolve()),
+            "seed": int(seed),
+            "policy_value_checkpoint_hash_pre_pv": model_state_sha256(
+                self.models["policy_value"]
+            ),
+            "sdf_fc1_hash": model_state_sha256(self.models["sdf_fc1"]),
+            "economic_config_hash": object_sha256(economic_config),
+            "hyperparameter_fingerprint": relevant_pq_hyperparameter_fingerprint(
+                self.hyperparams
+            ),
+            "pv_training_flow": str(self.hyperparams.pv_training_flow),
+            "q_target_refresh_mode": str(self.hyperparams.q_target_refresh_mode),
+            "simulation_bp_action_source": str(
+                self.hyperparams.simulation_bp_action_source
+            ),
+            "pv_bp_head_training_enabled": bool(
+                self.hyperparams.pv_bp_head_training_enabled
+            ),
+            "source_is_post_pv_output": False,
+            "p_optimizer_steps_in_current_stage": 0,
+        }
+        path = (
+            Path(run_root)
+            / "diagnostics"
+            / "frozen_pq_batch_banks"
+            / "ep2_pre_pv_frozen_batch_bank.pt"
+        )
+        return save_frozen_batch_bank(
+            path,
+            train_batches=train_batches,
+            validation_batches=validation_batches,
+            provenance=provenance,
+        )
 
     def _pv_value_scale(self, model: nn.Module, parent_state: torch.Tensor) -> torch.Tensor:
         scale_fn = getattr(model, "equity_value_scale", None)
@@ -6123,6 +6213,9 @@ class Episode:
                 'q_claim_bellman_abs_mean': float(branch_abs_raw.mean().item()),
                 'q_claim_bellman_signed_mean_raw': float(branch_residual_raw.mean().item()),
                 'q_claim_bellman_abs_mean_raw': float(branch_abs_raw.mean().item()),
+                'q_claim_bellman_mean_square_raw': float(
+                    branch_residual_raw.square().mean().item()
+                ),
                 'q_claim_bellman_abs_p50_raw': _qstat(branch_abs_raw, 0.50),
                 'q_claim_bellman_abs_p90_raw': _qstat(branch_abs_raw, 0.90),
                 'q_claim_bellman_abs_p95_raw': _qstat(branch_abs_raw, 0.95),
@@ -6133,6 +6226,9 @@ class Episode:
                 ),
                 'q_claim_bellman_abs_mean_normalized': float(
                     branch_abs_normalized.mean().item()
+                ),
+                'q_claim_bellman_mean_square_normalized': float(
+                    branch_residual_normalized.square().mean().item()
                 ),
                 'q_claim_bellman_abs_p50_normalized': _qstat(branch_abs_normalized, 0.50),
                 'q_claim_bellman_abs_p90_normalized': _qstat(branch_abs_normalized, 0.90),
@@ -10363,6 +10459,10 @@ class Episode:
 
         raw = _weighted("q_claim_bellman_abs_mean_raw")
         normalized = _weighted("q_claim_bellman_abs_mean_normalized")
+        raw_mean_square = _weighted("q_claim_bellman_mean_square_raw")
+        normalized_mean_square = _weighted(
+            "q_claim_bellman_mean_square_normalized"
+        )
         normalize_q = bool(
             getattr(
                 self.hyperparams,
@@ -10377,7 +10477,12 @@ class Episode:
             "score_normalized_abs": normalized,
             "sample_count": int(count),
             "batch_count": int(len(records)),
-            "metrics": {**avg, **meta},
+            "metrics": {
+                **avg,
+                **meta,
+                "q_claim_bellman_mean_square_raw": raw_mean_square,
+                "q_claim_bellman_mean_square_normalized": normalized_mean_square,
+            },
         }
 
     def _run_q_regime_phase(
@@ -15727,12 +15832,26 @@ class Episode:
                             module_summaries['policy_value_validation_batching_modeb'] = self._parent_batching_summary(
                                 pv_validation_batches
                             )
+                            capture_summary = self._capture_frozen_pq_batch_bank_if_enabled(
+                                pv_batches,
+                                pv_validation_batches,
+                            )
+                            if capture_summary is not None:
+                                module_summaries['frozen_pq_batch_bank'] = capture_summary
                             module_summaries['policy_value'] = self._run_policy_value_staged(
                                 pv_train_batches=pv_batches,
                                 validation_batches=pv_validation_batches,
                                 n_epochs=n_epochs,
                             )
                         else:
+                            if (
+                                int(self.episode_id) == 2
+                                and bool(getattr(self.hyperparams, "save_frozen_pq_batch_bank", False))
+                            ):
+                                raise RuntimeError(
+                                    "frozen P/Q batch capture requested, but the exact staged "
+                                    "mixture train/validation path is not active"
+                                )
                             module_summaries['policy_value'] = self._run_batches(
                                 pv_batches, n_epochs, log_interval, ['policy_value'], desc_prefix='Policy/Value '
                             )
