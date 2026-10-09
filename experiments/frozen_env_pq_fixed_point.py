@@ -43,6 +43,7 @@ from evaluation.pq_fixed_point import (  # noqa: E402
     absolute_gap_summary,
     checkpoint_provenance,
     choose_verdict,
+    evaluate_grid_p_fixed_point_residuals,
     fixed_rms_scale,
     function_drift,
     load_frozen_batch_bank,
@@ -248,6 +249,54 @@ def _build_p_caches(
     return cache
 
 
+def _prepare_cycle_batch_plan(
+    episode: Episode,
+    train_batches: list[dict[str, Any]],
+    validation_batches: list[dict[str, Any]],
+) -> Dict[str, Any]:
+    """Mirror production P-only eta balancing while preserving Q's frozen bank."""
+    p_train_batches, p_train_eta_summary = episode._balance_p_current_eta_batches(
+        train_batches,
+        stream="train",
+    )
+    balance_validation = bool(
+        getattr(episode.hyperparams, "pv_current_eta_balance_validation", True)
+    )
+    if balance_validation:
+        p_validation_batches, p_validation_eta_summary = (
+            episode._balance_p_current_eta_batches(
+                validation_batches,
+                stream="validation",
+            )
+        )
+        if not validation_batches:
+            p_validation_eta_summary = dict(p_train_eta_summary)
+            p_validation_eta_summary["stream"] = "train_fallback"
+    else:
+        p_validation_batches = validation_batches
+        counts = episode._current_eta_counts_from_batches(validation_batches)
+        p_validation_eta_summary = {
+            "enabled": False,
+            "stream": "validation",
+            **counts,
+            "eta0_count_after": counts["eta0_count"],
+            "eta1_count_after": counts["eta1_count"],
+            "eta1_share_after": counts["eta1_share"],
+        }
+    return {
+        "p_train_batches": p_train_batches,
+        "p_validation_batches": p_validation_batches,
+        "q_train_batches": train_batches,
+        "q_validation_batches": validation_batches,
+        "p_train_eta_summary": p_train_eta_summary,
+        "p_validation_eta_summary": p_validation_eta_summary,
+        "p_train_balanced_hash": object_sha256(p_train_batches),
+        "p_validation_balanced_hash": object_sha256(p_validation_batches),
+        "q_train_original_hash": object_sha256(train_batches),
+        "q_validation_original_hash": object_sha256(validation_batches),
+    }
+
+
 def _canonical_p_teacher_targets(
     episode: Episode,
     canonical_batch: dict[str, Any],
@@ -435,15 +484,23 @@ def _run_cycle(
         raise RuntimeError("cycle teacher does not match X^k start snapshot")
     episode.firm_target = teacher
 
-    on_p_cache = _build_p_caches(episode, validation_batches, teacher, teacher)
+    batch_plan = _prepare_cycle_batch_plan(
+        episode,
+        train_batches,
+        validation_batches,
+    )
+    p_train_batches = batch_plan["p_train_batches"]
+    p_validation_batches = batch_plan["p_validation_batches"]
+
+    on_p_cache = _build_p_caches(episode, p_validation_batches, teacher, teacher)
     canonical_p_cache = _build_p_caches(episode, [canonical_batch], teacher, teacher)
     canonical_p_targets = _canonical_p_teacher_targets(
         episode, canonical_batch, teacher
     )
     hashes_before_p = _subset_hashes(episode)
     p_summary = episode._run_policy_value_evaluation_stage(
-        train_batches,
-        validation_batches,
+        p_train_batches,
+        p_validation_batches,
         teacher,
         int(getattr(episode.hyperparams, "pv_eval_epochs", 1)),
         q_target_model=teacher,
@@ -452,7 +509,7 @@ def _run_cycle(
     _assert_stage_isolation(hashes_before_p, hashes_after_p, allowed="p", stage="P stage")
     if p_summary.get("status") != "accepted":
         raise RuntimeError(f"P stage was not accepted: {p_summary.get('status')}")
-    p_fit_on = _cache_fit(episode, validation_batches, on_p_cache)
+    p_fit_on = _cache_fit(episode, p_validation_batches, on_p_cache)
     p_fit_canonical = _cache_fit(episode, [canonical_batch], canonical_p_cache)
 
     frozen_p = copy.deepcopy(model).to(episode.device)
@@ -460,11 +517,15 @@ def _run_cycle(
     frozen_p.requires_grad_(False)
     frozen_p_hash = episode._state_dict_hash(frozen_p)
     hashes_before_q = _subset_hashes(episode)
-    with _capture_q_phase_fit(episode, validation_batches, [canonical_batch]) as q_records:
+    with _capture_q_phase_fit(
+        episode,
+        batch_plan["q_validation_batches"],
+        [canonical_batch],
+    ) as q_records:
         q_summary = episode._run_q_regime_training(
-            train_batches,
+            batch_plan["q_train_batches"],
             frozen_p,
-            validation_batches=validation_batches,
+            validation_batches=batch_plan["q_validation_batches"],
         )
     hashes_after_q = _subset_hashes(episode)
     _assert_stage_isolation(hashes_before_q, hashes_after_q, allowed="q", stage="Q stage")
@@ -490,6 +551,12 @@ def _run_cycle(
         "q_fit_on": _q_fit_from_records(q_records, "on_distribution"),
         "q_fit_canonical": _q_fit_from_records(q_records, "canonical"),
         "canonical_p_targets": canonical_p_targets,
+        "p_train_balanced_hash": batch_plan["p_train_balanced_hash"],
+        "p_validation_balanced_hash": batch_plan["p_validation_balanced_hash"],
+        "q_train_original_hash": batch_plan["q_train_original_hash"],
+        "q_validation_original_hash": batch_plan["q_validation_original_hash"],
+        "p_train_eta_summary": batch_plan["p_train_eta_summary"],
+        "p_validation_eta_summary": batch_plan["p_validation_eta_summary"],
         "p_changed": hashes_before_p["p"] != hashes_after_p["p"],
         "q_changed": hashes_before_q["q"] != hashes_after_q["q"],
     }
@@ -535,7 +602,9 @@ def _report(
         "",
         "## 7. Fixed-point residuals",
         "",
-        "These are contemporaneous self-consistency residuals and are not labelled as fitted-stage errors.",
+        "The main P residual is the contemporaneous BPGridTeacher argmax residual. "
+        "The BP-head action residual is reported separately as a compatibility diagnostic "
+        "and does not enter the verdict. Q keeps its production Bellman residual.",
         "",
         "## 8. Default-boundary stability",
         "",
@@ -709,6 +778,7 @@ def main() -> None:
         sdf_initial_hash = immutable_hashes["sdf_fc1"]
         previous_teacher_hash: str | None = None
         previous_cycle_end_hash: str | None = None
+        expected_p_batch_hashes: tuple[str, str] | None = None
 
         if not args.skip_determinism_replica:
             replica_a = _make_episode(loaded, copy.deepcopy(initial_policy).to(device), device)
@@ -751,6 +821,14 @@ def main() -> None:
             )
             if model_state_sha256(episode.models["sdf_fc1"]) != sdf_initial_hash:
                 raise RuntimeError("SDF/FC1 changed during frozen P/Q iteration")
+            current_p_batch_hashes = (
+                result["p_train_balanced_hash"],
+                result["p_validation_balanced_hash"],
+            )
+            if expected_p_batch_hashes is None:
+                expected_p_batch_hashes = current_p_batch_hashes
+            elif current_p_batch_hashes != expected_p_batch_hashes:
+                raise RuntimeError("P current-eta balanced batches changed across cycles")
             current = _forward_surfaces(
                 episode.models["policy_value"],
                 grid.base_states,
@@ -783,6 +861,12 @@ def main() -> None:
                 loaded.economic_config,
                 chunk_size=args.eval_chunk_size,
             )
+            grid_p_residual = evaluate_grid_p_fixed_point_residuals(
+                episode,
+                canonical_batch,
+                current_model=episode.models["policy_value"],
+            )
+            grid_p_summary = grid_p_residual["summary"]
             default = current["Phat"] <= 0.0
             previous_default = surfaces[-2]["Phat"] <= 0.0
             bar_z_drift = np.abs(current["bar_z"] - surfaces[-2]["bar_z"])
@@ -819,14 +903,32 @@ def main() -> None:
                 "Q_stage_fit_canonical_p99": result["q_fit_canonical"]["p99"],
                 "Q_stage_fit_canonical_max": result["q_fit_canonical"]["max"],
                 "Q_stage_fit_canonical_norm": result["q_fit_canonical"]["rms_raw"] / q_scale,
-                "P_fixed_point_residual_mean": np.mean([
+                "P_head_policy_residual_mean": np.mean([
                     residual_summary["p0_residual_abs_mean"],
                     residual_summary["pi_residual_abs_mean"],
                 ]),
-                "P_fixed_point_residual_p90": max(
+                "P_head_policy_residual_p90": max(
                     residual_summary["p0_residual_abs_p90"],
                     residual_summary["pi_residual_abs_p90"],
                 ),
+                "P_grid_fixed_point_residual_mean": grid_p_summary[
+                    "P_grid_fixed_point_residual_mean"
+                ],
+                "P_grid_fixed_point_residual_p90": grid_p_summary[
+                    "P_grid_fixed_point_residual_p90"
+                ],
+                "P0_grid_residual_mean": grid_p_summary[
+                    "p0_grid_residual_abs_mean"
+                ],
+                "P0_grid_residual_p90": grid_p_summary[
+                    "p0_grid_residual_abs_p90"
+                ],
+                "PI_grid_residual_mean": grid_p_summary[
+                    "pi_grid_residual_abs_mean"
+                ],
+                "PI_grid_residual_p90": grid_p_summary[
+                    "pi_grid_residual_abs_p90"
+                ],
                 "Q_fixed_point_residual_mean": residual_summary["q_residual_abs_mean"],
                 "Q_fixed_point_residual_p90": residual_summary["q_residual_abs_p90"],
                 "DefaultShare": float(default.mean()),
@@ -844,7 +946,15 @@ def main() -> None:
                 float(row["bar_z_mean_abs_drift"]),
             )
             rows.append(row)
-            residual_rows.append({"cycle": cycle + 1, **residual_summary})
+            residual_detail = {"cycle": cycle + 1, **grid_p_summary}
+            for key, value in residual_summary.items():
+                if key.startswith("p0_"):
+                    residual_detail[f"p0_head_policy_{key[3:]}"] = value
+                elif key.startswith("pi_"):
+                    residual_detail[f"pi_head_policy_{key[3:]}"] = value
+                elif key.startswith("q_"):
+                    residual_detail[key] = value
+            residual_rows.append(residual_detail)
             stage_rows.append({
                 "cycle": cycle + 1,
                 **{key: value for key, value in row.items() if "stage_fit" in key},
@@ -859,6 +969,10 @@ def main() -> None:
                 "bp_hash": result["component_hashes_after_q"]["bp"],
                 "sdf_fc1_hash": result["component_hashes_after_q"]["sdf_fc1"],
                 "dataset_hash": dataset_meta["dataset_sha256"],
+                "p_train_balanced_hash": result["p_train_balanced_hash"],
+                "p_validation_balanced_hash": result["p_validation_balanced_hash"],
+                "q_train_original_hash": result["q_train_original_hash"],
+                "q_validation_original_hash": result["q_validation_original_hash"],
                 "p_changed": result["p_changed"],
                 "q_changed": result["q_changed"],
             })
@@ -893,9 +1007,11 @@ def main() -> None:
         pd.DataFrame(checkpoint_rows).to_csv(output / "cycle_checkpoint_hashes.csv", index=False)
         _plot_lines(frame, ("dP", "dQ", "d_joint"), output / "figs" / "joint_distance_by_cycle.png")
         _plot_lines(frame, ("rho",), output / "figs" / "contraction_ratio.png", hline=1.0)
-        _plot_lines(frame, ("P_fixed_point_residual_mean", "Q_fixed_point_residual_mean"),
+        _plot_lines(frame, ("P_grid_fixed_point_residual_mean", "Q_fixed_point_residual_mean"),
                     output / "figs" / "fixed_point_residuals.png")
-        _plot_lines(frame, ("P_stage_fit_on_mean", "P_fixed_point_residual_mean",
+        _plot_lines(frame, ("P_head_policy_residual_mean",),
+                    output / "figs" / "p_head_policy_compatibility_residual.png")
+        _plot_lines(frame, ("P_stage_fit_on_mean", "P_grid_fixed_point_residual_mean",
                             "Q_stage_fit_on_mean", "Q_fixed_point_residual_mean"),
                     output / "figs" / "stage_fit_vs_fixed_point_gap.png")
         _plot_lines(frame, ("cos_theta",), output / "figs" / "update_cosine.png", hline=0.0)

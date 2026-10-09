@@ -7,6 +7,7 @@ existing evaluation package for contemporaneous residuals.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import ast
 import inspect
@@ -19,6 +20,8 @@ from typing import Any, Dict, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
+
+from training.bp_grid_teacher import BPGridTeacher
 
 
 BATCH_BANK_FORMAT = "frozen_pq_batch_bank_v1"
@@ -40,6 +43,10 @@ RELEVANT_PQ_HYPERPARAMETER_FIELDS = (
     "pv_mixture_seed",
     "pv_mixture_stratified_validation",
     "pv_exact_eta_integration_enabled",
+    "pv_current_eta_balance_enabled",
+    "pv_current_eta1_train_share",
+    "pv_current_eta_balance_validation",
+    "pv_current_eta_balance_seed",
     "pv_bp_training_mode",
     "pv_bp_head_training_enabled",
     "simulation_bp_action_source",
@@ -482,6 +489,98 @@ def absolute_gap_summary(prediction: np.ndarray, target: np.ndarray) -> Dict[str
     return distribution_summary(np.abs(prediction[finite] - target[finite]))
 
 
+def evaluate_grid_p_fixed_point_residuals(
+    episode: Any,
+    canonical_batch: Mapping[str, Any],
+    *,
+    current_model: torch.nn.Module | None = None,
+) -> Dict[str, Any]:
+    """Evaluate P self-consistency against the production GRID argmax target.
+
+    The current model supplies the left-hand-side P0/PI predictions.  A frozen
+    deepcopy of that same model supplies both continuation equity and Q pricing
+    inside ``BPGridTeacher``.  This is therefore a contemporaneous GRID
+    Bellman residual, not a residual evaluated at the model's BP-head action.
+    """
+    model = current_model or episode.models["policy_value"]
+    model_hash_before = model_state_sha256(model)
+    self_teacher = copy.deepcopy(model).to(episode.device)
+    self_teacher.eval()
+    self_teacher.requires_grad_(False)
+
+    parent_state, children, m_list, *_hashes = (
+        episode._policy_batch_hash_components(canonical_batch)
+    )
+    children, _m_raw, m_list, child_weights = (
+        episode._expand_policy_expectation_children(children, m_list, m_list)
+    )
+    teacher = BPGridTeacher.from_hyperparams(
+        self_teacher,
+        episode.loss_fns["p0"],
+        episode.loss_fns["pi"],
+        episode.hyperparams,
+        q_target_model=self_teacher,
+    )
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.inference_mode():
+            value_fn = getattr(model, "_value_outputs", None)
+            if callable(value_fn):
+                p0_pred, pi_pred = value_fn(parent_state)
+            else:
+                output = model(parent_state)
+                p0_pred = output["P0"] if isinstance(output, dict) else output.P0
+                pi_pred = output["PI"] if isinstance(output, dict) else output.PI
+
+            branch_results: Dict[str, Dict[str, torch.Tensor]] = {}
+            for branch in ("p0", "pi"):
+                branch_results[branch] = teacher.compute_value_target(
+                    parent_state=parent_state,
+                    children=children,
+                    m_list=m_list,
+                    branch=branch,
+                    child_weights=child_weights,
+                )
+    finally:
+        model.train(was_training)
+
+    if model_state_sha256(model) != model_hash_before:
+        raise RuntimeError("GRID P fixed-point evaluation mutated the current model")
+
+    predictions = {"p0": p0_pred, "pi": pi_pred}
+    result: Dict[str, Any] = {}
+    summary: Dict[str, float] = {}
+    branch_summaries: Dict[str, Dict[str, float]] = {}
+    for branch in ("p0", "pi"):
+        prediction = predictions[branch].detach().cpu().numpy().reshape(-1)
+        value_star = (
+            branch_results[branch]["value_star"].detach().cpu().numpy().reshape(-1)
+        )
+        bp_star = (
+            branch_results[branch]["bp_star"].detach().cpu().numpy().reshape(-1)
+        )
+        residual = prediction - value_star
+        stats = distribution_summary(np.abs(residual))
+        branch_summaries[branch] = stats
+        result[f"{branch}_prediction"] = prediction
+        result[f"{branch}_value_star"] = value_star
+        result[f"{branch}_bp_star"] = bp_star
+        result[f"{branch}_grid_residual"] = residual
+        for statistic, value in stats.items():
+            summary[f"{branch}_grid_residual_abs_{statistic}"] = value
+
+    summary["P_grid_fixed_point_residual_mean"] = float(
+        np.mean([branch_summaries["p0"]["mean"], branch_summaries["pi"]["mean"]])
+    )
+    summary["P_grid_fixed_point_residual_p90"] = float(
+        max(branch_summaries["p0"]["p90"], branch_summaries["pi"]["p90"])
+    )
+    result["summary"] = summary
+    return result
+
+
 def fixed_rms_scale(*values: np.ndarray, eps: float = 1e-6) -> float:
     flattened = [np.asarray(value, dtype=np.float64).reshape(-1) for value in values]
     combined = np.concatenate(flattened)
@@ -631,7 +730,7 @@ def choose_verdict(
     }
     for prefix, key in (
         ("d_joint", "d_joint"),
-        ("P_residual", "P_fixed_point_residual_mean"),
+        ("P_residual", "P_grid_fixed_point_residual_mean"),
         ("Q_residual", "Q_fixed_point_residual_mean"),
         ("boundary_switch", "boundary_switch_share"),
         ("bar_z_drift", "bar_z_mean_abs_drift"),

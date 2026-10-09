@@ -13,6 +13,7 @@ from evaluation.pq_fixed_point import (
     BATCH_BANK_FORMAT,
     absolute_gap_summary,
     choose_verdict,
+    evaluate_grid_p_fixed_point_residuals,
     fixed_rms_scale,
     make_frozen_batch_bank_payload,
     normalized_rms_error,
@@ -25,7 +26,10 @@ from evaluation.pq_fixed_point import (
     validate_frozen_batch_bank,
     verify_production_pq_method_fingerprints,
 )
-from experiments.frozen_env_pq_fixed_point import _assert_stage_isolation
+from experiments.frozen_env_pq_fixed_point import (
+    _assert_stage_isolation,
+    _prepare_cycle_batch_plan,
+)
 from training.episode import Episode
 
 
@@ -151,7 +155,8 @@ def _convergent_rows() -> list[dict]:
             "rho": 0.5,
             "cos_theta": 0.8,
             "two_step_distance": distance,
-            "P_fixed_point_residual_mean": residual,
+            "P_grid_fixed_point_residual_mean": residual,
+            "P_head_policy_residual_mean": 1.0 / residual,
             "Q_fixed_point_residual_mean": residual,
             "boundary_switch_share": switch,
             "bar_z_mean_abs_drift": switch,
@@ -179,7 +184,7 @@ def test_verdict_prioritizes_fitted_update_failure() -> None:
 def test_verdict_residual_not_improving_cannot_be_a() -> None:
     rows = _convergent_rows()
     for row in rows:
-        row["P_fixed_point_residual_mean"] = 1.0
+        row["P_grid_fixed_point_residual_mean"] = 1.0
         row["Q_fixed_point_residual_mean"] = 1.0
     assert _verdict(rows)["primary"] != "A"
 
@@ -332,3 +337,153 @@ def test_teacher_hash_rejects_pinned_initial_teacher() -> None:
 def test_production_pq_methods_match_audited_grid_mapping() -> None:
     fingerprints = verify_production_pq_method_fingerprints(Episode)
     assert len(fingerprints) == 5
+
+
+class _FixedValueModel(torch.nn.Module):
+    def __init__(self, p0: torch.Tensor, pi: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("p0", p0.reshape(-1, 1))
+        self.register_buffer("pi", pi.reshape(-1, 1))
+        self.register_buffer("bp0_head", torch.full_like(self.p0, 0.10))
+
+    def _value_outputs(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.p0[: state.shape[0]], self.pi[: state.shape[0]]
+
+
+class _FakeGridTeacher:
+    def __init__(self, p0_target: torch.Tensor, pi_target: torch.Tensor) -> None:
+        self.targets = {"p0": p0_target.reshape(-1, 1), "pi": pi_target.reshape(-1, 1)}
+
+    def compute_value_target(self, *, branch: str, **_kwargs: object) -> dict[str, torch.Tensor]:
+        target = self.targets[branch]
+        return {"value_star": target, "bp_star": torch.full_like(target, 0.75)}
+
+
+def _grid_residual_episode(model: torch.nn.Module) -> SimpleNamespace:
+    episode = SimpleNamespace(
+        models={"policy_value": model},
+        device=torch.device("cpu"),
+        loss_fns={"p0": object(), "pi": object()},
+        hyperparams=SimpleNamespace(),
+    )
+    episode._policy_batch_hash_components = lambda _batch: (
+        torch.zeros(2, 7),
+        [torch.zeros(2, 8), torch.zeros(2, 8)],
+        [torch.ones(2, 1), torch.ones(2, 1)],
+        "p",
+        "c",
+        "m",
+    )
+    episode._expand_policy_expectation_children = lambda children, raw, train: (
+        children,
+        raw,
+        train,
+        torch.full((2, 2), 0.5),
+    )
+    return episode
+
+
+def test_grid_p_residual_uses_grid_value_star_not_head_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = _FixedValueModel(torch.tensor([5.0, 7.0]), torch.tensor([11.0, 13.0]))
+    fake = _FakeGridTeacher(torch.tensor([4.0, 4.0]), torch.tensor([10.0, 10.0]))
+    monkeypatch.setattr(
+        "evaluation.pq_fixed_point.BPGridTeacher.from_hyperparams",
+        lambda *_args, **_kwargs: fake,
+    )
+    result = evaluate_grid_p_fixed_point_residuals(
+        _grid_residual_episode(model), {"parent": torch.zeros(2, 7)}
+    )
+    np.testing.assert_allclose(result["p0_grid_residual"], [1.0, 3.0])
+    np.testing.assert_allclose(result["pi_grid_residual"], [1.0, 3.0])
+    np.testing.assert_allclose(result["p0_bp_star"], [0.75, 0.75])
+    assert not np.allclose(result["p0_bp_star"], model.bp0_head.numpy().reshape(-1))
+    assert result["summary"]["P_grid_fixed_point_residual_mean"] == pytest.approx(2.0)
+    head_policy_residual = np.array([0.25, 0.5])
+    assert not np.allclose(result["p0_grid_residual"], head_policy_residual)
+
+
+def test_grid_p_residual_is_zero_at_exact_grid_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    p0 = torch.tensor([4.0, 6.0])
+    pi = torch.tensor([8.0, 10.0])
+    model = _FixedValueModel(p0, pi)
+    monkeypatch.setattr(
+        "evaluation.pq_fixed_point.BPGridTeacher.from_hyperparams",
+        lambda *_args, **_kwargs: _FakeGridTeacher(p0, pi),
+    )
+    result = evaluate_grid_p_fixed_point_residuals(
+        _grid_residual_episode(model), {"parent": torch.zeros(2, 7)}
+    )
+    assert result["summary"]["P_grid_fixed_point_residual_mean"] == 0.0
+    assert result["summary"]["P_grid_fixed_point_residual_p90"] == 0.0
+
+
+def test_verdict_uses_grid_residual_not_head_policy_residual() -> None:
+    rows = _convergent_rows()
+    for index, row in enumerate(rows):
+        row["P_head_policy_residual_mean"] = float(index + 1)
+    assert _verdict(rows)["primary"] == "A"
+
+
+def test_verdict_rejects_bad_grid_residual_even_when_head_residual_improves() -> None:
+    rows = _convergent_rows()
+    for index, row in enumerate(rows):
+        row["P_grid_fixed_point_residual_mean"] = 1.0
+        row["P_head_policy_residual_mean"] = 1.0 / float(index + 1)
+    assert _verdict(rows)["primary"] != "A"
+
+
+def _eta_batch(values: list[float]) -> dict[str, torch.Tensor]:
+    parent = torch.zeros(len(values), 7)
+    parent[:, 2] = torch.tensor(values)
+    return {"parent": parent, "children": [torch.zeros(len(values), 8)]}
+
+
+def _eta_episode(*, enabled: bool = True, share: float = 0.25) -> Episode:
+    episode = Episode.__new__(Episode)
+    episode.episode_id = 2
+    episode.hyperparams = SimpleNamespace(
+        pv_current_eta_balance_enabled=enabled,
+        pv_current_eta1_train_share=share,
+        pv_current_eta_balance_validation=True,
+        pv_current_eta_balance_seed=97531,
+    )
+    return episode
+
+
+def test_cycle_batch_plan_matches_production_balancer_and_is_deterministic() -> None:
+    episode = _eta_episode()
+    train = [_eta_batch([0.0] * 8)]
+    validation = [_eta_batch([1.0] * 4)]
+    direct_train, _ = episode._balance_p_current_eta_batches(train, stream="train")
+    direct_validation, _ = episode._balance_p_current_eta_batches(
+        validation, stream="validation"
+    )
+    first = _prepare_cycle_batch_plan(episode, train, validation)
+    second = _prepare_cycle_batch_plan(episode, train, validation)
+    assert first["p_train_balanced_hash"] == object_sha256(direct_train)
+    assert first["p_validation_balanced_hash"] == object_sha256(direct_validation)
+    assert first["p_train_balanced_hash"] == second["p_train_balanced_hash"]
+    assert first["p_validation_balanced_hash"] == second["p_validation_balanced_hash"]
+    assert first["p_train_eta_summary"]["eta1_share_after"] == pytest.approx(0.25)
+
+
+def test_cycle_batch_plan_keeps_q_on_original_frozen_bank() -> None:
+    episode = _eta_episode()
+    train = [_eta_batch([0.0] * 8)]
+    validation = [_eta_batch([1.0] * 4)]
+    plan = _prepare_cycle_batch_plan(episode, train, validation)
+    assert plan["q_train_batches"] is train
+    assert plan["q_validation_batches"] is validation
+    assert plan["q_train_original_hash"] == object_sha256(train)
+    assert plan["q_validation_original_hash"] == object_sha256(validation)
+    assert plan["p_train_balanced_hash"] != plan["q_train_original_hash"]
+
+
+def test_eta_balance_fields_change_relevant_hyperparameter_fingerprint() -> None:
+    from evaluation.pq_fixed_point import relevant_pq_hyperparameter_fingerprint
+
+    baseline = {"pv_current_eta_balance_enabled": False, "pv_current_eta1_train_share": 0.25}
+    enabled = dict(baseline, pv_current_eta_balance_enabled=True)
+    changed_share = dict(enabled, pv_current_eta1_train_share=0.50)
+    assert relevant_pq_hyperparameter_fingerprint(baseline) != relevant_pq_hyperparameter_fingerprint(enabled)
+    assert relevant_pq_hyperparameter_fingerprint(enabled) != relevant_pq_hyperparameter_fingerprint(changed_share)
