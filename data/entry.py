@@ -405,10 +405,16 @@ def validate_node_resource_account(
     C_reported: torch.Tensor,
     mode: str,
     atol: float = 1e-6,
-    rtol: float = 1e-6,
+    rtol: float = 1e-5,
     strict: bool = False,
 ) -> Dict[str, torch.Tensor]:
-    """Independently rebuild entry spending and node resources from details."""
+    """Independently rebuild entry spending and node resources from details.
+
+    The reported and rebuilt totals use separate GPU ``index_add_`` reductions.
+    Float32 atomic accumulation order can differ, so the comparison uses
+    PyTorch's conventional float32 relative tolerance while still rejecting
+    economically meaningful ledger discrepancies.
+    """
     if mode not in {"legacy_per_firm_clamp", "raw"}:
         raise ValueError(f"unknown consumption aggregation mode: {mode!r}")
     vectors = (

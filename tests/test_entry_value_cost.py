@@ -260,6 +260,34 @@ def test_independent_resource_rebuild_detects_ledger_and_detail_corruption():
             validate_node_resource_account(**{**common, **overrides}, strict=True)
 
 
+def test_resource_account_reconstruction_accepts_float32_gpu_reduction_noise():
+    # Captured from a formal A800 rollout. Separate, mathematically equivalent
+    # float32 index_add_ reductions differed only in atomic accumulation order.
+    C_rebuilt = torch.tensor([2.2625603675842285], dtype=torch.float32)
+    C_reported = torch.tensor([2.262557029724121], dtype=torch.float32)
+    result = validate_node_resource_account(
+        Y=C_rebuilt.clone(),
+        I_oper=torch.zeros(1, dtype=torch.float32),
+        Phi=torch.zeros(1, dtype=torch.float32),
+        path_index=torch.tensor([0]),
+        birth_mask=torch.tensor([False]),
+        entry_cost=torch.zeros(1, dtype=torch.float32),
+        K_birth=torch.zeros(1, dtype=torch.float32),
+        K_current=torch.ones(1, dtype=torch.float32),
+        n_paths=1,
+        I_entry_ledger=torch.zeros(1, dtype=torch.float32),
+        C_reported=C_reported,
+        mode="raw",
+        strict=True,
+    )
+
+    residual = result["resource_accounting_residual"].abs().item()
+    old_tolerance = 1e-6 + 1e-6 * max(C_reported.abs().item(), C_rebuilt.abs().item())
+    assert residual > old_tolerance
+    assert residual == pytest.approx(3.337860107421875e-6)
+    assert bool(result["accounting_valid"].item())
+
+
 @pytest.mark.parametrize(
     "previous_ids,previous_K,next_ids,next_K",
     [
