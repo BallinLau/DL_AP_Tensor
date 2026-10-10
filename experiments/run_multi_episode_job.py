@@ -94,6 +94,11 @@ def parse_args() -> argparse.Namespace:
         choices=["legacy_per_firm_clamp", "raw"],
         default=None,
     )
+    parser.add_argument(
+        "--node-accounting-mode",
+        choices=["auto", "legacy_recompute", "economic_node_ledger"],
+        default=None,
+    )
     parser.add_argument("--device", type=str, default=None, help="Force device, e.g. cuda:0 or cpu")
     parser.add_argument("--quick-test", action="store_true", help="Shrink workload for smoke tests (n_paths=10, epochs=20, horizon=20)")
     parser.add_argument(
@@ -694,6 +699,7 @@ def configure_hyperparams(args: argparse.Namespace):
         ("entry_inference_chunk_size", "entry_inference_chunk_size", int),
         ("entry_rng_seed", "entry_rng_seed", int),
         ("consumption_aggregation_mode", "consumption_aggregation_mode", str),
+        ("node_accounting_mode", "node_accounting_mode", str),
     ):
         value = getattr(args, arg_name)
         if value is not None:
@@ -708,6 +714,15 @@ def configure_hyperparams(args: argparse.Namespace):
         raise ValueError("entry_cost_max must be positive")
     if hyperparams.entry_inference_chunk_size <= 0:
         raise ValueError("entry_inference_chunk_size must be positive")
+    if str(hyperparams.node_accounting_mode).lower() not in {
+        "auto", "legacy_recompute", "economic_node_ledger"
+    }:
+        raise ValueError("invalid node_accounting_mode")
+    if (
+        hyperparams.entry_mode == "value_cost"
+        and str(hyperparams.node_accounting_mode).lower() == "legacy_recompute"
+    ):
+        raise ValueError("value_cost entry cannot use legacy_recompute accounting")
     hyperparams.ablation_mode = args.ablation_mode
     hyperparams.sdf_wealth_loss_mode = args.sdf_wealth_loss_mode
     hyperparams.sdf_fresh_pair_enabled = bool(args.sdf_fresh_pair_enabled)
@@ -1172,6 +1187,7 @@ def main():
                 "entry_inference_chunk_size": hyperparams.entry_inference_chunk_size,
                 "entry_rng_seed": hyperparams.entry_rng_seed,
                 "consumption_aggregation_mode": hyperparams.consumption_aggregation_mode,
+                "node_accounting_mode": hyperparams.node_accounting_mode,
             },
             sort_keys=True,
         )
@@ -1338,6 +1354,7 @@ def main():
                     "entry_inference_chunk_size": hyperparams.entry_inference_chunk_size,
                     "entry_rng_seed": hyperparams.entry_rng_seed,
                     "consumption_aggregation_mode": hyperparams.consumption_aggregation_mode,
+                    "node_accounting_mode": hyperparams.node_accounting_mode,
                 },
             }
             failure_path = resolve_base_dir(run_root, ROOT) / "failure_report.json"

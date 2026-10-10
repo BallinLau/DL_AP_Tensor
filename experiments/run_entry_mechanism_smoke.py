@@ -1,8 +1,8 @@
 """Short frozen-checkpoint comparison for the entry-mechanism experiment.
 
 This command runs simulation only. It never trains, updates, or saves model
-parameters. The same global seed is restored before each arm so incumbent and
-macro draws are common; value-cost entry itself uses its separate entry RNG.
+parameters. Initial states are matched by resetting the global seed; transition
+innovations use canonical identity keys, and entry uses a separate RNG stream.
 """
 
 from __future__ import annotations
@@ -12,8 +12,9 @@ import hashlib
 import json
 import random
 import sys
+import warnings
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -25,10 +26,14 @@ if str(ROOT) not in sys.path:
 
 from analysis.checkpoint_loader import load_analysis_checkpoint
 from config import Config
+from data.entry import EntryEconomicInfeasibilityError
 from data.simulate_ts import SimulateTS
+from losses import P0Loss, PILoss
+from training.bp_simulation_policy import GridBPSimulationPolicy
 
 
 BASE_COMMIT = "4b236eaacf47b2ac7cb506508e54b21a199e89b0"
+HARDENING_BASE_COMMIT = "5195ad058077f5fd45865c0ce8ed050be0f4fb6a"
 
 
 def _state_hash(module: torch.nn.Module) -> str:
@@ -94,7 +99,12 @@ def _summarize_macro(df: pd.DataFrame) -> Dict[str, Any]:
         "same_node_entrant_exit_count", "K_entry_same_node_exit",
         "deltaK_incumbent", "K_entry_endpoint", "K_exit_old",
         "C_oper", "C_raw", "resource_accounting_residual",
+        "I_entry_rebuilt", "entry_spend_residual", "C_rebuilt",
+        "legacy_clamp_adjustment",
         "capital_accounting_residual", "tensor_capacity",
+        "K_node_pre_exit", "K_endpoint_post_exit",
+        "K_decomposition_start", "K_decomposition_end",
+        "entry_capital_event_residual",
     )
     summary = {field: _finite_summary(nodes[field]) for field in fields}
     summary.update(
@@ -110,7 +120,7 @@ def _summarize_macro(df: pd.DataFrame) -> Dict[str, Any]:
     return summary
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -126,11 +136,162 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--entry-dummy-i", type=float, default=0.0)
     parser.add_argument("--entry-rng-seed", type=int, default=86420)
     parser.add_argument("--entry-inference-chunk-size", type=int, default=65536)
-    return parser.parse_args()
+    parser.add_argument(
+        "--simulation-bp-action-source",
+        choices=["checkpoint", "head", "grid"],
+        default="checkpoint",
+        help=(
+            "checkpoint uses the explicitly recorded source; head/grid are "
+            "diagnostic overrides and are recorded in the report"
+        ),
+    )
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def _jsonable_namespace(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+
+
+def resolve_simulation_bp_source(loaded, requested_source: str) -> Dict[str, Any]:
+    requested = str(requested_source).strip().lower()
+    if requested not in {"checkpoint", "head", "grid"}:
+        raise ValueError(f"unknown simulation BP source request: {requested!r}")
+    recorded = set(loaded.metadata.get("hyperparameter_recorded_fields", []))
+    source_recorded = "simulation_bp_action_source" in recorded
+    checkpoint_source = (
+        str(getattr(loaded.hyperparams, "simulation_bp_action_source", "")).lower()
+        if source_recorded
+        else None
+    )
+    if source_recorded and checkpoint_source not in {"head", "grid"}:
+        raise ValueError(
+            "checkpoint records an invalid simulation_bp_action_source: "
+            f"{checkpoint_source!r}"
+        )
+    if requested == "checkpoint":
+        if checkpoint_source is None:
+            raise ValueError(
+                "checkpoint does not record simulation_bp_action_source; "
+                "pass --simulation-bp-action-source head or grid explicitly"
+            )
+        resolved = checkpoint_source
+        provenance = "checkpoint_hyperparams"
+    else:
+        resolved = requested
+        provenance = "explicit_diagnostic_override"
+
+    head_status_recorded = "pv_bp_head_training_enabled" in recorded
+    head_training_enabled = (
+        bool(getattr(loaded.hyperparams, "pv_bp_head_training_enabled"))
+        if head_status_recorded
+        else None
+    )
+    warning = None
+    if resolved == "head" and head_training_enabled is False:
+        if requested == "checkpoint":
+            raise ValueError(
+                "checkpoint selects head simulation but records BP head training disabled; "
+                "an explicit --simulation-bp-action-source head override is required"
+            )
+        warning = (
+            "explicitly using BP head although checkpoint records "
+            "pv_bp_head_training_enabled=False"
+        )
+        warnings.warn(warning, RuntimeWarning)
+    return {
+        "requested_source": requested,
+        "checkpoint_source": checkpoint_source,
+        "resolved_source": resolved,
+        "resolution_provenance": provenance,
+        "head_training_status_recorded": head_status_recorded,
+        "head_training_enabled": head_training_enabled,
+        "warning": warning,
+    }
+
+
+def _build_grid_policy(loaded, config, *, device: torch.device):
+    target_name = "firm_target" if loaded.models.get("firm_target") is not None else "policy_value"
+    target = loaded.models[target_name]
+    economic = loaded.economic_config
+    p0_loss = P0Loss(
+        delta=economic.DELTA,
+        tau=economic.TAU,
+        kappa_b=economic.KAPPA_B,
+        kappa_e=economic.KAPPA_E,
+        aio_weight=economic.AIO_WEIGHT,
+        alpha_z=economic.ALPHA_Z,
+        beta_z=economic.BETA_Z,
+        z0=economic.Z0,
+    )
+    pi_loss = PILoss(
+        delta=economic.DELTA,
+        tau=economic.TAU,
+        g=economic.G,
+        kappa_b=economic.KAPPA_B,
+        kappa_e=economic.KAPPA_E,
+        aio_weight=economic.AIO_WEIGHT,
+        alpha_z=economic.ALPHA_Z,
+        beta_z=economic.BETA_Z,
+        z0=economic.Z0,
+        b_penalty_weight=0.0,
+    )
+    policy = GridBPSimulationPolicy(
+        target_model=target,
+        sdf_fc1_model=loaded.models.get("sdf_fc1"),
+        p0_loss=p0_loss,
+        pi_loss=pi_loss,
+        hyperparams=loaded.hyperparams,
+        economic_config=config,
+        n_child_shocks=int(loaded.hyperparams.simulation_bp_grid_n_child_shocks),
+        shock_seed=int(loaded.hyperparams.simulation_bp_grid_shock_seed),
+        require_cuda=True,
+    )
+    return policy, target_name
+
+
+def _crn_pair_summary(reference, comparison) -> Dict[str, Any]:
+    reference_firm, reference_macro = reference
+    comparison_firm, comparison_macro = comparison
+    result: Dict[str, Any] = {}
+    macro_keys = ["path", "t", "branch", "economic_node_id"]
+    macro = reference_macro[macro_keys + ["eps_x_transition"]].merge(
+        comparison_macro[macro_keys + ["eps_x_transition"]],
+        on=macro_keys,
+        suffixes=("_reference", "_comparison"),
+    )
+    macro_valid = macro["eps_x_transition_reference"].notna() & macro[
+        "eps_x_transition_comparison"
+    ].notna()
+    macro_diff = (
+        macro.loc[macro_valid, "eps_x_transition_reference"]
+        - macro.loc[macro_valid, "eps_x_transition_comparison"]
+    ).abs()
+    result["macro_common_samples"] = int(macro_valid.sum())
+    result["eps_x_max_abs_diff"] = None if macro_diff.empty else float(macro_diff.max())
+
+    firm_keys = ["path", "t", "branch", "ID"]
+    shock_fields = ["eps_z_transition", "u_eta_transition", "u_i_transition"]
+    left = reference_firm[reference_firm["initial_cohort"] > 0.5][firm_keys + shock_fields]
+    right = comparison_firm[comparison_firm["initial_cohort"] > 0.5][firm_keys + shock_fields]
+    merged = left.merge(right, on=firm_keys, suffixes=("_reference", "_comparison"))
+    result["initial_cohort_common_rows"] = int(len(merged))
+    for field in shock_fields:
+        valid = merged[f"{field}_reference"].notna() & merged[f"{field}_comparison"].notna()
+        diff = (
+            merged.loc[valid, f"{field}_reference"]
+            - merged.loc[valid, f"{field}_comparison"]
+        ).abs()
+        result[f"{field}_common_samples"] = int(valid.sum())
+        result[f"{field}_max_abs_diff"] = None if diff.empty else float(diff.max())
+    result["entrant_identity_matching"] = "not_claimed"
+    return result
+
+
+def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    args = parse_args(argv)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
@@ -139,6 +300,7 @@ def main() -> None:
         "policy_value": loaded.models["policy_value"],
         "sdf_fc1": loaded.models.get("sdf_fc1"),
         "dist_b": loaded.models.get("dist_b"),
+        "firm_target": loaded.models.get("firm_target"),
     }
     models = {name: model for name, model in models.items() if model is not None}
     for model in models.values():
@@ -158,46 +320,105 @@ def main() -> None:
         "C_value_cost_entry_raw_aggregation": ("value_cost", "raw"),
     }
     report: Dict[str, Any] = {
-        "base_commit": BASE_COMMIT,
+        "historical_behavior_base_commit": BASE_COMMIT,
+        "hardening_base_commit": HARDENING_BASE_COMMIT,
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_metadata": loaded.metadata,
-        "smoke_parameters": vars(args),
+        "smoke_parameters": _jsonable_namespace(args),
+        "bp_action_resolution": None,
+        "comparison_design": {
+            "node_accounting_mode": "economic_node_ledger",
+            "transition_rng_mode": "stable_firm_identity",
+            "initial_cohort_shock_matching": True,
+            "entrant_shock_matching": False,
+            "historical_4b236ea_reproduction_arm": False,
+        },
         "interpretation_warning": (
             "B versus C jointly changes entry screening, birth debt, and entrant scale; "
             "it does not isolate any one submechanism and is not a solved new equilibrium."
         ),
         "arms": {},
     }
-    report["smoke_parameters"]["checkpoint"] = str(args.checkpoint)
-    report["smoke_parameters"]["output_dir"] = str(args.output_dir)
-
-    for label, (entry_mode, aggregation_mode) in arms.items():
-        _reset_seed(args.seed, device)
-        arm_dir = args.output_dir / label
-        arm_dir.mkdir(parents=True, exist_ok=True)
-        simulator = SimulateTS(
-            models=models,
-            config=config,
-            n_paths=args.n_paths,
-            group_size=args.group_size,
-            horizon=args.horizon,
-            branch_num=args.branch_num,
-            enable_entry=True,
-            enable_exit=True,
-            device=device,
-            entry_mode=entry_mode,
-            entry_capital_ratio=args.entry_capital_ratio,
-            entry_size_ratio=args.entry_size_ratio,
-            entry_cost_max=args.entry_cost_max,
-            entry_dummy_i=args.entry_dummy_i,
-            entry_inference_chunk_size=args.entry_inference_chunk_size,
-            entry_rng_seed=args.entry_rng_seed,
-            consumption_aggregation_mode=aggregation_mode,
-            preserve_global_rng_around_entry=True,
-            common_transition_seed=args.seed + 700_001,
-        )
+    outputs = {}
+    pending_error: Optional[BaseException] = None
+    try:
         try:
-            firm, macro = simulator.simulate()
+            bp_resolution = resolve_simulation_bp_source(
+                loaded, args.simulation_bp_action_source
+            )
+            report["bp_action_resolution"] = bp_resolution
+        except Exception as exc:
+            report["preflight_error"] = {
+                "stage": "resolve_simulation_bp_action_source",
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            }
+            pending_error = exc
+
+        if pending_error is not None:
+            bp_resolution = None
+        for label, (entry_mode, aggregation_mode) in arms.items():
+            if pending_error is not None:
+                break
+            _reset_seed(args.seed, device)
+            arm_dir = args.output_dir / label
+            arm_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                grid_policy = None
+                target_name = None
+                if bp_resolution["resolved_source"] == "grid":
+                    grid_policy, target_name = _build_grid_policy(
+                        loaded, config, device=device
+                    )
+                simulator = SimulateTS(
+                    models=models,
+                    config=config,
+                    n_paths=args.n_paths,
+                    group_size=args.group_size,
+                    horizon=args.horizon,
+                    branch_num=args.branch_num,
+                    enable_entry=True,
+                    enable_exit=True,
+                    device=device,
+                    bp_action_source=bp_resolution["resolved_source"],
+                    bp_grid_policy=grid_policy,
+                    entry_mode=entry_mode,
+                    entry_capital_ratio=args.entry_capital_ratio,
+                    entry_size_ratio=args.entry_size_ratio,
+                    entry_cost_max=args.entry_cost_max,
+                    entry_dummy_i=args.entry_dummy_i,
+                    entry_inference_chunk_size=args.entry_inference_chunk_size,
+                    entry_rng_seed=args.entry_rng_seed,
+                    consumption_aggregation_mode=aggregation_mode,
+                    node_accounting_mode="economic_node_ledger",
+                    preserve_global_rng_around_entry=True,
+                    common_transition_seed=args.seed + 700_001,
+                    transition_rng_mode="stable_firm_identity",
+                )
+                firm, macro = simulator.simulate()
+            except EntryEconomicInfeasibilityError as exc:
+                report["arms"][label] = {
+                    "status": "economic_infeasible",
+                    "failure_class": "economic_infeasibility",
+                    "entry_mode": entry_mode,
+                    "consumption_aggregation_mode": aggregation_mode,
+                    "node_accounting_mode": "economic_node_ledger",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                continue
+            except Exception as exc:
+                report["arms"][label] = {
+                    "status": "program_or_configuration_error",
+                    "failure_class": "program_or_configuration_error",
+                    "entry_mode": entry_mode,
+                    "consumption_aggregation_mode": aggregation_mode,
+                    "node_accounting_mode": "economic_node_ledger",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                pending_error = exc
+                break
             firm.to_pickle(arm_dir / "firm.pkl")
             macro.to_pickle(arm_dir / "macro.pkl")
             macro.to_csv(arm_dir / "macro.csv", index=False)
@@ -205,32 +426,43 @@ def main() -> None:
                 "status": "completed",
                 "entry_mode": entry_mode,
                 "consumption_aggregation_mode": aggregation_mode,
+                "node_accounting_mode": "economic_node_ledger",
+                "bp_action_source": bp_resolution["resolved_source"],
+                "bp_grid_target_model": target_name,
                 "simulation_meta": simulator.last_simulation_meta,
                 "summary": _summarize_macro(macro),
             }
-        except RuntimeError as exc:
-            report["arms"][label] = {
-                "status": "infeasible_or_failed",
-                "entry_mode": entry_mode,
-                "consumption_aggregation_mode": aggregation_mode,
-                "error_type": type(exc).__name__,
-                "message": str(exc),
+            outputs[label] = (firm, macro)
+        if outputs:
+            reference_label = next(iter(outputs))
+            report["common_random_numbers"] = {
+                label: _crn_pair_summary(outputs[reference_label], output)
+                for label, output in outputs.items()
+                if label != reference_label
             }
-
-    hashes_after = {
-        name: _state_hash(model)
-        for name, model in models.items()
-        if isinstance(model, torch.nn.Module)
-    }
-    if hashes_before != hashes_after:
+    finally:
+        hashes_after = {
+            name: _state_hash(model)
+            for name, model in models.items()
+            if isinstance(model, torch.nn.Module)
+        }
+        report["model_hashes_before"] = hashes_before
+        report["model_hashes_after"] = hashes_after
+        report["model_hash_invariant"] = hashes_before == hashes_after
+        (args.output_dir / "summary.json").write_text(
+            json.dumps(report, indent=2, default=str), encoding="utf-8"
+        )
+    if not report["model_hash_invariant"]:
         raise RuntimeError("frozen entry smoke modified checkpoint model state")
-    report["model_hashes_before"] = hashes_before
-    report["model_hashes_after"] = hashes_after
-    report["model_hash_invariant"] = True
-    (args.output_dir / "summary.json").write_text(
-        json.dumps(report, indent=2, default=str), encoding="utf-8"
+    if pending_error is not None:
+        raise pending_error
+    completed = sum(
+        arm.get("status") == "completed" for arm in report["arms"].values()
     )
+    if completed == 0:
+        raise RuntimeError("all entry smoke arms failed; see summary.json")
     print(json.dumps(report, indent=2, default=str))
+    return report
 
 
 if __name__ == "__main__":

@@ -233,6 +233,9 @@ class HyperParams:
     entry_inference_chunk_size: int = 65536
     entry_rng_seed: int = 86420
     consumption_aggregation_mode: str = "legacy_per_firm_clamp"
+    # ``auto`` resolves to historical survivor-view recomputation for legacy
+    # entry and to the authoritative economic-node ledger for value-cost entry.
+    node_accounting_mode: str = "auto"
     # 训练数据批次是否优先走 tensor 管线（避免训练前 pandas 拼装）
     use_tensor_pipeline: bool = True
     # firm-level 训练每个 stage 最多使用多少 parent transitions；<=0 表示不截断。

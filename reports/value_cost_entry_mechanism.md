@@ -143,6 +143,7 @@ The runner exposes:
 --entry-inference-chunk-size INT
 --entry-rng-seed INT
 --consumption-aggregation-mode {legacy_per_firm_clamp,raw}
+--node-accounting-mode {auto,legacy_recompute,economic_node_ledger}
 ```
 
 The full resolved entry/economic snapshot and its SHA-256 fingerprint are
@@ -169,6 +170,7 @@ python3 -u experiments/run_entry_mechanism_smoke.py \
   --group-size 16 \
   --horizon 2 \
   --branch-num 2 \
+  --simulation-bp-action-source checkpoint \
   --entry-capital-ratio 0.10 \
   --entry-size-ratio 0.10 \
   --entry-cost-max 1.0 \

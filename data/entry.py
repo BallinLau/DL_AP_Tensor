@@ -21,6 +21,14 @@ from .simulation_forward import forward_policy_value_for_simulation
 ENTRY_SPEC_VERSION = "value_cost_v1"
 
 
+class EntryEconomicInfeasibilityError(RuntimeError):
+    """The stated entry economy produced a finite but infeasible resource node."""
+
+
+class EntryAccountingError(RuntimeError):
+    """Independent entry/resource reconstruction disagrees with the node ledger."""
+
+
 def entry_configuration_snapshot(
     *,
     entry_mode: str,
@@ -32,6 +40,8 @@ def entry_configuration_snapshot(
     entry_inference_chunk_size: int,
     entry_rng_seed: int,
     consumption_aggregation_mode: str,
+    node_accounting_mode: str,
+    transition_rng_mode: str,
     economic_config: Any,
 ) -> Dict[str, Any]:
     """Canonical entry configuration used by output/cache provenance."""
@@ -45,6 +55,8 @@ def entry_configuration_snapshot(
         "entry_inference_chunk_size": int(entry_inference_chunk_size),
         "entry_rng_seed": int(entry_rng_seed),
         "consumption_aggregation_mode": str(consumption_aggregation_mode),
+        "node_accounting_mode": str(node_accounting_mode),
+        "transition_rng_mode": str(transition_rng_mode),
         "reference_stage": "parent_pre_transition_alive_firms",
         "entry_timing": "child_node_creation_cost_paid_before_operation",
         "eta_information_timing": "eta_and_i_drawn_after_entry_acceptance",
@@ -367,14 +379,124 @@ def aggregate_node_resources(
     C_oper = torch.zeros(n_paths, device=contribution.device, dtype=contribution.dtype)
     C_oper.index_add_(0, path_index, contribution)
     C_raw = C_oper - I_entry
-    residual = C_raw - (C_oper - I_entry)
+    raw_operating = torch.zeros_like(C_oper)
+    raw_operating.index_add_(0, path_index, operating_contribution)
     return {
         "C_oper": C_oper,
         "I_entry": I_entry,
         "C_raw": C_raw,
-        "resource_accounting_residual": residual,
-        "resource_feasible": C_raw > 0.0,
+        "legacy_clamp_adjustment": C_oper - raw_operating,
+        "resource_feasible": torch.isfinite(C_raw) & (C_raw > 0.0),
     }
+
+
+def validate_node_resource_account(
+    *,
+    Y: torch.Tensor,
+    I_oper: torch.Tensor,
+    Phi: torch.Tensor,
+    path_index: torch.Tensor,
+    birth_mask: torch.Tensor,
+    entry_cost: torch.Tensor,
+    K_birth: torch.Tensor,
+    K_current: torch.Tensor,
+    n_paths: int,
+    I_entry_ledger: torch.Tensor,
+    C_reported: torch.Tensor,
+    mode: str,
+    atol: float = 1e-6,
+    rtol: float = 1e-6,
+    strict: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Independently rebuild entry spending and node resources from details."""
+    if mode not in {"legacy_per_firm_clamp", "raw"}:
+        raise ValueError(f"unknown consumption aggregation mode: {mode!r}")
+    vectors = (
+        Y, I_oper, Phi, path_index, birth_mask, entry_cost, K_birth, K_current
+    )
+    if any(value.ndim != 1 for value in vectors):
+        raise ValueError("resource-account detail inputs must be one-dimensional")
+    if len({int(value.numel()) for value in vectors}) != 1:
+        raise ValueError("resource-account detail inputs must have matching lengths")
+    if I_entry_ledger.shape != (n_paths,) or C_reported.shape != (n_paths,):
+        raise ValueError("reported resource totals must contain one value per path")
+
+    dtype = C_reported.dtype
+    device = C_reported.device
+    operating_detail = Y - I_oper - Phi
+    operating_used = (
+        operating_detail.clamp_min(0.0)
+        if mode == "legacy_per_firm_clamp"
+        else operating_detail
+    )
+    C_oper_rebuilt = torch.zeros(n_paths, device=device, dtype=dtype)
+    C_oper_raw_rebuilt = torch.zeros_like(C_oper_rebuilt)
+    I_entry_rebuilt = torch.zeros_like(C_oper_rebuilt)
+    C_oper_rebuilt.index_add_(0, path_index, operating_used)
+    C_oper_raw_rebuilt.index_add_(0, path_index, operating_detail)
+    birth_spend = torch.where(
+        birth_mask,
+        entry_cost * K_birth,
+        torch.zeros_like(entry_cost),
+    )
+    I_entry_rebuilt.index_add_(0, path_index, birth_spend)
+    C_rebuilt = C_oper_rebuilt - I_entry_rebuilt
+    entry_spend_residual = I_entry_ledger - I_entry_rebuilt
+    resource_residual = C_reported - C_rebuilt
+    entry_scale = torch.maximum(I_entry_ledger.abs(), I_entry_rebuilt.abs())
+    resource_scale = torch.maximum(C_reported.abs(), C_rebuilt.abs())
+    entry_tolerance = float(atol) + float(rtol) * entry_scale
+    resource_tolerance = float(atol) + float(rtol) * resource_scale
+    finite_detail = (
+        torch.isfinite(Y)
+        & torch.isfinite(I_oper)
+        & torch.isfinite(Phi)
+        & torch.isfinite(entry_cost)
+        & torch.isfinite(K_birth)
+        & torch.isfinite(K_current)
+    )
+    finite_by_path = torch.ones(n_paths, device=device, dtype=torch.bool)
+    if finite_detail.numel():
+        bad_paths = path_index[~finite_detail]
+        if bad_paths.numel():
+            finite_by_path[bad_paths.unique()] = False
+    finite_totals = (
+        torch.isfinite(I_entry_ledger)
+        & torch.isfinite(I_entry_rebuilt)
+        & torch.isfinite(C_reported)
+        & torch.isfinite(C_rebuilt)
+        & finite_by_path
+    )
+    accounting_valid = (
+        finite_totals
+        & (entry_spend_residual.abs() <= entry_tolerance)
+        & (resource_residual.abs() <= resource_tolerance)
+    )
+    resource_feasible = finite_totals & (C_reported > 0.0)
+    result = {
+        "I_entry_rebuilt": I_entry_rebuilt,
+        "entry_spend_residual": entry_spend_residual,
+        "C_oper_rebuilt": C_oper_rebuilt,
+        "C_oper_raw_rebuilt": C_oper_raw_rebuilt,
+        "legacy_clamp_adjustment": C_oper_rebuilt - C_oper_raw_rebuilt,
+        "C_rebuilt": C_rebuilt,
+        "resource_accounting_residual": resource_residual,
+        "accounting_valid": accounting_valid,
+        "resource_feasible": resource_feasible,
+    }
+    if strict and not bool(accounting_valid.all()):
+        bad = torch.nonzero(~accounting_valid, as_tuple=False).reshape(-1).tolist()
+        raise EntryAccountingError(
+            "independent node resource reconstruction failed; "
+            f"paths={bad[:20]}"
+        )
+    if strict and not bool(resource_feasible.all()):
+        bad = torch.nonzero(~resource_feasible, as_tuple=False).reshape(-1).tolist()
+        raise EntryEconomicInfeasibilityError(
+            "raw node resource account is infeasible or non-finite; "
+            f"paths={bad[:20]}"
+        )
+    return result
 
 
 def capital_growth_decomposition(
@@ -386,8 +508,18 @@ def capital_growth_decomposition(
     """Exact one-path endpoint decomposition using real firm identities."""
     if previous_ids.ndim != 1 or next_ids.ndim != 1:
         raise ValueError("firm identities must be one-dimensional")
-    previous = {int(i): previous_K[pos] for pos, i in enumerate(previous_ids.tolist())}
-    nxt = {int(i): next_K[pos] for pos, i in enumerate(next_ids.tolist())}
+    if previous_K.shape != previous_ids.shape or next_K.shape != next_ids.shape:
+        raise ValueError("firm capital and identity vectors must have matching shapes")
+    if not torch.isfinite(previous_K).all() or not torch.isfinite(next_K).all():
+        raise ValueError("capital decomposition requires finite firm capital")
+    previous_id_list = [int(value) for value in previous_ids.tolist()]
+    next_id_list = [int(value) for value in next_ids.tolist()]
+    if len(set(previous_id_list)) != len(previous_id_list):
+        raise ValueError("previous firm identities must be unique")
+    if len(set(next_id_list)) != len(next_id_list):
+        raise ValueError("next firm identities must be unique")
+    previous = {int(i): previous_K[pos] for pos, i in enumerate(previous_id_list)}
+    nxt = {int(i): next_K[pos] for pos, i in enumerate(next_id_list)}
     shared = sorted(set(previous) & set(nxt))
     exited = sorted(set(previous) - set(nxt))
     entered = sorted(set(nxt) - set(previous))
@@ -404,5 +536,7 @@ def capital_growth_decomposition(
         "K_exit_old": exit_old,
         "K_previous": K_previous,
         "K_next": K_next,
+        "K_decomposition_start": K_previous,
+        "K_decomposition_end": K_next,
         "capital_accounting_residual": residual,
     }

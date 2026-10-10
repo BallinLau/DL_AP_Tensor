@@ -48,7 +48,8 @@ class SimulateTS:
         'b_next_p0', 'b_next_pi', 'b_next_policy',
         'Y', 'I', 'Phi', 'C',
         'initial_cohort', 'birth_time', 'entry_cost', 'K_birth',
-        'economic_node_id', 'node_view', 'accounting_stage'
+        'economic_node_id', 'node_view', 'accounting_stage',
+        'eps_z_transition', 'u_eta_transition', 'u_i_transition'
     ]
     MACRO_COLUMNS = [
         'path', 't', 'branch', 'K', 'C', 'LnK', 'Hatc',
@@ -64,7 +65,15 @@ class SimulateTS:
         'K_entry_gross', 'same_node_entrant_exit_count',
         'K_entry_same_node_exit', 'K_entry_surviving',
         'deltaK_incumbent', 'K_entry_endpoint', 'K_exit_old',
-        'capital_accounting_residual', 'tensor_capacity'
+        'capital_accounting_residual', 'tensor_capacity',
+        'I_entry_rebuilt', 'entry_spend_residual', 'C_rebuilt',
+        'legacy_clamp_adjustment',
+        'K_node_pre_exit', 'K_endpoint_post_exit',
+        'K_decomposition_start', 'K_decomposition_end',
+        'decomposition_start_stage', 'decomposition_end_stage',
+        'decomposition_start_node_id', 'decomposition_end_node_id',
+        'decomposition_transition_valid', 'entry_capital_event_residual',
+        'eps_x_transition'
     ]
 
     def __init__(
@@ -91,8 +100,10 @@ class SimulateTS:
         entry_inference_chunk_size: int = 65536,
         entry_rng_seed: int = 86420,
         consumption_aggregation_mode: str = "legacy_per_firm_clamp",
+        node_accounting_mode: str = "auto",
         preserve_global_rng_around_entry: bool = False,
         common_transition_seed: Optional[int] = None,
+        transition_rng_mode: str = "legacy_position",
     ):
         """
         Args:
@@ -144,10 +155,34 @@ class SimulateTS:
         self.entry_inference_chunk_size = int(entry_inference_chunk_size)
         self.entry_rng_seed = int(entry_rng_seed)
         self.consumption_aggregation_mode = str(consumption_aggregation_mode).strip().lower()
+        self.node_accounting_mode_requested = str(node_accounting_mode).strip().lower()
+        if self.node_accounting_mode_requested not in {
+            "auto", "legacy_recompute", "economic_node_ledger"
+        }:
+            raise ValueError(
+                "node_accounting_mode must be auto, legacy_recompute, or "
+                "economic_node_ledger"
+            )
+        self.node_accounting_mode = (
+            "economic_node_ledger"
+            if self.node_accounting_mode_requested == "auto" and self.entry_mode == "value_cost"
+            else "legacy_recompute"
+            if self.node_accounting_mode_requested == "auto"
+            else self.node_accounting_mode_requested
+        )
         self.preserve_global_rng_around_entry = bool(preserve_global_rng_around_entry)
         self.common_transition_seed = (
             None if common_transition_seed is None else int(common_transition_seed)
         )
+        self.transition_rng_mode = str(transition_rng_mode).strip().lower()
+        if self.transition_rng_mode not in {"legacy_position", "stable_firm_identity"}:
+            raise ValueError(
+                "transition_rng_mode must be legacy_position or stable_firm_identity"
+            )
+        if self.transition_rng_mode == "stable_firm_identity" and self.common_transition_seed is None:
+            raise ValueError(
+                "transition_rng_mode='stable_firm_identity' requires common_transition_seed"
+            )
         self._entry_event_counter = 0
         if self.entry_mode not in {"legacy", "value_cost"}:
             raise ValueError("entry_mode must be 'legacy' or 'value_cost'")
@@ -164,6 +199,10 @@ class SimulateTS:
                 raise ValueError("entry_inference_chunk_size must be positive")
             if self.consumption_aggregation_mode != "raw":
                 raise ValueError("value_cost entry requires raw consumption aggregation")
+            if self.node_accounting_mode != "economic_node_ledger":
+                raise ValueError(
+                    "value_cost entry requires node_accounting_mode='economic_node_ledger'"
+                )
             if self.models.get("policy_value") is None:
                 raise RuntimeError("value_cost entry requires a policy_value model")
         elif self.consumption_aggregation_mode not in {"legacy_per_firm_clamp", "raw"}:
@@ -184,12 +223,15 @@ class SimulateTS:
             entry_inference_chunk_size=self.entry_inference_chunk_size,
             entry_rng_seed=self.entry_rng_seed,
             consumption_aggregation_mode=self.consumption_aggregation_mode,
+            node_accounting_mode=self.node_accounting_mode,
+            transition_rng_mode=self.transition_rng_mode,
             economic_config=self.config,
         )
         self.entry_configuration.update(
             {
                 "preserve_global_rng_around_entry": self.preserve_global_rng_around_entry,
                 "common_transition_seed": self.common_transition_seed,
+                "node_accounting_mode_requested": self.node_accounting_mode_requested,
             }
         )
         self.entry_configuration_fingerprint = entry_configuration_fingerprint(
@@ -236,6 +278,14 @@ class SimulateTS:
             df_macro['n_firms'] = np.rint(df_macro['n_firms']).astype(np.int64)
         if 'ID' in df_firm.columns:
             df_firm['ID'] = np.rint(df_firm['ID']).astype(np.int64).astype(str)
+        if 'decomposition_start_stage' in df_macro.columns:
+            df_macro['decomposition_start_stage'] = df_macro[
+                'decomposition_start_stage'
+            ].map({-1.0: 'none', 0.0: 'parent_pre_transition_alive'})
+        if 'decomposition_end_stage' in df_macro.columns:
+            df_macro['decomposition_end_stage'] = df_macro[
+                'decomposition_end_stage'
+            ].map({-1.0: 'none', 1.0: 'child_post_exit_endpoint'})
 
         print(f"Simulation completed: {len(df_firm)} firm records, {len(df_macro)} macro records")
         return df_firm, df_macro
@@ -283,6 +333,18 @@ class SimulateTS:
                 "entry_configuration_fingerprint": self.entry_configuration_fingerprint,
                 "preserve_global_rng_around_entry": self.preserve_global_rng_around_entry,
                 "common_transition_seed": self.common_transition_seed,
+                "transition_rng_mode": self.transition_rng_mode,
+                "transition_identity_scope": (
+                    "macro_by_path_and_initial_cohort_firms_by_stable_id"
+                    if self.transition_rng_mode == "stable_firm_identity"
+                    else "tensor_position_or_global_rng"
+                ),
+                "node_accounting_mode": self.node_accounting_mode,
+                "public_K_semantics": (
+                    "authoritative_economic_node_pre_exit"
+                    if self.node_accounting_mode == "economic_node_ledger"
+                    else "current_live_view_recomputed"
+                ),
                 "max_firms_observed": self._max_firms_observed,
             },
         })
@@ -529,6 +591,15 @@ class SimulateTS:
         b_next_p0 = torch.full_like(b, float("nan"))
         b_next_pi = torch.full_like(b, float("nan"))
         b_next_policy = torch.full_like(b, float("nan"))
+        transition_eps_z = state.get(
+            'transition_eps_z', torch.full_like(state['b'], float("nan"))
+        )[alive_idx]
+        transition_u_eta = state.get(
+            'transition_u_eta', torch.full_like(state['b'], float("nan"))
+        )[alive_idx]
+        transition_u_i = state.get(
+            'transition_u_i', torch.full_like(state['b'], float("nan"))
+        )[alive_idx]
 
         Y, I, Phi, C = self._resource_accounting(K, z, x_scalar, bar_i, bar_z, i)
 
@@ -571,6 +642,9 @@ class SimulateTS:
                 torch.full_like(K, float(t)),
                 torch.full_like(K, 0.0 if branch_k == -1 else 1.0),
                 torch.zeros_like(K),
+                transition_eps_z,
+                transition_u_eta,
+                transition_u_i,
             ],
             dim=1
         ).to(torch.float32)

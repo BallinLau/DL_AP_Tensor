@@ -365,6 +365,7 @@ def load_analysis_checkpoint(
             + (["firm_target"] if firm_target_state is not None else [])
         ),
         "hyperparameter_source": hp_source,
+        "hyperparameter_recorded_fields": sorted(hp_recorded_fields),
         # 原始 payload 中真实出现过的 q_* 字段。旧 checkpoint 不含
         # q_recovery_normalization_mode，据此可判定其训练时用的是 legacy 口径。
         "q_semantics_recorded_fields": sorted(
