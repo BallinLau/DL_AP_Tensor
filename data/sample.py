@@ -106,8 +106,11 @@ class Sample:
         self.sampling_mode = sampling_mode
         self.entry_rate = entry_rate
         self.entry_mode = str(entry_mode).strip().lower()
-        if self.entry_mode not in {"legacy", "value_cost"}:
-            raise ValueError("entry_mode must be 'legacy' or 'value_cost'")
+        if self.entry_mode not in {"legacy", "value_cost", "investment_compare"}:
+            raise ValueError(
+                "entry_mode must be 'legacy', 'value_cost', or "
+                "'investment_compare'"
+            )
         self.device = device or config.DEVICE
         
         # simulate 模式默认启用 entry
@@ -115,10 +118,12 @@ class Sample:
             self.enable_entry = (data_mode == 'simulate')
         else:
             self.enable_entry = enable_entry
-        if self.enable_entry and self.entry_mode == "value_cost":
+        if self.enable_entry and self.entry_mode in {
+            "value_cost", "investment_compare"
+        }:
             raise RuntimeError(
                 "Sample is a bootstrap/coverage generator and cannot create economic "
-                "value_cost entrants; use the formal SimulateTS path"
+                f"{self.entry_mode} entrants; use the formal SimulateTS path"
             )
         
         # 根据 data_mode 设置 group_size

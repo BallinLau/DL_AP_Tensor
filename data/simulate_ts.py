@@ -43,11 +43,13 @@ class SimulateTS:
     FIRM_COLUMNS = [
         'path', 't', 'branch', 'ID', 'entry',
         'b', 'z', 'ETA', 'i', 'x', 'Hatcf', 'LnKF',
-        'K', 'M', 'Q', 'P0', 'PI', 'Bar_i', 'Bar_z', 'P',
+        'K', 'M', 'Q', 'P0', 'PI', 'Bar_i', 'Bar_i_model',
+        'Bar_i_executed', 'Bar_z', 'P',
         'bp0', 'bpI', 'bp',
         'b_next_p0', 'b_next_pi', 'b_next_policy',
         'Y', 'I', 'Phi', 'C',
         'initial_cohort', 'birth_time', 'entry_cost', 'K_birth',
+        'entry_P0', 'entry_PI', 'entry_value_gap',
         'economic_node_id', 'node_view', 'accounting_stage',
         'eps_z_transition', 'u_eta_transition', 'u_i_transition'
     ]
@@ -60,6 +62,10 @@ class SimulateTS:
         'reference_K', 'reference_N', 'mean_K_ref', 'K_per_entrant',
         'potential_count', 'accepted_count', 'acceptance_rate',
         'entry_cutoff_mean', 'entry_cutoff_p10', 'entry_cutoff_p50', 'entry_cutoff_p90',
+        'entry_P0_mean', 'entry_P0_p10', 'entry_P0_p50', 'entry_P0_p90',
+        'entry_PI_mean', 'entry_PI_p10', 'entry_PI_p50', 'entry_PI_p90',
+        'entry_value_gap_mean', 'entry_value_gap_p10',
+        'entry_value_gap_p50', 'entry_value_gap_p90',
         'entry_cost_mean', 'entry_cost_p10', 'entry_cost_p50', 'entry_cost_p90',
         'potential_capital_nominal', 'candidate_capital_realized',
         'K_entry_gross', 'same_node_entrant_exit_count',
@@ -95,7 +101,7 @@ class SimulateTS:
         entry_spec_version: str = "value_cost_v1",
         entry_capital_ratio: float = 0.10,
         entry_size_ratio: float = 0.10,
-        entry_cost_max: float = 1.0,
+        entry_cost_max: Optional[float] = None,
         entry_dummy_i: float = 0.0,
         entry_inference_chunk_size: int = 65536,
         entry_rng_seed: int = 86420,
@@ -150,7 +156,13 @@ class SimulateTS:
         self.entry_spec_version = str(entry_spec_version)
         self.entry_capital_ratio = float(entry_capital_ratio)
         self.entry_size_ratio = float(entry_size_ratio)
-        self.entry_cost_max = float(entry_cost_max)
+        self.entry_cost_max_requested = (
+            None if entry_cost_max is None else float(entry_cost_max)
+        )
+        self.entry_cost_max = (
+            1.0 if entry_cost_max is None else float(entry_cost_max)
+        )
+        self.effective_entry_cost_max = self.entry_cost_max
         self.entry_dummy_i = float(entry_dummy_i)
         self.entry_inference_chunk_size = int(entry_inference_chunk_size)
         self.entry_rng_seed = int(entry_rng_seed)
@@ -165,7 +177,8 @@ class SimulateTS:
             )
         self.node_accounting_mode = (
             "economic_node_ledger"
-            if self.node_accounting_mode_requested == "auto" and self.entry_mode == "value_cost"
+            if self.node_accounting_mode_requested == "auto"
+            and self.entry_mode in {"value_cost", "investment_compare"}
             else "legacy_recompute"
             if self.node_accounting_mode_requested == "auto"
             else self.node_accounting_mode_requested
@@ -184,27 +197,75 @@ class SimulateTS:
                 "transition_rng_mode='stable_firm_identity' requires common_transition_seed"
             )
         self._entry_event_counter = 0
-        if self.entry_mode not in {"legacy", "value_cost"}:
-            raise ValueError("entry_mode must be 'legacy' or 'value_cost'")
-        if self.entry_mode == "value_cost":
-            if self.entry_spec_version != "value_cost_v1":
-                raise ValueError(f"unsupported entry_spec_version={self.entry_spec_version!r}")
+        if self.entry_mode not in {"legacy", "value_cost", "investment_compare"}:
+            raise ValueError(
+                "entry_mode must be 'legacy', 'value_cost', or "
+                "'investment_compare'"
+            )
+        if self.entry_mode in {"value_cost", "investment_compare"}:
+            expected_spec = (
+                "investment_compare_v1"
+                if self.entry_mode == "investment_compare"
+                else "value_cost_v1"
+            )
+            if self.entry_spec_version != expected_spec:
+                raise ValueError(
+                    f"entry_mode={self.entry_mode!r} requires "
+                    f"entry_spec_version={expected_spec!r}, got "
+                    f"{self.entry_spec_version!r}"
+                )
             if self.entry_capital_ratio < 0.0:
                 raise ValueError("entry_capital_ratio must be nonnegative")
             if not 0.0 < self.entry_size_ratio <= 1.0:
                 raise ValueError("entry_size_ratio must be in (0, 1]")
+            if self.entry_mode == "investment_compare":
+                resolved_i_max = float(self.config.I_THRESHOLD)
+                if resolved_i_max <= 0.0:
+                    raise ValueError("economic I_THRESHOLD must be positive")
+                if (
+                    self.entry_cost_max_requested is not None
+                    and not np.isclose(
+                        self.entry_cost_max_requested,
+                        resolved_i_max,
+                        rtol=0.0,
+                        atol=1e-12,
+                    )
+                ):
+                    raise ValueError(
+                        "entry_cost_max conflicts with ordinary investment-cost "
+                        f"support: requested={self.entry_cost_max_requested}, "
+                        f"I_THRESHOLD={resolved_i_max}"
+                    )
+                model_i_threshold = getattr(
+                    self.models.get("policy_value"), "i_threshold", resolved_i_max
+                )
+                if not np.isclose(
+                    float(model_i_threshold), resolved_i_max, rtol=0.0, atol=1e-12
+                ):
+                    raise ValueError(
+                        "policy_value.i_threshold conflicts with the effective "
+                        f"economic I_THRESHOLD: model={model_i_threshold}, "
+                        f"economic={resolved_i_max}"
+                    )
+                self.entry_cost_max = resolved_i_max
+                self.effective_entry_cost_max = resolved_i_max
             if self.entry_cost_max <= 0.0:
                 raise ValueError("entry_cost_max must be positive")
             if self.entry_inference_chunk_size <= 0:
                 raise ValueError("entry_inference_chunk_size must be positive")
             if self.consumption_aggregation_mode != "raw":
-                raise ValueError("value_cost entry requires raw consumption aggregation")
+                raise ValueError(
+                    f"{self.entry_mode} entry requires raw consumption aggregation"
+                )
             if self.node_accounting_mode != "economic_node_ledger":
                 raise ValueError(
-                    "value_cost entry requires node_accounting_mode='economic_node_ledger'"
+                    f"{self.entry_mode} entry requires "
+                    "node_accounting_mode='economic_node_ledger'"
                 )
             if self.models.get("policy_value") is None:
-                raise RuntimeError("value_cost entry requires a policy_value model")
+                raise RuntimeError(
+                    f"{self.entry_mode} entry requires a policy_value model"
+                )
         elif self.consumption_aggregation_mode not in {"legacy_per_firm_clamp", "raw"}:
             raise ValueError("unknown consumption_aggregation_mode")
         from .entry import (
@@ -218,7 +279,7 @@ class SimulateTS:
             entry_spec_version=self.entry_spec_version,
             entry_capital_ratio=self.entry_capital_ratio,
             entry_size_ratio=self.entry_size_ratio,
-            entry_cost_max=self.entry_cost_max,
+            entry_cost_max=self.effective_entry_cost_max,
             entry_dummy_i=self.entry_dummy_i,
             entry_inference_chunk_size=self.entry_inference_chunk_size,
             entry_rng_seed=self.entry_rng_seed,
@@ -367,9 +428,9 @@ class SimulateTS:
         - t 期数据：branch_k = -1 (父节点)
         - t+1 期数据：branch_k = 0, 1, ..., N-1 (各分支)
         """
-        if self.entry_mode == "value_cost":
+        if self.entry_mode in {"value_cost", "investment_compare"}:
             raise RuntimeError(
-                "value_cost entry is supported only by the formal tensor-path-parallel "
+                f"{self.entry_mode} entry is supported only by the formal tensor-path-parallel "
                 "SimulateTS.simulate()/simulate_tensor() path"
             )
         firm_data = []
@@ -418,9 +479,9 @@ class SimulateTS:
         """
         单条 path 的 tensor-native 模拟。
         """
-        if self.entry_mode == "value_cost":
+        if self.entry_mode in {"value_cost", "investment_compare"}:
             raise RuntimeError(
-                "value_cost entry is supported only by the formal tensor-path-parallel "
+                f"{self.entry_mode} entry is supported only by the formal tensor-path-parallel "
                 "SimulateTS.simulate()/simulate_tensor() path"
             )
         firm_rows: List[torch.Tensor] = []
@@ -623,6 +684,8 @@ class SimulateTS:
                 p0,
                 pi,
                 bar_i,
+                bar_i,
+                bar_i,
                 bar_z,
                 p,
                 bp0,
@@ -639,6 +702,9 @@ class SimulateTS:
                 torch.full_like(K, -1.0),
                 torch.zeros_like(K),
                 K,
+                torch.full_like(K, float("nan")),
+                torch.full_like(K, float("nan")),
+                torch.full_like(K, float("nan")),
                 torch.full_like(K, float(t)),
                 torch.full_like(K, 0.0 if branch_k == -1 else 1.0),
                 torch.zeros_like(K),
@@ -1249,9 +1315,9 @@ class SimulateTS:
         
         生成潜在进入者，筛选后加入
         """
-        if self.entry_mode == "value_cost":
+        if self.entry_mode in {"value_cost", "investment_compare"}:
             raise RuntimeError(
-                "legacy per-path entry cannot implement entry_mode='value_cost'; "
+                f"legacy per-path entry cannot implement entry_mode={self.entry_mode!r}; "
                 "use SimulateTS.simulate()/simulate_tensor()"
             )
         device = self.device
@@ -1306,9 +1372,9 @@ class SimulateTS:
         """
         应用进入规则（全 tensor 版本）。
         """
-        if self.entry_mode == "value_cost":
+        if self.entry_mode in {"value_cost", "investment_compare"}:
             raise RuntimeError(
-                "legacy single-path tensor entry cannot implement entry_mode='value_cost'; "
+                f"legacy single-path tensor entry cannot implement entry_mode={self.entry_mode!r}; "
                 "use SimulateTS.simulate()/simulate_tensor()"
             )
         device = self.device

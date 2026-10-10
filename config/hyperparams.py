@@ -222,8 +222,9 @@ class HyperParams:
     n_paths: int = 2000
     simulate_horizon: int = 200
     # Firm-entry experiment. ``legacy`` preserves the historical profit/i
-    # screen. ``value_cost`` uses a no-old-debt, relative-size candidate pool
-    # and an equity-value cutoff with a separate creation cost.
+    # screen. ``value_cost`` preserves the aggregate-equity/cost experiment.
+    # ``investment_compare`` reuses the existing PI>=P0 branch comparison at
+    # b=0, eta=0 and i=the entrant's creation cost.
     entry_mode: str = "legacy"
     entry_spec_version: str = "value_cost_v1"
     entry_capital_ratio: float = 0.10
@@ -234,7 +235,8 @@ class HyperParams:
     entry_rng_seed: int = 86420
     consumption_aggregation_mode: str = "legacy_per_firm_clamp"
     # ``auto`` resolves to historical survivor-view recomputation for legacy
-    # entry and to the authoritative economic-node ledger for value-cost entry.
+    # entry and to the authoritative economic-node ledger for either economic
+    # entry experiment.
     node_accounting_mode: str = "auto"
     # 训练数据批次是否优先走 tensor 管线（避免训练前 pandas 拼装）
     use_tensor_pipeline: bool = True

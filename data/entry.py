@@ -19,6 +19,7 @@ from .simulation_forward import forward_policy_value_for_simulation
 
 
 ENTRY_SPEC_VERSION = "value_cost_v1"
+INVESTMENT_COMPARE_SPEC_VERSION = "investment_compare_v1"
 
 
 class EntryEconomicInfeasibilityError(RuntimeError):
@@ -45,7 +46,7 @@ def entry_configuration_snapshot(
     economic_config: Any,
 ) -> Dict[str, Any]:
     """Canonical entry configuration used by output/cache provenance."""
-    return {
+    snapshot = {
         "entry_mode": str(entry_mode),
         "entry_specification_version": str(entry_spec_version),
         "entry_capital_ratio": float(entry_capital_ratio),
@@ -59,7 +60,11 @@ def entry_configuration_snapshot(
         "transition_rng_mode": str(transition_rng_mode),
         "reference_stage": "parent_pre_transition_alive_firms",
         "entry_timing": "child_node_creation_cost_paid_before_operation",
-        "eta_information_timing": "eta_and_i_drawn_after_entry_acceptance",
+        "eta_information_timing": (
+            "birth_eta_fixed_zero_and_birth_i_equals_entry_cost"
+            if str(entry_mode) == "investment_compare"
+            else "eta_and_i_drawn_after_entry_acceptance"
+        ),
         "economic": {
             "zeta": float(economic_config.ZETA),
             "rho_z": float(economic_config.RHO_Z),
@@ -71,6 +76,20 @@ def entry_configuration_snapshot(
             "g": float(economic_config.G),
         },
     }
+    if str(entry_mode) == "investment_compare":
+        snapshot.update(
+            {
+                "entry_criterion": "PI_ge_P0",
+                "birth_b": 0.0,
+                "birth_eta": 0.0,
+                "cost_distribution_source": "ordinary_investment_cost",
+                "effective_entry_cost_max": float(entry_cost_max),
+                "birth_i_equals_entry_cost": True,
+                "birth_extra_expansion": False,
+                "entry_dummy_i_effective": False,
+            }
+        )
+    return snapshot
 
 
 def entry_configuration_fingerprint(snapshot: Dict[str, Any]) -> str:
@@ -261,7 +280,6 @@ def evaluate_entry_cutoff(
     x_rows = x[path_index]
     hatcf_rows = hatcf[path_index]
     lnkf_rows = lnkf[path_index]
-
     p0_parts = []
     p1_parts = []
     modes = {
@@ -329,6 +347,128 @@ def evaluate_entry_cutoff(
         "entry_cutoff": scatter(cutoff_flat),
         "entry_net_value_per_capital": scatter(net_flat),
         "entry_net_value_total": scatter(k_flat * net_flat),
+        "accepted": accepted,
+    }
+
+
+def evaluate_investment_compare_entry(
+    policy_value_model: Any,
+    candidates: EntryCandidates,
+    *,
+    x: torch.Tensor,
+    hatcf: torch.Tensor,
+    lnkf: torch.Tensor,
+    chunk_size: int = 65536,
+) -> Dict[str, torch.Tensor]:
+    """Screen entrants by the existing physical-value investment comparison.
+
+    Each valid candidate is evaluated at ``b=0``, ``eta=0`` and
+    ``i=entry_cost``. The cost is already an input to ``PI`` and is therefore
+    never subtracted again from ``PI-P0``.
+    """
+    if policy_value_model is None:
+        raise RuntimeError(
+            "entry_mode='investment_compare' requires a policy_value model"
+        )
+    if chunk_size <= 0:
+        raise ValueError("entry inference chunk_size must be positive")
+    if candidates.mask.numel() == 0:
+        empty = candidates.z.clone()
+        return {
+            "entry_P0": empty,
+            "entry_PI": empty,
+            "entry_value_gap": empty,
+            "accepted": candidates.mask.clone(),
+        }
+    value_forward = getattr(policy_value_model, "forward_value_components", None)
+    if not callable(value_forward):
+        raise RuntimeError(
+            "entry_mode='investment_compare' requires "
+            "policy_value.forward_value_components()"
+        )
+
+    path_index, candidate_index = torch.nonzero(candidates.mask, as_tuple=True)
+    z = candidates.z[path_index, candidate_index]
+    cost = candidates.entry_cost[path_index, candidate_index]
+    n = int(z.numel())
+    x_rows = x[path_index]
+    hatcf_rows = hatcf[path_index]
+    lnkf_rows = lnkf[path_index]
+    candidate_inputs = (z, cost, x_rows, hatcf_rows, lnkf_rows)
+    if any(not torch.isfinite(value).all() for value in candidate_inputs):
+        raise FloatingPointError(
+            "investment-compare entry contains non-finite candidate state or cost"
+        )
+
+    p0_parts = []
+    pi_parts = []
+    modes = {module: module.training for module in policy_value_model.modules()}
+    parameter_versions = [
+        parameter._version for parameter in policy_value_model.parameters()
+    ]
+    buffer_versions = [buffer._version for buffer in policy_value_model.buffers()]
+    try:
+        policy_value_model.eval()
+        with torch.no_grad():
+            for start in range(0, n, int(chunk_size)):
+                stop = min(start + int(chunk_size), n)
+                state = torch.stack(
+                    [
+                        torch.zeros_like(z[start:stop]),
+                        z[start:stop],
+                        torch.zeros_like(z[start:stop]),
+                        cost[start:stop],
+                        x_rows[start:stop],
+                        hatcf_rows[start:stop],
+                        lnkf_rows[start:stop],
+                    ],
+                    dim=1,
+                )
+                values = value_forward(state)
+                try:
+                    p0 = values["V0_physical"].reshape(-1)
+                    pi = values["VI_physical"].reshape(-1)
+                except (KeyError, TypeError) as exc:
+                    raise RuntimeError(
+                        "forward_value_components() must expose physical-scale "
+                        "V0_physical and VI_physical"
+                    ) from exc
+                p0_parts.append(p0)
+                pi_parts.append(pi)
+    finally:
+        for module, was_training in modes.items():
+            module.train(was_training)
+
+    for before, after in zip(parameter_versions, policy_value_model.parameters()):
+        if before != after._version:
+            raise RuntimeError("entry branch-value forward modified model parameters")
+    for before, after in zip(buffer_versions, policy_value_model.buffers()):
+        if before != after._version:
+            raise RuntimeError("entry branch-value forward modified model buffers")
+
+    p0_flat = torch.cat(p0_parts)
+    pi_flat = torch.cat(pi_parts)
+    if not torch.isfinite(p0_flat).all() or not torch.isfinite(pi_flat).all():
+        raise FloatingPointError(
+            "investment-compare entry contains non-finite physical P0/PI values"
+        )
+    gap_flat = pi_flat - p0_flat
+    if not torch.isfinite(gap_flat).all():
+        raise FloatingPointError(
+            "investment-compare entry contains non-finite value gaps"
+        )
+
+    def scatter(values: torch.Tensor) -> torch.Tensor:
+        result = torch.zeros_like(candidates.z)
+        result[path_index, candidate_index] = values
+        return result
+
+    accepted = torch.zeros_like(candidates.mask)
+    accepted[path_index, candidate_index] = gap_flat >= 0.0
+    return {
+        "entry_P0": scatter(p0_flat),
+        "entry_PI": scatter(pi_flat),
+        "entry_value_gap": scatter(gap_flat),
         "accepted": accepted,
     }
 

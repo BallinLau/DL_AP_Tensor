@@ -126,7 +126,7 @@ def fill_df_to_fullN(
     if str(entry_mode).strip().lower() != "legacy":
         raise RuntimeError(
             "fill_df_to_fullN creates masked numerical coverage rows, not economic "
-            "value_cost entrants; entry_mode must remain 'legacy'"
+            f"{entry_mode} entrants; entry_mode must remain 'legacy'"
         )
     device = device or cfg.DEVICE
 

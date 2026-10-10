@@ -82,7 +82,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--simulate-group-size", type=int, default=None, help="Override firm count per simulated path for episodes > 0")
     parser.add_argument("--simulate-horizon", type=int, default=None, help="Override simulate horizon")
-    parser.add_argument("--entry-mode", choices=["legacy", "value_cost"], default=None)
+    parser.add_argument(
+        "--entry-mode",
+        choices=["legacy", "value_cost", "investment_compare"],
+        default=None,
+    )
     parser.add_argument("--entry-capital-ratio", type=float, default=None)
     parser.add_argument("--entry-size-ratio", type=float, default=None)
     parser.add_argument("--entry-cost-max", type=float, default=None)
@@ -704,8 +708,31 @@ def configure_hyperparams(args: argparse.Namespace):
         value = getattr(args, arg_name)
         if value is not None:
             setattr(hyperparams, hp_name, cast(value))
-    if hyperparams.entry_mode == "value_cost" and hyperparams.consumption_aggregation_mode != "raw":
-        raise ValueError("entry_mode='value_cost' requires consumption_aggregation_mode='raw'")
+    if hyperparams.entry_mode == "investment_compare":
+        from data.entry import INVESTMENT_COMPARE_SPEC_VERSION
+
+        resolved_i_max = float(Config.I_THRESHOLD)
+        if (
+            args.entry_cost_max is not None
+            and not np.isclose(
+                float(args.entry_cost_max), resolved_i_max, rtol=0.0, atol=1e-12
+            )
+        ):
+            raise ValueError(
+                "--entry-cost-max cannot differ from ordinary investment-cost "
+                f"support in investment_compare mode: requested={args.entry_cost_max}, "
+                f"I_THRESHOLD={resolved_i_max}"
+            )
+        hyperparams.entry_spec_version = INVESTMENT_COMPARE_SPEC_VERSION
+        hyperparams.entry_cost_max = resolved_i_max
+    if (
+        hyperparams.entry_mode in {"value_cost", "investment_compare"}
+        and hyperparams.consumption_aggregation_mode != "raw"
+    ):
+        raise ValueError(
+            f"entry_mode={hyperparams.entry_mode!r} requires "
+            "consumption_aggregation_mode='raw'"
+        )
     if hyperparams.entry_capital_ratio < 0.0:
         raise ValueError("entry_capital_ratio must be nonnegative")
     if not 0.0 < hyperparams.entry_size_ratio <= 1.0:
@@ -719,10 +746,12 @@ def configure_hyperparams(args: argparse.Namespace):
     }:
         raise ValueError("invalid node_accounting_mode")
     if (
-        hyperparams.entry_mode == "value_cost"
+        hyperparams.entry_mode in {"value_cost", "investment_compare"}
         and str(hyperparams.node_accounting_mode).lower() == "legacy_recompute"
     ):
-        raise ValueError("value_cost entry cannot use legacy_recompute accounting")
+        raise ValueError(
+            f"{hyperparams.entry_mode} entry cannot use legacy_recompute accounting"
+        )
     hyperparams.ablation_mode = args.ablation_mode
     hyperparams.sdf_wealth_loss_mode = args.sdf_wealth_loss_mode
     hyperparams.sdf_fresh_pair_enabled = bool(args.sdf_fresh_pair_enabled)

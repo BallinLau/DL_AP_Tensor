@@ -95,6 +95,10 @@ def _summarize_macro(df: pd.DataFrame) -> Dict[str, Any]:
         "potential_capital_nominal", "candidate_capital_realized",
         "K_entry_gross", "K_entry_surviving", "I_entry",
         "entry_cutoff_mean", "entry_cutoff_p10", "entry_cutoff_p50", "entry_cutoff_p90",
+        "entry_P0_mean", "entry_P0_p10", "entry_P0_p50", "entry_P0_p90",
+        "entry_PI_mean", "entry_PI_p10", "entry_PI_p50", "entry_PI_p90",
+        "entry_value_gap_mean", "entry_value_gap_p10",
+        "entry_value_gap_p50", "entry_value_gap_p90",
         "entry_cost_mean", "entry_cost_p10", "entry_cost_p50", "entry_cost_p90",
         "same_node_entrant_exit_count", "K_entry_same_node_exit",
         "deltaK_incumbent", "K_entry_endpoint", "K_exit_old",
@@ -318,6 +322,9 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         "A_legacy_entry_legacy_aggregation": ("legacy", "legacy_per_firm_clamp"),
         "B_legacy_entry_raw_aggregation": ("legacy", "raw"),
         "C_value_cost_entry_raw_aggregation": ("value_cost", "raw"),
+        "D_investment_compare_entry_raw_aggregation": (
+            "investment_compare", "raw"
+        ),
     }
     report: Dict[str, Any] = {
         "historical_behavior_base_commit": BASE_COMMIT,
@@ -334,8 +341,9 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
             "historical_4b236ea_reproduction_arm": False,
         },
         "interpretation_warning": (
-            "B versus C jointly changes entry screening, birth debt, and entrant scale; "
-            "it does not isolate any one submechanism and is not a solved new equilibrium."
+            "B/C/D comparisons jointly change entry screening, birth state, and entrant "
+            "scale; they do not isolate any one submechanism or represent a solved new "
+            "equilibrium. investment_compare is the explicit PI>=P0 approximation."
         ),
         "arms": {},
     }
@@ -383,9 +391,18 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                     bp_action_source=bp_resolution["resolved_source"],
                     bp_grid_policy=grid_policy,
                     entry_mode=entry_mode,
+                    entry_spec_version=(
+                        "investment_compare_v1"
+                        if entry_mode == "investment_compare"
+                        else "value_cost_v1"
+                    ),
                     entry_capital_ratio=args.entry_capital_ratio,
                     entry_size_ratio=args.entry_size_ratio,
-                    entry_cost_max=args.entry_cost_max,
+                    entry_cost_max=(
+                        float(config.I_THRESHOLD)
+                        if entry_mode == "investment_compare"
+                        else args.entry_cost_max
+                    ),
                     entry_dummy_i=args.entry_dummy_i,
                     entry_inference_chunk_size=args.entry_inference_chunk_size,
                     entry_rng_seed=args.entry_rng_seed,

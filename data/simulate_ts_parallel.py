@@ -14,6 +14,7 @@ from .entry import (
     compute_entry_reference,
     draw_value_cost_candidates,
     evaluate_entry_cutoff,
+    evaluate_investment_compare_entry,
     summarize_candidate_values,
     validate_node_resource_account,
 )
@@ -128,6 +129,8 @@ def _ensure_entry_state_fields(state: Dict[str, torch.Tensor]) -> None:
     state.setdefault("birth_time", torch.full_like(b, -1.0))
     state.setdefault("entry_cost", torch.zeros_like(b))
     state.setdefault("K_birth", torch.where(state["alive"], state["K"], torch.zeros_like(state["K"])))
+    for name in ("entry_P0", "entry_PI", "entry_value_gap"):
+        state.setdefault(name, torch.full_like(b, float("nan")))
     state.setdefault("economic_node_id", torch.zeros(n_paths, dtype=torch.long, device=device))
     state.setdefault("economic_time", torch.zeros(n_paths, dtype=torch.long, device=device))
     state.setdefault("accounting_valid", torch.zeros(n_paths, dtype=torch.bool, device=device))
@@ -147,6 +150,17 @@ def _ensure_entry_state_fields(state: Dict[str, torch.Tensor]) -> None:
         "event_entry_cost_p50", "event_entry_cost_p90",
     ):
         state.setdefault(name, torch.zeros(n_paths, device=device))
+    for name in (
+        "event_entry_P0_mean", "event_entry_P0_p10",
+        "event_entry_P0_p50", "event_entry_P0_p90",
+        "event_entry_PI_mean", "event_entry_PI_p10",
+        "event_entry_PI_p50", "event_entry_PI_p90",
+        "event_entry_value_gap_mean", "event_entry_value_gap_p10",
+        "event_entry_value_gap_p50", "event_entry_value_gap_p90",
+    ):
+        state.setdefault(
+            name, torch.full((n_paths,), float("nan"), device=device)
+        )
 
 
 def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
@@ -265,6 +279,9 @@ def _initialize_batched_state(sim, max_firms: int) -> Dict[str, torch.Tensor]:
         "birth_time": torch.full_like(K, -1.0),
         "entry_cost": torch.zeros_like(K),
         "K_birth": torch.where(alive, K, torch.zeros_like(K)),
+        "entry_P0": torch.full_like(K, float("nan")),
+        "entry_PI": torch.full_like(K, float("nan")),
+        "entry_value_gap": torch.full_like(K, float("nan")),
         "firm_id": firm_id,
         "next_firm_id": torch.full((n_paths,), n0, dtype=torch.long, device=device),
         "bar_i": torch.zeros_like(b),
@@ -294,6 +311,18 @@ def _initialize_batched_state(sim, max_firms: int) -> Dict[str, torch.Tensor]:
         "event_entry_cutoff_p10": torch.full((n_paths,), float("nan"), device=device),
         "event_entry_cutoff_p50": torch.full((n_paths,), float("nan"), device=device),
         "event_entry_cutoff_p90": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_P0_mean": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_P0_p10": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_P0_p50": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_P0_p90": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_PI_mean": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_PI_p10": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_PI_p50": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_PI_p90": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_value_gap_mean": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_value_gap_p10": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_value_gap_p50": torch.full((n_paths,), float("nan"), device=device),
+        "event_entry_value_gap_p90": torch.full((n_paths,), float("nan"), device=device),
         "event_entry_cost_mean": torch.full((n_paths,), float("nan"), device=device),
         "event_entry_cost_p10": torch.full((n_paths,), float("nan"), device=device),
         "event_entry_cost_p50": torch.full((n_paths,), float("nan"), device=device),
@@ -313,9 +342,11 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     path_grid = torch.arange(n_paths, device=device, dtype=torch.long).unsqueeze(1).expand(n_paths, n_firms)
 
     if alive_pos.numel() == 0:
-        if getattr(sim, "entry_mode", "legacy") == "value_cost":
+        if getattr(sim, "entry_mode", "legacy") in {
+            "value_cost", "investment_compare"
+        }:
             raise RuntimeError(
-                f"value_cost entry encountered an extinct economic node at t={t}; "
+                f"{sim.entry_mode} entry encountered an extinct economic node at t={t}; "
                 "no synthetic firms or macro floor are created"
             )
         state["hatc_cal"] = torch.full((n_paths,), -10.0, device=device)
@@ -353,6 +384,9 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     birth_time = state["birth_time"].reshape(-1)[alive_flat]
     entry_cost = state["entry_cost"].reshape(-1)[alive_flat]
     K_birth = state["K_birth"].reshape(-1)[alive_flat]
+    entry_p0 = state["entry_P0"].reshape(-1)[alive_flat]
+    entry_pi = state["entry_PI"].reshape(-1)[alive_flat]
+    entry_value_gap = state["entry_value_gap"].reshape(-1)[alive_flat]
     firm_id = state["firm_id"].reshape(-1)[alive_flat].to(torch.float32)
     x = state["x"][path_idx]
     hatcf = state["hatcf"][path_idx]
@@ -368,7 +402,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         q = output.Q.reshape(-1)
         p0 = output.P0.reshape(-1)
         pi = output.PI.reshape(-1)
-        bar_i = output.bar_i.reshape(-1)
+        bar_i_model = output.bar_i.reshape(-1)
         bar_z = output.bar_z.reshape(-1)
         p = output.P.reshape(-1)
         bp0 = output.bp0.reshape(-1)
@@ -378,12 +412,29 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         q = torch.zeros_like(b)
         p0 = torch.zeros_like(b)
         pi = torch.zeros_like(b)
-        bar_i = torch.zeros_like(b)
+        bar_i_model = torch.zeros_like(b)
         bar_z = torch.zeros_like(b)
         p = torch.zeros_like(b)
         bp0 = b.clone()
         bpI = b.clone()
         bp = b.clone()
+
+    birth_node_mask = (
+        (getattr(sim, "entry_mode", "legacy") == "investment_compare")
+        & (entry > 0.5)
+        & (initial_cohort < 0.5)
+        & (
+            birth_time
+            == state["economic_time"][path_idx].to(dtype=birth_time.dtype)
+        )
+    )
+    bar_i_executed = torch.where(
+        birth_node_mask, torch.zeros_like(bar_i_model), bar_i_model
+    )
+    # Keep the historical Bar_i export as the action actually used by the
+    # resource account and K transition. The model diagnostic is exported
+    # separately as Bar_i_model.
+    bar_i = bar_i_executed
 
     b_next_p0 = torch.full_like(b, float("nan"))
     b_next_pi = torch.full_like(b, float("nan"))
@@ -673,6 +724,8 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             p0,
             pi,
             bar_i,
+            bar_i_model,
+            bar_i_executed,
             bar_z,
             p,
             bp0,
@@ -689,6 +742,9 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             birth_time,
             entry_cost,
             K_birth,
+            entry_p0,
+            entry_pi,
+            entry_value_gap,
             state["economic_node_id"][path_idx].to(torch.float32),
             torch.full_like(b, 0.0 if branch_k == -1 else 1.0),
             torch.full_like(b, 1.0 if reused_account else 0.0),
@@ -775,6 +831,18 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             state.get("event_entry_cutoff_p10", torch.full((n_paths,), float("nan"), device=device)),
             state.get("event_entry_cutoff_p50", torch.full((n_paths,), float("nan"), device=device)),
             state.get("event_entry_cutoff_p90", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_P0_mean", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_P0_p10", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_P0_p50", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_P0_p90", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_PI_mean", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_PI_p10", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_PI_p50", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_PI_p90", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_value_gap_mean", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_value_gap_p10", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_value_gap_p50", torch.full((n_paths,), float("nan"), device=device)),
+            state.get("event_entry_value_gap_p90", torch.full((n_paths,), float("nan"), device=device)),
             state.get("event_entry_cost_mean", torch.full((n_paths,), float("nan"), device=device)),
             state.get("event_entry_cost_p10", torch.full((n_paths,), float("nan"), device=device)),
             state.get("event_entry_cost_p50", torch.full((n_paths,), float("nan"), device=device)),
@@ -944,6 +1012,9 @@ def _expand_branches_batched(
                 "birth_time": state["birth_time"].clone(),
                 "entry_cost": state["entry_cost"].clone(),
                 "K_birth": state["K_birth"].clone(),
+                "entry_P0": state["entry_P0"].clone(),
+                "entry_PI": state["entry_PI"].clone(),
+                "entry_value_gap": state["entry_value_gap"].clone(),
                 "firm_id": state["firm_id"].clone(),
                 "next_firm_id": state["next_firm_id"].clone(),
                 "bar_i": state.get("bar_i", torch.zeros_like(state["b"])) .clone(),
@@ -985,6 +1056,18 @@ def _expand_branches_batched(
                 "event_entry_cutoff_p10": torch.full((state["b"].shape[0],), float("nan"), device=device),
                 "event_entry_cutoff_p50": torch.full((state["b"].shape[0],), float("nan"), device=device),
                 "event_entry_cutoff_p90": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_P0_mean": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_P0_p10": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_P0_p50": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_P0_p90": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_PI_mean": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_PI_p10": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_PI_p50": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_PI_p90": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_value_gap_mean": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_value_gap_p10": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_value_gap_p50": torch.full((state["b"].shape[0],), float("nan"), device=device),
+                "event_entry_value_gap_p90": torch.full((state["b"].shape[0],), float("nan"), device=device),
                 "event_entry_cost_mean": torch.full((state["b"].shape[0],), float("nan"), device=device),
                 "event_entry_cost_p10": torch.full((state["b"].shape[0],), float("nan"), device=device),
                 "event_entry_cost_p50": torch.full((state["b"].shape[0],), float("nan"), device=device),
@@ -1025,7 +1108,9 @@ def _apply_exit_batched(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tenso
 
 
 def _apply_entry_batched(sim, state: Dict[str, torch.Tensor], n_potential: int) -> Dict[str, torch.Tensor]:
-    if getattr(sim, "entry_mode", "legacy") == "value_cost":
+    if getattr(sim, "entry_mode", "legacy") in {
+        "value_cost", "investment_compare"
+    }:
         return _apply_value_cost_entry_batched(sim, state)
     if getattr(sim, "preserve_global_rng_around_entry", False):
         cuda_devices = []
@@ -1157,7 +1242,10 @@ def _expand_firm_capacity(
             else -1
             if key == "firm_id"
             else float("nan")
-            if key in {"transition_eps_z", "transition_u_eta", "transition_u_i"}
+            if key in {
+                "transition_eps_z", "transition_u_eta", "transition_u_i",
+                "entry_P0", "entry_PI", "entry_value_gap",
+            }
             else 0
         )
         expanded = torch.full(
@@ -1186,19 +1274,29 @@ def _apply_value_cost_entry_batched(sim, state: Dict[str, torch.Tensor]) -> Dict
         rho_z=float(sim.config.RHO_Z),
         sigma_z=float(sim.config.SIGMA_Z),
         zbar=float(sim.config.ZBAR),
-        entry_cost_max=sim.entry_cost_max,
+        entry_cost_max=sim.effective_entry_cost_max,
         generator=sim.entry_generator,
     )
-    screened = evaluate_entry_cutoff(
-        sim.models.get("policy_value"),
-        candidates,
-        x=state["x"],
-        hatcf=state["hatcf"],
-        lnkf=state["lnkf"],
-        zeta=float(sim.config.ZETA),
-        dummy_i=sim.entry_dummy_i,
-        chunk_size=sim.entry_inference_chunk_size,
-    )
+    if sim.entry_mode == "investment_compare":
+        screened = evaluate_investment_compare_entry(
+            sim.models.get("policy_value"),
+            candidates,
+            x=state["x"],
+            hatcf=state["hatcf"],
+            lnkf=state["lnkf"],
+            chunk_size=sim.entry_inference_chunk_size,
+        )
+    else:
+        screened = evaluate_entry_cutoff(
+            sim.models.get("policy_value"),
+            candidates,
+            x=state["x"],
+            hatcf=state["hatcf"],
+            lnkf=state["lnkf"],
+            zeta=float(sim.config.ZETA),
+            dummy_i=sim.entry_dummy_i,
+            chunk_size=sim.entry_inference_chunk_size,
+        )
     accepted = screened["accepted"] & candidates.mask
     accepted_counts = accepted.sum(dim=1).to(torch.long)
     required = int((state["next_firm_id"] + accepted_counts).max().item()) if n_paths else 0
@@ -1213,14 +1311,20 @@ def _apply_value_cost_entry_batched(sim, state: Dict[str, torch.Tensor]) -> Dict
     state["event_K_per_entrant"] = reference.K_per_entrant
     state["event_potential_capital_nominal"] = candidates.potential_capital_nominal
     state["event_candidate_capital_realized"] = candidates.candidate_capital_realized
-    cutoff_summary = summarize_candidate_values(
-        screened["entry_cutoff"], candidates.mask
-    )
+    if sim.entry_mode == "investment_compare":
+        for field in ("entry_P0", "entry_PI", "entry_value_gap"):
+            summary = summarize_candidate_values(screened[field], candidates.mask)
+            for statistic, values in summary.items():
+                state[f"event_{field}_{statistic}"] = values
+    else:
+        cutoff_summary = summarize_candidate_values(
+            screened["entry_cutoff"], candidates.mask
+        )
+        for statistic, values in cutoff_summary.items():
+            state[f"event_entry_cutoff_{statistic}"] = values
     cost_summary = summarize_candidate_values(
         candidates.entry_cost, candidates.mask
     )
-    for statistic, values in cutoff_summary.items():
-        state[f"event_entry_cutoff_{statistic}"] = values
     for statistic, values in cost_summary.items():
         state[f"event_entry_cost_{statistic}"] = values
     state["event_I_entry"] = torch.where(
@@ -1243,15 +1347,22 @@ def _apply_value_cost_entry_batched(sim, state: Dict[str, torch.Tensor]) -> Dict
     K_new = candidates.K_birth[accepted]
     cost_new = candidates.entry_cost[accepted]
     n_accepted = int(path_idx.numel())
-    # Draw eta and ordinary investment cost only after the entry screen.
-    eta_draw = (
-        torch.rand(n_accepted, generator=sim.entry_generator, dtype=torch.float64)
-        < float(sim.config.ZETA)
-    ).to(device=device, dtype=state["eta"].dtype)
-    i_draw = (
-        torch.rand(n_accepted, generator=sim.entry_generator, dtype=torch.float64)
-        * float(sim.config.I_THRESHOLD)
-    ).to(device=device, dtype=state["i"].dtype)
+    if sim.entry_mode == "investment_compare":
+        eta_draw = torch.zeros(
+            n_accepted, device=device, dtype=state["eta"].dtype
+        )
+        i_draw = cost_new.to(device=device, dtype=state["i"].dtype)
+    else:
+        # Historical value_cost_v1 timing: eta and ordinary investment cost are
+        # drawn only after the aggregate-equity entry screen.
+        eta_draw = (
+            torch.rand(n_accepted, generator=sim.entry_generator, dtype=torch.float64)
+            < float(sim.config.ZETA)
+        ).to(device=device, dtype=state["eta"].dtype)
+        i_draw = (
+            torch.rand(n_accepted, generator=sim.entry_generator, dtype=torch.float64)
+            * float(sim.config.I_THRESHOLD)
+        ).to(device=device, dtype=state["i"].dtype)
     new_id = destination[accepted].to(torch.long)
 
     state["b"][path_idx, slot_idx] = 0.0
@@ -1267,6 +1378,12 @@ def _apply_value_cost_entry_batched(sim, state: Dict[str, torch.Tensor]) -> Dict
     )
     state["entry_cost"][path_idx, slot_idx] = cost_new
     state["K_birth"][path_idx, slot_idx] = K_new
+    if sim.entry_mode == "investment_compare":
+        state["entry_P0"][path_idx, slot_idx] = screened["entry_P0"][accepted]
+        state["entry_PI"][path_idx, slot_idx] = screened["entry_PI"][accepted]
+        state["entry_value_gap"][path_idx, slot_idx] = screened[
+            "entry_value_gap"
+        ][accepted]
     state["firm_id"][path_idx, slot_idx] = new_id
     state["bar_i"][path_idx, slot_idx] = 0.0
     state["bar_z"][path_idx, slot_idx] = 0.0

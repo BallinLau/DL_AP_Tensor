@@ -183,6 +183,10 @@ It evaluates:
 2. legacy entry plus raw aggregation;
 3. value-cost entry plus raw aggregation.
 
+The later `investment_compare_v1` experiment is a separate, explicitly named
+entry rule. It is documented in `reports/investment_compare_entry_mechanism.md`
+and does not silently replace the `value_cost_v1` semantics described here.
+
 The command resets the same initial seed for each arm, isolates entry draws,
 and uses tagged common transition shocks so dynamic capacity cannot shift the
 macro/incumbent shock streams. These numerical values are smoke defaults, not

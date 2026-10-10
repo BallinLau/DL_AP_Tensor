@@ -790,6 +790,7 @@ def test_smoke_main_keeps_namespace_paths_and_runs_all_arms(tmp_path):
         "A_legacy_entry_legacy_aggregation",
         "B_legacy_entry_raw_aggregation",
         "C_value_cost_entry_raw_aggregation",
+        "D_investment_compare_entry_raw_aggregation",
     }
     assert all(arm["status"] == "completed" for arm in report["arms"].values())
     assert (output_dir / "summary.json").is_file()
@@ -868,7 +869,7 @@ def test_smoke_all_economic_failures_write_report_and_return_failure(tmp_path):
         (output_dir / "summary.json").read_text(encoding="utf-8")
     )
     assert report["model_hash_invariant"] is True
-    assert len(report["arms"]) == 3
+    assert len(report["arms"]) == 4
     assert all(
         arm["status"] == "economic_infeasible"
         for arm in report["arms"].values()
@@ -935,7 +936,7 @@ def test_smoke_grid_source_constructs_and_calls_grid_resolver(tmp_path):
             "--n-paths", "1", "--group-size", "2", "--horizon", "1",
             "--branch-num", "1", "--entry-capital-ratio", "0",
         ])
-    assert calls["constructed"] == 3
+    assert calls["constructed"] == 4
     assert calls["called"] >= 3
     assert report["bp_action_resolution"]["resolved_source"] == "grid"
     assert all(
