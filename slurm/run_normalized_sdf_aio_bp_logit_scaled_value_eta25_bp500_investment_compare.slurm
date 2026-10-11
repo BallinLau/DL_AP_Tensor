@@ -36,6 +36,7 @@ export ENTRY_DUMMY_I=0.0
 export ENTRY_INFERENCE_CHUNK_SIZE="${ENTRY_INFERENCE_CHUNK_SIZE:-65536}"
 export ENTRY_RNG_SEED="${ENTRY_RNG_SEED:-86420}"
 export CONSUMPTION_AGGREGATION_MODE=raw
+export CONSUMPTION_FLOOR="${CONSUMPTION_FLOOR:-1e-4}"
 export NODE_ACCOUNTING_MODE=economic_node_ledger
 
 echo "Dispatching 10-episode investment-compare full-equilibrium run"
@@ -45,6 +46,7 @@ echo "N_EPISODES=$N_EPISODES"
 echo "ENTRY_MODE=$ENTRY_MODE"
 echo "ENTRY_COST_MAX=ordinary I_THRESHOLD"
 echo "CONSUMPTION_AGGREGATION_MODE=$CONSUMPTION_AGGREGATION_MODE"
+echo "CONSUMPTION_FLOOR=$CONSUMPTION_FLOOR"
 echo "NODE_ACCOUNTING_MODE=$NODE_ACCOUNTING_MODE"
 
 exec bash "$REPO_DIR/slurm/run_normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500.slurm"

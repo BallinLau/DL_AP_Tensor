@@ -63,6 +63,7 @@ def entry_configuration_snapshot(
     node_accounting_mode: str,
     transition_rng_mode: str,
     economic_config: Any,
+    consumption_floor: float = 0.0,
 ) -> Dict[str, Any]:
     """Canonical entry configuration used by output/cache provenance."""
     snapshot = {
@@ -75,6 +76,7 @@ def entry_configuration_snapshot(
         "entry_inference_chunk_size": int(entry_inference_chunk_size),
         "entry_rng_seed": int(entry_rng_seed),
         "consumption_aggregation_mode": str(consumption_aggregation_mode),
+        "consumption_floor": float(consumption_floor),
         "node_accounting_mode": str(node_accounting_mode),
         "transition_rng_mode": str(transition_rng_mode),
         "reference_stage": "parent_pre_transition_alive_firms",

@@ -503,7 +503,8 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     reused_account = use_node_ledger and bool(cache_valid.all())
     if reused_account:
         K_total = state["accounting_K_total"]
-        C_total = state["accounting_C_raw"]
+        C_raw_total = state["accounting_C_raw"]
+        C_total = state.get("accounting_C_effective", C_raw_total)
         C_oper_total = state["accounting_C_oper"]
         I_oper_total = state["accounting_I_oper"]
         I_entry_total = state["accounting_I_entry"]
@@ -524,9 +525,13 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         birth_maintenance_exemption = state[
             "accounting_birth_maintenance_exemption"
         ]
+        consumption_floor_applied = state.get(
+            "accounting_consumption_floor_applied",
+            torch.zeros(n_paths, dtype=torch.bool, device=device),
+        )
     else:
         K_total = K_total_computed
-        C_total = resources["C_raw"]
+        C_raw_total = resources["C_raw"]
         C_oper_total = resources["C_oper"]
         I_oper_total = I_oper_computed
         I_entry_total = resources["I_entry"]
@@ -542,7 +547,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             K_current=K,
             n_paths=n_paths,
             I_entry_ledger=I_entry_total,
-            C_reported=C_total,
+            C_reported=C_raw_total,
             mode=getattr(sim, "consumption_aggregation_mode", "legacy_per_firm_clamp"),
             bar_i_executed=bar_i,
             bar_z=bar_z,
@@ -577,24 +582,46 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                 f"t={t}, branch={branch_k}, paths={bad[:20]}"
             )
         n_firms_accounted = n_alive_per_path.to(torch.float32)
-        if getattr(sim, "consumption_aggregation_mode", "legacy_per_firm_clamp") == "raw" and not bool(resource_feasible.all()):
-            bad = torch.nonzero(~resource_feasible, as_tuple=False).reshape(-1).tolist()
+        consumption_floor = float(getattr(sim, "consumption_floor", 0.0))
+        raw_mode = (
+            getattr(sim, "consumption_aggregation_mode", "legacy_per_firm_clamp")
+            == "raw"
+        )
+        raw_finite = torch.isfinite(C_raw_total)
+        invalid = ~raw_finite
+        if raw_mode and consumption_floor <= 0.0:
+            invalid = invalid | (C_raw_total <= 0.0)
+        if raw_mode and bool(invalid.any()):
+            bad = torch.nonzero(invalid, as_tuple=False).reshape(-1).tolist()
             raise EntryEconomicInfeasibilityError(
                 "raw node resource account is infeasible or non-finite (C_raw<=0); "
                 f"t={t}, branch={branch_k}, paths={bad[:20]}, "
                 f"C_oper={[float(C_oper_total[index]) for index in bad[:20]]}, "
                 f"I_entry={[float(I_entry_total[index]) for index in bad[:20]]}, "
-                f"C_raw={[float(C_total[index]) for index in bad[:20]]}, "
+                f"C_raw={[float(C_raw_total[index]) for index in bad[:20]]}, "
                 f"accepted_count={[float(state.get('event_accepted_count', torch.zeros(n_paths, device=device))[index]) for index in bad[:20]]}, "
                 "no positive floor was applied"
             )
         alive_any = n_alive_per_path > 0
-        LnK = torch.where(
-            alive_any,
-            torch.log(K_total + 1e-8),
-            torch.full_like(K_total, float("nan")),
-        )
-        if getattr(sim, "consumption_aggregation_mode", "legacy_per_firm_clamp") == "legacy_per_firm_clamp":
+        if raw_mode and consumption_floor > 0.0:
+            C_total = C_raw_total.clamp_min(consumption_floor)
+            K_for_macro = K_total.clamp_min(consumption_floor)
+            consumption_floor_applied = (
+                (C_raw_total < consumption_floor)
+                | (K_total < consumption_floor)
+            )
+            LnK = torch.log(K_for_macro)
+            Hatc = torch.log(C_total / K_for_macro)
+        elif not raw_mode:
+            C_total = C_raw_total
+            consumption_floor_applied = torch.zeros(
+                n_paths, dtype=torch.bool, device=device
+            )
+            LnK = torch.where(
+                alive_any,
+                torch.log(K_total + 1e-8),
+                torch.full_like(K_total, float("nan")),
+            )
             # Preserve the exact historical macro transform in legacy mode.
             Hatc = torch.where(
                 alive_any,
@@ -602,6 +629,11 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                 torch.full_like(C_total, -10.0),
             )
         else:
+            C_total = C_raw_total
+            consumption_floor_applied = torch.zeros(
+                n_paths, dtype=torch.bool, device=device
+            )
+            LnK = torch.log(K_total + 1e-8)
             Hatc = torch.where(
                 resource_feasible,
                 torch.log(C_total / (K_total + 1e-8)),
@@ -610,7 +642,8 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         if use_node_ledger:
             state["accounting_valid"] = torch.ones(n_paths, dtype=torch.bool, device=device)
             state["accounting_K_total"] = K_total.detach()
-            state["accounting_C_raw"] = C_total.detach()
+            state["accounting_C_raw"] = C_raw_total.detach()
+            state["accounting_C_effective"] = C_total.detach()
             state["accounting_C_oper"] = C_oper_total.detach()
             state["accounting_I_oper"] = I_oper_total.detach()
             state["accounting_I_entry"] = I_entry_total.detach()
@@ -632,6 +665,9 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             state["accounting_maintenance_residual"] = maintenance_residual.detach()
             state["accounting_birth_maintenance_exemption"] = (
                 birth_maintenance_exemption.detach()
+            )
+            state["accounting_consumption_floor_applied"] = (
+                consumption_floor_applied.detach()
             )
     state["hatc_cal"] = Hatc.detach()
     state["lnk_cal"] = LnK.detach()
@@ -892,7 +928,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             I_entry_total,
             I_oper_total + I_entry_total,
             C_oper_total,
-            C_total,
+            C_raw_total,
             resource_residual,
             resource_feasible.to(torch.float32),
             state.get("event_reference_K", torch.zeros(n_paths, device=device)),
@@ -954,6 +990,11 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             I_maintenance_rebuilt,
             maintenance_residual,
             birth_maintenance_exemption,
+            torch.full(
+                (n_paths,), float(getattr(sim, "consumption_floor", 0.0)),
+                device=device,
+            ),
+            consumption_floor_applied.to(torch.float32),
         ],
         dim=1,
     ).to(torch.float32)

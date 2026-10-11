@@ -595,6 +595,35 @@ def test_raw_infeasible_node_fails_without_positive_floor():
         simulator.simulate_tensor()
 
 
+def test_raw_consumption_floor_preserves_accounting_and_keeps_macro_finite():
+    class InfeasibleConfig(_TestConfig):
+        DELTA = 2.0
+
+    simulator = SimulateTS(
+        models={"policy_value": _SimulationPolicy()},
+        config=InfeasibleConfig,
+        n_paths=1,
+        group_size=2,
+        horizon=1,
+        branch_num=1,
+        device=torch.device("cpu"),
+        entry_mode="value_cost",
+        entry_capital_ratio=0.0,
+        entry_size_ratio=0.25,
+        entry_cost_max=0.01,
+        consumption_aggregation_mode="raw",
+        consumption_floor=1e-4,
+    )
+    macro = simulator.simulate_tensor().macro.to_dataframe()
+
+    assert (macro["C_raw"] <= 0.0).any()
+    assert (macro["C"] >= 1e-4).all()
+    assert (macro["consumption_floor"] - 1e-4).abs().max() < 1e-10
+    assert (macro.loc[macro["C_raw"] < 1e-4, "consumption_floor_applied"] == 1.0).all()
+    assert macro["Hatc"].map(math.isfinite).all()
+    assert macro["LnK"].map(math.isfinite).all()
+
+
 def test_runner_entry_configuration_reaches_effective_hyperparams():
     argv = [
         "run_multi_episode_job.py",
@@ -606,6 +635,7 @@ def test_runner_entry_configuration_reaches_effective_hyperparams():
         "--entry-inference-chunk-size", "1234",
         "--entry-rng-seed", "99",
         "--consumption-aggregation-mode", "raw",
+        "--consumption-floor", "0.0001",
         "--node-accounting-mode", "economic_node_ledger",
     ]
     with patch.object(sys, "argv", argv):
@@ -618,6 +648,7 @@ def test_runner_entry_configuration_reaches_effective_hyperparams():
     assert hp.entry_inference_chunk_size == 1234
     assert hp.entry_rng_seed == 99
     assert hp.consumption_aggregation_mode == "raw"
+    assert hp.consumption_floor == pytest.approx(1e-4)
     assert hp.node_accounting_mode == "economic_node_ledger"
 
 

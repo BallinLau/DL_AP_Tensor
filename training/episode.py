@@ -1128,6 +1128,7 @@ class Episode:
             "entry_inference_chunk_size",
             "entry_rng_seed",
             "consumption_aggregation_mode",
+            "consumption_floor",
             "node_accounting_mode",
         ):
             sim_kwargs[name] = getattr(self.hyperparams, name)
@@ -8629,6 +8630,7 @@ class Episode:
             "entry_dummy_i",
             "entry_rng_seed",
             "consumption_aggregation_mode",
+            "consumption_floor",
             "node_accounting_mode",
         ]
         payload: Dict[str, Any] = {

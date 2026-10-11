@@ -8,6 +8,8 @@ SimulateTS 类：树状分支模拟器
 - 资源核算
 """
 
+import math
+
 import torch
 import pandas as pd
 import numpy as np
@@ -83,7 +85,8 @@ class SimulateTS:
         'eps_x_transition',
         'K_maintenance_base', 'K_birth_current_node',
         'I_maintenance', 'I_maintenance_rebuilt',
-        'maintenance_accounting_residual', 'birth_maintenance_exemption'
+        'maintenance_accounting_residual', 'birth_maintenance_exemption',
+        'consumption_floor', 'consumption_floor_applied'
     ]
 
     def __init__(
@@ -110,6 +113,7 @@ class SimulateTS:
         entry_inference_chunk_size: int = 65536,
         entry_rng_seed: int = 86420,
         consumption_aggregation_mode: str = "legacy_per_firm_clamp",
+        consumption_floor: float = 0.0,
         node_accounting_mode: str = "auto",
         preserve_global_rng_around_entry: bool = False,
         common_transition_seed: Optional[int] = None,
@@ -171,6 +175,9 @@ class SimulateTS:
         self.entry_inference_chunk_size = int(entry_inference_chunk_size)
         self.entry_rng_seed = int(entry_rng_seed)
         self.consumption_aggregation_mode = str(consumption_aggregation_mode).strip().lower()
+        self.consumption_floor = float(consumption_floor)
+        if not math.isfinite(self.consumption_floor) or self.consumption_floor < 0.0:
+            raise ValueError("consumption_floor must be finite and nonnegative")
         self.node_accounting_mode_requested = str(node_accounting_mode).strip().lower()
         if self.node_accounting_mode_requested not in {
             "auto", "legacy_recompute", "economic_node_ledger"
@@ -288,6 +295,7 @@ class SimulateTS:
             entry_inference_chunk_size=self.entry_inference_chunk_size,
             entry_rng_seed=self.entry_rng_seed,
             consumption_aggregation_mode=self.consumption_aggregation_mode,
+            consumption_floor=self.consumption_floor,
             node_accounting_mode=self.node_accounting_mode,
             transition_rng_mode=self.transition_rng_mode,
             economic_config=self.config,

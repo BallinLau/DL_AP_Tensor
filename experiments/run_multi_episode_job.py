@@ -98,6 +98,7 @@ def parse_args() -> argparse.Namespace:
         choices=["legacy_per_firm_clamp", "raw"],
         default=None,
     )
+    parser.add_argument("--consumption-floor", type=float, default=None)
     parser.add_argument(
         "--node-accounting-mode",
         choices=["auto", "legacy_recompute", "economic_node_ledger"],
@@ -703,6 +704,7 @@ def configure_hyperparams(args: argparse.Namespace):
         ("entry_inference_chunk_size", "entry_inference_chunk_size", int),
         ("entry_rng_seed", "entry_rng_seed", int),
         ("consumption_aggregation_mode", "consumption_aggregation_mode", str),
+        ("consumption_floor", "consumption_floor", float),
         ("node_accounting_mode", "node_accounting_mode", str),
     ):
         value = getattr(args, arg_name)
@@ -746,6 +748,8 @@ def configure_hyperparams(args: argparse.Namespace):
         raise ValueError("entry_cost_max must be positive")
     if hyperparams.entry_inference_chunk_size <= 0:
         raise ValueError("entry_inference_chunk_size must be positive")
+    if not np.isfinite(hyperparams.consumption_floor) or hyperparams.consumption_floor < 0.0:
+        raise ValueError("consumption_floor must be finite and nonnegative")
     if str(hyperparams.node_accounting_mode).lower() not in {
         "auto", "legacy_recompute", "economic_node_ledger"
     }:
@@ -1222,6 +1226,7 @@ def main():
                 "entry_inference_chunk_size": hyperparams.entry_inference_chunk_size,
                 "entry_rng_seed": hyperparams.entry_rng_seed,
                 "consumption_aggregation_mode": hyperparams.consumption_aggregation_mode,
+                "consumption_floor": hyperparams.consumption_floor,
                 "node_accounting_mode": hyperparams.node_accounting_mode,
             },
             sort_keys=True,
@@ -1390,6 +1395,7 @@ def main():
                     "entry_inference_chunk_size": hyperparams.entry_inference_chunk_size,
                     "entry_rng_seed": hyperparams.entry_rng_seed,
                     "consumption_aggregation_mode": hyperparams.consumption_aggregation_mode,
+                    "consumption_floor": hyperparams.consumption_floor,
                     "node_accounting_mode": hyperparams.node_accounting_mode,
                 },
             }

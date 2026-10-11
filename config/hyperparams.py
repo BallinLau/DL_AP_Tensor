@@ -235,6 +235,9 @@ class HyperParams:
     entry_inference_chunk_size: int = 65536
     entry_rng_seed: int = 86420
     consumption_aggregation_mode: str = "legacy_per_firm_clamp"
+    # Optional floor used only for macro-state transforms.  C_raw remains the
+    # exact resource-accounting quantity so floor usage stays observable.
+    consumption_floor: float = 0.0
     # ``auto`` resolves to historical survivor-view recomputation for legacy
     # entry and to the authoritative economic-node ledger for either economic
     # entry experiment.
