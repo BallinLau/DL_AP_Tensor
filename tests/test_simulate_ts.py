@@ -129,6 +129,67 @@ def test_parallel_simulation_branches_share_parent_eta_leverage(monkeypatch):
     assert not torch.equal(branches[0]["eta"], branches[1]["eta"])
 
 
+def test_parallel_simulation_stops_when_any_path_has_no_surviving_firms(monkeypatch):
+    device = torch.device("cpu")
+    sim = SimpleNamespace(
+        device=device,
+        n_paths=2,
+        group_size=1,
+        horizon=5,
+        branch_num=1,
+        main_branch=0,
+        enable_entry=False,
+        enable_exit=True,
+        entry_mode="investment_compare",
+        FIRM_COLUMNS=["value"],
+        MACRO_COLUMNS=["value"],
+        _max_firms_observed=1,
+    )
+    process_calls = []
+
+    monkeypatch.setattr(
+        simulate_ts_parallel,
+        "_initialize_batched_state",
+        lambda _sim, _max_firms: {
+            "alive": torch.ones(2, 1, dtype=torch.bool, device=device)
+        },
+    )
+
+    def fake_process(_sim, _state, t, branch_k):
+        process_calls.append((t, branch_k))
+        row = torch.tensor([[float(t)]], device=device)
+        return row, row.clone()
+
+    monkeypatch.setattr(simulate_ts_parallel, "_process_node_batched", fake_process)
+    monkeypatch.setattr(
+        simulate_ts_parallel,
+        "_expand_branches_batched",
+        lambda _sim, state, child_t: [{"alive": state["alive"].clone()}],
+    )
+    monkeypatch.setattr(
+        simulate_ts_parallel,
+        "_annotate_parent_next_leverage_rows",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def make_first_path_extinct(state):
+        state["alive"][0] = False
+        return state
+
+    monkeypatch.setattr(
+        simulate_ts_parallel, "_apply_exit_batched", make_first_path_extinct
+    )
+
+    output = simulate_ts_parallel.simulate_tensor_parallel(sim)
+
+    assert process_calls == [(0, -1), (1, 0)]
+    assert output.meta["completed_parent_steps"] == 1
+    assert output.meta["stopped_early"] is True
+    assert output.meta["stop_reason"] == "no_surviving_firms"
+    assert output.meta["stop_time"] == 1
+    assert output.meta["extinct_paths"] == [0]
+
+
 def test_sample_update_child_leverage_uses_parent_eta():
     sample = Sample(models={}, n_samples=0, n_paths=0)
     df = pd.DataFrame(

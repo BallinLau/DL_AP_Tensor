@@ -185,11 +185,16 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
 
     firm_rows: List[torch.Tensor] = []
     macro_rows: List[torch.Tensor] = []
+    stopped_early = False
+    stop_time = None
+    extinct_paths: List[int] = []
+    completed_parent_steps = 0
 
     for t in tqdm(range(sim.horizon), desc="Simulating steps (tensor)"):
         parent_firm, parent_macro = _process_node_batched(sim, state, t, branch_k=-1)
         firm_rows.append(parent_firm)
         macro_rows.append(parent_macro)
+        completed_parent_steps += 1
 
         branch_states = _expand_branches_batched(sim, state, child_t=t + 1)
         _annotate_parent_next_leverage_rows(
@@ -207,6 +212,20 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
         state = branch_states[sim.main_branch]
         if sim.enable_exit:
             state = _apply_exit_batched(state)
+            extinct = torch.nonzero(
+                ~state["alive"].any(dim=1), as_tuple=False
+            ).reshape(-1)
+            if extinct.numel() > 0:
+                stopped_early = True
+                stop_time = t + 1
+                extinct_paths = [
+                    int(path) for path in extinct.detach().cpu().tolist()
+                ]
+                print(
+                    "Stopping simulation early: no surviving firms remain in "
+                    f"paths={extinct_paths[:20]} at t={stop_time}."
+                )
+                break
 
     firm_tensor = cat_rows(firm_rows, len(sim.FIRM_COLUMNS), device)
     macro_tensor = cat_rows(macro_rows, len(sim.MACRO_COLUMNS), device)
@@ -221,6 +240,11 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
             "max_firms_initial": max_firms,
             "max_firms": int(sim._max_firms_observed),
             "firm_id_float32_exact_guard": int(2 ** 24),
+            "completed_parent_steps": completed_parent_steps,
+            "stopped_early": stopped_early,
+            "stop_reason": "no_surviving_firms" if stopped_early else None,
+            "stop_time": stop_time,
+            "extinct_paths": extinct_paths,
         },
     )
 
