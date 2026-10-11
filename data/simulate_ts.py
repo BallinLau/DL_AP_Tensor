@@ -51,7 +51,8 @@ class SimulateTS:
         'initial_cohort', 'birth_time', 'entry_cost', 'K_birth',
         'entry_P0', 'entry_PI', 'entry_value_gap',
         'economic_node_id', 'node_view', 'accounting_stage',
-        'eps_z_transition', 'u_eta_transition', 'u_i_transition'
+        'eps_z_transition', 'u_eta_transition', 'u_i_transition',
+        'birth_at_node', 'maintenance_eligible', 'I_maintenance'
     ]
     MACRO_COLUMNS = [
         'path', 't', 'branch', 'K', 'C', 'LnK', 'Hatc',
@@ -79,7 +80,10 @@ class SimulateTS:
         'decomposition_start_stage', 'decomposition_end_stage',
         'decomposition_start_node_id', 'decomposition_end_node_id',
         'decomposition_transition_valid', 'entry_capital_event_residual',
-        'eps_x_transition'
+        'eps_x_transition',
+        'K_maintenance_base', 'K_birth_current_node',
+        'I_maintenance', 'I_maintenance_rebuilt',
+        'maintenance_accounting_residual', 'birth_maintenance_exemption'
     ]
 
     def __init__(
@@ -662,7 +666,15 @@ class SimulateTS:
             'transition_u_i', torch.full_like(state['b'], float("nan"))
         )[alive_idx]
 
-        Y, I, Phi, C = self._resource_accounting(K, z, x_scalar, bar_i, bar_z, i)
+        Y, I, Phi, C, I_maintenance = self._resource_accounting(
+            K,
+            z,
+            x_scalar,
+            bar_i,
+            bar_z,
+            i,
+            return_maintenance=True,
+        )
 
         firm_rows = torch.stack(
             [
@@ -711,6 +723,9 @@ class SimulateTS:
                 transition_eps_z,
                 transition_u_eta,
                 transition_u_i,
+                torch.zeros_like(K),
+                torch.ones_like(K),
+                I_maintenance,
             ],
             dim=1
         ).to(torch.float32)
@@ -748,6 +763,12 @@ class SimulateTS:
                 ),
             ],
             dim=1,
+        )
+        macro_columns = {name: idx for idx, name in enumerate(self.MACRO_COLUMNS)}
+        macro_row[0, macro_columns['K_maintenance_base']] = K_total
+        macro_row[0, macro_columns['I_maintenance']] = I_maintenance.sum()
+        macro_row[0, macro_columns['I_maintenance_rebuilt']] = (
+            I_maintenance.sum()
         )
 
         full_bar_i = torch.zeros_like(state['b'])
@@ -872,8 +893,14 @@ class SimulateTS:
         b_next_policy = torch.full_like(b, float("nan"))
         
         # 资源核算
-        Y, I, Phi, C = self._resource_accounting(
-            K, z, state['x'], output.bar_i.squeeze(), output.bar_z.squeeze(), i
+        Y, I, Phi, C, I_maintenance = self._resource_accounting(
+            K,
+            z,
+            state['x'],
+            output.bar_i.squeeze(),
+            output.bar_z.squeeze(),
+            i,
+            return_maintenance=True,
         )
         
         # 记录公司数据
@@ -911,7 +938,10 @@ class SimulateTS:
                 'Y': Y[j].item(),
                 'I': I[j].item(),
                 'Phi': Phi[j].item(),
-                'C': C[j].item()
+                'C': C[j].item(),
+                'birth_at_node': 0.0,
+                'maintenance_eligible': 1.0,
+                'I_maintenance': I_maintenance[j].item(),
             }
             firm_data.append(row)
         
@@ -930,7 +960,13 @@ class SimulateTS:
             'M': state.get('M'),
             'x': state['x'],
             'hatcf': state['hatcf'],
-            'lnkf': state['lnkf']
+            'lnkf': state['lnkf'],
+            'K_maintenance_base': K_total,
+            'K_birth_current_node': 0.0,
+            'I_maintenance': I_maintenance.sum().item(),
+            'I_maintenance_rebuilt': I_maintenance.sum().item(),
+            'maintenance_accounting_residual': 0.0,
+            'birth_maintenance_exemption': 0.0,
         }
         state['hatc_cal'] = macro_row['Hatc']
         state['lnk_cal'] = macro_row['LnK']
@@ -1037,23 +1073,38 @@ class SimulateTS:
         x,
         bar_i: torch.Tensor,
         bar_z: torch.Tensor,
-        i: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        i: torch.Tensor,
+        maintenance_eligible: Optional[torch.Tensor] = None,
+        return_maintenance: bool = False,
+    ):
         """
         资源核算
         
         Y = exp(x+z) * K
         Φ = (1-PHI) * (1 + exp(x+z)) * K * bar_z
-        I = bar_i * K * i - bar_z * K + δ * K
+        I = bar_i * K * i - bar_z * K + δ * K * maintenance_eligible
         C = Y - I - Φ
         """
         x_tensor = x if torch.is_tensor(x) else torch.tensor(x, device=K.device)
+        if maintenance_eligible is None:
+            maintenance_eligible = torch.ones_like(K, dtype=torch.bool)
+        if maintenance_eligible.shape != K.shape:
+            raise ValueError(
+                "maintenance_eligible must have the same shape as K"
+            )
+        if maintenance_eligible.dtype != torch.bool:
+            raise TypeError("maintenance_eligible must be a boolean tensor")
         
         Y = torch.exp(x_tensor + z) * K
         Phi = (1 - self.phi) * (1 + torch.exp(x_tensor + z)) * K * bar_z
-        I = bar_i * K * i - bar_z * K + self.delta * K
+        I_maintenance = (
+            self.delta * K * maintenance_eligible.to(dtype=K.dtype)
+        )
+        I = bar_i * K * i - bar_z * K + I_maintenance
         C = Y - I - Phi
-        
+
+        if return_maintenance:
+            return Y, I, Phi, C, I_maintenance
         return Y, I, Phi, C
 
     def _expand_branches_tensor(self, state: Dict) -> List[Dict]:

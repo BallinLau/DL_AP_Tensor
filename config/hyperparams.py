@@ -227,6 +227,7 @@ class HyperParams:
     # b=0, eta=0 and i=the entrant's creation cost.
     entry_mode: str = "legacy"
     entry_spec_version: str = "value_cost_v1"
+    resource_accounting_version: str = "all_participating_firm_maintenance_v1"
     entry_capital_ratio: float = 0.10
     entry_size_ratio: float = 0.10
     entry_cost_max: float = 1.0

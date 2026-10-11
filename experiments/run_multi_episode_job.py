@@ -725,6 +725,11 @@ def configure_hyperparams(args: argparse.Namespace):
             )
         hyperparams.entry_spec_version = INVESTMENT_COMPARE_SPEC_VERSION
         hyperparams.entry_cost_max = resolved_i_max
+    from data.entry import resource_accounting_metadata
+
+    hyperparams.resource_accounting_version = resource_accounting_metadata(
+        hyperparams.entry_mode
+    )["resource_accounting_version"]
     if (
         hyperparams.entry_mode in {"value_cost", "investment_compare"}
         and hyperparams.consumption_aggregation_mode != "raw"
@@ -1209,6 +1214,7 @@ def main():
             {
                 "entry_mode": hyperparams.entry_mode,
                 "entry_spec_version": hyperparams.entry_spec_version,
+                "resource_accounting_version": hyperparams.resource_accounting_version,
                 "entry_capital_ratio": hyperparams.entry_capital_ratio,
                 "entry_size_ratio": hyperparams.entry_size_ratio,
                 "entry_cost_max": hyperparams.entry_cost_max,
@@ -1376,6 +1382,7 @@ def main():
                     "max_firm_train_units": hyperparams.max_firm_train_units,
                     "entry_mode": hyperparams.entry_mode,
                     "entry_spec_version": hyperparams.entry_spec_version,
+                    "resource_accounting_version": hyperparams.resource_accounting_version,
                     "entry_capital_ratio": hyperparams.entry_capital_ratio,
                     "entry_size_ratio": hyperparams.entry_size_ratio,
                     "entry_cost_max": hyperparams.entry_cost_max,

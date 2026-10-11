@@ -455,6 +455,7 @@ def test_entry_fingerprint_is_configuration_sensitive():
     episode.hyperparams = SimpleNamespace(
         entry_mode="value_cost",
         entry_spec_version="value_cost_v1",
+        resource_accounting_version="all_participating_firm_maintenance_v1",
         entry_capital_ratio=0.1,
         entry_size_ratio=0.1,
         entry_cost_max=1.0,
@@ -464,6 +465,12 @@ def test_entry_fingerprint_is_configuration_sensitive():
     )
     cache_hash_before = episode._pq_grid_config_hash()
     episode.hyperparams.entry_cost_max = 2.0
+    assert episode._pq_grid_config_hash() != cache_hash_before
+    episode.hyperparams.entry_cost_max = 1.0
+    cache_hash_before = episode._pq_grid_config_hash()
+    episode.hyperparams.resource_accounting_version = (
+        "investment_compare_incumbent_maintenance_v1"
+    )
     assert episode._pq_grid_config_hash() != cache_hash_before
 
 

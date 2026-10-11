@@ -20,6 +20,25 @@ from .simulation_forward import forward_policy_value_for_simulation
 
 ENTRY_SPEC_VERSION = "value_cost_v1"
 INVESTMENT_COMPARE_SPEC_VERSION = "investment_compare_v1"
+ALL_FIRM_MAINTENANCE_VERSION = "all_participating_firm_maintenance_v1"
+INVESTMENT_COMPARE_MAINTENANCE_VERSION = (
+    "investment_compare_incumbent_maintenance_v1"
+)
+
+
+def resource_accounting_metadata(entry_mode: str) -> Dict[str, Any]:
+    """Return the immutable maintenance semantics for an entry mode."""
+    if str(entry_mode) == "investment_compare":
+        return {
+            "resource_accounting_version": INVESTMENT_COMPARE_MAINTENANCE_VERSION,
+            "maintenance_basis": "incumbent_capital_only",
+            "birth_maintenance_exempt": True,
+        }
+    return {
+        "resource_accounting_version": ALL_FIRM_MAINTENANCE_VERSION,
+        "maintenance_basis": "all_participating_firm_capital",
+        "birth_maintenance_exempt": False,
+    }
 
 
 class EntryEconomicInfeasibilityError(RuntimeError):
@@ -76,6 +95,7 @@ def entry_configuration_snapshot(
             "g": float(economic_config.G),
         },
     }
+    snapshot.update(resource_accounting_metadata(entry_mode))
     if str(entry_mode) == "investment_compare":
         snapshot.update(
             {
@@ -95,6 +115,39 @@ def entry_configuration_snapshot(
 def entry_configuration_fingerprint(snapshot: Dict[str, Any]) -> str:
     payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def identify_birth_at_node(
+    initial_cohort: torch.Tensor,
+    birth_time: torch.Tensor,
+    economic_time: torch.Tensor,
+    path_index: torch.Tensor,
+) -> torch.Tensor:
+    """Identify current-node births without relying on transient entry flags."""
+    firm_vectors = (initial_cohort, birth_time, path_index)
+    if any(value.ndim != 1 for value in firm_vectors):
+        raise ValueError("birth provenance firm inputs must be one-dimensional")
+    if len({int(value.numel()) for value in firm_vectors}) != 1:
+        raise ValueError("birth provenance firm inputs must have matching lengths")
+    if economic_time.ndim != 1:
+        raise ValueError("economic_time must be one-dimensional")
+    if path_index.dtype not in {
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }:
+        raise TypeError("path_index must be an integer tensor")
+    if path_index.numel() and (
+        bool((path_index < 0).any())
+        or bool((path_index >= economic_time.numel()).any())
+    ):
+        raise ValueError("path_index is outside economic_time")
+    return (
+        (initial_cohort < 0.5)
+        & (birth_time == economic_time[path_index].to(birth_time.dtype))
+    )
 
 
 @dataclass(frozen=True)
@@ -544,6 +597,15 @@ def validate_node_resource_account(
     I_entry_ledger: torch.Tensor,
     C_reported: torch.Tensor,
     mode: str,
+    bar_i_executed: Optional[torch.Tensor] = None,
+    bar_z: Optional[torch.Tensor] = None,
+    investment_cost: Optional[torch.Tensor] = None,
+    initial_cohort: Optional[torch.Tensor] = None,
+    birth_time: Optional[torch.Tensor] = None,
+    economic_time: Optional[torch.Tensor] = None,
+    delta: Optional[float] = None,
+    maintenance_reported: Optional[torch.Tensor] = None,
+    birth_maintenance_exempt: bool = False,
     atol: float = 1e-6,
     rtol: float = 1e-5,
     strict: bool = False,
@@ -569,7 +631,96 @@ def validate_node_resource_account(
 
     dtype = C_reported.dtype
     device = C_reported.device
-    operating_detail = Y - I_oper - Phi
+    maintenance_inputs = (
+        bar_i_executed,
+        bar_z,
+        investment_cost,
+        initial_cohort,
+        birth_time,
+        economic_time,
+        maintenance_reported,
+    )
+    maintenance_validation_enabled = any(
+        value is not None for value in maintenance_inputs
+    ) or delta is not None
+    if maintenance_validation_enabled and (
+        any(value is None for value in maintenance_inputs) or delta is None
+    ):
+        raise ValueError(
+            "independent maintenance validation requires bar_i_executed, bar_z, "
+            "investment_cost, initial_cohort, birth_time, economic_time, delta, "
+            "and maintenance_reported"
+        )
+
+    zero_by_path = torch.zeros(n_paths, device=device, dtype=dtype)
+    if maintenance_validation_enabled:
+        firm_vectors = (
+            bar_i_executed,
+            bar_z,
+            investment_cost,
+            initial_cohort,
+            birth_time,
+            maintenance_reported,
+        )
+        if any(value.ndim != 1 for value in firm_vectors):
+            raise ValueError("maintenance detail inputs must be one-dimensional")
+        if any(int(value.numel()) != int(Y.numel()) for value in firm_vectors):
+            raise ValueError("maintenance detail inputs must match firm detail length")
+        if economic_time.ndim != 1 or economic_time.shape != (n_paths,):
+            raise ValueError("economic_time must contain one value per path")
+        birth_at_node = identify_birth_at_node(
+            initial_cohort,
+            birth_time,
+            economic_time,
+            path_index,
+        )
+        maintenance_eligible = (
+            ~birth_at_node
+            if bool(birth_maintenance_exempt)
+            else torch.ones_like(birth_at_node)
+        )
+        maintenance_rebuilt_detail = (
+            float(delta)
+            * K_current
+            * maintenance_eligible.to(K_current.dtype)
+        )
+        I_oper_rebuilt_detail = (
+            bar_i_executed * K_current * investment_cost
+            - bar_z * K_current
+            + maintenance_rebuilt_detail
+        )
+        operating_detail = Y - I_oper_rebuilt_detail - Phi
+        I_maintenance_reported = zero_by_path.clone()
+        I_maintenance_rebuilt = zero_by_path.clone()
+        K_maintenance_base = zero_by_path.clone()
+        K_birth_current_node = zero_by_path.clone()
+        I_oper_reported_total = zero_by_path.clone()
+        I_oper_rebuilt_total = zero_by_path.clone()
+        I_maintenance_reported.index_add_(0, path_index, maintenance_reported)
+        I_maintenance_rebuilt.index_add_(
+            0, path_index, maintenance_rebuilt_detail
+        )
+        K_maintenance_base.index_add_(
+            0,
+            path_index,
+            K_current * maintenance_eligible.to(K_current.dtype),
+        )
+        K_birth_current_node.index_add_(
+            0, path_index, K_current * birth_at_node.to(K_current.dtype)
+        )
+        I_oper_reported_total.index_add_(0, path_index, I_oper)
+        I_oper_rebuilt_total.index_add_(0, path_index, I_oper_rebuilt_detail)
+    else:
+        birth_at_node = birth_mask
+        maintenance_eligible = torch.ones_like(birth_mask)
+        maintenance_rebuilt_detail = torch.zeros_like(K_current)
+        operating_detail = Y - I_oper - Phi
+        I_maintenance_reported = zero_by_path.clone()
+        I_maintenance_rebuilt = zero_by_path.clone()
+        K_maintenance_base = zero_by_path.clone()
+        K_birth_current_node = zero_by_path.clone()
+        I_oper_reported_total = zero_by_path.clone()
+        I_oper_rebuilt_total = zero_by_path.clone()
     operating_used = (
         operating_detail.clamp_min(0.0)
         if mode == "legacy_per_firm_clamp"
@@ -589,10 +740,20 @@ def validate_node_resource_account(
     C_rebuilt = C_oper_rebuilt - I_entry_rebuilt
     entry_spend_residual = I_entry_ledger - I_entry_rebuilt
     resource_residual = C_reported - C_rebuilt
+    maintenance_residual = I_maintenance_reported - I_maintenance_rebuilt
+    I_oper_residual = I_oper_reported_total - I_oper_rebuilt_total
     entry_scale = torch.maximum(I_entry_ledger.abs(), I_entry_rebuilt.abs())
     resource_scale = torch.maximum(C_reported.abs(), C_rebuilt.abs())
     entry_tolerance = float(atol) + float(rtol) * entry_scale
     resource_tolerance = float(atol) + float(rtol) * resource_scale
+    maintenance_scale = torch.maximum(
+        I_maintenance_reported.abs(), I_maintenance_rebuilt.abs()
+    )
+    maintenance_tolerance = float(atol) + float(rtol) * maintenance_scale
+    I_oper_scale = torch.maximum(
+        I_oper_reported_total.abs(), I_oper_rebuilt_total.abs()
+    )
+    I_oper_tolerance = float(atol) + float(rtol) * I_oper_scale
     finite_detail = (
         torch.isfinite(Y)
         & torch.isfinite(I_oper)
@@ -601,6 +762,16 @@ def validate_node_resource_account(
         & torch.isfinite(K_birth)
         & torch.isfinite(K_current)
     )
+    if maintenance_validation_enabled:
+        finite_detail = (
+            finite_detail
+            & torch.isfinite(bar_i_executed)
+            & torch.isfinite(bar_z)
+            & torch.isfinite(investment_cost)
+            & torch.isfinite(initial_cohort)
+            & torch.isfinite(birth_time)
+            & torch.isfinite(maintenance_reported)
+        )
     finite_by_path = torch.ones(n_paths, device=device, dtype=torch.bool)
     if finite_detail.numel():
         bad_paths = path_index[~finite_detail]
@@ -611,12 +782,18 @@ def validate_node_resource_account(
         & torch.isfinite(I_entry_rebuilt)
         & torch.isfinite(C_reported)
         & torch.isfinite(C_rebuilt)
+        & torch.isfinite(I_maintenance_reported)
+        & torch.isfinite(I_maintenance_rebuilt)
+        & torch.isfinite(I_oper_reported_total)
+        & torch.isfinite(I_oper_rebuilt_total)
         & finite_by_path
     )
     accounting_valid = (
         finite_totals
         & (entry_spend_residual.abs() <= entry_tolerance)
         & (resource_residual.abs() <= resource_tolerance)
+        & (maintenance_residual.abs() <= maintenance_tolerance)
+        & (I_oper_residual.abs() <= I_oper_tolerance)
     )
     resource_feasible = finite_totals & (C_reported > 0.0)
     result = {
@@ -627,6 +804,18 @@ def validate_node_resource_account(
         "legacy_clamp_adjustment": C_oper_rebuilt - C_oper_raw_rebuilt,
         "C_rebuilt": C_rebuilt,
         "resource_accounting_residual": resource_residual,
+        "I_maintenance_reported": I_maintenance_reported,
+        "I_maintenance_rebuilt": I_maintenance_rebuilt,
+        "maintenance_accounting_residual": maintenance_residual,
+        "I_oper_rebuilt": I_oper_rebuilt_total,
+        "I_oper_accounting_residual": I_oper_residual,
+        "K_maintenance_base": K_maintenance_base,
+        "K_birth_current_node": K_birth_current_node,
+        "birth_maintenance_exemption": (
+            float(delta) * K_birth_current_node
+            if maintenance_validation_enabled and birth_maintenance_exempt
+            else zero_by_path.clone()
+        ),
         "accounting_valid": accounting_valid,
         "resource_feasible": resource_feasible,
     }

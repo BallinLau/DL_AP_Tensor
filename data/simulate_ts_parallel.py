@@ -15,6 +15,7 @@ from .entry import (
     draw_value_cost_candidates,
     evaluate_entry_cutoff,
     evaluate_investment_compare_entry,
+    identify_birth_at_node,
     summarize_candidate_values,
     validate_node_resource_account,
 )
@@ -331,6 +332,17 @@ def _initialize_batched_state(sim, max_firms: int) -> Dict[str, torch.Tensor]:
 
 
 def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    if getattr(sim, "entry_mode", "legacy") == "investment_compare":
+        missing = [
+            name
+            for name in ("initial_cohort", "birth_time", "economic_time")
+            if name not in state
+        ]
+        if missing:
+            raise RuntimeError(
+                "investment_compare maintenance accounting requires explicit "
+                f"birth provenance fields: missing={missing}"
+            )
     _ensure_entry_state_fields(state)
     device = sim.device
     n_paths, n_firms = state["b"].shape
@@ -419,14 +431,20 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         bpI = b.clone()
         bp = b.clone()
 
-    birth_node_mask = (
-        (getattr(sim, "entry_mode", "legacy") == "investment_compare")
-        & (entry > 0.5)
-        & (initial_cohort < 0.5)
-        & (
-            birth_time
-            == state["economic_time"][path_idx].to(dtype=birth_time.dtype)
-        )
+    birth_at_node = identify_birth_at_node(
+        initial_cohort,
+        birth_time,
+        state["economic_time"],
+        path_idx,
+    )
+    investment_compare = (
+        getattr(sim, "entry_mode", "legacy") == "investment_compare"
+    )
+    birth_node_mask = investment_compare & birth_at_node
+    maintenance_eligible = (
+        ~birth_at_node
+        if investment_compare
+        else torch.ones_like(birth_at_node)
     )
     bar_i_executed = torch.where(
         birth_node_mask, torch.zeros_like(bar_i_model), bar_i_model
@@ -440,12 +458,31 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     b_next_pi = torch.full_like(b, float("nan"))
     b_next_policy = torch.full_like(b, float("nan"))
 
-    Y, I, Phi, C = sim._resource_accounting(K, z, x, bar_i, bar_z, i)
+    Y, I, Phi, C, I_maintenance = sim._resource_accounting(
+        K,
+        z,
+        x,
+        bar_i,
+        bar_z,
+        i,
+        maintenance_eligible=maintenance_eligible,
+        return_maintenance=True,
+    )
 
     K_total_computed = torch.zeros(n_paths, device=device)
     I_oper_computed = torch.zeros(n_paths, device=device)
+    K_maintenance_base_computed = torch.zeros(n_paths, device=device)
+    K_birth_current_node_computed = torch.zeros(n_paths, device=device)
+    I_maintenance_computed = torch.zeros(n_paths, device=device)
     K_total_computed.index_add_(0, path_idx, K)
     I_oper_computed.index_add_(0, path_idx, I)
+    K_maintenance_base_computed.index_add_(
+        0, path_idx, K * maintenance_eligible.to(K.dtype)
+    )
+    K_birth_current_node_computed.index_add_(
+        0, path_idx, K * birth_at_node.to(K.dtype)
+    )
+    I_maintenance_computed.index_add_(0, path_idx, I_maintenance)
     I_entry_event = state.get("event_I_entry", torch.zeros(n_paths, device=device))
     resources = aggregate_node_resources(
         C,
@@ -479,17 +516,21 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         LnK = state["accounting_LnK"]
         Hatc = state["accounting_Hatc"]
         n_firms_accounted = state["accounting_n_firms"]
+        K_maintenance_base = state["accounting_K_maintenance_base"]
+        K_birth_current_node = state["accounting_K_birth_current_node"]
+        I_maintenance_total = state["accounting_I_maintenance"]
+        I_maintenance_rebuilt = state["accounting_I_maintenance_rebuilt"]
+        maintenance_residual = state["accounting_maintenance_residual"]
+        birth_maintenance_exemption = state[
+            "accounting_birth_maintenance_exemption"
+        ]
     else:
         K_total = K_total_computed
         C_total = resources["C_raw"]
         C_oper_total = resources["C_oper"]
         I_oper_total = I_oper_computed
         I_entry_total = resources["I_entry"]
-        birth_mask = (
-            (entry > 0.5)
-            & (birth_time == state["economic_time"][path_idx].to(birth_time.dtype))
-            & (initial_cohort < 0.5)
-        )
+        birth_mask = birth_at_node
         validation = validate_node_resource_account(
             Y=Y,
             I_oper=I,
@@ -503,6 +544,15 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             I_entry_ledger=I_entry_total,
             C_reported=C_total,
             mode=getattr(sim, "consumption_aggregation_mode", "legacy_per_firm_clamp"),
+            bar_i_executed=bar_i,
+            bar_z=bar_z,
+            investment_cost=i,
+            initial_cohort=initial_cohort,
+            birth_time=birth_time,
+            economic_time=state["economic_time"],
+            delta=float(sim.delta),
+            maintenance_reported=I_maintenance,
+            birth_maintenance_exempt=investment_compare,
         )
         I_entry_rebuilt = validation["I_entry_rebuilt"]
         entry_spend_residual = validation["entry_spend_residual"]
@@ -510,6 +560,14 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         legacy_clamp_adjustment = validation["legacy_clamp_adjustment"]
         resource_residual = validation["resource_accounting_residual"]
         resource_feasible = validation["resource_feasible"]
+        K_maintenance_base = K_maintenance_base_computed
+        K_birth_current_node = K_birth_current_node_computed
+        I_maintenance_total = I_maintenance_computed
+        I_maintenance_rebuilt = validation["I_maintenance_rebuilt"]
+        maintenance_residual = validation["maintenance_accounting_residual"]
+        birth_maintenance_exemption = validation[
+            "birth_maintenance_exemption"
+        ]
         if not bool(validation["accounting_valid"].all()):
             bad = torch.nonzero(
                 ~validation["accounting_valid"], as_tuple=False
@@ -524,6 +582,10 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             raise EntryEconomicInfeasibilityError(
                 "raw node resource account is infeasible or non-finite (C_raw<=0); "
                 f"t={t}, branch={branch_k}, paths={bad[:20]}, "
+                f"C_oper={[float(C_oper_total[index]) for index in bad[:20]]}, "
+                f"I_entry={[float(I_entry_total[index]) for index in bad[:20]]}, "
+                f"C_raw={[float(C_total[index]) for index in bad[:20]]}, "
+                f"accepted_count={[float(state.get('event_accepted_count', torch.zeros(n_paths, device=device))[index]) for index in bad[:20]]}, "
                 "no positive floor was applied"
             )
         alive_any = n_alive_per_path > 0
@@ -561,6 +623,16 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             state["accounting_LnK"] = LnK.detach()
             state["accounting_Hatc"] = Hatc.detach()
             state["accounting_n_firms"] = n_firms_accounted.detach()
+            state["accounting_K_maintenance_base"] = K_maintenance_base.detach()
+            state["accounting_K_birth_current_node"] = K_birth_current_node.detach()
+            state["accounting_I_maintenance"] = I_maintenance_total.detach()
+            state["accounting_I_maintenance_rebuilt"] = (
+                I_maintenance_rebuilt.detach()
+            )
+            state["accounting_maintenance_residual"] = maintenance_residual.detach()
+            state["accounting_birth_maintenance_exemption"] = (
+                birth_maintenance_exemption.detach()
+            )
     state["hatc_cal"] = Hatc.detach()
     state["lnk_cal"] = LnK.detach()
 
@@ -751,6 +823,9 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             state["transition_eps_z"].reshape(-1)[alive_flat],
             state["transition_u_eta"].reshape(-1)[alive_flat],
             state["transition_u_i"].reshape(-1)[alive_flat],
+            birth_at_node.to(torch.float32),
+            maintenance_eligible.to(torch.float32),
+            I_maintenance,
         ],
         dim=1,
     ).to(torch.float32)
@@ -873,6 +948,12 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             decomposition_transition_valid.to(torch.float32),
             entry_capital_event_residual,
             state["transition_eps_x"],
+            K_maintenance_base,
+            K_birth_current_node,
+            I_maintenance_total,
+            I_maintenance_rebuilt,
+            maintenance_residual,
+            birth_maintenance_exemption,
         ],
         dim=1,
     ).to(torch.float32)

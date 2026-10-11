@@ -10,6 +10,7 @@ The version identifier is:
 
 ```text
 entry_spec_version=investment_compare_v1
+resource_accounting_version=investment_compare_incumbent_maintenance_v1
 ```
 
 `legacy` and `value_cost` remain available with their historical behavior.
@@ -74,8 +75,33 @@ C_reported = sum(C_operating) - I_entry
 ```
 
 The birth-node ordinary expansion contribution is zero because
-`bar_i_executed=0`. Existing economic-node ledger, independent reconstruction,
-resource feasibility and capital decomposition checks remain active.
+`bar_i_executed=0`. In addition, maintenance is charged only to capital that
+already existed before the current economic node:
+
+```text
+birth_at_node = (not initial_cohort) and (birth_time == economic_time)
+maintenance_eligible = not birth_at_node
+I_maintenance = delta * K * maintenance_eligible
+```
+
+Creation spending remains `entry_cost * K_birth`; the birth node does not add a
+second `delta * K_birth` goods expenditure. The same exemption is reused when a
+child is shown as the promoted-parent view of that economic node. At the next
+true economic period, `economic_time > birth_time`, so ordinary maintenance is
+restored using the firm's actual current capital. Initial-cohort firms and
+incumbents that default or exit at the end of the current node remain in the
+maintenance base.
+
+This change does not defer birth production, change default/liquidation or
+`Phi`, alter the entry value comparison, or remove maintenance from any value
+function. It is a local simulation resource-accounting timing rule, not a
+complete implementation of every Gomes entry-timing convention and not a
+numerical device for forcing aggregate consumption to be positive.
+
+The economic-node ledger stores the first full-node maintenance account and
+reuses it for the promoted-parent view. Independent validation reconstructs
+maintenance from `initial_cohort`, `birth_time`, `economic_time`, `K`, and
+`delta`; it also rebuilds firm operating investment and aggregate consumption.
 
 ## Diagnostics and provenance
 
@@ -87,16 +113,25 @@ Bar_i_executed
 entry_P0
 entry_PI
 entry_value_gap
+birth_at_node
+maintenance_eligible
+I_maintenance
 ```
 
 Macro output adds distribution summaries for `entry_P0`, `entry_PI`, and
 `entry_value_gap`. The old `entry_cutoff_*` fields remain specific to
 `value_cost_v1` and are not relabeled.
 
+Maintenance diagnostics include `K_maintenance_base`,
+`K_birth_current_node`, `I_maintenance`, `I_maintenance_rebuilt`,
+`maintenance_accounting_residual`, and `birth_maintenance_exemption`.
+
 Metadata records the criterion, birth state, ordinary-investment cost source,
-effective support, and the fact that birth extra expansion is disabled. These
-fields enter the existing entry configuration fingerprint and P/Q grid cache
-configuration hash.
+effective support, the fact that birth extra expansion is disabled, and the
+maintenance basis/version. These fields enter the existing entry configuration
+fingerprint and P/Q grid cache configuration hash. Checkpoint weights may be
+used as a warm start, but simulations generated under the previous all-capital
+maintenance account must be regenerated rather than treated as compatible.
 
 ## Short frozen-checkpoint smoke
 

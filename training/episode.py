@@ -8622,6 +8622,7 @@ class Episode:
             # compatible even when a tiny fixture happens to match exactly.
             "entry_mode",
             "entry_spec_version",
+            "resource_accounting_version",
             "entry_capital_ratio",
             "entry_size_ratio",
             "entry_cost_max",
