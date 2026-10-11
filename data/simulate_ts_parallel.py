@@ -188,6 +188,10 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
     stopped_early = False
     stop_time = None
     extinct_paths: List[int] = []
+    path_stop_times: List[int | None] = [None] * int(sim.n_paths)
+    known_extinct = torch.zeros(
+        int(sim.n_paths), dtype=torch.bool, device=device
+    )
     completed_parent_steps = 0
 
     for t in tqdm(range(sim.horizon), desc="Simulating steps (tensor)"):
@@ -212,18 +216,27 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
         state = branch_states[sim.main_branch]
         if sim.enable_exit:
             state = _apply_exit_batched(state)
-            extinct = torch.nonzero(
-                ~state["alive"].any(dim=1), as_tuple=False
-            ).reshape(-1)
+            active_after_exit = state["alive"].any(dim=1)
+            newly_extinct = ~active_after_exit & ~known_extinct
+            extinct = torch.nonzero(newly_extinct, as_tuple=False).reshape(-1)
             if extinct.numel() > 0:
-                stopped_early = True
-                stop_time = t + 1
-                extinct_paths = [
+                new_paths = [
                     int(path) for path in extinct.detach().cpu().tolist()
                 ]
+                for path in new_paths:
+                    path_stop_times[path] = int(t + 1)
+                extinct_paths.extend(new_paths)
+                known_extinct = known_extinct | ~active_after_exit
+                print(
+                    "Stopping extinct paths while continuing survivors: "
+                    f"paths={new_paths[:20]} at t={t + 1}."
+                )
+            if not bool(active_after_exit.any()):
+                stopped_early = True
+                stop_time = t + 1
                 print(
                     "Stopping simulation early: no surviving firms remain in "
-                    f"paths={extinct_paths[:20]} at t={stop_time}."
+                    f"any path at t={stop_time}."
                 )
                 break
 
@@ -245,6 +258,8 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
             "stop_reason": "no_surviving_firms" if stopped_early else None,
             "stop_time": stop_time,
             "extinct_paths": extinct_paths,
+            "n_extinct_paths": len(extinct_paths),
+            "path_stop_times": path_stop_times,
         },
     )
 
@@ -374,6 +389,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     alive_flat = alive.reshape(-1)
     alive_pos = torch.nonzero(alive_flat, as_tuple=False).squeeze(-1)
     n_alive_per_path = alive.sum(dim=1)
+    active_paths = n_alive_per_path > 0
 
     path_grid = torch.arange(n_paths, device=device, dtype=torch.long).unsqueeze(1).expand(n_paths, n_firms)
 
@@ -597,9 +613,10 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         birth_maintenance_exemption = validation[
             "birth_maintenance_exemption"
         ]
-        if not bool(validation["accounting_valid"].all()):
+        invalid_accounting = active_paths & ~validation["accounting_valid"]
+        if bool(invalid_accounting.any()):
             bad = torch.nonzero(
-                ~validation["accounting_valid"], as_tuple=False
+                invalid_accounting, as_tuple=False
             ).reshape(-1).tolist()
             raise EntryAccountingError(
                 "independent node resource reconstruction failed; "
@@ -612,9 +629,9 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             == "raw"
         )
         raw_finite = torch.isfinite(C_raw_total)
-        invalid = ~raw_finite
+        invalid = active_paths & ~raw_finite
         if raw_mode and consumption_floor <= 0.0:
-            invalid = invalid | (C_raw_total <= 0.0)
+            invalid = invalid | (active_paths & (C_raw_total <= 0.0))
         if raw_mode and bool(invalid.any()):
             bad = torch.nonzero(invalid, as_tuple=False).reshape(-1).tolist()
             raise EntryEconomicInfeasibilityError(
@@ -626,7 +643,6 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                 f"accepted_count={[float(state.get('event_accepted_count', torch.zeros(n_paths, device=device))[index]) for index in bad[:20]]}, "
                 "no positive floor was applied"
             )
-        alive_any = n_alive_per_path > 0
         if raw_mode and consumption_floor > 0.0:
             C_total = C_raw_total.clamp_min(consumption_floor)
             K_for_macro = K_total.clamp_min(consumption_floor)
@@ -642,13 +658,13 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                 n_paths, dtype=torch.bool, device=device
             )
             LnK = torch.where(
-                alive_any,
+                active_paths,
                 torch.log(K_total + 1e-8),
                 torch.full_like(K_total, float("nan")),
             )
             # Preserve the exact historical macro transform in legacy mode.
             Hatc = torch.where(
-                alive_any,
+                active_paths,
                 torch.log(C_total / (K_total + 1e-8) + 1e-5),
                 torch.full_like(C_total, -10.0),
             )
@@ -693,8 +709,16 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             state["accounting_consumption_floor_applied"] = (
                 consumption_floor_applied.detach()
             )
-    state["hatc_cal"] = Hatc.detach()
-    state["lnk_cal"] = LnK.detach()
+    state["hatc_cal"] = torch.where(
+        active_paths,
+        Hatc.detach(),
+        state.get("hatc_cal", Hatc.detach()),
+    )
+    state["lnk_cal"] = torch.where(
+        active_paths,
+        LnK.detach(),
+        state.get("lnk_cal", LnK.detach()),
+    )
 
     # Endpoint capital uses the post-default survivor set. Once a child node is
     # promoted to parent, its full-node account remains authoritative even
@@ -1022,6 +1046,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         ],
         dim=1,
     ).to(torch.float32)
+    macro_rows = macro_rows[active_paths]
 
     full_bar_i = torch.zeros_like(state["b"])
     full_bar_z = torch.zeros_like(state["b"])
@@ -1166,17 +1191,25 @@ def _expand_branches_batched(
                 "bar_i": state.get("bar_i", torch.zeros_like(state["b"])) .clone(),
                 "bar_z": state.get("bar_z", torch.zeros_like(state["b"])) .clone(),
                 "bp": state.get("bp", state["b"]).clone(),
-                "economic_node_id": torch.full(
-                    (state["b"].shape[0],),
-                    int(child_t * (sim.branch_num + 1) + branch_index + 1),
-                    dtype=torch.long,
-                    device=device,
+                "economic_node_id": torch.where(
+                    alive_any,
+                    torch.full(
+                        (state["b"].shape[0],),
+                        int(child_t * (sim.branch_num + 1) + branch_index + 1),
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                    state["economic_node_id"],
                 ),
-                "economic_time": torch.full(
-                    (state["b"].shape[0],),
-                    int(child_t),
-                    dtype=torch.long,
-                    device=device,
+                "economic_time": torch.where(
+                    alive_any,
+                    torch.full(
+                        (state["b"].shape[0],),
+                        int(child_t),
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                    state["economic_time"],
                 ),
                 "accounting_valid": torch.zeros(
                     state["b"].shape[0], dtype=torch.bool, device=device

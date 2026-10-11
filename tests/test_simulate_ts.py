@@ -129,7 +129,7 @@ def test_parallel_simulation_branches_share_parent_eta_leverage(monkeypatch):
     assert not torch.equal(branches[0]["eta"], branches[1]["eta"])
 
 
-def test_parallel_simulation_stops_when_any_path_has_no_surviving_firms(monkeypatch):
+def test_parallel_simulation_continues_after_one_path_becomes_extinct(monkeypatch):
     device = torch.device("cpu")
     sim = SimpleNamespace(
         device=device,
@@ -182,12 +182,109 @@ def test_parallel_simulation_stops_when_any_path_has_no_surviving_firms(monkeypa
 
     output = simulate_ts_parallel.simulate_tensor_parallel(sim)
 
+    assert process_calls == [
+        (0, -1), (1, 0),
+        (1, -1), (2, 0),
+        (2, -1), (3, 0),
+        (3, -1), (4, 0),
+        (4, -1), (5, 0),
+    ]
+    assert output.meta["completed_parent_steps"] == 5
+    assert output.meta["stopped_early"] is False
+    assert output.meta["stop_reason"] is None
+    assert output.meta["stop_time"] is None
+    assert output.meta["extinct_paths"] == [0]
+    assert output.meta["n_extinct_paths"] == 1
+    assert output.meta["path_stop_times"] == [1, None]
+
+
+def test_parallel_simulation_stops_only_when_all_paths_are_extinct(monkeypatch):
+    device = torch.device("cpu")
+    sim = SimpleNamespace(
+        device=device,
+        n_paths=2,
+        group_size=1,
+        horizon=5,
+        branch_num=1,
+        main_branch=0,
+        enable_entry=False,
+        enable_exit=True,
+        entry_mode="investment_compare",
+        FIRM_COLUMNS=["value"],
+        MACRO_COLUMNS=["value"],
+        _max_firms_observed=1,
+    )
+    process_calls = []
+
+    monkeypatch.setattr(
+        simulate_ts_parallel,
+        "_initialize_batched_state",
+        lambda _sim, _max_firms: {
+            "alive": torch.ones(2, 1, dtype=torch.bool, device=device)
+        },
+    )
+
+    def fake_process(_sim, _state, t, branch_k):
+        process_calls.append((t, branch_k))
+        row = torch.tensor([[float(t)]], device=device)
+        return row, row.clone()
+
+    monkeypatch.setattr(simulate_ts_parallel, "_process_node_batched", fake_process)
+    monkeypatch.setattr(
+        simulate_ts_parallel,
+        "_expand_branches_batched",
+        lambda _sim, state, child_t: [{"alive": state["alive"].clone()}],
+    )
+    monkeypatch.setattr(
+        simulate_ts_parallel,
+        "_annotate_parent_next_leverage_rows",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def make_all_paths_extinct(state):
+        state["alive"][:] = False
+        return state
+
+    monkeypatch.setattr(
+        simulate_ts_parallel, "_apply_exit_batched", make_all_paths_extinct
+    )
+
+    output = simulate_ts_parallel.simulate_tensor_parallel(sim)
+
     assert process_calls == [(0, -1), (1, 0)]
     assert output.meta["completed_parent_steps"] == 1
     assert output.meta["stopped_early"] is True
     assert output.meta["stop_reason"] == "no_surviving_firms"
     assert output.meta["stop_time"] == 1
-    assert output.meta["extinct_paths"] == [0]
+    assert output.meta["extinct_paths"] == [0, 1]
+    assert output.meta["n_extinct_paths"] == 2
+    assert output.meta["path_stop_times"] == [1, 1]
+
+
+def test_parallel_node_omits_macro_rows_for_extinct_paths():
+    device = torch.device("cpu")
+    sim = SimulateTS(
+        models={"policy_value": None, "sdf_fc1": None, "fc2": None},
+        config=Config,
+        n_paths=2,
+        group_size=2,
+        horizon=1,
+        branch_num=1,
+        enable_entry=False,
+        enable_exit=False,
+        device=device,
+    )
+    state = simulate_ts_parallel._initialize_batched_state(sim, max_firms=2)
+    state["alive"][0] = False
+
+    firm_rows, macro_rows = simulate_ts_parallel._process_node_batched(
+        sim, state, t=0, branch_k=-1
+    )
+
+    firm_path_col = sim.FIRM_COLUMNS.index("path")
+    macro_path_col = sim.MACRO_COLUMNS.index("path")
+    assert firm_rows[:, firm_path_col].unique().tolist() == [1.0]
+    assert macro_rows[:, macro_path_col].tolist() == [1.0]
 
 
 def test_sample_update_child_leverage_uses_parent_eta():
