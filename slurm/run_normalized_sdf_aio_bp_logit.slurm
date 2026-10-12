@@ -23,6 +23,9 @@ REQUIRED_COMMIT="${REQUIRED_COMMIT:?REQUIRED_COMMIT must be set}"
 RUN_ROOT="${RUN_ROOT:-$WORK_ROOT/cachedir/normalized_sdf_aio_bp_logit_${STAMP}}"
 SEED="${SEED:-12345}"
 N_EPISODES="${N_EPISODES:-10}"
+INITIAL_CHECKPOINT="${INITIAL_CHECKPOINT:-}"
+INITIAL_CHECKPOINT_EPISODE="${INITIAL_CHECKPOINT_EPISODE:-}"
+START_EPISODE="${START_EPISODE:-}"
 EPOCHS="${EPOCHS:-20}"
 N_PATHS="${N_PATHS:-400}"
 POST0_N_PATHS="${POST0_N_PATHS:-400}"
@@ -342,6 +345,22 @@ fi
 if [[ -n "$Q_STAGE_LR" ]]; then
   EXTRA_ARGS+=(--q-stage-lr "$Q_STAGE_LR")
 fi
+if [[ -n "$INITIAL_CHECKPOINT" ]]; then
+  if [[ ! -f "$INITIAL_CHECKPOINT" ]]; then
+    echo "ERROR: warm-start checkpoint not found: $INITIAL_CHECKPOINT"
+    exit 1
+  fi
+  EXTRA_ARGS+=(--initial-checkpoint "$INITIAL_CHECKPOINT")
+  if [[ -n "$INITIAL_CHECKPOINT_EPISODE" ]]; then
+    EXTRA_ARGS+=(--initial-checkpoint-episode "$INITIAL_CHECKPOINT_EPISODE")
+  fi
+  if [[ -n "$START_EPISODE" ]]; then
+    EXTRA_ARGS+=(--start-episode "$START_EPISODE")
+  fi
+elif [[ -n "$INITIAL_CHECKPOINT_EPISODE" || -n "$START_EPISODE" ]]; then
+  echo "ERROR: INITIAL_CHECKPOINT_EPISODE/START_EPISODE require INITIAL_CHECKPOINT"
+  exit 1
+fi
 EXTRA_ARGS+=(
   --entry-mode "$ENTRY_MODE"
   --entry-capital-ratio "$ENTRY_CAPITAL_RATIO"
@@ -362,6 +381,9 @@ fi
 echo "Run parameters:"
 echo "  SEED=$SEED"
 echo "  N_EPISODES=$N_EPISODES"
+echo "  INITIAL_CHECKPOINT=${INITIAL_CHECKPOINT:-fresh}"
+echo "  INITIAL_CHECKPOINT_EPISODE=${INITIAL_CHECKPOINT_EPISODE:-none}"
+echo "  START_EPISODE=${START_EPISODE:-auto}"
 echo "  EPOCHS=$EPOCHS"
 echo "  N_PATHS=$N_PATHS"
 echo "  POST0_N_PATHS=$POST0_N_PATHS"

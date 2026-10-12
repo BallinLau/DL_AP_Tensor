@@ -30,6 +30,7 @@ from experiments.run_utils import (  # noqa: E402
     build_models,
     build_optimizers,
     build_hyperparams,
+    load_training_warmstart,
     ensure_dirs,
     save_models,
     save_stage_df,
@@ -61,6 +62,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-root", type=Path, default=None, help="Override output root; default cachedir/timestamp")
     parser.add_argument("--seed", type=int, default=12345, help="Global random seed for Python, NumPy, and Torch")
     parser.add_argument("--n-episodes", type=int, default=10, help="Number of episodes to run")
+    parser.add_argument(
+        "--initial-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Combined checkpoint used to warm-start all models. Optimizers and RNG "
+            "state are recreated; this is not an exact resume."
+        ),
+    )
+    parser.add_argument(
+        "--initial-checkpoint-episode",
+        type=int,
+        default=None,
+        help="Expected source episode recorded in --initial-checkpoint",
+    )
+    parser.add_argument(
+        "--start-episode",
+        type=int,
+        default=None,
+        help=(
+            "Logical first episode to run. With a warm-start it must equal source "
+            "episode + 1; without a warm-start it must be 0."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=None, help="Override epochs per stage")
     parser.add_argument("--n-paths", type=int, default=None, help="Override n_paths for data")
     parser.add_argument("--post0-n-paths", type=int, default=None, help="Override n_paths for episodes > 0; default keeps full n_paths")
@@ -1243,6 +1268,29 @@ def make_run_root(arg_path: Path | None) -> Path:
     return ROOT.parent / "cachedir" / datetime.now().strftime("%Y%m%d_%H%M")
 
 
+def resolve_start_episode(
+    *,
+    requested_start_episode: int | None,
+    warmstart_provenance: dict | None,
+) -> int:
+    """Resolve logical episode numbering without silently skipping cold-start."""
+    if warmstart_provenance is None:
+        resolved = 0 if requested_start_episode is None else int(requested_start_episode)
+        if resolved != 0:
+            raise ValueError("--start-episode must be 0 when --initial-checkpoint is omitted")
+        return resolved
+
+    source_episode = int(warmstart_provenance["source_episode"])
+    required_start = source_episode + 1
+    resolved = required_start if requested_start_episode is None else int(requested_start_episode)
+    if resolved != required_start:
+        raise ValueError(
+            "Continuation warm-start must begin at the next logical episode: "
+            f"source=ep{source_episode}, required start=ep{required_start}, got ep{resolved}"
+        )
+    return resolved
+
+
 def main():
     args = parse_args()
     random.seed(args.seed)
@@ -1293,7 +1341,41 @@ def main():
             sort_keys=True,
         )
     )
-    models = build_models(device)
+    firm_target = None
+    warmstart_provenance = None
+    if args.initial_checkpoint is None:
+        if args.initial_checkpoint_episode is not None:
+            raise ValueError(
+                "--initial-checkpoint-episode requires --initial-checkpoint"
+            )
+        models = build_models(device)
+    else:
+        models, firm_target, warmstart_provenance = load_training_warmstart(
+            args.initial_checkpoint,
+            device,
+            expected_episode=args.initial_checkpoint_episode,
+            expected_q_parameterization=hyperparams.q_parameterization,
+            expected_value_scale_mode=hyperparams.pv_value_scale_mode,
+            expected_value_scale_log_max=hyperparams.pv_value_scale_log_max,
+            expected_bellman_normalization=(
+                hyperparams.pv_bellman_normalize_by_value_scale
+            ),
+        )
+    start_episode = resolve_start_episode(
+        requested_start_episode=args.start_episode,
+        warmstart_provenance=warmstart_provenance,
+    )
+    if warmstart_provenance is not None:
+        warmstart_provenance["start_episode"] = start_episode
+        provenance_path = run_root / "metadata" / "warmstart_provenance.json"
+        provenance_path.parent.mkdir(parents=True, exist_ok=True)
+        provenance_path.write_text(
+            json.dumps(warmstart_provenance, indent=2, default=str),
+            encoding="utf-8",
+        )
+        print("Continuation warm-start: " + json.dumps(warmstart_provenance, sort_keys=True))
+    else:
+        print("Model initialization: fresh Xavier weights with fresh optimizers")
     optimizers = build_optimizers(models, hyperparams)
     post0_n_paths = args.post0_n_paths if args.post0_n_paths is not None else hyperparams.n_paths
     simulate_group_size = args.simulate_group_size if args.simulate_group_size is not None else Config.SIMULATE_GROUP_SIZE
@@ -1311,10 +1393,13 @@ def main():
             config=Config,
             hyperparams=hyperparams,
             device=device,
-            episode_id=0,
+            episode_id=start_episode,
             gpu_monitor=gpu_monitor,
+            firm_target=firm_target,
+            q_checkpoint_loaded=warmstart_provenance is not None,
         )
-    for ep in range(args.n_episodes):
+    for episode_offset in range(args.n_episodes):
+        ep = start_episode + episode_offset
         episode.episode_id = ep  # update episode ID for logging/saving
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -1381,6 +1466,8 @@ def main():
                 "completed_summaries": summaries,
                 "run_parameters": {
                     "n_episodes": args.n_episodes,
+                    "start_episode": start_episode,
+                    "warmstart": warmstart_provenance,
                     "epochs": hyperparams.epochs,
                     "n_paths": data_kwargs["n_paths"],
                     "batch_size": hyperparams.batch_size,
@@ -1508,7 +1595,10 @@ def main():
             resolve_base_dir(run_root, ROOT),
             hyperparams=hyperparams,
             extra_models={"firm_target": episode.firm_target},
-            extra_metadata={"episode_mode": episode_mode},
+            extra_metadata={
+                "episode_mode": episode_mode,
+                "warmstart": warmstart_provenance,
+            },
         )
         print(f"Checkpoint metadata written: {saved_paths}")
 
@@ -1539,6 +1629,7 @@ def main():
         plot_macro_series(ep, episode.df_macro, resolve_base_dir(run_root, ROOT))
 
         summaries.append({
+            "episode": ep,
             "episode_mode": episode_mode,
             "sdf_wealth_loss_mode": hyperparams.sdf_wealth_loss_mode,
             "pv_bp_training_mode": hyperparams.pv_bp_training_mode,
