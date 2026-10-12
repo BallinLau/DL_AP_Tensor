@@ -576,6 +576,58 @@ def test_independent_maintenance_rebuild_detects_mask_and_total_corruption():
             )
 
 
+def test_i_oper_validation_uses_gross_scale_under_strong_cancellation():
+    n_firms = 1024
+    K = torch.ones(n_firms, dtype=torch.float32)
+    bar_z = torch.cat(
+        [
+            torch.zeros(n_firms // 2, dtype=torch.float32),
+            torch.full((n_firms // 2,), 2.0, dtype=torch.float32),
+        ]
+    )
+    maintenance = torch.ones_like(K)
+    I_oper_rebuilt = maintenance - bar_z
+    I_oper_reported = I_oper_rebuilt.clone()
+    I_oper_reported[0] += 2.5e-6
+    Y = torch.full_like(K, 2.0)
+
+    result = validate_node_resource_account(
+        Y=Y,
+        I_oper=I_oper_reported,
+        Phi=torch.zeros_like(K),
+        path_index=torch.zeros(n_firms, dtype=torch.long),
+        birth_mask=torch.zeros(n_firms, dtype=torch.bool),
+        entry_cost=torch.zeros_like(K),
+        K_birth=torch.zeros_like(K),
+        K_current=K,
+        n_paths=1,
+        I_entry_ledger=torch.zeros(1, dtype=torch.float32),
+        C_reported=(Y - I_oper_reported).sum().reshape(1),
+        mode="raw",
+        bar_i_executed=torch.zeros_like(K),
+        bar_z=bar_z,
+        investment_cost=torch.zeros_like(K),
+        initial_cohort=torch.ones_like(K),
+        birth_time=torch.full_like(K, -1.0),
+        economic_time=torch.tensor([1]),
+        delta=1.0,
+        maintenance_reported=maintenance,
+        birth_maintenance_exempt=True,
+        strict=True,
+    )
+
+    residual = result["I_oper_accounting_residual"].abs().item()
+    net_scale = max(
+        result["I_oper_reported"].abs().item(),
+        result["I_oper_rebuilt"].abs().item(),
+    )
+    old_net_tolerance = 1e-6 + 1e-5 * net_scale
+    assert residual > old_net_tolerance
+    assert result["I_oper_gross_scale"].item() == pytest.approx(2048.0)
+    assert residual <= result["I_oper_accounting_tolerance"].item()
+    assert bool(result["accounting_valid"].item())
+
+
 def test_investment_compare_birth_state_and_extra_expansion_timing():
     with (
         patch(
