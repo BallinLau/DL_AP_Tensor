@@ -628,6 +628,54 @@ def test_i_oper_validation_uses_gross_scale_under_strong_cancellation():
     assert bool(result["accounting_valid"].item())
 
 
+def test_maintenance_validation_uses_float64_audit_reduction():
+    n_firms = 1024
+    generator = torch.Generator().manual_seed(123)
+    K = torch.rand(n_firms, generator=generator, dtype=torch.float32) * 10.0 + 0.01
+    maintenance_rebuilt = 0.1 * K
+    maintenance_reported = maintenance_rebuilt.clone()
+    maintenance_reported[::7] = torch.nextafter(
+        maintenance_reported[::7],
+        torch.full_like(maintenance_reported[::7], float("inf")),
+    )
+    expected_residual = (
+        maintenance_reported.to(torch.float64).sum()
+        - maintenance_rebuilt.to(torch.float64).sum()
+    )
+    Y = torch.full_like(K, 2.0)
+
+    result = validate_node_resource_account(
+        Y=Y,
+        I_oper=maintenance_reported,
+        Phi=torch.zeros_like(K),
+        path_index=torch.zeros(n_firms, dtype=torch.long),
+        birth_mask=torch.zeros(n_firms, dtype=torch.bool),
+        entry_cost=torch.zeros_like(K),
+        K_birth=torch.zeros_like(K),
+        K_current=K,
+        n_paths=1,
+        I_entry_ledger=torch.zeros(1, dtype=torch.float32),
+        C_reported=(Y - maintenance_rebuilt).sum().reshape(1),
+        mode="raw",
+        bar_i_executed=torch.zeros_like(K),
+        bar_z=torch.zeros_like(K),
+        investment_cost=torch.zeros_like(K),
+        initial_cohort=torch.ones_like(K),
+        birth_time=torch.full_like(K, -1.0),
+        economic_time=torch.tensor([1]),
+        delta=0.1,
+        maintenance_reported=maintenance_reported,
+        birth_maintenance_exempt=True,
+        strict=True,
+    )
+
+    assert expected_residual.item() != 0.0
+    assert result["maintenance_accounting_residual"].item() == pytest.approx(
+        expected_residual.item(), rel=0.0, abs=1e-10
+    )
+    assert bool(result["accounting_valid"].item())
+
+
 def test_investment_compare_birth_state_and_extra_expansion_timing():
     with (
         patch(

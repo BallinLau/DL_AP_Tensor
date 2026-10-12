@@ -843,12 +843,13 @@ def validate_node_resource_account(
 ) -> Dict[str, torch.Tensor]:
     """Independently rebuild entry spending and node resources from details.
 
-    Operating-investment audit reductions use float64 so separate GPU
-    ``index_add_`` kernels do not turn float32 atomic accumulation order into a
-    false accounting failure. Its tolerance is scaled by gross component flows,
-    because economically valid investment, exit, and maintenance flows can
-    nearly cancel to a small net ``I_oper`` total. Other ledger calculations
-    retain their production dtype and historical arithmetic semantics.
+    Operating-investment and maintenance audit reductions use float64 so
+    separate GPU ``index_add_`` kernels do not turn float32 atomic accumulation
+    order into a false accounting failure. The operating-investment tolerance
+    is scaled by gross component flows, because economically valid investment,
+    exit, and maintenance flows can nearly cancel to a small net ``I_oper``
+    total. Production ledger calculations retain their historical dtype and
+    arithmetic semantics.
     """
     if mode not in {"legacy_per_firm_clamp", "raw"}:
         raise ValueError(f"unknown consumption aggregation mode: {mode!r}")
@@ -939,16 +940,18 @@ def validate_node_resource_account(
             + maintenance_rebuilt_detail
         )
         operating_detail = Y - I_oper_rebuilt_detail - Phi
-        I_maintenance_reported = zero_by_path.clone()
-        I_maintenance_rebuilt = zero_by_path.clone()
+        I_maintenance_reported = audit_zero_by_path.clone()
+        I_maintenance_rebuilt = audit_zero_by_path.clone()
         K_maintenance_base = zero_by_path.clone()
         K_birth_current_node = zero_by_path.clone()
         I_oper_reported_total = audit_zero_by_path.clone()
         I_oper_rebuilt_total = audit_zero_by_path.clone()
         I_oper_gross_scale = audit_zero_by_path.clone()
-        I_maintenance_reported.index_add_(0, path_index, maintenance_reported)
+        I_maintenance_reported.index_add_(
+            0, path_index, _audit(maintenance_reported)
+        )
         I_maintenance_rebuilt.index_add_(
-            0, path_index, maintenance_rebuilt_detail
+            0, path_index, _audit(maintenance_rebuilt_detail)
         )
         K_maintenance_base.index_add_(
             0,
@@ -976,8 +979,8 @@ def validate_node_resource_account(
         maintenance_eligible = torch.ones_like(birth_mask)
         maintenance_rebuilt_detail = torch.zeros_like(K_current)
         operating_detail = Y - I_oper - Phi
-        I_maintenance_reported = zero_by_path.clone()
-        I_maintenance_rebuilt = zero_by_path.clone()
+        I_maintenance_reported = audit_zero_by_path.clone()
+        I_maintenance_rebuilt = audit_zero_by_path.clone()
         K_maintenance_base = zero_by_path.clone()
         K_birth_current_node = zero_by_path.clone()
         I_oper_reported_total = audit_zero_by_path.clone()
@@ -1071,10 +1074,10 @@ def validate_node_resource_account(
         "C_reported": C_reported,
         "resource_accounting_residual": resource_residual,
         "resource_accounting_tolerance": resource_tolerance,
-        "I_maintenance_reported": I_maintenance_reported,
-        "I_maintenance_rebuilt": I_maintenance_rebuilt,
-        "maintenance_accounting_residual": maintenance_residual,
-        "maintenance_accounting_tolerance": maintenance_tolerance,
+        "I_maintenance_reported": I_maintenance_reported.to(dtype=dtype),
+        "I_maintenance_rebuilt": I_maintenance_rebuilt.to(dtype=dtype),
+        "maintenance_accounting_residual": maintenance_residual.to(dtype=dtype),
+        "maintenance_accounting_tolerance": maintenance_tolerance.to(dtype=dtype),
         "I_oper_reported": I_oper_reported_total.to(dtype=dtype),
         "I_oper_rebuilt": I_oper_rebuilt_total.to(dtype=dtype),
         "I_oper_accounting_residual": I_oper_residual.to(dtype=dtype),
