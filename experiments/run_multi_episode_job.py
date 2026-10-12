@@ -168,6 +168,27 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Symmetric log-consumption width around the current FC1 Hatc input",
     )
+    parser.add_argument(
+        "--entry-macro-progress-plots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Generate cumulative entry/macro diagnostics after fixed episode "
+            "milestones and after the final requested episode"
+        ),
+    )
+    parser.add_argument(
+        "--entry-macro-progress-every",
+        type=int,
+        default=3,
+        help="Generate cumulative entry/macro plots after every N completed episodes",
+    )
+    parser.add_argument(
+        "--entry-macro-growth-start-time",
+        type=int,
+        default=2,
+        help="First simulation time included in non-entry capital growth-rate plots",
+    )
     parser.add_argument("--device", type=str, default=None, help="Force device, e.g. cuda:0 or cpu")
     parser.add_argument("--quick-test", action="store_true", help="Shrink workload for smoke tests (n_paths=10, epochs=20, horizon=20)")
     parser.add_argument(
@@ -1617,6 +1638,54 @@ def main():
             break
         ep_summary = summary.get("module_summaries", summary)
         save_stage_df(ep, episode_mode, resolve_base_dir(run_root, ROOT), episode.df, episode.df_macro, episode.df_sdf)
+        if args.entry_macro_progress_plots:
+            from analysis.entry_macro_progress import (  # noqa: E402
+                generate_entry_macro_progress_report,
+                is_entry_macro_plot_milestone,
+            )
+
+            if is_entry_macro_plot_milestone(
+                episode_offset,
+                args.n_episodes,
+                args.entry_macro_progress_every,
+            ):
+                report_dir = (
+                    resolve_base_dir(run_root, ROOT)
+                    / "analysis"
+                    / f"macro_growth_cumulative_ep{ep}"
+                )
+                try:
+                    report = generate_entry_macro_progress_report(
+                        resolve_base_dir(run_root, ROOT),
+                        report_dir,
+                        latest_episode=ep,
+                        growth_start_time=args.entry_macro_growth_start_time,
+                    )
+                    print(
+                        f"[Episode {ep}] cumulative entry/macro plots written to "
+                        f"{report_dir}; episodes={report['episodes']}"
+                    )
+                except Exception as exc:
+                    failure = {
+                        "episode": ep,
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                        "report_dir": str(report_dir),
+                    }
+                    failure_path = (
+                        resolve_base_dir(run_root, ROOT)
+                        / "analysis"
+                        / f"macro_growth_plot_failure_ep{ep}.json"
+                    )
+                    failure_path.parent.mkdir(parents=True, exist_ok=True)
+                    failure_path.write_text(
+                        json.dumps(failure, indent=2),
+                        encoding="utf-8",
+                    )
+                    print(
+                        f"WARNING: cumulative entry/macro plotting failed for "
+                        f"Episode {ep}: {exc}. Details: {failure_path}"
+                    )
         if bool(getattr(hyperparams, "save_episode_diagnostics", False)):
             canonical_diagnostic_reference = save_episode_diagnostics(
                 run_root=resolve_base_dir(run_root, ROOT),
