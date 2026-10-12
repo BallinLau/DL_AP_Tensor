@@ -1549,6 +1549,22 @@ def build_and_commit_state_bank(
     episode_summary.setdefault("module_summaries", {}).setdefault(
         "state_bank", {}
     )["acceptance"] = acceptance
+    sdf_publication = acceptance["sdf_publication_gate"]
+    print(
+        "SDF publication status: "
+        f"safe_to_continue={sdf_publication['safe_to_continue']} "
+        f"stage_progress={sdf_publication['stage_progress']} "
+        f"converged={sdf_publication['converged']} "
+        f"publication_passed={sdf_publication['publication_passed']} "
+        f"reason={sdf_publication['reason']}"
+    )
+    print(
+        "State Bank strict acceptance: "
+        f"checks={acceptance['strict_checks']} "
+        f"bellman={acceptance['bellman_gate']['status']} "
+        f"bank_integrity={acceptance['refresh_finite_and_accounting_valid']} "
+        f"publish={acceptance['episode_acceptance_passed']}"
+    )
     if not acceptance["episode_acceptance_passed"]:
         raise RuntimeError(
             "State Bank candidate rejected before atomic publish: "
@@ -1678,17 +1694,56 @@ def evaluate_state_bank_acceptance(
         "p90_threshold": bellman_p90_threshold,
         "bellman_passed": bellman_passed,
     }
+    schedule = modules.get("sdf_formal_stage_schedule", {})
+    formal_sdf_active = bool(schedule.get("formal_sdf_active", False))
+    sdf_publication_gate = {
+        "formal_sdf_active": formal_sdf_active,
+        "safe_to_continue": None,
+        "stage_progress": None,
+        "converged": None,
+        "publication_passed": True,
+        "reason": "formal_sdf_inactive_not_required",
+    }
     if mode == "strict":
-        schedule = modules.get("sdf_formal_stage_schedule", {})
-        if bool(schedule.get("formal_sdf_active", False)):
+        if formal_sdf_active:
             sdf_gate = modules.get("sdf_fc1_post_refresh_gate")
-            sdf_passed = (
+            safe_to_continue = bool(
                 isinstance(sdf_gate, dict)
-                and sdf_gate.get("strict_passed") is True
+                and sdf_gate.get("sdf_safe_to_continue") is True
             )
-            strict_checks["formal_sdf_strict_gate_passed"] = sdf_passed
-            if not sdf_passed:
-                reasons.append("formal_sdf_strict_gate_missing_or_failed")
+            stage_progress = bool(
+                isinstance(sdf_gate, dict)
+                and sdf_gate.get("sdf_stage_progress") is True
+            )
+            converged = bool(
+                isinstance(sdf_gate, dict)
+                and sdf_gate.get("sdf_converged") is True
+            )
+            publication_passed = bool(
+                safe_to_continue and (stage_progress or converged)
+            )
+            if not isinstance(sdf_gate, dict):
+                publication_reason = "sdf_continuation_status_missing"
+            elif not safe_to_continue:
+                publication_reason = "sdf_unsafe_for_continuation"
+            elif converged:
+                publication_reason = "sdf_converged"
+            elif stage_progress:
+                publication_reason = "safe_and_progressing_not_yet_converged"
+            else:
+                publication_reason = "sdf_safe_but_no_progress"
+            sdf_publication_gate.update(
+                {
+                    "safe_to_continue": safe_to_continue,
+                    "stage_progress": stage_progress,
+                    "converged": converged,
+                    "publication_passed": publication_passed,
+                    "reason": publication_reason,
+                }
+            )
+            strict_checks["sdf_publication_gate_passed"] = publication_passed
+            if not publication_passed:
+                reasons.append(publication_reason)
 
         policy = modules.get("policy_value")
         metadata = policy.get("metadata", {}) if isinstance(policy, dict) else {}
@@ -1726,6 +1781,7 @@ def evaluate_state_bank_acceptance(
         "unique_lineages": unique_lineages,
         "minimum_unique_lineages": minimum,
         "strict_checks": strict_checks,
+        "sdf_publication_gate": sdf_publication_gate,
         "bellman_gate": bellman_gate,
     }
 
@@ -1958,10 +2014,25 @@ def main():
                         previous_bank=active_state_bank,
                     )
                 except Exception as exc:
+                    acceptance = summary.get("module_summaries", {}).get(
+                        "state_bank", {}
+                    ).get("acceptance")
+                    acceptance_rejected = bool(
+                        isinstance(acceptance, dict)
+                        and acceptance.get("episode_acceptance_passed") is False
+                    )
                     raise NumericalStageFailure(
-                        f"Episode {ep} State Bank refresh failed",
+                        (
+                            f"Episode {ep} State Bank acceptance rejected"
+                            if acceptance_rejected
+                            else f"Episode {ep} State Bank refresh failed"
+                        ),
                         diagnostics={
-                            "stage": "state_bank_refresh",
+                            "stage": (
+                                "state_bank_acceptance"
+                                if acceptance_rejected
+                                else "state_bank_refresh"
+                            ),
                             "episode": ep,
                             "previous_bank_source_episode": (
                                 None
@@ -1970,9 +2041,7 @@ def main():
                             ),
                             "error_type": type(exc).__name__,
                             "message": str(exc),
-                            "acceptance": summary.get("module_summaries", {})
-                            .get("state_bank", {})
-                            .get("acceptance"),
+                            "acceptance": acceptance,
                         },
                     ) from exc
                 active_state_bank = candidate_bank

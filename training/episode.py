@@ -15039,8 +15039,16 @@ class Episode:
                 prefix="post_refresh",
                 stage=SDFTrainingPhase.SDF_TRUE_ONLY,
             )
+            sdf_true_result = module_summaries.get("sdf_fc1_sdf_true_only", {})
+            pre_sdf_summary = (
+                sdf_true_result.get("initial_validation_summary")
+                if isinstance(sdf_true_result, dict)
+                else None
+            )
+            if not isinstance(pre_sdf_summary, dict):
+                pre_sdf_summary = primary_safety_summary
             primary_sdf_status = self._sdf_stage_status(
-                primary_safety_summary,
+                pre_sdf_summary,
                 primary_safety_summary,
                 primary_sdf_diag,
             )
@@ -15063,18 +15071,31 @@ class Episode:
                 fc1_data_passed
                 and primary_sdf_status["sdf_safe_to_continue"]
             )
+            sdf_continuation_passed = bool(
+                primary_sdf_status["sdf_safe_to_continue"]
+                and (
+                    primary_sdf_status["sdf_stage_progress"]
+                    or primary_sdf_status["sdf_converged"]
+                )
+            )
             gate_passed = strict_passed if gate_mode == "strict" else safety_passed
             result = {
                 "passed": bool(gate_passed),
                 "strict_passed": bool(strict_passed),
                 "safety_passed": bool(safety_passed),
+                "continuation_passed": bool(sdf_continuation_passed),
                 "gate_mode": gate_mode,
                 "hard_gate_state": "primary_calculated_state",
                 "failed_stage": None if gate_passed else "post_refresh",
                 "holdout_split": holdout_diag,
                 "primary_safety_summary": primary_safety_summary,
                 "primary_sdf_status": primary_sdf_status,
-                "sdf_safe_to_continue": bool(safety_passed),
+                "sdf_safe_to_continue": bool(
+                    primary_sdf_status["sdf_safe_to_continue"]
+                ),
+                "sdf_stage_progress": bool(
+                    primary_sdf_status["sdf_stage_progress"]
+                ),
                 "sdf_converged": bool(primary_sdf_status["sdf_converged"]),
                 "fc1_gate": {
                     "passed": bool(fc1_passed),

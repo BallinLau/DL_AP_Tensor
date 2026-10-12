@@ -1511,6 +1511,30 @@ class SdfPhaseRecoveryTest(unittest.TestCase):
         self.assertFalse(result["strict_passed"])
         self.assertEqual(result["gate_mode"], "safety")
 
+    def test_post_refresh_reports_progress_without_final_convergence(self):
+        episode = _make_post_refresh_episode(primary_m=0.98, recursive_m=0.98)
+        initial_summary = self._stage_summary(
+            mean=0.10,
+            t_value=40.0,
+            violation=0.01,
+        )
+
+        result = episode._evaluate_post_refresh_sdf_gate(
+            module_summaries={
+                "sdf_fc1_sdf_true_only": {
+                    "initial_validation_summary": initial_summary,
+                }
+            },
+            batch_size=2,
+            n_branches=2,
+        )
+
+        self.assertTrue(result["sdf_safe_to_continue"])
+        self.assertTrue(result["sdf_stage_progress"])
+        self.assertFalse(result["sdf_converged"])
+        self.assertTrue(result["continuation_passed"])
+        self.assertFalse(result["strict_passed"])
+
     def test_post_refresh_uses_primary_state_when_recursive_collapses(self):
         episode = _make_post_refresh_episode(primary_m=0.98, recursive_m=0.001)
         result = episode._evaluate_post_refresh_sdf_gate(

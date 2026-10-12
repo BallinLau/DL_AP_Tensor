@@ -645,24 +645,51 @@ def test_entry_identity_draws_survive_bank_save_reload_without_global_rng_use(tm
         _assert_tensor_equal(getattr(actual, name), getattr(expected, name))
 
 
-def _strict_acceptance_summary(*, bellman_passed):
-    return {
-        "module_summaries": {
-            "sdf_formal_stage_schedule": {"formal_sdf_active": False},
-            "policy_value": {
-                "metadata": {
-                    "policy_value_stage_status": "accepted",
-                    "q_stage_required_gate_passed": True,
-                    "bp_distillation_stage": {"status": "accepted"},
-                }
-            },
+def _strict_acceptance_summary(
+    *,
+    bellman_passed,
+    formal_sdf_active: bool = False,
+    safe_to_continue: bool = True,
+    stage_progress: bool = True,
+    converged: bool = False,
+    strict_passed: bool = False,
+):
+    modules = {
+        "sdf_formal_stage_schedule": {
+            "formal_sdf_active": formal_sdf_active,
         },
+        "policy_value": {
+            "metadata": {
+                "policy_value_stage_status": "accepted",
+                "q_stage_required_gate_passed": True,
+                "bp_distillation_stage": {"status": "accepted"},
+            }
+        },
+    }
+    if formal_sdf_active:
+        modules["sdf_fc1_post_refresh_gate"] = {
+            "strict_passed": strict_passed,
+            "sdf_safe_to_continue": safe_to_continue,
+            "sdf_stage_progress": stage_progress,
+            "sdf_converged": converged,
+        }
+    return {
+        "module_summaries": modules,
         "convergence": {
             "bellman_passed": bellman_passed,
             "policy_passed": True,
             "passed": None if bellman_passed is None else bool(bellman_passed),
         },
     }
+
+
+def _strict_acceptance_hyperparams():
+    return SimpleNamespace(
+        state_bank_acceptance_mode="strict",
+        state_bank_min_unique_lineages=1,
+        bellman_conditional_mean_thresh=None,
+        bellman_conditional_p90_thresh=None,
+    )
 
 
 def _finite_candidate_bank():
@@ -715,6 +742,90 @@ def test_strict_acceptance_requires_configured_bellman_gate_to_pass():
     assert result["episode_acceptance_passed"] is False
     assert result["bellman_gate"]["status"] == "failed"
     assert "bellman_required_gate_failed" in result["reasons"]
+
+
+@pytest.mark.parametrize(
+    (
+        "safe_to_continue",
+        "stage_progress",
+        "converged",
+        "expected_passed",
+        "expected_reason",
+    ),
+    [
+        (True, True, False, True, "safe_and_progressing_not_yet_converged"),
+        (True, False, False, False, "sdf_safe_but_no_progress"),
+        (True, False, True, True, "sdf_converged"),
+        (False, True, False, False, "sdf_unsafe_for_continuation"),
+    ],
+)
+def test_strict_acceptance_uses_sdf_continuation_quality_for_publication(
+    safe_to_continue,
+    stage_progress,
+    converged,
+    expected_passed,
+    expected_reason,
+):
+    result = evaluate_state_bank_acceptance(
+        episode_summary=_strict_acceptance_summary(
+            bellman_passed=None,
+            formal_sdf_active=True,
+            safe_to_continue=safe_to_continue,
+            stage_progress=stage_progress,
+            converged=converged,
+        ),
+        candidate_bank=_finite_candidate_bank(),
+        hyperparams=_strict_acceptance_hyperparams(),
+    )
+    assert result["episode_acceptance_passed"] is expected_passed
+    assert result["sdf_publication_gate"] == {
+        "formal_sdf_active": True,
+        "safe_to_continue": safe_to_continue,
+        "stage_progress": stage_progress,
+        "converged": converged,
+        "publication_passed": expected_passed,
+        "reason": expected_reason,
+    }
+    if not expected_passed:
+        assert expected_reason in result["reasons"]
+
+
+def test_strict_acceptance_ignores_final_strict_failure_when_sdf_is_progressing():
+    result = evaluate_state_bank_acceptance(
+        episode_summary=_strict_acceptance_summary(
+            bellman_passed=None,
+            formal_sdf_active=True,
+            safe_to_continue=True,
+            stage_progress=True,
+            converged=False,
+            strict_passed=False,
+        ),
+        candidate_bank=_finite_candidate_bank(),
+        hyperparams=_strict_acceptance_hyperparams(),
+    )
+    assert result["episode_acceptance_passed"] is True
+    assert result["strict_checks"]["sdf_publication_gate_passed"] is True
+    assert "formal_sdf_strict_gate_missing_or_failed" not in result["reasons"]
+
+
+def test_calibration_episode_does_not_require_sdf_publication_gate():
+    result = evaluate_state_bank_acceptance(
+        episode_summary=_strict_acceptance_summary(
+            bellman_passed=None,
+            formal_sdf_active=False,
+        ),
+        candidate_bank=_finite_candidate_bank(),
+        hyperparams=_strict_acceptance_hyperparams(),
+    )
+    assert result["episode_acceptance_passed"] is True
+    assert result["sdf_publication_gate"] == {
+        "formal_sdf_active": False,
+        "safe_to_continue": None,
+        "stage_progress": None,
+        "converged": None,
+        "publication_passed": True,
+        "reason": "formal_sdf_inactive_not_required",
+    }
 
 
 @pytest.mark.parametrize(
@@ -823,11 +934,23 @@ def test_strict_acceptance_rejects_missing_gates_and_preserves_bank_file(tmp_pat
         state_bank_acceptance_mode="strict",
         state_bank_min_unique_lineages=1,
     )
-    result = evaluate_state_bank_acceptance(
-        episode_summary={"module_summaries": {}},
-        candidate_bank=candidate,
+    summary = {"module_summaries": {}}
+    fake_episode = SimpleNamespace(
         hyperparams=hp,
+        build_state_bank_after_success=lambda **_kwargs: candidate,
     )
+    with pytest.raises(RuntimeError, match="State Bank candidate rejected"):
+        build_and_commit_state_bank(
+            fake_episode,
+            output_path=output,
+            n_paths=1,
+            group_size=1,
+            n_branches=2,
+            simulate_kwargs={},
+            episode_summary=summary,
+            previous_bank=previous,
+        )
+    result = summary["module_summaries"]["state_bank"]["acceptance"]
     assert result["episode_acceptance_passed"] is False
     assert any("policy_value_stage_passed" in reason for reason in result["reasons"])
     assert output.read_bytes() == before
