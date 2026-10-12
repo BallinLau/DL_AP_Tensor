@@ -1132,6 +1132,19 @@ class Episode:
             "node_accounting_mode",
         ):
             sim_kwargs[name] = getattr(self.hyperparams, name)
+        sim_kwargs["entry_hatc_failure_scan_enabled"] = bool(
+            getattr(self.hyperparams, "entry_hatc_failure_scan_enabled", False)
+        )
+        sim_kwargs["entry_hatc_failure_scan_output_dir"] = getattr(
+            self.hyperparams, "entry_hatc_failure_scan_output_dir", None
+        )
+        sim_kwargs["entry_hatc_failure_scan_points"] = int(
+            getattr(self.hyperparams, "entry_hatc_failure_scan_points", 81)
+        )
+        sim_kwargs["entry_hatc_failure_scan_half_width"] = float(
+            getattr(self.hyperparams, "entry_hatc_failure_scan_half_width", 2.0)
+        )
+        sim_kwargs["entry_hatc_failure_episode_id"] = int(self.episode_id)
         source = self._simulation_bp_action_source()
         # The formal source is controlled only by HyperParams. This prevents a
         # stale caller-provided kwarg from silently switching a replay back to

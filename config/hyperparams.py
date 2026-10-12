@@ -242,6 +242,12 @@ class HyperParams:
     # entry and to the authoritative economic-node ledger for either economic
     # entry experiment.
     node_accounting_mode: str = "auto"
+    # Failure-only node-clearing diagnostic. The runner supplies a run-local
+    # output directory; successful nodes incur no grid evaluation.
+    entry_hatc_failure_scan_enabled: bool = False
+    entry_hatc_failure_scan_output_dir: str = ""
+    entry_hatc_failure_scan_points: int = 81
+    entry_hatc_failure_scan_half_width: float = 2.0
     # 训练数据批次是否优先走 tensor 管线（避免训练前 pandas 拼装）
     use_tensor_pipeline: bool = True
     # firm-level 训练每个 stage 最多使用多少 parent transitions；<=0 表示不截断。

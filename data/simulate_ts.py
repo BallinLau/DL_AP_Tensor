@@ -118,6 +118,11 @@ class SimulateTS:
         preserve_global_rng_around_entry: bool = False,
         common_transition_seed: Optional[int] = None,
         transition_rng_mode: str = "legacy_position",
+        entry_hatc_failure_scan_enabled: bool = False,
+        entry_hatc_failure_scan_output_dir: Optional[str] = None,
+        entry_hatc_failure_scan_points: int = 81,
+        entry_hatc_failure_scan_half_width: float = 2.0,
+        entry_hatc_failure_episode_id: int = -1,
     ):
         """
         Args:
@@ -207,7 +212,43 @@ class SimulateTS:
             raise ValueError(
                 "transition_rng_mode='stable_firm_identity' requires common_transition_seed"
             )
+        self.entry_hatc_failure_scan_enabled = bool(
+            entry_hatc_failure_scan_enabled
+        )
+        self.entry_hatc_failure_scan_output_dir = (
+            None
+            if entry_hatc_failure_scan_output_dir is None
+            else str(entry_hatc_failure_scan_output_dir)
+        )
+        self.entry_hatc_failure_scan_points = int(
+            entry_hatc_failure_scan_points
+        )
+        self.entry_hatc_failure_scan_half_width = float(
+            entry_hatc_failure_scan_half_width
+        )
+        self.entry_hatc_failure_episode_id = int(
+            entry_hatc_failure_episode_id
+        )
+        if self.entry_hatc_failure_scan_points < 3:
+            raise ValueError("entry_hatc_failure_scan_points must be at least 3")
+        if self.entry_hatc_failure_scan_points % 2 == 0:
+            raise ValueError("entry_hatc_failure_scan_points must be odd")
+        if (
+            not math.isfinite(self.entry_hatc_failure_scan_half_width)
+            or self.entry_hatc_failure_scan_half_width <= 0.0
+        ):
+            raise ValueError(
+                "entry_hatc_failure_scan_half_width must be finite and positive"
+            )
+        if (
+            self.entry_hatc_failure_scan_enabled
+            and not self.entry_hatc_failure_scan_output_dir
+        ):
+            raise ValueError(
+                "enabled entry Hatc failure scan requires an output directory"
+            )
         self._entry_event_counter = 0
+        self._pending_entry_candidates = None
         if self.entry_mode not in {"legacy", "value_cost", "investment_compare"}:
             raise ValueError(
                 "entry_mode must be 'legacy', 'value_cost', or "

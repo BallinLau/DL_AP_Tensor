@@ -16,9 +16,12 @@ from data.entry import (
     aggregate_node_resources,
     evaluate_investment_compare_entry,
     identify_birth_at_node,
+    scan_investment_compare_hatc,
+    slice_entry_candidates,
     validate_node_resource_account,
 )
 from data.simulate_ts import SimulateTS
+from data.simulate_ts_parallel import _write_entry_hatc_failure_scan
 from experiments.run_multi_episode_job import configure_hyperparams, parse_args
 
 
@@ -72,6 +75,32 @@ class _AlwaysInvestPolicy(_BranchValuePolicy):
         )
 
 
+class _HatcResponsivePolicy(_BranchValuePolicy):
+    def forward_value_components(self, state: torch.Tensor):
+        v0 = torch.ones_like(state[:, 0:1]) + self.anchor * 0.0
+        return {
+            "V0_physical": v0,
+            "VI_physical": v0 + state[:, 1:2] + state[:, 5:6],
+        }
+
+    def forward_simulation(self, state: torch.Tensor):
+        n = state.shape[0]
+        zeros = state.new_zeros((n, 1)) + self.anchor * 0.0
+        ones = torch.ones_like(zeros)
+        bar_i = torch.sigmoid(state[:, 5:6])
+        return SimpleNamespace(
+            Q=zeros,
+            P0=ones,
+            PI=ones,
+            bar_i=bar_i,
+            bar_z=zeros,
+            P=ones,
+            bp0=zeros,
+            bpI=zeros,
+            bp=zeros,
+        )
+
+
 class _Config:
     DEVICE = torch.device("cpu")
     RHO_X = 0.0
@@ -109,6 +138,178 @@ def _candidates() -> EntryCandidates:
         potential_capital_nominal=torch.tensor([6.0]),
         candidate_capital_realized=torch.tensor([6.0]),
     )
+
+
+def test_hatc_node_scan_freezes_candidates_and_recomputes_only_node_decisions():
+    model = _HatcResponsivePolicy().train()
+    simulator = SimulateTS(
+        models={"policy_value": model},
+        config=_Config,
+        n_paths=1,
+        group_size=1,
+        horizon=1,
+        enable_entry=True,
+        enable_exit=True,
+        entry_mode="investment_compare",
+        entry_spec_version=INVESTMENT_COMPARE_SPEC_VERSION,
+        entry_cost_max=_Config.I_THRESHOLD,
+        consumption_aggregation_mode="raw",
+        node_accounting_mode="economic_node_ledger",
+    )
+    model.train()
+    candidates = slice_entry_candidates(_candidates(), 0)
+    candidate_before = {
+        name: getattr(candidates, name).clone()
+        for name in candidates.__dataclass_fields__
+    }
+    parameter_before = model.anchor.detach().clone()
+
+    kwargs = dict(
+        policy_value_model=model,
+        candidates=candidates,
+        hatc_values=[-1.0, 0.0, 1.0],
+        incumbent_b=torch.tensor([0.2, 0.4]),
+        incumbent_z=torch.tensor([0.0, 0.1]),
+        incumbent_eta=torch.tensor([0.0, 1.0]),
+        incumbent_i=torch.tensor([0.2, 0.3]),
+        incumbent_K=torch.tensor([2.0, 3.0]),
+        incumbent_birth_at_node=torch.tensor([False, False]),
+        x=torch.tensor(0.0),
+        lnkf=torch.tensor(0.0),
+        resource_accounting=simulator._resource_accounting,
+        chunk_size=2,
+    )
+    first = scan_investment_compare_hatc(**kwargs)
+    second = scan_investment_compare_hatc(**kwargs)
+
+    assert set(first) >= {
+        "hatc_trial",
+        "consumption_implied",
+        "aggregate_resource_balance",
+        "clearing_residual",
+        "ordinary_investment_spending",
+        "creation_spending",
+        "accepted_entrant_count",
+        "aggregate_capital",
+    }
+    torch.testing.assert_close(first["hatc_trial"], torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float64))
+    assert first["accepted_entrant_count"].tolist() == [1.0, 2.0, 3.0]
+    assert first["aggregate_capital"].tolist() == [7.0, 9.0, 11.0]
+    for name in first:
+        torch.testing.assert_close(first[name], second[name])
+    for name, value in candidate_before.items():
+        torch.testing.assert_close(getattr(candidates, name), value)
+    torch.testing.assert_close(model.anchor, parameter_before)
+    assert model.training
+
+
+def test_hatc_node_scan_uses_resource_identity_for_clearing_residual():
+    model = _HatcResponsivePolicy()
+    simulator = SimulateTS(
+        models={"policy_value": model},
+        config=_Config,
+        n_paths=1,
+        group_size=1,
+        horizon=1,
+        entry_mode="investment_compare",
+        entry_spec_version=INVESTMENT_COMPARE_SPEC_VERSION,
+        entry_cost_max=_Config.I_THRESHOLD,
+        consumption_aggregation_mode="raw",
+        node_accounting_mode="economic_node_ledger",
+    )
+    result = scan_investment_compare_hatc(
+        model,
+        slice_entry_candidates(_candidates(), 0),
+        hatc_values=[0.0],
+        incumbent_b=torch.tensor([0.2]),
+        incumbent_z=torch.tensor([0.0]),
+        incumbent_eta=torch.tensor([0.0]),
+        incumbent_i=torch.tensor([0.2]),
+        incumbent_K=torch.tensor([2.0]),
+        incumbent_birth_at_node=torch.tensor([False]),
+        x=torch.tensor(0.0),
+        lnkf=torch.tensor(0.0),
+        resource_accounting=simulator._resource_accounting,
+    )
+    torch.testing.assert_close(
+        result["clearing_residual"],
+        result["aggregate_resource_balance"] - result["consumption_implied"],
+    )
+    assert result["accepted_entrant_count"].item() == 2.0
+    assert result["creation_spending"].item() == pytest.approx(1.6)
+
+
+def test_hatc_failure_scan_writes_lightweight_node_artifacts(tmp_path):
+    model = _HatcResponsivePolicy()
+    simulator = SimulateTS(
+        models={"policy_value": model},
+        config=_Config,
+        n_paths=1,
+        group_size=2,
+        horizon=1,
+        entry_mode="investment_compare",
+        entry_spec_version=INVESTMENT_COMPARE_SPEC_VERSION,
+        entry_cost_max=_Config.I_THRESHOLD,
+        consumption_aggregation_mode="raw",
+        node_accounting_mode="economic_node_ledger",
+        entry_hatc_failure_scan_enabled=True,
+        entry_hatc_failure_scan_output_dir=str(tmp_path),
+        entry_hatc_failure_scan_points=5,
+        entry_hatc_failure_scan_half_width=1.0,
+        entry_hatc_failure_episode_id=2,
+    )
+    state = {
+        "b": torch.tensor([[0.2, 0.4]]),
+        "z": torch.tensor([[0.0, 0.1]]),
+        "eta": torch.tensor([[0.0, 1.0]]),
+        "i": torch.tensor([[0.2, 0.3]]),
+        "K": torch.tensor([[2.0, 3.0]]),
+        "alive": torch.tensor([[True, True]]),
+        "entry": torch.tensor([[0.0, 0.0]]),
+        "initial_cohort": torch.tensor([[1.0, 1.0]]),
+        "birth_time": torch.tensor([[0.0, 0.0]]),
+        "entry_cost": torch.tensor([[0.0, 0.0]]),
+        "K_birth": torch.tensor([[2.0, 3.0]]),
+        "firm_id": torch.tensor([[0, 1]]),
+        "x": torch.tensor([0.0]),
+        "hatcf": torch.tensor([0.0]),
+        "lnkf": torch.tensor([0.0]),
+        "economic_time": torch.tensor([4]),
+    }
+    validation = {
+        "I_entry_reported": torch.tensor([1.0]),
+        "I_entry_rebuilt": torch.tensor([1.1]),
+        "entry_spend_residual": torch.tensor([-0.1]),
+        "entry_spend_tolerance": torch.tensor([1e-5]),
+        "C_reported": torch.tensor([2.0]),
+        "C_rebuilt": torch.tensor([2.1]),
+        "resource_accounting_residual": torch.tensor([-0.1]),
+        "resource_accounting_tolerance": torch.tensor([2e-5]),
+        "I_maintenance_reported": torch.tensor([0.0]),
+        "I_maintenance_rebuilt": torch.tensor([0.0]),
+        "maintenance_accounting_residual": torch.tensor([0.0]),
+        "maintenance_accounting_tolerance": torch.tensor([1e-6]),
+        "I_oper_reported": torch.tensor([0.2]),
+        "I_oper_rebuilt": torch.tensor([0.2]),
+        "I_oper_accounting_residual": torch.tensor([0.0]),
+        "I_oper_accounting_tolerance": torch.tensor([3e-6]),
+        "finite_totals": torch.tensor([True]),
+    }
+    summary = _write_entry_hatc_failure_scan(
+        simulator,
+        state,
+        _candidates(),
+        validation,
+        path=0,
+        t=4,
+        branch_k=1,
+    )
+    assert (tmp_path / "ep2_t4_branch1_path0_hatc_scan.csv").is_file()
+    assert (tmp_path / "ep2_t4_branch1_path0_hatc_scan_summary.json").is_file()
+    assert (tmp_path / "ep2_t4_branch1_path0_node_snapshot.pt").is_file()
+    assert summary["hatc_points"] == 5
+    assert summary["fixed_candidate_count"] == 3
+    assert summary["original_accounting_failure"]["finite_totals"] is True
 
 
 def test_investment_compare_uses_physical_pi_ge_p0_at_b0_eta0_i_equals_e():

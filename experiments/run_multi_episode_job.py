@@ -104,6 +104,26 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "legacy_recompute", "economic_node_ledger"],
         default=None,
     )
+    parser.add_argument(
+        "--entry-hatc-failure-scan-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "On an entry resource/accounting failure, scan a fixed node over "
+            "trial Hatc values without replaying or retraining"
+        ),
+    )
+    parser.add_argument(
+        "--entry-hatc-failure-scan-points",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--entry-hatc-failure-scan-half-width",
+        type=float,
+        default=None,
+        help="Symmetric log-consumption width around the current FC1 Hatc input",
+    )
     parser.add_argument("--device", type=str, default=None, help="Force device, e.g. cuda:0 or cpu")
     parser.add_argument("--quick-test", action="store_true", help="Shrink workload for smoke tests (n_paths=10, epochs=20, horizon=20)")
     parser.add_argument(
@@ -706,6 +726,21 @@ def configure_hyperparams(args: argparse.Namespace):
         ("consumption_aggregation_mode", "consumption_aggregation_mode", str),
         ("consumption_floor", "consumption_floor", float),
         ("node_accounting_mode", "node_accounting_mode", str),
+        (
+            "entry_hatc_failure_scan_enabled",
+            "entry_hatc_failure_scan_enabled",
+            bool,
+        ),
+        (
+            "entry_hatc_failure_scan_points",
+            "entry_hatc_failure_scan_points",
+            int,
+        ),
+        (
+            "entry_hatc_failure_scan_half_width",
+            "entry_hatc_failure_scan_half_width",
+            float,
+        ),
     ):
         value = getattr(args, arg_name)
         if value is not None:
@@ -754,6 +789,17 @@ def configure_hyperparams(args: argparse.Namespace):
         "auto", "legacy_recompute", "economic_node_ledger"
     }:
         raise ValueError("invalid node_accounting_mode")
+    if int(hyperparams.entry_hatc_failure_scan_points) < 3:
+        raise ValueError("entry_hatc_failure_scan_points must be at least 3")
+    if int(hyperparams.entry_hatc_failure_scan_points) % 2 == 0:
+        raise ValueError("entry_hatc_failure_scan_points must be odd")
+    if (
+        not np.isfinite(hyperparams.entry_hatc_failure_scan_half_width)
+        or float(hyperparams.entry_hatc_failure_scan_half_width) <= 0.0
+    ):
+        raise ValueError(
+            "entry_hatc_failure_scan_half_width must be finite and positive"
+        )
     if (
         hyperparams.entry_mode in {"value_cost", "investment_compare"}
         and str(hyperparams.node_accounting_mode).lower() == "legacy_recompute"
@@ -1211,6 +1257,9 @@ def main():
     Config.DEVICE = device
 
     hyperparams = configure_hyperparams(args)
+    hyperparams.entry_hatc_failure_scan_output_dir = str(
+        run_root / "diagnostics" / "entry_hatc_failure_scans"
+    )
     print(f"Global random seed: {args.seed}")
     print(
         "Entry configuration: "
@@ -1228,6 +1277,18 @@ def main():
                 "consumption_aggregation_mode": hyperparams.consumption_aggregation_mode,
                 "consumption_floor": hyperparams.consumption_floor,
                 "node_accounting_mode": hyperparams.node_accounting_mode,
+                "entry_hatc_failure_scan_enabled": (
+                    hyperparams.entry_hatc_failure_scan_enabled
+                ),
+                "entry_hatc_failure_scan_points": (
+                    hyperparams.entry_hatc_failure_scan_points
+                ),
+                "entry_hatc_failure_scan_half_width": (
+                    hyperparams.entry_hatc_failure_scan_half_width
+                ),
+                "entry_hatc_failure_scan_output_dir": (
+                    hyperparams.entry_hatc_failure_scan_output_dir
+                ),
             },
             sort_keys=True,
         )
@@ -1397,6 +1458,10 @@ def main():
                     "consumption_aggregation_mode": hyperparams.consumption_aggregation_mode,
                     "consumption_floor": hyperparams.consumption_floor,
                     "node_accounting_mode": hyperparams.node_accounting_mode,
+                    "entry_hatc_failure_scan_enabled": hyperparams.entry_hatc_failure_scan_enabled,
+                    "entry_hatc_failure_scan_points": hyperparams.entry_hatc_failure_scan_points,
+                    "entry_hatc_failure_scan_half_width": hyperparams.entry_hatc_failure_scan_half_width,
+                    "entry_hatc_failure_scan_output_dir": hyperparams.entry_hatc_failure_scan_output_dir,
                 },
             }
             failure_path = resolve_base_dir(run_root, ROOT) / "failure_report.json"

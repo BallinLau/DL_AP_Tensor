@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import torch
 
@@ -554,6 +554,235 @@ def summarize_candidate_values(
     return result
 
 
+def slice_entry_candidates(
+    candidates: EntryCandidates,
+    path: int,
+) -> EntryCandidates:
+    """Select one path without redrawing or otherwise changing candidates."""
+    path = int(path)
+    n_paths = int(candidates.counts.shape[0])
+    if not 0 <= path < n_paths:
+        raise IndexError(f"entry candidate path {path} is outside [0, {n_paths})")
+    row = slice(path, path + 1)
+    return EntryCandidates(
+        counts=candidates.counts[row],
+        mask=candidates.mask[row],
+        z=candidates.z[row],
+        entry_cost=candidates.entry_cost[row],
+        K_birth=candidates.K_birth[row],
+        potential_capital_nominal=candidates.potential_capital_nominal[row],
+        candidate_capital_realized=candidates.candidate_capital_realized[row],
+    )
+
+
+def scan_investment_compare_hatc(
+    policy_value_model: Any,
+    candidates: EntryCandidates,
+    *,
+    hatc_values: Sequence[float] | torch.Tensor,
+    incumbent_b: torch.Tensor,
+    incumbent_z: torch.Tensor,
+    incumbent_eta: torch.Tensor,
+    incumbent_i: torch.Tensor,
+    incumbent_K: torch.Tensor,
+    incumbent_birth_at_node: torch.Tensor,
+    x: float | torch.Tensor,
+    lnkf: float | torch.Tensor,
+    resource_accounting: Callable[..., tuple[torch.Tensor, ...]],
+    chunk_size: int = 65536,
+) -> Dict[str, torch.Tensor]:
+    """Evaluate one frozen node over trial aggregate-consumption inputs.
+
+    The incumbent cross-section and candidate draws are fixed.  Only the
+    Policy/Value input ``Hatc`` changes.  Candidate acceptance and firm actions
+    are then recomputed with the frozen model, followed by the production
+    resource-accounting callable.  No optimizer or historical simulation is
+    involved.
+    """
+    incumbent_vectors = (
+        incumbent_b,
+        incumbent_z,
+        incumbent_eta,
+        incumbent_i,
+        incumbent_K,
+        incumbent_birth_at_node,
+    )
+    if any(value.ndim != 1 for value in incumbent_vectors):
+        raise ValueError("incumbent node inputs must be one-dimensional")
+    if len({int(value.numel()) for value in incumbent_vectors}) != 1:
+        raise ValueError("incumbent node inputs must have matching lengths")
+    if incumbent_birth_at_node.dtype != torch.bool:
+        raise TypeError("incumbent_birth_at_node must be boolean")
+    if int(candidates.counts.numel()) != 1:
+        raise ValueError("Hatc node scan requires candidates for exactly one path")
+    if int(chunk_size) <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    device = incumbent_K.device
+    dtype = incumbent_K.dtype
+    trials = torch.as_tensor(hatc_values, device=device, dtype=dtype).reshape(-1)
+    if trials.numel() < 1 or not torch.isfinite(trials).all():
+        raise ValueError("hatc_values must contain at least one finite value")
+    if any(value.device != device for value in incumbent_vectors):
+        raise ValueError("all incumbent node inputs must share one device")
+    if not all(
+        torch.isfinite(value).all()
+        for value in incumbent_vectors[:-1]
+    ):
+        raise ValueError("incumbent node inputs must be finite")
+
+    x_value = torch.as_tensor(x, device=device, dtype=dtype).reshape(())
+    lnkf_value = torch.as_tensor(lnkf, device=device, dtype=dtype).reshape(())
+    if not bool(torch.isfinite(x_value)) or not bool(torch.isfinite(lnkf_value)):
+        raise ValueError("x and lnkf must be finite")
+
+    candidate_count = int(candidates.counts[0].item())
+    valid_candidates = candidates.mask[0]
+    candidate_z = candidates.z[0][valid_candidates]
+    candidate_cost = candidates.entry_cost[0][valid_candidates]
+    candidate_K = candidates.K_birth[0][valid_candidates]
+    if candidate_count != int(valid_candidates.sum().item()):
+        raise ValueError("candidate count and mask disagree")
+
+    modes = {module: module.training for module in policy_value_model.modules()}
+    parameter_versions = [
+        parameter._version for parameter in policy_value_model.parameters()
+    ]
+    buffer_versions = [buffer._version for buffer in policy_value_model.buffers()]
+    rows: Dict[str, list[torch.Tensor]] = {
+        name: []
+        for name in (
+            "hatc_trial",
+            "consumption_implied",
+            "aggregate_resource_balance",
+            "clearing_residual",
+            "clearing_residual_relative",
+            "ordinary_investment_spending",
+            "maintenance_spending",
+            "operating_investment_total",
+            "creation_spending",
+            "accepted_entrant_count",
+            "aggregate_capital",
+            "incumbent_count",
+            "candidate_count",
+        )
+    }
+    try:
+        policy_value_model.eval()
+        with torch.no_grad():
+            for hatc_trial in trials:
+                screened = evaluate_investment_compare_entry(
+                    policy_value_model,
+                    candidates,
+                    x=x_value.reshape(1),
+                    hatcf=hatc_trial.reshape(1),
+                    lnkf=lnkf_value.reshape(1),
+                    chunk_size=int(chunk_size),
+                )
+                accepted = screened["accepted"][0][valid_candidates]
+                entrant_z = candidate_z[accepted]
+                entrant_i = candidate_cost[accepted]
+                entrant_K = candidate_K[accepted]
+                n_enter = int(accepted.sum().item())
+
+                b_all = torch.cat((incumbent_b, torch.zeros_like(entrant_z)))
+                z_all = torch.cat((incumbent_z, entrant_z))
+                eta_all = torch.cat((incumbent_eta, torch.zeros_like(entrant_z)))
+                i_all = torch.cat((incumbent_i, entrant_i))
+                K_all = torch.cat((incumbent_K, entrant_K))
+                birth_at_node = torch.cat(
+                    (
+                        incumbent_birth_at_node,
+                        torch.ones(n_enter, dtype=torch.bool, device=device),
+                    )
+                )
+                firm_state = torch.stack(
+                    (
+                        b_all,
+                        z_all,
+                        eta_all,
+                        i_all,
+                        x_value.expand_as(K_all),
+                        hatc_trial.expand_as(K_all),
+                        lnkf_value.expand_as(K_all),
+                    ),
+                    dim=1,
+                )
+                output = forward_policy_value_for_simulation(
+                    policy_value_model, firm_state
+                )
+                bar_i_model = output.bar_i.reshape(-1)
+                bar_z = output.bar_z.reshape(-1)
+                bar_i_executed = torch.where(
+                    birth_at_node,
+                    torch.zeros_like(bar_i_model),
+                    bar_i_model,
+                )
+                maintenance_eligible = ~birth_at_node
+                _, I_oper, _, operating_contribution, I_maintenance = (
+                    resource_accounting(
+                        K_all,
+                        z_all,
+                        x_value,
+                        bar_i_executed,
+                        bar_z,
+                        i_all,
+                        maintenance_eligible=maintenance_eligible,
+                        return_maintenance=True,
+                    )
+                )
+
+                aggregate_capital = K_all.sum(dtype=torch.float64)
+                C_oper = operating_contribution.sum(dtype=torch.float64)
+                creation_spending = (entrant_i * entrant_K).sum(
+                    dtype=torch.float64
+                )
+                resource_balance = C_oper - creation_spending
+                consumption_implied = (
+                    torch.exp(hatc_trial.to(torch.float64)) * aggregate_capital
+                )
+                clearing_residual = resource_balance - consumption_implied
+                residual_scale = torch.maximum(
+                    torch.maximum(resource_balance.abs(), consumption_implied.abs()),
+                    resource_balance.new_tensor(1e-12),
+                )
+                maintenance_spending = I_maintenance.sum(dtype=torch.float64)
+                operating_total = I_oper.sum(dtype=torch.float64)
+                ordinary_spending = operating_total - maintenance_spending
+
+                values = {
+                    "hatc_trial": hatc_trial.to(torch.float64),
+                    "consumption_implied": consumption_implied,
+                    "aggregate_resource_balance": resource_balance,
+                    "clearing_residual": clearing_residual,
+                    "clearing_residual_relative": clearing_residual.abs()
+                    / residual_scale,
+                    "ordinary_investment_spending": ordinary_spending,
+                    "maintenance_spending": maintenance_spending,
+                    "operating_investment_total": operating_total,
+                    "creation_spending": creation_spending,
+                    "accepted_entrant_count": resource_balance.new_tensor(n_enter),
+                    "aggregate_capital": aggregate_capital,
+                    "incumbent_count": resource_balance.new_tensor(
+                        int(incumbent_K.numel())
+                    ),
+                    "candidate_count": resource_balance.new_tensor(candidate_count),
+                }
+                for name, value in values.items():
+                    rows[name].append(value.detach())
+    finally:
+        for module, was_training in modes.items():
+            module.train(was_training)
+
+    for before, after in zip(parameter_versions, policy_value_model.parameters()):
+        if before != after._version:
+            raise RuntimeError("Hatc node scan modified model parameters")
+    for before, after in zip(buffer_versions, policy_value_model.buffers()):
+        if before != after._version:
+            raise RuntimeError("Hatc node scan modified model buffers")
+    return {name: torch.stack(values) for name, values in rows.items()}
+
+
 def aggregate_node_resources(
     operating_contribution: torch.Tensor,
     path_index: torch.Tensor,
@@ -800,17 +1029,24 @@ def validate_node_resource_account(
     resource_feasible = finite_totals & (C_reported > 0.0)
     result = {
         "I_entry_rebuilt": I_entry_rebuilt,
+        "I_entry_reported": I_entry_ledger,
         "entry_spend_residual": entry_spend_residual,
+        "entry_spend_tolerance": entry_tolerance,
         "C_oper_rebuilt": C_oper_rebuilt,
         "C_oper_raw_rebuilt": C_oper_raw_rebuilt,
         "legacy_clamp_adjustment": C_oper_rebuilt - C_oper_raw_rebuilt,
         "C_rebuilt": C_rebuilt,
+        "C_reported": C_reported,
         "resource_accounting_residual": resource_residual,
+        "resource_accounting_tolerance": resource_tolerance,
         "I_maintenance_reported": I_maintenance_reported,
         "I_maintenance_rebuilt": I_maintenance_rebuilt,
         "maintenance_accounting_residual": maintenance_residual,
+        "maintenance_accounting_tolerance": maintenance_tolerance,
+        "I_oper_reported": I_oper_reported_total,
         "I_oper_rebuilt": I_oper_rebuilt_total,
         "I_oper_accounting_residual": I_oper_residual,
+        "I_oper_accounting_tolerance": I_oper_tolerance,
         "K_maintenance_base": K_maintenance_base,
         "K_birth_current_node": K_birth_current_node,
         "birth_maintenance_exemption": (
@@ -819,6 +1055,7 @@ def validate_node_resource_account(
             else zero_by_path.clone()
         ),
         "accounting_valid": accounting_valid,
+        "finite_totals": finite_totals,
         "resource_feasible": resource_feasible,
     }
     if strict and not bool(accounting_valid.all()):

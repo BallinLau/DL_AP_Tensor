@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import csv
+import hashlib
+import json
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
@@ -7,6 +11,7 @@ from tqdm import tqdm
 
 from .data_utils import sample_ar1, sample_bernoulli, sample_stationary_ar1, sample_uniform
 from .entry import (
+    EntryCandidates,
     EntryAccountingError,
     EntryEconomicInfeasibilityError,
     aggregate_node_resources,
@@ -16,12 +21,200 @@ from .entry import (
     evaluate_entry_cutoff,
     evaluate_investment_compare_entry,
     identify_birth_at_node,
+    scan_investment_compare_hatc,
+    slice_entry_candidates,
     summarize_candidate_values,
     validate_node_resource_account,
 )
 from .simulation_forward import forward_policy_value_for_simulation
 from .tensor_data import TensorSimulationOutput, TensorTable, cat_rows
 from utils.firm_transition import apply_refinancing_policy
+
+
+def _module_state_hash(module: torch.nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(module.state_dict().items()):
+        digest.update(name.encode("utf-8"))
+        tensor = value.detach().cpu().contiguous()
+        digest.update(str(tensor.dtype).encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _write_entry_hatc_failure_scan(
+    sim,
+    state: Dict[str, torch.Tensor],
+    candidates: EntryCandidates,
+    validation: Dict[str, torch.Tensor],
+    *,
+    path: int,
+    t: int,
+    branch_k: int,
+) -> Dict[str, object]:
+    """Scan one failed node without redrawing candidates or replaying history."""
+    output_root = getattr(sim, "entry_hatc_failure_scan_output_dir", None)
+    if not output_root:
+        raise RuntimeError("entry Hatc failure scan output directory is not configured")
+    model = sim.models.get("policy_value")
+    if model is None:
+        raise RuntimeError("entry Hatc failure scan requires policy_value")
+
+    path = int(path)
+    alive = state["alive"][path]
+    same_node_entry = state["entry"][path] > 0.5
+    incumbent_mask = alive & ~same_node_entry
+    economic_time = state["economic_time"][path]
+    incumbent_birth = (
+        (state["initial_cohort"][path][incumbent_mask] < 0.5)
+        & (
+            state["birth_time"][path][incumbent_mask]
+            == economic_time.to(state["birth_time"].dtype)
+        )
+    )
+    center = float(state["hatcf"][path].detach().cpu())
+    points = int(getattr(sim, "entry_hatc_failure_scan_points", 81))
+    half_width = float(
+        getattr(sim, "entry_hatc_failure_scan_half_width", 2.0)
+    )
+    hatc_values = torch.linspace(
+        center - half_width,
+        center + half_width,
+        points,
+        device=state["b"].device,
+        dtype=state["b"].dtype,
+    )
+    hatc_values[points // 2] = center
+    path_candidates = slice_entry_candidates(candidates, path)
+    scan = scan_investment_compare_hatc(
+        model,
+        path_candidates,
+        hatc_values=hatc_values,
+        incumbent_b=state["b"][path][incumbent_mask],
+        incumbent_z=state["z"][path][incumbent_mask],
+        incumbent_eta=state["eta"][path][incumbent_mask],
+        incumbent_i=state["i"][path][incumbent_mask],
+        incumbent_K=state["K"][path][incumbent_mask],
+        incumbent_birth_at_node=incumbent_birth,
+        x=state["x"][path],
+        lnkf=state["lnkf"][path],
+        resource_accounting=sim._resource_accounting,
+        chunk_size=int(sim.entry_inference_chunk_size),
+    )
+    scan_cpu = {name: value.detach().cpu() for name, value in scan.items()}
+    residual = scan_cpu["clearing_residual"]
+    feasible = scan_cpu["aggregate_resource_balance"] > 0.0
+    feasible_pos = torch.nonzero(feasible, as_tuple=False).reshape(-1)
+    if feasible_pos.numel():
+        local = residual[feasible_pos].abs().argmin()
+        best_pos = int(feasible_pos[local].item())
+    else:
+        best_pos = int(residual.abs().argmin().item())
+    sign_change = (
+        (residual[:-1] == 0.0)
+        | (residual[1:] == 0.0)
+        | ((residual[:-1] < 0.0) != (residual[1:] < 0.0))
+    )
+
+    episode = int(getattr(sim, "entry_hatc_failure_episode_id", -1))
+    stem = f"ep{episode}_t{int(t)}_branch{int(branch_k)}_path{path}"
+    output_dir = Path(output_root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / f"{stem}_hatc_scan.csv"
+    fieldnames = list(scan_cpu)
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in range(points):
+            writer.writerow(
+                {name: float(values[row].item()) for name, values in scan_cpu.items()}
+            )
+
+    accounting_fields = (
+        "I_entry_reported",
+        "I_entry_rebuilt",
+        "entry_spend_residual",
+        "entry_spend_tolerance",
+        "C_reported",
+        "C_rebuilt",
+        "resource_accounting_residual",
+        "resource_accounting_tolerance",
+        "I_maintenance_reported",
+        "I_maintenance_rebuilt",
+        "maintenance_accounting_residual",
+        "maintenance_accounting_tolerance",
+        "I_oper_reported",
+        "I_oper_rebuilt",
+        "I_oper_accounting_residual",
+        "I_oper_accounting_tolerance",
+        "finite_totals",
+    )
+    accounting = {
+        name: (
+            bool(validation[name][path].item())
+            if validation[name].dtype == torch.bool
+            else float(validation[name][path].detach().cpu())
+        )
+        for name in accounting_fields
+    }
+    summary = {
+        "episode": episode,
+        "t": int(t),
+        "branch": int(branch_k),
+        "path": path,
+        "hatc_source": "current FC1 forecast input",
+        "hatc_center": center,
+        "hatc_min": float(hatc_values[0].detach().cpu()),
+        "hatc_max": float(hatc_values[-1].detach().cpu()),
+        "hatc_points": points,
+        "fixed_incumbent_count": int(incumbent_mask.sum().item()),
+        "fixed_candidate_count": int(path_candidates.counts[0].item()),
+        "model_state_hash": _module_state_hash(model),
+        "scan_csv": str(csv_path),
+        "positive_resource_balance_points": int(feasible.sum().item()),
+        "clearing_sign_change_intervals": int(sign_change.sum().item()),
+        "best_positive_resource_point": {
+            name: float(values[best_pos].item())
+            for name, values in scan_cpu.items()
+        },
+        "original_accounting_failure": accounting,
+    }
+    summary_path = output_dir / f"{stem}_hatc_scan_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    snapshot_fields = (
+        "b",
+        "z",
+        "eta",
+        "i",
+        "K",
+        "alive",
+        "entry",
+        "initial_cohort",
+        "birth_time",
+        "entry_cost",
+        "K_birth",
+        "firm_id",
+    )
+    snapshot = {
+        "metadata": summary,
+        "x": state["x"][path].detach().cpu(),
+        "hatcf": state["hatcf"][path].detach().cpu(),
+        "lnkf": state["lnkf"][path].detach().cpu(),
+        "economic_time": economic_time.detach().cpu(),
+        "node_state": {
+            name: state[name][path].detach().cpu() for name in snapshot_fields
+        },
+        "candidates": {
+            name: getattr(path_candidates, name).detach().cpu()
+            for name in path_candidates.__dataclass_fields__
+        },
+    }
+    snapshot_path = output_dir / f"{stem}_node_snapshot.pt"
+    torch.save(snapshot, snapshot_path)
+    summary["snapshot"] = str(snapshot_path)
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary
 
 
 def _draw_transition_shock(sim, child_t: int, branch_index: int, tag: int, draw):
@@ -618,6 +811,40 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             bad = torch.nonzero(
                 invalid_accounting, as_tuple=False
             ).reshape(-1).tolist()
+            if (
+                getattr(sim, "entry_mode", "legacy") == "investment_compare"
+                and bool(getattr(sim, "entry_hatc_failure_scan_enabled", False))
+            ):
+                pending_candidates = getattr(
+                    sim, "_pending_entry_candidates", None
+                )
+                if pending_candidates is None:
+                    print(
+                        "Entry Hatc failure scan skipped: fixed candidate draws "
+                        "are unavailable."
+                    )
+                else:
+                    for bad_path in bad[:20]:
+                        try:
+                            diagnostic = _write_entry_hatc_failure_scan(
+                                sim,
+                                state,
+                                pending_candidates,
+                                validation,
+                                path=bad_path,
+                                t=t,
+                                branch_k=branch_k,
+                            )
+                            print(
+                                "Entry Hatc failure scan saved: "
+                                f"{diagnostic['scan_csv']}"
+                            )
+                        except Exception as diagnostic_exc:
+                            print(
+                                "Entry Hatc failure scan failed without replacing "
+                                "the original accounting error: "
+                                f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+                            )
             raise EntryAccountingError(
                 "independent node resource reconstruction failed; "
                 f"t={t}, branch={branch_k}, paths={bad[:20]}"
@@ -634,6 +861,35 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             invalid = invalid | (active_paths & (C_raw_total <= 0.0))
         if raw_mode and bool(invalid.any()):
             bad = torch.nonzero(invalid, as_tuple=False).reshape(-1).tolist()
+            if (
+                getattr(sim, "entry_mode", "legacy") == "investment_compare"
+                and bool(getattr(sim, "entry_hatc_failure_scan_enabled", False))
+            ):
+                pending_candidates = getattr(
+                    sim, "_pending_entry_candidates", None
+                )
+                if pending_candidates is not None:
+                    for bad_path in bad[:20]:
+                        try:
+                            diagnostic = _write_entry_hatc_failure_scan(
+                                sim,
+                                state,
+                                pending_candidates,
+                                validation,
+                                path=bad_path,
+                                t=t,
+                                branch_k=branch_k,
+                            )
+                            print(
+                                "Entry Hatc infeasibility scan saved: "
+                                f"{diagnostic['scan_csv']}"
+                            )
+                        except Exception as diagnostic_exc:
+                            print(
+                                "Entry Hatc infeasibility scan failed without "
+                                "replacing the original error: "
+                                f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+                            )
             raise EntryEconomicInfeasibilityError(
                 "raw node resource account is infeasible or non-finite (C_raw<=0); "
                 f"t={t}, branch={branch_k}, paths={bad[:20]}, "
@@ -643,6 +899,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                 f"accepted_count={[float(state.get('event_accepted_count', torch.zeros(n_paths, device=device))[index]) for index in bad[:20]]}, "
                 "no positive floor was applied"
             )
+        sim._pending_entry_candidates = None
         if raw_mode and consumption_floor > 0.0:
             C_total = C_raw_total.clamp_min(consumption_floor)
             K_for_macro = K_total.clamp_min(consumption_floor)
@@ -1456,6 +1713,10 @@ def _apply_value_cost_entry_batched(sim, state: Dict[str, torch.Tensor]) -> Dict
         entry_cost_max=sim.effective_entry_cost_max,
         generator=sim.entry_generator,
     )
+    # Retain this event's exact draws only until the corresponding node has
+    # passed accounting validation.  This enables an in-place failure scan
+    # without redrawing candidates or accumulating history-sized state.
+    sim._pending_entry_candidates = candidates
     if sim.entry_mode == "investment_compare":
         screened = evaluate_investment_compare_entry(
             sim.models.get("policy_value"),
