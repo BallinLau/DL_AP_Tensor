@@ -197,11 +197,44 @@ def parse_args() -> argparse.Namespace:
         help="Enable State Bank v1 warm starts for Mode B Episode >= 2",
     )
     parser.add_argument("--state-bank-short-horizon", type=int, default=None)
+    parser.add_argument("--state-bank-bootstrap-burn-in", type=int, default=None)
+    parser.add_argument("--state-bank-bootstrap-capture-stride", type=int, default=None)
+    parser.add_argument("--state-bank-refresh-burn-in", type=int, default=None)
+    parser.add_argument("--state-bank-refresh-capture-stride", type=int, default=None)
+    parser.add_argument("--state-bank-parent-transition-budget", type=int, default=None)
     parser.add_argument("--state-bank-burn-in", type=int, default=None)
     parser.add_argument("--state-bank-capture-stride", type=int, default=None)
     parser.add_argument("--state-bank-max-entries", type=int, default=None)
+    parser.add_argument(
+        "--state-bank-sampling-mode",
+        choices=["uniform_entry", "uniform_lineage"],
+        default=None,
+    )
+    parser.add_argument(
+        "--state-bank-acceptance-mode",
+        choices=["numerical", "strict"],
+        default=None,
+    )
+    parser.add_argument("--state-bank-min-unique-lineages", type=int, default=None)
     parser.add_argument("--state-bank-sample-seed", type=int, default=None)
     parser.add_argument("--state-bank-refresh-seed", type=int, default=None)
+    parser.add_argument("--state-bank-reservoir-seed", type=int, default=None)
+    parser.add_argument(
+        "--transition-rng-mode",
+        choices=["legacy_position", "stable_firm_identity"],
+        default=None,
+    )
+    parser.add_argument("--common-transition-seed", type=int, default=None)
+    parser.add_argument(
+        "--entry-rng-mode",
+        choices=["legacy_sequential", "stable_economic_identity"],
+        default=None,
+    )
+    parser.add_argument(
+        "--preserve-global-rng-around-entry",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--device", type=str, default=None, help="Force device, e.g. cuda:0 or cpu")
     parser.add_argument("--quick-test", action="store_true", help="Shrink workload for smoke tests (n_paths=10, epochs=20, horizon=20)")
     parser.add_argument(
@@ -826,15 +859,62 @@ def configure_hyperparams(args: argparse.Namespace):
         ),
         ("state_bank_enabled", "state_bank_enabled", bool),
         ("state_bank_short_horizon", "state_bank_short_horizon", int),
+        ("state_bank_bootstrap_burn_in", "state_bank_bootstrap_burn_in", int),
+        (
+            "state_bank_bootstrap_capture_stride",
+            "state_bank_bootstrap_capture_stride",
+            int,
+        ),
+        ("state_bank_refresh_burn_in", "state_bank_refresh_burn_in", int),
+        (
+            "state_bank_refresh_capture_stride",
+            "state_bank_refresh_capture_stride",
+            int,
+        ),
+        (
+            "state_bank_parent_transition_budget",
+            "state_bank_parent_transition_budget",
+            int,
+        ),
         ("state_bank_burn_in", "state_bank_burn_in", int),
         ("state_bank_capture_stride", "state_bank_capture_stride", int),
         ("state_bank_max_entries", "state_bank_max_entries", int),
+        ("state_bank_sampling_mode", "state_bank_sampling_mode", str),
+        ("state_bank_acceptance_mode", "state_bank_acceptance_mode", str),
+        (
+            "state_bank_min_unique_lineages",
+            "state_bank_min_unique_lineages",
+            int,
+        ),
         ("state_bank_sample_seed", "state_bank_sample_seed", int),
         ("state_bank_refresh_seed", "state_bank_refresh_seed", int),
+        ("state_bank_reservoir_seed", "state_bank_reservoir_seed", int),
+        ("transition_rng_mode", "transition_rng_mode", str),
+        ("common_transition_seed", "common_transition_seed", int),
+        ("entry_rng_mode", "entry_rng_mode", str),
+        (
+            "preserve_global_rng_around_entry",
+            "preserve_global_rng_around_entry",
+            bool,
+        ),
     ):
         value = getattr(args, arg_name)
         if value is not None:
             setattr(hyperparams, hp_name, cast(value))
+    if args.state_bank_burn_in is not None:
+        if args.state_bank_bootstrap_burn_in is None:
+            hyperparams.state_bank_bootstrap_burn_in = int(args.state_bank_burn_in)
+        if args.state_bank_refresh_burn_in is None:
+            hyperparams.state_bank_refresh_burn_in = int(args.state_bank_burn_in)
+    if args.state_bank_capture_stride is not None:
+        if args.state_bank_bootstrap_capture_stride is None:
+            hyperparams.state_bank_bootstrap_capture_stride = int(
+                args.state_bank_capture_stride
+            )
+        if args.state_bank_refresh_capture_stride is None:
+            hyperparams.state_bank_refresh_capture_stride = int(
+                args.state_bank_capture_stride
+            )
     if hyperparams.entry_mode == "investment_compare":
         from data.entry import INVESTMENT_COMPARE_SPEC_VERSION
 
@@ -899,23 +979,45 @@ def configure_hyperparams(args: argparse.Namespace):
         )
     if int(hyperparams.state_bank_short_horizon) <= 0:
         raise ValueError("state_bank_short_horizon must be positive")
-    if int(hyperparams.state_bank_burn_in) < 1:
-        raise ValueError("state_bank_burn_in must be at least 1")
-    if int(hyperparams.state_bank_capture_stride) <= 0:
-        raise ValueError("state_bank_capture_stride must be positive")
+    if int(hyperparams.state_bank_bootstrap_burn_in) < 1:
+        raise ValueError("state_bank_bootstrap_burn_in must be at least 1")
+    if int(hyperparams.state_bank_refresh_burn_in) < 1:
+        raise ValueError("state_bank_refresh_burn_in must be at least 1")
+    if int(hyperparams.state_bank_bootstrap_capture_stride) <= 0:
+        raise ValueError("state_bank_bootstrap_capture_stride must be positive")
+    if int(hyperparams.state_bank_refresh_capture_stride) <= 0:
+        raise ValueError("state_bank_refresh_capture_stride must be positive")
+    if int(hyperparams.state_bank_parent_transition_budget) < 0:
+        raise ValueError("state_bank_parent_transition_budget must be non-negative")
     if int(hyperparams.state_bank_max_entries) < 0:
         raise ValueError("state_bank_max_entries must be non-negative")
-    if int(hyperparams.state_bank_burn_in) >= int(hyperparams.state_bank_short_horizon):
+    if int(hyperparams.state_bank_refresh_burn_in) >= int(hyperparams.state_bank_short_horizon):
         raise ValueError(
-            "state_bank_burn_in must be smaller than state_bank_short_horizon"
+            "state_bank_refresh_burn_in must be smaller than state_bank_short_horizon"
         )
     if (
         bool(hyperparams.state_bank_enabled)
-        and int(hyperparams.state_bank_burn_in) >= int(hyperparams.simulate_horizon)
+        and int(hyperparams.state_bank_bootstrap_burn_in) >= int(hyperparams.simulate_horizon)
     ):
         raise ValueError(
-            "state_bank_burn_in must be smaller than simulate_horizon so "
+            "state_bank_bootstrap_burn_in must be smaller than simulate_horizon so "
             "Episode 1 can produce Bank_1"
+        )
+    if str(hyperparams.state_bank_sampling_mode) not in {
+        "uniform_entry",
+        "uniform_lineage",
+    }:
+        raise ValueError("invalid state_bank_sampling_mode")
+    if str(hyperparams.state_bank_acceptance_mode) not in {"numerical", "strict"}:
+        raise ValueError("invalid state_bank_acceptance_mode")
+    if int(hyperparams.state_bank_min_unique_lineages) < 0:
+        raise ValueError("state_bank_min_unique_lineages must be non-negative")
+    if (
+        str(hyperparams.transition_rng_mode) == "stable_firm_identity"
+        and hyperparams.common_transition_seed is None
+    ):
+        raise ValueError(
+            "stable_firm_identity transition RNG requires common_transition_seed"
         )
     hyperparams.ablation_mode = args.ablation_mode
     hyperparams.sdf_wealth_loss_mode = args.sdf_wealth_loss_mode
@@ -1403,16 +1505,163 @@ def build_and_commit_state_bank(
     group_size: int,
     n_branches: int,
     simulate_kwargs: dict,
+    episode_summary: dict | None = None,
+    previous_bank: StateBank | None = None,
 ) -> StateBank:
-    """Build a complete candidate Bank and atomically publish it."""
+    """Build, validate, then atomically publish one accepted candidate Bank."""
     candidate = episode.build_state_bank_after_success(
         n_paths=n_paths,
         group_size=group_size,
         n_branches=n_branches,
         simulate_kwargs=simulate_kwargs,
     )
+    episode_summary = {} if episode_summary is None else episode_summary
+    acceptance = evaluate_state_bank_acceptance(
+        episode_summary=episode_summary,
+        candidate_bank=candidate,
+        hyperparams=episode.hyperparams,
+    )
+    candidate.metadata["acceptance"] = acceptance
+    episode_summary.setdefault("module_summaries", {}).setdefault(
+        "state_bank", {}
+    )["acceptance"] = acceptance
+    if not acceptance["episode_acceptance_passed"]:
+        raise RuntimeError(
+            "State Bank candidate rejected before atomic publish: "
+            + "; ".join(acceptance["reasons"])
+        )
+    previous_lineages = (
+        0
+        if previous_bank is None
+        else len({str(entry["lineage_id"]) for entry in previous_bank.entries})
+    )
+    candidate_lineages = len(
+        {str(entry["lineage_id"]) for entry in candidate.entries}
+    )
+    lineage_refresh = {
+        "previous_unique_lineages": previous_lineages,
+        "candidate_unique_lineages": candidate_lineages,
+        "change": candidate_lineages - previous_lineages,
+    }
+    candidate.metadata["lineage_refresh"] = lineage_refresh
+    if previous_lineages and candidate_lineages < previous_lineages:
+        print(
+            "WARNING: State Bank lineage count declined: "
+            f"{previous_lineages} -> {candidate_lineages}"
+        )
     candidate.save(output_path, atomic=True)
+    summary_path = output_path.with_suffix(".summary.json")
+    summary_path.write_text(
+        json.dumps(
+            {
+                "acceptance": acceptance,
+                "distribution": candidate.distribution_summary(),
+                "lineage_refresh": lineage_refresh,
+                "compatibility_fingerprint": candidate.compatibility_fingerprint,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
     return candidate
+
+
+def _state_bank_core_fields_are_finite(bank: StateBank) -> tuple[bool, list[str]]:
+    errors: list[str] = []
+    for entry in bank.entries:
+        fields = entry["fields"]
+        alive = fields.get("alive")
+        for name in ("x", "b", "z", "eta", "i", "K", "hatcf", "lnkf", "M"):
+            value = fields.get(name)
+            if not torch.is_tensor(value):
+                errors.append(f"{entry['entry_id']}:missing:{name}")
+                continue
+            selected = value
+            if alive is not None and value.ndim >= 1 and value.shape[0] == alive.shape[0]:
+                selected = value[alive.to(torch.bool)]
+            if selected.numel() and not bool(torch.isfinite(selected).all()):
+                errors.append(f"{entry['entry_id']}:nonfinite:{name}")
+        accounting = fields.get("accounting_valid")
+        if accounting is not None and not bool(accounting.to(torch.bool).all()):
+            errors.append(f"{entry['entry_id']}:accounting_invalid")
+        if len(errors) >= 20:
+            break
+    return not errors, errors
+
+
+def evaluate_state_bank_acceptance(
+    *,
+    episode_summary: dict,
+    candidate_bank: StateBank,
+    hyperparams,
+) -> dict:
+    mode = str(getattr(hyperparams, "state_bank_acceptance_mode", "numerical"))
+    reasons: list[str] = []
+    finite, finite_errors = _state_bank_core_fields_are_finite(candidate_bank)
+    if not candidate_bank.entries:
+        reasons.append("refresh_bank_empty")
+    if not finite:
+        reasons.append("refresh_bank_nonfinite_or_accounting_invalid")
+    unique_lineages = len(
+        {str(entry["lineage_id"]) for entry in candidate_bank.entries}
+    )
+    minimum = int(getattr(hyperparams, "state_bank_min_unique_lineages", 0))
+    if unique_lineages < minimum:
+        reasons.append(
+            f"unique_lineages={unique_lineages}<required={minimum}"
+        )
+
+    modules = episode_summary.get("module_summaries", {})
+    strict_checks: dict[str, object] = {}
+    if mode == "strict":
+        schedule = modules.get("sdf_formal_stage_schedule", {})
+        if bool(schedule.get("formal_sdf_active", False)):
+            sdf_gate = modules.get("sdf_fc1_post_refresh_gate")
+            sdf_passed = (
+                isinstance(sdf_gate, dict)
+                and sdf_gate.get("strict_passed") is True
+            )
+            strict_checks["formal_sdf_strict_gate_passed"] = sdf_passed
+            if not sdf_passed:
+                reasons.append("formal_sdf_strict_gate_missing_or_failed")
+
+        policy = modules.get("policy_value")
+        metadata = policy.get("metadata", {}) if isinstance(policy, dict) else {}
+        stage_passed = metadata.get("policy_value_stage_status") == "accepted"
+        q_passed = metadata.get("q_stage_required_gate_passed") is True
+        bp_status = metadata.get("bp_distillation_stage", {}).get("status")
+        bp_passed = bp_status == "accepted"
+        convergence = episode_summary.get("convergence")
+        convergence_passed = (
+            isinstance(convergence, dict) and convergence.get("passed") is True
+        )
+        strict_checks.update(
+            {
+                "policy_value_stage_passed": stage_passed,
+                "q_required_gate_passed": q_passed,
+                "bp_required_gate_passed": bp_passed,
+                "bellman_policy_convergence_passed": convergence_passed,
+            }
+        )
+        for key, passed in strict_checks.items():
+            if passed is not True:
+                reasons.append(f"{key}=False_or_unavailable")
+    elif mode != "numerical":
+        raise ValueError(f"Unknown state_bank_acceptance_mode={mode!r}")
+
+    return {
+        "mode": mode,
+        "episode_acceptance_passed": not reasons,
+        "reasons": reasons,
+        "refresh_nonempty": bool(candidate_bank.entries),
+        "refresh_finite_and_accounting_valid": finite,
+        "refresh_validation_errors": finite_errors,
+        "unique_lineages": unique_lineages,
+        "minimum_unique_lineages": minimum,
+        "strict_checks": strict_checks,
+    }
 
 
 def main():
@@ -1531,11 +1780,16 @@ def main():
     if bool(hyperparams.state_bank_enabled):
         state_bank_dir.mkdir(parents=True, exist_ok=True)
         print(
-            "State Bank v1 enabled: "
+            "State Bank v2 enabled: "
             f"directory={state_bank_dir}, "
             f"short_horizon={hyperparams.state_bank_short_horizon}, "
-            f"burn_in={hyperparams.state_bank_burn_in}, "
-            f"capture_stride={hyperparams.state_bank_capture_stride}, "
+            f"bootstrap=({hyperparams.state_bank_bootstrap_burn_in},"
+            f"{hyperparams.state_bank_bootstrap_capture_stride}), "
+            f"refresh=({hyperparams.state_bank_refresh_burn_in},"
+            f"{hyperparams.state_bank_refresh_capture_stride}), "
+            f"parent_budget={hyperparams.state_bank_parent_transition_budget}, "
+            f"sampling={hyperparams.state_bank_sampling_mode}, "
+            f"acceptance={hyperparams.state_bank_acceptance_mode}, "
             f"max_entries={hyperparams.state_bank_max_entries}"
         )
     episode = Episode(
@@ -1633,6 +1887,8 @@ def main():
                         group_size=data_kwargs["group_size"],
                         n_branches=data_kwargs["n_branches"],
                         simulate_kwargs=simulate_kwargs,
+                        episode_summary=summary,
+                        previous_bank=active_state_bank,
                     )
                 except Exception as exc:
                     raise NumericalStageFailure(
@@ -1647,6 +1903,9 @@ def main():
                             ),
                             "error_type": type(exc).__name__,
                             "message": str(exc),
+                            "acceptance": summary.get("module_summaries", {})
+                            .get("state_bank", {})
+                            .get("acceptance"),
                         },
                     ) from exc
                 active_state_bank = candidate_bank
@@ -1662,6 +1921,15 @@ def main():
                         ),
                         "output_capture": candidate_bank.metadata.get(
                             "capture", {}
+                        ),
+                        "output_distribution_summary": (
+                            candidate_bank.distribution_summary()
+                        ),
+                        "lineage_refresh": candidate_bank.metadata.get(
+                            "lineage_refresh", {}
+                        ),
+                        "output_summary_path": str(
+                            bank_path.with_suffix(".summary.json")
                         ),
                     }
                 )
@@ -1703,11 +1971,18 @@ def main():
                     "simulate_horizon": hyperparams.simulate_horizon,
                     "state_bank_enabled": hyperparams.state_bank_enabled,
                     "state_bank_short_horizon": hyperparams.state_bank_short_horizon,
-                    "state_bank_burn_in": hyperparams.state_bank_burn_in,
-                    "state_bank_capture_stride": hyperparams.state_bank_capture_stride,
+                    "state_bank_bootstrap_burn_in": hyperparams.state_bank_bootstrap_burn_in,
+                    "state_bank_bootstrap_capture_stride": hyperparams.state_bank_bootstrap_capture_stride,
+                    "state_bank_refresh_burn_in": hyperparams.state_bank_refresh_burn_in,
+                    "state_bank_refresh_capture_stride": hyperparams.state_bank_refresh_capture_stride,
+                    "state_bank_parent_transition_budget": hyperparams.state_bank_parent_transition_budget,
                     "state_bank_max_entries": hyperparams.state_bank_max_entries,
+                    "state_bank_sampling_mode": hyperparams.state_bank_sampling_mode,
+                    "state_bank_acceptance_mode": hyperparams.state_bank_acceptance_mode,
+                    "state_bank_min_unique_lineages": hyperparams.state_bank_min_unique_lineages,
                     "state_bank_sample_seed": hyperparams.state_bank_sample_seed,
                     "state_bank_refresh_seed": hyperparams.state_bank_refresh_seed,
+                    "state_bank_reservoir_seed": hyperparams.state_bank_reservoir_seed,
                     "post0_mode": args.post0_mode,
                     "sdf_wealth_loss_mode": hyperparams.sdf_wealth_loss_mode,
                     "sdf_true_only_epochs": hyperparams.sdf_true_only_epochs,

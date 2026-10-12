@@ -112,6 +112,7 @@ class SimulateTS:
         entry_dummy_i: float = 0.0,
         entry_inference_chunk_size: int = 65536,
         entry_rng_seed: int = 86420,
+        entry_rng_mode: str = "legacy_sequential",
         consumption_aggregation_mode: str = "legacy_per_firm_clamp",
         consumption_floor: float = 0.0,
         node_accounting_mode: str = "auto",
@@ -185,6 +186,14 @@ class SimulateTS:
         self.entry_dummy_i = float(entry_dummy_i)
         self.entry_inference_chunk_size = int(entry_inference_chunk_size)
         self.entry_rng_seed = int(entry_rng_seed)
+        self.entry_rng_mode = str(entry_rng_mode).strip().lower()
+        if self.entry_rng_mode not in {
+            "legacy_sequential",
+            "stable_economic_identity",
+        }:
+            raise ValueError(
+                "entry_rng_mode must be legacy_sequential or stable_economic_identity"
+            )
         self.consumption_aggregation_mode = str(consumption_aggregation_mode).strip().lower()
         self.consumption_floor = float(consumption_floor)
         if not math.isfinite(self.consumption_floor) or self.consumption_floor < 0.0:
@@ -364,6 +373,7 @@ class SimulateTS:
             {
                 "preserve_global_rng_around_entry": self.preserve_global_rng_around_entry,
                 "common_transition_seed": self.common_transition_seed,
+                "entry_rng_mode": self.entry_rng_mode,
                 "node_accounting_mode_requested": self.node_accounting_mode_requested,
                 "independent_resource_validation_enabled": (
                     self.entry_independent_resource_validation_enabled

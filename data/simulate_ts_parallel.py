@@ -248,7 +248,7 @@ def _keyed_uniform(
     seed: int,
     path_id: torch.Tensor,
     economic_time: int | torch.Tensor,
-    branch_id: int,
+    branch_id: int | torch.Tensor,
     identity: torch.Tensor,
     shock_type: int,
     dtype: torch.dtype,
@@ -261,16 +261,24 @@ def _keyed_uniform(
     )
     while time_key.ndim < path_id.ndim:
         time_key = time_key.unsqueeze(-1)
-    path_key, identity_key, time_key = torch.broadcast_tensors(
+    branch_key = torch.as_tensor(
+        branch_id,
+        dtype=torch.int64,
+        device=path_id.device,
+    )
+    while branch_key.ndim < path_id.ndim:
+        branch_key = branch_key.unsqueeze(-1)
+    path_key, identity_key, time_key, branch_key = torch.broadcast_tensors(
         path_id.to(torch.int64),
         identity.to(torch.int64),
         time_key,
+        branch_key,
     )
     mixed = torch.full_like(path_key, int(seed) % _HASH_MODULUS)
     for value, salt in (
         (path_key, 1_000_003),
         (time_key, 97_409),
-        (torch.full_like(path_key, int(branch_id)), 65_537),
+        (branch_key, 65_537),
         (identity_key, 32_771),
         (torch.full_like(path_key, int(shock_type)), 8_191),
     ):
@@ -346,6 +354,72 @@ def _stable_transition_draws(sim, state, child_t: int, branch_index: int):
     return x_next, z_next, eta_next, i_next, eps_x, eps_z, u_eta, u_i
 
 
+def _stable_entry_candidates(sim, state, reference) -> EntryCandidates:
+    """Draw entrant candidates from economic identity, not call order."""
+    path = state["transition_path_id"].to(torch.long)
+    economic_time = state["economic_time"].to(torch.long)
+    branch = state.get(
+        "transition_branch_id", torch.zeros_like(path, dtype=torch.long)
+    ).to(torch.long)
+    zero_identity = torch.zeros_like(path)
+    rounding = _keyed_uniform(
+        seed=int(sim.entry_rng_seed),
+        path_id=path,
+        economic_time=economic_time,
+        branch_id=branch,
+        identity=zero_identity,
+        shock_type=101,
+        dtype=torch.float64,
+    )
+    n_star = reference.n_star.to(torch.float64)
+    base = torch.floor(n_star)
+    counts = (base + (rounding < (n_star - base)).to(torch.float64)).to(torch.long)
+    max_count = int(counts.max().item()) if counts.numel() else 0
+    candidate = torch.arange(max_count, device=path.device, dtype=torch.long)
+    candidate = candidate.unsqueeze(0).expand(path.numel(), -1)
+    mask = candidate < counts.unsqueeze(1)
+    path_grid = path.unsqueeze(1).expand_as(candidate)
+    time_grid = economic_time.unsqueeze(1).expand_as(candidate)
+    branch_grid = branch.unsqueeze(1).expand_as(candidate)
+    dtype = reference.reference_K.dtype
+    stationary_std = float(sim.config.SIGMA_Z) / max(
+        (1.0 - float(sim.config.RHO_Z) ** 2) ** 0.5,
+        1e-12,
+    )
+    z = float(sim.config.ZBAR) + stationary_std * _keyed_normal(
+        seed=int(sim.entry_rng_seed),
+        path_id=path_grid,
+        economic_time=time_grid,
+        branch_id=branch_grid,
+        identity=candidate,
+        shock_type=102,
+        dtype=dtype,
+    )
+    entry_cost = float(sim.effective_entry_cost_max) * _keyed_uniform(
+        seed=int(sim.entry_rng_seed),
+        path_id=path_grid,
+        economic_time=time_grid,
+        branch_id=branch_grid,
+        identity=candidate,
+        shock_type=103,
+        dtype=dtype,
+    )
+    K_birth = reference.K_per_entrant.unsqueeze(1).expand_as(z).clone()
+    zero = torch.zeros((), device=path.device, dtype=dtype)
+    z = torch.where(mask, z, zero)
+    entry_cost = torch.where(mask, entry_cost, zero)
+    K_birth = torch.where(mask, K_birth, zero)
+    return EntryCandidates(
+        counts=counts,
+        mask=mask,
+        z=z,
+        entry_cost=entry_cost,
+        K_birth=K_birth,
+        potential_capital_nominal=reference.potential_capital_nominal,
+        candidate_capital_realized=K_birth.sum(dim=1),
+    )
+
+
 def _ensure_entry_state_fields(state: Dict[str, torch.Tensor]) -> None:
     """Add zero-cost provenance fields to legacy/test states in place."""
     b = state["b"]
@@ -364,6 +438,10 @@ def _ensure_entry_state_fields(state: Dict[str, torch.Tensor]) -> None:
     state.setdefault(
         "transition_path_id",
         torch.arange(n_paths, dtype=torch.long, device=device),
+    )
+    state.setdefault(
+        "transition_branch_id",
+        torch.full((n_paths,), -1, dtype=torch.long, device=device),
     )
     state.setdefault("accounting_valid", torch.zeros(n_paths, dtype=torch.bool, device=device))
     state.setdefault("transition_eps_x", torch.full((n_paths,), float("nan"), device=device))
@@ -574,6 +652,9 @@ def _initialize_batched_state(sim, max_firms: int) -> Dict[str, torch.Tensor]:
         "economic_node_id": torch.zeros(n_paths, dtype=torch.long, device=device),
         "economic_time": torch.zeros(n_paths, dtype=torch.long, device=device),
         "transition_path_id": torch.arange(n_paths, dtype=torch.long, device=device),
+        "transition_branch_id": torch.full(
+            (n_paths,), -1, dtype=torch.long, device=device
+        ),
         "accounting_valid": torch.zeros(n_paths, dtype=torch.bool, device=device),
         "transition_eps_x": torch.full((n_paths,), float("nan"), device=device),
         "transition_eps_z": torch.full_like(K, float("nan")),
@@ -1555,6 +1636,9 @@ def _expand_branches_batched(
                 "firm_id": state["firm_id"].clone(),
                 "next_firm_id": state["next_firm_id"].clone(),
                 "transition_path_id": state["transition_path_id"].clone(),
+                "transition_branch_id": torch.full_like(
+                    state["transition_path_id"], int(branch_index)
+                ),
                 "bar_i": state.get("bar_i", torch.zeros_like(state["b"])) .clone(),
                 "bar_z": state.get("bar_z", torch.zeros_like(state["b"])) .clone(),
                 "bp": state.get("bp", state["b"]).clone(),
@@ -1806,14 +1890,17 @@ def _apply_value_cost_entry_batched(sim, state: Dict[str, torch.Tensor]) -> Dict
         entry_capital_ratio=sim.entry_capital_ratio,
         entry_size_ratio=sim.entry_size_ratio,
     )
-    candidates = draw_value_cost_candidates(
-        reference,
-        rho_z=float(sim.config.RHO_Z),
-        sigma_z=float(sim.config.SIGMA_Z),
-        zbar=float(sim.config.ZBAR),
-        entry_cost_max=sim.effective_entry_cost_max,
-        generator=sim.entry_generator,
-    )
+    if getattr(sim, "entry_rng_mode", "legacy_sequential") == "stable_economic_identity":
+        candidates = _stable_entry_candidates(sim, state, reference)
+    else:
+        candidates = draw_value_cost_candidates(
+            reference,
+            rho_z=float(sim.config.RHO_Z),
+            sigma_z=float(sim.config.SIGMA_Z),
+            zbar=float(sim.config.ZBAR),
+            entry_cost_max=sim.effective_entry_cost_max,
+            generator=sim.entry_generator,
+        )
     # Retain this event's exact draws only until the corresponding node has
     # passed accounting validation.  This enables an in-place failure scan
     # without redrawing candidates or accumulating history-sized state.
@@ -1896,14 +1983,36 @@ def _apply_value_cost_entry_batched(sim, state: Dict[str, torch.Tensor]) -> Dict
     else:
         # Historical value_cost_v1 timing: eta and ordinary investment cost are
         # drawn only after the aggregate-equity entry screen.
-        eta_draw = (
-            torch.rand(n_accepted, generator=sim.entry_generator, dtype=torch.float64)
-            < float(sim.config.ZETA)
-        ).to(device=device, dtype=state["eta"].dtype)
-        i_draw = (
-            torch.rand(n_accepted, generator=sim.entry_generator, dtype=torch.float64)
-            * float(sim.config.I_THRESHOLD)
-        ).to(device=device, dtype=state["i"].dtype)
+        if getattr(sim, "entry_rng_mode", "legacy_sequential") == "stable_economic_identity":
+            candidate_grid = torch.arange(
+                accepted.shape[1], device=device, dtype=torch.long
+            ).unsqueeze(0).expand_as(accepted)
+            candidate_id = candidate_grid[accepted]
+            keyed_common = {
+                "seed": int(sim.entry_rng_seed),
+                "path_id": state["transition_path_id"][path_idx],
+                "economic_time": state["economic_time"][path_idx],
+                "branch_id": state["transition_branch_id"][path_idx],
+                "identity": candidate_id,
+                "dtype": torch.float64,
+            }
+            eta_draw = (
+                _keyed_uniform(**keyed_common, shock_type=104)
+                < float(sim.config.ZETA)
+            ).to(device=device, dtype=state["eta"].dtype)
+            i_draw = (
+                _keyed_uniform(**keyed_common, shock_type=105)
+                * float(sim.config.I_THRESHOLD)
+            ).to(device=device, dtype=state["i"].dtype)
+        else:
+            eta_draw = (
+                torch.rand(n_accepted, generator=sim.entry_generator, dtype=torch.float64)
+                < float(sim.config.ZETA)
+            ).to(device=device, dtype=state["eta"].dtype)
+            i_draw = (
+                torch.rand(n_accepted, generator=sim.entry_generator, dtype=torch.float64)
+                * float(sim.config.I_THRESHOLD)
+            ).to(device=device, dtype=state["i"].dtype)
     new_id = destination[accepted].to(torch.long)
 
     state["b"][path_idx, slot_idx] = 0.0

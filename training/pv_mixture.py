@@ -17,6 +17,7 @@ class PVParentGroupPool:
     children: List[torch.Tensor]
     source_id: torch.Tensor
     source_index: torch.Tensor
+    lineage_id: torch.Tensor | None = None
 
     def __len__(self) -> int:
         return int(self.parent.shape[0])
@@ -33,6 +34,7 @@ def select_parent_groups(pool: PVParentGroupPool, indices: torch.Tensor) -> PVPa
         children=[child[idx] for child in pool.children],
         source_id=pool.source_id[idx],
         source_index=pool.source_index[idx],
+        lineage_id=None if pool.lineage_id is None else pool.lineage_id[idx],
     )
 
 
@@ -44,6 +46,7 @@ def concat_parent_group_pools(pools: List[PVParentGroupPool]) -> PVParentGroupPo
     for pool in non_empty:
         if len(pool.children) != n_children:
             raise ValueError("All PV parent-group pools must have the same number of child branches.")
+    lineage_available = all(pool.lineage_id is not None for pool in non_empty)
     return PVParentGroupPool(
         parent=torch.cat([pool.parent for pool in non_empty], dim=0),
         children=[
@@ -52,6 +55,47 @@ def concat_parent_group_pools(pools: List[PVParentGroupPool]) -> PVParentGroupPo
         ],
         source_id=torch.cat([pool.source_id for pool in non_empty], dim=0),
         source_index=torch.cat([pool.source_index for pool in non_empty], dim=0),
+        lineage_id=(
+            torch.cat([pool.lineage_id for pool in non_empty], dim=0)
+            if lineage_available
+            else None
+        ),
+    )
+
+
+def split_pool_by_lineage(
+    pool: PVParentGroupPool,
+    val_fraction: float,
+    generator: torch.Generator,
+) -> Tuple[PVParentGroupPool, PVParentGroupPool, Dict[str, int]]:
+    """Split whole lineages, never individual states from the same lineage."""
+    if pool.lineage_id is None:
+        raise ValueError("lineage-aware split requires pool.lineage_id")
+    unique = torch.unique(pool.lineage_id.detach().cpu().to(torch.long))
+    if unique.numel() < 2:
+        raise ValueError("lineage-aware split requires at least two lineages")
+    n_val = resolve_val_count(int(unique.numel()), val_fraction)
+    if n_val <= 0:
+        raise ValueError("lineage-aware validation requires a positive val_fraction")
+    order = torch.randperm(unique.numel(), generator=generator)
+    val_lineages = unique[order[:n_val]]
+    train_lineages = unique[order[n_val:]]
+    lineage_cpu = pool.lineage_id.detach().cpu().to(torch.long)
+    val_mask = torch.isin(lineage_cpu, val_lineages)
+    train_mask = torch.isin(lineage_cpu, train_lineages)
+    overlap = int(torch.isin(train_lineages, val_lineages).sum().item())
+    if overlap:
+        raise RuntimeError(f"PV train-validation lineage overlap: {overlap}")
+    train_indices = torch.nonzero(train_mask, as_tuple=False).reshape(-1)
+    val_indices = torch.nonzero(val_mask, as_tuple=False).reshape(-1)
+    return (
+        select_parent_groups(pool, train_indices),
+        select_parent_groups(pool, val_indices),
+        {
+            "train_lineage_count": int(train_lineages.numel()),
+            "val_lineage_count": int(val_lineages.numel()),
+            "train_val_lineage_overlap": overlap,
+        },
     )
 
 

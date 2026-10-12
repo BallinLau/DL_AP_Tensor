@@ -28,6 +28,7 @@ from data.entry import (
 from data.simulate_ts import SimulateTS
 from data.simulate_ts_parallel import _expand_branches_batched
 from data.sample import Sample
+from data.state_bank import StateBank, StateBankCapture
 from experiments.fill_fullN_entrants import fill_df_to_fullN
 from experiments.run_multi_episode_job import configure_hyperparams, parse_args
 from training.episode import Episode
@@ -322,7 +323,15 @@ def test_capital_decomposition_reports_actual_endpoints_and_rejects_duplicate_id
         )
 
 
-def _value_cost_sim(*, horizon=2, capital_ratio=1.0, bp_source="head"):
+def _value_cost_sim(
+    *,
+    horizon=2,
+    capital_ratio=1.0,
+    bp_source="head",
+    initial_state=None,
+    state_bank_capture=None,
+    stable_identity_rng=False,
+):
     model = _SimulationPolicy()
     kwargs = {}
     if bp_source == "grid":
@@ -347,9 +356,85 @@ def _value_cost_sim(*, horizon=2, capital_ratio=1.0, bp_source="head"):
         entry_rng_seed=17,
         consumption_aggregation_mode="raw",
         node_accounting_mode="economic_node_ledger",
+        initial_state=initial_state,
+        state_bank_capture=state_bank_capture,
+        transition_rng_mode=(
+            "stable_firm_identity" if stable_identity_rng else "legacy_position"
+        ),
+        common_transition_seed=24680 if stable_identity_rng else None,
+        entry_rng_mode=(
+            "stable_economic_identity"
+            if stable_identity_rng
+            else "legacy_sequential"
+        ),
         **kwargs,
     )
     return simulator, model
+
+
+@torch.random.fork_rng(devices=[])
+def test_entry_enabled_continuous_and_saved_bank_resume_match_exactly(tmp_path):
+    compatibility = {"format_version": "state_bank_v2", "test": "entry_resume"}
+    continuous_bank = StateBank(
+        compatibility=compatibility,
+        source_episode=1,
+    )
+    continuous_capture = StateBankCapture(
+        continuous_bank,
+        burn_in=2,
+        capture_stride=2,
+    )
+    continuous, _ = _value_cost_sim(
+        horizon=5,
+        state_bank_capture=continuous_capture,
+        stable_identity_rng=True,
+    )
+    continuous.simulate_tensor()
+
+    checkpoint_id = next(
+        entry["entry_id"]
+        for entry in continuous_bank.entries
+        if entry["capture_time"] == 2
+    )
+    expected_id = next(
+        entry["entry_id"]
+        for entry in continuous_bank.entries
+        if entry["capture_time"] == 4
+    )
+    bank_path = continuous_bank.save(tmp_path / "entry_resume.pt")
+    reloaded = StateBank.load(
+        bank_path,
+        expected_compatibility=compatibility,
+    )
+
+    resumed_bank = StateBank(
+        compatibility=compatibility,
+        source_episode=2,
+    )
+    resumed_capture = StateBankCapture(
+        resumed_bank,
+        burn_in=2,
+        capture_stride=1,
+    )
+    resumed, _ = _value_cost_sim(
+        horizon=3,
+        initial_state=reloaded.stack_entries([checkpoint_id]),
+        state_bank_capture=resumed_capture,
+        stable_identity_rng=True,
+    )
+    resumed.simulate_tensor()
+
+    expected = continuous_bank._entry_index[expected_id]["fields"]
+    actual = resumed_bank.entries[0]["fields"]
+    assert set(actual) == set(expected)
+    for name, expected_tensor in expected.items():
+        torch.testing.assert_close(
+            actual[name],
+            expected_tensor,
+            rtol=0.0,
+            atol=0.0,
+            equal_nan=True,
+        )
 
 
 @pytest.mark.parametrize("bp_source", ["head", "grid"])

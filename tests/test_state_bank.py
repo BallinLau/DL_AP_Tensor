@@ -8,13 +8,24 @@ import torch
 
 from config import Config
 from data import simulate_ts_parallel
+from data.entry import compute_entry_reference
 from data.simulate_ts import SimulateTS
-from data.state_bank import StateBank, StateBankCapture, clone_state
+from data.state_bank import (
+    StateBank,
+    StateBankCapture,
+    StateBankRolloutChunk,
+    StateBankRolloutPlan,
+    clone_state,
+)
+from data.tensor_data import TensorSimulationOutput, TensorTable
 from experiments.run_multi_episode_job import (
     build_and_commit_state_bank,
     configure_hyperparams,
+    evaluate_state_bank_acceptance,
     parse_args,
 )
+from training.pv_mixture import PVParentGroupPool, split_pool_by_lineage
+from training.episode import Episode
 
 
 def _compatibility(*, branch_num: int = 2, marker: str = "baseline") -> dict:
@@ -318,3 +329,353 @@ def test_state_bank_cli_is_opt_in_and_preserves_entry_scale(monkeypatch):
     assert hp.state_bank_sample_seed == 101
     assert hp.state_bank_refresh_seed == 202
     assert hp.entry_size_ratio == pytest.approx(1.0)
+
+
+def test_bootstrap_and_refresh_capture_schedules_are_distinct():
+    _, state = _fresh_state(n_paths=1)
+    bootstrap_bank = StateBank(compatibility=_compatibility(), source_episode=1)
+    bootstrap = StateBankCapture(
+        bootstrap_bank, burn_in=4, capture_stride=2
+    )
+    refresh_bank = StateBank(compatibility=_compatibility(), source_episode=2)
+    refresh = StateBankCapture(refresh_bank, burn_in=1, capture_stride=1)
+    for time_index in range(7):
+        state["economic_time"].fill_(time_index)
+        bootstrap.capture_parent_ready(state, time_index=time_index)
+        refresh.capture_parent_ready(state, time_index=time_index)
+    assert [entry["capture_time"] for entry in bootstrap_bank.entries] == [4, 6]
+    assert [entry["capture_time"] for entry in refresh_bank.entries] == list(range(1, 7))
+
+
+def test_rollout_plan_meets_budget_in_chunks_without_path_namespace_collision():
+    _, state = _fresh_state(n_paths=4)
+    bank = StateBank(compatibility=_compatibility(), source_episode=1)
+    bank.capture(
+        state,
+        capture_time=3,
+        lineage_ids=[f"lineage-{index}" for index in range(4)],
+    )
+    plan = StateBankRolloutPlan.build(
+        bank,
+        episode_id=2,
+        n_paths_per_chunk=3,
+        short_horizon=2,
+        parent_transition_budget=13,
+        sample_seed=17,
+        sampling_mode="uniform_lineage",
+        transition_seed=29,
+    )
+    assert len(plan.chunks) == 3
+    assert sum(chunk.n_paths for chunk in plan.chunks) * plan.short_horizon >= 13
+    namespaces = [
+        range(chunk.path_offset, chunk.path_offset + chunk.n_paths)
+        for chunk in plan.chunks
+    ]
+    flat = [path for namespace in namespaces for path in namespace]
+    assert len(flat) == len(set(flat))
+    assert plan.summary()["requested_parent_budget"] == 13
+
+
+def test_episode_multichunk_concat_and_matched_replay_use_same_plan(monkeypatch):
+    class FakeSimulator:
+        FIRM_COLUMNS = ["path", "t", "branch"]
+        MACRO_COLUMNS = ["path", "t", "branch"]
+
+        def __init__(self, *, n_paths, horizon, **_kwargs):
+            self.n_paths = int(n_paths)
+            self.horizon = int(horizon)
+
+        def simulate_tensor(self):
+            rows = []
+            for time_index in range(self.horizon):
+                for path_index in range(self.n_paths):
+                    rows.append([path_index, time_index, -1])
+                    rows.append([path_index, time_index + 1, 0])
+                    rows.append([path_index, time_index + 1, 1])
+            table = torch.tensor(rows, dtype=torch.float32)
+            return TensorSimulationOutput(
+                firm=TensorTable(table.clone(), self.FIRM_COLUMNS),
+                macro=TensorTable(table.clone(), self.MACRO_COLUMNS),
+                meta={"fake": True},
+            )
+
+    monkeypatch.setattr("training.episode.SimulateTS", FakeSimulator)
+    chunks = (
+        StateBankRolloutChunk(
+            chunk_id=0,
+            path_offset=0,
+            entry_ids=("a", "b"),
+            lineage_ids=("la", "lb"),
+            initial_state_cpu={"b": torch.zeros(2, 1)},
+            transition_seed=3,
+        ),
+        StateBankRolloutChunk(
+            chunk_id=1,
+            path_offset=2,
+            entry_ids=("c",),
+            lineage_ids=("lc",),
+            initial_state_cpu={"b": torch.zeros(1, 1)},
+            transition_seed=3,
+        ),
+    )
+    plan = StateBankRolloutPlan(
+        episode_id=2,
+        short_horizon=2,
+        requested_parent_transitions=6,
+        sampling_mode="uniform_lineage",
+        chunks=chunks,
+    )
+    episode = Episode.__new__(Episode)
+    episode.models = {}
+    episode.config = Config
+    episode._prepare_simulation_kwargs = lambda kwargs: dict(kwargs)
+    episode._state_bank_rollout_replay_fingerprints = []
+    episode._simulate_state_bank_rollout_plan(
+        plan,
+        group_size=1,
+        n_branches=2,
+        simulate_kwargs={},
+    )
+    first_firm = episode.tensor_firm.data.clone()
+    paths = torch.unique(
+        episode.tensor_macro.data[
+            :, list(episode.tensor_macro.columns).index("path")
+        ]
+    )
+    assert paths.tolist() == [0.0, 1.0, 2.0]
+    assert episode._last_simulation_meta["actual_parent_transitions"] == 6
+    episode._simulate_state_bank_rollout_plan(
+        plan,
+        group_size=1,
+        n_branches=2,
+        simulate_kwargs={},
+    )
+    _assert_tensor_equal(episode.tensor_firm.data, first_firm)
+    assert episode._last_simulation_meta["rollout_replay_count"] == 2
+    assert episode._last_simulation_meta["matched_entry_ids_equal"] is True
+
+
+def test_uniform_lineage_sampling_does_not_weight_long_lineage_by_entry_count():
+    _, state = _fresh_state(n_paths=1)
+    bank = StateBank(compatibility=_compatibility(), source_episode=1)
+    for capture_time in range(20):
+        bank.capture(
+            state,
+            capture_time=capture_time,
+            lineage_ids=["long"],
+            entry_namespace=f"long-{capture_time}",
+        )
+    bank.capture(
+        state,
+        capture_time=100,
+        lineage_ids=["short"],
+        entry_namespace="short",
+    )
+    sampled = bank.sample_entry_ids(
+        2000, seed=7, episode_id=2, mode="uniform_lineage"
+    )
+    lineages = bank.lineage_ids_for_entries(sampled)
+    short_share = lineages.count("short") / len(lineages)
+    assert short_share == pytest.approx(0.5, abs=0.05)
+
+
+def test_lineage_id_persists_when_descendant_bank_is_captured():
+    _, state = _fresh_state(n_paths=2)
+    parent = StateBank(compatibility=_compatibility(), source_episode=1)
+    parent.capture(
+        state,
+        capture_time=20,
+        lineage_ids=["root:path:0", "root:path:1"],
+    )
+    sampled_ids = parent.sample_entry_ids(
+        2,
+        seed=41,
+        episode_id=2,
+        mode="uniform_lineage",
+    )
+    inherited_lineages = parent.lineage_ids_for_entries(sampled_ids)
+    descendant = StateBank(compatibility=_compatibility(), source_episode=2)
+    capture = StateBankCapture(descendant, burn_in=1, capture_stride=1)
+    capture.set_context(
+        lineage_ids=inherited_lineages,
+        entry_namespace="refresh-chunk-0",
+    )
+    restored = parent.stack_entries(sampled_ids)
+    capture.capture_parent_ready(restored, time_index=1)
+
+    assert [entry["lineage_id"] for entry in descendant.entries] == inherited_lineages
+    assert all(entry["source_episode"] == 2 for entry in descendant.entries)
+    assert all(entry["capture_time"] == 1 for entry in descendant.entries)
+
+
+def test_reservoir_cap_is_deterministic_rng_neutral_and_not_prefix_biased():
+    _, state = _fresh_state(n_paths=1)
+
+    def build(seed):
+        bank = StateBank(compatibility=_compatibility(), source_episode=1)
+        capture = StateBankCapture(
+            bank,
+            burn_in=1,
+            capture_stride=1,
+            max_entries=5,
+            reservoir_seed=seed,
+        )
+        for time_index in range(1, 31):
+            state["economic_time"].fill_(time_index)
+            capture.capture_parent_ready(state, time_index=time_index)
+        return bank
+
+    torch.manual_seed(999)
+    before = torch.get_rng_state().clone()
+    first = build(123)
+    assert torch.equal(torch.get_rng_state(), before)
+    second = build(123)
+    assert first.entry_ids == second.entry_ids
+    capture_times = [entry["capture_time"] for entry in first.entries]
+    assert len(first) == 5
+    assert max(capture_times) > 5
+
+
+def test_lineage_split_has_zero_overlap_with_multiple_states_per_lineage():
+    parent = torch.arange(48, dtype=torch.float32).reshape(6, 8)
+    pool = PVParentGroupPool(
+        parent=parent,
+        children=[parent.clone(), parent.clone()],
+        source_id=torch.zeros(6, dtype=torch.long),
+        source_index=torch.arange(6),
+        lineage_id=torch.tensor([0, 0, 1, 1, 2, 2]),
+    )
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(10)
+    train, val, summary = split_pool_by_lineage(pool, 1 / 3, generator)
+    assert summary["train_val_lineage_overlap"] == 0
+    assert set(train.lineage_id.tolist()).isdisjoint(set(val.lineage_id.tolist()))
+    assert len(train) + len(val) == len(pool)
+
+
+def test_compatibility_mismatch_reports_changed_field(tmp_path):
+    _, state = _fresh_state(n_paths=1)
+    bank = StateBank(
+        compatibility={"format_version": "state_bank_v2", "G": 1.12},
+        source_episode=1,
+    )
+    bank.capture(state, capture_time=2)
+    path = bank.save(tmp_path / "bank.pt")
+    with pytest.raises(ValueError, match='"G".*1.12.*1.14'):
+        StateBank.load(
+            path,
+            expected_compatibility={"format_version": "state_bank_v2", "G": 1.14},
+        )
+
+
+def test_transition_only_continuous_and_saved_resume_match_exactly(tmp_path):
+    continuous_bank = StateBank(compatibility=_compatibility(), source_episode=1)
+    continuous_capture = StateBankCapture(
+        continuous_bank, burn_in=2, capture_stride=2
+    )
+    _simulator(horizon=5, capture=continuous_capture).simulate_tensor()
+    checkpoint_id = next(
+        entry["entry_id"]
+        for entry in continuous_bank.entries
+        if entry["capture_time"] == 2
+    )
+    expected_id = next(
+        entry["entry_id"]
+        for entry in continuous_bank.entries
+        if entry["capture_time"] == 4
+    )
+    checkpoint = continuous_bank.stack_entries([checkpoint_id])
+    saved = continuous_bank.save(tmp_path / "resume.pt")
+    loaded = StateBank.load(saved)
+    resumed_bank = StateBank(compatibility=_compatibility(), source_episode=2)
+    resumed_capture = StateBankCapture(resumed_bank, burn_in=2, capture_stride=1)
+    _simulator(
+        n_paths=1,
+        horizon=3,
+        initial_state=loaded.stack_entries([checkpoint_id]),
+        capture=resumed_capture,
+    ).simulate_tensor()
+    expected = continuous_bank._entry_index[expected_id]["fields"]
+    actual = resumed_bank.entries[0]["fields"]
+    for name in expected:
+        _assert_tensor_equal(actual[name], expected[name])
+    for name, value in checkpoint.items():
+        _assert_tensor_equal(value, loaded.stack_entries([checkpoint_id])[name])
+
+
+def test_entry_identity_draws_survive_bank_save_reload_without_global_rng_use(tmp_path):
+    _, state = _fresh_state(n_paths=2)
+    sim = SimpleNamespace(
+        config=Config,
+        entry_rng_seed=86420,
+        effective_entry_cost_max=1.0,
+        entry_capital_ratio=0.10,
+        entry_size_ratio=1.0,
+    )
+    reference = compute_entry_reference(
+        state["K"],
+        state["alive"],
+        entry_capital_ratio=sim.entry_capital_ratio,
+        entry_size_ratio=sim.entry_size_ratio,
+    )
+    before = torch.get_rng_state().clone()
+    expected = simulate_ts_parallel._stable_entry_candidates(sim, state, reference)
+    assert torch.equal(torch.get_rng_state(), before)
+    bank = StateBank(compatibility=_compatibility(), source_episode=1)
+    bank.capture(state, capture_time=2)
+    loaded = StateBank.load(bank.save(tmp_path / "entry_resume.pt"))
+    resumed = loaded.stack_entries(loaded.entry_ids)
+    resumed_reference = compute_entry_reference(
+        resumed["K"],
+        resumed["alive"],
+        entry_capital_ratio=sim.entry_capital_ratio,
+        entry_size_ratio=sim.entry_size_ratio,
+    )
+    actual = simulate_ts_parallel._stable_entry_candidates(
+        sim, resumed, resumed_reference
+    )
+    for name in (
+        "counts", "mask", "z", "entry_cost", "K_birth",
+        "potential_capital_nominal", "candidate_capital_realized",
+    ):
+        _assert_tensor_equal(getattr(actual, name), getattr(expected, name))
+
+
+def test_strict_acceptance_rejects_missing_gates_and_preserves_bank_file(tmp_path):
+    _, state = _fresh_state(n_paths=1)
+    previous = StateBank(compatibility=_compatibility(), source_episode=1)
+    previous.capture(state, capture_time=2)
+    output = previous.save(tmp_path / "bank_ep2.pt")
+    before = output.read_bytes()
+    candidate = StateBank(compatibility=_compatibility(), source_episode=2)
+    candidate.capture(state, capture_time=3, lineage_ids=["root:0"])
+    hp = SimpleNamespace(
+        state_bank_acceptance_mode="strict",
+        state_bank_min_unique_lineages=1,
+    )
+    result = evaluate_state_bank_acceptance(
+        episode_summary={"module_summaries": {}},
+        candidate_bank=candidate,
+        hyperparams=hp,
+    )
+    assert result["episode_acceptance_passed"] is False
+    assert any("policy_value_stage_passed" in reason for reason in result["reasons"])
+    assert output.read_bytes() == before
+
+
+def test_state_bank_slurm_pins_formal_v2_parameters():
+    text = Path(
+        "slurm/run_normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500_"
+        "investment_compare_state_bank.slurm"
+    ).read_text(encoding="utf-8")
+    for expected in (
+        "STATE_BANK_ENABLED=1",
+        "STATE_BANK_PARENT_TRANSITION_BUDGET:-40000",
+        "STATE_BANK_MAX_ENTRIES:-5000",
+        "STATE_BANK_SAMPLING_MODE:-uniform_lineage",
+        "STATE_BANK_ACCEPTANCE_MODE:-strict",
+        "TRANSITION_RNG_MODE=stable_firm_identity",
+        "ENTRY_RNG_MODE=stable_economic_identity",
+        "ENTRY_SIZE_RATIO=1.0",
+    ):
+        assert expected in text

@@ -31,6 +31,7 @@ from data import Sample, SimulateTS, TensorTable, TensorSimulationOutput
 from data.state_bank import (
     StateBank,
     StateBankCapture,
+    StateBankRolloutPlan,
     build_state_bank_compatibility,
     clone_state,
 )
@@ -66,9 +67,12 @@ from .bp_policy_loss import (
 from .pv_mixture import (
     PVParentGroupPool,
     build_selected_mixture_split,
+    concat_parent_group_pools,
     fixed_total_source_counts,
     sample_pool_without_replacement,
     select_parent_groups,
+    source_counts,
+    split_pool_by_lineage,
 )
 from .pq_value_cache import PQValueTargetBatch
 from .target_utils import hard_update, soft_update
@@ -1133,10 +1137,14 @@ class Episode:
             "entry_dummy_i",
             "entry_inference_chunk_size",
             "entry_rng_seed",
+            "entry_rng_mode",
             "consumption_aggregation_mode",
             "consumption_floor",
             "node_accounting_mode",
             "entry_independent_resource_validation_enabled",
+            "transition_rng_mode",
+            "common_transition_seed",
+            "preserve_global_rng_around_entry",
         ):
             sim_kwargs[name] = getattr(self.hyperparams, name)
         sim_kwargs["entry_hatc_failure_scan_enabled"] = bool(
@@ -2061,11 +2069,17 @@ class Episode:
             dtype=torch.long,
         )
         source_index = parent_take.to(device=parent.device, dtype=torch.long)
+        lineage_id = (
+            data[parent_take, col['lineage_id']].to(device=parent.device, dtype=torch.long)
+            if 'lineage_id' in col
+            else None
+        )
         return PVParentGroupPool(
             parent=parent,
             children=children,
             source_id=source_tensor,
             source_index=source_index,
+            lineage_id=lineage_id,
         )
 
     def _parent_group_pool_to_batches(
@@ -2077,15 +2091,18 @@ class Episode:
     ) -> List[Dict[str, torch.Tensor]]:
         if pool is None or len(pool) == 0:
             return []
+        extra_tensors = {
+            "source_id": pool.source_id,
+            "source_index": pool.source_index,
+        }
+        if pool.lineage_id is not None:
+            extra_tensors["lineage_id"] = pool.lineage_id
         return self._build_batches_from_parent_children(
             parent=pool.parent,
             children=pool.children,
             batch_size=batch_size,
             eta_resample=eta_resample,
-            extra_tensors={
-                "source_id": pool.source_id,
-                "source_index": pool.source_index,
-            },
+            extra_tensors=extra_tensors,
             shuffle=shuffle,
         )
 
@@ -2192,6 +2209,11 @@ class Episode:
             children=[child[:0] for child in pool.children],
             source_id=torch.empty(0, device=pool.parent.device, dtype=torch.long).fill_(int(source_id)),
             source_index=torch.empty(0, device=pool.parent.device, dtype=torch.long),
+            lineage_id=(
+                None
+                if pool.lineage_id is None
+                else torch.empty(0, device=pool.parent.device, dtype=torch.long)
+            ),
         )
 
     def _pv_mixture_enabled_for_episode(self) -> Tuple[bool, str]:
@@ -2329,16 +2351,61 @@ class Episode:
         coverage_selected = sample_pool_without_replacement(coverage_pool, n_coverage, generator)
 
         val_fraction = float(getattr(hp, "pv_target_grid_val_fraction", 0.10))
-        train_pool, val_pool, mix_summary = build_selected_mixture_split(
-            sim_selected=sim_selected,
-            coverage_selected=coverage_selected,
-            val_fraction=val_fraction,
-            generator=generator,
-            stratified_validation=bool(getattr(hp, "pv_mixture_stratified_validation", True)),
-            sim_parent_groups_available=n_available,
-            coverage_parent_groups_available=len(coverage_pool),
-            total_parent_budget=n_total,
+        state_bank_lineage_split = bool(
+            getattr(hp, "state_bank_enabled", False)
+            and sim_selected.lineage_id is not None
         )
+        if state_bank_lineage_split:
+            # Synthetic coverage states have no economic ancestry. Assign each
+            # one a unique negative lineage so they cannot bridge train/val.
+            coverage_selected = PVParentGroupPool(
+                parent=coverage_selected.parent,
+                children=coverage_selected.children,
+                source_id=coverage_selected.source_id,
+                source_index=coverage_selected.source_index,
+                lineage_id=-torch.arange(
+                    1,
+                    len(coverage_selected) + 1,
+                    device=coverage_selected.parent.device,
+                    dtype=torch.long,
+                ),
+            )
+            combined = concat_parent_group_pools(
+                [sim_selected, coverage_selected]
+            )
+            train_pool, val_pool, lineage_summary = split_pool_by_lineage(
+                combined, val_fraction, generator
+            )
+            train_counts = source_counts(train_pool)
+            val_counts = source_counts(val_pool)
+            mix_summary = {
+                "sim_parent_groups_available": float(n_available),
+                "coverage_parent_groups_available": float(len(coverage_pool)),
+                "total_parent_budget": float(n_total),
+                "sim_parent_groups_selected": float(len(sim_selected)),
+                "coverage_parent_groups_selected": float(len(coverage_selected)),
+                "mixed_parent_groups_selected": float(len(combined)),
+                "train_parent_groups": float(len(train_pool)),
+                "validation_parent_groups": float(len(val_pool)),
+                "train_sim_parent_groups": float(train_counts["source0"]),
+                "train_coverage_parent_groups": float(train_counts["source1"]),
+                "validation_sim_parent_groups": float(val_counts["source0"]),
+                "validation_coverage_parent_groups": float(val_counts["source1"]),
+                "lineage_split_active": True,
+                **lineage_summary,
+            }
+        else:
+            train_pool, val_pool, mix_summary = build_selected_mixture_split(
+                sim_selected=sim_selected,
+                coverage_selected=coverage_selected,
+                val_fraction=val_fraction,
+                generator=generator,
+                stratified_validation=bool(getattr(hp, "pv_mixture_stratified_validation", True)),
+                sim_parent_groups_available=n_available,
+                coverage_parent_groups_available=len(coverage_pool),
+                total_parent_budget=n_total,
+            )
+            mix_summary["lineage_split_active"] = False
         train_pool = self._shuffle_pool(train_pool, generator)
         val_pool = self._shuffle_pool(val_pool, generator)
         train_batches = self._parent_group_pool_to_batches(
@@ -2397,18 +2464,22 @@ class Episode:
             path[child_idx], torch.zeros_like(path[child_idx]), child_parent_t, max_id=1, max_t=key_max_t
         )
         valid, matched_parent_idx = self._match_keys(child_key, parent_key, parent_idx)
+        output_columns = [
+            'path', 't', 'branch', 'x_t', 'x_t1', 'Hatcf_t', 'LnKF_t',
+            'Hatc_t', 'LnK_t', 'Hatc_t1', 'LnK_t1'
+        ]
+        if 'lineage_id' in col:
+            output_columns.append('lineage_id')
         if valid.sum().item() == 0:
-            empty = torch.empty((0, 11), device=self.device, dtype=torch.float32)
-            return TensorTable(
-                data=empty,
-                columns=['path', 't', 'branch', 'x_t', 'x_t1', 'Hatcf_t', 'LnKF_t', 'Hatc_t', 'LnK_t', 'Hatc_t1', 'LnK_t1']
+            empty = torch.empty(
+                (0, len(output_columns)), device=self.device, dtype=torch.float32
             )
+            return TensorTable(data=empty, columns=output_columns)
 
         child_take = child_idx[valid]
         parent_take = matched_parent_idx[valid]
 
-        out = torch.stack(
-            [
+        output_parts = [
                 data[child_take, col['path']],    # path
                 data[child_take, col['t']],       # t (child t)
                 data[child_take, col['branch']],  # child branch
@@ -2420,13 +2491,15 @@ class Episode:
                 data[parent_take, col['LnK']],    # LnK_t
                 data[child_take, col['Hatc']],    # Hatc_t1
                 data[child_take, col['LnK']],     # LnK_t1
-            ],
-            dim=1
-        ).to(torch.float32)
-        return TensorTable(
-            data=out,
-            columns=['path', 't', 'branch', 'x_t', 'x_t1', 'Hatcf_t', 'LnKF_t', 'Hatc_t', 'LnK_t', 'Hatc_t1', 'LnK_t1']
-        )
+        ]
+        if 'lineage_id' in col:
+            child_lineage = data[child_take, col['lineage_id']]
+            parent_lineage = data[parent_take, col['lineage_id']]
+            if not torch.equal(child_lineage, parent_lineage):
+                raise RuntimeError("Macro parent/child lineage ids are inconsistent")
+            output_parts.append(child_lineage)
+        out = torch.stack(output_parts, dim=1).to(torch.float32)
+        return TensorTable(data=out, columns=output_columns)
 
     def _create_sdf_batches_from_macro_tensor(
         self,
@@ -2647,7 +2720,14 @@ class Episode:
         val_fraction = float(getattr(self.hyperparams, "sdf_fc1_val_fraction", 0.2))
         val_fraction = min(max(val_fraction, 0.0), 0.5)
         path = sdf_table.data[:, col['path']].long()
-        unique_paths = torch.unique(path)
+        split_name = (
+            'lineage_id'
+            if bool(getattr(self.hyperparams, "state_bank_enabled", False))
+            and 'lineage_id' in col
+            else 'path'
+        )
+        split_id = sdf_table.data[:, col[split_name]].long()
+        unique_paths = torch.unique(split_id)
         allow_in_sample = bool(getattr(self.hyperparams, "allow_in_sample_sdf_gate_for_debug", False))
         if val_fraction <= 0.0:
             if not allow_in_sample:
@@ -2679,8 +2759,13 @@ class Episode:
         n_val = min(max(1, n_val), unique_paths.numel() - 1)
         val_paths = unique_paths[order[:n_val]]
         train_paths = unique_paths[order[n_val:]]
-        val_mask = torch.isin(path, val_paths)
-        train_mask = torch.isin(path, train_paths)
+        val_mask = torch.isin(split_id, val_paths)
+        train_mask = torch.isin(split_id, train_paths)
+        overlap = torch.isin(train_paths, val_paths).sum().item()
+        if overlap:
+            raise RuntimeError(
+                f"SDF/FC1 train-validation {split_name} overlap: {overlap}"
+            )
         train_table = TensorTable(data=sdf_table.data[train_mask], columns=list(sdf_table.columns))
         val_table = TensorTable(data=sdf_table.data[val_mask], columns=list(sdf_table.columns))
         return train_table, val_table, {
@@ -2691,6 +2776,10 @@ class Episode:
             'sdf_fc1_val_paths': int(val_paths.numel()),
             'sdf_fc1_train_rows': int(train_table.data.shape[0]),
             'sdf_fc1_val_rows': int(val_table.data.shape[0]),
+            'sdf_fc1_split_unit': split_name,
+            'train_lineage_count': int(train_paths.numel()) if split_name == 'lineage_id' else None,
+            'val_lineage_count': int(val_paths.numel()) if split_name == 'lineage_id' else None,
+            'train_val_lineage_overlap': int(overlap) if split_name == 'lineage_id' else None,
         }
     
     def _init_weight_scheduler(self) -> LossWeightScheduler:
@@ -12004,6 +12093,160 @@ class Episode:
             self.df = None
             self.df_macro = None
 
+    @staticmethod
+    def _offset_tensor_table_paths(table: TensorTable, path_offset: int) -> TensorTable:
+        columns = list(table.columns)
+        if "path" not in columns or int(path_offset) == 0:
+            return table
+        data = table.data.clone()
+        data[:, columns.index("path")] += float(path_offset)
+        return TensorTable(data=data, columns=columns)
+
+    @staticmethod
+    def _append_tensor_table_column(
+        table: TensorTable,
+        name: str,
+        values: torch.Tensor,
+    ) -> TensorTable:
+        if name in table.columns:
+            raise ValueError(f"Tensor table already contains {name!r}")
+        if values.ndim != 1 or values.shape[0] != table.data.shape[0]:
+            raise ValueError(
+                f"Column {name!r} has shape {tuple(values.shape)} for "
+                f"table rows={table.data.shape[0]}"
+            )
+        return TensorTable(
+            data=torch.cat(
+                [table.data, values.to(table.data.device, table.data.dtype).unsqueeze(1)],
+                dim=1,
+            ),
+            columns=[*table.columns, name],
+        )
+
+    def _simulate_state_bank_rollout_plan(
+        self,
+        plan: StateBankRolloutPlan,
+        *,
+        group_size: int,
+        n_branches: int,
+        simulate_kwargs: Dict,
+        export_df: bool = False,
+    ) -> None:
+        """Run and concatenate one immutable State Bank short-rollout plan."""
+        sim_kwargs = self._prepare_simulation_kwargs(simulate_kwargs)
+        firm_tables: List[TensorTable] = []
+        macro_tables: List[TensorTable] = []
+        chunk_meta: List[Dict[str, Any]] = []
+        lineage_codes = {
+            lineage: index
+            for index, lineage in enumerate(sorted(set(plan.lineage_ids)))
+        }
+        for chunk in plan.chunks:
+            chunk_lineage_codes = torch.tensor(
+                [lineage_codes[lineage] for lineage in chunk.lineage_ids],
+                dtype=torch.long,
+            )
+            chunk_kwargs = dict(sim_kwargs)
+            chunk_kwargs["common_transition_seed"] = int(chunk.transition_seed)
+            simulator = SimulateTS(
+                models=self.models,
+                config=self.config,
+                n_paths=chunk.n_paths,
+                group_size=group_size,
+                branch_num=n_branches,
+                horizon=plan.short_horizon,
+                initial_state=clone_state(chunk.initial_state_cpu, device="cpu"),
+                **chunk_kwargs,
+            )
+            out = simulator.simulate_tensor()
+            firm = self._offset_tensor_table_paths(out.firm, chunk.path_offset)
+            macro = self._offset_tensor_table_paths(out.macro, chunk.path_offset)
+            for table_name, table in (("firm", firm), ("macro", macro)):
+                path_col = list(table.columns).index("path")
+                local_path = (table.data[:, path_col].long() - int(chunk.path_offset))
+                if local_path.numel() and (
+                    int(local_path.min()) < 0 or int(local_path.max()) >= chunk.n_paths
+                ):
+                    raise RuntimeError(
+                        f"State Bank {table_name} output contains invalid local path ids"
+                    )
+                codes = chunk_lineage_codes.to(table.data.device)[local_path]
+                table = self._append_tensor_table_column(table, "lineage_id", codes)
+                if table_name == "firm":
+                    firm = table
+                else:
+                    macro = table
+            firm_tables.append(firm)
+            macro_tables.append(macro)
+            chunk_meta.append(
+                {
+                    "chunk_id": int(chunk.chunk_id),
+                    "path_offset": int(chunk.path_offset),
+                    "n_paths": int(chunk.n_paths),
+                    "entry_ids": list(chunk.entry_ids),
+                    "lineage_ids": list(chunk.lineage_ids),
+                    "transition_seed": int(chunk.transition_seed),
+                    "simulation_meta": dict(out.meta),
+                }
+            )
+        if not firm_tables or not macro_tables:
+            raise RuntimeError("State Bank rollout plan produced no simulation chunks")
+        firm_columns = list(firm_tables[0].columns)
+        macro_columns = list(macro_tables[0].columns)
+        if any(list(table.columns) != firm_columns for table in firm_tables):
+            raise RuntimeError("State Bank firm chunk schemas differ")
+        if any(list(table.columns) != macro_columns for table in macro_tables):
+            raise RuntimeError("State Bank macro chunk schemas differ")
+        self.tensor_firm = TensorTable(
+            data=torch.cat([table.data for table in firm_tables], dim=0),
+            columns=firm_columns,
+        )
+        self.tensor_macro = TensorTable(
+            data=torch.cat([table.data for table in macro_tables], dim=0),
+            columns=macro_columns,
+        )
+        macro_col = {name: index for index, name in enumerate(macro_columns)}
+        actual_parent_transitions = int(
+            (self.tensor_macro.data[:, macro_col["branch"]].long() == -1).sum().item()
+        )
+        unique_paths = int(
+            torch.unique(self.tensor_macro.data[:, macro_col["path"]].long()).numel()
+        )
+        expected_paths = sum(chunk.n_paths for chunk in plan.chunks)
+        if unique_paths != expected_paths:
+            raise RuntimeError(
+                "State Bank chunk path namespaces collided: "
+                f"unique={unique_paths}, expected={expected_paths}"
+            )
+        self._last_simulation_meta = {
+            **plan.summary(),
+            "actual_parent_transitions": actual_parent_transitions,
+            "output_unique_paths": unique_paths,
+            "chunks": chunk_meta,
+            "lineage_codebook": {str(value): key for key, value in lineage_codes.items()},
+            "matched_rollout_plan": True,
+        }
+        replay_history = list(
+            getattr(self, "_state_bank_rollout_replay_fingerprints", [])
+        )
+        replay_history.append(plan.fingerprint())
+        self._state_bank_rollout_replay_fingerprints = replay_history
+        self._last_simulation_meta.update(
+            {
+                "rollout_replay_count": len(replay_history),
+                "rollout_replay_fingerprints": replay_history,
+                "matched_entry_ids_equal": len(set(replay_history)) == 1,
+            }
+        )
+        if export_df:
+            self.df, self.df_macro = (
+                self.tensor_firm.to_dataframe(),
+                self.tensor_macro.to_dataframe(),
+            )
+        else:
+            self.df = None
+            self.df_macro = None
+
     def _state_bank_compatibility(self, n_branches: int) -> Dict[str, Any]:
         return build_state_bank_compatibility(
             config=self.config,
@@ -12027,21 +12270,24 @@ class Episode:
         if not bool(getattr(self.hyperparams, "state_bank_enabled", False)):
             raise RuntimeError("State Bank construction requested while disabled")
 
+        rollout_plan = getattr(self, "_state_bank_rollout_plan", None)
         if episode_id == 1:
-            initial_state = None
             refresh_horizon = int(self.hyperparams.simulate_horizon)
             source_entry_ids: List[str] = []
-        else:
-            initial_state = getattr(self, "_state_bank_initial_state_cpu", None)
-            source_entry_ids = list(
-                getattr(self, "_state_bank_sampled_entry_ids", [])
+            burn_in = int(self.hyperparams.state_bank_bootstrap_burn_in)
+            capture_stride = int(
+                self.hyperparams.state_bank_bootstrap_capture_stride
             )
-            if initial_state is None or not source_entry_ids:
+        else:
+            source_entry_ids = list(getattr(self, "_state_bank_sampled_entry_ids", []))
+            if rollout_plan is None or not source_entry_ids:
                 raise RuntimeError(
-                    "Episode >= 2 State Bank refresh requires the sampled initial "
-                    "states used by the training simulations"
+                    "Episode >= 2 State Bank refresh requires the immutable rollout "
+                    "plan used by the training simulations"
                 )
             refresh_horizon = int(self.hyperparams.state_bank_short_horizon)
+            burn_in = int(self.hyperparams.state_bank_refresh_burn_in)
+            capture_stride = int(self.hyperparams.state_bank_refresh_capture_stride)
 
         compatibility = self._state_bank_compatibility(n_branches)
         bank = StateBank(
@@ -12050,18 +12296,24 @@ class Episode:
             metadata={
                 "source_episode": episode_id,
                 "initial_state_source": (
-                    "fresh" if initial_state is None else "previous_state_bank"
+                    "fresh" if episode_id == 1 else "previous_state_bank"
                 ),
                 "source_entry_ids": source_entry_ids,
                 "refresh_horizon": refresh_horizon,
                 "final_accepted_models": True,
+                "generation_id": f"ep{episode_id}",
+                "rollout_plan": None if rollout_plan is None else rollout_plan.summary(),
             },
         )
         capture = StateBankCapture(
             bank,
-            burn_in=int(self.hyperparams.state_bank_burn_in),
-            capture_stride=int(self.hyperparams.state_bank_capture_stride),
+            burn_in=burn_in,
+            capture_stride=capture_stride,
             max_entries=int(self.hyperparams.state_bank_max_entries),
+            reservoir_seed=(
+                int(self.hyperparams.state_bank_reservoir_seed)
+                + episode_id * 100_003
+            ),
         )
         refresh_simulate_kwargs = dict(simulate_kwargs)
         for runner_only_key in (
@@ -12084,26 +12336,51 @@ class Episode:
             torch.manual_seed(refresh_seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(refresh_seed)
-            simulator = SimulateTS(
-                models=self.models,
-                config=self.config,
-                n_paths=n_paths,
-                group_size=group_size,
-                branch_num=n_branches,
-                horizon=refresh_horizon,
-                initial_state=(
-                    None
-                    if initial_state is None
-                    else clone_state(initial_state, device="cpu")
-                ),
-                state_bank_capture=capture,
-                **sim_kwargs,
-            )
-            output = simulator.simulate_tensor()
+            outputs: List[Dict[str, Any]] = []
+            if episode_id == 1:
+                capture.set_context(lineage_ids=None, entry_namespace="bootstrap")
+                simulator = SimulateTS(
+                    models=self.models,
+                    config=self.config,
+                    n_paths=n_paths,
+                    group_size=group_size,
+                    branch_num=n_branches,
+                    horizon=refresh_horizon,
+                    initial_state=None,
+                    state_bank_capture=capture,
+                    **sim_kwargs,
+                )
+                output = simulator.simulate_tensor()
+                outputs.append(dict(output.meta))
+            else:
+                for chunk in rollout_plan.chunks:
+                    capture.set_context(
+                        lineage_ids=chunk.lineage_ids,
+                        entry_namespace=f"chunk{chunk.chunk_id}",
+                    )
+                    chunk_kwargs = dict(sim_kwargs)
+                    chunk_kwargs["common_transition_seed"] = int(
+                        chunk.transition_seed
+                    )
+                    simulator = SimulateTS(
+                        models=self.models,
+                        config=self.config,
+                        n_paths=chunk.n_paths,
+                        group_size=group_size,
+                        branch_num=n_branches,
+                        horizon=refresh_horizon,
+                        initial_state=clone_state(
+                            chunk.initial_state_cpu, device="cpu"
+                        ),
+                        state_bank_capture=capture,
+                        **chunk_kwargs,
+                    )
+                    output = simulator.simulate_tensor()
+                    outputs.append(dict(output.meta))
             bank.metadata.update(
                 {
                     "capture": capture.summary(),
-                    "simulation_meta": output.meta,
+                    "simulation_meta": outputs,
                     "refresh_seed": refresh_seed,
                 }
             )
@@ -12117,6 +12394,7 @@ class Episode:
             raise RuntimeError(
                 "State Bank refresh produced no parent-ready non-extinct entries"
             )
+        bank.metadata["distribution_summary"] = bank.distribution_summary()
         return bank
 
     def _run_fc2_epochs(
@@ -15348,6 +15626,8 @@ class Episode:
         )
         self._state_bank_initial_state_cpu = None
         self._state_bank_sampled_entry_ids = []
+        self._state_bank_rollout_plan = None
+        self._state_bank_rollout_replay_fingerprints = []
         if state_bank_enabled and mode != "modeb" and int(self.episode_id) >= 1:
             raise ValueError("State Bank v1 supports Mode B only")
         if state_bank_enabled and int(self.episode_id) >= 2:
@@ -15365,17 +15645,33 @@ class Episode:
             state_bank.validate_compatibility(
                 self._state_bank_compatibility(n_branches)
             )
-            sampled_ids = state_bank.sample_entry_ids(
-                n_paths,
-                seed=int(self.hyperparams.state_bank_sample_seed),
-                episode_id=int(self.episode_id),
-            )
-            self._state_bank_sampled_entry_ids = list(sampled_ids)
-            self._state_bank_initial_state_cpu = state_bank.stack_entries(
-                sampled_ids,
-                device="cpu",
-            )
             horizon_modeb = int(self.hyperparams.state_bank_short_horizon)
+            parent_budget = int(
+                getattr(self.hyperparams, "state_bank_parent_transition_budget", 0)
+            )
+            if parent_budget <= 0:
+                parent_budget = int(n_paths) * int(self.hyperparams.simulate_horizon)
+            transition_seed = getattr(self.hyperparams, "common_transition_seed", None)
+            if transition_seed is None:
+                transition_seed = int(self.hyperparams.state_bank_sample_seed)
+            self._state_bank_rollout_plan = StateBankRolloutPlan.build(
+                state_bank,
+                episode_id=int(self.episode_id),
+                n_paths_per_chunk=int(n_paths),
+                short_horizon=horizon_modeb,
+                parent_transition_budget=parent_budget,
+                sample_seed=int(self.hyperparams.state_bank_sample_seed),
+                sampling_mode=str(self.hyperparams.state_bank_sampling_mode),
+                transition_seed=int(transition_seed),
+            )
+            self._state_bank_sampled_entry_ids = list(
+                self._state_bank_rollout_plan.entry_ids
+            )
+            if self._state_bank_rollout_plan.chunks:
+                self._state_bank_initial_state_cpu = clone_state(
+                    self._state_bank_rollout_plan.chunks[0].initial_state_cpu,
+                    device="cpu",
+                )
 
         module_summaries = {}
         module_summaries["state_bank"] = {
@@ -15392,12 +15688,34 @@ class Episode:
             "sampled_entry_count": len(self._state_bank_sampled_entry_ids),
             "sampled_entry_ids": self._state_bank_sampled_entry_ids,
             "effective_horizon": int(horizon_modeb),
+            "rollout_plan": (
+                None
+                if self._state_bank_rollout_plan is None
+                else self._state_bank_rollout_plan.summary()
+            ),
         }
-        state_bank_simulation_kwargs = (
-            {}
-            if self._state_bank_initial_state_cpu is None
-            else {"initial_state": self._state_bank_initial_state_cpu}
-        )
+
+        def _simulate_modeb_tensor(*, export_df: bool) -> None:
+            if self._state_bank_rollout_plan is None:
+                self._simulate_tensor(
+                    n_paths=n_paths,
+                    group_size=group_size,
+                    n_branches=n_branches,
+                    horizon=horizon_modeb,
+                    simulate_kwargs=simulate_kwargs,
+                    export_df=export_df,
+                )
+            else:
+                self._simulate_state_bank_rollout_plan(
+                    self._state_bank_rollout_plan,
+                    group_size=group_size,
+                    n_branches=n_branches,
+                    simulate_kwargs=simulate_kwargs,
+                    export_df=export_df,
+                )
+                module_summaries["state_bank"].update(
+                    self._last_simulation_meta
+                )
         module_summaries["batch_configuration"] = {
             "fallback_batch_size": int(batch_size),
             "pv_batch_size": int(resolved_pv_batch_size),
@@ -15701,15 +16019,7 @@ class Episode:
                 }
                 modeb_rng_before_first_sim = self._capture_rng_state()
                 if tensor_pipeline:
-                    self._simulate_tensor(
-                        n_paths=n_paths,
-                        group_size=group_size,
-                        n_branches=n_branches,
-                        horizon=horizon_modeb,
-                        simulate_kwargs=simulate_kwargs,
-                        export_df=use_fc2,
-                        **state_bank_simulation_kwargs,
-                    )
+                    _simulate_modeb_tensor(export_df=use_fc2)
                 else:
                     self._simulate_df(
                         n_paths=n_paths,
@@ -15775,15 +16085,7 @@ class Episode:
                     rng_after_sdf_training = self._capture_rng_state()
                     self._restore_rng_state(modeb_rng_before_first_sim)
                     if tensor_pipeline:
-                        self._simulate_tensor(
-                            n_paths=n_paths,
-                            group_size=group_size,
-                            n_branches=n_branches,
-                            horizon=horizon_modeb,
-                            simulate_kwargs=simulate_kwargs,
-                            export_df=use_fc2,
-                            **state_bank_simulation_kwargs,
-                        )
+                        _simulate_modeb_tensor(export_df=use_fc2)
                     else:
                         self._simulate_df(
                             n_paths=n_paths,
@@ -15940,15 +16242,7 @@ class Episode:
                     rng_after_pv_training = self._capture_rng_state()
                     self._restore_rng_state(modeb_rng_before_first_sim)
                     if tensor_pipeline:
-                        self._simulate_tensor(
-                            n_paths=n_paths,
-                            group_size=group_size,
-                            n_branches=n_branches,
-                            horizon=horizon_modeb,
-                            simulate_kwargs=simulate_kwargs,
-                            export_df=use_fc2,
-                            **state_bank_simulation_kwargs,
-                        )
+                        _simulate_modeb_tensor(export_df=use_fc2)
                     else:
                         self._simulate_df(
                             n_paths=n_paths,

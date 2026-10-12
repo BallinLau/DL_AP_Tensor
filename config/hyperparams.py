@@ -221,14 +221,25 @@ class HyperParams:
     n_samples: int = 100000
     n_paths: int = 2000
     simulate_horizon: int = 200
-    # Mode-B State Bank v1. Disabled by default for exact legacy reproduction.
+    # Mode-B State Bank v2. Disabled by default for exact legacy reproduction.
     state_bank_enabled: bool = False
     state_bank_short_horizon: int = 10
+    state_bank_bootstrap_burn_in: int = 20
+    state_bank_bootstrap_capture_stride: int = 5
+    state_bank_refresh_burn_in: int = 2
+    state_bank_refresh_capture_stride: int = 1
+    # Deprecated aliases retained for old command lines. New runs use the
+    # explicit bootstrap/refresh controls above.
     state_bank_burn_in: int = 2
     state_bank_capture_stride: int = 1
-    state_bank_max_entries: int = 0
+    state_bank_parent_transition_budget: int = 0
+    state_bank_max_entries: int = 5000
+    state_bank_sampling_mode: str = "uniform_lineage"
+    state_bank_acceptance_mode: str = "numerical"
+    state_bank_min_unique_lineages: int = 0
     state_bank_sample_seed: int = 271828
     state_bank_refresh_seed: int = 314159
+    state_bank_reservoir_seed: int = 161803
     # Firm-entry experiment. ``legacy`` preserves the historical profit/i
     # screen. ``value_cost`` preserves the aggregate-equity/cost experiment.
     # ``investment_compare`` reuses the existing PI>=P0 branch comparison at
@@ -242,6 +253,10 @@ class HyperParams:
     entry_dummy_i: float = 0.0
     entry_inference_chunk_size: int = 65536
     entry_rng_seed: int = 86420
+    entry_rng_mode: str = "legacy_sequential"
+    transition_rng_mode: str = "legacy_position"
+    common_transition_seed: int | None = None
+    preserve_global_rng_around_entry: bool = False
     consumption_aggregation_mode: str = "legacy_per_firm_clamp"
     # Optional floor used only for macro-state transforms.  C_raw remains the
     # exact resource-accounting quantity so floor usage stays observable.
