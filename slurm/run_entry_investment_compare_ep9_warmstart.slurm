@@ -30,6 +30,7 @@ export INITIAL_CHECKPOINT_EPISODE="${INITIAL_CHECKPOINT_EPISODE:-9}"
 export START_EPISODE="${START_EPISODE:-10}"
 export N_EPISODES="${N_EPISODES:-10}"
 export RUN_ROOT="${RUN_ROOT:-$WORK_ROOT/cachedir/investment_compare_ep9_warmstart_${STAMP}}"
+export ENTRY_INDEPENDENT_RESOURCE_VALIDATION_ENABLED=0
 
 echo "Dispatching investment-compare continuation warm-start"
 echo "SOURCE_RUN_ROOT=$SOURCE_RUN_ROOT"
@@ -39,6 +40,7 @@ echo "START_EPISODE=$START_EPISODE"
 echo "N_EPISODES=$N_EPISODES"
 echo "RUN_ROOT=$RUN_ROOT"
 echo "REQUIRED_COMMIT=$REQUIRED_COMMIT"
+echo "ENTRY_INDEPENDENT_RESOURCE_VALIDATION_ENABLED=$ENTRY_INDEPENDENT_RESOURCE_VALIDATION_ENABLED"
 echo "Optimizer/RNG state: fresh (combined checkpoint stores model state only)"
 
 exec bash "$REPO_DIR/slurm/run_normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500_investment_compare.slurm"

@@ -130,6 +130,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument(
+        "--entry-independent-resource-validation-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Run the diagnostic second-pass resource-account reconstruction. "
+            "Disabling it keeps the authoritative ledger and feasibility guard."
+        ),
+    )
+    parser.add_argument(
         "--entry-hatc-failure-scan-enabled",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -752,6 +761,11 @@ def configure_hyperparams(args: argparse.Namespace):
         ("consumption_floor", "consumption_floor", float),
         ("node_accounting_mode", "node_accounting_mode", str),
         (
+            "entry_independent_resource_validation_enabled",
+            "entry_independent_resource_validation_enabled",
+            bool,
+        ),
+        (
             "entry_hatc_failure_scan_enabled",
             "entry_hatc_failure_scan_enabled",
             bool,
@@ -1325,6 +1339,9 @@ def main():
                 "consumption_aggregation_mode": hyperparams.consumption_aggregation_mode,
                 "consumption_floor": hyperparams.consumption_floor,
                 "node_accounting_mode": hyperparams.node_accounting_mode,
+                "entry_independent_resource_validation_enabled": (
+                    hyperparams.entry_independent_resource_validation_enabled
+                ),
                 "entry_hatc_failure_scan_enabled": (
                     hyperparams.entry_hatc_failure_scan_enabled
                 ),

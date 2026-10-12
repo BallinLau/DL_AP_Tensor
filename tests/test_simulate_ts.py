@@ -444,6 +444,57 @@ def test_parallel_tensor_node_defers_next_debt_until_child_eta_is_drawn(monkeypa
         assert torch.isnan(firm_rows[:, columns[name]]).all()
 
 
+def test_parallel_node_can_disable_independent_resource_validation(monkeypatch):
+    device = torch.device("cpu")
+    sim = _make_serial_sim(device)
+    sim.models["policy_value"] = object()
+    sim.n_paths = 1
+    sim.entry_independent_resource_validation_enabled = False
+
+    monkeypatch.setattr(
+        simulate_ts_parallel,
+        "forward_policy_value_for_simulation",
+        lambda model, firm_state: _fake_policy_value_output(firm_state),
+    )
+
+    def fail_if_called(**_kwargs):
+        raise AssertionError("independent resource validator must remain disabled")
+
+    monkeypatch.setattr(
+        simulate_ts_parallel,
+        "validate_node_resource_account",
+        fail_if_called,
+    )
+    state = {
+        "x": torch.zeros(1, device=device),
+        "b": torch.tensor([[0.6, 0.4]], device=device),
+        "z": torch.zeros(1, 2, device=device),
+        "eta": torch.tensor([[1.0, 0.0]], device=device),
+        "i": torch.zeros(1, 2, device=device),
+        "K": torch.ones(1, 2, device=device),
+        "hatcf": torch.zeros(1, device=device),
+        "lnkf": torch.zeros(1, device=device),
+        "M": torch.ones(1, device=device),
+        "alive": torch.ones(1, 2, dtype=torch.bool, device=device),
+        "entry": torch.zeros(1, 2, device=device),
+        "firm_id": torch.arange(2, device=device).reshape(1, 2),
+        "next_firm_id": torch.full((1,), 2, device=device),
+        "bar_i": torch.zeros(1, 2, device=device),
+        "bar_z": torch.zeros(1, 2, device=device),
+        "bp": torch.tensor([[0.6, 0.4]], device=device),
+    }
+
+    firm_rows, macro_rows = simulate_ts_parallel._process_node_batched(
+        sim,
+        state,
+        t=0,
+        branch_k=-1,
+    )
+
+    assert firm_rows.shape[0] == 2
+    assert macro_rows.shape[0] == 1
+
+
 def test_serial_legacy_expand_branches_uses_parent_eta(monkeypatch):
     device = torch.device("cpu")
     eta_draws = [torch.zeros(2, device=device), torch.ones(2, device=device)]

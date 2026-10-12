@@ -1130,6 +1130,7 @@ class Episode:
             "consumption_aggregation_mode",
             "consumption_floor",
             "node_accounting_mode",
+            "entry_independent_resource_validation_enabled",
         ):
             sim_kwargs[name] = getattr(self.hyperparams, name)
         sim_kwargs["entry_hatc_failure_scan_enabled"] = bool(
@@ -8645,6 +8646,7 @@ class Episode:
             "consumption_aggregation_mode",
             "consumption_floor",
             "node_accounting_mode",
+            "entry_independent_resource_validation_enabled",
         ]
         payload: Dict[str, Any] = {
             key: getattr(hp, key, None)

@@ -115,6 +115,7 @@ class SimulateTS:
         consumption_aggregation_mode: str = "legacy_per_firm_clamp",
         consumption_floor: float = 0.0,
         node_accounting_mode: str = "auto",
+        entry_independent_resource_validation_enabled: bool = True,
         preserve_global_rng_around_entry: bool = False,
         common_transition_seed: Optional[int] = None,
         transition_rng_mode: str = "legacy_position",
@@ -198,6 +199,9 @@ class SimulateTS:
             else "legacy_recompute"
             if self.node_accounting_mode_requested == "auto"
             else self.node_accounting_mode_requested
+        )
+        self.entry_independent_resource_validation_enabled = bool(
+            entry_independent_resource_validation_enabled
         )
         self.preserve_global_rng_around_entry = bool(preserve_global_rng_around_entry)
         self.common_transition_seed = (
@@ -346,6 +350,9 @@ class SimulateTS:
                 "preserve_global_rng_around_entry": self.preserve_global_rng_around_entry,
                 "common_transition_seed": self.common_transition_seed,
                 "node_accounting_mode_requested": self.node_accounting_mode_requested,
+                "independent_resource_validation_enabled": (
+                    self.entry_independent_resource_validation_enabled
+                ),
             }
         )
         self.entry_configuration_fingerprint = entry_configuration_fingerprint(

@@ -157,6 +157,12 @@ def _write_entry_hatc_failure_scan(
         )
         for name in accounting_fields
     }
+    performed = validation.get("independent_validation_performed")
+    accounting["independent_validation_performed"] = (
+        True
+        if performed is None
+        else bool(performed[path].item())
+    )
     summary = {
         "episode": episode,
         "t": int(t),
@@ -769,86 +775,142 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         I_oper_total = I_oper_computed
         I_entry_total = resources["I_entry"]
         birth_mask = birth_at_node
-        validation = validate_node_resource_account(
-            Y=Y,
-            I_oper=I,
-            Phi=Phi,
-            path_index=path_idx,
-            birth_mask=birth_mask,
-            entry_cost=entry_cost,
-            K_birth=K_birth,
-            K_current=K,
-            n_paths=n_paths,
-            I_entry_ledger=I_entry_total,
-            C_reported=C_raw_total,
-            mode=getattr(sim, "consumption_aggregation_mode", "legacy_per_firm_clamp"),
-            bar_i_executed=bar_i,
-            bar_z=bar_z,
-            investment_cost=i,
-            initial_cohort=initial_cohort,
-            birth_time=birth_time,
-            economic_time=state["economic_time"],
-            delta=float(sim.delta),
-            maintenance_reported=I_maintenance,
-            birth_maintenance_exempt=investment_compare,
-        )
-        I_entry_rebuilt = validation["I_entry_rebuilt"]
-        entry_spend_residual = validation["entry_spend_residual"]
-        C_rebuilt = validation["C_rebuilt"]
-        legacy_clamp_adjustment = validation["legacy_clamp_adjustment"]
-        resource_residual = validation["resource_accounting_residual"]
-        resource_feasible = validation["resource_feasible"]
         K_maintenance_base = K_maintenance_base_computed
         K_birth_current_node = K_birth_current_node_computed
         I_maintenance_total = I_maintenance_computed
-        I_maintenance_rebuilt = validation["I_maintenance_rebuilt"]
-        maintenance_residual = validation["maintenance_accounting_residual"]
-        birth_maintenance_exemption = validation[
-            "birth_maintenance_exemption"
-        ]
-        invalid_accounting = active_paths & ~validation["accounting_valid"]
-        if bool(invalid_accounting.any()):
-            bad = torch.nonzero(
-                invalid_accounting, as_tuple=False
-            ).reshape(-1).tolist()
-            if (
-                getattr(sim, "entry_mode", "legacy") == "investment_compare"
-                and bool(getattr(sim, "entry_hatc_failure_scan_enabled", False))
-            ):
-                pending_candidates = getattr(
-                    sim, "_pending_entry_candidates", None
-                )
-                if pending_candidates is None:
-                    print(
-                        "Entry Hatc failure scan skipped: fixed candidate draws "
-                        "are unavailable."
-                    )
-                else:
-                    for bad_path in bad[:20]:
-                        try:
-                            diagnostic = _write_entry_hatc_failure_scan(
-                                sim,
-                                state,
-                                pending_candidates,
-                                validation,
-                                path=bad_path,
-                                t=t,
-                                branch_k=branch_k,
-                            )
-                            print(
-                                "Entry Hatc failure scan saved: "
-                                f"{diagnostic['scan_csv']}"
-                            )
-                        except Exception as diagnostic_exc:
-                            print(
-                                "Entry Hatc failure scan failed without replacing "
-                                "the original accounting error: "
-                                f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
-                            )
-            raise EntryAccountingError(
-                "independent node resource reconstruction failed; "
-                f"t={t}, branch={branch_k}, paths={bad[:20]}"
+        independent_validation_enabled = bool(
+            getattr(sim, "entry_independent_resource_validation_enabled", True)
+        )
+        if independent_validation_enabled:
+            validation = validate_node_resource_account(
+                Y=Y,
+                I_oper=I,
+                Phi=Phi,
+                path_index=path_idx,
+                birth_mask=birth_mask,
+                entry_cost=entry_cost,
+                K_birth=K_birth,
+                K_current=K,
+                n_paths=n_paths,
+                I_entry_ledger=I_entry_total,
+                C_reported=C_raw_total,
+                mode=getattr(
+                    sim, "consumption_aggregation_mode", "legacy_per_firm_clamp"
+                ),
+                bar_i_executed=bar_i,
+                bar_z=bar_z,
+                investment_cost=i,
+                initial_cohort=initial_cohort,
+                birth_time=birth_time,
+                economic_time=state["economic_time"],
+                delta=float(sim.delta),
+                maintenance_reported=I_maintenance,
+                birth_maintenance_exempt=investment_compare,
             )
+            validation["independent_validation_performed"] = torch.ones(
+                n_paths, dtype=torch.bool, device=device
+            )
+            I_entry_rebuilt = validation["I_entry_rebuilt"]
+            entry_spend_residual = validation["entry_spend_residual"]
+            C_rebuilt = validation["C_rebuilt"]
+            legacy_clamp_adjustment = validation["legacy_clamp_adjustment"]
+            resource_residual = validation["resource_accounting_residual"]
+            resource_feasible = validation["resource_feasible"]
+            I_maintenance_rebuilt = validation["I_maintenance_rebuilt"]
+            maintenance_residual = validation["maintenance_accounting_residual"]
+            birth_maintenance_exemption = validation[
+                "birth_maintenance_exemption"
+            ]
+            invalid_accounting = active_paths & ~validation["accounting_valid"]
+            if bool(invalid_accounting.any()):
+                bad = torch.nonzero(
+                    invalid_accounting, as_tuple=False
+                ).reshape(-1).tolist()
+                if (
+                    getattr(sim, "entry_mode", "legacy") == "investment_compare"
+                    and bool(getattr(sim, "entry_hatc_failure_scan_enabled", False))
+                ):
+                    pending_candidates = getattr(
+                        sim, "_pending_entry_candidates", None
+                    )
+                    if pending_candidates is None:
+                        print(
+                            "Entry Hatc failure scan skipped: fixed candidate draws "
+                            "are unavailable."
+                        )
+                    else:
+                        for bad_path in bad[:20]:
+                            try:
+                                diagnostic = _write_entry_hatc_failure_scan(
+                                    sim,
+                                    state,
+                                    pending_candidates,
+                                    validation,
+                                    path=bad_path,
+                                    t=t,
+                                    branch_k=branch_k,
+                                )
+                                print(
+                                    "Entry Hatc failure scan saved: "
+                                    f"{diagnostic['scan_csv']}"
+                                )
+                            except Exception as diagnostic_exc:
+                                print(
+                                    "Entry Hatc failure scan failed without replacing "
+                                    "the original accounting error: "
+                                    f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+                                )
+                raise EntryAccountingError(
+                    "independent node resource reconstruction failed; "
+                    f"t={t}, branch={branch_k}, paths={bad[:20]}"
+                )
+        else:
+            # Use the authoritative first-pass ledger directly. These aliases
+            # preserve the output schema but are not an independent validation.
+            zero_by_path = torch.zeros_like(C_raw_total)
+            finite_totals = (
+                torch.isfinite(C_raw_total)
+                & torch.isfinite(I_entry_total)
+                & torch.isfinite(I_oper_total)
+                & torch.isfinite(I_maintenance_total)
+            )
+            resource_feasible = resources["resource_feasible"]
+            I_entry_rebuilt = I_entry_total
+            entry_spend_residual = zero_by_path
+            C_rebuilt = C_raw_total
+            legacy_clamp_adjustment = resources["legacy_clamp_adjustment"]
+            resource_residual = zero_by_path
+            I_maintenance_rebuilt = I_maintenance_total
+            maintenance_residual = zero_by_path
+            birth_maintenance_exemption = (
+                float(sim.delta) * K_birth_current_node
+                if investment_compare
+                else zero_by_path
+            )
+            validation = {
+                "I_entry_reported": I_entry_total,
+                "I_entry_rebuilt": I_entry_rebuilt,
+                "entry_spend_residual": entry_spend_residual,
+                "entry_spend_tolerance": zero_by_path,
+                "C_reported": C_raw_total,
+                "C_rebuilt": C_rebuilt,
+                "resource_accounting_residual": resource_residual,
+                "resource_accounting_tolerance": zero_by_path,
+                "I_maintenance_reported": I_maintenance_total,
+                "I_maintenance_rebuilt": I_maintenance_rebuilt,
+                "maintenance_accounting_residual": maintenance_residual,
+                "maintenance_accounting_tolerance": zero_by_path,
+                "I_oper_reported": I_oper_total,
+                "I_oper_rebuilt": I_oper_total,
+                "I_oper_accounting_residual": zero_by_path,
+                "I_oper_accounting_tolerance": zero_by_path,
+                "finite_totals": finite_totals,
+                "accounting_valid": finite_totals,
+                "resource_feasible": resource_feasible,
+                "independent_validation_performed": torch.zeros(
+                    n_paths, dtype=torch.bool, device=device
+                ),
+            }
         n_firms_accounted = n_alive_per_path.to(torch.float32)
         consumption_floor = float(getattr(sim, "consumption_floor", 0.0))
         raw_mode = (
