@@ -1423,7 +1423,7 @@ def _expand_branches_batched(
         state["K"],
         state["alive"],
         entry_capital_ratio=float(getattr(sim, "entry_capital_ratio", 0.10)),
-        entry_size_ratio=float(getattr(sim, "entry_size_ratio", 0.10)),
+        entry_size_ratio=float(getattr(sim, "entry_size_ratio", 1.0)),
     )
     for branch_index in range(sim.branch_num):
         if getattr(sim, "transition_rng_mode", "legacy_position") == "stable_firm_identity":

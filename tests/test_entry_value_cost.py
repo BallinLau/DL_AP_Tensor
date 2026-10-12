@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import inspect
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -650,6 +651,19 @@ def test_runner_entry_configuration_reaches_effective_hyperparams():
     assert hp.consumption_aggregation_mode == "raw"
     assert hp.consumption_floor == pytest.approx(1e-4)
     assert hp.node_accounting_mode == "economic_node_ledger"
+
+
+def test_entry_size_ratio_defaults_to_incumbent_mean_capital():
+    with patch.object(sys, "argv", ["run_multi_episode_job.py"]):
+        hp = configure_hyperparams(parse_args())
+
+    assert hp.entry_size_ratio == pytest.approx(1.0)
+    assert (
+        inspect.signature(SimulateTS.__init__)
+        .parameters["entry_size_ratio"]
+        .default
+        == pytest.approx(1.0)
+    )
 
 
 def test_non_economic_padding_paths_reject_value_cost_mode():

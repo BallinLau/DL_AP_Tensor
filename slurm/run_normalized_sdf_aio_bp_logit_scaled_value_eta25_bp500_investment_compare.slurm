@@ -30,7 +30,7 @@ export N_EPISODES="${N_EPISODES:-10}"
 # Entry approximation: screen at b=0, eta=0, i=e using physical PI >= P0.
 export ENTRY_MODE=investment_compare
 export ENTRY_CAPITAL_RATIO="${ENTRY_CAPITAL_RATIO:-0.10}"
-export ENTRY_SIZE_RATIO="${ENTRY_SIZE_RATIO:-0.10}"
+export ENTRY_SIZE_RATIO="${ENTRY_SIZE_RATIO:-1.0}"
 export ENTRY_COST_MAX=""
 export ENTRY_DUMMY_I=0.0
 export ENTRY_INFERENCE_CHUNK_SIZE="${ENTRY_INFERENCE_CHUNK_SIZE:-65536}"

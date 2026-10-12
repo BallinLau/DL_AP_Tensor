@@ -107,7 +107,7 @@ class SimulateTS:
         entry_mode: str = "legacy",
         entry_spec_version: str = "value_cost_v1",
         entry_capital_ratio: float = 0.10,
-        entry_size_ratio: float = 0.10,
+        entry_size_ratio: float = 1.0,
         entry_cost_max: Optional[float] = None,
         entry_dummy_i: float = 0.0,
         entry_inference_chunk_size: int = 65536,
