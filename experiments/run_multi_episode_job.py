@@ -67,8 +67,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Combined checkpoint used to warm-start all models. Optimizers and RNG "
-            "state are recreated; this is not an exact resume."
+            "Combined checkpoint used to initialize all models. Optimizers and RNG "
+            "state are recreated; simulation/data state is never restored."
+        ),
+    )
+    parser.add_argument(
+        "--initial-checkpoint-mode",
+        choices=["continuation", "model_init"],
+        default="continuation",
+        help=(
+            "How to interpret --initial-checkpoint: continuation starts at source "
+            "episode + 1; model_init starts a fresh run at Episode 0 using only the "
+            "checkpoint model weights."
         ),
     )
     parser.add_argument(
@@ -82,8 +92,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Logical first episode to run. With a warm-start it must equal source "
-            "episode + 1; without a warm-start it must be 0."
+            "Logical first episode to run. continuation requires source episode + 1; "
+            "model_init and runs without a checkpoint require Episode 0."
         ),
     )
     parser.add_argument("--epochs", type=int, default=None, help="Override epochs per stage")
@@ -1286,12 +1296,31 @@ def resolve_start_episode(
     *,
     requested_start_episode: int | None,
     warmstart_provenance: dict | None,
+    initial_checkpoint_mode: str = "continuation",
 ) -> int:
-    """Resolve logical episode numbering without silently skipping cold-start."""
+    """Resolve numbering for continuation versus model-only initialization."""
+    checkpoint_mode = str(initial_checkpoint_mode).lower()
+    if checkpoint_mode not in {"continuation", "model_init"}:
+        raise ValueError(
+            "--initial-checkpoint-mode must be 'continuation' or 'model_init'"
+        )
     if warmstart_provenance is None:
+        if checkpoint_mode == "model_init":
+            raise ValueError(
+                "--initial-checkpoint-mode=model_init requires --initial-checkpoint"
+            )
         resolved = 0 if requested_start_episode is None else int(requested_start_episode)
         if resolved != 0:
             raise ValueError("--start-episode must be 0 when --initial-checkpoint is omitted")
+        return resolved
+
+    if checkpoint_mode == "model_init":
+        resolved = 0 if requested_start_episode is None else int(requested_start_episode)
+        if resolved != 0:
+            raise ValueError(
+                "Model-only checkpoint initialization must begin at Episode 0: "
+                f"got ep{resolved}"
+            )
         return resolved
 
     source_episode = int(warmstart_provenance["source_episode"])
@@ -1381,16 +1410,28 @@ def main():
     start_episode = resolve_start_episode(
         requested_start_episode=args.start_episode,
         warmstart_provenance=warmstart_provenance,
+        initial_checkpoint_mode=args.initial_checkpoint_mode,
     )
     if warmstart_provenance is not None:
+        if args.initial_checkpoint_mode == "model_init":
+            warmstart_provenance["mode"] = "model_initialization_fresh_training"
+        else:
+            warmstart_provenance["mode"] = "continuation_warmstart_fresh_optimizers"
         warmstart_provenance["start_episode"] = start_episode
-        provenance_path = run_root / "metadata" / "warmstart_provenance.json"
+        warmstart_provenance["simulation_state_restored"] = False
+        warmstart_provenance["training_data_restored"] = False
+        provenance_path = (
+            run_root / "metadata" / "checkpoint_initialization_provenance.json"
+        )
         provenance_path.parent.mkdir(parents=True, exist_ok=True)
         provenance_path.write_text(
             json.dumps(warmstart_provenance, indent=2, default=str),
             encoding="utf-8",
         )
-        print("Continuation warm-start: " + json.dumps(warmstart_provenance, sort_keys=True))
+        print(
+            "Checkpoint initialization: "
+            + json.dumps(warmstart_provenance, sort_keys=True)
+        )
     else:
         print("Model initialization: fresh Xavier weights with fresh optimizers")
     optimizers = build_optimizers(models, hyperparams)

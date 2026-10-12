@@ -223,26 +223,28 @@ def load_training_warmstart(
     expected_value_scale_log_max: float,
     expected_bellman_normalization: bool,
 ):
-    """Strictly restore all model states needed for continuation warm-start.
+    """Strictly restore all model states for checkpoint-based initialization.
 
     Optimizer and RNG state are intentionally not restored. The multi-episode
-    checkpoints written by :func:`save_models` do not contain either state, so
-    callers must describe this as a warm-start rather than an exact resume.
+    checkpoints written by :func:`save_models` do not contain either state.
+    Simulation data/state is not read by this loader.
     """
     checkpoint_path = Path(checkpoint_path).expanduser().resolve()
     if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Warm-start checkpoint not found: {checkpoint_path}")
+        raise FileNotFoundError(f"Initialization checkpoint not found: {checkpoint_path}")
 
     payload = torch.load(checkpoint_path, map_location=device)
     if not isinstance(payload, dict) or not isinstance(payload.get("models"), dict):
-        raise ValueError("Warm-start requires a combined checkpoint with a models mapping")
+        raise ValueError(
+            "Checkpoint initialization requires a combined checkpoint with a models mapping"
+        )
 
     source_episode = int(payload.get("episode", -1))
     if source_episode < 0:
-        raise ValueError("Warm-start checkpoint is missing a valid episode number")
+        raise ValueError("Initialization checkpoint is missing a valid episode number")
     if expected_episode is not None and source_episode != int(expected_episode):
         raise ValueError(
-            f"Warm-start episode mismatch: checkpoint records ep{source_episode}, "
+            f"Initialization episode mismatch: checkpoint records ep{source_episode}, "
             f"expected ep{int(expected_episode)}"
         )
 
@@ -253,30 +255,30 @@ def load_training_warmstart(
     expected_q = resolve_expected_q_parameterization(expected_q_parameterization)
     if checkpoint_q != expected_q:
         raise ValueError(
-            "Warm-start q_parameterization mismatch: "
+            "Initialization q_parameterization mismatch: "
             f"checkpoint={checkpoint_q!r}, expected={expected_q!r}"
         )
 
     value_meta = payload.get("value_parameterization")
     if not isinstance(value_meta, dict):
-        raise ValueError("Warm-start checkpoint is missing value_parameterization")
+        raise ValueError("Initialization checkpoint is missing value_parameterization")
     checkpoint_value_mode = str(value_meta.get("mode", "none")).lower()
     expected_value_mode = str(expected_value_scale_mode).lower()
     checkpoint_log_max = float(value_meta.get("log_max", 20.0))
     checkpoint_normalized = bool(value_meta.get("bellman_normalization", False))
     if checkpoint_value_mode != expected_value_mode:
         raise ValueError(
-            "Warm-start value scale mismatch: "
+            "Initialization value scale mismatch: "
             f"checkpoint={checkpoint_value_mode!r}, expected={expected_value_mode!r}"
         )
     if abs(checkpoint_log_max - float(expected_value_scale_log_max)) > 1e-12:
         raise ValueError(
-            "Warm-start value scale log_max mismatch: "
+            "Initialization value scale log_max mismatch: "
             f"checkpoint={checkpoint_log_max}, expected={expected_value_scale_log_max}"
         )
     if checkpoint_normalized != bool(expected_bellman_normalization):
         raise ValueError(
-            "Warm-start Bellman normalization mismatch: "
+            "Initialization Bellman normalization mismatch: "
             f"checkpoint={checkpoint_normalized}, "
             f"expected={bool(expected_bellman_normalization)}"
         )
@@ -285,7 +287,7 @@ def load_training_warmstart(
     required_models = ("sdf_fc1", "policy_value", "fc2", "firm_target")
     missing = [name for name in required_models if name not in states]
     if missing:
-        raise ValueError(f"Warm-start checkpoint is missing model states: {missing}")
+        raise ValueError(f"Initialization checkpoint is missing model states: {missing}")
 
     models = build_models(device)
     models["policy_value"] = build_policy_value_from_checkpoint_spec(
@@ -311,7 +313,7 @@ def load_training_warmstart(
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     provenance = {
-        "mode": "continuation_warmstart_fresh_optimizers",
+        "mode": "checkpoint_model_weights",
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": digest.hexdigest(),
         "source_episode": source_episode,
@@ -320,6 +322,8 @@ def load_training_warmstart(
         "value_parameterization": dict(value_meta),
         "optimizer_state_restored": False,
         "rng_state_restored": False,
+        "simulation_state_restored": False,
+        "training_data_restored": False,
         "loaded_model_keys": list(required_models),
     }
     return models, firm_target, provenance

@@ -136,3 +136,29 @@ def test_start_episode_is_next_logical_episode_only():
             requested_start_episode=10,
             warmstart_provenance=None,
         )
+
+
+def test_model_init_checkpoint_starts_fresh_episode_zero_only():
+    provenance = {"source_episode": 9}
+    assert resolve_start_episode(
+        requested_start_episode=None,
+        warmstart_provenance=provenance,
+        initial_checkpoint_mode="model_init",
+    ) == 0
+    assert resolve_start_episode(
+        requested_start_episode=0,
+        warmstart_provenance=provenance,
+        initial_checkpoint_mode="model_init",
+    ) == 0
+    with pytest.raises(ValueError, match="must begin at Episode 0"):
+        resolve_start_episode(
+            requested_start_episode=10,
+            warmstart_provenance=provenance,
+            initial_checkpoint_mode="model_init",
+        )
+    with pytest.raises(ValueError, match="requires --initial-checkpoint"):
+        resolve_start_episode(
+            requested_start_episode=0,
+            warmstart_provenance=None,
+            initial_checkpoint_mode="model_init",
+        )
