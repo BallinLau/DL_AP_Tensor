@@ -221,6 +221,14 @@ class HyperParams:
     n_samples: int = 100000
     n_paths: int = 2000
     simulate_horizon: int = 200
+    # Mode-B State Bank v1. Disabled by default for exact legacy reproduction.
+    state_bank_enabled: bool = False
+    state_bank_short_horizon: int = 10
+    state_bank_burn_in: int = 2
+    state_bank_capture_stride: int = 1
+    state_bank_max_entries: int = 0
+    state_bank_sample_seed: int = 271828
+    state_bank_refresh_seed: int = 314159
     # Firm-entry experiment. ``legacy`` preserves the historical profit/i
     # screen. ``value_cost`` preserves the aggregate-equity/cost experiment.
     # ``investment_compare`` reuses the existing PI>=P0 branch comparison at

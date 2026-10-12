@@ -124,6 +124,8 @@ class SimulateTS:
         entry_hatc_failure_scan_points: int = 81,
         entry_hatc_failure_scan_half_width: float = 2.0,
         entry_hatc_failure_episode_id: int = -1,
+        initial_state: Optional[Dict[str, torch.Tensor]] = None,
+        state_bank_capture=None,
     ):
         """
         Args:
@@ -145,6 +147,9 @@ class SimulateTS:
             bp_action_override: 可选实验回调；优先于配置的 action source。
             bp_action_source: ``head`` 沿用网络 BP，``grid`` 使用正式 grid policy。
             bp_grid_policy: 复用整个 rollout 的冻结 grid-policy resolver。
+            initial_state: 可选完整 batched parent-ready state。None 严格保留
+                fresh initialization；非 None 时不会调用 fresh initializer。
+            state_bank_capture: 可选 parent-ready State Bank capture policy。
         """
         self.models = models
         self.config = config
@@ -233,6 +238,16 @@ class SimulateTS:
         self.entry_hatc_failure_episode_id = int(
             entry_hatc_failure_episode_id
         )
+        self.initial_state = initial_state
+        self.state_bank_capture = state_bank_capture
+        if self.initial_state is not None:
+            if "b" not in self.initial_state or self.initial_state["b"].ndim != 2:
+                raise ValueError("initial_state must contain two-dimensional 'b'")
+            if int(self.initial_state["b"].shape[0]) != int(self.n_paths):
+                raise ValueError(
+                    "initial_state path count does not match n_paths: "
+                    f"state={self.initial_state['b'].shape[0]}, n_paths={self.n_paths}"
+                )
         if self.entry_hatc_failure_scan_points < 3:
             raise ValueError("entry_hatc_failure_scan_points must be at least 3")
         if self.entry_hatc_failure_scan_points % 2 == 0:
@@ -442,6 +457,9 @@ class SimulateTS:
         parent_steps = int(bp_metrics.get("num_parent_states", 0))
         output.meta.update({
             "simulation_bp_source": self.bp_action_source,
+            "initial_state_source": (
+                "state_bank" if self.initial_state is not None else "fresh"
+            ),
             "runtime_total": float(elapsed),
             "runtime_per_firm_step": float(elapsed / max(parent_steps, 1)),
             "gpu_memory_before_bytes": memory_before,
@@ -469,6 +487,8 @@ class SimulateTS:
                 "max_firms_observed": self._max_firms_observed,
             },
         })
+        if self.state_bank_capture is not None:
+            output.meta["state_bank_capture"] = self.state_bank_capture.summary()
         self.last_simulation_meta = dict(output.meta)
         return output
 

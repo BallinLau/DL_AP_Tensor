@@ -247,20 +247,29 @@ def _keyed_uniform(
     *,
     seed: int,
     path_id: torch.Tensor,
-    economic_time: int,
+    economic_time: int | torch.Tensor,
     branch_id: int,
     identity: torch.Tensor,
     shock_type: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """Vectorized deterministic uniforms keyed by canonical economic identity."""
-    path_key, identity_key = torch.broadcast_tensors(
-        path_id.to(torch.int64), identity.to(torch.int64)
+    time_key = torch.as_tensor(
+        economic_time,
+        dtype=torch.int64,
+        device=path_id.device,
+    )
+    while time_key.ndim < path_id.ndim:
+        time_key = time_key.unsqueeze(-1)
+    path_key, identity_key, time_key = torch.broadcast_tensors(
+        path_id.to(torch.int64),
+        identity.to(torch.int64),
+        time_key,
     )
     mixed = torch.full_like(path_key, int(seed) % _HASH_MODULUS)
     for value, salt in (
         (path_key, 1_000_003),
-        (torch.full_like(path_key, int(economic_time)), 97_409),
+        (time_key, 97_409),
         (torch.full_like(path_key, int(branch_id)), 65_537),
         (identity_key, 32_771),
         (torch.full_like(path_key, int(shock_type)), 8_191),
@@ -281,27 +290,46 @@ def _keyed_normal(**kwargs) -> torch.Tensor:
 def _stable_transition_draws(sim, state, child_t: int, branch_index: int):
     """Draw macro and firm innovations without depending on slots or capacity."""
     n_paths, n_firms = state["b"].shape
-    path = torch.arange(n_paths, device=sim.device, dtype=torch.long)
+    path = state.get(
+        "transition_path_id",
+        torch.arange(n_paths, device=sim.device, dtype=torch.long),
+    ).to(torch.long)
     path_2d = path.unsqueeze(1).expand(n_paths, n_firms)
     firm_identity = state["firm_id"].to(torch.long)
     macro_identity = torch.zeros_like(path)
+    next_economic_time = state["economic_time"].to(torch.long) + 1
     common = {
         "seed": int(sim.common_transition_seed),
-        "economic_time": int(child_t),
         "branch_id": int(branch_index),
         "dtype": state["x"].dtype,
     }
     eps_x = _keyed_normal(
-        **common, path_id=path, identity=macro_identity, shock_type=1
+        **common,
+        path_id=path,
+        economic_time=next_economic_time,
+        identity=macro_identity,
+        shock_type=1,
     )
     eps_z = _keyed_normal(
-        **common, path_id=path_2d, identity=firm_identity, shock_type=2
+        **common,
+        path_id=path_2d,
+        economic_time=next_economic_time,
+        identity=firm_identity,
+        shock_type=2,
     )
     u_eta = _keyed_uniform(
-        **common, path_id=path_2d, identity=firm_identity, shock_type=3
+        **common,
+        path_id=path_2d,
+        economic_time=next_economic_time,
+        identity=firm_identity,
+        shock_type=3,
     )
     u_i = _keyed_uniform(
-        **common, path_id=path_2d, identity=firm_identity, shock_type=4
+        **common,
+        path_id=path_2d,
+        economic_time=next_economic_time,
+        identity=firm_identity,
+        shock_type=4,
     )
     x_next = (
         (1.0 - float(sim.config.RHO_X)) * float(sim.config.XBAR)
@@ -333,6 +361,10 @@ def _ensure_entry_state_fields(state: Dict[str, torch.Tensor]) -> None:
         state.setdefault(name, torch.full_like(b, float("nan")))
     state.setdefault("economic_node_id", torch.zeros(n_paths, dtype=torch.long, device=device))
     state.setdefault("economic_time", torch.zeros(n_paths, dtype=torch.long, device=device))
+    state.setdefault(
+        "transition_path_id",
+        torch.arange(n_paths, dtype=torch.long, device=device),
+    )
     state.setdefault("accounting_valid", torch.zeros(n_paths, dtype=torch.bool, device=device))
     state.setdefault("transition_eps_x", torch.full((n_paths,), float("nan"), device=device))
     for name in ("transition_eps_z", "transition_u_eta", "transition_u_i"):
@@ -379,7 +411,15 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
         if sim.entry_mode == "legacy"
         else sim.group_size
     )
-    state = _initialize_batched_state(sim, max_firms)
+    initial_state = getattr(sim, "initial_state", None)
+    if initial_state is None:
+        state = _initialize_batched_state(sim, max_firms)
+    else:
+        from .state_bank import clone_state
+
+        state = clone_state(initial_state, device=device)
+        _ensure_entry_state_fields(state)
+        max_firms = int(state["b"].shape[1])
     sim._max_firms_observed = max(int(sim._max_firms_observed), int(max_firms))
 
     firm_rows: List[torch.Tensor] = []
@@ -394,6 +434,11 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
     completed_parent_steps = 0
 
     for t in tqdm(range(sim.horizon), desc="Simulating steps (tensor)"):
+        state_bank_capture = getattr(sim, "state_bank_capture", None)
+        if state_bank_capture is not None:
+            # State Bank v1 contract: capture the complete parent-ready state
+            # before any node processing mutates policy/accounting fields.
+            state_bank_capture.capture_parent_ready(state, time_index=t)
         parent_firm, parent_macro = _process_node_batched(sim, state, t, branch_k=-1)
         firm_rows.append(parent_firm)
         macro_rows.append(parent_macro)
@@ -528,6 +573,7 @@ def _initialize_batched_state(sim, max_firms: int) -> Dict[str, torch.Tensor]:
         "bp": b.clone(),
         "economic_node_id": torch.zeros(n_paths, dtype=torch.long, device=device),
         "economic_time": torch.zeros(n_paths, dtype=torch.long, device=device),
+        "transition_path_id": torch.arange(n_paths, dtype=torch.long, device=device),
         "accounting_valid": torch.zeros(n_paths, dtype=torch.bool, device=device),
         "transition_eps_x": torch.full((n_paths,), float("nan"), device=device),
         "transition_eps_z": torch.full_like(K, float("nan")),
@@ -1416,6 +1462,7 @@ def _expand_branches_batched(
     _ensure_entry_state_fields(state)
     device = sim.device
     alive_any = state["alive"].any(dim=1)
+    next_economic_time = state["economic_time"].to(torch.long) + 1
     branches: List[Dict[str, torch.Tensor]] = []
     b_prev = state["b"]
     bp_prev = state.get("bp", b_prev)
@@ -1507,27 +1554,19 @@ def _expand_branches_batched(
                 "entry_value_gap": state["entry_value_gap"].clone(),
                 "firm_id": state["firm_id"].clone(),
                 "next_firm_id": state["next_firm_id"].clone(),
+                "transition_path_id": state["transition_path_id"].clone(),
                 "bar_i": state.get("bar_i", torch.zeros_like(state["b"])) .clone(),
                 "bar_z": state.get("bar_z", torch.zeros_like(state["b"])) .clone(),
                 "bp": state.get("bp", state["b"]).clone(),
                 "economic_node_id": torch.where(
                     alive_any,
-                    torch.full(
-                        (state["b"].shape[0],),
-                        int(child_t * (sim.branch_num + 1) + branch_index + 1),
-                        dtype=torch.long,
-                        device=device,
-                    ),
+                    next_economic_time * int(sim.branch_num + 1)
+                    + int(branch_index + 1),
                     state["economic_node_id"],
                 ),
                 "economic_time": torch.where(
                     alive_any,
-                    torch.full(
-                        (state["b"].shape[0],),
-                        int(child_t),
-                        dtype=torch.long,
-                        device=device,
-                    ),
+                    next_economic_time,
                     state["economic_time"],
                 ),
                 "accounting_valid": torch.zeros(

@@ -24,6 +24,7 @@ sys.path.append(str(ROOT))
 print(f"Added {ROOT} to sys.path for imports")
 from config import Config  # noqa: E402
 from training.episode import Episode, NumericalStageFailure  # noqa: E402
+from data.state_bank import StateBank  # noqa: E402
 from data.simulate_ts import SimulateTS  # noqa: E402
 from experiments.run_utils import (  # noqa: E402
     resolve_base_dir,
@@ -189,6 +190,18 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="First simulation time included in non-entry capital growth-rate plots",
     )
+    parser.add_argument(
+        "--state-bank-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable State Bank v1 warm starts for Mode B Episode >= 2",
+    )
+    parser.add_argument("--state-bank-short-horizon", type=int, default=None)
+    parser.add_argument("--state-bank-burn-in", type=int, default=None)
+    parser.add_argument("--state-bank-capture-stride", type=int, default=None)
+    parser.add_argument("--state-bank-max-entries", type=int, default=None)
+    parser.add_argument("--state-bank-sample-seed", type=int, default=None)
+    parser.add_argument("--state-bank-refresh-seed", type=int, default=None)
     parser.add_argument("--device", type=str, default=None, help="Force device, e.g. cuda:0 or cpu")
     parser.add_argument("--quick-test", action="store_true", help="Shrink workload for smoke tests (n_paths=10, epochs=20, horizon=20)")
     parser.add_argument(
@@ -811,6 +824,13 @@ def configure_hyperparams(args: argparse.Namespace):
             "entry_hatc_failure_scan_half_width",
             float,
         ),
+        ("state_bank_enabled", "state_bank_enabled", bool),
+        ("state_bank_short_horizon", "state_bank_short_horizon", int),
+        ("state_bank_burn_in", "state_bank_burn_in", int),
+        ("state_bank_capture_stride", "state_bank_capture_stride", int),
+        ("state_bank_max_entries", "state_bank_max_entries", int),
+        ("state_bank_sample_seed", "state_bank_sample_seed", int),
+        ("state_bank_refresh_seed", "state_bank_refresh_seed", int),
     ):
         value = getattr(args, arg_name)
         if value is not None:
@@ -876,6 +896,26 @@ def configure_hyperparams(args: argparse.Namespace):
     ):
         raise ValueError(
             f"{hyperparams.entry_mode} entry cannot use legacy_recompute accounting"
+        )
+    if int(hyperparams.state_bank_short_horizon) <= 0:
+        raise ValueError("state_bank_short_horizon must be positive")
+    if int(hyperparams.state_bank_burn_in) < 1:
+        raise ValueError("state_bank_burn_in must be at least 1")
+    if int(hyperparams.state_bank_capture_stride) <= 0:
+        raise ValueError("state_bank_capture_stride must be positive")
+    if int(hyperparams.state_bank_max_entries) < 0:
+        raise ValueError("state_bank_max_entries must be non-negative")
+    if int(hyperparams.state_bank_burn_in) >= int(hyperparams.state_bank_short_horizon):
+        raise ValueError(
+            "state_bank_burn_in must be smaller than state_bank_short_horizon"
+        )
+    if (
+        bool(hyperparams.state_bank_enabled)
+        and int(hyperparams.state_bank_burn_in) >= int(hyperparams.simulate_horizon)
+    ):
+        raise ValueError(
+            "state_bank_burn_in must be smaller than simulate_horizon so "
+            "Episode 1 can produce Bank_1"
         )
     hyperparams.ablation_mode = args.ablation_mode
     hyperparams.sdf_wealth_loss_mode = args.sdf_wealth_loss_mode
@@ -1355,6 +1395,26 @@ def resolve_start_episode(
     return resolved
 
 
+def build_and_commit_state_bank(
+    episode: Episode,
+    *,
+    output_path: Path,
+    n_paths: int,
+    group_size: int,
+    n_branches: int,
+    simulate_kwargs: dict,
+) -> StateBank:
+    """Build a complete candidate Bank and atomically publish it."""
+    candidate = episode.build_state_bank_after_success(
+        n_paths=n_paths,
+        group_size=group_size,
+        n_branches=n_branches,
+        simulate_kwargs=simulate_kwargs,
+    )
+    candidate.save(output_path, atomic=True)
+    return candidate
+
+
 def main():
     args = parse_args()
     random.seed(args.seed)
@@ -1466,6 +1526,18 @@ def main():
     summaries = []
     failure_report = None
     canonical_diagnostic_reference = None
+    active_state_bank = None
+    state_bank_dir = resolve_base_dir(run_root, ROOT) / "state_banks"
+    if bool(hyperparams.state_bank_enabled):
+        state_bank_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            "State Bank v1 enabled: "
+            f"directory={state_bank_dir}, "
+            f"short_horizon={hyperparams.state_bank_short_horizon}, "
+            f"burn_in={hyperparams.state_bank_burn_in}, "
+            f"capture_stride={hyperparams.state_bank_capture_stride}, "
+            f"max_entries={hyperparams.state_bank_max_entries}"
+        )
     episode = Episode(
             models=models,
             optimizers=optimizers,
@@ -1511,6 +1583,34 @@ def main():
             "modeb_resimulate_after_pv": args.modeb_resimulate_after_pv,
         }
         try:
+            if bool(hyperparams.state_bank_enabled) and ep >= 2:
+                required_bank_path = state_bank_dir / f"bank_ep{ep - 1}.pt"
+                if (
+                    active_state_bank is None
+                    or int(active_state_bank.source_episode) != ep - 1
+                ):
+                    try:
+                        active_state_bank = StateBank.load(
+                            required_bank_path,
+                            expected_compatibility=episode._state_bank_compatibility(
+                                data_kwargs["n_branches"]
+                            ),
+                        )
+                    except Exception as exc:
+                        raise NumericalStageFailure(
+                            f"Episode {ep} could not load required State Bank",
+                            diagnostics={
+                                "stage": "state_bank_load",
+                                "episode": ep,
+                                "required_path": str(required_bank_path),
+                                "error_type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                        ) from exc
+                print(
+                    f"[Episode {ep}] loaded State Bank: {required_bank_path} "
+                    f"entries={len(active_state_bank)}"
+                )
             summary = episode.run_episode(
                 n_epochs=hyperparams.epochs,
                 batch_size=hyperparams.batch_size,
@@ -1520,8 +1620,55 @@ def main():
                 train_modules=train_modules,
                 simulate_kwargs=simulate_kwargs,
                 episode_mode=episode_mode,
+                state_bank=active_state_bank,
                 **data_kwargs,
             )
+            if bool(hyperparams.state_bank_enabled) and ep >= 1:
+                try:
+                    bank_path = state_bank_dir / f"bank_ep{ep}.pt"
+                    candidate_bank = build_and_commit_state_bank(
+                        episode,
+                        output_path=bank_path,
+                        n_paths=data_kwargs["n_paths"],
+                        group_size=data_kwargs["group_size"],
+                        n_branches=data_kwargs["n_branches"],
+                        simulate_kwargs=simulate_kwargs,
+                    )
+                except Exception as exc:
+                    raise NumericalStageFailure(
+                        f"Episode {ep} State Bank refresh failed",
+                        diagnostics={
+                            "stage": "state_bank_refresh",
+                            "episode": ep,
+                            "previous_bank_source_episode": (
+                                None
+                                if active_state_bank is None
+                                else int(active_state_bank.source_episode)
+                            ),
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    ) from exc
+                active_state_bank = candidate_bank
+                state_bank_summary = summary.setdefault(
+                    "module_summaries", {}
+                ).setdefault("state_bank", {})
+                state_bank_summary.update(
+                    {
+                        "output_path": str(bank_path),
+                        "output_entry_count": len(candidate_bank),
+                        "output_fingerprint": (
+                            candidate_bank.compatibility_fingerprint
+                        ),
+                        "output_capture": candidate_bank.metadata.get(
+                            "capture", {}
+                        ),
+                    }
+                )
+                print(
+                    f"[Episode {ep}] committed State Bank: {bank_path} "
+                    f"entries={len(candidate_bank)}"
+                )
         except NumericalStageFailure as exc:
             failure_report = {
                 "failed_episode": ep,
@@ -1554,6 +1701,13 @@ def main():
                     "sdf_fc1_batch_size": hyperparams.sdf_fc1_batch_size,
                     "simulate_group_size": simulate_group_size,
                     "simulate_horizon": hyperparams.simulate_horizon,
+                    "state_bank_enabled": hyperparams.state_bank_enabled,
+                    "state_bank_short_horizon": hyperparams.state_bank_short_horizon,
+                    "state_bank_burn_in": hyperparams.state_bank_burn_in,
+                    "state_bank_capture_stride": hyperparams.state_bank_capture_stride,
+                    "state_bank_max_entries": hyperparams.state_bank_max_entries,
+                    "state_bank_sample_seed": hyperparams.state_bank_sample_seed,
+                    "state_bank_refresh_seed": hyperparams.state_bank_refresh_seed,
                     "post0_mode": args.post0_mode,
                     "sdf_wealth_loss_mode": hyperparams.sdf_wealth_loss_mode,
                     "sdf_true_only_epochs": hyperparams.sdf_true_only_epochs,

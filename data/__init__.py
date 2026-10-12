@@ -8,6 +8,7 @@ from .data_utils import (
     create_triplet_structure
 )
 from .tensor_data import TensorTable, TensorSimulationOutput
+from .state_bank import StateBank, StateBankCapture
 
 
 def create_sample_data(models=None, n_paths=1000, **kwargs):
@@ -43,6 +44,8 @@ __all__ = [
     'create_triplet_structure',
     'TensorTable',
     'TensorSimulationOutput',
+    'StateBank',
+    'StateBankCapture',
     'create_sample_data',
     'create_simulate_data'
 ]

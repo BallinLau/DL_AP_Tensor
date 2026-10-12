@@ -28,6 +28,12 @@ import warnings
 sys.path.append('..')
 from config import Config, HyperParams, SIMMODEL
 from data import Sample, SimulateTS, TensorTable, TensorSimulationOutput
+from data.state_bank import (
+    StateBank,
+    StateBankCapture,
+    build_state_bank_compatibility,
+    clone_state,
+)
 from data.data_utils import compute_quantile_features
 from losses import SDFLoss, P0Loss, PILoss, QLoss, FC2Loss
 from losses.q_loss import (
@@ -11965,7 +11971,8 @@ class Episode:
         n_branches: int,
         horizon: int,
         simulate_kwargs: Dict,
-        export_df: bool = False
+        export_df: bool = False,
+        initial_state: Optional[Dict[str, torch.Tensor]] = None,
     ) -> None:
         sim_kwargs = self._prepare_simulation_kwargs(simulate_kwargs)
         simulator = SimulateTS(
@@ -11975,6 +11982,7 @@ class Episode:
             group_size=group_size,
             branch_num=n_branches,
             horizon=int(horizon),
+            initial_state=initial_state,
             **sim_kwargs
         )
         out: TensorSimulationOutput = simulator.simulate_tensor()
@@ -11995,6 +12003,121 @@ class Episode:
         else:
             self.df = None
             self.df_macro = None
+
+    def _state_bank_compatibility(self, n_branches: int) -> Dict[str, Any]:
+        return build_state_bank_compatibility(
+            config=self.config,
+            hyperparams=self.hyperparams,
+            branch_num=n_branches,
+            main_branch=0,
+        )
+
+    def build_state_bank_after_success(
+        self,
+        *,
+        n_paths: int,
+        group_size: int,
+        n_branches: int,
+        simulate_kwargs: Dict,
+    ) -> StateBank:
+        """Build Bank_e with final accepted models without altering training RNG."""
+        episode_id = int(self.episode_id)
+        if episode_id < 1:
+            raise ValueError("State Bank construction starts after Episode 1")
+        if not bool(getattr(self.hyperparams, "state_bank_enabled", False)):
+            raise RuntimeError("State Bank construction requested while disabled")
+
+        if episode_id == 1:
+            initial_state = None
+            refresh_horizon = int(self.hyperparams.simulate_horizon)
+            source_entry_ids: List[str] = []
+        else:
+            initial_state = getattr(self, "_state_bank_initial_state_cpu", None)
+            source_entry_ids = list(
+                getattr(self, "_state_bank_sampled_entry_ids", [])
+            )
+            if initial_state is None or not source_entry_ids:
+                raise RuntimeError(
+                    "Episode >= 2 State Bank refresh requires the sampled initial "
+                    "states used by the training simulations"
+                )
+            refresh_horizon = int(self.hyperparams.state_bank_short_horizon)
+
+        compatibility = self._state_bank_compatibility(n_branches)
+        bank = StateBank(
+            compatibility=compatibility,
+            source_episode=episode_id,
+            metadata={
+                "source_episode": episode_id,
+                "initial_state_source": (
+                    "fresh" if initial_state is None else "previous_state_bank"
+                ),
+                "source_entry_ids": source_entry_ids,
+                "refresh_horizon": refresh_horizon,
+                "final_accepted_models": True,
+            },
+        )
+        capture = StateBankCapture(
+            bank,
+            burn_in=int(self.hyperparams.state_bank_burn_in),
+            capture_stride=int(self.hyperparams.state_bank_capture_stride),
+            max_entries=int(self.hyperparams.state_bank_max_entries),
+        )
+        refresh_simulate_kwargs = dict(simulate_kwargs)
+        for runner_only_key in (
+            "horizon",
+            "horizon_mode1",
+            "modeb_resimulate_after_pv",
+        ):
+            refresh_simulate_kwargs.pop(runner_only_key, None)
+        sim_kwargs = self._prepare_simulation_kwargs(refresh_simulate_kwargs)
+        rng_state = self._capture_rng_state()
+        model_modes = {
+            name: model.training
+            for name, model in self.models.items()
+            if isinstance(model, nn.Module)
+        }
+        refresh_seed = int(self.hyperparams.state_bank_refresh_seed) + episode_id * 100_003
+        try:
+            random.seed(refresh_seed)
+            np.random.seed(refresh_seed % (2 ** 32))
+            torch.manual_seed(refresh_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(refresh_seed)
+            simulator = SimulateTS(
+                models=self.models,
+                config=self.config,
+                n_paths=n_paths,
+                group_size=group_size,
+                branch_num=n_branches,
+                horizon=refresh_horizon,
+                initial_state=(
+                    None
+                    if initial_state is None
+                    else clone_state(initial_state, device="cpu")
+                ),
+                state_bank_capture=capture,
+                **sim_kwargs,
+            )
+            output = simulator.simulate_tensor()
+            bank.metadata.update(
+                {
+                    "capture": capture.summary(),
+                    "simulation_meta": output.meta,
+                    "refresh_seed": refresh_seed,
+                }
+            )
+        finally:
+            self._restore_rng_state(rng_state)
+            for name, was_training in model_modes.items():
+                model = self.models.get(name)
+                if isinstance(model, nn.Module):
+                    model.train(was_training)
+        if len(bank) == 0:
+            raise RuntimeError(
+                "State Bank refresh produced no parent-ready non-extinct entries"
+            )
+        return bank
 
     def _run_fc2_epochs(
         self,
@@ -15191,7 +15314,8 @@ class Episode:
         train_mode: str = '2time',
         train_modules: Optional[List[str]] = None,
         simulate_kwargs: Optional[Dict] = None,
-        episode_mode: Optional[str] = None
+        episode_mode: Optional[str] = None,
+        state_bank: Optional[StateBank] = None,
     ) -> Dict:
         """
         按 Episode 逻辑执行训练（三模式）：
@@ -15219,8 +15343,61 @@ class Episode:
         modeb_resimulate_after_pv = bool(simulate_kwargs.pop('modeb_resimulate_after_pv', False))
         mode = self._resolve_episode_mode(episode_mode)
         tensor_pipeline = self._use_tensor_pipeline()
+        state_bank_enabled = bool(
+            getattr(self.hyperparams, "state_bank_enabled", False)
+        )
+        self._state_bank_initial_state_cpu = None
+        self._state_bank_sampled_entry_ids = []
+        if state_bank_enabled and mode != "modeb" and int(self.episode_id) >= 1:
+            raise ValueError("State Bank v1 supports Mode B only")
+        if state_bank_enabled and int(self.episode_id) >= 2:
+            if not tensor_pipeline:
+                raise ValueError("State Bank v1 requires the tensor simulation pipeline")
+            if state_bank is None:
+                raise FileNotFoundError(
+                    f"Episode {self.episode_id} requires Bank_{self.episode_id - 1}"
+                )
+            if int(state_bank.source_episode) != int(self.episode_id) - 1:
+                raise ValueError(
+                    "State Bank source episode mismatch: "
+                    f"bank=ep{state_bank.source_episode}, current=ep{self.episode_id}"
+                )
+            state_bank.validate_compatibility(
+                self._state_bank_compatibility(n_branches)
+            )
+            sampled_ids = state_bank.sample_entry_ids(
+                n_paths,
+                seed=int(self.hyperparams.state_bank_sample_seed),
+                episode_id=int(self.episode_id),
+            )
+            self._state_bank_sampled_entry_ids = list(sampled_ids)
+            self._state_bank_initial_state_cpu = state_bank.stack_entries(
+                sampled_ids,
+                device="cpu",
+            )
+            horizon_modeb = int(self.hyperparams.state_bank_short_horizon)
 
         module_summaries = {}
+        module_summaries["state_bank"] = {
+            "enabled": state_bank_enabled,
+            "episode_id": int(self.episode_id),
+            "initial_state_source": (
+                "state_bank"
+                if self._state_bank_initial_state_cpu is not None
+                else "fresh"
+            ),
+            "source_episode": (
+                None if state_bank is None else int(state_bank.source_episode)
+            ),
+            "sampled_entry_count": len(self._state_bank_sampled_entry_ids),
+            "sampled_entry_ids": self._state_bank_sampled_entry_ids,
+            "effective_horizon": int(horizon_modeb),
+        }
+        state_bank_simulation_kwargs = (
+            {}
+            if self._state_bank_initial_state_cpu is None
+            else {"initial_state": self._state_bank_initial_state_cpu}
+        )
         module_summaries["batch_configuration"] = {
             "fallback_batch_size": int(batch_size),
             "pv_batch_size": int(resolved_pv_batch_size),
@@ -15530,7 +15707,8 @@ class Episode:
                         n_branches=n_branches,
                         horizon=horizon_modeb,
                         simulate_kwargs=simulate_kwargs,
-                        export_df=use_fc2
+                        export_df=use_fc2,
+                        **state_bank_simulation_kwargs,
                     )
                 else:
                     self._simulate_df(
@@ -15603,7 +15781,8 @@ class Episode:
                             n_branches=n_branches,
                             horizon=horizon_modeb,
                             simulate_kwargs=simulate_kwargs,
-                            export_df=use_fc2
+                            export_df=use_fc2,
+                            **state_bank_simulation_kwargs,
                         )
                     else:
                         self._simulate_df(
@@ -15767,7 +15946,8 @@ class Episode:
                             n_branches=n_branches,
                             horizon=horizon_modeb,
                             simulate_kwargs=simulate_kwargs,
-                            export_df=use_fc2
+                            export_df=use_fc2,
+                            **state_bank_simulation_kwargs,
                         )
                     else:
                         self._simulate_df(
