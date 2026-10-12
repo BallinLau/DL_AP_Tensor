@@ -27,8 +27,9 @@ export REQUIRED_COMMIT="${REQUIRED_COMMIT:-$DEFAULT_REQUIRED_COMMIT}"
 export RUN_ROOT="${RUN_ROOT:-$WORK_ROOT/cachedir/normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500_investment_compare_state_bank_${STAMP}}"
 export N_EPISODES="${N_EPISODES:-10}"
 
-# State Bank v2 changes numerical data generation only. Economic entry settings
-# match the existing investment-compare experiment.
+# State Bank v2 changes numerical data generation and diagnostics only. Keep
+# this wrapper in each formal State Bank code revision so its self-pin resolves
+# to the exact implementation under test. Economic entry settings are unchanged.
 export STATE_BANK_ENABLED=1
 export STATE_BANK_SHORT_HORIZON="${STATE_BANK_SHORT_HORIZON:-10}"
 export STATE_BANK_BOOTSTRAP_BURN_IN="${STATE_BANK_BOOTSTRAP_BURN_IN:-20}"

@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
+from .tensor_data import TensorTable
+
 
 STATE_BANK_FORMAT_VERSION = "state_bank_v2"
 
@@ -132,6 +134,113 @@ def clone_state(
     return {
         name: tensor.detach().clone().to(target or tensor.device)
         for name, tensor in state.items()
+    }
+
+
+def _finite_distribution_stats(values: Sequence[float]) -> Dict[str, float]:
+    tensor = torch.as_tensor(values, dtype=torch.float64)
+    finite = tensor[torch.isfinite(tensor)]
+    if not finite.numel():
+        return {
+            name: float("nan")
+            for name in ("mean", "std", "p10", "p50", "p90")
+        }
+    quantiles = torch.quantile(
+        finite,
+        torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64),
+    )
+    return {
+        "mean": float(finite.mean()),
+        "std": float(finite.std(unbiased=False)),
+        "p10": float(quantiles[0]),
+        "p50": float(quantiles[1]),
+        "p90": float(quantiles[2]),
+    }
+
+
+def summarize_parent_transition_budget(
+    requested_parent_transitions: int,
+    actual_parent_transitions: int,
+) -> Dict[str, Any]:
+    """Report delivered transition coverage without changing rollout behavior."""
+    requested = int(requested_parent_transitions)
+    actual = int(actual_parent_transitions)
+    if requested < 0 or actual < 0:
+        raise ValueError("parent transition counts must be non-negative")
+    return {
+        "requested_parent_transitions": requested,
+        "actual_parent_transitions": actual,
+        "parent_transition_budget_ratio": (
+            float(actual / requested) if requested > 0 else float("nan")
+        ),
+        "parent_transition_shortfall": max(0, requested - actual),
+    }
+
+
+def summarize_state_bank_rollout_diagnostics(
+    macro_table: TensorTable,
+    *,
+    requested_parent_transitions: int,
+    main_branch: int = 0,
+) -> Dict[str, Any]:
+    """Summarize true parent-to-main-child macro transitions.
+
+    Parent rows are matched to child rows by ``(path, parent_t)`` and
+    ``(path, child_t - 1)``. Array position is never used as an identity.
+    """
+    columns = {name: index for index, name in enumerate(macro_table.columns)}
+    required = ("path", "t", "branch", "LnK")
+    missing = [name for name in required if name not in columns]
+    if missing:
+        raise ValueError(f"State Bank macro diagnostics missing columns: {missing}")
+    data = macro_table.data
+    path = data[:, columns["path"]].to(torch.long)
+    time = data[:, columns["t"]].to(torch.long)
+    branch = data[:, columns["branch"]].to(torch.long)
+    parent_idx = torch.nonzero(branch == -1, as_tuple=False).reshape(-1)
+    child_idx = torch.nonzero(branch == int(main_branch), as_tuple=False).reshape(-1)
+    budget = summarize_parent_transition_budget(
+        requested_parent_transitions,
+        int(parent_idx.numel()),
+    )
+    if not parent_idx.numel() or not child_idx.numel():
+        return {
+            **budget,
+            "realized_dlnk_cal": {"n": 0, **_finite_distribution_stats([])},
+        }
+
+    max_time = int(time.max().item()) + 2
+    parent_key = path[parent_idx] * max_time + time[parent_idx]
+    child_key = path[child_idx] * max_time + (time[child_idx] - 1)
+    if torch.unique(parent_key).numel() != parent_key.numel():
+        raise RuntimeError("State Bank macro diagnostics found duplicate parent keys")
+    if torch.unique(child_key).numel() != child_key.numel():
+        raise RuntimeError("State Bank macro diagnostics found duplicate main-child keys")
+    sorted_key, order = torch.sort(parent_key)
+    positions = torch.searchsorted(sorted_key, child_key)
+    in_range = positions < sorted_key.numel()
+    matched = torch.zeros_like(in_range, dtype=torch.bool)
+    matched[in_range] = sorted_key[positions[in_range]] == child_key[in_range]
+    child_take = child_idx[matched]
+    parent_take = parent_idx[order[positions[matched]]]
+    if "lineage_id" in columns and child_take.numel():
+        child_lineage = data[child_take, columns["lineage_id"]]
+        parent_lineage = data[parent_take, columns["lineage_id"]]
+        if not torch.equal(child_lineage, parent_lineage):
+            raise RuntimeError(
+                "State Bank macro diagnostics matched different parent/child lineages"
+            )
+    dlnk = (
+        data[child_take, columns["LnK"]]
+        - data[parent_take, columns["LnK"]]
+    ).detach().to("cpu", torch.float64)
+    finite = dlnk[torch.isfinite(dlnk)]
+    return {
+        **budget,
+        "realized_dlnk_cal": {
+            "n": int(finite.numel()),
+            **_finite_distribution_stats(finite.tolist()),
+        },
     }
 
 
@@ -529,15 +638,16 @@ class StateBank:
         capital_weights: List[float] = []
         capital_weighted_b: List[float] = []
         total_k: List[float] = []
-        lnk: List[float] = []
-        hatc: List[float] = []
-        hatcf: List[float] = []
+        lnkf_forecast: List[float] = []
+        lnk_calculated: List[float] = []
+        log_k_sum: List[float] = []
+        hatcf_forecast: List[float] = []
+        hatc_calculated: List[float] = []
         firm_count: List[float] = []
         entry_share: List[float] = []
         initial_share: List[float] = []
         default_rate: List[float] = []
         investment_rate: List[float] = []
-        lnk_by_lineage: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
         for entry in self.entries:
             fields = entry["fields"]
             alive = fields["alive"].to(torch.bool)
@@ -547,16 +657,19 @@ class StateBank:
             capital_weights.extend(K.tolist())
             capital_weighted_b.extend((b * K).tolist())
             total_k.append(float(K.sum()))
+            log_k_sum.append(float(torch.log(K.sum())) if K.sum() > 0 else float("nan"))
             firm_count.append(float(alive.sum()))
-            lnk_value = float(fields["lnkf"].reshape(-1)[0])
-            hatc_value = float(
-                fields.get("hatc_cal", fields["hatcf"]).reshape(-1)[0]
+            lnkf_forecast.append(float(fields["lnkf"].reshape(-1)[0]))
+            lnk_calculated.append(
+                float(fields["lnk_cal"].reshape(-1)[0])
+                if "lnk_cal" in fields
+                else float("nan")
             )
-            lnk.append(lnk_value)
-            hatc.append(hatc_value)
-            hatcf.append(float(fields["hatcf"].reshape(-1)[0]))
-            lnk_by_lineage[str(entry["lineage_id"])].append(
-                (int(entry["economic_time"]), lnk_value)
+            hatcf_forecast.append(float(fields["hatcf"].reshape(-1)[0]))
+            hatc_calculated.append(
+                float(fields["hatc_cal"].reshape(-1)[0])
+                if "hatc_cal" in fields
+                else float("nan")
             )
             if alive.any():
                 entry_share.append(float(fields["entry"][alive].float().mean()))
@@ -576,14 +689,11 @@ class StateBank:
                 lineage_weighted_b.append(
                     float((fields["b"][alive].to(torch.float64) * weights).sum() / weights.sum())
                 )
-        dlnk: List[float] = []
-        for sequence in lnk_by_lineage.values():
-            ordered = sorted(sequence)
-            dlnk.extend(
-                ordered[index][1] - ordered[index - 1][1]
-                for index in range(1, len(ordered))
-                if ordered[index][0] != ordered[index - 1][0]
-            )
+        lnkf_stats = _stats(lnkf_forecast)
+        lnk_cal_stats = _stats(lnk_calculated)
+        log_k_stats = _stats(log_k_sum)
+        hatcf_stats = _stats(hatcf_forecast)
+        hatc_cal_stats = _stats(hatc_calculated)
         return {
             "bank_entry_count": int(len(self.entries)),
             "unique_lineages": int(len(lineage_counts)),
@@ -597,19 +707,26 @@ class StateBank:
                 **_quantiles(lineage_weighted_b),
             },
             "K": _stats(total_k),
-            "LnK": _stats(lnk),
-            "Hatc": _stats(hatc),
-            "hatcf": _stats(hatcf),
+            "lnkf_forecast": lnkf_stats,
+            "lnk_cal": lnk_cal_stats,
+            "log_K_sum": log_k_stats,
+            "hatcf_forecast": hatcf_stats,
+            "hatc_calculated": hatc_cal_stats,
+            # Explicit backward-compatible aliases. Snapshot differences are
+            # intentionally absent because bank entries are not transitions.
+            "LnK": lnkf_stats,
+            "Hatc": hatc_cal_stats,
+            "hatcf": hatcf_stats,
+            "deprecated_aliases": {
+                "LnK": "lnkf_forecast",
+                "Hatc": "hatc_calculated",
+                "hatcf": "hatcf_forecast",
+            },
             "firm_count": _quantiles(firm_count),
             "entry_share": float(sum(entry_share) / max(len(entry_share), 1)),
             "initial_cohort_share": float(sum(initial_share) / max(len(initial_share), 1)),
             "default_rate": float(sum(default_rate) / max(len(default_rate), 1)),
             "investment_rate": float(sum(investment_rate) / max(len(investment_rate), 1)),
-            "mean_LnK": float(sum(lnk) / max(len(lnk), 1)),
-            "p10_LnK": _quantiles(lnk)["p10"],
-            "p50_LnK": _quantiles(lnk)["p50"],
-            "p90_LnK": _quantiles(lnk)["p90"],
-            "mean_dLnK": float(sum(dlnk) / len(dlnk)) if dlnk else float("nan"),
         }
 
 
@@ -725,6 +842,7 @@ class StateBankRolloutPlan:
         sampled = len(self.entry_ids)
         return {
             "requested_parent_budget": int(self.requested_parent_transitions),
+            "requested_parent_transitions": int(self.requested_parent_transitions),
             "rollout_chunk_count": int(len(self.chunks)),
             "sampled_bank_entry_count": int(sampled),
             "unique_sampled_bank_entries": int(len(set(self.entry_ids))),

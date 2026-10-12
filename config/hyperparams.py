@@ -233,6 +233,8 @@ class HyperParams:
     state_bank_burn_in: int = 2
     state_bank_capture_stride: int = 1
     state_bank_parent_transition_budget: int = 0
+    # Diagnostic warning only; it does not top up or reject a rollout.
+    state_bank_parent_budget_warn_ratio: float = 0.98
     state_bank_max_entries: int = 5000
     state_bank_sampling_mode: str = "uniform_lineage"
     state_bank_acceptance_mode: str = "numerical"

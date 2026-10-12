@@ -13,6 +13,7 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 import hashlib
+import math
 import random
 import json
 from contextlib import contextmanager
@@ -34,6 +35,7 @@ from data.state_bank import (
     StateBankRolloutPlan,
     build_state_bank_compatibility,
     clone_state,
+    summarize_state_bank_rollout_diagnostics,
 )
 from data.data_utils import compute_quantile_features
 from losses import SDFLoss, P0Loss, PILoss, QLoss, FC2Loss
@@ -12206,8 +12208,13 @@ class Episode:
             columns=macro_columns,
         )
         macro_col = {name: index for index, name in enumerate(macro_columns)}
+        rollout_diagnostics = summarize_state_bank_rollout_diagnostics(
+            self.tensor_macro,
+            requested_parent_transitions=plan.requested_parent_transitions,
+            main_branch=0,
+        )
         actual_parent_transitions = int(
-            (self.tensor_macro.data[:, macro_col["branch"]].long() == -1).sum().item()
+            rollout_diagnostics["actual_parent_transitions"]
         )
         unique_paths = int(
             torch.unique(self.tensor_macro.data[:, macro_col["path"]].long()).numel()
@@ -12220,12 +12227,33 @@ class Episode:
             )
         self._last_simulation_meta = {
             **plan.summary(),
-            "actual_parent_transitions": actual_parent_transitions,
+            **rollout_diagnostics,
+            "rollout_diagnostics": rollout_diagnostics,
             "output_unique_paths": unique_paths,
             "chunks": chunk_meta,
             "lineage_codebook": {str(value): key for key, value in lineage_codes.items()},
             "matched_rollout_plan": True,
         }
+        warn_ratio = float(
+            getattr(
+                getattr(self, "hyperparams", None),
+                "state_bank_parent_budget_warn_ratio",
+                0.98,
+            )
+        )
+        budget_ratio = float(
+            rollout_diagnostics["parent_transition_budget_ratio"]
+        )
+        if math.isfinite(budget_ratio) and budget_ratio < warn_ratio:
+            warnings.warn(
+                "State Bank rollout delivered fewer than "
+                f"{warn_ratio:.0%} of requested parent transitions: "
+                f"actual={actual_parent_transitions}, "
+                f"requested={plan.requested_parent_transitions}, "
+                f"ratio={budget_ratio:.6f}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         replay_history = list(
             getattr(self, "_state_bank_rollout_replay_fingerprints", [])
         )
@@ -12337,6 +12365,7 @@ class Episode:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(refresh_seed)
             outputs: List[Dict[str, Any]] = []
+            refresh_macro_tables: List[TensorTable] = []
             if episode_id == 1:
                 capture.set_context(lineage_ids=None, entry_namespace="bootstrap")
                 simulator = SimulateTS(
@@ -12352,6 +12381,7 @@ class Episode:
                 )
                 output = simulator.simulate_tensor()
                 outputs.append(dict(output.meta))
+                refresh_macro_tables.append(output.macro)
             else:
                 for chunk in rollout_plan.chunks:
                     capture.set_context(
@@ -12377,11 +12407,63 @@ class Episode:
                     )
                     output = simulator.simulate_tensor()
                     outputs.append(dict(output.meta))
+                    refresh_macro_tables.append(
+                        self._offset_tensor_table_paths(
+                            output.macro,
+                            chunk.path_offset,
+                        )
+                    )
+            if not refresh_macro_tables:
+                raise RuntimeError("State Bank refresh produced no macro output")
+            refresh_columns = list(refresh_macro_tables[0].columns)
+            if any(
+                list(table.columns) != refresh_columns
+                for table in refresh_macro_tables
+            ):
+                raise RuntimeError("State Bank refresh macro schemas differ")
+            refresh_macro = TensorTable(
+                data=torch.cat(
+                    [table.data for table in refresh_macro_tables],
+                    dim=0,
+                ),
+                columns=refresh_columns,
+            )
+            requested_transitions = (
+                int(n_paths) * int(refresh_horizon)
+                if episode_id == 1
+                else int(rollout_plan.requested_parent_transitions)
+            )
+            rollout_diagnostics = summarize_state_bank_rollout_diagnostics(
+                refresh_macro,
+                requested_parent_transitions=requested_transitions,
+                main_branch=0,
+            )
+            warn_ratio = float(
+                getattr(
+                    self.hyperparams,
+                    "state_bank_parent_budget_warn_ratio",
+                    0.98,
+                )
+            )
+            budget_ratio = float(
+                rollout_diagnostics["parent_transition_budget_ratio"]
+            )
+            if math.isfinite(budget_ratio) and budget_ratio < warn_ratio:
+                warnings.warn(
+                    "State Bank rollout delivered fewer than "
+                    f"{warn_ratio:.0%} of requested parent transitions: "
+                    f"actual={rollout_diagnostics['actual_parent_transitions']}, "
+                    f"requested={requested_transitions}, "
+                    f"ratio={budget_ratio:.6f}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             bank.metadata.update(
                 {
                     "capture": capture.summary(),
                     "simulation_meta": outputs,
                     "refresh_seed": refresh_seed,
+                    "rollout_diagnostics": rollout_diagnostics,
                 }
             )
         finally:

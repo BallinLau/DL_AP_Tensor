@@ -202,6 +202,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-bank-refresh-burn-in", type=int, default=None)
     parser.add_argument("--state-bank-refresh-capture-stride", type=int, default=None)
     parser.add_argument("--state-bank-parent-transition-budget", type=int, default=None)
+    parser.add_argument("--state-bank-parent-budget-warn-ratio", type=float, default=None)
     parser.add_argument("--state-bank-burn-in", type=int, default=None)
     parser.add_argument("--state-bank-capture-stride", type=int, default=None)
     parser.add_argument("--state-bank-max-entries", type=int, default=None)
@@ -876,6 +877,11 @@ def configure_hyperparams(args: argparse.Namespace):
             "state_bank_parent_transition_budget",
             int,
         ),
+        (
+            "state_bank_parent_budget_warn_ratio",
+            "state_bank_parent_budget_warn_ratio",
+            float,
+        ),
         ("state_bank_burn_in", "state_bank_burn_in", int),
         ("state_bank_capture_stride", "state_bank_capture_stride", int),
         ("state_bank_max_entries", "state_bank_max_entries", int),
@@ -989,6 +995,10 @@ def configure_hyperparams(args: argparse.Namespace):
         raise ValueError("state_bank_refresh_capture_stride must be positive")
     if int(hyperparams.state_bank_parent_transition_budget) < 0:
         raise ValueError("state_bank_parent_transition_budget must be non-negative")
+    if not 0.0 < float(hyperparams.state_bank_parent_budget_warn_ratio) <= 1.0:
+        raise ValueError(
+            "state_bank_parent_budget_warn_ratio must be in (0, 1]"
+        )
     if int(hyperparams.state_bank_max_entries) < 0:
         raise ValueError("state_bank_max_entries must be non-negative")
     if int(hyperparams.state_bank_refresh_burn_in) >= int(hyperparams.state_bank_short_horizon):
@@ -1012,6 +1022,20 @@ def configure_hyperparams(args: argparse.Namespace):
         raise ValueError("invalid state_bank_acceptance_mode")
     if int(hyperparams.state_bank_min_unique_lineages) < 0:
         raise ValueError("state_bank_min_unique_lineages must be non-negative")
+    bellman_mean_threshold = getattr(
+        hyperparams,
+        "bellman_conditional_mean_thresh",
+        None,
+    )
+    bellman_p90_threshold = getattr(
+        hyperparams,
+        "bellman_conditional_p90_thresh",
+        None,
+    )
+    if (bellman_mean_threshold is None) != (bellman_p90_threshold is None):
+        raise ValueError(
+            "Bellman conditional thresholds must be both configured or both None"
+        )
     if (
         str(hyperparams.transition_rng_mode) == "stable_firm_identity"
         and hyperparams.common_transition_seed is None
@@ -1556,6 +1580,7 @@ def build_and_commit_state_bank(
             {
                 "acceptance": acceptance,
                 "distribution": candidate.distribution_summary(),
+                "rollout": candidate.metadata.get("rollout_diagnostics", {}),
                 "lineage_refresh": lineage_refresh,
                 "compatibility_fingerprint": candidate.compatibility_fingerprint,
             },
@@ -1615,6 +1640,44 @@ def evaluate_state_bank_acceptance(
 
     modules = episode_summary.get("module_summaries", {})
     strict_checks: dict[str, object] = {}
+    bellman_mean_threshold = getattr(
+        hyperparams,
+        "bellman_conditional_mean_thresh",
+        None,
+    )
+    bellman_p90_threshold = getattr(
+        hyperparams,
+        "bellman_conditional_p90_thresh",
+        None,
+    )
+    if (bellman_mean_threshold is None) != (bellman_p90_threshold is None):
+        raise ValueError(
+            "Bellman conditional thresholds must be both configured or both None"
+        )
+    bellman_gate_configured = (
+        bellman_mean_threshold is not None
+        and bellman_p90_threshold is not None
+    )
+    convergence = episode_summary.get("convergence")
+    bellman_passed = (
+        convergence.get("bellman_passed")
+        if isinstance(convergence, dict)
+        else None
+    )
+    bellman_gate = {
+        "configured": bellman_gate_configured,
+        "required": bellman_gate_configured,
+        "status": (
+            "passed"
+            if bellman_gate_configured and bellman_passed is True
+            else "failed"
+            if bellman_gate_configured
+            else "diagnostic_only"
+        ),
+        "mean_threshold": bellman_mean_threshold,
+        "p90_threshold": bellman_p90_threshold,
+        "bellman_passed": bellman_passed,
+    }
     if mode == "strict":
         schedule = modules.get("sdf_formal_stage_schedule", {})
         if bool(schedule.get("formal_sdf_active", False)):
@@ -1633,21 +1696,23 @@ def evaluate_state_bank_acceptance(
         q_passed = metadata.get("q_stage_required_gate_passed") is True
         bp_status = metadata.get("bp_distillation_stage", {}).get("status")
         bp_passed = bp_status == "accepted"
-        convergence = episode_summary.get("convergence")
-        convergence_passed = (
-            isinstance(convergence, dict) and convergence.get("passed") is True
-        )
         strict_checks.update(
             {
                 "policy_value_stage_passed": stage_passed,
                 "q_required_gate_passed": q_passed,
                 "bp_required_gate_passed": bp_passed,
-                "bellman_policy_convergence_passed": convergence_passed,
             }
         )
         for key, passed in strict_checks.items():
             if passed is not True:
                 reasons.append(f"{key}=False_or_unavailable")
+        strict_checks["bellman_fixed_point_gate"] = (
+            bool(bellman_passed)
+            if bellman_gate_configured
+            else "not_required_unconfigured"
+        )
+        if bellman_gate_configured and bellman_passed is not True:
+            reasons.append("bellman_required_gate_failed")
     elif mode != "numerical":
         raise ValueError(f"Unknown state_bank_acceptance_mode={mode!r}")
 
@@ -1661,6 +1726,7 @@ def evaluate_state_bank_acceptance(
         "unique_lineages": unique_lineages,
         "minimum_unique_lineages": minimum,
         "strict_checks": strict_checks,
+        "bellman_gate": bellman_gate,
     }
 
 
@@ -1788,6 +1854,7 @@ def main():
             f"refresh=({hyperparams.state_bank_refresh_burn_in},"
             f"{hyperparams.state_bank_refresh_capture_stride}), "
             f"parent_budget={hyperparams.state_bank_parent_transition_budget}, "
+            f"budget_warn_ratio={hyperparams.state_bank_parent_budget_warn_ratio}, "
             f"sampling={hyperparams.state_bank_sampling_mode}, "
             f"acceptance={hyperparams.state_bank_acceptance_mode}, "
             f"max_entries={hyperparams.state_bank_max_entries}"
@@ -1925,6 +1992,9 @@ def main():
                         "output_distribution_summary": (
                             candidate_bank.distribution_summary()
                         ),
+                        "output_rollout_diagnostics": candidate_bank.metadata.get(
+                            "rollout_diagnostics", {}
+                        ),
                         "lineage_refresh": candidate_bank.metadata.get(
                             "lineage_refresh", {}
                         ),
@@ -1976,6 +2046,7 @@ def main():
                     "state_bank_refresh_burn_in": hyperparams.state_bank_refresh_burn_in,
                     "state_bank_refresh_capture_stride": hyperparams.state_bank_refresh_capture_stride,
                     "state_bank_parent_transition_budget": hyperparams.state_bank_parent_transition_budget,
+                    "state_bank_parent_budget_warn_ratio": hyperparams.state_bank_parent_budget_warn_ratio,
                     "state_bank_max_entries": hyperparams.state_bank_max_entries,
                     "state_bank_sampling_mode": hyperparams.state_bank_sampling_mode,
                     "state_bank_acceptance_mode": hyperparams.state_bank_acceptance_mode,

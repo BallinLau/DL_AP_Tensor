@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from config import Config
+from config import Config, HyperParams
 from data import simulate_ts_parallel
 from data.entry import compute_entry_reference
 from data.simulate_ts import SimulateTS
@@ -16,6 +17,8 @@ from data.state_bank import (
     StateBankRolloutChunk,
     StateBankRolloutPlan,
     clone_state,
+    summarize_parent_transition_budget,
+    summarize_state_bank_rollout_diagnostics,
 )
 from data.tensor_data import TensorSimulationOutput, TensorTable
 from experiments.run_multi_episode_job import (
@@ -24,6 +27,7 @@ from experiments.run_multi_episode_job import (
     evaluate_state_bank_acceptance,
     parse_args,
 )
+import experiments.run_multi_episode_job as job_module
 from training.pv_mixture import PVParentGroupPool, split_pool_by_lineage
 from training.episode import Episode
 
@@ -379,7 +383,7 @@ def test_rollout_plan_meets_budget_in_chunks_without_path_namespace_collision():
 def test_episode_multichunk_concat_and_matched_replay_use_same_plan(monkeypatch):
     class FakeSimulator:
         FIRM_COLUMNS = ["path", "t", "branch"]
-        MACRO_COLUMNS = ["path", "t", "branch"]
+        MACRO_COLUMNS = ["path", "t", "branch", "LnK"]
 
         def __init__(self, *, n_paths, horizon, **_kwargs):
             self.n_paths = int(n_paths)
@@ -389,12 +393,12 @@ def test_episode_multichunk_concat_and_matched_replay_use_same_plan(monkeypatch)
             rows = []
             for time_index in range(self.horizon):
                 for path_index in range(self.n_paths):
-                    rows.append([path_index, time_index, -1])
-                    rows.append([path_index, time_index + 1, 0])
-                    rows.append([path_index, time_index + 1, 1])
+                    rows.append([path_index, time_index, -1, float(time_index)])
+                    rows.append([path_index, time_index + 1, 0, float(time_index + 1)])
+                    rows.append([path_index, time_index + 1, 1, float(time_index + 1)])
             table = torch.tensor(rows, dtype=torch.float32)
             return TensorSimulationOutput(
-                firm=TensorTable(table.clone(), self.FIRM_COLUMNS),
+                firm=TensorTable(table[:, :3].clone(), self.FIRM_COLUMNS),
                 macro=TensorTable(table.clone(), self.MACRO_COLUMNS),
                 meta={"fake": True},
             )
@@ -639,6 +643,172 @@ def test_entry_identity_draws_survive_bank_save_reload_without_global_rng_use(tm
         "potential_capital_nominal", "candidate_capital_realized",
     ):
         _assert_tensor_equal(getattr(actual, name), getattr(expected, name))
+
+
+def _strict_acceptance_summary(*, bellman_passed):
+    return {
+        "module_summaries": {
+            "sdf_formal_stage_schedule": {"formal_sdf_active": False},
+            "policy_value": {
+                "metadata": {
+                    "policy_value_stage_status": "accepted",
+                    "q_stage_required_gate_passed": True,
+                    "bp_distillation_stage": {"status": "accepted"},
+                }
+            },
+        },
+        "convergence": {
+            "bellman_passed": bellman_passed,
+            "policy_passed": True,
+            "passed": None if bellman_passed is None else bool(bellman_passed),
+        },
+    }
+
+
+def _finite_candidate_bank():
+    _, state = _fresh_state(n_paths=1)
+    state["accounting_valid"].fill_(True)
+    bank = StateBank(compatibility=_compatibility(), source_episode=2)
+    bank.capture(state, capture_time=3, lineage_ids=["root:0"])
+    return bank
+
+
+def test_strict_acceptance_treats_unconfigured_bellman_as_diagnostic_only():
+    hp = SimpleNamespace(
+        state_bank_acceptance_mode="strict",
+        state_bank_min_unique_lineages=1,
+        bellman_conditional_mean_thresh=None,
+        bellman_conditional_p90_thresh=None,
+    )
+    result = evaluate_state_bank_acceptance(
+        episode_summary=_strict_acceptance_summary(bellman_passed=None),
+        candidate_bank=_finite_candidate_bank(),
+        hyperparams=hp,
+    )
+    assert result["episode_acceptance_passed"] is True
+    assert result["bellman_gate"] == {
+        "configured": False,
+        "required": False,
+        "status": "diagnostic_only",
+        "mean_threshold": None,
+        "p90_threshold": None,
+        "bellman_passed": None,
+    }
+    assert (
+        result["strict_checks"]["bellman_fixed_point_gate"]
+        == "not_required_unconfigured"
+    )
+
+
+def test_strict_acceptance_requires_configured_bellman_gate_to_pass():
+    hp = SimpleNamespace(
+        state_bank_acceptance_mode="strict",
+        state_bank_min_unique_lineages=1,
+        bellman_conditional_mean_thresh=0.01,
+        bellman_conditional_p90_thresh=0.02,
+    )
+    result = evaluate_state_bank_acceptance(
+        episode_summary=_strict_acceptance_summary(bellman_passed=False),
+        candidate_bank=_finite_candidate_bank(),
+        hyperparams=hp,
+    )
+    assert result["episode_acceptance_passed"] is False
+    assert result["bellman_gate"]["status"] == "failed"
+    assert "bellman_required_gate_failed" in result["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("mean_threshold", "p90_threshold"),
+    [(0.01, None), (None, 0.02)],
+)
+def test_partial_bellman_threshold_configuration_fails_fast(
+    monkeypatch,
+    mean_threshold,
+    p90_threshold,
+):
+    hp = HyperParams()
+    hp.bellman_conditional_mean_thresh = mean_threshold
+    hp.bellman_conditional_p90_thresh = p90_threshold
+    monkeypatch.setattr(job_module, "build_hyperparams", lambda: hp)
+    monkeypatch.setattr("sys.argv", ["run_multi_episode_job.py"])
+    with pytest.raises(
+        ValueError,
+        match="Bellman conditional thresholds must be both configured or both None",
+    ):
+        configure_hyperparams(parse_args())
+
+
+def test_bank_capital_summary_separates_forecast_calculated_and_direct_rebuild():
+    _, state = _fresh_state(n_paths=1, group_size=2)
+    state["lnkf"].fill_(100.0)
+    state["lnk_cal"] = torch.full_like(state["lnkf"], 5.0)
+    state["hatcf"].fill_(20.0)
+    state["hatc_cal"] = torch.full_like(state["hatcf"], 3.0)
+    alive_count = int(state["alive"].sum().item())
+    state["K"][state["alive"]] = math.exp(6.0) / alive_count
+    bank = StateBank(compatibility=_compatibility(), source_episode=1)
+    bank.capture(state, capture_time=20, lineage_ids=["root:0"])
+    summary = bank.distribution_summary()
+
+    assert summary["lnkf_forecast"]["mean"] == pytest.approx(100.0)
+    assert summary["lnk_cal"]["mean"] == pytest.approx(5.0)
+    assert summary["log_K_sum"]["mean"] == pytest.approx(6.0, abs=1e-6)
+    assert summary["hatcf_forecast"]["mean"] == pytest.approx(20.0)
+    assert summary["hatc_calculated"]["mean"] == pytest.approx(3.0)
+    assert summary["deprecated_aliases"]["LnK"] == "lnkf_forecast"
+
+
+def test_bank_snapshots_do_not_report_transition_growth():
+    _, state = _fresh_state(n_paths=1)
+    state["lnk_cal"] = torch.zeros_like(state["lnkf"])
+    bank = StateBank(compatibility=_compatibility(), source_episode=1)
+    for capture_time, economic_time, lnk_cal in ((20, 20, 4.0), (35, 35, 9.0)):
+        state["economic_time"].fill_(economic_time)
+        state["lnk_cal"].fill_(lnk_cal)
+        bank.capture(
+            state,
+            capture_time=capture_time,
+            lineage_ids=["same-lineage"],
+            entry_namespace=f"t{capture_time}",
+        )
+    summary = bank.distribution_summary()
+    assert "mean_dLnK" not in summary
+    assert "snapshot_spacing_difference_not_transition_growth" not in summary
+
+
+def test_realized_dlnk_uses_matched_parent_main_child_transitions():
+    macro = TensorTable(
+        data=torch.tensor(
+            [
+                [0, 0, -1, 4.0],
+                [1, 3, -1, 2.0],
+                [0, 1, 0, 4.1],
+                [1, 4, 0, 1.8],
+                [0, 1, 1, 99.0],
+            ],
+            dtype=torch.float32,
+        ),
+        columns=["path", "t", "branch", "LnK"],
+    )
+    result = summarize_state_bank_rollout_diagnostics(
+        macro,
+        requested_parent_transitions=2,
+        main_branch=0,
+    )
+    realized = result["realized_dlnk_cal"]
+    assert realized["n"] == 2
+    assert realized["mean"] == pytest.approx(-0.05, abs=1e-6)
+    assert realized["p10"] == pytest.approx(-0.17, abs=1e-6)
+    assert realized["p90"] == pytest.approx(0.07, abs=1e-6)
+
+
+def test_parent_transition_budget_ratio_and_shortfall():
+    below = summarize_parent_transition_budget(100, 98)
+    assert below["parent_transition_budget_ratio"] == pytest.approx(0.98)
+    assert below["parent_transition_shortfall"] == 2
+    above = summarize_parent_transition_budget(100, 103)
+    assert above["parent_transition_budget_ratio"] == pytest.approx(1.03)
+    assert above["parent_transition_shortfall"] == 0
 
 
 def test_strict_acceptance_rejects_missing_gates_and_preserves_bank_file(tmp_path):
