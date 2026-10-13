@@ -683,9 +683,10 @@ def _strict_acceptance_summary(
     }
 
 
-def _strict_acceptance_hyperparams():
+def _strict_acceptance_hyperparams(*, sdf_publication_gate_enabled: bool = True):
     return SimpleNamespace(
         state_bank_acceptance_mode="strict",
+        state_bank_sdf_publication_gate_enabled=sdf_publication_gate_enabled,
         state_bank_min_unique_lineages=1,
         bellman_conditional_mean_thresh=None,
         bellman_conditional_p90_thresh=None,
@@ -780,6 +781,7 @@ def test_strict_acceptance_uses_sdf_continuation_quality_for_publication(
     assert result["episode_acceptance_passed"] is expected_passed
     assert result["sdf_publication_gate"] == {
         "formal_sdf_active": True,
+        "required": True,
         "safe_to_continue": safe_to_continue,
         "stage_progress": stage_progress,
         "converged": converged,
@@ -788,6 +790,34 @@ def test_strict_acceptance_uses_sdf_continuation_quality_for_publication(
     }
     if not expected_passed:
         assert expected_reason in result["reasons"]
+
+
+def test_strict_acceptance_keeps_disabled_sdf_gate_diagnostic_only():
+    result = evaluate_state_bank_acceptance(
+        episode_summary=_strict_acceptance_summary(
+            bellman_passed=None,
+            formal_sdf_active=True,
+            safe_to_continue=True,
+            stage_progress=False,
+            converged=False,
+        ),
+        candidate_bank=_finite_candidate_bank(),
+        hyperparams=_strict_acceptance_hyperparams(
+            sdf_publication_gate_enabled=False
+        ),
+    )
+    assert result["episode_acceptance_passed"] is True
+    assert result["sdf_publication_gate"] == {
+        "formal_sdf_active": True,
+        "required": False,
+        "safe_to_continue": True,
+        "stage_progress": False,
+        "converged": False,
+        "publication_passed": False,
+        "reason": "sdf_safe_but_no_progress",
+    }
+    assert "sdf_publication_gate_passed" not in result["strict_checks"]
+    assert "sdf_safe_but_no_progress" not in result["reasons"]
 
 
 def test_strict_acceptance_ignores_final_strict_failure_when_sdf_is_progressing():
@@ -820,6 +850,7 @@ def test_calibration_episode_does_not_require_sdf_publication_gate():
     assert result["episode_acceptance_passed"] is True
     assert result["sdf_publication_gate"] == {
         "formal_sdf_active": False,
+        "required": False,
         "safe_to_continue": None,
         "stage_progress": None,
         "converged": None,
@@ -967,6 +998,7 @@ def test_state_bank_slurm_pins_formal_v2_parameters():
         "STATE_BANK_MAX_ENTRIES:-5000",
         "STATE_BANK_SAMPLING_MODE:-uniform_lineage",
         "STATE_BANK_ACCEPTANCE_MODE:-strict",
+        "STATE_BANK_SDF_PUBLICATION_GATE_ENABLED=0",
         "TRANSITION_RNG_MODE=stable_firm_identity",
         "ENTRY_RNG_MODE=stable_economic_identity",
         "ENTRY_SIZE_RATIO=1.0",

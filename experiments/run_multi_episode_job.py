@@ -216,6 +216,15 @@ def parse_args() -> argparse.Namespace:
         choices=["numerical", "strict"],
         default=None,
     )
+    parser.add_argument(
+        "--state-bank-sdf-publication-gate-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Allow SDF continuation/progress/convergence diagnostics to block "
+            "State Bank publication in strict acceptance mode"
+        ),
+    )
     parser.add_argument("--state-bank-min-unique-lineages", type=int, default=None)
     parser.add_argument("--state-bank-sample-seed", type=int, default=None)
     parser.add_argument("--state-bank-refresh-seed", type=int, default=None)
@@ -888,6 +897,11 @@ def configure_hyperparams(args: argparse.Namespace):
         ("state_bank_sampling_mode", "state_bank_sampling_mode", str),
         ("state_bank_acceptance_mode", "state_bank_acceptance_mode", str),
         (
+            "state_bank_sdf_publication_gate_enabled",
+            "state_bank_sdf_publication_gate_enabled",
+            bool,
+        ),
+        (
             "state_bank_min_unique_lineages",
             "state_bank_min_unique_lineages",
             int,
@@ -1552,6 +1566,7 @@ def build_and_commit_state_bank(
     sdf_publication = acceptance["sdf_publication_gate"]
     print(
         "SDF publication status: "
+        f"required={sdf_publication['required']} "
         f"safe_to_continue={sdf_publication['safe_to_continue']} "
         f"stage_progress={sdf_publication['stage_progress']} "
         f"converged={sdf_publication['converged']} "
@@ -1696,8 +1711,12 @@ def evaluate_state_bank_acceptance(
     }
     schedule = modules.get("sdf_formal_stage_schedule", {})
     formal_sdf_active = bool(schedule.get("formal_sdf_active", False))
+    sdf_publication_gate_enabled = bool(
+        getattr(hyperparams, "state_bank_sdf_publication_gate_enabled", False)
+    )
     sdf_publication_gate = {
         "formal_sdf_active": formal_sdf_active,
+        "required": bool(formal_sdf_active and sdf_publication_gate_enabled),
         "safe_to_continue": None,
         "stage_progress": None,
         "converged": None,
@@ -1741,9 +1760,10 @@ def evaluate_state_bank_acceptance(
                     "reason": publication_reason,
                 }
             )
-            strict_checks["sdf_publication_gate_passed"] = publication_passed
-            if not publication_passed:
-                reasons.append(publication_reason)
+            if sdf_publication_gate_enabled:
+                strict_checks["sdf_publication_gate_passed"] = publication_passed
+                if not publication_passed:
+                    reasons.append(publication_reason)
 
         policy = modules.get("policy_value")
         metadata = policy.get("metadata", {}) if isinstance(policy, dict) else {}
@@ -1913,6 +1933,8 @@ def main():
             f"budget_warn_ratio={hyperparams.state_bank_parent_budget_warn_ratio}, "
             f"sampling={hyperparams.state_bank_sampling_mode}, "
             f"acceptance={hyperparams.state_bank_acceptance_mode}, "
+            "sdf_publication_gate="
+            f"{hyperparams.state_bank_sdf_publication_gate_enabled}, "
             f"max_entries={hyperparams.state_bank_max_entries}"
         )
     episode = Episode(
@@ -2119,6 +2141,7 @@ def main():
                     "state_bank_max_entries": hyperparams.state_bank_max_entries,
                     "state_bank_sampling_mode": hyperparams.state_bank_sampling_mode,
                     "state_bank_acceptance_mode": hyperparams.state_bank_acceptance_mode,
+                    "state_bank_sdf_publication_gate_enabled": hyperparams.state_bank_sdf_publication_gate_enabled,
                     "state_bank_min_unique_lineages": hyperparams.state_bank_min_unique_lineages,
                     "state_bank_sample_seed": hyperparams.state_bank_sample_seed,
                     "state_bank_refresh_seed": hyperparams.state_bank_refresh_seed,

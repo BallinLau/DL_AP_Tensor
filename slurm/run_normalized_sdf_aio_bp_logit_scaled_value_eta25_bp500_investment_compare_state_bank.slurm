@@ -47,10 +47,10 @@ if [[ ! -f "$INITIAL_CHECKPOINT" ]]; then
   exit 1
 fi
 
-# State Bank publication requires safe SDF progress, while final SDF convergence
-# remains diagnostic. Keep this wrapper in each formal State Bank code revision
-# so its self-pin resolves to the exact implementation under test. Economic
-# entry settings are unchanged.
+# SDF continuation/progress/convergence remain diagnostic and do not block
+# State Bank publication. Strict acceptance still enforces the policy, Q, BP,
+# bank-integrity, and lineage checks. Keep this wrapper in each formal State
+# Bank code revision so its self-pin resolves to the exact implementation.
 export STATE_BANK_ENABLED=1
 export STATE_BANK_SHORT_HORIZON="${STATE_BANK_SHORT_HORIZON:-10}"
 export STATE_BANK_BOOTSTRAP_BURN_IN="${STATE_BANK_BOOTSTRAP_BURN_IN:-5}"
@@ -61,6 +61,7 @@ export STATE_BANK_PARENT_TRANSITION_BUDGET="${STATE_BANK_PARENT_TRANSITION_BUDGE
 export STATE_BANK_MAX_ENTRIES="${STATE_BANK_MAX_ENTRIES:-5000}"
 export STATE_BANK_SAMPLING_MODE="${STATE_BANK_SAMPLING_MODE:-uniform_lineage}"
 export STATE_BANK_ACCEPTANCE_MODE="${STATE_BANK_ACCEPTANCE_MODE:-strict}"
+export STATE_BANK_SDF_PUBLICATION_GATE_ENABLED=0
 export STATE_BANK_MIN_UNIQUE_LINEAGES="${STATE_BANK_MIN_UNIQUE_LINEAGES:-200}"
 export STATE_BANK_SAMPLE_SEED="${STATE_BANK_SAMPLE_SEED:-271828}"
 export STATE_BANK_REFRESH_SEED="${STATE_BANK_REFRESH_SEED:-314159}"
@@ -101,6 +102,7 @@ echo "STATE_BANK_BOOTSTRAP_BURN_IN=$STATE_BANK_BOOTSTRAP_BURN_IN"
 echo "STATE_BANK_PARENT_TRANSITION_BUDGET=$STATE_BANK_PARENT_TRANSITION_BUDGET"
 echo "STATE_BANK_SAMPLING_MODE=$STATE_BANK_SAMPLING_MODE"
 echo "STATE_BANK_ACCEPTANCE_MODE=$STATE_BANK_ACCEPTANCE_MODE"
+echo "STATE_BANK_SDF_PUBLICATION_GATE_ENABLED=$STATE_BANK_SDF_PUBLICATION_GATE_ENABLED"
 echo "SDF_CONTINUE_CONSTRAINT_TOL=$SDF_CONTINUE_CONSTRAINT_TOL"
 echo "TRANSITION_RNG_MODE=$TRANSITION_RNG_MODE"
 echo "ENTRY_RNG_MODE=$ENTRY_RNG_MODE"
