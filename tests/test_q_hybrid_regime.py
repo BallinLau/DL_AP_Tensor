@@ -382,6 +382,26 @@ def test_hybrid_claim_batch_reports_realized_zero_survival_default_partition():
     assert diagnostics["claim_total_sample_count"] == 1
 
 
+def test_hybrid_claim_diagnostics_preserve_natural_coverage_sources():
+    episode = _episode_for_gate()
+    episode.hyperparams.q_claim_coverage_enabled = True
+    episode.hyperparams.q_survival_ondist_share = 0.5
+    batch = _q_batch((0.2, 0.4, 0.7, 0.9))
+    batch["source_id"] = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+    batch["source_index"] = torch.arange(4, dtype=torch.long)
+    claim_batch, diagnostics = episode._build_q_survival_batch(
+        batch, _CandidateGate(), return_diagnostics=True
+    )
+    assert claim_batch is not None
+    assert diagnostics["realized_parent_survival_natural_count"] == 1
+    assert diagnostics["realized_parent_survival_coverage_count"] == 1
+    assert diagnostics["claim_ondist_natural_sample_count"] == 1
+    assert diagnostics["claim_ondist_coverage_sample_count"] == 1
+    assert diagnostics["claim_synthetic_natural_sample_count"] == 1
+    assert diagnostics["claim_synthetic_coverage_sample_count"] == 1
+    assert torch.equal(claim_batch["source_id"], torch.tensor([0, 1, 0, 1]))
+
+
 def test_hybrid_claim_coverage_spans_bins_and_produces_q_gradient():
     episode = _episode_for_gate()
     episode.hyperparams.q_claim_coverage_enabled = True

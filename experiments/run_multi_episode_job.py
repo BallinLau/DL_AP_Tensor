@@ -229,6 +229,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--state-bank-pq-decoupling-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use a State-Bank-specific natural/coverage mixture for P/Q only.",
+    )
+    parser.add_argument(
+        "--state-bank-pq-coverage-ratio",
+        type=float,
+        default=None,
+        help="Coverage parent-group share for decoupled State Bank P/Q training.",
+    )
+    parser.add_argument(
         "--state-bank-economic-feasibility-filter-enabled",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -914,6 +926,16 @@ def configure_hyperparams(args: argparse.Namespace):
             bool,
         ),
         (
+            "state_bank_pq_decoupling_enabled",
+            "state_bank_pq_decoupling_enabled",
+            bool,
+        ),
+        (
+            "state_bank_pq_coverage_ratio",
+            "state_bank_pq_coverage_ratio",
+            float,
+        ),
+        (
             "state_bank_economic_feasibility_filter_enabled",
             "state_bank_economic_feasibility_filter_enabled",
             bool,
@@ -1430,6 +1452,8 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.pv_mixture_preserve_rng = bool(args.pv_mixture_preserve_rng)
     if not 0.0 <= float(getattr(hyperparams, "pv_mixture_ratio", 0.0)) <= 1.0:
         raise ValueError("pv_mixture_ratio must be in [0, 1].")
+    if not 0.0 <= float(getattr(hyperparams, "state_bank_pq_coverage_ratio", 0.80)) <= 1.0:
+        raise ValueError("state_bank_pq_coverage_ratio must be in [0, 1].")
     if str(getattr(hyperparams, "pv_mixture_budget_mode", "fixed_total")).lower() != "fixed_total":
         raise ValueError("pv_mixture_budget_mode must be fixed_total.")
     if int(getattr(hyperparams, "pv_mixture_coverage_group_size", 2)) <= 0:
@@ -1440,7 +1464,10 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.pv_exact_eta_integration_enabled = bool(
             args.pv_exact_eta_integration_enabled
         )
-    if bool(getattr(hyperparams, "pv_mixture_enabled", False)):
+    if bool(getattr(hyperparams, "pv_mixture_enabled", False)) or (
+        bool(getattr(hyperparams, "state_bank_enabled", False))
+        and bool(getattr(hyperparams, "state_bank_pq_decoupling_enabled", False))
+    ):
         if bool(getattr(hyperparams, "pv_eta_resample_enabled", False)):
             raise ValueError("PV mixture currently requires --no-pv-eta-resample-enabled.")
         if str(getattr(hyperparams, "pv_training_flow", "joint")).lower() != "staged":
@@ -1976,6 +2003,10 @@ def main():
             f"{hyperparams.state_bank_sdf_publication_gate_enabled}, "
             "economic_feasibility_filter="
             f"{hyperparams.state_bank_economic_feasibility_filter_enabled}, "
+            "pq_decoupling="
+            f"{hyperparams.state_bank_pq_decoupling_enabled}, "
+            "pq_coverage_ratio="
+            f"{hyperparams.state_bank_pq_coverage_ratio}, "
             f"max_entries={hyperparams.state_bank_max_entries}"
         )
     episode = Episode(
@@ -2183,6 +2214,8 @@ def main():
                     "state_bank_sampling_mode": hyperparams.state_bank_sampling_mode,
                     "state_bank_acceptance_mode": hyperparams.state_bank_acceptance_mode,
                     "state_bank_sdf_publication_gate_enabled": hyperparams.state_bank_sdf_publication_gate_enabled,
+                    "state_bank_pq_decoupling_enabled": hyperparams.state_bank_pq_decoupling_enabled,
+                    "state_bank_pq_coverage_ratio": hyperparams.state_bank_pq_coverage_ratio,
                     "state_bank_economic_feasibility_filter_enabled": hyperparams.state_bank_economic_feasibility_filter_enabled,
                     "state_bank_min_unique_lineages": hyperparams.state_bank_min_unique_lineages,
                     "state_bank_sample_seed": hyperparams.state_bank_sample_seed,

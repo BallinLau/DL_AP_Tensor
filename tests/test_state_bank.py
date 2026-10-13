@@ -354,6 +354,20 @@ def test_economic_filter_setting_is_part_of_compatibility_fingerprint(tmp_path):
         StateBank.load(path, expected_compatibility=enabled_compatibility)
 
 
+def test_pq_decoupling_does_not_change_state_bank_compatibility():
+    legacy = HyperParams()
+    decoupled = HyperParams()
+    decoupled.state_bank_pq_decoupling_enabled = True
+    decoupled.state_bank_pq_coverage_ratio = 0.80
+    legacy_payload = build_state_bank_compatibility(
+        config=Config, hyperparams=legacy, branch_num=2
+    )
+    decoupled_payload = build_state_bank_compatibility(
+        config=Config, hyperparams=decoupled, branch_num=2
+    )
+    assert decoupled_payload == legacy_payload
+
+
 def test_sampling_is_reproducible_episode_specific_and_rng_neutral():
     _, state = _fresh_state(n_paths=2)
     bank = StateBank(compatibility=_compatibility(), source_episode=1)

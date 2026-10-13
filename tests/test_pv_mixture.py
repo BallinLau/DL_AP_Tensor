@@ -471,3 +471,126 @@ def test_coverage_generation_restores_model_modes():
     assert pool is not None
     assert episode.models["policy_value"].training is True
     assert episode.models["sdf_fc1"].training is True
+
+
+def test_state_bank_without_decoupling_preserves_legacy_ratio():
+    hp = _hp_mixture()
+    hp.state_bank_enabled = True
+    hp.state_bank_pq_decoupling_enabled = False
+    hp.state_bank_pq_coverage_ratio = 0.80
+    episode = _episode(hp, episode_id=1)
+    role = episode._resolve_pq_distribution_role()
+    assert role["mode"] == "legacy_pv_mixture"
+    assert role["requested_coverage_ratio"] == pytest.approx(0.25)
+    hp.pv_mixture_enabled = False
+    assert _episode(hp, episode_id=1)._pv_mixture_enabled_for_episode() == (False, "disabled")
+
+
+def test_decoupling_requires_state_bank_and_keeps_episode0_unchanged():
+    hp = _hp_mixture()
+    hp.pv_mixture_enabled = False
+    hp.state_bank_enabled = False
+    hp.state_bank_pq_decoupling_enabled = True
+    assert _episode(hp, episode_id=1)._pv_mixture_enabled_for_episode() == (False, "disabled")
+    hp.state_bank_enabled = True
+    assert _episode(hp, episode_id=0)._pv_mixture_enabled_for_episode() == (
+        False,
+        "episode0_unchanged",
+    )
+
+
+def test_state_bank_decoupling_selects_eighty_percent_coverage_fixed_total():
+    hp = _hp_mixture()
+    hp.state_bank_enabled = True
+    hp.state_bank_pq_decoupling_enabled = True
+    hp.state_bank_pq_coverage_ratio = 0.80
+    hp.pv_mixture_enabled = False  # Decoupling itself activates the P/Q mixture.
+    hp.pv_target_grid_val_fraction = 0.20
+    episode = _episode(hp, episode_id=1)
+    natural = _firm_table(10)
+    coverage_pool = episode._tensor_to_parent_group_pool(
+        _firm_table(8, source_offset=100, value_offset=1.0), source_id=1
+    )
+    episode._build_pv_coverage_pool = lambda *args, **kwargs: coverage_pool
+
+    train, val, summary = episode._prepare_mixed_policy_value_batches(
+        natural, batch_size=4, n_branches=2
+    )
+
+    role = summary["pq_distribution_role"]
+    assert summary["reason"] == "enabled_state_bank_pq_decoupling"
+    assert _parent_count(train + val) == 10
+    assert role["natural_parent_groups_selected"] == 2
+    assert role["coverage_parent_groups_selected"] == 8
+    assert role["realized_coverage_ratio"] == pytest.approx(0.80)
+    assert "natural_b_p10" in summary
+    assert "coverage_b_p90" in summary
+    assert "natural_train_b_p50" in summary
+    assert "coverage_train_z_p50" in summary
+    assert "mixed_train_bz_occupancy_10x10" in summary
+    assert len(summary["mixed_train_bz_occupancy_10x10"]) == 10
+
+
+@pytest.mark.parametrize("ratio", [-0.01, 1.01])
+def test_state_bank_decoupling_ratio_fails_fast_at_invalid_boundaries(ratio):
+    hp = _hp_mixture()
+    hp.state_bank_enabled = True
+    hp.state_bank_pq_decoupling_enabled = True
+    hp.state_bank_pq_coverage_ratio = ratio
+    episode = _episode(hp, episode_id=1)
+    with pytest.raises(ValueError, match="state_bank_pq_coverage_ratio"):
+        episode._pv_mixture_enabled_for_episode()
+
+
+@pytest.mark.parametrize("ratio, expected_coverage", [(0.0, 0), (1.0, 4)])
+def test_state_bank_decoupling_accepts_closed_interval_boundaries(ratio, expected_coverage):
+    hp = _hp_mixture()
+    hp.state_bank_enabled = True
+    hp.state_bank_pq_decoupling_enabled = True
+    hp.state_bank_pq_coverage_ratio = ratio
+    episode = _episode(hp, episode_id=1)
+    if expected_coverage:
+        episode._build_pv_coverage_pool = lambda *args, **kwargs: episode._tensor_to_parent_group_pool(
+            _firm_table(4, source_offset=100), source_id=1
+        )
+    _, _, summary = episode._prepare_mixed_policy_value_batches(
+        _firm_table(4), batch_size=4, n_branches=2
+    )
+    assert summary["coverage_parent_groups_selected"] == expected_coverage
+
+
+def test_formal_state_bank_wrapper_enables_pq_decoupling():
+    wrapper = (
+        ROOT
+        / "slurm"
+        / "run_normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500_investment_compare_state_bank.slurm"
+    ).read_text()
+    assert "export STATE_BANK_PQ_DECOUPLING_ENABLED=1" in wrapper
+    assert 'STATE_BANK_PQ_COVERAGE_RATIO="${STATE_BANK_PQ_COVERAGE_RATIO:-0.80}"' in wrapper
+
+
+def test_state_bank_decoupling_keeps_lineages_disjoint_across_split():
+    hp = _hp_mixture()
+    hp.state_bank_enabled = True
+    hp.state_bank_pq_decoupling_enabled = True
+    hp.state_bank_pq_coverage_ratio = 0.50
+    natural = _firm_table(8)
+    firm_col = natural.columns.index("firm")
+    natural = TensorTable(
+        torch.cat([natural.data, natural.data[:, firm_col:firm_col + 1]], dim=1),
+        [*natural.columns, "lineage_id"],
+    )
+    episode = _episode(hp, episode_id=1)
+    coverage_pool = episode._tensor_to_parent_group_pool(
+        _firm_table(4, source_offset=100), source_id=1
+    )
+    episode._build_pv_coverage_pool = lambda *args, **kwargs: coverage_pool
+    train, val, summary = episode._prepare_mixed_policy_value_batches(
+        natural, batch_size=8, n_branches=2
+    )
+    train_lineages = set(torch.cat([item["lineage_id"] for item in train]).tolist())
+    val_lineages = set(torch.cat([item["lineage_id"] for item in val]).tolist())
+    assert summary["lineage_split_active"] is True
+    assert train_lineages.isdisjoint(val_lineages)
+    synthetic_lineages = train_lineages.union(val_lineages).intersection(set(range(-4, 0)))
+    assert len(synthetic_lineages) == 4

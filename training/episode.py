@@ -2135,7 +2135,7 @@ class Episode:
         # 与 Bellman 收敛诊断共用同一上限（torch.quantile 的元素数硬限制是 2^24）。
         return max(1, int(getattr(self.hyperparams, "bellman_conv_max_samples", 1_000_000)))
 
-    def _pool_feature_stats(self, prefix: str, pool: Optional[PVParentGroupPool]) -> Dict[str, float]:
+    def _pool_feature_stats(self, prefix: str, pool: Optional[PVParentGroupPool]) -> Dict[str, Any]:
         if pool is None or len(pool) == 0:
             return {f"{prefix}_parent_groups": 0.0}
         cap = self._distribution_quantile_cap()
@@ -2146,6 +2146,40 @@ class Episode:
             col = data[:, idx]
             stats[f"{prefix}_{name}_mean"] = float(col.mean().item())
             stats[f"{prefix}_{name}_std"] = float(col.std(unbiased=False).item()) if col.numel() > 1 else 0.0
+        if data.shape[1] > 0:
+            stats.update(self._tensor_distribution_stats(f"{prefix}_b", data[:, 0], cap))
+            b = data[:, 0]
+            stats.update({
+                f"{prefix}_b_lt_0_1_share": float((b < 0.1).float().mean().item()),
+                f"{prefix}_b_ge_0_5_share": float((b >= 0.5).float().mean().item()),
+                f"{prefix}_b_ge_0_8_share": float((b >= 0.8).float().mean().item()),
+            })
+        if data.shape[1] > 1:
+            stats.update(self._tensor_distribution_stats(f"{prefix}_z", data[:, 1], cap))
+            b = data[:, 0].clamp(0.0, 1.0)
+            z = data[:, 1]
+            z_std = float(self.config.z_stationary_std())
+            z_min = float(self.config.ZBAR) - 4.0 * z_std
+            z_max = float(self.config.ZBAR) + 4.0 * z_std
+            b_bin = torch.clamp((b * 10.0).floor().long(), 0, 9)
+            if z_max > z_min:
+                z_bin = torch.clamp((((z - z_min) / (z_max - z_min)) * 10.0).floor().long(), 0, 9)
+            else:
+                z_bin = torch.zeros_like(b_bin)
+            occupancy = torch.bincount(b_bin * 10 + z_bin, minlength=100).reshape(10, 10)
+            stats[f"{prefix}_bz_occupancy_10x10"] = occupancy.tolist()
+            stats[f"{prefix}_bz_occupied_cells"] = int((occupancy > 0).sum().item())
+            stats[f"{prefix}_bz_z_min"] = z_min
+            stats[f"{prefix}_bz_z_max"] = z_max
+        if data.shape[1] > 2:
+            stats[f"{prefix}_eta_share"] = float(data[:, 2].mean().item())
+        if data.shape[1] > 3:
+            i_quantiles = torch.quantile(data[:, 3], torch.tensor([0.1, 0.5, 0.9]))
+            stats.update({
+                f"{prefix}_i_p10": float(i_quantiles[0].item()),
+                f"{prefix}_i_p50": float(i_quantiles[1].item()),
+                f"{prefix}_i_p90": float(i_quantiles[2].item()),
+            })
         if pool.parent.shape[1] > 7:
             stats.update(Episode._tensor_distribution_stats(f"{prefix}_parent_M", pool.parent[:, 7], cap))
         for child_idx, child in enumerate(pool.children):
@@ -2218,20 +2252,44 @@ class Episode:
             ),
         )
 
+    def _resolve_pq_distribution_role(self) -> Dict[str, Any]:
+        hp = self.hyperparams
+        legacy_ratio = float(getattr(hp, "pv_mixture_ratio", 0.20))
+        coverage_ratio = float(getattr(hp, "state_bank_pq_coverage_ratio", 0.80))
+        if not 0.0 <= legacy_ratio <= 1.0:
+            raise ValueError(f"pv_mixture_ratio must be in [0, 1], got {legacy_ratio}.")
+        if not 0.0 <= coverage_ratio <= 1.0:
+            raise ValueError(
+                "state_bank_pq_coverage_ratio must be in [0, 1], "
+                f"got {coverage_ratio}."
+            )
+        decoupling_enabled = bool(
+            getattr(hp, "state_bank_enabled", False)
+            and getattr(hp, "state_bank_pq_decoupling_enabled", False)
+        )
+        effective_ratio = coverage_ratio if decoupling_enabled else legacy_ratio
+        return {
+            "decoupling_enabled": decoupling_enabled,
+            "mode": "state_bank_pq_decoupled" if decoupling_enabled else "legacy_pv_mixture",
+            "legacy_pv_mixture_enabled": bool(getattr(hp, "pv_mixture_enabled", False)),
+            "legacy_pv_mixture_ratio": legacy_ratio,
+            "requested_coverage_ratio": effective_ratio,
+            "requested_natural_ratio": 1.0 - effective_ratio,
+        }
+
     def _pv_mixture_enabled_for_episode(self) -> Tuple[bool, str]:
         hp = self.hyperparams
-        if not bool(getattr(hp, "pv_mixture_enabled", False)):
+        role = self._resolve_pq_distribution_role()
+        if not bool(getattr(hp, "pv_mixture_enabled", False)) and not role["decoupling_enabled"]:
             return False, "disabled"
         if int(self.episode_id) == 0:
             return False, "episode0_unchanged"
         if int(self.episode_id) < int(getattr(hp, "pv_mixture_start_episode", 1)):
             return False, "before_start_episode"
-        ratio = float(getattr(hp, "pv_mixture_ratio", 0.0))
-        if ratio < 0.0 or ratio > 1.0:
-            raise ValueError(f"pv_mixture_ratio must be in [0, 1], got {ratio}.")
+        ratio = float(role["requested_coverage_ratio"])
         if ratio == 0.0:
             return True, "enabled_experiment_control"
-        return True, "enabled"
+        return True, "enabled_state_bank_pq_decoupling" if role["decoupling_enabled"] else "enabled"
 
     def _build_pv_coverage_pool(self, n_parent_groups: int, n_branches: int) -> Optional[PVParentGroupPool]:
         hp = self.hyperparams
@@ -2279,19 +2337,22 @@ class Episode:
     ) -> Tuple[List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]], Dict[str, Any]]:
         hp = self.hyperparams
         enabled, reason = self._pv_mixture_enabled_for_episode()
+        role = self._resolve_pq_distribution_role()
         summary: Dict[str, Any] = {
             "enabled": bool(enabled),
             "reason": reason,
             "episode_id": int(self.episode_id),
             "budget_mode": str(getattr(hp, "pv_mixture_budget_mode", "fixed_total")),
-            "requested_ratio": float(getattr(hp, "pv_mixture_ratio", 0.0)),
+            "requested_ratio": float(role["requested_coverage_ratio"]),
             "start_episode": int(getattr(hp, "pv_mixture_start_episode", 1)),
+            "pq_distribution_role": dict(role),
         }
         sim_pool = self._tensor_to_parent_group_pool(table, n_branches=n_branches, source_id=0)
         if sim_pool is None or len(sim_pool) == 0:
             summary["reason"] = "empty_simulate_pool"
             return [], [], summary
         summary.update(self._pool_feature_stats("simulate", sim_pool))
+        summary.update(self._pool_feature_stats("natural", sim_pool))
 
         if not enabled:
             train_batches = self._parent_group_pool_to_batches(
@@ -2301,9 +2362,7 @@ class Episode:
             )
             return train_batches, [], summary
 
-        ratio = float(getattr(hp, "pv_mixture_ratio", 0.20))
-        if not 0.0 <= ratio <= 1.0:
-            raise ValueError(f"pv_mixture_ratio must be in [0, 1], got {ratio}.")
+        ratio = float(role["requested_coverage_ratio"])
         budget_mode = str(getattr(hp, "pv_mixture_budget_mode", "fixed_total")).lower()
         if budget_mode not in {"fixed_total"}:
             raise ValueError(f"Unknown pv_mixture_budget_mode={budget_mode!r}.")
@@ -2410,6 +2469,14 @@ class Episode:
             mix_summary["lineage_split_active"] = False
         train_pool = self._shuffle_pool(train_pool, generator)
         val_pool = self._shuffle_pool(val_pool, generator)
+        train_natural_pool = select_parent_groups(
+            train_pool,
+            torch.nonzero(train_pool.source_id == 0, as_tuple=False).reshape(-1),
+        )
+        train_coverage_pool = select_parent_groups(
+            train_pool,
+            torch.nonzero(train_pool.source_id == 1, as_tuple=False).reshape(-1),
+        )
         train_batches = self._parent_group_pool_to_batches(
             train_pool,
             batch_size=batch_size,
@@ -2434,9 +2501,24 @@ class Episode:
             **self._pool_feature_stats("coverage", coverage_pool),
             **self._pool_feature_stats("selected_sim", sim_selected),
             **self._pool_feature_stats("selected_coverage", coverage_selected),
+            **self._pool_feature_stats("natural_train", train_natural_pool),
+            **self._pool_feature_stats("coverage_train", train_coverage_pool),
             **self._pool_feature_stats("mixed_train", train_pool),
             **self._pool_feature_stats("mixed_validation", val_pool),
         })
+        role.update({
+            "natural_parent_groups_available": int(n_available),
+            "coverage_parent_groups_available": int(len(coverage_pool)),
+            "natural_parent_groups_selected": int(len(sim_selected)),
+            "coverage_parent_groups_selected": int(len(coverage_selected)),
+            "realized_natural_ratio": float(len(sim_selected) / max(len(sim_selected) + len(coverage_selected), 1)),
+            "realized_coverage_ratio": float(len(coverage_selected) / max(len(sim_selected) + len(coverage_selected), 1)),
+            "train_natural_parent_groups": int(source_counts(train_pool)["source0"]),
+            "train_coverage_parent_groups": int(source_counts(train_pool)["source1"]),
+            "validation_natural_parent_groups": int(source_counts(val_pool)["source0"]),
+            "validation_coverage_parent_groups": int(source_counts(val_pool)["source1"]),
+        })
+        summary["pq_distribution_role"] = role
         return train_batches, val_batches, summary
 
     def _build_sdf_pairs_from_macro_tensor(self, macro_table: TensorTable) -> TensorTable:
@@ -8447,6 +8529,11 @@ class Episode:
                 stage_start_checkpoint,
                 None,
             )
+        source_validation_losses = (
+            self._evaluate_cached_p_score_by_source(val_source, val_cache)
+            if status == "accepted"
+            else {}
+        )
         return {
             "status": status,
             "epochs_requested": int(n_epochs),
@@ -8489,6 +8576,7 @@ class Episode:
                 if best_checkpoint is not None
                 else {}
             ),
+            "source_validation_losses": source_validation_losses,
         }
 
     def _build_bp_target_cache(
@@ -9147,6 +9235,63 @@ class Episode:
             **meta,
             "validation_batches": len(batches),
         }
+
+    def _evaluate_cached_p_score_by_source(
+        self,
+        batches: List[Dict[str, torch.Tensor]],
+        cache: List[PQValueTargetBatch],
+    ) -> Dict[str, Any]:
+        """Diagnostic-only P validation losses; never participates in the gate."""
+        if not any("source_id" in batch for batch in batches):
+            return {}
+        output: Dict[str, Any] = {}
+        # Some legacy tests replace the joint scorer to instrument the gate.
+        # Source diagnostics must not invoke that hook or alter gate call count.
+        legacy_override = self.__dict__.pop("_evaluate_cached_pq_score", None)
+        try:
+            mixed_score, mixed_metrics = self._evaluate_cached_p_score(batches, cache)
+            output["mixed"] = {"loss": mixed_score, **mixed_metrics}
+            for source_id, label in ((0, "natural"), (1, "coverage")):
+                source_batches: List[Dict[str, torch.Tensor]] = []
+                source_cache: List[PQValueTargetBatch] = []
+                for batch, cache_item in zip(batches, cache):
+                    if "source_id" not in batch:
+                        continue
+                    mask = batch["source_id"].reshape(-1).long() == source_id
+                    if not bool(mask.any().item()):
+                        continue
+                    indices = torch.nonzero(mask, as_tuple=False).reshape(-1)
+                    source_batches.append(self._index_q_batch(batch, indices))
+                    cpu_indices = indices.detach().cpu()
+                    p0_indices = indices.to(cache_item.p0_value_target.device)
+                    pi_indices = indices.to(cache_item.pi_value_target.device)
+                    source_cache.append(PQValueTargetBatch(
+                        batch_id=cache_item.batch_id,
+                        p0_value_target=cache_item.p0_value_target[p0_indices],
+                        pi_value_target=cache_item.pi_value_target[pi_indices],
+                        teacher_hash=cache_item.teacher_hash,
+                        parent_hash=cache_item.parent_hash,
+                        children_hash=cache_item.children_hash,
+                        m_hash=cache_item.m_hash,
+                        grid_config_hash=cache_item.grid_config_hash,
+                        source_id=(
+                            None if cache_item.source_id is None
+                            else cache_item.source_id[cpu_indices]
+                        ),
+                        source_index=(
+                            None if cache_item.source_index is None
+                            else cache_item.source_index[cpu_indices]
+                        ),
+                    ))
+                if source_batches:
+                    score, metrics = self._evaluate_cached_p_score(source_batches, source_cache)
+                    output[label] = {"loss": score, **metrics}
+                else:
+                    output[label] = {"loss": None, "validation_batches": 0}
+        finally:
+            if legacy_override is not None:
+                self.__dict__["_evaluate_cached_pq_score"] = legacy_override
+        return output
 
     def _bp_cache_hash(self, cache: List[Dict[str, Any]]) -> str:
         tensors: List[torch.Tensor] = []
@@ -9952,6 +10097,10 @@ class Episode:
         """
         parent = batch["parent"]
         state = parent[:, :7] if parent.shape[1] > 7 else parent
+        parent_source = batch.get(
+            "source_id",
+            torch.zeros(state.shape[0], device=state.device, dtype=torch.long),
+        ).reshape(-1).long()
         b_eps = float(getattr(self.hyperparams, "q_zero_b_eps", 0.0))
         hybrid = (
             getattr(self.models["policy_value"], "q_parameterization", None)
@@ -10035,13 +10184,19 @@ class Episode:
                 )
                 empty_diag = {
                     "realized_parent_survival_count": int(realized_survival.sum().item()),
+                    "realized_parent_survival_natural_count": int((realized_survival & (parent_source == 0)).sum().item()),
+                    "realized_parent_survival_coverage_count": int((realized_survival & (parent_source == 1)).sum().item()),
                     "realized_parent_default_count": int(realized_default.sum().item()),
                     "realized_parent_zero_b_count": int(realized_zero.sum().item()),
                     "claim_parent_count": 0,
                     "claim_parent_default_count": int(realized_default.sum().item()),
                     "claim_parent_default_share": 0.0,
                     "claim_ondist_sample_count": 0,
+                    "claim_ondist_natural_sample_count": 0,
+                    "claim_ondist_coverage_sample_count": 0,
                     "claim_synthetic_sample_count": 0,
+                    "claim_synthetic_natural_sample_count": 0,
+                    "claim_synthetic_coverage_sample_count": 0,
                     "claim_total_sample_count": 0,
                     "synthetic_source_context_count": 0,
                     "synthetic_candidate_phat_positive_share": float("nan"),
@@ -10160,6 +10315,8 @@ class Episode:
                 )
             diagnostics = {
                 "realized_parent_survival_count": int(realized_survival.sum().item()),
+                "realized_parent_survival_natural_count": int((realized_survival & (parent_source == 0)).sum().item()),
+                "realized_parent_survival_coverage_count": int((realized_survival & (parent_source == 1)).sum().item()),
                 "realized_parent_default_count": int(realized_default.sum().item()),
                 "realized_parent_zero_b_count": int(realized_zero.sum().item()),
                 "claim_parent_count": int(result_state.shape[0]),
@@ -10168,7 +10325,11 @@ class Episode:
                     realized_default.float().mean().item()
                 ),
                 "claim_ondist_sample_count": int(ondist_indices.numel()),
+                "claim_ondist_natural_sample_count": int((parent_source[ondist_indices] == 0).sum().item()),
+                "claim_ondist_coverage_sample_count": int((parent_source[ondist_indices] == 1).sum().item()),
                 "claim_synthetic_sample_count": int(synthetic_n),
+                "claim_synthetic_natural_sample_count": int((parent_source[synthetic_source_indices] == 0).sum().item()),
+                "claim_synthetic_coverage_sample_count": int((parent_source[synthetic_source_indices] == 1).sum().item()),
                 "claim_total_sample_count": int(result_state.shape[0]),
                 "synthetic_source_context_count": int(
                     torch.unique(synthetic_source_indices).numel()
@@ -10216,7 +10377,18 @@ class Episode:
         ))
         keep = ((state[:, 0:1] > b_eps) & (phat > strict_eps)).reshape(-1)
         if not keep.any():
-            return (None, {}) if return_diagnostics else None
+            diagnostics = {
+                "realized_parent_survival_count": 0,
+                "realized_parent_survival_natural_count": 0,
+                "realized_parent_survival_coverage_count": 0,
+                "claim_ondist_sample_count": 0,
+                "claim_ondist_natural_sample_count": 0,
+                "claim_ondist_coverage_sample_count": 0,
+                "claim_synthetic_sample_count": 0,
+                "claim_synthetic_natural_sample_count": 0,
+                "claim_synthetic_coverage_sample_count": 0,
+            }
+            return (None, diagnostics) if return_diagnostics else None
         subset = self._slice_q_batch(batch, keep)
         n = int(subset["parent"].shape[0])
         if requested is not None and n > int(requested):
@@ -10226,7 +10398,19 @@ class Episode:
         ondist = min(max(float(getattr(self.hyperparams, "q_survival_ondist_share", 0.8)), 1e-6), 1.0)
         extra_n = max(0, int(round(n * (1.0 - ondist) / ondist)))
         if extra_n <= 0 or n <= 1:
-            return (subset, {}) if return_diagnostics else subset
+            subset_source = subset.get("source_id", torch.zeros(n, device=state.device, dtype=torch.long)).reshape(-1)
+            diagnostics = {
+                "realized_parent_survival_count": n,
+                "realized_parent_survival_natural_count": int((subset_source == 0).sum().item()),
+                "realized_parent_survival_coverage_count": int((subset_source == 1).sum().item()),
+                "claim_ondist_sample_count": n,
+                "claim_ondist_natural_sample_count": int((subset_source == 0).sum().item()),
+                "claim_ondist_coverage_sample_count": int((subset_source == 1).sum().item()),
+                "claim_synthetic_sample_count": 0,
+                "claim_synthetic_natural_sample_count": 0,
+                "claim_synthetic_coverage_sample_count": 0,
+            }
+            return (subset, diagnostics) if return_diagnostics else subset
         values = subset["parent"][:, :2].detach()
         # Deterministic coverage replay: sort by a joint normalized b/z key, then
         # sample evenly across that support. Parent-child rows remain matched.
@@ -10239,7 +10423,20 @@ class Episode:
         replay = order[positions]
         indices = torch.cat([torch.arange(n, device=order.device), replay], dim=0)
         result = self._index_q_batch(subset, indices)
-        return (result, {}) if return_diagnostics else result
+        subset_source = subset.get("source_id", torch.zeros(n, device=state.device, dtype=torch.long)).reshape(-1)
+        replay_source = subset_source[replay]
+        diagnostics = {
+            "realized_parent_survival_count": n,
+            "realized_parent_survival_natural_count": int((subset_source == 0).sum().item()),
+            "realized_parent_survival_coverage_count": int((subset_source == 1).sum().item()),
+            "claim_ondist_sample_count": n,
+            "claim_ondist_natural_sample_count": int((subset_source == 0).sum().item()),
+            "claim_ondist_coverage_sample_count": int((subset_source == 1).sum().item()),
+            "claim_synthetic_sample_count": int(extra_n),
+            "claim_synthetic_natural_sample_count": int((replay_source == 0).sum().item()),
+            "claim_synthetic_coverage_sample_count": int((replay_source == 1).sum().item()),
+        }
+        return (result, diagnostics) if return_diagnostics else result
 
     # Bootstrap 只实现不依赖旧 checkpoint 的 cold start。
     Q_BOOTSTRAP_MODES: Tuple[str, ...] = ("constant_unit",)
@@ -10985,6 +11182,8 @@ class Episode:
                     for item in diagnostics
                 )
             ),
+            "realized_parent_survival_natural_count": int(sum(int(item.get("realized_parent_survival_natural_count", 0)) for item in diagnostics)),
+            "realized_parent_survival_coverage_count": int(sum(int(item.get("realized_parent_survival_coverage_count", 0)) for item in diagnostics)),
             "realized_parent_default_count": int(
                 sum(
                     int(item.get("realized_parent_default_count", 0))
@@ -11017,9 +11216,13 @@ class Episode:
             "claim_ondist_sample_count": int(
                 sum(int(item.get("claim_ondist_sample_count", 0)) for item in diagnostics)
             ),
+            "claim_ondist_natural_sample_count": int(sum(int(item.get("claim_ondist_natural_sample_count", 0)) for item in diagnostics)),
+            "claim_ondist_coverage_sample_count": int(sum(int(item.get("claim_ondist_coverage_sample_count", 0)) for item in diagnostics)),
             "claim_synthetic_sample_count": int(
                 sum(int(item.get("claim_synthetic_sample_count", 0)) for item in diagnostics)
             ),
+            "claim_synthetic_natural_sample_count": int(sum(int(item.get("claim_synthetic_natural_sample_count", 0)) for item in diagnostics)),
+            "claim_synthetic_coverage_sample_count": int(sum(int(item.get("claim_synthetic_coverage_sample_count", 0)) for item in diagnostics)),
             "claim_total_sample_count": int(
                 sum(int(item.get("claim_total_sample_count", 0)) for item in diagnostics)
             ),

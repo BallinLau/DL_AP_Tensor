@@ -240,6 +240,10 @@ class HyperParams:
     state_bank_acceptance_mode: str = "numerical"
     # Keep SDF quality in State Bank diagnostics without blocking publication.
     state_bank_sdf_publication_gate_enabled: bool = False
+    # Decouple persistent State Bank storage from the micro-state distribution
+    # used only by P/Q training. Disabled by default for exact legacy behavior.
+    state_bank_pq_decoupling_enabled: bool = False
+    state_bank_pq_coverage_ratio: float = 0.80
     # Opt-in persistent-state contract; legacy capture remains unchanged by default.
     state_bank_economic_feasibility_filter_enabled: bool = False
     state_bank_min_unique_lineages: int = 0
