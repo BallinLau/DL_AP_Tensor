@@ -27,6 +27,21 @@ export REQUIRED_COMMIT="${REQUIRED_COMMIT:-$DEFAULT_REQUIRED_COMMIT}"
 export RUN_ROOT="${RUN_ROOT:-$WORK_ROOT/cachedir/normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500_investment_compare_state_bank_${STAMP}}"
 export N_EPISODES="${N_EPISODES:-10}"
 
+# Initialize model weights from the completed scaled-value eta25/bp500 run,
+# while keeping this experiment's simulation state and optimizers fresh from
+# Episode 0.  `model_init` is intentional: continuation mode would resume at
+# Episode 10 and would not run the new State Bank experiment from Episode 0.
+WARMSTART_RUN_ROOT="${WARMSTART_RUN_ROOT:-$WORK_ROOT/cachedir/normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500_20261008_184305}"
+export INITIAL_CHECKPOINT="${INITIAL_CHECKPOINT:-$WARMSTART_RUN_ROOT/checkpoints/ep9_combined.pt}"
+export INITIAL_CHECKPOINT_EPISODE="${INITIAL_CHECKPOINT_EPISODE:-9}"
+export INITIAL_CHECKPOINT_MODE="${INITIAL_CHECKPOINT_MODE:-model_init}"
+export START_EPISODE="${START_EPISODE:-0}"
+
+if [[ ! -f "$INITIAL_CHECKPOINT" ]]; then
+  echo "ERROR: warm-start checkpoint not found: $INITIAL_CHECKPOINT"
+  exit 1
+fi
+
 # State Bank publication requires safe SDF progress, while final SDF convergence
 # remains diagnostic. Keep this wrapper in each formal State Bank code revision
 # so its self-pin resolves to the exact implementation under test. Economic
@@ -69,6 +84,10 @@ export NODE_ACCOUNTING_MODE=economic_node_ledger
 echo "Dispatching State Bank v2 investment-compare full-equilibrium run"
 echo "RUN_ROOT=$RUN_ROOT"
 echo "REQUIRED_COMMIT=$REQUIRED_COMMIT"
+echo "INITIAL_CHECKPOINT=$INITIAL_CHECKPOINT"
+echo "INITIAL_CHECKPOINT_EPISODE=$INITIAL_CHECKPOINT_EPISODE"
+echo "INITIAL_CHECKPOINT_MODE=$INITIAL_CHECKPOINT_MODE"
+echo "START_EPISODE=$START_EPISODE"
 echo "STATE_BANK_PARENT_TRANSITION_BUDGET=$STATE_BANK_PARENT_TRANSITION_BUDGET"
 echo "STATE_BANK_SAMPLING_MODE=$STATE_BANK_SAMPLING_MODE"
 echo "STATE_BANK_ACCEPTANCE_MODE=$STATE_BANK_ACCEPTANCE_MODE"
