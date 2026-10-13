@@ -24,7 +24,10 @@ sys.path.append(str(ROOT))
 print(f"Added {ROOT} to sys.path for imports")
 from config import Config  # noqa: E402
 from training.episode import Episode, NumericalStageFailure  # noqa: E402
-from data.state_bank import StateBank  # noqa: E402
+from data.state_bank import (  # noqa: E402
+    StateBank,
+    summarize_stored_economic_feasibility,
+)
 from data.simulate_ts import SimulateTS  # noqa: E402
 from experiments.run_utils import (  # noqa: E402
     resolve_base_dir,
@@ -223,6 +226,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Allow SDF continuation/progress/convergence diagnostics to block "
             "State Bank publication in strict acceptance mode"
+        ),
+    )
+    parser.add_argument(
+        "--state-bank-economic-feasibility-filter-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Persist only accounting-valid, resource-feasible State Bank "
+            "snapshots with finite positive raw consumption and no floor"
         ),
     )
     parser.add_argument("--state-bank-min-unique-lineages", type=int, default=None)
@@ -899,6 +911,11 @@ def configure_hyperparams(args: argparse.Namespace):
         (
             "state_bank_sdf_publication_gate_enabled",
             "state_bank_sdf_publication_gate_enabled",
+            bool,
+        ),
+        (
+            "state_bank_economic_feasibility_filter_enabled",
+            "state_bank_economic_feasibility_filter_enabled",
             bool,
         ),
         (
@@ -1605,12 +1622,14 @@ def build_and_commit_state_bank(
             f"{previous_lineages} -> {candidate_lineages}"
         )
     candidate.save(output_path, atomic=True)
+    distribution = candidate.distribution_summary()
     summary_path = output_path.with_suffix(".summary.json")
     summary_path.write_text(
         json.dumps(
             {
                 "acceptance": acceptance,
-                "distribution": candidate.distribution_summary(),
+                "distribution": distribution,
+                "economic_feasibility": distribution["economic_feasibility"],
                 "rollout": candidate.metadata.get("rollout_diagnostics", {}),
                 "lineage_refresh": lineage_refresh,
                 "compatibility_fingerprint": candidate.compatibility_fingerprint,
@@ -1668,6 +1687,25 @@ def evaluate_state_bank_acceptance(
         reasons.append(
             f"unique_lineages={unique_lineages}<required={minimum}"
         )
+
+    economic_filter_enabled = bool(
+        getattr(
+            hyperparams,
+            "state_bank_economic_feasibility_filter_enabled",
+            False,
+        )
+    )
+    stored_feasibility = summarize_stored_economic_feasibility(candidate_bank)
+    economic_gate_passed = stored_feasibility["invalid_entry_count"] == 0
+    economic_gate = {
+        "required": economic_filter_enabled,
+        "passed": bool(economic_gate_passed),
+        "stored_entry_count": stored_feasibility["stored_entry_count"],
+        "invalid_entry_count": stored_feasibility["invalid_entry_count"],
+        "invalid_reasons": stored_feasibility["invalid_reasons"],
+    }
+    if economic_filter_enabled and not economic_gate_passed:
+        reasons.append("state_bank_contains_economically_ineligible_entries")
 
     modules = episode_summary.get("module_summaries", {})
     strict_checks: dict[str, object] = {}
@@ -1801,6 +1839,7 @@ def evaluate_state_bank_acceptance(
         "unique_lineages": unique_lineages,
         "minimum_unique_lineages": minimum,
         "strict_checks": strict_checks,
+        "bank_economic_feasibility_gate": economic_gate,
         "sdf_publication_gate": sdf_publication_gate,
         "bellman_gate": bellman_gate,
     }
@@ -1935,6 +1974,8 @@ def main():
             f"acceptance={hyperparams.state_bank_acceptance_mode}, "
             "sdf_publication_gate="
             f"{hyperparams.state_bank_sdf_publication_gate_enabled}, "
+            "economic_feasibility_filter="
+            f"{hyperparams.state_bank_economic_feasibility_filter_enabled}, "
             f"max_entries={hyperparams.state_bank_max_entries}"
         )
     episode = Episode(
@@ -2142,6 +2183,7 @@ def main():
                     "state_bank_sampling_mode": hyperparams.state_bank_sampling_mode,
                     "state_bank_acceptance_mode": hyperparams.state_bank_acceptance_mode,
                     "state_bank_sdf_publication_gate_enabled": hyperparams.state_bank_sdf_publication_gate_enabled,
+                    "state_bank_economic_feasibility_filter_enabled": hyperparams.state_bank_economic_feasibility_filter_enabled,
                     "state_bank_min_unique_lineages": hyperparams.state_bank_min_unique_lineages,
                     "state_bank_sample_seed": hyperparams.state_bank_sample_seed,
                     "state_bank_refresh_seed": hyperparams.state_bank_refresh_seed,

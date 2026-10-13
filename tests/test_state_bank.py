@@ -16,6 +16,7 @@ from data.state_bank import (
     StateBankCapture,
     StateBankRolloutChunk,
     StateBankRolloutPlan,
+    build_state_bank_compatibility,
     clone_state,
     summarize_parent_transition_budget,
     summarize_state_bank_rollout_diagnostics,
@@ -73,6 +74,34 @@ def _fresh_state(*, n_paths: int = 2, group_size: int = 2):
     return sim, simulate_ts_parallel._initialize_batched_state(sim, group_size)
 
 
+def _set_economic_accounting(
+    state,
+    *,
+    accounting_valid=True,
+    resource_feasible=True,
+    c_raw=1.0,
+    floor_applied=False,
+):
+    n_paths = int(state["b"].shape[0])
+    device = state["b"].device
+
+    def vector(value, dtype):
+        tensor = torch.as_tensor(value, dtype=dtype, device=device).reshape(-1)
+        if tensor.numel() == 1:
+            tensor = tensor.expand(n_paths)
+        return tensor.clone()
+
+    state["accounting_valid"] = vector(accounting_valid, torch.bool)
+    state["accounting_resource_feasible"] = vector(
+        resource_feasible, torch.bool
+    )
+    state["accounting_C_raw"] = vector(c_raw, torch.float32)
+    state["accounting_consumption_floor_applied"] = vector(
+        floor_applied, torch.bool
+    )
+    return state
+
+
 def _assert_tensor_equal(left: torch.Tensor, right: torch.Tensor) -> None:
     torch.testing.assert_close(left, right, rtol=0.0, atol=0.0, equal_nan=True)
 
@@ -101,6 +130,163 @@ def test_state_bank_round_trip_captures_complete_state_and_cpu_storage(tmp_path)
         _assert_tensor_equal(
             loaded.stack_entries(loaded.entry_ids)[name], expected
         )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_reason"),
+    [
+        ({"resource_feasible": False}, "rejected_resource_infeasible"),
+        ({"floor_applied": True}, "rejected_consumption_floor_applied"),
+        ({"c_raw": 0.0}, "rejected_nonpositive_c_raw"),
+        ({"c_raw": -1.0}, "rejected_nonpositive_c_raw"),
+        ({"c_raw": float("nan")}, "rejected_nonfinite_c_raw"),
+        ({"c_raw": float("inf")}, "rejected_nonfinite_c_raw"),
+        ({"accounting_valid": False}, "rejected_accounting_invalid"),
+    ],
+)
+def test_economic_feasibility_filter_rejects_each_failed_predicate(
+    overrides,
+    expected_reason,
+):
+    _, state = _fresh_state(n_paths=1)
+    _set_economic_accounting(state, **overrides)
+    bank = StateBank(compatibility=_compatibility(), source_episode=1)
+
+    captured = bank.capture(
+        state,
+        capture_time=3,
+        economic_feasibility_filter_enabled=True,
+    )
+
+    assert captured == 0
+    assert len(bank) == 0
+    diagnostics = bank.distribution_summary()["economic_feasibility"]
+    assert diagnostics["capture_candidates_total"] == 1
+    assert diagnostics["capture_eligible_total"] == 0
+    assert diagnostics["capture_rejected_unique"] == 1
+    assert diagnostics[expected_reason] == 1
+
+
+def test_economic_feasibility_filter_captures_eligible_snapshot():
+    _, state = _fresh_state(n_paths=1)
+    _set_economic_accounting(state)
+    bank = StateBank(compatibility=_compatibility(), source_episode=1)
+
+    assert bank.capture(
+        state,
+        capture_time=3,
+        economic_feasibility_filter_enabled=True,
+    ) == 1
+    diagnostics = bank.distribution_summary()["economic_feasibility"]
+    assert diagnostics["capture_candidates_total"] == 1
+    assert diagnostics["capture_eligible_total"] == 1
+    assert diagnostics["capture_rejected_unique"] == 0
+    assert diagnostics["stored_economically_eligible_share"] == pytest.approx(1.0)
+
+
+def test_economic_feasibility_filter_is_pathwise_and_preserves_identity_alignment():
+    _, state = _fresh_state(n_paths=4)
+    _set_economic_accounting(
+        state,
+        accounting_valid=[True, True, True, True],
+        resource_feasible=[True, False, True, True],
+        c_raw=[2.0, 2.0, -0.5, 3.0],
+        floor_applied=[False, False, False, False],
+    )
+    state["economic_time"] = torch.tensor([10, 11, 12, 13])
+    state["firm_id"][:, 0] = torch.tensor([100, 101, 102, 103])
+    lineage_ids = ["lineage-a", "lineage-b", "lineage-c", "lineage-d"]
+    source_path_ids = [40, 41, 42, 43]
+    bank = StateBank(compatibility=_compatibility(), source_episode=1)
+
+    assert bank.capture(
+        state,
+        capture_time=5,
+        lineage_ids=lineage_ids,
+        source_path_ids=source_path_ids,
+        economic_feasibility_filter_enabled=True,
+    ) == 2
+
+    assert [entry["lineage_id"] for entry in bank.entries] == [
+        "lineage-a",
+        "lineage-d",
+    ]
+    assert [entry["source_path"] for entry in bank.entries] == [40, 43]
+    assert [entry["economic_time"] for entry in bank.entries] == [10, 13]
+    assert [int(entry["fields"]["firm_id"][0]) for entry in bank.entries] == [
+        100,
+        103,
+    ]
+    diagnostics = bank.distribution_summary()["economic_feasibility"]
+    assert diagnostics["capture_eligible_total"] == 2
+    assert diagnostics["capture_rejected_unique"] == 2
+    assert diagnostics["capture_eligible_total"] + diagnostics[
+        "capture_rejected_unique"
+    ] == diagnostics["capture_candidates_total"]
+
+
+def test_filtered_reservoir_counts_only_eligible_candidates_and_is_rng_neutral():
+    _, mixed = _fresh_state(n_paths=6)
+    _set_economic_accounting(
+        mixed,
+        resource_feasible=[False, True, False, True, True, True],
+        c_raw=1.0,
+    )
+    mixed["transition_path_id"] = torch.arange(100, 106)
+    eligible_index = torch.tensor([1, 3, 4, 5])
+    eligible = {
+        name: value.index_select(0, eligible_index).clone()
+        for name, value in mixed.items()
+    }
+    source_ids = mixed["transition_path_id"].tolist()
+    eligible_source_ids = eligible["transition_path_id"].tolist()
+    filtered = StateBank(compatibility=_compatibility(), source_episode=1)
+    reference = StateBank(compatibility=_compatibility(), source_episode=1)
+    filtered_generator = torch.Generator(device="cpu").manual_seed(73)
+    reference_generator = torch.Generator(device="cpu").manual_seed(73)
+
+    torch.manual_seed(9001)
+    global_rng_before = torch.get_rng_state().clone()
+    filtered.capture(
+        mixed,
+        capture_time=2,
+        max_entries=2,
+        source_path_ids=source_ids,
+        reservoir_generator=filtered_generator,
+        economic_feasibility_filter_enabled=True,
+    )
+    assert torch.equal(torch.get_rng_state(), global_rng_before)
+    reference.capture(
+        eligible,
+        capture_time=2,
+        max_entries=2,
+        source_path_ids=eligible_source_ids,
+        reservoir_generator=reference_generator,
+        economic_feasibility_filter_enabled=False,
+    )
+
+    assert filtered.metadata["reservoir_candidates_seen"] == 4
+    assert filtered.metadata["economic_feasibility"]["capture_candidates_total"] == 6
+    assert [entry["source_path"] for entry in filtered.entries] == [
+        entry["source_path"] for entry in reference.entries
+    ]
+
+
+def test_disabled_economic_filter_preserves_legacy_capture_behavior():
+    _, state = _fresh_state(n_paths=2)
+    bank = StateBank(compatibility=_compatibility(), source_episode=1)
+
+    assert bank.capture(
+        state,
+        capture_time=0,
+        economic_feasibility_filter_enabled=False,
+    ) == 2
+    assert len(bank) == 2
+    diagnostics = bank.distribution_summary()["economic_feasibility"]
+    assert diagnostics["filter_enabled"] is False
+    assert diagnostics["capture_candidates_total"] == 2
+    assert diagnostics["capture_eligible_total"] == 2
+    assert diagnostics["capture_rejected_unique"] == 0
 
 
 def test_state_bank_stacks_variable_firm_capacity_with_field_specific_padding():
@@ -138,6 +324,34 @@ def test_state_bank_rejects_compatibility_fingerprint_mismatch(tmp_path):
             path,
             expected_compatibility=_compatibility(marker="changed"),
         )
+
+
+def test_economic_filter_setting_is_part_of_compatibility_fingerprint(tmp_path):
+    disabled = HyperParams()
+    disabled.state_bank_economic_feasibility_filter_enabled = False
+    enabled = HyperParams()
+    enabled.state_bank_economic_feasibility_filter_enabled = True
+    disabled_compatibility = build_state_bank_compatibility(
+        config=Config,
+        hyperparams=disabled,
+        branch_num=2,
+    )
+    enabled_compatibility = build_state_bank_compatibility(
+        config=Config,
+        hyperparams=enabled,
+        branch_num=2,
+    )
+    bank = StateBank(
+        compatibility=disabled_compatibility,
+        source_episode=1,
+    )
+    path = bank.save(tmp_path / "bank.pt")
+
+    with pytest.raises(
+        ValueError,
+        match="hyperparams.state_bank_economic_feasibility_filter_enabled",
+    ):
+        StateBank.load(path, expected_compatibility=enabled_compatibility)
 
 
 def test_sampling_is_reproducible_episode_specific_and_rng_neutral():
@@ -326,6 +540,7 @@ def test_state_bank_cli_is_opt_in_and_preserves_entry_scale(monkeypatch):
     hp = configure_hyperparams(parse_args())
 
     assert hp.state_bank_enabled is True
+    assert hp.state_bank_economic_feasibility_filter_enabled is False
     assert hp.state_bank_short_horizon == 7
     assert hp.state_bank_burn_in == 2
     assert hp.state_bank_capture_stride == 2
@@ -987,6 +1202,77 @@ def test_strict_acceptance_rejects_missing_gates_and_preserves_bank_file(tmp_pat
     assert output.read_bytes() == before
 
 
+def test_economic_publication_gate_rejects_bypassed_invalid_entry_and_preserves_bank(
+    tmp_path,
+):
+    _, previous_state = _fresh_state(n_paths=1)
+    _set_economic_accounting(previous_state)
+    previous = StateBank(compatibility=_compatibility(), source_episode=1)
+    previous.capture(previous_state, capture_time=2)
+    output = previous.save(tmp_path / "bank_ep2.pt")
+    before = output.read_bytes()
+
+    _, invalid_state = _fresh_state(n_paths=1)
+    _set_economic_accounting(invalid_state, resource_feasible=False)
+    candidate = StateBank(compatibility=_compatibility(), source_episode=2)
+    candidate.capture(
+        invalid_state,
+        capture_time=3,
+        lineage_ids=["root:0"],
+        economic_feasibility_filter_enabled=False,
+    )
+    hp = SimpleNamespace(
+        state_bank_acceptance_mode="numerical",
+        state_bank_economic_feasibility_filter_enabled=True,
+        state_bank_min_unique_lineages=1,
+        bellman_conditional_mean_thresh=None,
+        bellman_conditional_p90_thresh=None,
+    )
+    direct = evaluate_state_bank_acceptance(
+        episode_summary={},
+        candidate_bank=candidate,
+        hyperparams=hp,
+    )
+    assert direct["episode_acceptance_passed"] is False
+    assert direct["reasons"] == [
+        "state_bank_contains_economically_ineligible_entries"
+    ]
+    assert direct["bank_economic_feasibility_gate"] == {
+        "required": True,
+        "passed": False,
+        "stored_entry_count": 1,
+        "invalid_entry_count": 1,
+        "invalid_reasons": {
+            "rejected_accounting_invalid": 0,
+            "rejected_resource_infeasible": 1,
+            "rejected_nonfinite_c_raw": 0,
+            "rejected_nonpositive_c_raw": 0,
+            "rejected_consumption_floor_applied": 0,
+        },
+    }
+
+    summary = {"module_summaries": {}}
+    fake_episode = SimpleNamespace(
+        hyperparams=hp,
+        build_state_bank_after_success=lambda **_kwargs: candidate,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="state_bank_contains_economically_ineligible_entries",
+    ):
+        build_and_commit_state_bank(
+            fake_episode,
+            output_path=output,
+            n_paths=1,
+            group_size=1,
+            n_branches=2,
+            simulate_kwargs={},
+            episode_summary=summary,
+            previous_bank=previous,
+        )
+    assert output.read_bytes() == before
+
+
 def test_state_bank_slurm_pins_formal_v2_parameters():
     text = Path(
         "slurm/run_normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500_"
@@ -999,8 +1285,13 @@ def test_state_bank_slurm_pins_formal_v2_parameters():
         "STATE_BANK_SAMPLING_MODE:-uniform_lineage",
         "STATE_BANK_ACCEPTANCE_MODE:-strict",
         "STATE_BANK_SDF_PUBLICATION_GATE_ENABLED=0",
+        "STATE_BANK_ECONOMIC_FEASIBILITY_FILTER_ENABLED=1",
         "TRANSITION_RNG_MODE=stable_firm_identity",
         "ENTRY_RNG_MODE=stable_economic_identity",
         "ENTRY_SIZE_RATIO=1.0",
     ):
         assert expected in text
+    runner_text = Path(
+        "slurm/run_normalized_sdf_aio_bp_logit.slurm"
+    ).read_text(encoding="utf-8")
+    assert "--state-bank-economic-feasibility-filter-enabled" in runner_text

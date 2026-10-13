@@ -79,6 +79,7 @@ def build_state_bank_compatibility(
         "common_transition_seed",
         "preserve_global_rng_around_entry",
         "entry_rng_mode",
+        "state_bank_economic_feasibility_filter_enabled",
     )
     return {
         "format_version": STATE_BANK_FORMAT_VERSION,
@@ -134,6 +135,132 @@ def clone_state(
     return {
         name: tensor.detach().clone().to(target or tensor.device)
         for name, tensor in state.items()
+    }
+
+
+_ECONOMIC_REJECTION_KEYS = (
+    "rejected_accounting_invalid",
+    "rejected_resource_infeasible",
+    "rejected_nonfinite_c_raw",
+    "rejected_nonpositive_c_raw",
+    "rejected_consumption_floor_applied",
+)
+
+
+def _path_accounting_vector(
+    fields: Mapping[str, torch.Tensor],
+    name: str,
+    *,
+    n_paths: int,
+    default: float | bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    value = fields.get(name)
+    if not torch.is_tensor(value):
+        return torch.full((n_paths,), default, dtype=dtype, device=device)
+    value = value.detach().to(device=device).reshape(-1)
+    if int(value.numel()) != int(n_paths):
+        return torch.full((n_paths,), default, dtype=dtype, device=device)
+    return value.to(dtype=dtype)
+
+
+def economic_feasibility_masks(
+    fields: Mapping[str, torch.Tensor],
+    *,
+    n_paths: int,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Evaluate the authoritative per-path economic accounting predicates."""
+    accounting_valid = _path_accounting_vector(
+        fields,
+        "accounting_valid",
+        n_paths=n_paths,
+        default=False,
+        dtype=torch.bool,
+        device=device,
+    )
+    resource_feasible = _path_accounting_vector(
+        fields,
+        "accounting_resource_feasible",
+        n_paths=n_paths,
+        default=False,
+        dtype=torch.bool,
+        device=device,
+    )
+    c_raw = _path_accounting_vector(
+        fields,
+        "accounting_C_raw",
+        n_paths=n_paths,
+        default=float("nan"),
+        dtype=torch.float64,
+        device=device,
+    )
+    floor_applied = _path_accounting_vector(
+        fields,
+        "accounting_consumption_floor_applied",
+        n_paths=n_paths,
+        default=True,
+        dtype=torch.bool,
+        device=device,
+    )
+    finite_c_raw = torch.isfinite(c_raw)
+    positive_c_raw = finite_c_raw & (c_raw > 0)
+    no_floor = ~floor_applied
+    return {
+        "accounting_valid": accounting_valid,
+        "resource_feasible": resource_feasible,
+        "finite_c_raw": finite_c_raw,
+        "positive_c_raw": positive_c_raw,
+        "no_floor": no_floor,
+        "economically_eligible": (
+            accounting_valid
+            & resource_feasible
+            & positive_c_raw
+            & no_floor
+        ),
+        "rejected_accounting_invalid": ~accounting_valid,
+        "rejected_resource_infeasible": ~resource_feasible,
+        "rejected_nonfinite_c_raw": ~finite_c_raw,
+        "rejected_nonpositive_c_raw": finite_c_raw & ~positive_c_raw,
+        "rejected_consumption_floor_applied": floor_applied,
+    }
+
+
+def summarize_stored_economic_feasibility(bank: "StateBank") -> Dict[str, Any]:
+    """Revalidate stored entries independently of the capture-time filter."""
+    totals = {
+        "accounting_valid": 0,
+        "resource_feasible": 0,
+        "positive_c_raw": 0,
+        "no_floor": 0,
+        "economically_eligible": 0,
+    }
+    invalid_reasons = {key: 0 for key in _ECONOMIC_REJECTION_KEYS}
+    for entry in bank.entries:
+        masks = economic_feasibility_masks(
+            entry["fields"],
+            n_paths=1,
+            device=torch.device("cpu"),
+        )
+        for name in totals:
+            totals[name] += int(bool(masks[name][0]))
+        for name in invalid_reasons:
+            invalid_reasons[name] += int(bool(masks[name][0]))
+    count = int(len(bank.entries))
+    denominator = max(count, 1)
+    return {
+        "stored_entry_count": count,
+        "stored_accounting_valid_share": float(totals["accounting_valid"] / denominator),
+        "stored_resource_feasible_share": float(totals["resource_feasible"] / denominator),
+        "stored_positive_c_raw_share": float(totals["positive_c_raw"] / denominator),
+        "stored_no_floor_share": float(totals["no_floor"] / denominator),
+        "stored_economically_eligible_share": float(
+            totals["economically_eligible"] / denominator
+        ),
+        "stored_economically_eligible_count": int(totals["economically_eligible"]),
+        "invalid_entry_count": int(count - totals["economically_eligible"]),
+        "invalid_reasons": invalid_reasons,
     }
 
 
@@ -349,6 +476,7 @@ class StateBank:
         source_path_ids: Optional[Sequence[int]] = None,
         entry_namespace: str = "",
         reservoir_generator: Optional[torch.Generator] = None,
+        economic_feasibility_filter_enabled: bool = False,
     ) -> int:
         """Capture every non-extinct path from one parent-ready state."""
         self._validate_state_schema(state)
@@ -373,10 +501,43 @@ class StateBank:
             raise ValueError("source_path_ids must match the captured path dimension")
         if max_entries > 0 and reservoir_generator is None:
             raise ValueError("capped State Bank capture requires a reservoir generator")
+        filter_enabled = bool(economic_feasibility_filter_enabled)
+        feasibility = economic_feasibility_masks(
+            state,
+            n_paths=n_paths,
+            device=state["b"].device,
+        )
+        diagnostics = self.metadata.setdefault(
+            "economic_feasibility",
+            {
+                "filter_enabled": filter_enabled,
+                "capture_candidates_total": 0,
+                "capture_eligible_total": 0,
+                "capture_rejected_total": 0,
+                "capture_rejected_unique": 0,
+                **{key: 0 for key in _ECONOMIC_REJECTION_KEYS},
+            },
+        )
+        if bool(diagnostics.get("filter_enabled", filter_enabled)) != filter_enabled:
+            raise ValueError("State Bank economic feasibility filter changed across captures")
         captured = 0
         for path_index in range(n_paths):
             if alive is not None and not bool(alive[path_index].any()):
                 continue
+            diagnostics["capture_candidates_total"] += 1
+            eligible = (
+                bool(feasibility["economically_eligible"][path_index])
+                if filter_enabled
+                else True
+            )
+            if filter_enabled:
+                for reason in _ECONOMIC_REJECTION_KEYS:
+                    diagnostics[reason] += int(bool(feasibility[reason][path_index]))
+            if not eligible:
+                diagnostics["capture_rejected_total"] += 1
+                diagnostics["capture_rejected_unique"] += 1
+                continue
+            diagnostics["capture_eligible_total"] += 1
             fields = {
                 name: _clone_cpu(tensor[path_index])
                 for name, tensor in state.items()
@@ -598,12 +759,38 @@ class StateBank:
         return bank
 
     def distribution_summary(self) -> Dict[str, Any]:
+        stored_feasibility = summarize_stored_economic_feasibility(self)
+        capture_feasibility = dict(
+            self.metadata.get("economic_feasibility", {})
+        )
+        candidates = int(capture_feasibility.get("capture_candidates_total", 0))
+        eligible = int(capture_feasibility.get("capture_eligible_total", 0))
+        rejected = int(capture_feasibility.get("capture_rejected_unique", 0))
+        economic_feasibility = {
+            "filter_enabled": bool(
+                capture_feasibility.get("filter_enabled", False)
+            ),
+            "capture_candidates_total": candidates,
+            "capture_eligible_total": eligible,
+            "capture_rejected_total": int(
+                capture_feasibility.get("capture_rejected_total", rejected)
+            ),
+            "capture_rejected_unique": rejected,
+            "eligible_share": float(eligible / max(candidates, 1)),
+            "rejected_share": float(rejected / max(candidates, 1)),
+            **{
+                key: int(capture_feasibility.get(key, 0))
+                for key in _ECONOMIC_REJECTION_KEYS
+            },
+            **stored_feasibility,
+        }
         if not self.entries:
             return {
                 "bank_entry_count": 0,
                 "unique_lineages": 0,
                 "bank_unique_lineage_ratio": 0.0,
                 "largest_lineage_share": 0.0,
+                "economic_feasibility": economic_feasibility,
             }
 
         def _quantiles(values: Sequence[float]) -> Dict[str, float]:
@@ -727,6 +914,7 @@ class StateBank:
             "initial_cohort_share": float(sum(initial_share) / max(len(initial_share), 1)),
             "default_rate": float(sum(default_rate) / max(len(default_rate), 1)),
             "investment_rate": float(sum(investment_rate) / max(len(investment_rate), 1)),
+            "economic_feasibility": economic_feasibility,
         }
 
 
@@ -871,6 +1059,7 @@ class StateBankCapture:
         lineage_ids: Optional[Sequence[str]] = None,
         entry_namespace: str = "",
         reservoir_seed: int = 0,
+        economic_feasibility_filter_enabled: bool = False,
     ) -> None:
         if burn_in < 1:
             raise ValueError("State Bank burn_in must be at least 1")
@@ -885,6 +1074,9 @@ class StateBankCapture:
         self.lineage_ids = None if lineage_ids is None else tuple(map(str, lineage_ids))
         self.entry_namespace = str(entry_namespace)
         self.reservoir_seed = int(reservoir_seed)
+        self.economic_feasibility_filter_enabled = bool(
+            economic_feasibility_filter_enabled
+        )
         self.reservoir_generator = torch.Generator(device="cpu")
         self.reservoir_generator.manual_seed(self.reservoir_seed)
         self.capture_calls = 0
@@ -920,6 +1112,9 @@ class StateBankCapture:
             lineage_ids=self.lineage_ids,
             entry_namespace=self.entry_namespace,
             reservoir_generator=self.reservoir_generator,
+            economic_feasibility_filter_enabled=(
+                self.economic_feasibility_filter_enabled
+            ),
         )
 
     def summary(self) -> Dict[str, Any]:
@@ -928,6 +1123,9 @@ class StateBankCapture:
             "capture_stride": self.capture_stride,
             "max_entries": self.max_entries,
             "reservoir_seed": self.reservoir_seed,
+            "economic_feasibility_filter_enabled": (
+                self.economic_feasibility_filter_enabled
+            ),
             "capture_calls": self.capture_calls,
             "entries_captured": self.entries_captured,
             "bank_size": len(self.bank),

@@ -240,6 +240,8 @@ class HyperParams:
     state_bank_acceptance_mode: str = "numerical"
     # Keep SDF quality in State Bank diagnostics without blocking publication.
     state_bank_sdf_publication_gate_enabled: bool = False
+    # Opt-in persistent-state contract; legacy capture remains unchanged by default.
+    state_bank_economic_feasibility_filter_enabled: bool = False
     state_bank_min_unique_lineages: int = 0
     state_bank_sample_seed: int = 271828
     state_bank_refresh_seed: int = 314159

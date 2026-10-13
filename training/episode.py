@@ -12342,6 +12342,9 @@ class Episode:
                 int(self.hyperparams.state_bank_reservoir_seed)
                 + episode_id * 100_003
             ),
+            economic_feasibility_filter_enabled=bool(
+                self.hyperparams.state_bank_economic_feasibility_filter_enabled
+            ),
         )
         refresh_simulate_kwargs = dict(simulate_kwargs)
         for runner_only_key in (
