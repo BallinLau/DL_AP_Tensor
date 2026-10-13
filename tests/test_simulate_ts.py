@@ -444,12 +444,12 @@ def test_parallel_tensor_node_defers_next_debt_until_child_eta_is_drawn(monkeypa
         assert torch.isnan(firm_rows[:, columns[name]]).all()
 
 
-def test_parallel_node_can_disable_independent_resource_validation(monkeypatch):
+def test_parallel_node_defaults_to_disabled_independent_resource_validation(monkeypatch):
     device = torch.device("cpu")
     sim = _make_serial_sim(device)
     sim.models["policy_value"] = object()
     sim.n_paths = 1
-    sim.entry_independent_resource_validation_enabled = False
+    assert sim.entry_independent_resource_validation_enabled is False
 
     monkeypatch.setattr(
         simulate_ts_parallel,

@@ -269,7 +269,7 @@ class HyperParams:
     node_accounting_mode: str = "auto"
     # Optional diagnostic-only second pass. The authoritative resource ledger
     # and raw-consumption feasibility guard remain active when this is false.
-    entry_independent_resource_validation_enabled: bool = True
+    entry_independent_resource_validation_enabled: bool = False
     # Failure-only node-clearing diagnostic. The runner supplies a run-local
     # output directory; successful nodes incur no grid evaluation.
     entry_hatc_failure_scan_enabled: bool = False

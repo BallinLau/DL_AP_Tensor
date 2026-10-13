@@ -116,7 +116,7 @@ class SimulateTS:
         consumption_aggregation_mode: str = "legacy_per_firm_clamp",
         consumption_floor: float = 0.0,
         node_accounting_mode: str = "auto",
-        entry_independent_resource_validation_enabled: bool = True,
+        entry_independent_resource_validation_enabled: bool = False,
         preserve_global_rng_around_entry: bool = False,
         common_transition_seed: Optional[int] = None,
         transition_rng_mode: str = "legacy_position",

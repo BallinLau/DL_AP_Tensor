@@ -906,7 +906,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         K_birth_current_node = K_birth_current_node_computed
         I_maintenance_total = I_maintenance_computed
         independent_validation_enabled = bool(
-            getattr(sim, "entry_independent_resource_validation_enabled", True)
+            getattr(sim, "entry_independent_resource_validation_enabled", False)
         )
         if independent_validation_enabled:
             validation = validate_node_resource_account(

@@ -85,6 +85,9 @@ export ENTRY_RNG_SEED="${ENTRY_RNG_SEED:-86420}"
 export CONSUMPTION_AGGREGATION_MODE=raw
 export CONSUMPTION_FLOOR="${CONSUMPTION_FLOOR:-1e-4}"
 export NODE_ACCOUNTING_MODE=economic_node_ledger
+# The first-pass economic-node ledger is authoritative.  Keep the optional
+# rebuilt second-pass check off for this formal training path.
+export ENTRY_INDEPENDENT_RESOURCE_VALIDATION_ENABLED=0
 
 echo "Dispatching State Bank v2 investment-compare full-equilibrium run"
 echo "RUN_ROOT=$RUN_ROOT"
@@ -101,5 +104,6 @@ echo "STATE_BANK_ACCEPTANCE_MODE=$STATE_BANK_ACCEPTANCE_MODE"
 echo "SDF_CONTINUE_CONSTRAINT_TOL=$SDF_CONTINUE_CONSTRAINT_TOL"
 echo "TRANSITION_RNG_MODE=$TRANSITION_RNG_MODE"
 echo "ENTRY_RNG_MODE=$ENTRY_RNG_MODE"
+echo "ENTRY_INDEPENDENT_RESOURCE_VALIDATION_ENABLED=$ENTRY_INDEPENDENT_RESOURCE_VALIDATION_ENABLED"
 
 exec bash "$REPO_DIR/slurm/run_normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500_investment_compare.slurm"
