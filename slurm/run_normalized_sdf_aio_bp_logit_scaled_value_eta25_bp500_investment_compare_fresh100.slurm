@@ -59,9 +59,9 @@ export STATE_BANK_MIN_UNIQUE_LINEAGES=0
 export PV_MIXTURE_ENABLED=1
 export PV_MIXTURE_RATIO=0.20
 
-# The formal Fresh100 baseline uses the historical continuation tolerance, not
-# the State Bank experiment's temporary 1.0 relaxation.
-export SDF_CONTINUE_CONSTRAINT_TOL=0.02
+# Allow numerically safe SDF states to continue across outer episodes while
+# keeping the separate final-convergence tolerances unchanged.
+export SDF_CONTINUE_CONSTRAINT_TOL="${SDF_CONTINUE_CONSTRAINT_TOL:-1}"
 
 # These identity-based RNG modes are simulator features, not State Bank-only
 # features. Match the formal State Bank experiment to remove RNG confounds.

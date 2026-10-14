@@ -29,7 +29,7 @@ def test_fresh100_wrapper_pins_the_ablation_contract():
         "export STATE_BANK_ECONOMIC_FEASIBILITY_FILTER_ENABLED=0",
         "export PV_MIXTURE_ENABLED=1",
         "export PV_MIXTURE_RATIO=0.20",
-        "export SDF_CONTINUE_CONSTRAINT_TOL=0.02",
+        'export SDF_CONTINUE_CONSTRAINT_TOL="${SDF_CONTINUE_CONSTRAINT_TOL:-1}"',
         "export TRANSITION_RNG_MODE=stable_firm_identity",
         "export COMMON_TRANSITION_SEED=424242",
         "export ENTRY_RNG_MODE=stable_economic_identity",
