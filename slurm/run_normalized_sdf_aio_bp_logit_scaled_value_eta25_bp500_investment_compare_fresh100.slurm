@@ -72,7 +72,7 @@ export PRESERVE_GLOBAL_RNG_AROUND_ENTRY=1
 
 # Preserve the current investment-compare entry and accounting specification.
 export ENTRY_MODE=investment_compare
-export ENTRY_CAPITAL_RATIO=0.10
+export ENTRY_CAPITAL_RATIO=0.05
 export ENTRY_SIZE_RATIO=1.0
 export ENTRY_COST_MAX=""
 export ENTRY_DUMMY_I=0.0

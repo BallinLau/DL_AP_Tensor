@@ -35,7 +35,7 @@ def test_fresh100_wrapper_pins_the_ablation_contract():
         "export ENTRY_RNG_MODE=stable_economic_identity",
         "export PRESERVE_GLOBAL_RNG_AROUND_ENTRY=1",
         "export ENTRY_MODE=investment_compare",
-        "export ENTRY_CAPITAL_RATIO=0.10",
+        "export ENTRY_CAPITAL_RATIO=0.05",
         "export ENTRY_SIZE_RATIO=1.0",
         "export CONSUMPTION_AGGREGATION_MODE=raw",
         "export CONSUMPTION_FLOOR=1e-4",
