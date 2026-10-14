@@ -239,3 +239,15 @@ def test_checkpoint_resume_restores_exact_sweep_state(tmp_path: Path):
         assert torch.equal(value, resumed.model.state_dict()[key])
     assert resumed.history == original.history
     assert torch.equal(resumed.previous_values["q"], torch.tensor([1.0]))
+    for state in (
+        resumed.previous_values,
+        resumed.previous_previous_values,
+        resumed.previous_boundary,
+        resumed.previous_previous_boundary,
+        resumed.previous_policies,
+    ):
+        assert state is not None
+        assert all(
+            not torch.is_tensor(value) or value.device.type == "cpu"
+            for value in state.values()
+        )

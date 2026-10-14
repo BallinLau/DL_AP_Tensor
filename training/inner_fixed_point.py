@@ -834,11 +834,27 @@ class InnerFixedPointSolver:
             raise ValueError("Resume checkpoint frozen sdf_fc1 hash does not match")
         self.model.load_state_dict(payload["policy_value"], strict=True)
         self.history = list(payload.get("history", []))
-        self.previous_values = payload.get("previous_values")
-        self.previous_previous_values = payload.get("previous_previous_values")
-        self.previous_boundary = payload.get("previous_boundary")
-        self.previous_previous_boundary = payload.get("previous_previous_boundary")
-        self.previous_policies = payload.get("previous_policies")
+        # Diagnostic evaluators deliberately return CPU tensors.  A CUDA
+        # map_location is needed for model weights but must not migrate the
+        # saved comparison surfaces, otherwise the first resumed sweep mixes
+        # CPU current values with CUDA previous values.
+        def _diagnostic_cpu(value):
+            if value is None:
+                return None
+            return {
+                key: tensor.detach().cpu() if torch.is_tensor(tensor) else tensor
+                for key, tensor in value.items()
+            }
+
+        self.previous_values = _diagnostic_cpu(payload.get("previous_values"))
+        self.previous_previous_values = _diagnostic_cpu(
+            payload.get("previous_previous_values")
+        )
+        self.previous_boundary = _diagnostic_cpu(payload.get("previous_boundary"))
+        self.previous_previous_boundary = _diagnostic_cpu(
+            payload.get("previous_previous_boundary")
+        )
+        self.previous_policies = _diagnostic_cpu(payload.get("previous_policies"))
         self.consecutive_passes = int(payload.get("consecutive_passes", 0))
         return int(payload["sweep"]) + 1
 

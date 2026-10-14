@@ -66,3 +66,12 @@ configured convergence verdict.
 11. Fixed-point evaluator definition and residual calculation unchanged.
 12. Outer simulation remains disabled.
 13. Damping remains 1.0.
+
+## Resume-only infrastructure correction
+
+The 5-to-10 continuation initially exposed a pre-existing device mismatch:
+`torch.load(..., map_location=cuda)` moved saved diagnostic comparison surfaces
+to CUDA, while fresh evaluator surfaces are intentionally returned on CPU.
+`InnerFixedPointSolver.load_resume` now moves only the saved diagnostic
+values/boundaries/policies back to CPU. Model weights still load on the solver
+device. This does not alter any fresh-run or training calculation.
