@@ -28,7 +28,11 @@ import sys
 sys.path.append('..')
 from config import Config
 
-from .utils import compute_aio_residual, compute_z_penalty
+from .utils import (
+    compute_aio_residual,
+    compute_pairwise_aio_components,
+    compute_z_penalty,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -611,14 +615,16 @@ class QLoss(nn.Module):
         Q: torch.Tensor,
         nonnegative_weight: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
-        """Survival-parent Bellman AiO objective.
+        """Survival-parent Bellman pairwise-U AiO objective.
 
         Only this Q regime accepts branch residuals and calls
-        ``compute_aio_residual``.
+        ``compute_pairwise_aio_components``.  Other legacy AiO callers retain
+        their historical J-way-product semantics.
         """
         if len(residuals) < 2:
             raise ValueError("Q survival AiO requires at least two independent child shocks")
-        aio = compute_aio_residual(residuals, self.aio_weight)
+        aio_components = compute_pairwise_aio_components(residuals, self.aio_weight)
+        aio = aio_components["total"]
         nonnegative = self.compute_nonnegative_penalty(Q)
         per_sample = aio + float(nonnegative_weight) * nonnegative
         return {
@@ -627,6 +633,9 @@ class QLoss(nn.Module):
             "loss": per_sample.mean(),
             "bellman_loss": aio.mean(),
             "nonnegative_loss": nonnegative.mean(),
+            "aio_stable": aio_components["stable"],
+            "aio_u_signed": aio_components["u_signed"],
+            "aio_u_abs": aio_components["u_abs"],
         }
 
     def compute_regime_aware_objective(

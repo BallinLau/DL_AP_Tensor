@@ -178,6 +178,20 @@ def test_current_residual_evaluator_uses_current_model_on_both_sides():
     assert "episode._compute_q_bellman_signed_residuals" in source
 
 
+def test_inner_fixed_point_unconfigured_bellman_gate_is_explicit():
+    solver = object.__new__(InnerFixedPointSolver)
+    latest = {
+        "operator": {"bellman_passed": None},
+        "gates": {
+            "function_change_passed": True,
+            "default_boundary_passed": True,
+            "implicit_policy_passed": True,
+            "two_cycle_detected": False,
+        },
+    }
+    assert solver._failure_reasons(latest) == ["convergence_gate_unconfigured"]
+
+
 def test_collocation_bank_is_deterministic_for_same_seed():
     econ = AnalysisEconomicConfig.from_current_config()
     rng = np.random.default_rng(4)

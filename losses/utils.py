@@ -6,7 +6,7 @@
 
 import torch
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Dict, Sequence, Tuple
 
 
 def softplus_gate(x: torch.Tensor, delta: float = 1e-3) -> torch.Tensor:
@@ -139,6 +139,56 @@ def compute_aio_residual(
     residual_aio = residual_aio.abs()
     
     return (1 - aio_weight) * residual_stable + aio_weight * residual_aio
+
+
+def compute_pairwise_aio_components(
+    residuals: Sequence[torch.Tensor],
+    aio_weight: float = 0.5,
+) -> Dict[str, torch.Tensor]:
+    """Return the pairwise-U AiO objective and its per-parent components.
+
+    For ``J`` conditionally independent residual draws at one parent state,
+
+    ``U_J = ((sum_j r_j)^2 - sum_j r_j^2) / (J * (J - 1))``.
+
+    This is the mean of ``r_j * r_k`` over all unordered pairs, evaluated in
+    O(J) time without materializing an O(J^2) pair tensor.  If
+    ``mu(s) = E[r | s]``, conditional independence gives
+    ``E[U_J | s] = mu(s)^2``.  Increasing J therefore improves estimator
+    precision; it does not change the target to ``mu(s)^J``.
+
+    The caller must pass residuals *after* any exact discrete-state
+    expectation.  In particular, eta=0/1 branches are not independent AiO
+    draws.
+    """
+    if not isinstance(residuals, (list, tuple)):
+        raise ValueError("residuals must be a list or tuple of tensors")
+    child_count = len(residuals)
+    if child_count < 2:
+        raise ValueError("pairwise AiO requires at least two residual draws")
+
+    stacked = torch.stack(list(residuals), dim=0)
+    sum_r = stacked.sum(dim=0)
+    sum_r2 = stacked.square().sum(dim=0)
+    stable = sum_r2 / float(child_count)
+    u_signed = (sum_r.square() - sum_r2) / float(
+        child_count * (child_count - 1)
+    )
+    total = (1.0 - aio_weight) * stable + aio_weight * u_signed.abs()
+    return {
+        "stable": stable,
+        "u_signed": u_signed,
+        "u_abs": u_signed.abs(),
+        "total": total,
+    }
+
+
+def compute_pairwise_aio_residual(
+    residuals: Sequence[torch.Tensor],
+    aio_weight: float = 0.5,
+) -> torch.Tensor:
+    """Return one pairwise-U AiO loss per parent; legacy AiO is unchanged."""
+    return compute_pairwise_aio_components(residuals, aio_weight)["total"]
 
 
 def compute_aio_residual_legacy(

@@ -6373,6 +6373,13 @@ class Episode:
             q_claim_values = Q.detach().reshape(-1)
             self._latest_q_terms = {
                 'q_main': float(main_loss.item()),
+                'q_aio_mode': 'pairwise_u_statistic',
+                'q_aio_child_count': float(len(residuals)),
+                'q_aio_pair_count': float(len(residuals) * (len(residuals) - 1) // 2),
+                'q_aio_stable_mean': float(survival_terms['aio_stable'].mean().item()),
+                'q_aio_u_signed_mean': float(survival_terms['aio_u_signed'].mean().item()),
+                'q_aio_u_abs_mean': float(survival_terms['aio_u_abs'].mean().item()),
+                'q_aio_total_mean': float(aio_residual.mean().item()),
                 'q_regime_survival_n': float(Q.numel()),
                 'q_regime_claim_n': float(Q.numel()) if getattr(model, "q_parameterization", None) == "hybrid_regime" else 0.0,
                 'q_survival_bellman_signed_mean': float(branch_residual_raw.mean().item()),

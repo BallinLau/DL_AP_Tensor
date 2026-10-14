@@ -19,6 +19,8 @@ REPO_DIR="${REPO_DIR:-$WORK_ROOT/DL_AP_Tensor}"
 SOURCE_RUN="${SOURCE_RUN:-$WORK_ROOT/cachedir/normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500_investment_compare_fresh100_20261014_144528}"
 CHECKPOINT="${CHECKPOINT:-$SOURCE_RUN/checkpoints/ep1_combined.pt}"
 INNER_FP_SMOKE="${INNER_FP_SMOKE:-0}"
+INNER_FP_MAX_SWEEPS="${INNER_FP_MAX_SWEEPS:-}"
+RESUME="${RESUME:-}"
 REQUIRED_COMMIT="${REQUIRED_COMMIT:-}"
 SEED="${SEED:-20261014}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -46,7 +48,7 @@ else
     --fp-validation-parents 2048
     --fp-child-shocks 16
     --fp-batch-size 256
-    --fp-max-sweeps 30
+    --fp-max-sweeps "${INNER_FP_MAX_SWEEPS:-30}"
     --fp-min-sweeps 3
     --fp-consecutive-passes 3
   )
@@ -81,7 +83,7 @@ for required in \
     exit 1
   fi
 done
-if [[ -e "$OUTPUT_DIR" ]]; then
+if [[ -e "$OUTPUT_DIR" && -z "$RESUME" ]]; then
   echo "ERROR: refusing to overwrite existing OUTPUT_DIR: $OUTPUT_DIR"
   exit 1
 fi
@@ -101,6 +103,11 @@ if not torch.cuda.is_available():
 print("device:", torch.cuda.get_device_name(0))
 PY
 
+RESUME_ARGS=()
+if [[ -n "$RESUME" ]]; then
+  RESUME_ARGS=(--resume "$RESUME")
+fi
+
 python3 -u experiments/run_inner_fixed_point.py \
   --source-run "$SOURCE_RUN" \
   --checkpoint "$CHECKPOINT" \
@@ -108,6 +115,7 @@ python3 -u experiments/run_inner_fixed_point.py \
   --device cuda:0 \
   --seed "$SEED" \
   --fp-damping 1.0 \
+  "${RESUME_ARGS[@]}" \
   "${MODE_ARGS[@]}"
 
 echo "Finished: $(date)"

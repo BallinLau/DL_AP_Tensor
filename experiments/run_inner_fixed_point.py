@@ -67,6 +67,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fp-change-p90-tol", type=float, default=5e-3)
     parser.add_argument("--fp-default-flip-tol", type=float, default=1e-3)
     parser.add_argument("--fp-bstar-p90-tol", type=float, default=1e-2)
+    parser.add_argument("--fp-bellman-mean-tol", type=float, default=None)
+    parser.add_argument("--fp-bellman-p90-tol", type=float, default=None)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--skip-report", action="store_true")
     return parser.parse_args()
@@ -171,6 +173,11 @@ def main() -> int:
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     Config.DEVICE = device
     hp = _restore_hyperparams(hp_values)
+    if (args.fp_bellman_mean_tol is None) != (args.fp_bellman_p90_tol is None):
+        raise ValueError("Bellman mean/p90 thresholds must be configured together")
+    if args.fp_bellman_mean_tol is not None:
+        hp.bellman_conditional_mean_thresh = float(args.fp_bellman_mean_tol)
+        hp.bellman_conditional_p90_thresh = float(args.fp_bellman_p90_tol)
     hp.bp_distill_epochs = 0
     hp.pv_bp_head_training_enabled = False
     overrides = {

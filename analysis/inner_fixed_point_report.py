@@ -245,8 +245,9 @@ def build_inner_fixed_point_report(run_root: str | Path) -> Path:
 
 1. **Numerical inner fixed point found:** `{summary.get('inner_fp_passed')}`
 2. **First passing sweep:** `{summary.get('first_pass_sweep')}`
-3. **Final empirical distance:** mean `{summary.get('final_empirical_fp_distance_mean')}`, p90 `{summary.get('final_empirical_fp_distance_p90')}` (normalized fixed-bank operator residual).
-4. **Final stability:** ΔP0 p90 `{final_change.get('p0', {}).get('p90')}`, ΔPI p90 `{final_change.get('pi', {}).get('p90')}`, ΔQ p90 `{final_change.get('q', {}).get('p90')}`; default flip `{final_boundary.get('default_flip_share')}`; cutoff drift p90 `{final_boundary.get('default_cutoff_drift_p90')}`; b0* drift p90 `{final_policy.get('b0_star', {}).get('p90')}`; bI* drift p90 `{final_policy.get('bi_star', {}).get('p90')}`.
+3. **Convergence statement:** {summary.get('statement')}
+4. **Final empirical distance:** mean `{summary.get('final_empirical_fp_distance_mean')}`, p90 `{summary.get('final_empirical_fp_distance_p90')}` (normalized fixed-bank operator residual).
+5. **Final stability:** ΔP0 p90 `{final_change.get('p0', {}).get('p90')}`, ΔPI p90 `{final_change.get('pi', {}).get('p90')}`, ΔQ p90 `{final_change.get('q', {}).get('p90')}`; default flip `{final_boundary.get('default_flip_share')}`; cutoff drift p90 `{final_boundary.get('default_cutoff_drift_p90')}`; b0* drift p90 `{final_policy.get('b0_star', {}).get('p90')}`; bI* drift p90 `{final_policy.get('bi_star', {}).get('p90')}`.
 
 The result is conditional on the frozen Episode-1 Macro Law/SDF, this immutable parent bank, and this immutable one-step shock bank. It does not establish existence or uniqueness in the continuous state space. `failure_reason={summary.get('failure_reason')}` and `numerical_failure={summary.get('numerical_failure')}`.
 

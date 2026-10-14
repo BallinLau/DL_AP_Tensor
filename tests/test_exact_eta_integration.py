@@ -8,6 +8,7 @@ from config import Config, HyperParams
 from losses import P0Loss, PILoss, QLoss
 import losses.q_loss as q_loss_module
 from losses.utils import compute_aio_residual as real_compute_aio_residual
+from losses.utils import compute_pairwise_aio_components as real_pairwise_aio_components
 from models import PolicyValueModel
 import training.episode as episode_module
 from training.bp_grid_teacher import BPGridTeacher
@@ -323,7 +324,13 @@ def test_training_aio_receives_only_independent_continuous_branches(monkeypatch,
         loss = episode._compute_pi_loss(batch)
     else:
         # Direct-Q dispatch calls AiO only on the explicit survival path.
-        monkeypatch.setattr(q_loss_module, "compute_aio_residual", capture)
+        def capture_pairwise(residuals, aio_weight):
+            branch_counts.append(len(residuals))
+            return real_pairwise_aio_components(residuals, aio_weight)
+
+        monkeypatch.setattr(
+            q_loss_module, "compute_pairwise_aio_components", capture_pairwise
+        )
         loss = episode._compute_q_survival_bellman_loss(batch)
     assert torch.isfinite(loss)
     assert branch_counts == [2]

@@ -638,13 +638,14 @@ def evaluate_inner_operator(
     p90_distance = max(equations[name]["normalized"]["p90"] for name in equations)
     mean_tol = getattr(episode.hyperparams, "bellman_conditional_mean_thresh", None)
     p90_tol = getattr(episode.hyperparams, "bellman_conditional_p90_thresh", None)
-    bellman_passed = bool(
-        mean_tol is not None and p90_tol is not None
-        and all(
+    bellman_gate_configured = mean_tol is not None and p90_tol is not None
+    bellman_passed = (
+        bool(all(
             equations[name]["normalized"]["mean"] < float(mean_tol)
             and equations[name]["normalized"]["p90"] < float(p90_tol)
             for name in equations
-        )
+        ))
+        if bellman_gate_configured else None
     )
     metrics = {
         "definition": "current_online_fixed_bank_operator_residual_v1",
@@ -652,6 +653,7 @@ def evaluate_inner_operator(
         "empirical_fixed_point_distance_mean": float(mean_distance),
         "empirical_fixed_point_distance_p90": float(p90_distance),
         "bellman_thresholds": {"mean": mean_tol, "p90": p90_tol},
+        "bellman_gate_configured": bellman_gate_configured,
         "bellman_passed": bellman_passed,
         "q_regime_counts": q_counts,
     }
@@ -882,7 +884,9 @@ class InnerFixedPointSolver:
 
     def _failure_reasons(self, latest: Mapping[str, Any]) -> List[str]:
         reasons = []
-        if not latest["operator"]["bellman_passed"]:
+        if latest["operator"]["bellman_passed"] is None:
+            reasons.append("convergence_gate_unconfigured")
+        elif latest["operator"]["bellman_passed"] is False:
             reasons.append("bellman_residual_not_converged")
         if not latest["gates"]["function_change_passed"]:
             reasons.append("function_change_not_converged")
@@ -1088,7 +1092,7 @@ class InnerFixedPointSolver:
             }
             sweep_pass = bool(
                 sweep >= self.config.min_sweeps
-                and operator["bellman_passed"]
+                and operator["bellman_passed"] is True
                 and function_pass and boundary_pass and policy_pass and not two_cycle
             )
             self.consecutive_passes = self.consecutive_passes + 1 if sweep_pass else 0
@@ -1157,6 +1161,9 @@ class InnerFixedPointSolver:
                 "From the ep1 initialization, a numerical inner fixed point was found "
                 "on the frozen ep1 Macro Law and fixed collocation/shock banks."
                 if passed else
+                "The solver ran, but the convergence gate is unconfigured because the "
+                "conditional Bellman thresholds are None; no convergence verdict is made."
+                if latest is not None and not latest["operator"].get("bellman_gate_configured", False) else
                 "No numerical inner fixed point was found under the configured frozen "
                 "Macro Law, collocation bank, shock bank, and acceptance thresholds."
             ),
