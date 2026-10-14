@@ -20,13 +20,19 @@ SOURCE_RUN="${SOURCE_RUN:-$WORK_ROOT/cachedir/normalized_sdf_aio_bp_logit_scaled
 CHECKPOINT="${CHECKPOINT:-$SOURCE_RUN/checkpoints/ep1_combined.pt}"
 INNER_FP_SMOKE="${INNER_FP_SMOKE:-0}"
 INNER_FP_MAX_SWEEPS="${INNER_FP_MAX_SWEEPS:-}"
+INNER_FP_MODE="${INNER_FP_MODE:-coupled}"
 RESUME="${RESUME:-}"
 REQUIRED_COMMIT="${REQUIRED_COMMIT:-}"
 SEED="${SEED:-20261014}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 
+case "$INNER_FP_MODE" in
+  coupled|p_only|q_only) ;;
+  *) echo "ERROR: INNER_FP_MODE must be coupled, p_only, or q_only"; exit 1 ;;
+esac
+
 if [[ "$INNER_FP_SMOKE" == "1" ]]; then
-  OUTPUT_DIR="${OUTPUT_DIR:-$WORK_ROOT/cachedir/inner_fixed_point_smoke_from_fresh100_ep1_${STAMP}}"
+  OUTPUT_DIR="${OUTPUT_DIR:-$WORK_ROOT/cachedir/inner_fp_block_${INNER_FP_MODE}_smoke_ep1_${STAMP}}"
   MODE_ARGS=(
     --fp-train-parents 256
     --fp-validation-parents 128
@@ -42,7 +48,7 @@ if [[ "$INNER_FP_SMOKE" == "1" ]]; then
     --fp-q-polish-epochs 1
   )
 else
-  OUTPUT_DIR="${OUTPUT_DIR:-$WORK_ROOT/cachedir/inner_fixed_point_from_fresh100_ep1_${STAMP}}"
+  OUTPUT_DIR="${OUTPUT_DIR:-$WORK_ROOT/cachedir/inner_fp_block_${INNER_FP_MODE}_ep1_10s_${STAMP}}"
   MODE_ARGS=(
     --fp-train-parents 8192
     --fp-validation-parents 2048
@@ -63,6 +69,7 @@ echo "Repo/branch/commit: $REPO_DIR / $(git branch --show-current) / $ACTUAL_COM
 echo "Source: $SOURCE_RUN"
 echo "Checkpoint: $CHECKPOINT"
 echo "Smoke: $INNER_FP_SMOKE"
+echo "Block mode: $INNER_FP_MODE"
 echo "Output: $OUTPUT_DIR"
 git status --short
 echo "============================================================"
@@ -114,6 +121,7 @@ python3 -u experiments/run_inner_fixed_point.py \
   --run-root "$OUTPUT_DIR" \
   --device cuda:0 \
   --seed "$SEED" \
+  --fp-mode "$INNER_FP_MODE" \
   --fp-damping 1.0 \
   "${RESUME_ARGS[@]}" \
   "${MODE_ARGS[@]}"

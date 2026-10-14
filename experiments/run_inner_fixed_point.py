@@ -63,6 +63,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fp-q-survival-epochs", type=int, default=None)
     parser.add_argument("--fp-q-polish-epochs", type=int, default=None)
     parser.add_argument("--fp-damping", type=float, default=1.0)
+    parser.add_argument(
+        "--fp-mode", choices=("coupled", "p_only", "q_only"), default="coupled"
+    )
     parser.add_argument("--fp-change-mean-tol", type=float, default=1e-3)
     parser.add_argument("--fp-change-p90-tol", type=float, default=5e-3)
     parser.add_argument("--fp-default-flip-tol", type=float, default=1e-3)
@@ -287,12 +290,14 @@ def main() -> int:
         "entry": False,
         "bp_distillation": False,
         "macro_law_update": False,
+        "inner_fp_mode": args.fp_mode,
     }
     write_json(output_dir / "metadata" / "provenance.json", provenance)
     write_json(output_dir / "metadata" / "source_hyperparams.json", hp_values)
     write_json(output_dir / "metadata" / "solver_cli.json", vars(args))
 
     solver_config = InnerFPSolverConfig(
+        mode=args.fp_mode,
         max_sweeps=args.fp_max_sweeps,
         min_sweeps=args.fp_min_sweeps,
         consecutive_passes=args.fp_consecutive_passes,

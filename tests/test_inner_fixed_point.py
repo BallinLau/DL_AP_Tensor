@@ -19,6 +19,9 @@ from training.inner_fixed_point import (
     InnerFixedPointSolver,
     InnerFPSolverConfig,
     build_collocation_bank,
+    _q_fit_by_regime,
+    _target_difference,
+    evaluate_inner_operator_snapshot,
     module_hash,
     named_parameter_hash,
 )
@@ -172,10 +175,50 @@ def test_inner_solver_source_contains_no_simulation_or_entry_call():
 
 def test_current_residual_evaluator_uses_current_model_on_both_sides():
     import training.inner_fixed_point as module
-    source = inspect.getsource(module.evaluate_inner_operator)
+    source = inspect.getsource(module.evaluate_inner_operator_snapshot)
     assert "q_target_model=model" in source
-    assert "pred_p0, pred_pi = model._value_outputs(parent)" in source
-    assert "episode._compute_q_bellman_signed_residuals" in source
+    assert "p0_value, pi_value = model._value_outputs(parent)" in source
+    assert "compute_main_residual" in source
+    assert 'branch_targets.mean(dim=1, keepdim=True)' in source
+
+
+def test_cross_effect_reports_signed_absolute_and_normalized_movement():
+    before = torch.tensor([[1.0], [2.0]])
+    after = torch.tensor([[2.0], [0.0]])
+    result = _target_difference(
+        after, before, torch.tensor([[2.0], [4.0]]), include_signed=True
+    )
+    assert result["signed_mean"] == pytest.approx(-0.5)
+    assert result["mean"] == pytest.approx(1.5)
+    assert result["normalized_mean"] == pytest.approx(0.5)
+
+
+def test_q_frozen_target_fit_is_partitioned_by_regime():
+    result = _q_fit_by_regime(
+        torch.tensor([[0.0], [3.0], [4.0], [6.0]]),
+        torch.tensor([[0.0], [1.0], [5.0], [3.0]]),
+        torch.ones((4, 1)),
+        torch.tensor([0, 1, 2, 2]),
+    )
+    assert result["zero"]["count"] == 1
+    assert result["default"]["normalized_mean"] == pytest.approx(2.0)
+    assert result["survival"]["normalized_mean"] == pytest.approx(2.0)
+
+
+def test_block_modes_skip_only_the_requested_optimizer_stage():
+    source = inspect.getsource(InnerFixedPointSolver.run)
+    assert 'mode == "q_only"' in source
+    assert 'mode == "p_only"' in source
+    assert '"status": "frozen_block"' in source
+    assert "_run_policy_value_evaluation_stage" in source
+    assert "_run_q_regime_training" in source
+
+
+def test_snapshot_evaluator_returns_row_aligned_operator_targets():
+    source = inspect.getsource(evaluate_inner_operator_snapshot)
+    assert 'pieces["q_target"].append' in source
+    assert 'pieces["q_regime"].append' in source
+    assert 'q_target[survival]' in source
 
 
 def test_inner_fixed_point_unconfigured_bellman_gate_is_explicit():

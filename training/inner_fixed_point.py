@@ -9,6 +9,7 @@ It never simulates a long path and never trains the macro/SDF models.
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 import json
@@ -533,27 +534,76 @@ def boundary_metrics(
     return metrics
 
 
-def evaluate_inner_operator(
+@contextmanager
+def _policy_value_model_scope(episode: Episode, model: nn.Module):
+    """Temporarily make ``model`` the explicit current firm operator."""
+    original = episode.models["policy_value"]
+    episode.models["policy_value"] = model
+    try:
+        yield
+    finally:
+        episode.models["policy_value"] = original
+
+
+def _operator_snapshot_metrics(snapshot: Mapping[str, torch.Tensor]) -> Dict[str, Any]:
+    equations: Dict[str, Any] = {}
+    for equation in ("p0", "pi", "q"):
+        residual = (snapshot[f"{equation}_target"] - snapshot[f"{equation}_value"]).abs()
+        normalized = residual / snapshot[f"{equation}_scale"].clamp_min(1e-8)
+        equations[equation] = {
+            "raw": _summary(residual),
+            "normalized": _summary(normalized),
+        }
+    q_regimes: Dict[str, Any] = {}
+    for index, name in enumerate(("zero", "default", "survival")):
+        mask = snapshot["q_regime"] == index
+        residual = (snapshot["q_target"] - snapshot["q_value"]).abs()[mask]
+        normalized = residual / snapshot["q_scale"].clamp_min(1e-8)[mask]
+        q_regimes[name] = {
+            "count": int(mask.sum().item()),
+            "raw": _summary(residual),
+            "normalized": _summary(normalized),
+        }
+    mean_distance = max(equations[name]["normalized"]["mean"] for name in equations)
+    p90_distance = max(equations[name]["normalized"]["p90"] for name in equations)
+    return {
+        "definition": "fresh_current_operator_snapshot_v1",
+        "equations": equations,
+        "q_regimes": q_regimes,
+        "q_regime_counts": {name: q_regimes[name]["count"] for name in q_regimes},
+        "q_recursion_gain": _summary(snapshot["q_recursion_gain"]),
+        "q_recursion_gain_gt1_share": (
+            float((snapshot["q_recursion_gain"] > 1.0).float().mean().item())
+            if snapshot["q_recursion_gain"].numel() else float("nan")
+        ),
+        "empirical_fixed_point_distance_mean": float(mean_distance),
+        "empirical_fixed_point_distance_p90": float(p90_distance),
+    }
+
+
+def evaluate_inner_operator_snapshot(
     episode: Episode,
     batches: List[Dict[str, torch.Tensor]],
-) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
-    """Evaluate T(F)-F with the same current model on both sides."""
-    model = episode.models["policy_value"]
+    *,
+    model: Optional[nn.Module] = None,
+) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """Fresh-evaluate outputs and Bellman targets on one fixed bank."""
+    model = model or episode.models["policy_value"]
     model.eval()
-    p0_raw: List[torch.Tensor] = []
-    pi_raw: List[torch.Tensor] = []
-    p0_norm: List[torch.Tensor] = []
-    pi_norm: List[torch.Tensor] = []
-    q_raw: List[torch.Tensor] = []
-    q_norm: List[torch.Tensor] = []
+    fields = (
+        "p0_value", "pi_value", "q_value",
+        "p0_target", "pi_target", "q_target",
+        "p0_scale", "pi_scale", "q_scale", "q_regime",
+    )
+    pieces: Dict[str, List[torch.Tensor]] = {name: [] for name in fields}
     b0_star: List[torch.Tensor] = []
     bi_star: List[torch.Tensor] = []
-    q_counts = {"zero": 0, "default": 0, "survival": 0}
+    recursion_gain: List[torch.Tensor] = []
     teacher = BPGridTeacher.from_hyperparams(
         model, episode.loss_fns["p0"], episode.loss_fns["pi"],
         episode.hyperparams, q_target_model=model,
     )
-    with torch.no_grad():
+    with _policy_value_model_scope(episode, model), torch.no_grad():
         for batch in batches:
             parent = batch["parent"][:, :7]
             children = episode._get_policy_children(batch)
@@ -563,106 +613,201 @@ def evaluate_inner_operator(
             children_exp, _, used_exp, weights = episode._expand_policy_expectation_children(
                 children, raw_m, used_m
             )
-            p0_target = teacher.compute_value_target(
+            p0_result = teacher.compute_value_target(
                 parent, children_exp, used_exp, branch="p0", child_weights=weights
             )
-            pi_target = teacher.compute_value_target(
+            pi_result = teacher.compute_value_target(
                 parent, children_exp, used_exp, branch="pi", child_weights=weights
             )
-            pred_p0, pred_pi = model._value_outputs(parent)
-            scale = model.equity_value_scale(parent).detach().clamp_min(1e-8)
-            p0_delta = (p0_target["value_star"] - pred_p0).abs()
-            pi_delta = (pi_target["value_star"] - pred_pi).abs()
-            p0_raw.append(p0_delta.cpu())
-            pi_raw.append(pi_delta.cpu())
-            p0_norm.append((p0_delta / scale).cpu())
-            pi_norm.append((pi_delta / scale).cpu())
-            b0_star.append(p0_target["bp_star"].detach().cpu())
-            bi_star.append(pi_target["bp_star"].detach().cpu())
+            p0_value, pi_value = model._value_outputs(parent)
+            value_scale = model.equity_value_scale(parent).detach().clamp_min(1e-8)
 
             equity = model.forward_equity(parent)
             masks = classify_q_parent_regimes(
                 parent[:, 0:1], equity["Phat"],
                 zero_b_eps=float(getattr(episode.hyperparams, "q_zero_b_eps", 0.0)),
             )
-            q_parent = model._q_claim_output(parent)
-            for regime in ("zero", "default"):
-                mask = masks[regime].reshape(-1)
-                q_counts[regime] += int(mask.sum().item())
-                if not mask.any():
-                    continue
-                q_value = q_parent[mask]
-                if regime == "zero":
-                    target = torch.zeros_like(q_value)
-                else:
-                    state = parent[mask]
-                    target = episode.loss_fns["q"].compute_current_recovery(
-                        state[:, 0:1], state[:, 4:5], state[:, 1:2]
-                    )
-                residual = (target - q_value).abs()
-                q_raw.append(residual.cpu())
-                q_norm.append((residual / (1.0 + target.abs())).cpu())
+            q_value = model._q_claim_output(parent)
+            q_target = torch.empty_like(q_value)
+            q_scale = torch.empty_like(q_value)
+            regime = torch.empty(parent.shape[0], dtype=torch.long, device=parent.device)
 
+            zero = masks["zero"].reshape(-1)
+            if zero.any():
+                q_target[zero] = 0.0
+                q_scale[zero] = 1.0
+                regime[zero] = 0
+            default = masks["default"].reshape(-1)
+            if default.any():
+                state = parent[default]
+                target = episode.loss_fns["q"].compute_current_recovery(
+                    state[:, 0:1], state[:, 4:5], state[:, 1:2]
+                )
+                q_target[default] = target
+                q_scale[default] = 1.0 + target.abs()
+                regime[default] = 1
             survival = masks["survival"].reshape(-1)
-            q_counts["survival"] += int(survival.sum().item())
             if survival.any():
                 subset = episode._slice_q_batch(batch, survival)
-                signed = episode._compute_q_bellman_signed_residuals(
-                    subset, m_mode="train"
-                )
-                conditional = signed.mean(dim=1, keepdim=True)
                 state = subset["parent"][:, :7]
-                q_value = model._q_claim_output(state)
-                target = q_value + signed
-                scale_q = (1.0 + target.abs().mean(dim=1, keepdim=True)).clamp_min(1e-8)
-                q_raw.append(conditional.abs().cpu())
-                q_norm.append((conditional.abs() / scale_q).cpu())
+                child_list = episode._get_policy_children(subset)
+                raw_q_m = [child[:, 7:8] for child in child_list]
+                if getattr(episode.hyperparams, "q_use_detached_m", True):
+                    q_lo = float(getattr(episode.hyperparams, "q_m_clamp_min", 0.5))
+                    q_hi = float(getattr(episode.hyperparams, "q_m_clamp_max", 1.5))
+                    used_q_m = [value.detach().clamp(q_lo, q_hi) for value in raw_q_m]
+                else:
+                    used_q_m = raw_q_m
+                child_exp, _, used_q_m, _ = episode._expand_policy_expectation_children(
+                    child_list, raw_q_m, used_q_m
+                )
+                output_t = model(state)
+                bar_i = episode._policy_get_out(output_t, "bar_i", 5)
+                multiplier = bar_i * (float(episode.loss_fns["q"].g) - 1.0) + 1.0
+                b_sp = state[:, 0:1] / multiplier.clamp_min(1e-6)
+                q_sp: List[torch.Tensor] = []
+                bar_z_sp: List[torch.Tensor] = []
+                for child in child_exp:
+                    child_state = child[:, :7].clone()
+                    child_state[:, 0:1] = b_sp
+                    output_sp = model(child_state)
+                    q_sp.append(episode._policy_get_out(output_sp, "Q", 0))
+                    bar_z_sp.append(episode._policy_get_out(output_sp, "bar_z", 6))
+                residuals = episode.loss_fns["q"].compute_main_residual(
+                    model._q_claim_output(state), state[:, 0:1], bar_i,
+                    used_q_m, q_sp, bar_z_sp,
+                    [child[:, 4:5] for child in child_exp],
+                    [child[:, 1:2] for child in child_exp],
+                )
+                residuals = episode._collapse_policy_eta_pairs(residuals)
+                signed = episode._stack_signed_branch_residuals(
+                    residuals, expected_batch=state.shape[0],
+                    device=episode.device, label="q_snapshot",
+                )
+                branch_targets = model._q_claim_output(state) + signed
+                q_target[survival] = branch_targets.mean(dim=1, keepdim=True)
+                q_scale[survival] = 1.0 + branch_targets.abs().mean(dim=1, keepdim=True)
+                regime[survival] = 2
+                gains = [
+                    m * multiplier * (1.0 - bar_z)
+                    for m, bar_z in zip(used_q_m, bar_z_sp)
+                ]
+                gains = episode._collapse_policy_eta_pairs(gains)
+                recursion_gain.append(torch.stack(gains, dim=1).reshape(-1).cpu())
 
-    raw = {
-        "p0": torch.cat(p0_raw),
-        "pi": torch.cat(pi_raw),
-        "q": torch.cat(q_raw) if q_raw else torch.empty(0),
-    }
-    normalized = {
-        "p0": torch.cat(p0_norm),
-        "pi": torch.cat(pi_norm),
-        "q": torch.cat(q_norm) if q_norm else torch.empty(0),
-    }
-    equations: Dict[str, Any] = {}
-    for equation in ("p0", "pi", "q"):
-        equations[equation] = {
-            "raw": _summary(raw[equation]),
-            "normalized": _summary(normalized[equation]),
-        }
-    mean_distance = max(equations[name]["normalized"]["mean"] for name in equations)
-    p90_distance = max(equations[name]["normalized"]["p90"] for name in equations)
+            pieces["p0_value"].append(p0_value.detach().cpu())
+            pieces["pi_value"].append(pi_value.detach().cpu())
+            pieces["q_value"].append(q_value.detach().cpu())
+            pieces["p0_target"].append(p0_result["value_star"].detach().cpu())
+            pieces["pi_target"].append(pi_result["value_star"].detach().cpu())
+            pieces["q_target"].append(q_target.detach().cpu())
+            pieces["p0_scale"].append(value_scale.cpu())
+            pieces["pi_scale"].append(value_scale.cpu())
+            pieces["q_scale"].append(q_scale.detach().cpu())
+            pieces["q_regime"].append(regime.detach().cpu())
+            b0_star.append(p0_result["bp_star"].detach().cpu())
+            bi_star.append(pi_result["bp_star"].detach().cpu())
+    snapshot = {name: torch.cat(values) for name, values in pieces.items()}
+    snapshot["q_recursion_gain"] = (
+        torch.cat(recursion_gain) if recursion_gain else torch.empty(0)
+    )
+    metrics = _operator_snapshot_metrics(snapshot)
     mean_tol = getattr(episode.hyperparams, "bellman_conditional_mean_thresh", None)
     p90_tol = getattr(episode.hyperparams, "bellman_conditional_p90_thresh", None)
-    bellman_gate_configured = mean_tol is not None and p90_tol is not None
-    bellman_passed = (
-        bool(all(
-            equations[name]["normalized"]["mean"] < float(mean_tol)
-            and equations[name]["normalized"]["p90"] < float(p90_tol)
-            for name in equations
-        ))
-        if bellman_gate_configured else None
-    )
-    metrics = {
-        "definition": "current_online_fixed_bank_operator_residual_v1",
-        "equations": equations,
-        "empirical_fixed_point_distance_mean": float(mean_distance),
-        "empirical_fixed_point_distance_p90": float(p90_distance),
+    configured = mean_tol is not None and p90_tol is not None
+    metrics.update({
         "bellman_thresholds": {"mean": mean_tol, "p90": p90_tol},
-        "bellman_gate_configured": bellman_gate_configured,
-        "bellman_passed": bellman_passed,
-        "q_regime_counts": q_counts,
-    }
+        "bellman_gate_configured": configured,
+        "bellman_passed": (
+            bool(all(
+                metrics["equations"][name]["normalized"]["mean"] < float(mean_tol)
+                and metrics["equations"][name]["normalized"]["p90"] < float(p90_tol)
+                for name in ("p0", "pi", "q")
+            )) if configured else None
+        ),
+    })
     policies = {"b0_star": torch.cat(b0_star), "bi_star": torch.cat(bi_star)}
+    return metrics, policies, snapshot
+
+
+def evaluate_inner_operator(
+    episode: Episode,
+    batches: List[Dict[str, torch.Tensor]],
+) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
+    """Evaluate T(F)-F with the same current model on both sides."""
+    metrics, policies, _ = evaluate_inner_operator_snapshot(episode, batches)
+    metrics["definition"] = "current_online_fixed_bank_operator_residual_v1"
     return metrics, policies
+
+
+def _nan_change_summary() -> Dict[str, float]:
+    return {key: float("nan") for key in (
+        "mean", "p50", "p90", "p99", "max",
+        "normalized_mean", "normalized_p50", "normalized_p90",
+        "normalized_p99", "normalized_max",
+    )}
+
+
+def _target_difference(
+    current: torch.Tensor,
+    previous: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    include_signed: bool = False,
+) -> Dict[str, float]:
+    delta = current - previous
+    result = _summary(delta.abs())
+    result.update({
+        f"normalized_{key}": value
+        for key, value in _summary(delta.abs() / scale.clamp_min(1e-8)).items()
+    })
+    if include_signed:
+        result["signed_mean"] = float(delta.mean().item())
+    return result
+
+
+def _fit_error(
+    values: torch.Tensor,
+    frozen_target: torch.Tensor,
+    scale: torch.Tensor,
+) -> Dict[str, float]:
+    return _target_difference(values, frozen_target, scale)
+
+
+def _q_fit_by_regime(
+    values: torch.Tensor,
+    frozen_target: torch.Tensor,
+    scale: torch.Tensor,
+    regimes: torch.Tensor,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "overall": _fit_error(values, frozen_target, scale),
+    }
+    for index, name in enumerate(("zero", "default", "survival")):
+        mask = regimes == index
+        result[name] = (
+            _fit_error(values[mask], frozen_target[mask], scale[mask])
+            if mask.any() else _nan_change_summary()
+        )
+        result[name]["count"] = int(mask.sum().item())
+    return result
+
+
+def _q_training_diagnostics(summary: Mapping[str, Any]) -> Dict[str, float]:
+    phases = {item.get("phase"): item for item in summary.get("phases", [])}
+    metrics = phases.get("survival", {}).get("metrics", {})
+    return {
+        "q_main": float(metrics.get("q_main", float("nan"))),
+        "q_aio_stable_mean": float(metrics.get("q_aio_stable_mean", float("nan"))),
+        "q_aio_u_abs_mean": float(metrics.get("q_aio_u_abs_mean", float("nan"))),
+        "q_raw_grad_norm": float(metrics.get("q_raw_grad_norm", float("nan"))),
+        "q_clipped_grad_norm": float(metrics.get("q_clipped_grad_norm", float("nan"))),
+    }
 
 
 @dataclass
 class InnerFPSolverConfig:
+    mode: str = "coupled"
     max_sweeps: int = 30
     min_sweeps: int = 3
     consecutive_passes: int = 3
@@ -726,6 +871,10 @@ class InnerFixedPointSolver:
         self.previous_previous_boundary: Optional[Dict[str, torch.Tensor]] = None
         self.previous_policies: Optional[Dict[str, torch.Tensor]] = None
         self.consecutive_passes = 0
+        self.previous_targets: Optional[Dict[str, torch.Tensor]] = None
+        self.initial_component_hashes = self._component_hashes()
+        self.initial_boundary: Optional[Dict[str, torch.Tensor]] = None
+        self.initial_q_regime_counts: Optional[Dict[str, int]] = None
 
     def _component_hashes(self) -> Dict[str, str]:
         return {
@@ -799,6 +948,11 @@ class InnerFixedPointSolver:
     def _save_checkpoint(self, sweep: int, name: str, extra: Mapping[str, Any]) -> Path:
         path = self.output_dir / "checkpoints" / name
         path.parent.mkdir(parents=True, exist_ok=True)
+        initial_hashes = getattr(self, "initial_component_hashes", None)
+        if initial_hashes is None:
+            initial_hashes = (
+                self._component_hashes() if hasattr(self, "sdf_fc1") else {}
+            )
         torch.save({
             "format": "inner_fixed_point_v1",
             "sweep": int(sweep),
@@ -813,6 +967,10 @@ class InnerFixedPointSolver:
             "previous_boundary": self.previous_boundary,
             "previous_previous_boundary": self.previous_previous_boundary,
             "previous_policies": self.previous_policies,
+            "previous_targets": getattr(self, "previous_targets", None),
+            "initial_component_hashes": initial_hashes,
+            "initial_boundary": getattr(self, "initial_boundary", None),
+            "initial_q_regime_counts": getattr(self, "initial_q_regime_counts", None),
             "consecutive_passes": int(self.consecutive_passes),
             "rng": {
                 "python": random.getstate(),
@@ -855,6 +1013,21 @@ class InnerFixedPointSolver:
             payload.get("previous_previous_boundary")
         )
         self.previous_policies = _diagnostic_cpu(payload.get("previous_policies"))
+        self.previous_targets = _diagnostic_cpu(payload.get("previous_targets"))
+        fallback_initial_hashes = getattr(self, "initial_component_hashes", None)
+        if fallback_initial_hashes is None:
+            fallback_initial_hashes = (
+                self._component_hashes() if hasattr(self, "sdf_fc1") else {}
+            )
+        self.initial_component_hashes = dict(
+            payload.get("initial_component_hashes", fallback_initial_hashes)
+        )
+        self.initial_boundary = _diagnostic_cpu(payload.get("initial_boundary"))
+        initial_counts = payload.get("initial_q_regime_counts")
+        self.initial_q_regime_counts = (
+            {str(key): int(value) for key, value in initial_counts.items()}
+            if initial_counts is not None else None
+        )
         self.consecutive_passes = int(payload.get("consecutive_passes", 0))
         return int(payload["sweep"]) + 1
 
@@ -897,6 +1070,102 @@ class InnerFixedPointSolver:
             visit("", row)
             flat_rows.append(flat)
         pd.DataFrame(flat_rows).to_csv(fp / "metrics.csv", index=False)
+        block_rows: List[Dict[str, Any]] = []
+        for row in self.history:
+            equations = row["operator"]["equations"]
+            q_regimes = row["operator"]["q_regimes"]
+            changes = row["function_change"]
+            fit = row["frozen_target_fit"]
+            cross = row["cross_effects"]
+            stages = row["operator_stages"]
+            q_diag = row["q_training_diagnostics"]
+            recursion = row["operator"]["q_recursion_gain"]
+            block_rows.append({
+                "mode": row["mode"],
+                "sweep": row["sweep"],
+                "p0_residual_mean": equations["p0"]["normalized"]["mean"],
+                "p0_residual_p90": equations["p0"]["normalized"]["p90"],
+                "p0_residual_p99": equations["p0"]["normalized"]["p99"],
+                "p0_residual_raw_mean": equations["p0"]["raw"]["mean"],
+                "p0_residual_raw_p90": equations["p0"]["raw"]["p90"],
+                "pi_residual_mean": equations["pi"]["normalized"]["mean"],
+                "pi_residual_p90": equations["pi"]["normalized"]["p90"],
+                "pi_residual_p99": equations["pi"]["normalized"]["p99"],
+                "pi_residual_raw_mean": equations["pi"]["raw"]["mean"],
+                "pi_residual_raw_p90": equations["pi"]["raw"]["p90"],
+                "q_residual_mean": equations["q"]["normalized"]["mean"],
+                "q_residual_p90": equations["q"]["normalized"]["p90"],
+                "q_residual_p99": equations["q"]["normalized"]["p99"],
+                "q_residual_raw_mean": equations["q"]["raw"]["mean"],
+                "q_residual_raw_p90": equations["q"]["raw"]["p90"],
+                "q0_residual_mean": q_regimes["zero"]["normalized"]["mean"],
+                "qd_residual_mean": q_regimes["default"]["normalized"]["mean"],
+                "qs_residual_mean": q_regimes["survival"]["normalized"]["mean"],
+                "qs_residual_p90": q_regimes["survival"]["normalized"]["p90"],
+                "p0_function_change": changes["p0"]["normalized_p90"],
+                "pi_function_change": changes["pi"]["normalized_p90"],
+                "q_function_change": changes["q"]["normalized_p90"],
+                "p0_function_change_mean": changes["p0"]["normalized_mean"],
+                "pi_function_change_mean": changes["pi"]["normalized_mean"],
+                "q_function_change_mean": changes["q"]["normalized_mean"],
+                "p_fit_mean": max(
+                    fit["p0"]["normalized_mean"], fit["pi"]["normalized_mean"]
+                ),
+                "p_fit_p90": max(
+                    fit["p0"]["normalized_p90"], fit["pi"]["normalized_p90"]
+                ),
+                "p0_fit_mean": fit["p0"]["normalized_mean"],
+                "p0_fit_p90": fit["p0"]["normalized_p90"],
+                "pi_fit_mean": fit["pi"]["normalized_mean"],
+                "pi_fit_p90": fit["pi"]["normalized_p90"],
+                "q_fit_mean": fit["q"]["overall"]["normalized_mean"],
+                "q_fit_p90": fit["q"]["overall"]["normalized_p90"],
+                "q0_fit_mean": fit["q"]["zero"]["normalized_mean"],
+                "qd_fit_mean": fit["q"]["default"]["normalized_mean"],
+                "qs_fit_mean": fit["q"]["survival"]["normalized_mean"],
+                "default_area": row["default_boundary"]["default_area_share"],
+                "default_flip": row["default_boundary"]["default_flip_share"],
+                "q_zero_count": row["operator"]["q_regime_counts"]["zero"],
+                "q_default_count": row["operator"]["q_regime_counts"]["default"],
+                "q_survival_count": row["operator"]["q_regime_counts"]["survival"],
+                **q_diag,
+                "q_recursion_gain_mean": recursion["mean"],
+                "q_recursion_gain_p90": recursion["p90"],
+                "q_recursion_gain_gt1_share": row["operator"]["q_recursion_gain_gt1_share"],
+                "p_to_q_effect_mean": cross["p_to_q"]["mean"],
+                "p_to_q_effect_p90": cross["p_to_q"]["p90"],
+                "p_to_q_effect_normalized_mean": cross["p_to_q"]["normalized_mean"],
+                "p_to_q_effect_normalized_p90": cross["p_to_q"]["normalized_p90"],
+                "q_to_p_p0_effect_mean": cross["q_to_p0"]["mean"],
+                "q_to_p_p0_effect_p90": cross["q_to_p0"]["p90"],
+                "q_to_p_p0_effect_signed_mean": cross["q_to_p0"].get("signed_mean"),
+                "q_to_p_p0_effect_normalized_mean": cross["q_to_p0"]["normalized_mean"],
+                "q_to_p_p0_effect_normalized_p90": cross["q_to_p0"]["normalized_p90"],
+                "q_to_p_pi_effect_mean": cross["q_to_pi"]["mean"],
+                "q_to_p_pi_effect_p90": cross["q_to_pi"]["p90"],
+                "q_to_p_pi_effect_signed_mean": cross["q_to_pi"].get("signed_mean"),
+                "q_to_p_pi_effect_normalized_mean": cross["q_to_pi"]["normalized_mean"],
+                "q_to_p_pi_effect_normalized_p90": cross["q_to_pi"]["normalized_p90"],
+                "start_fp_residual": stages["start"]["empirical_fixed_point_distance_p90"],
+                "post_p_fp_residual": stages["post_p"]["empirical_fixed_point_distance_p90"],
+                "post_q_fp_residual": stages["post_q"]["empirical_fixed_point_distance_p90"],
+                "start_p0_residual_p90": stages["start"]["equations"]["p0"]["normalized"]["p90"],
+                "post_p_p0_residual_p90": stages["post_p"]["equations"]["p0"]["normalized"]["p90"],
+                "post_q_p0_residual_p90": stages["post_q"]["equations"]["p0"]["normalized"]["p90"],
+                "start_pi_residual_p90": stages["start"]["equations"]["pi"]["normalized"]["p90"],
+                "post_p_pi_residual_p90": stages["post_p"]["equations"]["pi"]["normalized"]["p90"],
+                "post_q_pi_residual_p90": stages["post_q"]["equations"]["pi"]["normalized"]["p90"],
+                "start_q_residual_p90": stages["start"]["equations"]["q"]["normalized"]["p90"],
+                "post_p_q_residual_p90": stages["post_p"]["equations"]["q"]["normalized"]["p90"],
+                "post_q_q_residual_p90": stages["post_q"]["equations"]["q"]["normalized"]["p90"],
+                "target_movement_p0_mean": row["target_movement"]["p0"]["normalized_mean"],
+                "target_movement_p0_p90": row["target_movement"]["p0"]["normalized_p90"],
+                "target_movement_pi_mean": row["target_movement"]["pi"]["normalized_mean"],
+                "target_movement_pi_p90": row["target_movement"]["pi"]["normalized_p90"],
+                "target_movement_q_mean": row["target_movement"]["q"]["normalized_mean"],
+                "target_movement_q_p90": row["target_movement"]["q"]["normalized_p90"],
+            })
+        pd.DataFrame(block_rows).to_csv(fp / "block_isolation_metrics.csv", index=False)
 
     def _failure_reasons(self, latest: Mapping[str, Any]) -> List[str]:
         reasons = []
@@ -917,6 +1186,9 @@ class InnerFixedPointSolver:
     def run(self, *, start_sweep: int = 1) -> Dict[str, Any]:
         if not 0.0 < float(self.config.damping) <= 1.0:
             raise ValueError("fp_damping must be in (0,1]")
+        mode = str(self.config.mode).lower()
+        if mode not in {"coupled", "p_only", "q_only"}:
+            raise ValueError("mode must be one of: coupled, p_only, q_only")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._save_static_artifacts()
         self.sdf_fc1.eval().requires_grad_(False)
@@ -931,16 +1203,27 @@ class InnerFixedPointSolver:
             self.previous_boundary = evaluate_boundary(
                 self.model, self.boundary_grid, device=self.episode.device
             )
-            _, self.previous_policies = evaluate_inner_operator(
+            initial_operator, self.previous_policies, initial_snapshot = (
+                evaluate_inner_operator_snapshot(
                 self.episode, self.validation_batches
+                )
             )
+            self.initial_boundary = {
+                key: value.detach().cpu() if torch.is_tensor(value) else value
+                for key, value in self.previous_boundary.items()
+            }
+            self.initial_q_regime_counts = dict(initial_operator["q_regime_counts"])
             boundary_dir = self.output_dir / "fixed_point" / "boundaries"
             surface_dir = self.output_dir / "fixed_point" / "surfaces"
             boundary_dir.mkdir(parents=True, exist_ok=True)
             surface_dir.mkdir(parents=True, exist_ok=True)
             torch.save(self.previous_boundary, boundary_dir / "sweep_000.pt")
             torch.save(
-                {"values": self.previous_values, "policies": self.previous_policies},
+                {
+                    "values": self.previous_values,
+                    "policies": self.previous_policies,
+                    "operator_snapshot": initial_snapshot,
+                },
                 surface_dir / "sweep_000.pt",
             )
             self._save_checkpoint(0, "sweep_000.pt", {"stage": "initial"})
@@ -961,19 +1244,33 @@ class InnerFixedPointSolver:
             teacher_k = deepcopy(self.model).to(self.episode.device).eval().requires_grad_(False)
 
             try:
-                p_start = time.perf_counter()
-                p_summary = self.episode._run_policy_value_evaluation_stage(
-                    self.train_batches,
-                    self.validation_batches,
-                    teacher_k,
-                    int(self.config.p_epochs),
-                    q_target_model=teacher_k,
+                start_operator, _, start_snapshot = evaluate_inner_operator_snapshot(
+                    self.episode, self.validation_batches, model=teacher_k
                 )
-                if p_summary.get("status") != "accepted":
-                    raise RuntimeError(
-                        "P stage was not accepted: "
-                        f"{p_summary.get('status', 'missing_status')}"
+                start_boundary = evaluate_boundary(
+                    teacher_k, self.boundary_grid, device=self.episode.device
+                )
+
+                p_start = time.perf_counter()
+                if mode == "q_only":
+                    p_summary = {
+                        "status": "frozen_block",
+                        "optimizer_steps": 0,
+                        "mode": mode,
+                    }
+                else:
+                    p_summary = self.episode._run_policy_value_evaluation_stage(
+                        self.train_batches,
+                        self.validation_batches,
+                        teacher_k,
+                        int(self.config.p_epochs),
+                        q_target_model=teacher_k,
                     )
+                    if p_summary.get("status") != "accepted":
+                        raise RuntimeError(
+                            "P stage was not accepted: "
+                            f"{p_summary.get('status', 'missing_status')}"
+                        )
                 p_seconds = time.perf_counter() - p_start
                 hashes_post_p = self._component_hashes()
                 if hashes_post_p["q"] != hashes_start["q"]:
@@ -987,19 +1284,33 @@ class InnerFixedPointSolver:
                 )
 
                 p_snapshot = deepcopy(self.model).to(self.episode.device).eval().requires_grad_(False)
-                q_start = time.perf_counter()
-                q_summary = self.episode._run_q_regime_training(
-                    self.train_batches,
-                    p_snapshot,
-                    validation_batches=self.validation_batches,
-                    fixed_q_target_model=teacher_k,
+                post_p_operator, _, post_p_snapshot = evaluate_inner_operator_snapshot(
+                    self.episode, self.validation_batches, model=p_snapshot
                 )
-                if not str(q_summary.get("status", "")).startswith("accepted"):
-                    raise RuntimeError(
-                        "Q stage was not accepted: "
-                        f"{q_summary.get('status', 'missing_status')} "
-                        f"({q_summary.get('q_stage_rejection_reason')})"
+                post_p_boundary = evaluate_boundary(
+                    p_snapshot, self.boundary_grid, device=self.episode.device
+                )
+                q_start = time.perf_counter()
+                if mode == "p_only":
+                    q_summary = {
+                        "status": "frozen_block",
+                        "optimizer_steps": 0,
+                        "phases": [],
+                        "mode": mode,
+                    }
+                else:
+                    q_summary = self.episode._run_q_regime_training(
+                        self.train_batches,
+                        p_snapshot,
+                        validation_batches=self.validation_batches,
+                        fixed_q_target_model=teacher_k,
                     )
+                    if not str(q_summary.get("status", "")).startswith("accepted"):
+                        raise RuntimeError(
+                            "Q stage was not accepted: "
+                            f"{q_summary.get('status', 'missing_status')} "
+                            f"({q_summary.get('q_stage_rejection_reason')})"
+                        )
                 q_seconds = time.perf_counter() - q_start
                 hashes_post_q = self._component_hashes()
                 if hashes_post_q["p"] != hashes_post_p["p"]:
@@ -1010,7 +1321,7 @@ class InnerFixedPointSolver:
                     raise RuntimeError("Q stage changed frozen sdf_fc1")
 
                 eval_start = time.perf_counter()
-                operator, policies = evaluate_inner_operator(
+                operator, policies, post_q_snapshot = evaluate_inner_operator_snapshot(
                     self.episode, self.validation_batches
                 )
                 values = self._values()
@@ -1020,33 +1331,133 @@ class InnerFixedPointSolver:
                     self.model, self.boundary_grid, device=self.episode.device
                 )
                 boundary_summary = boundary_metrics(boundary, self.previous_boundary)
+                post_q_boundary = boundary
+                fit = {
+                    "p0": (
+                        _fit_error(
+                            post_p_snapshot["p0_value"], start_snapshot["p0_target"],
+                            start_snapshot["p0_scale"],
+                        ) if mode != "q_only" else _nan_change_summary()
+                    ),
+                    "pi": (
+                        _fit_error(
+                            post_p_snapshot["pi_value"], start_snapshot["pi_target"],
+                            start_snapshot["pi_scale"],
+                        ) if mode != "q_only" else _nan_change_summary()
+                    ),
+                    "q": (
+                        _q_fit_by_regime(
+                            post_q_snapshot["q_value"], post_p_snapshot["q_target"],
+                            post_p_snapshot["q_scale"], post_p_snapshot["q_regime"],
+                        ) if mode != "p_only" else {
+                            name: _nan_change_summary()
+                            for name in ("overall", "zero", "default", "survival")
+                        }
+                    ),
+                }
+                if mode == "coupled":
+                    cross_effects = {
+                        "p_to_q": _target_difference(
+                            post_p_snapshot["q_target"], start_snapshot["q_target"],
+                            start_snapshot["q_scale"],
+                        ),
+                        "q_to_p0": _target_difference(
+                            post_q_snapshot["p0_target"], post_p_snapshot["p0_target"],
+                            post_p_snapshot["p0_scale"], include_signed=True,
+                        ),
+                        "q_to_pi": _target_difference(
+                            post_q_snapshot["pi_target"], post_p_snapshot["pi_target"],
+                            post_p_snapshot["pi_scale"], include_signed=True,
+                        ),
+                    }
+                else:
+                    cross_effects = {
+                        name: _nan_change_summary()
+                        for name in ("p_to_q", "q_to_p0", "q_to_pi")
+                    }
+                current_targets = {
+                    "p0": start_snapshot["p0_target"],
+                    "pi": start_snapshot["pi_target"],
+                    "q": post_p_snapshot["q_target"],
+                }
+                target_movement = {
+                    name: (
+                        _target_difference(
+                            current_targets[name], self.previous_targets[name],
+                            (
+                                start_snapshot[f"{name}_scale"]
+                                if name in {"p0", "pi"}
+                                else post_p_snapshot["q_scale"]
+                            ),
+                        ) if self.previous_targets is not None else _nan_change_summary()
+                    )
+                    for name in ("p0", "pi", "q")
+                }
+                q_training = _q_training_diagnostics(q_summary)
                 eval_seconds = time.perf_counter() - eval_start
             except Exception as exc:
                 numerical_failure = f"{type(exc).__name__}: {exc}"
                 break
 
+            invariant_checks = {
+                "bp_hash_unchanged": hashes_post_q["bp"] == self.initial_component_hashes["bp"],
+                "sdf_fc1_hash_unchanged": (
+                    hashes_post_q["sdf_fc1"] == self.initial_component_hashes["sdf_fc1"]
+                ),
+                "q_hash_unchanged": (
+                    hashes_post_q["q"] == self.initial_component_hashes["q"]
+                    if mode == "p_only" else None
+                ),
+                "p_hash_unchanged": (
+                    hashes_post_q["p"] == self.initial_component_hashes["p"]
+                    if mode == "q_only" else None
+                ),
+                "q_only_default_tensor_unchanged": (
+                    bool(torch.equal(post_q_boundary["default"], self.initial_boundary["default"]))
+                    if mode == "q_only" and self.initial_boundary is not None else None
+                ),
+                "q_only_regime_counts_unchanged": (
+                    operator["q_regime_counts"] == self.initial_q_regime_counts
+                    if mode == "q_only" else None
+                ),
+            }
+            failed_invariants = [
+                key for key, value in invariant_checks.items() if value is False
+            ]
+            if failed_invariants:
+                numerical_failure = "RuntimeError: block-isolation invariant failed: " + ", ".join(
+                    failed_invariants
+                )
+                break
+
+            active_functions = ("p0", "pi") if mode == "p_only" else (
+                ("q",) if mode == "q_only" else ("p0", "pi", "q")
+            )
             finite_changes = all(
                 math.isfinite(changes[name]["normalized_mean"])
                 and math.isfinite(changes[name]["normalized_p90"])
-                for name in ("p0", "pi", "q")
+                for name in active_functions
             )
             function_pass = bool(
                 finite_changes
                 and all(
                     changes[name]["normalized_mean"] < self.config.change_mean_tol
                     and changes[name]["normalized_p90"] < self.config.change_p90_tol
-                    for name in ("p0", "pi", "q")
+                    for name in active_functions
                 )
             )
-            boundary_pass = bool(
-                math.isfinite(boundary_summary["default_flip_share"])
-                and boundary_summary["default_flip_share"] < self.config.default_flip_tol
+            boundary_pass = (
+                bool(invariant_checks["q_only_default_tensor_unchanged"])
+                if mode == "q_only" else bool(
+                    math.isfinite(boundary_summary["default_flip_share"])
+                    and boundary_summary["default_flip_share"] < self.config.default_flip_tol
+                )
             )
-            policy_pass = bool(all(
-                math.isfinite(policy_changes[name]["p90"])
-                and policy_changes[name]["p90"] < self.config.bstar_p90_tol
-                for name in ("b0_star", "bi_star")
-            ))
+            policy_pass = True if mode == "q_only" else bool(all(
+                    math.isfinite(policy_changes[name]["p90"])
+                    and policy_changes[name]["p90"] < self.config.bstar_p90_tol
+                    for name in ("b0_star", "bi_star")
+                ))
             function_two_cycle = False
             q_two_cycle = False
             if self.previous_previous_values is not None:
@@ -1055,14 +1466,14 @@ class InnerFixedPointSolver:
                         (values[name] - self.previous_previous_values[name])
                         .abs().quantile(0.9).item()
                     )
-                    for name in ("p0", "pi", "q")
+                    for name in active_functions
                 }
                 function_two_cycle = bool(
                     max(delta_two_by_function.values()) < self.config.change_p90_tol
-                    and max(changes[name]["p90"] for name in ("p0", "pi", "q"))
+                    and max(changes[name]["p90"] for name in active_functions)
                     > 5.0 * self.config.change_p90_tol
                 )
-                q_two_cycle = bool(
+                q_two_cycle = bool(mode != "p_only" and
                     delta_two_by_function["q"] < self.config.change_p90_tol
                     and changes["q"]["p90"] > 5.0 * self.config.change_p90_tol
                 )
@@ -1079,19 +1490,30 @@ class InnerFixedPointSolver:
                 )
             two_cycle = function_two_cycle or q_two_cycle or default_two_cycle
             recent = self.history[-4:]
+            active_equations = ("p0", "pi") if mode == "p_only" else (
+                ("q",) if mode == "q_only" else ("p0", "pi", "q")
+            )
+            primary_mean = max(
+                operator["equations"][name]["normalized"]["mean"]
+                for name in active_equations
+            )
+            primary_p90 = max(
+                operator["equations"][name]["normalized"]["p90"]
+                for name in active_equations
+            )
             residual_stalled = bool(
                 len(recent) == 4
-                and operator["empirical_fixed_point_distance_p90"]
+                and primary_p90
                 >= 0.99 * min(
-                    row["operator"]["empirical_fixed_point_distance_p90"]
+                    row["primary_operator"]["normalized_p90"]
                     for row in recent
                 )
             )
             function_stalled = bool(
                 len(recent) == 4
-                and max(changes[name]["normalized_p90"] for name in ("p0", "pi", "q"))
+                and max(changes[name]["normalized_p90"] for name in active_functions)
                 >= 0.99 * min(
-                    max(row["function_change"][name]["normalized_p90"] for name in ("p0", "pi", "q"))
+                    max(row["function_change"][name]["normalized_p90"] for name in active_functions)
                     for row in recent
                 )
             )
@@ -1113,11 +1535,32 @@ class InnerFixedPointSolver:
             )
             self.consecutive_passes = self.consecutive_passes + 1 if sweep_pass else 0
             row = {
+                "mode": mode,
                 "sweep": int(sweep),
                 "operator": operator,
+                "operator_stages": {
+                    "start": start_operator,
+                    "post_p": post_p_operator,
+                    "post_q": operator,
+                },
+                "primary_operator": {
+                    "equations": list(active_equations),
+                    "normalized_mean": float(primary_mean),
+                    "normalized_p90": float(primary_p90),
+                },
                 "function_change": changes,
+                "frozen_target_fit": fit,
+                "cross_effects": cross_effects,
+                "target_movement": target_movement,
                 "default_boundary": boundary_summary,
+                "default_boundary_stages": {
+                    "start": boundary_metrics(start_boundary, None),
+                    "post_p": boundary_metrics(post_p_boundary, start_boundary),
+                    "post_q": boundary_metrics(post_q_boundary, post_p_boundary),
+                },
                 "implicit_policy": policy_changes,
+                "q_training_diagnostics": q_training,
+                "invariants": invariant_checks,
                 "gates": gates,
                 "sweep_passed": sweep_pass,
                 "consecutive_passes": int(self.consecutive_passes),
@@ -1143,12 +1586,21 @@ class InnerFixedPointSolver:
             torch.save(boundary, boundary_dir / f"sweep_{sweep:03d}.pt")
             surface_dir = self.output_dir / "fixed_point" / "surfaces"
             surface_dir.mkdir(parents=True, exist_ok=True)
-            torch.save({"values": values, "policies": policies}, surface_dir / f"sweep_{sweep:03d}.pt")
+            torch.save({
+                "values": values,
+                "policies": policies,
+                "operator_snapshots": {
+                    "start": start_snapshot,
+                    "post_p": post_p_snapshot,
+                    "post_q": post_q_snapshot,
+                },
+            }, surface_dir / f"sweep_{sweep:03d}.pt")
             self.previous_previous_values = self.previous_values
             self.previous_values = values
             self.previous_previous_boundary = self.previous_boundary
             self.previous_boundary = boundary
             self.previous_policies = policies
+            self.previous_targets = current_targets
             self._save_checkpoint(
                 sweep, f"sweep_{sweep:03d}.pt", {"stage": "post_q", "metrics": row}
             )
@@ -1168,6 +1620,7 @@ class InnerFixedPointSolver:
             failure_reasons = ["numerical_failure"]
         latest = self.history[-1] if self.history else None
         summary = {
+            "mode": mode,
             "inner_fp_passed": bool(passed),
             "first_pass_sweep": first_pass_sweep,
             "completed_sweeps": len(self.history),
@@ -1197,6 +1650,8 @@ class InnerFixedPointSolver:
             "thresholds": asdict(self.config),
             "frozen_sdf_fc1_hash": self.sdf_hash,
             "bank_hashes": self.bank_hashes,
+            "initial_component_hashes": self.initial_component_hashes,
+            "final_invariants": latest["invariants"] if latest else None,
             "source_provenance": self.source_provenance,
         }
         self._write_metrics()
