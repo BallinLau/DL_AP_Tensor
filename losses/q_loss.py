@@ -550,18 +550,25 @@ class QLoss(nn.Module):
         Q: torch.Tensor,
         *,
         nonnegative_weight: float = 1.0,
+        target_override: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Exact analytical boundary objective for synthetic ``b == 0`` states.
 
         This path intentionally has no children, M, SDF, or AiO arguments.
         """
-        boundary = Q.pow(2)
+        target = (
+            torch.zeros_like(Q)
+            if target_override is None
+            else target_override.detach().to(device=Q.device, dtype=Q.dtype)
+        )
+        boundary = (Q - target).pow(2)
         nonnegative = self.compute_nonnegative_penalty(Q)
         per_sample = boundary + float(nonnegative_weight) * nonnegative
         return {
             "per_sample": per_sample,
             "loss": per_sample.mean(),
             "boundary_loss": boundary.mean(),
+            "target": target,
             "nonnegative_loss": nonnegative.mean(),
         }
 
@@ -573,13 +580,19 @@ class QLoss(nn.Module):
         x: torch.Tensor,
         z: torch.Tensor,
         nonnegative_weight: float = 1.0,
+        target_override: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Current-parent default objective ``Q = asset_only recovery``.
 
         This path intentionally has no children, M, SDF, or AiO arguments.
         """
         recovery = self.compute_current_recovery(b, x, z).detach()
-        recovery_error = (Q - recovery).pow(2)
+        target = (
+            recovery
+            if target_override is None
+            else target_override.detach().to(device=Q.device, dtype=Q.dtype)
+        )
+        recovery_error = (Q - target).pow(2)
         nonnegative = self.compute_nonnegative_penalty(Q)
         per_sample = recovery_error + float(nonnegative_weight) * nonnegative
         return {
@@ -587,6 +600,7 @@ class QLoss(nn.Module):
             "loss": per_sample.mean(),
             "recovery_loss": recovery_error.mean(),
             "recovery_current": recovery,
+            "target": target,
             "nonnegative_loss": nonnegative.mean(),
         }
 

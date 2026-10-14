@@ -5842,7 +5842,12 @@ class Episode:
             output = frozen_p_model(parent_state.detach())
             return self._policy_get_out(output, "Phat", -1).detach()
 
-    def _compute_q_zero_loss(self, parent_state: torch.Tensor) -> torch.Tensor:
+    def _compute_q_zero_loss(
+        self,
+        parent_state: torch.Tensor,
+        *,
+        q_target_model: Optional[nn.Module] = None,
+    ) -> torch.Tensor:
         """Q0 path: synthetic exact b=0, no children/SDF/AiO."""
         model = self.models["policy_value"]
         zero_state = parent_state[:, :7].clone()
@@ -5854,9 +5859,18 @@ class Episode:
             )
         else:
             Q = model._q_output(zero_state)
+        damping = float(getattr(self, "_inner_fp_target_damping", 1.0))
+        target_override = None
+        if damping < 1.0:
+            if q_target_model is None:
+                raise RuntimeError("Inner-FP Q damping requires a fixed q_target_model")
+            with torch.no_grad():
+                old_q = q_target_model._q_claim_output(zero_state.detach())
+            target_override = (1.0 - damping) * old_q
         terms = self.loss_fns["q"].compute_zero_debt_objective(
             Q,
             nonnegative_weight=float(getattr(self.hyperparams, "q_nonnegative_weight", 1.0)),
+            target_override=target_override,
         )
         with torch.no_grad():
             negative = Q < 0.0
@@ -5878,6 +5892,7 @@ class Episode:
         parent_state: torch.Tensor,
         *,
         frozen_p_model: Optional[nn.Module] = None,
+        q_target_model: Optional[nn.Module] = None,
     ) -> torch.Tensor:
         """QD path: current-parent recovery regression, no children/SDF/AiO."""
         model = self.models["policy_value"]
@@ -5889,12 +5904,24 @@ class Episode:
             Q = model._q_effective_output(state, phat=phat)
         else:
             Q = model._q_output(state)
+        damping = float(getattr(self, "_inner_fp_target_damping", 1.0))
+        target_override = None
+        if damping < 1.0:
+            if q_target_model is None:
+                raise RuntimeError("Inner-FP Q damping requires a fixed q_target_model")
+            with torch.no_grad():
+                old_q = q_target_model._q_claim_output(state.detach())
+                recovery = self.loss_fns["q"].compute_current_recovery(
+                    state[:, 0:1], state[:, 4:5], state[:, 1:2]
+                )
+            target_override = (1.0 - damping) * old_q + damping * recovery
         terms = self.loss_fns["q"].compute_default_parent_objective(
             Q=Q,
             b=state[:, 0:1],
             z=state[:, 1:2],
             x=state[:, 4:5],
             nonnegative_weight=float(getattr(self.hyperparams, "q_nonnegative_weight", 1.0)),
+            target_override=target_override,
         )
         with torch.no_grad():
             negative = Q < 0.0
@@ -5939,14 +5966,21 @@ class Episode:
         parent = batch["parent"]
         parent_state = parent[:, :7] if parent.shape[1] > 7 else parent
         if mode == "zero":
-            return self._compute_q_zero_loss(parent_state)
+            if q_target_model is None:
+                return self._compute_q_zero_loss(parent_state)
+            return self._compute_q_zero_loss(
+                parent_state, q_target_model=q_target_model
+            )
         if mode == "default":
             if getattr(self.models["policy_value"], "q_parameterization", None) == "hybrid_regime":
                 return self._compute_q_default_loss(
                     parent_state,
                     frozen_p_model=frozen_p_model,
+                    q_target_model=q_target_model,
                 )
-            return self._compute_q_default_loss(parent_state)
+            if q_target_model is None:
+                return self._compute_q_default_loss(parent_state)
+            return self._compute_q_default_loss(parent_state, q_target_model=q_target_model)
         if mode == "survival":
             return self._compute_q_survival_bellman_loss(
                 batch,
@@ -5989,15 +6023,26 @@ class Episode:
                 continue
             subset = self._slice_q_batch(batch, mask)
             if name == "zero":
-                value = self._compute_q_zero_loss(subset["parent"][:, :7])
+                if q_target_model is None:
+                    value = self._compute_q_zero_loss(subset["parent"][:, :7])
+                else:
+                    value = self._compute_q_zero_loss(
+                        subset["parent"][:, :7], q_target_model=q_target_model
+                    )
             elif name == "default":
                 if getattr(self.models["policy_value"], "q_parameterization", None) == "hybrid_regime":
                     value = self._compute_q_default_loss(
                         subset["parent"][:, :7],
                         frozen_p_model=frozen_p,
+                        q_target_model=q_target_model,
                     )
                 else:
-                    value = self._compute_q_default_loss(subset["parent"][:, :7])
+                    if q_target_model is None:
+                        value = self._compute_q_default_loss(subset["parent"][:, :7])
+                    else:
+                        value = self._compute_q_default_loss(
+                            subset["parent"][:, :7], q_target_model=q_target_model
+                        )
             else:
                 value = self._compute_q_survival_bellman_loss(
                     subset,
@@ -6161,9 +6206,26 @@ class Episode:
             for key in component_keys
         }
         residuals_raw = collapsed_components["q_training_residual"]
+        effective_targets = collapsed_components["q_target_total"]
+        damping = float(getattr(self, "_inner_fp_target_damping", 1.0))
+        if not 0.0 < damping <= 1.0:
+            raise ValueError("Inner-FP target damping must be in (0, 1]")
+        if damping < 1.0:
+            with torch.no_grad():
+                old_q_fn = getattr(target_model, "_q_claim_output", None)
+                old_q = (
+                    old_q_fn(parent_state.detach())
+                    if callable(old_q_fn)
+                    else _get_out(target_model(parent_state.detach()), "Q", 0)
+                )
+            effective_targets = [
+                (1.0 - damping) * old_q + damping * target
+                for target in effective_targets
+            ]
+            residuals_raw = [target - Q for target in effective_targets]
         residuals_normalized, q_bellman_scale = normalize_q_bellman_residuals(
             residuals_raw,
-            collapsed_components["q_target_total"],
+            effective_targets,
         )
         normalize_q = bool(
             getattr(
@@ -6298,7 +6360,9 @@ class Episode:
                 flat = values.detach().reshape(-1)
                 return float(torch.quantile(flat, quantile).item())
 
-            target_total = _flat_component("q_target_total")
+            target_total = torch.stack(
+                [value.reshape(-1) for value in effective_targets], dim=1
+            ).reshape(-1)
             target_survival = _flat_component("q_target_survival")
             target_recovery = _flat_component("q_target_recovery")
             coupon_component = _flat_component("coupon_component")
@@ -6373,6 +6437,7 @@ class Episode:
                 'q_growth_multiplier_p95': _qstat(growth_multiplier, 0.95),
                 'q_growth_multiplier_p99': _qstat(growth_multiplier, 0.99),
                 'q_bellman_normalized': normalize_q,
+                'q_inner_fp_target_damping': damping,
                 'q_nonnegative': float(survival_terms["nonnegative_loss"].item()),
                 'q_negative_share': float(negative.float().mean().item()),
                 'q_negative_mean_abs': float((-Q[negative]).mean().item()) if negative.any() else 0.0,
@@ -8911,6 +8976,20 @@ class Episode:
                     branch="pi",
                     child_weights=child_weights,
                 )
+                damping = float(getattr(self, "_inner_fp_target_damping", 1.0))
+                if not 0.0 < damping <= 1.0:
+                    raise ValueError("Inner-FP target damping must be in (0, 1]")
+                if damping < 1.0:
+                    with torch.no_grad():
+                        old_p0, old_pi = teacher_model._value_outputs(parent_state)
+                    p0_target["value_star"] = (
+                        (1.0 - damping) * old_p0
+                        + damping * p0_target["value_star"]
+                    )
+                    pi_target["value_star"] = (
+                        (1.0 - damping) * old_pi
+                        + damping * pi_target["value_star"]
+                    )
                 cache.append(
                     PQValueTargetBatch(
                         batch_id=int(batch_id),
@@ -10858,7 +10937,10 @@ class Episode:
                         source_parent = batch["parent"]
                         source_state = source_parent[:, :7] if source_parent.shape[1] > 7 else source_parent
                         if phase == "zero":
-                            loss = self._compute_q_zero_loss(source_state)
+                            loss = self._compute_q_zero_loss(
+                                source_state,
+                                q_target_model=q_target_model,
+                            )
                         elif phase == "default":
                             default_states, default_diag = self._build_q_default_coverage_states(
                                 source_state, frozen_p_model, return_diagnostics=True
@@ -10870,6 +10952,7 @@ class Episode:
                             loss = self._compute_q_default_loss(
                                 default_states,
                                 frozen_p_model=frozen_p_model,
+                                q_target_model=q_target_model,
                             )
                         elif phase == "survival":
                             if hybrid:
@@ -10919,13 +11002,19 @@ class Episode:
                                 survival_n = max(1, int(round(total_n * float(getattr(self.hyperparams, "q_survival_sample_share", 0.5)))))
                                 polish_terms: List[torch.Tensor] = []
                                 polish_weights: List[float] = []
-                                polish_terms.append(self._compute_q_zero_loss(source_state[:zero_n]))
+                                polish_terms.append(self._compute_q_zero_loss(
+                                    source_state[:zero_n],
+                                    q_target_model=q_target_model,
+                                ))
                                 polish_weights.append(float(getattr(self.hyperparams, "q_zero_sample_share", 0.2)))
                                 default_states = self._build_q_default_coverage_states(
                                     source_state, frozen_p_model, requested=default_n, phat_eps=0.0
                                 )
                                 if default_states.shape[0] > 0:
-                                    polish_terms.append(self._compute_q_default_loss(default_states))
+                                    polish_terms.append(self._compute_q_default_loss(
+                                        default_states,
+                                        q_target_model=q_target_model,
+                                    ))
                                     polish_weights.append(float(getattr(self.hyperparams, "q_default_sample_share", 0.3)))
                                 survival_batch = self._build_q_survival_batch(
                                     batch, frozen_p_model, requested=survival_n, phat_eps=0.0
@@ -11308,8 +11397,15 @@ class Episode:
         batches: List[Dict[str, torch.Tensor]],
         frozen_p_model: nn.Module,
         validation_batches: Optional[List[Dict[str, torch.Tensor]]] = None,
+        fixed_q_target_model: Optional[nn.Module] = None,
     ) -> Dict[str, Any]:
-        """Run Q0 -> QD -> QS -> optional polish with one fixed P classifier."""
+        """Run Q0 -> QD -> QS -> optional polish with one fixed P classifier.
+
+        ``fixed_q_target_model`` is reserved for an outer firm-side fixed-point
+        sweep.  When supplied, every recursive Q phase consumes exactly that
+        snapshot; the production ``phase``/``stage`` refresh behavior is left
+        unchanged when it is omitted.
+        """
         if not batches or any("parent" not in batch for batch in batches):
             return {
                 "status": "skipped_missing_q_training_batches",
@@ -11328,6 +11424,11 @@ class Episode:
         if refresh_mode not in {"phase", "stage"}:
             raise ValueError("q_target_refresh_mode must be 'phase' or 'stage'")
         stage_target = None
+        fixed_target_hash = None
+        if fixed_q_target_model is not None:
+            fixed_q_target_model.eval()
+            fixed_q_target_model.requires_grad_(False)
+            fixed_target_hash = self._state_dict_hash(fixed_q_target_model)
         validation_source = validation_batches or batches
         validation_bank = (
             self._build_q_validation_bank(validation_source, frozen_p_model)
@@ -11344,11 +11445,15 @@ class Episode:
         for phase, epochs in phase_specs:
             # In stage mode, survival and polish share the Q snapshot taken
             # before survival. Phase mode preserves the historical refresh.
-            if refresh_mode == "stage" and phase == "survival":
+            if (
+                fixed_q_target_model is None
+                and refresh_mode == "stage"
+                and phase == "survival"
+            ):
                 stage_target = deepcopy(self.models["policy_value"]).to(self.device)
                 stage_target.eval()
                 stage_target.requires_grad_(False)
-            q_target_model = stage_target
+            q_target_model = fixed_q_target_model or stage_target
             if q_target_model is None:
                 q_target_model = deepcopy(self.models["policy_value"]).to(self.device)
                 q_target_model.eval()
@@ -11474,6 +11579,10 @@ class Episode:
         frozen_p_hash_after = self._state_dict_hash(frozen_p_model)
         if frozen_p_hash_after != frozen_p_hash_before:
             raise RuntimeError("Frozen P snapshot changed across the Q stage")
+        if fixed_q_target_model is not None:
+            fixed_target_hash_after = self._state_dict_hash(fixed_q_target_model)
+            if fixed_target_hash_after != fixed_target_hash:
+                raise RuntimeError("Fixed Q target snapshot changed across the Q stage")
 
         learned_statuses = {
             name: by_phase.get(name, {}).get("status")
@@ -11499,7 +11608,12 @@ class Episode:
             "optimizer_steps": int(sum(item.get("optimizer_steps", 0) for item in summaries)),
             "q_stage_required_gate_passed": rejection_reason is None,
             "q_stage_rejection_reason": rejection_reason,
-            "q_target_refresh_mode": refresh_mode,
+            "q_target_refresh_mode": (
+                "fixed_sweep_snapshot"
+                if fixed_q_target_model is not None
+                else refresh_mode
+            ),
+            "fixed_q_target_hash": fixed_target_hash,
             "q_target_hash_survival": by_phase.get("survival", {}).get("q_target_hash"),
             "q_target_hash_polish": by_phase.get("polish", {}).get("q_target_hash"),
             "q_online_hash_before_survival": by_phase.get("survival", {}).get(
