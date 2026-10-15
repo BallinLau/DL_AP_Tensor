@@ -1222,11 +1222,74 @@ class Episode:
             fixed = parent_b.clamp(0.0, 1.0)
         return fixed.detach().clone().requires_grad_(bp.requires_grad)
 
-    def _build_policy_m_lists(self, parent: torch.Tensor, children: List[torch.Tensor], clamp_min: float, clamp_max: float) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        if parent.shape[1] > 7:
-            raw_M_list = [child[:, 7:8] for child in children]
-        else:
-            raw_M_list = [torch.ones(parent.shape[0], 1, device=self.device) for _ in children]
+    def _extract_transition_m_list(
+        self,
+        children: List[torch.Tensor],
+        batch_size: int,
+        *,
+        allow_unit_fallback: bool,
+    ) -> Tuple[List[torch.Tensor], str]:
+        """Extract raw transition SDFs from parent-to-child edges.
+
+        Firm model state is always the first seven columns
+        ``[b,z,eta,i,x,Hatcf,LnKF]``.  ``M_{t,t+1}`` belongs to the
+        transition edge and, in the established PV/firm batch layout, lives
+        in ``child[:, 7]``.  A parent eighth column is legacy layout data and
+        must never be used as either the continuation SDF or a has-M sentinel.
+
+        Seven-column children are accepted only for explicitly opted-in
+        legacy/test callers.  Mixed child layouts are always an error.
+        """
+        if not children:
+            raise ValueError("Cannot extract transition M without children")
+        expected_batch = int(batch_size)
+        widths: List[int] = []
+        for index, child in enumerate(children):
+            if child.ndim != 2:
+                raise ValueError(
+                    f"child[{index}] must be rank-2, got shape={tuple(child.shape)}"
+                )
+            if int(child.shape[0]) != expected_batch:
+                raise ValueError(
+                    f"child[{index}] batch size {int(child.shape[0])} != {expected_batch}"
+                )
+            width = int(child.shape[1])
+            if width < 7:
+                raise ValueError(
+                    f"child[{index}] width must be at least 7, got {width}"
+                )
+            widths.append(width)
+
+        has_transition_m = [width >= 8 for width in widths]
+        if all(has_transition_m):
+            return [child[:, 7:8] for child in children], "child_column_7"
+        if any(has_transition_m):
+            raise ValueError(
+                "Mixed child transition-M layouts are forbidden: "
+                f"widths={widths}"
+            )
+        if not allow_unit_fallback:
+            raise RuntimeError(
+                "Transition M is required, but all children have only seven columns"
+            )
+        return [torch.ones_like(child[:, 0:1]) for child in children], "unit_fallback"
+
+    def _build_policy_m_lists(
+        self,
+        parent: torch.Tensor,
+        children: List[torch.Tensor],
+        clamp_min: float,
+        clamp_max: float,
+        *,
+        allow_unit_fallback: bool = True,
+        return_source: bool = False,
+    ):
+        """Build P-side raw/used M without consulting parent layout."""
+        raw_M_list, source = self._extract_transition_m_list(
+            children,
+            int(parent.shape[0]),
+            allow_unit_fallback=allow_unit_fallback,
+        )
         if self._pv_use_fixed_sdf():
             fixed = float(getattr(self.hyperparams, "pv_fixed_sdf_value", 0.98))
             M_list = [torch.full_like(m, fixed) for m in raw_M_list]
@@ -1235,6 +1298,35 @@ class Episode:
         else:
             M_list = raw_M_list
 
+        if return_source:
+            return raw_M_list, M_list, source
+        return raw_M_list, M_list
+
+    def _build_q_m_lists(
+        self,
+        children: List[torch.Tensor],
+        batch_size: int,
+        *,
+        allow_unit_fallback: bool = True,
+        return_source: bool = False,
+    ):
+        """Build Q-side raw/used M with Q-specific detach/clamp semantics."""
+        raw_M_list, source = self._extract_transition_m_list(
+            children,
+            batch_size,
+            allow_unit_fallback=allow_unit_fallback,
+        )
+        if self._pv_use_fixed_sdf():
+            fixed = float(getattr(self.hyperparams, "pv_fixed_sdf_value", 0.98))
+            M_list = [torch.full_like(m, fixed).detach() for m in raw_M_list]
+        elif bool(getattr(self.hyperparams, "q_use_detached_m", True)):
+            m_lo = float(getattr(self.hyperparams, "q_m_clamp_min", 0.5))
+            m_hi = float(getattr(self.hyperparams, "q_m_clamp_max", 1.5))
+            M_list = [m.clamp(m_lo, m_hi).detach() for m in raw_M_list]
+        else:
+            M_list = raw_M_list
+        if return_source:
+            return raw_M_list, M_list, source
         return raw_M_list, M_list
 
     def _pv_exact_eta_enabled(self) -> bool:
@@ -1310,10 +1402,14 @@ class Episode:
         return {
             f'{prefix}_log_mean_M_raw': float(torch.log(raw_finite.mean().clamp_min(1e-8)).item()),
             f'{prefix}_log_mean_M_used': float(torch.log(used_finite.mean().clamp_min(1e-8)).item()),
+            f'{prefix}_M_raw_mean': float(raw_finite.mean().item()),
+            f'{prefix}_M_raw_min': float(raw_finite.min().item()),
             f'{prefix}_M_raw_p50': self._safe_quantile(raw_finite, 0.50),
             f'{prefix}_M_raw_p90': self._safe_quantile(raw_finite, 0.90),
             f'{prefix}_M_raw_p99': self._safe_quantile(raw_finite, 0.99),
             f'{prefix}_M_raw_max': float(raw_finite.max().item()),
+            f'{prefix}_M_used_mean': float(used_finite.mean().item()),
+            f'{prefix}_M_used_min': float(used_finite.min().item()),
             f'{prefix}_M_used_p50': self._safe_quantile(used_finite, 0.50),
             f'{prefix}_M_used_p90': self._safe_quantile(used_finite, 0.90),
             f'{prefix}_M_used_p99': self._safe_quantile(used_finite, 0.99),
@@ -5289,9 +5385,12 @@ class Episode:
         
         m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
         m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-        continuous_raw_M_list, continuous_M_list = self._build_policy_m_lists(
-            parent, children, m_lo, m_hi
+        continuous_raw_M_list, continuous_M_list, p_m_source = self._build_policy_m_lists(
+            parent, children, m_lo, m_hi,
+            allow_unit_fallback=False,
+            return_source=True,
         )
+        self._latest_p_m_source = p_m_source
         children, raw_M_list, M_list, child_weights = (
             self._expand_policy_expectation_children(
                 children, continuous_raw_M_list, continuous_M_list
@@ -5542,9 +5641,12 @@ class Episode:
         
         m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
         m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-        continuous_raw_M_list, continuous_M_list = self._build_policy_m_lists(
-            parent, children, m_lo, m_hi
+        continuous_raw_M_list, continuous_M_list, p_m_source = self._build_policy_m_lists(
+            parent, children, m_lo, m_hi,
+            allow_unit_fallback=False,
+            return_source=True,
         )
+        self._latest_p_m_source = p_m_source
         children, raw_M_list, M_list, child_weights = (
             self._expand_policy_expectation_children(
                 children, continuous_raw_M_list, continuous_M_list
@@ -6097,20 +6199,14 @@ class Episode:
             getattr(self.hyperparams, "q_freeze_non_q_in_pretrain", True)
         )
 
-        # 获取 SDF（优先用 batch 内的 M，避免重复计算）
-        if parent.shape[1] > 7:
-            raw_M_list = [child[:, 7:8] for child in children]
-        else:
-            raw_M_list = [torch.ones(parent.shape[0], 1, device=self.device) for _ in children]
-        if self._pv_use_fixed_sdf():
-            fixed = float(getattr(self.hyperparams, "pv_fixed_sdf_value", 0.98))
-            M_list = [torch.full_like(m, fixed).detach() for m in raw_M_list]
-        elif getattr(self.hyperparams, "q_use_detached_m", True):
-            m_lo = float(getattr(self.hyperparams, "q_m_clamp_min", 0.5))
-            m_hi = float(getattr(self.hyperparams, "q_m_clamp_max", 1.5))
-            M_list = [m.clamp(m_lo, m_hi).detach() for m in raw_M_list]
-        else:
-            M_list = raw_M_list
+        # Transition SDF belongs to each child edge, never to parent layout.
+        raw_M_list, M_list, q_m_source = self._build_q_m_lists(
+            children,
+            int(parent.shape[0]),
+            allow_unit_fallback=False,
+            return_source=True,
+        )
+        self._latest_q_m_source = q_m_source
 
         children, raw_M_list, M_list, _child_weights = (
             self._expand_policy_expectation_children(children, raw_M_list, M_list)
@@ -6460,6 +6556,13 @@ class Episode:
                 'q_child_b_sp_reconstruction_max_error': b_sp_reconstruction_max_error,
                 **boundary_diag,
             }
+            raw_m_flat = torch.cat([m.reshape(-1) for m in raw_M_list], dim=0)
+            used_m_flat = torch.cat([m.reshape(-1) for m in M_list], dim=0)
+            q_m_lo = float(getattr(self.hyperparams, "q_m_clamp_min", 0.5))
+            q_m_hi = float(getattr(self.hyperparams, "q_m_clamp_max", 1.5))
+            self._latest_q_terms.update(
+                self._m_diagnostics("q", raw_m_flat, used_m_flat, q_m_lo, q_m_hi)
+            )
             if q_unit_values is not None:
                 self._latest_q_terms.update({
                     "q_unit_mean": float(q_unit_values.mean().item()),
@@ -6915,7 +7018,9 @@ class Episode:
 
         m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
         m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-        raw_M_list, train_M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+        raw_M_list, train_M_list = self._build_policy_m_lists(
+            parent, children, m_lo, m_hi, allow_unit_fallback=False
+        )
         M_list = train_M_list if mode == "train" else raw_M_list
         children, _raw_expanded, M_list, _child_weights = (
             self._expand_policy_expectation_children(children, raw_M_list, M_list)
@@ -6992,7 +7097,9 @@ class Episode:
 
         m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
         m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-        raw_M_list, train_M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+        raw_M_list, train_M_list = self._build_policy_m_lists(
+            parent, children, m_lo, m_hi, allow_unit_fallback=False
+        )
         M_list = train_M_list if mode == "train" else raw_M_list
         children, _raw_expanded, M_list, _child_weights = (
             self._expand_policy_expectation_children(children, raw_M_list, M_list)
@@ -7068,14 +7175,16 @@ class Episode:
         if not children:
             return torch.empty((parent.shape[0], 0), device=self.device)
 
-        if parent.shape[1] > 7:
-            raw_M_list = [child[:, 7:8] for child in children]
-        else:
-            raw_M_list = [torch.ones(parent.shape[0], 1, device=self.device) for _ in children]
-        if mode == "train" and getattr(self.hyperparams, "q_use_detached_m", True):
-            m_lo = float(getattr(self.hyperparams, "q_m_clamp_min", 0.5))
-            m_hi = float(getattr(self.hyperparams, "q_m_clamp_max", 1.5))
-            M_list = [m.detach().clamp(m_lo, m_hi) for m in raw_M_list]
+        raw_M_list, train_M_list = self._build_q_m_lists(
+            children,
+            int(parent.shape[0]),
+            allow_unit_fallback=False,
+        )
+        if mode == "train" and (
+            self._pv_use_fixed_sdf()
+            or getattr(self.hyperparams, "q_use_detached_m", True)
+        ):
+            M_list = train_M_list
         else:
             M_list = raw_M_list
         children, _raw_expanded, M_list, _child_weights = (
@@ -7276,7 +7385,9 @@ class Episode:
                 children = self._get_policy_children(batch)
                 if not children:
                     continue
-                raw_M_list, M_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+                raw_M_list, M_list = self._build_policy_m_lists(
+                    parent, children, m_lo, m_hi, allow_unit_fallback=False
+                )
                 children, raw_M_list, M_list, child_weights = (
                     self._expand_policy_expectation_children(children, raw_M_list, M_list)
                 )
@@ -8673,7 +8784,9 @@ class Episode:
                 parent_state = parent[:, :7] if parent.shape[1] > 7 else parent
                 m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
                 m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-                raw_m_list, m_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+                raw_m_list, m_list = self._build_policy_m_lists(
+                    parent, children, m_lo, m_hi, allow_unit_fallback=False
+                )
                 children, _raw_expanded, m_list, child_weights = (
                     self._expand_policy_expectation_children(children, raw_m_list, m_list)
                 )
@@ -8922,7 +9035,15 @@ class Episode:
     def _policy_batch_hash_components(
         self,
         batch: Dict[str, torch.Tensor],
-    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], str, str, str]:
+    ) -> Tuple[
+        torch.Tensor,
+        List[torch.Tensor],
+        List[torch.Tensor],
+        str,
+        str,
+        str,
+        str,
+    ]:
         parent = batch["parent"]
         children = batch.get("children", [])
         if not children and batch.get("child0") is not None and batch.get("child1") is not None:
@@ -8930,7 +9051,14 @@ class Episode:
         parent_state = parent[:, :7] if parent.shape[1] > 7 else parent
         m_lo = float(getattr(self.hyperparams, "pv_m_clamp_min", 0.7))
         m_hi = float(getattr(self.hyperparams, "pv_m_clamp_max", 1.3))
-        _, m_list = self._build_policy_m_lists(parent, children, m_lo, m_hi)
+        _, m_list, m_source = self._build_policy_m_lists(
+            parent,
+            children,
+            m_lo,
+            m_hi,
+            allow_unit_fallback=False,
+            return_source=True,
+        )
         return (
             parent_state,
             children,
@@ -8938,6 +9066,7 @@ class Episode:
             self._tensor_list_hash([parent_state]),
             self._tensor_list_hash(children),
             self._tensor_list_hash(m_list),
+            m_source,
         )
 
     def _build_pq_value_target_cache(
@@ -8950,6 +9079,7 @@ class Episode:
         grid_config_hash: Optional[str] = None,
     ) -> Tuple[List[PQValueTargetBatch], Dict[str, Any]]:
         cache: List[PQValueTargetBatch] = []
+        m_sources: List[str] = []
         grid_teacher = BPGridTeacher.from_hyperparams(
             teacher_model,
             self.loss_fns["p0"],
@@ -8963,9 +9093,10 @@ class Episode:
         teacher_model.eval()
         try:
             for batch_id, batch in enumerate(batches):
-                parent_state, children, m_list, parent_hash, children_hash, m_hash = (
+                parent_state, children, m_list, parent_hash, children_hash, m_hash, m_source = (
                     self._policy_batch_hash_components(batch)
                 )
+                m_sources.append(m_source)
                 children, _raw_expanded, m_list, child_weights = (
                     self._expand_policy_expectation_children(children, m_list, m_list)
                 )
@@ -9013,10 +9144,16 @@ class Episode:
                 )
         finally:
             teacher_model.train(was_training)
+        unique_m_sources = sorted(set(m_sources))
+        if unique_m_sources != ["child_column_7"]:
+            raise RuntimeError(
+                f"Formal P target cache requires child transition M; got {unique_m_sources}"
+            )
         return cache, {
             "cache_batches": int(len(cache)),
             "teacher_hash": teacher_hash,
             "grid_config_hash": grid_config_hash,
+            "p_m_source": unique_m_sources[0],
         }
 
     def _validate_pq_cache_item(
@@ -9070,7 +9207,7 @@ class Episode:
             if not torch.equal(cache_item.source_index, batch["source_index"].detach().cpu()):
                 raise RuntimeError("P/Q cache source_index mismatch.")
         if mode == "full":
-            _, _, _, parent_hash, children_hash, m_hash = self._policy_batch_hash_components(batch)
+            _, _, _, parent_hash, children_hash, m_hash, _m_source = self._policy_batch_hash_components(batch)
             if cache_item.parent_hash != parent_hash:
                 raise RuntimeError("P/Q cache parent hash mismatch.")
             if cache_item.children_hash != children_hash:

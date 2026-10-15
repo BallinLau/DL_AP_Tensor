@@ -87,6 +87,38 @@ def write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(_jsonable(payload), indent=2, sort_keys=True), encoding="utf-8")
 
 
+def _transition_m_summary(
+    prefix: str,
+    sources: Sequence[str],
+    raw_parts: Sequence[torch.Tensor],
+    used_parts: Sequence[torch.Tensor],
+) -> Dict[str, Any]:
+    """Summarize the transition-M provenance used by one inner operator."""
+    unique_sources = sorted(set(sources))
+    if len(unique_sources) != 1:
+        raise RuntimeError(f"{prefix} inner M sources are not unique: {unique_sources}")
+    source = unique_sources[0]
+    if source == "unit_fallback":
+        raise RuntimeError(f"Formal inner {prefix} operator used forbidden unit-M fallback")
+    raw = torch.cat([value.detach().reshape(-1).cpu() for value in raw_parts])
+    used = torch.cat([value.detach().reshape(-1).cpu() for value in used_parts])
+
+    def stats(label: str, value: torch.Tensor) -> Dict[str, float]:
+        return {
+            f"{prefix}_M_{label}_mean": float(value.mean().item()),
+            f"{prefix}_M_{label}_p50": float(torch.quantile(value, 0.50).item()),
+            f"{prefix}_M_{label}_p90": float(torch.quantile(value, 0.90).item()),
+            f"{prefix}_M_{label}_min": float(value.min().item()),
+            f"{prefix}_M_{label}_max": float(value.max().item()),
+        }
+
+    return {
+        f"{prefix}_m_source": source,
+        **stats("raw", raw),
+        **stats("used", used),
+    }
+
+
 @dataclass(frozen=True)
 class InnerFPCollocationBank:
     parent_states: torch.Tensor
@@ -599,6 +631,12 @@ def evaluate_inner_operator_snapshot(
     b0_star: List[torch.Tensor] = []
     bi_star: List[torch.Tensor] = []
     recursion_gain: List[torch.Tensor] = []
+    p_m_sources: List[str] = []
+    p_m_raw: List[torch.Tensor] = []
+    p_m_used: List[torch.Tensor] = []
+    q_m_sources: List[str] = []
+    q_m_raw: List[torch.Tensor] = []
+    q_m_used: List[torch.Tensor] = []
     teacher = BPGridTeacher.from_hyperparams(
         model, episode.loss_fns["p0"], episode.loss_fns["pi"],
         episode.hyperparams, q_target_model=model,
@@ -609,7 +647,21 @@ def evaluate_inner_operator_snapshot(
             children = episode._get_policy_children(batch)
             m_lo = float(getattr(episode.hyperparams, "pv_m_clamp_min", 0.7))
             m_hi = float(getattr(episode.hyperparams, "pv_m_clamp_max", 1.3))
-            raw_m, used_m = episode._build_policy_m_lists(parent, children, m_lo, m_hi)
+            raw_m, used_m, p_m_source = episode._build_policy_m_lists(
+                parent,
+                children,
+                m_lo,
+                m_hi,
+                allow_unit_fallback=False,
+                return_source=True,
+            )
+            if p_m_source != "child_column_7":
+                raise RuntimeError(
+                    f"Formal inner P evaluator requires child transition M; got {p_m_source}"
+                )
+            p_m_sources.append(p_m_source)
+            p_m_raw.extend(raw_m)
+            p_m_used.extend(used_m)
             children_exp, _, used_exp, weights = episode._expand_policy_expectation_children(
                 children, raw_m, used_m
             )
@@ -651,13 +703,19 @@ def evaluate_inner_operator_snapshot(
                 subset = episode._slice_q_batch(batch, survival)
                 state = subset["parent"][:, :7]
                 child_list = episode._get_policy_children(subset)
-                raw_q_m = [child[:, 7:8] for child in child_list]
-                if getattr(episode.hyperparams, "q_use_detached_m", True):
-                    q_lo = float(getattr(episode.hyperparams, "q_m_clamp_min", 0.5))
-                    q_hi = float(getattr(episode.hyperparams, "q_m_clamp_max", 1.5))
-                    used_q_m = [value.detach().clamp(q_lo, q_hi) for value in raw_q_m]
-                else:
-                    used_q_m = raw_q_m
+                raw_q_m, used_q_m, q_m_source = episode._build_q_m_lists(
+                    child_list,
+                    int(state.shape[0]),
+                    allow_unit_fallback=False,
+                    return_source=True,
+                )
+                if q_m_source != "child_column_7":
+                    raise RuntimeError(
+                        f"Formal inner Q evaluator requires child transition M; got {q_m_source}"
+                    )
+                q_m_sources.append(q_m_source)
+                q_m_raw.extend(raw_q_m)
+                q_m_used.extend(used_q_m)
                 child_exp, _, used_q_m, _ = episode._expand_policy_expectation_children(
                     child_list, raw_q_m, used_q_m
                 )
@@ -712,6 +770,10 @@ def evaluate_inner_operator_snapshot(
         torch.cat(recursion_gain) if recursion_gain else torch.empty(0)
     )
     metrics = _operator_snapshot_metrics(snapshot)
+    metrics["transition_m"] = {
+        **_transition_m_summary("p", p_m_sources, p_m_raw, p_m_used),
+        **_transition_m_summary("q", q_m_sources, q_m_raw, q_m_used),
+    }
     mean_tol = getattr(episode.hyperparams, "bellman_conditional_mean_thresh", None)
     p90_tol = getattr(episode.hyperparams, "bellman_conditional_p90_thresh", None)
     configured = mean_tol is not None and p90_tol is not None
