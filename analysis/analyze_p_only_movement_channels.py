@@ -66,6 +66,8 @@ FIXED_INVEST_BUCKETS = (0.0, 0.01, 0.05, 0.20, math.inf)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, required=True)
+    parser.add_argument("--source-run", type=Path, default=None)
+    parser.add_argument("--source-checkpoint", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--report", type=Path, default=None)
     parser.add_argument("--device", default=None)
@@ -259,10 +261,18 @@ def _bucket_label(lo: float, hi: float) -> str:
     return f"[{lo:g},{hi:g})" if math.isfinite(hi) else f"[{lo:g},inf)"
 
 
-def _load_setup(run: Path, device: torch.device, limit: Optional[int]):
+def _load_setup(
+    run: Path,
+    device: torch.device,
+    limit: Optional[int],
+    source_override: Optional[Path] = None,
+    checkpoint_override: Optional[Path] = None,
+):
     provenance = _load_json(run / "metadata" / "provenance.json")
-    source = Path(provenance["source_run"])
-    source_checkpoint = Path(provenance["source_checkpoint"])
+    source = (source_override or Path(provenance["source_run"])).expanduser().resolve()
+    source_checkpoint = (
+        checkpoint_override or Path(provenance["source_checkpoint"])
+    ).expanduser().resolve()
     hp_values = _load_json(source / "metadata" / "hyperparams.json")
     config_values = _load_json(source / "metadata" / "config_snapshot.json")
     economic = AnalysisEconomicConfig.from_dict(config_values)
@@ -275,6 +285,9 @@ def _load_setup(run: Path, device: torch.device, limit: Optional[int]):
         device,
         expected_episode=1,
         expected_q_parameterization="direct",
+        expected_value_scale_mode=str(hp_values["pv_value_scale_mode"]),
+        expected_value_scale_log_max=float(hp_values["pv_value_scale_log_max"]),
+        expected_bellman_normalization=bool(hp_values["pv_bellman_normalize_by_value_scale"]),
     )
     # Empty by design: the analysis must be structurally incapable of an optimizer step.
     episode = Episode(
@@ -589,7 +602,11 @@ def main() -> int:
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.set_grad_enabled(False)
     episode, hp, models, parents, base_children, parent_payload, child_payload, provenance, loader = _load_setup(
-        run, device, args.validation_limit
+        run,
+        device,
+        args.validation_limit,
+        args.source_run,
+        args.source_checkpoint,
     )
     if episode.optimizers:
         raise RuntimeError("Analysis must not own optimizers")
