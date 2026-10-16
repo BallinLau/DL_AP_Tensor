@@ -180,10 +180,13 @@ def _models_hash(models: Mapping[str, torch.nn.Module]) -> str:
     return _tensor_digest(entries)
 
 
-def _build_p_problem(episode, model, parents, children, batch_size):
+def _build_p_problem(
+    episode, model, parents, children, batch_size, *, require_legacy_m1=True
+):
     return build_problem(
         episode, model, parents, children, batch_size,
         snapshot_batch_size=min(512, batch_size),
+        require_legacy_m1=require_legacy_m1,
     )
 
 
@@ -191,16 +194,19 @@ def solve_p_block(
     *, model, episode, train_parents, train_children, validation_parents,
     validation_children, batch_size, policy_outer_max, adam_steps, adam_lr,
     eval_every, lbfgs_max_iter, lbfgs_chunk_iterations, target_residual,
+    require_legacy_m1=True,
 ) -> tuple[torch.nn.Module, list[dict[str, Any]], Sequence[Any], Sequence[Any]]:
     current = model
     rows = []
     final_train = final_validation = None
     for policy_outer in range(policy_outer_max):
         train = _build_p_problem(
-            episode, current, train_parents, train_children, batch_size
+            episode, current, train_parents, train_children, batch_size,
+            require_legacy_m1=require_legacy_m1,
         )
         validation = _build_p_problem(
-            episode, current, validation_parents, validation_children, batch_size
+            episode, current, validation_parents, validation_children, batch_size,
+            require_legacy_m1=require_legacy_m1,
         )
         view_before = build_policy_view(current, validation)
         started = time.perf_counter()
@@ -212,10 +218,12 @@ def solve_p_block(
             target_residual=target_residual,
         )
         final_train = _build_p_problem(
-            episode, solved, train_parents, train_children, batch_size
+            episode, solved, train_parents, train_children, batch_size,
+            require_legacy_m1=require_legacy_m1,
         )
         final_validation = _build_p_problem(
-            episode, solved, validation_parents, validation_children, batch_size
+            episode, solved, validation_parents, validation_children, batch_size,
+            require_legacy_m1=require_legacy_m1,
         )
         greedy = evaluate_problem(solved, final_validation)
         view_after = build_policy_view(solved, final_validation)
@@ -241,6 +249,7 @@ def solve_q_block(
     *, model, episode, train_parents, train_children, validation_parents,
     validation_children, batch_size, adam_steps, adam_lr, eval_every,
     lbfgs_max_iter, lbfgs_chunk_iterations, target_residual,
+    m_mode="corrected_child",
 ) -> tuple[torch.nn.Module, dict[str, Any], Sequence[Any], Sequence[Any]]:
     started = time.perf_counter()
     frozen_p = deepcopy(model).to(train_parents.device)
@@ -249,12 +258,12 @@ def solve_q_block(
     train, train_regimes = build_q_survival_problem(
         episode=episode, initial_model=model, frozen_p_model=frozen_p,
         parents=train_parents, children=train_children, batch_size=batch_size,
-        m_mode="corrected_child", include_all_regimes=True,
+        m_mode=m_mode, include_all_regimes=True,
     )
     validation, validation_regimes = build_q_survival_problem(
         episode=episode, initial_model=model, frozen_p_model=frozen_p,
         parents=validation_parents, children=validation_children,
-        batch_size=batch_size, m_mode="corrected_child", include_all_regimes=True,
+        batch_size=batch_size, m_mode=m_mode, include_all_regimes=True,
     )
     root = deepcopy(model).to(train_parents.device)
     initial = evaluate_q_problem(root, episode, validation)

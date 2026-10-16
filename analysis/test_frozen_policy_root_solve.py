@@ -117,6 +117,9 @@ class FrozenBranchPolicy:
     bp_star: torch.Tensor  # [B,1]
     production_target: torch.Tensor  # [B,1]
     continuation_factor: float
+    # Discount factor used by the Bellman continuation term.  ``None`` keeps
+    # backward compatibility with the historical M=1 frozen-policy fixtures.
+    m: Optional[torch.Tensor] = None  # [B,J]
     # Static [I*B*J, state_dim] tensor used by the fast residual engine.  It is
     # optional so older serialized/test fixtures remain valid.
     expanded_child_states: Optional[torch.Tensor] = None
@@ -130,6 +133,10 @@ class FrozenBranchPolicy:
             (f"{prefix}.cashflow", self.cashflow),
             (f"{prefix}.bp_star", self.bp_star),
             (f"{prefix}.production_target", self.production_target),
+            *(
+                [(f"{prefix}.m", self.m)]
+                if self.m is not None else []
+            ),
             *(
                 [(f"{prefix}.expanded_child_states", self.expanded_child_states)]
                 if self.expanded_child_states is not None else []
@@ -217,7 +224,8 @@ def _make_branch_snapshot(
     weights = _normalized_weights(
         child_weights, parent.shape[0], child_states.shape[1], parent.device, parent.dtype
     )
-    continuation = (weights * old_equity).sum(dim=1, keepdim=True)
+    branch_m = used_m.squeeze(-1).detach()
+    continuation = (weights * branch_m * old_equity).sum(dim=1, keepdim=True)
     factor = 1.0 if branch == "p0" else float(Config.G)
     reconstructed = fixed_eval["cashflow_grid_mean"][:, 0:1] + factor * continuation
     target = production["value_star"].detach()
@@ -234,6 +242,7 @@ def _make_branch_snapshot(
         bp_star=bp_star,
         production_target=target,
         continuation_factor=factor,
+        m=branch_m,
         expanded_child_states=_expand_i_grid_states(model, child_states),
     )
 
@@ -243,9 +252,22 @@ def build_frozen_policy_batch(
     model: torch.nn.Module,
     parent: torch.Tensor,
     children_raw: torch.Tensor,
+    *,
+    require_legacy_m1: bool = True,
 ) -> FrozenPolicyBatch:
-    children, used_m, weights = _expanded_inputs(episode, parent, children_raw)
-    assert_legacy_m1(used_m)
+    if require_legacy_m1:
+        children, used_m, weights = _expanded_inputs(episode, parent, children_raw)
+        assert_legacy_m1(used_m)
+    else:
+        if children_raw.shape[-1] <= 7:
+            raise ValueError("current-SDF P operator requires child transition column 7")
+        child_list = list(children_raw.unbind(dim=1))
+        common_m = [child[:, 7:8].detach() for child in child_list]
+        expanded, _, expanded_m, weights = episode._expand_policy_expectation_children(
+            child_list, common_m, common_m
+        )
+        children = torch.stack([child[:, :7] for child in expanded], dim=1)
+        used_m = torch.stack(expanded_m, dim=1)
     teacher = _teacher(episode, model)
     with torch.no_grad():
         p0 = _make_branch_snapshot(
@@ -273,6 +295,7 @@ def build_problem(
     children: torch.Tensor,
     batch_size: int,
     snapshot_batch_size: Optional[int] = None,
+    require_legacy_m1: bool = True,
 ) -> list[FrozenPolicyBatch]:
     build_batch_size = min(
         batch_size,
@@ -282,7 +305,8 @@ def build_problem(
     for start in range(0, parents.shape[0], build_batch_size):
         stop = min(start + build_batch_size, parents.shape[0])
         problem.append(build_frozen_policy_batch(
-            episode, model, parents[start:stop], children[start:stop]
+            episode, model, parents[start:stop], children[start:stop],
+            require_legacy_m1=require_legacy_m1,
         ))
     if build_batch_size == batch_size:
         return problem
@@ -323,6 +347,10 @@ def _merge_frozen_branches(
             [branch.production_target for branch in branches], dim=0
         ),
         continuation_factor=first.continuation_factor,
+        m=(
+            torch.cat([branch.m for branch in branches], dim=0)
+            if all(branch.m is not None for branch in branches) else None
+        ),
         expanded_child_states=expanded,
     )
 
@@ -480,7 +508,8 @@ def dynamic_rhs(
         )
     else:
         raise ValueError(f"Unknown residual implementation: {implementation!r}")
-    continuation = (branch.child_weights * equity).sum(dim=1, keepdim=True)
+    m = branch.m if branch.m is not None else torch.ones_like(branch.child_weights)
+    continuation = (branch.child_weights * m * equity).sum(dim=1, keepdim=True)
     return branch.cashflow + branch.continuation_factor * continuation
 
 
@@ -508,8 +537,10 @@ def residual_tensors(
             detach_child=detach_child,
             use_cache=use_cache,
         )
-        continuation0 = (batch.p0.child_weights * equity0).sum(dim=1, keepdim=True)
-        continuationi = (batch.pi.child_weights * equityi).sum(dim=1, keepdim=True)
+        m0 = batch.p0.m if batch.p0.m is not None else torch.ones_like(batch.p0.child_weights)
+        mi = batch.pi.m if batch.pi.m is not None else torch.ones_like(batch.pi.child_weights)
+        continuation0 = (batch.p0.child_weights * m0 * equity0).sum(dim=1, keepdim=True)
+        continuationi = (batch.pi.child_weights * mi * equityi).sum(dim=1, keepdim=True)
         rhs0 = batch.p0.cashflow + batch.p0.continuation_factor * continuation0
         rhsi = batch.pi.cashflow + batch.pi.continuation_factor * continuationi
     else:

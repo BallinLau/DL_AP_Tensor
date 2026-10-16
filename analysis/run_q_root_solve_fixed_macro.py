@@ -117,10 +117,12 @@ def _used_m(
 ) -> tuple[list[torch.Tensor], str]:
     if mode == "legacy_m1":
         return [torch.ones_like(child[:, 0:1]) for child in children], "LEGACY_M1"
-    if mode != "corrected_child":
+    if mode not in {"corrected_child", "current_sdf_child"}:
         raise ValueError(f"unknown M mode: {mode!r}")
     if any(child.shape[1] <= 7 for child in children):
-        raise ValueError("corrected_child M requires child transition column 7")
+        raise ValueError(f"{mode} M requires child transition column 7")
+    if mode == "current_sdf_child":
+        return [child[:, 7:8].detach() for child in children], "CURRENT_SDF_CHILD"
     lo = float(getattr(episode.hyperparams, "q_m_clamp_min", 0.5))
     hi = float(getattr(episode.hyperparams, "q_m_clamp_max", 1.5))
     return [child[:, 7:8].clamp(lo, hi).detach() for child in children], (
