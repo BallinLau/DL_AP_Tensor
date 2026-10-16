@@ -51,7 +51,7 @@ from analysis.test_frozen_policy_root_solve import (  # noqa: E402
     residual_tensors,
     root_loss,
     run_adam,
-    run_lbfgs,
+    run_lbfgs_chunked,
 )
 from config.constants import SIMMODEL  # noqa: E402
 
@@ -64,6 +64,19 @@ CONVERGENCE = {
     "bp0_p90": 0.025,
     "bpI_p90": 0.025,
 }
+
+
+def resolve_policy_evaluation_target(
+    outer: int,
+    schedule: Sequence[float],
+) -> float | None:
+    """Return the explicit inexact policy-evaluation target for an outer."""
+    if not schedule:
+        return None
+    values = [float(value) for value in schedule]
+    if any(not math.isfinite(value) or value <= 0.0 for value in values):
+        raise ValueError("policy evaluation targets must be finite and positive")
+    return values[min(max(int(outer), 0), len(values) - 1)]
 
 
 @dataclass(frozen=True)
@@ -614,6 +627,8 @@ def _solve_frozen_policy(
     eval_every: int,
     lbfgs_max_iter: int,
     lbfgs_history_size: int,
+    lbfgs_chunk_iterations: int,
+    target_residual: float | None,
 ) -> tuple[torch.nn.Module, pd.DataFrame, dict[str, Any]]:
     initial = evaluate_problem(model, validation_problem)
     root = deepcopy(model).to(validation_problem[0].parent.device)
@@ -622,17 +637,31 @@ def _solve_frozen_policy(
         steps=adam_steps, lr=adam_lr, clip=10.0, eval_every=eval_every,
     )
     _restore_state(root, adam_state)
-    lbfgs_history, best_state, best = run_lbfgs(
-        model=root, episode=episode, train=train_problem, validation=validation_problem,
-        max_iter=lbfgs_max_iter, history_size=lbfgs_history_size,
-    )
+    if target_residual is not None and adam_best["normalized_mae"] <= target_residual:
+        lbfgs_history = []
+        best_state, best = adam_state, adam_best
+        stop_reason = "target_residual_reached_after_adam"
+    else:
+        lbfgs_history, best_state, best, stop_reason = run_lbfgs_chunked(
+            model=root,
+            episode=episode,
+            train=train_problem,
+            validation=validation_problem,
+            max_iter=lbfgs_max_iter,
+            chunk_iterations=lbfgs_chunk_iterations,
+            history_size=lbfgs_history_size,
+            implementation="fast",
+            target_residual=target_residual,
+        )
     _restore_state(root, best_state)
     final = evaluate_problem(root, validation_problem)
     history = pd.DataFrame(adam_history + lbfgs_history)
-    stop_reason = "optimizer_limit"
-    if final["normalized_mae"] < 0.02:
-        stop_reason = "frozen_validation_below_0.02_after_optimizer"
-    elif initial["normalized_mae"] / max(final["normalized_mae"], 1e-30) >= 5.0:
+    if (target_residual is not None
+            and final["normalized_mae"] <= target_residual
+            and stop_reason == "optimizer_limit"):
+        stop_reason = "target_residual_reached"
+    elif (stop_reason == "optimizer_limit"
+            and initial["normalized_mae"] / max(final["normalized_mae"], 1e-30) >= 5.0):
         stop_reason = "fivefold_reduction_after_optimizer"
     return root, history, {
         "initial": initial,
@@ -743,6 +772,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--lbfgs-max-iter", type=int, default=200)
     parser.add_argument("--lbfgs-history-size", type=int, default=50)
+    parser.add_argument("--lbfgs-chunk-iterations", type=int, default=20)
+    parser.add_argument(
+        "--policy-eval-targets",
+        type=float,
+        nargs="*",
+        default=[0.04, 0.03, 0.02, 0.01, 0.005],
+        help="Explicit inexact frozen-policy residual targets by outer",
+    )
     return parser.parse_args()
 
 
@@ -857,10 +894,15 @@ def main() -> None:
             }
             history = pd.read_csv(reuse / "root_solve_history.csv")
         else:
+            target_residual = resolve_policy_evaluation_target(
+                outer, args.policy_eval_targets
+            )
             root_model, history, solve_info = _solve_frozen_policy(
                 current_model, episode, current_train_problem, current_validation_problem,
                 adam_steps=args.adam_steps, adam_lr=args.adam_lr, eval_every=args.eval_every,
                 lbfgs_max_iter=args.lbfgs_max_iter, lbfgs_history_size=args.lbfgs_history_size,
+                lbfgs_chunk_iterations=args.lbfgs_chunk_iterations,
+                target_residual=target_residual,
             )
             final_frozen = solve_info["final"]
         history.insert(0, "outer", outer)
@@ -953,6 +995,9 @@ def main() -> None:
             **function_metrics,
             **magnitudes,
             "two_cycle_flag": bool(two_cycle["possible_two_cycle"]),
+            "policy_evaluation_target": resolve_policy_evaluation_target(
+                outer, args.policy_eval_targets
+            ),
             "stop_reason": solve_info["stop_reason"],
             "elapsed_seconds": time.time() - outer_started,
         }

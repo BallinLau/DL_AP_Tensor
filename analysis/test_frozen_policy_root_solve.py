@@ -117,6 +117,9 @@ class FrozenBranchPolicy:
     bp_star: torch.Tensor  # [B,1]
     production_target: torch.Tensor  # [B,1]
     continuation_factor: float
+    # Static [I*B*J, state_dim] tensor used by the fast residual engine.  It is
+    # optional so older serialized/test fixtures remain valid.
+    expanded_child_states: Optional[torch.Tensor] = None
 
     def digest_items(self, prefix: str) -> list[tuple[str, torch.Tensor]]:
         return [
@@ -127,6 +130,10 @@ class FrozenBranchPolicy:
             (f"{prefix}.cashflow", self.cashflow),
             (f"{prefix}.bp_star", self.bp_star),
             (f"{prefix}.production_target", self.production_target),
+            *(
+                [(f"{prefix}.expanded_child_states", self.expanded_child_states)]
+                if self.expanded_child_states is not None else []
+            ),
         ]
 
 
@@ -164,6 +171,25 @@ def _frozen_equity_components(
     phat = torch.where(selector_pi, pi_grid, p0_grid).mean(dim=0)
     survival = (phat > 0.0).to(phat.dtype)
     return selector_pi, survival, survival * phat
+
+
+def _expand_i_grid_states(
+    model: torch.nn.Module,
+    child_states: torch.Tensor,
+) -> torch.Tensor:
+    """Materialize the frozen i-grid states once, without changing semantics."""
+    i_grid = torch.linspace(
+        0.0,
+        float(model.i_threshold),
+        steps=max(int(model.i_grid_size), 2),
+        device=child_states.device,
+        dtype=child_states.dtype,
+    )
+    expanded = child_states.unsqueeze(0).expand(
+        i_grid.numel(), *child_states.shape
+    ).clone()
+    expanded[..., 3] = i_grid[:, None, None]
+    return expanded.reshape(-1, child_states.shape[-1]).detach()
 
 
 def _make_branch_snapshot(
@@ -208,6 +234,7 @@ def _make_branch_snapshot(
         bp_star=bp_star,
         production_target=target,
         continuation_factor=factor,
+        expanded_child_states=_expand_i_grid_states(model, child_states),
     )
 
 
@@ -245,17 +272,102 @@ def build_problem(
     parents: torch.Tensor,
     children: torch.Tensor,
     batch_size: int,
+    snapshot_batch_size: Optional[int] = None,
 ) -> list[FrozenPolicyBatch]:
+    build_batch_size = min(
+        batch_size,
+        int(snapshot_batch_size) if snapshot_batch_size is not None else batch_size,
+    )
     problem = []
-    for start in range(0, parents.shape[0], batch_size):
-        stop = min(start + batch_size, parents.shape[0])
+    for start in range(0, parents.shape[0], build_batch_size):
+        stop = min(start + build_batch_size, parents.shape[0])
         problem.append(build_frozen_policy_batch(
             episode, model, parents[start:stop], children[start:stop]
         ))
-    return problem
+    if build_batch_size == batch_size:
+        return problem
+    return coalesce_problem(problem, batch_size)
 
 
-def current_frozen_child_equity(
+def _merge_frozen_branches(
+    branches: Sequence[FrozenBranchPolicy],
+) -> FrozenBranchPolicy:
+    if not branches:
+        raise ValueError("cannot merge an empty frozen branch list")
+    first = branches[0]
+    if any(branch.name != first.name for branch in branches):
+        raise ValueError("frozen branch names differ during coalescing")
+    if any(branch.continuation_factor != first.continuation_factor for branch in branches):
+        raise ValueError("frozen continuation factors differ during coalescing")
+    expanded: Optional[torch.Tensor] = None
+    if all(branch.expanded_child_states is not None for branch in branches):
+        rows = []
+        for branch in branches:
+            shape = (
+                branch.selector_pi.shape[0],
+                branch.child_states.shape[0],
+                branch.child_states.shape[1],
+                branch.child_states.shape[2],
+            )
+            rows.append(branch.expanded_child_states.reshape(shape))
+        expanded = torch.cat(rows, dim=1).reshape(-1, first.child_states.shape[-1])
+    return FrozenBranchPolicy(
+        name=first.name,
+        child_states=torch.cat([branch.child_states for branch in branches], dim=0),
+        child_weights=torch.cat([branch.child_weights for branch in branches], dim=0),
+        selector_pi=torch.cat([branch.selector_pi for branch in branches], dim=1),
+        survival=torch.cat([branch.survival for branch in branches], dim=0),
+        cashflow=torch.cat([branch.cashflow for branch in branches], dim=0),
+        bp_star=torch.cat([branch.bp_star for branch in branches], dim=0),
+        production_target=torch.cat(
+            [branch.production_target for branch in branches], dim=0
+        ),
+        continuation_factor=first.continuation_factor,
+        expanded_child_states=expanded,
+    )
+
+
+def coalesce_problem(
+    problem: Sequence[FrozenPolicyBatch],
+    batch_size: int,
+) -> list[FrozenPolicyBatch]:
+    """Merge already-frozen snapshots without rerunning policy search."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    result: list[FrozenPolicyBatch] = []
+    pending: list[FrozenPolicyBatch] = []
+    pending_rows = 0
+    for batch in problem:
+        rows = int(batch.parent.shape[0])
+        if pending and pending_rows + rows > batch_size:
+            result.append(FrozenPolicyBatch(
+                parent=torch.cat([item.parent for item in pending], dim=0),
+                scale=torch.cat([item.scale for item in pending], dim=0),
+                p0=_merge_frozen_branches([item.p0 for item in pending]),
+                pi=_merge_frozen_branches([item.pi for item in pending]),
+            ))
+            pending, pending_rows = [], 0
+        pending.append(batch)
+        pending_rows += rows
+        if pending_rows == batch_size:
+            result.append(FrozenPolicyBatch(
+                parent=torch.cat([item.parent for item in pending], dim=0),
+                scale=torch.cat([item.scale for item in pending], dim=0),
+                p0=_merge_frozen_branches([item.p0 for item in pending]),
+                pi=_merge_frozen_branches([item.pi for item in pending]),
+            ))
+            pending, pending_rows = [], 0
+    if pending:
+        result.append(FrozenPolicyBatch(
+            parent=torch.cat([item.parent for item in pending], dim=0),
+            scale=torch.cat([item.scale for item in pending], dim=0),
+            p0=_merge_frozen_branches([item.p0 for item in pending]),
+            pi=_merge_frozen_branches([item.pi for item in pending]),
+        ))
+    return result
+
+
+def current_frozen_child_equity_loop(
     model: torch.nn.Module,
     branch: FrozenBranchPolicy,
     *,
@@ -280,13 +392,94 @@ def current_frozen_child_equity(
     return equity.detach() if detach_child else equity
 
 
+def current_frozen_child_equity_vectorized(
+    model: torch.nn.Module,
+    branch: FrozenBranchPolicy,
+    *,
+    detach_child: bool = False,
+    use_cache: bool = True,
+) -> torch.Tensor:
+    """Evaluate the complete frozen i-grid in one network call."""
+    states = (
+        branch.expanded_child_states
+        if use_cache and branch.expanded_child_states is not None
+        else _expand_i_grid_states(model, branch.child_states)
+    )
+    p0, pi = model._value_outputs(states)
+    shape = (branch.selector_pi.shape[0],) + tuple(branch.child_states.shape[:2])
+    p0_grid = p0.reshape(shape)
+    pi_grid = pi.reshape(shape)
+    phat = torch.where(branch.selector_pi, pi_grid, p0_grid).mean(dim=0)
+    equity = branch.survival * phat
+    return equity.detach() if detach_child else equity
+
+
+def current_frozen_child_equity_pair(
+    model: torch.nn.Module,
+    p0_branch: FrozenBranchPolicy,
+    pi_branch: FrozenBranchPolicy,
+    *,
+    detach_child: bool = False,
+    use_cache: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate both frozen branches in one concatenated network call."""
+    states0 = (
+        p0_branch.expanded_child_states
+        if use_cache and p0_branch.expanded_child_states is not None
+        else _expand_i_grid_states(model, p0_branch.child_states)
+    )
+    statesi = (
+        pi_branch.expanded_child_states
+        if use_cache and pi_branch.expanded_child_states is not None
+        else _expand_i_grid_states(model, pi_branch.child_states)
+    )
+    if states0.shape[1:] != statesi.shape[1:]:
+        raise ValueError("P0/PI expanded child state dimensions do not match")
+    joined = torch.cat([states0, statesi], dim=0)
+    joined_p0, joined_pi = model._value_outputs(joined)
+    split = states0.shape[0]
+
+    def _equity(
+        branch: FrozenBranchPolicy,
+        flat_p0: torch.Tensor,
+        flat_pi: torch.Tensor,
+    ) -> torch.Tensor:
+        shape = (branch.selector_pi.shape[0],) + tuple(branch.child_states.shape[:2])
+        p0_grid = flat_p0.reshape(shape)
+        pi_grid = flat_pi.reshape(shape)
+        phat = torch.where(branch.selector_pi, pi_grid, p0_grid).mean(dim=0)
+        return branch.survival * phat
+
+    equity0 = _equity(p0_branch, joined_p0[:split], joined_pi[:split])
+    equityi = _equity(pi_branch, joined_p0[split:], joined_pi[split:])
+    if detach_child:
+        return equity0.detach(), equityi.detach()
+    return equity0, equityi
+
+
+# Public default is the fast, mathematically identical implementation.  The
+# loop implementation stays available for parity and performance controls.
+current_frozen_child_equity = current_frozen_child_equity_vectorized
+
+
 def dynamic_rhs(
     model: torch.nn.Module,
     branch: FrozenBranchPolicy,
     *,
     detach_child: bool = False,
+    implementation: str = "fast",
+    use_cache: bool = True,
 ) -> torch.Tensor:
-    equity = current_frozen_child_equity(model, branch, detach_child=detach_child)
+    if implementation == "legacy":
+        equity = current_frozen_child_equity_loop(
+            model, branch, detach_child=detach_child
+        )
+    elif implementation == "fast":
+        equity = current_frozen_child_equity_vectorized(
+            model, branch, detach_child=detach_child, use_cache=use_cache
+        )
+    else:
+        raise ValueError(f"Unknown residual implementation: {implementation!r}")
     continuation = (branch.child_weights * equity).sum(dim=1, keepdim=True)
     return branch.cashflow + branch.continuation_factor * continuation
 
@@ -296,10 +489,31 @@ def residual_tensors(
     batch: FrozenPolicyBatch,
     *,
     detach_child: bool = False,
+    implementation: str = "fast",
+    use_cache: bool = True,
 ) -> dict[str, torch.Tensor]:
     p0, pi = model._value_outputs(batch.parent)
-    rhs0 = dynamic_rhs(model, batch.p0, detach_child=detach_child)
-    rhsi = dynamic_rhs(model, batch.pi, detach_child=detach_child)
+    if implementation == "legacy":
+        rhs0 = dynamic_rhs(
+            model, batch.p0, detach_child=detach_child, implementation="legacy"
+        )
+        rhsi = dynamic_rhs(
+            model, batch.pi, detach_child=detach_child, implementation="legacy"
+        )
+    elif implementation == "fast":
+        equity0, equityi = current_frozen_child_equity_pair(
+            model,
+            batch.p0,
+            batch.pi,
+            detach_child=detach_child,
+            use_cache=use_cache,
+        )
+        continuation0 = (batch.p0.child_weights * equity0).sum(dim=1, keepdim=True)
+        continuationi = (batch.pi.child_weights * equityi).sum(dim=1, keepdim=True)
+        rhs0 = batch.p0.cashflow + batch.p0.continuation_factor * continuation0
+        rhsi = batch.pi.cashflow + batch.pi.continuation_factor * continuationi
+    else:
+        raise ValueError(f"Unknown residual implementation: {implementation!r}")
     r0, ri = p0 - rhs0, pi - rhsi
     return {
         "p0": r0,
@@ -313,8 +527,16 @@ def residual_tensors(
     }
 
 
-def root_loss(model: torch.nn.Module, batch: FrozenPolicyBatch) -> torch.Tensor:
-    values = residual_tensors(model, batch)
+def root_loss(
+    model: torch.nn.Module,
+    batch: FrozenPolicyBatch,
+    *,
+    implementation: str = "fast",
+    use_cache: bool = True,
+) -> torch.Tensor:
+    values = residual_tensors(
+        model, batch, implementation=implementation, use_cache=use_cache
+    )
     return values["p0_normalized"].square().mean() + values["pi_normalized"].square().mean()
 
 
@@ -439,6 +661,7 @@ def run_adam(
 def run_lbfgs(
     *, model: torch.nn.Module, episode: Any, train: Sequence[FrozenPolicyBatch],
     validation: Sequence[FrozenPolicyBatch], max_iter: int, history_size: int,
+    implementation: str = "fast", validate_in_closure: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, torch.Tensor], dict[str, float]]:
     params, _ = _p_scope(episode, model)
     optimizer = torch.optim.LBFGS(
@@ -459,11 +682,13 @@ def run_lbfgs(
         # spanning the complete bank.
         loss = torch.zeros((), device=train[0].parent.device)
         for batch in train:
-            batch_loss = root_loss(model, batch) / len(train)
+            batch_loss = root_loss(
+                model, batch, implementation=implementation
+            ) / len(train)
             batch_loss.backward()
             loss = loss + batch_loss.detach()
         calls += 1
-        if calls == 1 or calls % 5 == 0:
+        if validate_in_closure and (calls == 1 or calls % 5 == 0):
             val = evaluate_problem(model, validation)
             row = {
                 "phase": "lbfgs", "step": calls, "loss": float(loss.detach()),
@@ -478,9 +703,103 @@ def run_lbfgs(
     if max_iter > 0:
         optimizer.step(closure)
     final = evaluate_problem(model, validation)
+    history.append({
+        "phase": "lbfgs", "step": calls, "loss": float("nan"),
+        "raw_grad_norm": _grad_norm(params), "parameter_norm": _param_norm(params),
+        "validation_timing": "after_optimizer_block",
+        **{f"val_{k}": v for k, v in final.items()},
+    })
     if final["normalized_mae"] < best["normalized_mae"]:
         best, best_state = final, _clone_state(model)
     return history, best_state, best
+
+
+def run_lbfgs_chunked(
+    *,
+    model: torch.nn.Module,
+    episode: Any,
+    train: Sequence[FrozenPolicyBatch],
+    validation: Sequence[FrozenPolicyBatch],
+    max_iter: int,
+    chunk_iterations: int,
+    history_size: int,
+    implementation: str = "fast",
+    line_search_fn: Optional[str] = "strong_wolfe",
+    lr: float = 1.0,
+    target_residual: Optional[float] = None,
+) -> tuple[list[dict[str, Any]], dict[str, torch.Tensor], dict[str, float], str]:
+    """Run LBFGS in bounded chunks and validate only between chunks.
+
+    The residual objective and line-search semantics within every optimizer
+    block are unchanged.  Chunking keeps expensive full validation out of the
+    strong-Wolfe closure and provides an explicit inexact policy-evaluation
+    stopping point.
+    """
+    if chunk_iterations <= 0:
+        raise ValueError("chunk_iterations must be positive")
+    params, _ = _p_scope(episode, model)
+    best = evaluate_problem(model, validation)
+    best_state = _clone_state(model)
+    history: list[dict[str, Any]] = []
+    total_calls = 0
+    completed_budget = 0
+    stop_reason = "optimizer_limit"
+    while completed_budget < max_iter:
+        block_budget = min(chunk_iterations, max_iter - completed_budget)
+        optimizer = torch.optim.LBFGS(
+            params,
+            lr=lr,
+            max_iter=block_budget,
+            history_size=history_size,
+            line_search_fn=line_search_fn,
+            tolerance_grad=1e-9,
+            tolerance_change=1e-12,
+        )
+        block_calls = 0
+        started = time.perf_counter()
+
+        def closure() -> torch.Tensor:
+            nonlocal block_calls, total_calls
+            optimizer.zero_grad(set_to_none=True)
+            loss = torch.zeros((), device=train[0].parent.device)
+            for batch in train:
+                batch_loss = root_loss(
+                    model, batch, implementation=implementation
+                ) / len(train)
+                batch_loss.backward()
+                loss = loss + batch_loss.detach()
+            block_calls += 1
+            total_calls += 1
+            return loss
+
+        optimizer.step(closure)
+        if train[0].parent.is_cuda:
+            torch.cuda.synchronize(train[0].parent.device)
+        elapsed = time.perf_counter() - started
+        completed_budget += block_budget
+        val = evaluate_problem(model, validation)
+        row = {
+            "phase": "lbfgs_chunk",
+            "optimizer_budget": completed_budget,
+            "block_budget": block_budget,
+            "block_closure_calls": block_calls,
+            "total_closure_calls": total_calls,
+            "seconds": elapsed,
+            "seconds_per_closure": elapsed / max(block_calls, 1),
+            "raw_grad_norm": _grad_norm(params),
+            "parameter_norm": _param_norm(params),
+            **{f"val_{key}": value for key, value in val.items()},
+        }
+        history.append(row)
+        if val["normalized_mae"] < best["normalized_mae"]:
+            best, best_state = val, _clone_state(model)
+        if not bool(val["finite"]):
+            stop_reason = "nonfinite_validation"
+            break
+        if target_residual is not None and val["normalized_mae"] <= target_residual:
+            stop_reason = "target_residual_reached"
+            break
+    return history, best_state, best, stop_reason
 
 
 def run_picard(

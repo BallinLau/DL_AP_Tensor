@@ -16,9 +16,13 @@ from analysis.test_frozen_policy_root_solve import (
     Q_PREFIXES,
     FrozenBranchPolicy,
     FrozenPolicyBatch,
+    _expand_i_grid_states,
     _state_hash,
     assert_legacy_m1,
     current_frozen_child_equity,
+    current_frozen_child_equity_loop,
+    current_frozen_child_equity_vectorized,
+    coalesce_problem,
     dynamic_rhs,
     evaluate_problem,
     initial_parity,
@@ -90,6 +94,7 @@ def _branch(model: TinyPolicyValue, states: torch.Tensor, weights: torch.Tensor,
         bp_star=torch.full((states.shape[0], 1), 0.3),
         production_target=(cashflow + factor * continuation).detach(),
         continuation_factor=factor,
+        expanded_child_states=_expand_i_grid_states(model, states),
     )
 
 
@@ -209,6 +214,78 @@ def test_current_child_equity_uses_frozen_active_sets():
     assert torch.isfinite(value).all()
     assert torch.equal(batch.pi.selector_pi, before_selector)
     assert torch.equal(batch.pi.survival, before_survival)
+
+
+def test_vectorized_child_equity_matches_legacy_loop():
+    model, _, batch = _fixture()
+    for branch in (batch.p0, batch.pi):
+        old = current_frozen_child_equity_loop(model, branch)
+        new = current_frozen_child_equity_vectorized(model, branch)
+        torch.testing.assert_close(new, old, rtol=1e-6, atol=1e-6)
+
+
+def test_vectorized_residual_and_loss_match_legacy_loop():
+    model, _, batch = _fixture()
+    old = residual_tensors(model, batch, implementation="legacy")
+    new = residual_tensors(model, batch, implementation="fast")
+    for name in ("p0", "pi", "p0_normalized", "pi_normalized", "p0_rhs", "pi_rhs"):
+        torch.testing.assert_close(new[name], old[name], rtol=1e-6, atol=1e-6)
+    old_loss = root_loss(model, batch, implementation="legacy")
+    new_loss = root_loss(model, batch, implementation="fast")
+    torch.testing.assert_close(new_loss, old_loss, rtol=1e-6, atol=1e-7)
+
+
+def test_vectorized_gradient_matches_legacy_loop():
+    model, _, batch = _fixture()
+    old_model = deepcopy(model)
+    new_model = deepcopy(model)
+    old_loss = root_loss(old_model, batch, implementation="legacy")
+    new_loss = root_loss(new_model, batch, implementation="fast")
+    old_grads = torch.autograd.grad(old_loss, tuple(old_model.parameters()), allow_unused=True)
+    new_grads = torch.autograd.grad(new_loss, tuple(new_model.parameters()), allow_unused=True)
+    for old_grad, new_grad in zip(old_grads, new_grads):
+        assert (old_grad is None) == (new_grad is None)
+        if old_grad is not None:
+            torch.testing.assert_close(new_grad, old_grad, rtol=2e-5, atol=2e-6)
+
+
+def test_cached_and_noncached_vectorized_paths_match():
+    model, _, batch = _fixture()
+    cached = residual_tensors(model, batch, implementation="fast", use_cache=True)
+    uncached = residual_tensors(model, batch, implementation="fast", use_cache=False)
+    for name in ("p0", "pi", "p0_normalized", "pi_normalized"):
+        torch.testing.assert_close(cached[name], uncached[name], rtol=0.0, atol=0.0)
+
+
+def test_fast_residual_reduces_value_forward_calls(monkeypatch):
+    model, _, batch = _fixture()
+    original = model._value_outputs
+    calls = 0
+
+    def counted(states):
+        nonlocal calls
+        calls += 1
+        return original(states)
+
+    monkeypatch.setattr(model, "_value_outputs", counted)
+    residual_tensors(model, batch, implementation="legacy")
+    legacy_calls = calls
+    calls = 0
+    residual_tensors(model, batch, implementation="fast")
+    fast_calls = calls
+    assert legacy_calls == 1 + 2 * model.i_grid_size
+    assert fast_calls == 2
+
+
+def test_coalesced_static_snapshots_preserve_residuals():
+    model, _, batch = _fixture()
+    merged = coalesce_problem([batch, deepcopy(batch)], batch_size=6)
+    assert len(merged) == 1
+    individual = residual_tensors(model, batch, implementation="fast")
+    combined = residual_tensors(model, merged[0], implementation="fast")
+    for name in ("p0", "pi", "p0_normalized", "pi_normalized"):
+        expected = torch.cat([individual[name], individual[name]], dim=0)
+        torch.testing.assert_close(combined[name], expected, rtol=1e-6, atol=1e-6)
 
 
 def test_lbfgs_full_bank_closure_runs_with_dynamic_rhs():

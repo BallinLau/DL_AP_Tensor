@@ -11,6 +11,7 @@ from analysis.run_neural_policy_iteration import (
     detect_two_cycle,
     function_transition_metrics,
     policy_transition_metrics,
+    resolve_policy_evaluation_target,
     run_boundary_only_loop,
 )
 from analysis.test_frozen_policy_root_solve import (
@@ -198,3 +199,13 @@ def test_two_cycle_detector_finds_a_to_b_to_a():
     assert result["possible_two_cycle"] is True
     assert result["two_step_investment_flip"] == 0.0
     assert result["one_step_investment_flip"] == 1.0
+
+
+def test_inexact_policy_evaluation_target_is_explicit_and_bounded():
+    schedule = [0.04, 0.03, 0.02, 0.01, 0.005]
+    assert resolve_policy_evaluation_target(0, schedule) == pytest.approx(0.04)
+    assert resolve_policy_evaluation_target(3, schedule) == pytest.approx(0.01)
+    assert resolve_policy_evaluation_target(99, schedule) == pytest.approx(0.005)
+    assert resolve_policy_evaluation_target(0, []) is None
+    with pytest.raises(ValueError, match="finite and positive"):
+        resolve_policy_evaluation_target(0, [0.04, 0.0])
