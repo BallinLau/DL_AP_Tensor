@@ -548,7 +548,33 @@ def _write_report(
     summary: pd.DataFrame,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    table = summary.to_markdown(index=False) if not summary.empty else "No completed outer."
+    if summary.empty:
+        table = "No completed outer."
+    else:
+        # Keep the runner self-contained; pandas.to_markdown requires the
+        # optional ``tabulate`` package, which is absent on some GPU workers.
+        display_columns = [
+            name for name in (
+                "outer", "p_residual_pre_inner", "p_residual_post_inner",
+                "q_residual_pre_inner", "q_residual_post_inner",
+                "sdf_M_function_drift_nmae", "fc1_hatc_function_drift_nmae",
+                "fc1_lnk_function_drift_nmae", "macro_hatc_path_drift",
+                "macro_lnk_path_drift", "macro_to_p_disturbance",
+                "macro_to_q_disturbance", "investment_flip", "default_flip",
+                "outer_total_seconds",
+            ) if name in summary.columns
+        ]
+        rows = []
+        for values in summary[display_columns].itertuples(index=False, name=None):
+            rows.append("| " + " | ".join(
+                f"{value:.6g}" if isinstance(value, (float, np.floating)) else str(value)
+                for value in values
+            ) + " |")
+        table = "\n".join([
+            "| " + " | ".join(display_columns) + " |",
+            "| " + " | ".join("---" for _ in display_columns) + " |",
+            *rows,
+        ])
     cls = metadata.get("classification", "E. inconclusive due implementation/operator issue")
     lines = [
         "# Macro outer / firm inner P-Q diagnostic",

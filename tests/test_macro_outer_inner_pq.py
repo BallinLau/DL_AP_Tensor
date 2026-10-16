@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
+import pandas as pd
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +24,7 @@ from analysis.run_macro_outer_inner_pq import (
     set_stage_trainability,
     stable_json_hash,
     state_hash,
+    _write_report,
 )
 from analysis.test_frozen_policy_root_solve import FrozenBranchPolicy, dynamic_rhs
 
@@ -188,4 +191,15 @@ def test_train_validation_simulation_banks_not_mixed():
     train = {"b": torch.zeros(2, 3), "x": torch.zeros(2)}
     validation = {"b": torch.ones(2, 3), "x": torch.ones(2)}
     assert state_hash(train) != state_hash(validation)
+
+
+def test_report_writer_has_no_optional_tabulate_dependency(tmp_path: Path):
+    path = tmp_path / "report.md"
+    _write_report(
+        path,
+        args=SimpleNamespace(example=True),
+        metadata={"classification": "E", "m_parity": {}},
+        summary=pd.DataFrame([{"outer": 0, "p_residual_post_inner": 0.1}]),
+    )
+    assert "| outer | p_residual_post_inner |" in path.read_text(encoding="utf-8")
 
