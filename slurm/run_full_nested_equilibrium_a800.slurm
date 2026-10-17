@@ -22,6 +22,8 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_ROOT="${RUN_ROOT:-$WORK_ROOT/cachedir/full_nested_equilibrium_${STAMP}}"
 REQUIRED_COMMIT="${REQUIRED_COMMIT:?Set REQUIRED_COMMIT to the tested Git commit}"
 NESTED_SMOKE="${NESTED_SMOKE:-0}"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
+ALLOW_CODE_MISMATCH="${ALLOW_CODE_MISMATCH:-0}"
 
 mkdir -p "$LOG_DIR" "$RUN_ROOT/logs" "$WORK_ROOT/.mplcache"
 cd "$REPO_DIR"
@@ -51,6 +53,7 @@ echo "Branch: $(git branch --show-current)"
 echo "Commit: $OBSERVED_COMMIT"
 echo "Run root: $RUN_ROOT"
 echo "Smoke: $NESTED_SMOKE"
+echo "Resume checkpoint: ${RESUME_CHECKPOINT:-none}"
 echo "Python: $(command -v python3)"
 echo "MACRO_PRIMARY_TRAINING=MANY_PARENT_ONE_STEP"
 echo "LONG_TRAJECTORY_100_PRIMARY_TRAINING=NO"
@@ -81,9 +84,16 @@ EXTRA_ARGS=()
 if [[ "$NESTED_SMOKE" == "1" ]]; then
   EXTRA_ARGS+=(--smoke)
 fi
+MODE_ARGS=(--cold-start)
+if [[ -n "$RESUME_CHECKPOINT" ]]; then
+  MODE_ARGS=(--resume "$RESUME_CHECKPOINT")
+  if [[ "$ALLOW_CODE_MISMATCH" == "1" ]]; then
+    MODE_ARGS+=(--allow-code-mismatch)
+  fi
+fi
 
 python3 -u analysis/run_full_nested_equilibrium.py \
-  --cold-start \
+  "${MODE_ARGS[@]}" \
   --device cuda:0 \
   --output-dir "$RUN_ROOT" \
   --seed 20261018 \

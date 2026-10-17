@@ -98,6 +98,9 @@ def test_a800_launcher_enforces_single_gpu_and_formal_modes():
     assert "--long-diagnostic-horizon 100" in source
     assert "--no-use-long-rollout-for-macro-training" in source
     assert 'REQUIRED_COMMIT="${REQUIRED_COMMIT:?' in source
+    assert 'RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"' in source
+    assert 'MODE_ARGS=(--resume "$RESUME_CHECKPOINT")' in source
+    assert "--allow-code-mismatch" in source
 
 
 def test_atomic_json_has_no_partial_generation(tmp_path: Path):

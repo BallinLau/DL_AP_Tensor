@@ -20,6 +20,7 @@ from analysis.macro_parent_state_bank import (
     harvest_macro_parent_schedule,
     initial_cross_section_hash_audit,
     prepare_macro_parent_schedule,
+    restrict_schedule_to_available_sources,
     run_short_rollout_harvest,
     simulate_one_step_chunked,
     source_overlap,
@@ -295,6 +296,30 @@ def test_candidate_selection_deterministic_and_coverage_not_all_same_cross_secti
     assert first["b_mean"].nunique() > 1
     assert first["z_mean"].nunique() > 1
     assert (first["selection_component"] == "COVERAGE_AWARE").sum() == 4
+
+
+def test_global_schedule_censors_extinct_sources_without_replacement():
+    frame = _candidate_frame(5)
+    schedule = build_source_schedule(
+        frame.assign(selection_component="ENDOGENOUS_FREQUENCY"),
+        split="train",
+        initial_state_seed=10,
+        transition_seed=20,
+        entry_seed=30,
+        candidate_paths=5,
+        short_rollout_horizon=3,
+        requested_capture_times=(1, 2),
+    )
+    active, audit = restrict_schedule_to_available_sources(
+        schedule, frame.iloc[[3, 1]].copy()
+    )
+
+    assert [key.initial_path_id for key in active.source_keys] == [1, 3]
+    assert audit["scheduled_source_count"] == 5
+    assert audit["available_source_count"] == 2
+    assert audit["missing_extinct_source_count"] == 3
+    assert audit["availability_rate"] == pytest.approx(0.4)
+    assert audit["replacement_sources_used"] is False
 
 
 def test_macro_training_does_not_require_horizon_100_and_long_rollout_not_primary():

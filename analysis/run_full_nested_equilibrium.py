@@ -55,6 +55,7 @@ from analysis.macro_parent_state_bank import (  # noqa: E402
     build_one_step_macro_dataset,
     distribution_coverage,
     effective_capture_times,
+    harvest_available_macro_parent_schedule_with_candidate,
     harvest_macro_parent_schedule,
     harvest_macro_parent_schedule_with_candidate,
     load_schedule,
@@ -1009,29 +1010,17 @@ def _build_or_refresh_macro_parent_context(
         )
         atomic_torch_save(validation_initial_path, macro_validation_initial)
 
-    validation_schedule_path = global_validation_root / "validation_source_schedule.json"
-    if validation_schedule_path.is_file():
-        validation_schedule = load_schedule(validation_schedule_path)
-        validation_harvest, validation_candidate, validation_candidate_occupancy = (
-            harvest_macro_parent_schedule_with_candidate(
-                models=models,
-                episode=episode,
-                initial_state=macro_validation_initial,
-                schedule=validation_schedule,
-                source_episode=equilibrium_outer,
-                branch_num=args.branch_num,
-                device=device,
-            )
-        )
-        validation_report = _schedule_report(
-            candidate=validation_candidate,
-            selected=validation_harvest.summary,
-            schedule=validation_schedule,
-            initial_audit=validation_harvest.initial_hash_audit,
-        )
+    global_validation_schedule_path = (
+        global_validation_root / "validation_source_schedule.json"
+    )
+    outer_validation_schedule_path = parent_root / "validation_source_schedule.json"
+    global_validation_created = False
+    if global_validation_schedule_path.is_file():
+        global_validation_schedule = load_schedule(global_validation_schedule_path)
     else:
+        global_validation_created = True
         (
-            validation_schedule,
+            global_validation_schedule,
             validation_harvest,
             validation_candidate,
             validation_candidate_occupancy,
@@ -1053,8 +1042,95 @@ def _build_or_refresh_macro_parent_context(
             selection_seed=validation_seed + 21,
             device=device,
         )
-        save_schedule(validation_schedule_path, validation_schedule)
-    save_schedule(parent_root / "validation_source_schedule.json", validation_schedule)
+        save_schedule(global_validation_schedule_path, global_validation_schedule)
+
+    if outer_validation_schedule_path.is_file():
+        validation_schedule = load_schedule(outer_validation_schedule_path)
+        validation_harvest, validation_candidate, validation_candidate_occupancy = (
+            harvest_macro_parent_schedule_with_candidate(
+                models=models,
+                episode=episode,
+                initial_state=macro_validation_initial,
+                schedule=validation_schedule,
+                source_episode=equilibrium_outer,
+                branch_num=args.branch_num,
+                device=device,
+            )
+        )
+        validation_report = _schedule_report(
+            candidate=validation_candidate,
+            selected=validation_harvest.summary,
+            schedule=validation_schedule,
+            initial_audit=validation_harvest.initial_hash_audit,
+        )
+        global_keys = {
+            key.canonical for key in global_validation_schedule.source_keys
+        }
+        active_keys = {key.canonical for key in validation_schedule.source_keys}
+        if not active_keys.issubset(global_keys):
+            raise RuntimeError(
+                "outer validation schedule is not a subset of the fixed global schedule"
+            )
+        missing_keys = [
+            key for key in global_validation_schedule.source_keys
+            if key.canonical not in active_keys
+        ]
+        validation_availability = {
+            "global_schedule_fingerprint": global_validation_schedule.fingerprint,
+            "active_schedule_fingerprint": validation_schedule.fingerprint,
+            "scheduled_source_count": len(global_validation_schedule.source_keys),
+            "available_source_count": len(validation_schedule.source_keys),
+            "missing_extinct_source_count": len(missing_keys),
+            "availability_rate": float(
+                len(validation_schedule.source_keys)
+                / max(len(global_validation_schedule.source_keys), 1)
+            ),
+            "missing_extinct_source_keys": [key.to_dict() for key in missing_keys],
+            "replacement_sources_used": False,
+            "censoring_reason": "PRODUCTION_ROLLOUT_PATH_EXTINCT",
+        }
+    elif not global_validation_created:
+        (
+            validation_schedule,
+            validation_harvest,
+            validation_candidate,
+            validation_candidate_occupancy,
+            validation_availability,
+        ) = harvest_available_macro_parent_schedule_with_candidate(
+            models=models,
+            episode=episode,
+            initial_state=macro_validation_initial,
+            schedule=global_validation_schedule,
+            source_episode=equilibrium_outer,
+            branch_num=args.branch_num,
+            device=device,
+        )
+        validation_report = _schedule_report(
+            candidate=validation_candidate,
+            selected=validation_harvest.summary,
+            schedule=validation_schedule,
+            initial_audit=validation_harvest.initial_hash_audit,
+        )
+        save_schedule(outer_validation_schedule_path, validation_schedule)
+    else:
+        validation_schedule = global_validation_schedule
+        save_schedule(outer_validation_schedule_path, validation_schedule)
+        validation_availability = {
+            "global_schedule_fingerprint": global_validation_schedule.fingerprint,
+            "active_schedule_fingerprint": validation_schedule.fingerprint,
+            "scheduled_source_count": len(global_validation_schedule.source_keys),
+            "available_source_count": len(validation_schedule.source_keys),
+            "missing_extinct_source_count": 0,
+            "availability_rate": 1.0,
+            "missing_extinct_source_keys": [],
+            "replacement_sources_used": False,
+            "censoring_reason": "PRODUCTION_ROLLOUT_PATH_EXTINCT",
+        }
+    validation_report["global_validation_availability"] = validation_availability
+    atomic_write_json(
+        parent_root / "global_validation_availability.json",
+        validation_availability,
+    )
 
     split_audit = source_overlap(train_schedule, validation_schedule)
     if split_audit["overlap_count"]:

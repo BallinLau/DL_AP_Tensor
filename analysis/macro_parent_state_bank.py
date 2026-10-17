@@ -9,7 +9,7 @@ at the top of the production tensor simulation loop and are resumed through
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -958,6 +958,42 @@ def source_overlap(
     }
 
 
+def restrict_schedule_to_available_sources(
+    schedule: MacroParentSourceSchedule,
+    candidate_summary: pd.DataFrame,
+) -> tuple[MacroParentSourceSchedule, dict[str, Any]]:
+    """Keep the fixed source order while censoring economically extinct rows.
+
+    A global validation schedule is fixed across equilibrium outers, while the
+    Firm solution is not.  Production ``StateBank`` correctly omits a path once
+    its cross-section is extinct, so such a source cannot supply the required
+    two one-step child branches.  We never replace it with a new random source:
+    the active schedule is the ordered available subset, and the censoring is
+    recorded explicitly for cross-outer diagnostics.
+    """
+    available = set(map(str, candidate_summary["source_key"].tolist()))
+    retained = tuple(key for key in schedule.source_keys if key.canonical in available)
+    missing = tuple(key for key in schedule.source_keys if key.canonical not in available)
+    if not retained:
+        raise RuntimeError(
+            "fixed macro parent source schedule has no non-extinct sources under "
+            "the current Firm solution"
+        )
+    active = replace(schedule, source_keys=retained)
+    audit = {
+        "global_schedule_fingerprint": schedule.fingerprint,
+        "active_schedule_fingerprint": active.fingerprint,
+        "scheduled_source_count": len(schedule.source_keys),
+        "available_source_count": len(retained),
+        "missing_extinct_source_count": len(missing),
+        "availability_rate": float(len(retained) / max(len(schedule.source_keys), 1)),
+        "missing_extinct_source_keys": [key.to_dict() for key in missing],
+        "replacement_sources_used": False,
+        "censoring_reason": "PRODUCTION_ROLLOUT_PATH_EXTINCT",
+    }
+    return active, audit
+
+
 def prepare_macro_parent_schedule(
     *,
     models: Mapping[str, torch.nn.Module],
@@ -1143,6 +1179,67 @@ def harvest_macro_parent_schedule_with_candidate(
         ),
         candidate,
         candidate_occupancy,
+    )
+
+
+def harvest_available_macro_parent_schedule_with_candidate(
+    *,
+    models: Mapping[str, torch.nn.Module],
+    episode: Any,
+    initial_state: Mapping[str, torch.Tensor],
+    schedule: MacroParentSourceSchedule,
+    source_episode: int,
+    branch_num: int,
+    device: torch.device,
+) -> tuple[
+    MacroParentSourceSchedule,
+    HarvestedParentBank,
+    pd.DataFrame,
+    np.ndarray,
+    dict[str, Any],
+]:
+    """Harvest the ordered non-extinct subset of a cross-outer schedule."""
+    bank, output, initial_audit = run_short_rollout_harvest(
+        models=models,
+        episode=episode,
+        initial_state=initial_state,
+        split=schedule.split,
+        source_episode=source_episode,
+        initial_state_seed=schedule.initial_state_seed,
+        transition_seed=schedule.transition_seed,
+        entry_seed=schedule.entry_seed,
+        short_rollout_horizon=schedule.short_rollout_horizon,
+        capture_times=schedule.requested_capture_times,
+        branch_num=branch_num,
+        device=device,
+    )
+    candidate, candidate_occupancy, _ = summarize_parent_bank(
+        bank,
+        output.macro,
+        split=schedule.split,
+        initial_state_seed=schedule.initial_state_seed,
+        config=episode.config,
+    )
+    active_schedule, availability_audit = restrict_schedule_to_available_sources(
+        schedule, candidate
+    )
+    entry_ids, selected, occupancy = select_scheduled_entries(
+        bank, candidate, active_schedule
+    )
+    harvested = HarvestedParentBank(
+        bank=bank,
+        selected_entry_ids=entry_ids,
+        summary=selected,
+        occupancy=occupancy,
+        simulation_output=output,
+        initial_hash_audit=initial_audit,
+    )
+    return (
+        active_schedule,
+        harvested,
+        candidate,
+        candidate_occupancy,
+        availability_audit,
     )
 
 
