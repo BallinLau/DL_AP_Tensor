@@ -192,9 +192,23 @@ def test_l1_max_outer_eight_is_strict():
 
 
 def test_two_cycle_detector_synthetic():
-    a = torch.zeros(16)
-    b = torch.ones(16)
-    assert two_cycle_detect(a, b, a)
+    one = torch.ones(16)
+    minus_one = -one
+    assert two_cycle_detect(one, minus_one, one)
+
+
+def test_damped_oscillation_is_not_a_two_cycle():
+    one = torch.ones(16)
+    minus_half = torch.full((16,), -0.5)
+    quarter = torch.full((16,), 0.25)
+    assert not two_cycle_detect(one, minus_half, quarter)
+
+
+def test_monotone_damping_is_not_a_two_cycle():
+    one = torch.ones(16)
+    half = torch.full((16,), 0.5)
+    quarter = torch.full((16,), 0.25)
+    assert not two_cycle_detect(one, half, quarter)
 
 
 def test_resume_roundtrip_preserves_frozen_hash(tmp_path: Path):

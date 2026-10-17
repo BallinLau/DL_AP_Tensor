@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -54,6 +55,21 @@ DEFAULT_REPORT = ROOT / "reports" / "macro_block_isolation_20261017.md"
 BLOCK_NAMES = ("fc1_c", "fc1_k", "sdf", "joint", "frozen")
 FUNCTION_NAMES = ("m", "fc1_c", "fc1_k")
 TARGET_NAMES = ("hatc", "lnk")
+
+
+@dataclass(frozen=True)
+class TwoCycleDiagnosticsConfig:
+    """Diagnostic thresholds for a non-decaying period-two candidate.
+
+    A negative update direction alone is only oscillation.  A strict
+    period-two candidate must also return close to the state from two updates
+    ago and retain most of the preceding update amplitude.
+    """
+
+    cosine_max: float = -0.5
+    two_step_to_one_step_max: float = 0.5
+    amplitude_ratio_min: float = 0.8
+    consecutive_required: int = 2
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -378,16 +394,20 @@ def two_cycle_detect(
     previous: torch.Tensor,
     current: torch.Tensor,
     *,
-    ratio_threshold: float = 0.25,
+    config: Optional[TwoCycleDiagnosticsConfig] = None,
 ) -> bool:
+    config = config or TwoCycleDiagnosticsConfig()
     delta_previous = previous - two_back
     delta_current = current - previous
     relation = movement_relation(delta_previous, delta_current)
     distance_one = torch.linalg.vector_norm(delta_current.to(torch.float64))
     distance_two = torch.linalg.vector_norm((current - two_back).to(torch.float64))
+    amplitude_ratio = relation["norm_gain"]
+    two_step_ratio = float(distance_two / (distance_one + 1e-12))
     return bool(
-        distance_two < ratio_threshold * (distance_one + 1e-12)
-        and relation["movement_cosine"] < 0.0
+        relation["movement_cosine"] < config.cosine_max
+        and two_step_ratio < config.two_step_to_one_step_max
+        and amplitude_ratio > config.amplitude_ratio_min
     )
 
 
@@ -1150,6 +1170,8 @@ def run_l1_branch(
     val_frames: list[pd.DataFrame] = []
     target_vectors: list[dict[str, torch.Tensor]] = []
     stop_reason = "max_outer"
+    two_cycle_config = TwoCycleDiagnosticsConfig()
+    two_cycle_counts = {name: 0 for name in FUNCTION_NAMES}
 
     for outer in range(args.l1_max_outer + 1):
         set_macro_scope(model, "frozen")
@@ -1189,18 +1211,38 @@ def run_l1_branch(
                         function_states[-1][name] - function_states[-2][name],
                     )
                     row.update({f"function_{name}_{key}": value for key, value in relation.items()})
+                candidates = {
+                    name: two_cycle_detect(
+                        function_states[-3][name],
+                        function_states[-2][name],
+                        function_states[-1][name],
+                        config=two_cycle_config,
+                    )
+                    for name in FUNCTION_NAMES
+                }
+                for name, candidate in candidates.items():
+                    two_cycle_counts[name] = two_cycle_counts[name] + 1 if candidate else 0
+                    row[f"function_{name}_two_cycle_candidate"] = candidate
+                    row[f"function_{name}_two_cycle_consecutive"] = two_cycle_counts[name]
+                    row[f"function_{name}_negative_directional_movement"] = bool(
+                        row[f"function_{name}_movement_cosine"] < 0.0
+                    )
                 possible = any(
-                    two_cycle_detect(
-                        function_states[-3][name], function_states[-2][name], function_states[-1][name]
-                    ) for name in FUNCTION_NAMES
+                    count >= two_cycle_config.consecutive_required
+                    for count in two_cycle_counts.values()
                 )
-                row["possible_two_cycle"] = possible
+                row["negative_directional_movement"] = any(
+                    row[f"function_{name}_negative_directional_movement"]
+                    for name in FUNCTION_NAMES
+                )
+                row["possible_two_cycle_strict"] = possible
+                row["possible_two_cycle"] = possible  # compatibility alias
                 if possible:
-                    stop_reason = "possible_two_cycle"
+                    stop_reason = "possible_two_cycle_strict"
         rows.append(row)
         pd.DataFrame(rows).to_csv(branch_root / "metrics.csv", index=False)
         print(json.dumps({"l1_branch": branch, "outer_complete": outer, **row}, default=str), flush=True)
-        if stop_reason == "possible_two_cycle" or outer == args.l1_max_outer:
+        if stop_reason == "possible_two_cycle_strict" or outer == args.l1_max_outer:
             break
 
         current_batches = build_in_memory_batches(
