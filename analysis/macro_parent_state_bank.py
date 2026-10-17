@@ -876,13 +876,27 @@ def distribution_coverage(frame: pd.DataFrame) -> dict[str, Any]:
 
 def parent_summary_movement(
     old: pd.DataFrame, new: pd.DataFrame
-) -> dict[str, float]:
+) -> dict[str, Any]:
     left = old.set_index("source_key")
     right = new.set_index("source_key")
-    if set(left.index) != set(right.index):
-        raise RuntimeError("macro parent-bank movement source keys are not aligned")
-    right = right.loc[left.index]
-    result = {}
+    left_keys = list(map(str, left.index))
+    right_keys = set(map(str, right.index))
+    common = [key for key in left_keys if key in right_keys]
+    if not common:
+        raise RuntimeError("macro parent-bank movement has no common source keys")
+    left = left.loc[common]
+    right = right.loc[common]
+    result: dict[str, Any] = {
+        "old_source_count": int(len(old)),
+        "new_source_count": int(len(new)),
+        "common_source_count": int(len(common)),
+        "dropped_source_count": int(len(set(left_keys).difference(right_keys))),
+        "added_source_count": int(
+            len(set(map(str, new["source_key"])).difference(left_keys))
+        ),
+        "common_source_share_of_old": float(len(common) / max(len(old), 1)),
+        "movement_alignment": "COMMON_FIXED_SOURCE_KEYS_ONLY",
+    }
     for name in (*SUMMARY_FEATURES, "K_total", "Hatc", "LnK", "n_alive"):
         old_value = torch.as_tensor(left[name].to_numpy(dtype=np.float64))
         new_value = torch.as_tensor(right[name].to_numpy(dtype=np.float64))

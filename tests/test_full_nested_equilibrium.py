@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 
+import pandas as pd
 import pytest
 import torch
 
@@ -17,7 +18,8 @@ from analysis.nested_equilibrium_utils import (
     publish_checkpoint,
     run_with_oom_fallback,
 )
-from analysis.run_full_nested_equilibrium import parse_args
+from analysis.run_full_nested_equilibrium import _one_step_target_movements, parse_args
+from data.tensor_data import TensorTable
 
 
 def _models() -> dict[str, torch.nn.Module]:
@@ -79,6 +81,39 @@ def test_recursive_sdf_and_fc2_are_rejected():
         parse_args(["--cold-start", "--sdf-recursive-epochs", "1"])
     with pytest.raises(SystemExit):
         parse_args(["--cold-start", "--no-disable-fc2"])
+
+
+def test_one_step_target_movement_aligns_common_sources_after_censoring():
+    columns = ["path", "t", "branch", "Hatc_t1", "LnK_t1"]
+
+    def table(path_start: int, offset: float) -> TensorTable:
+        rows = []
+        for local_path in range(3):
+            for branch in range(2):
+                rows.append([
+                    path_start + local_path,
+                    1,
+                    branch,
+                    10.0 + local_path + branch + offset,
+                    20.0 + local_path + branch + offset,
+                ])
+        return TensorTable(data=torch.tensor(rows), columns=columns)
+
+    old_summary = pd.DataFrame({"source_key": ["a", "b", "c"]})
+    new_summary = pd.DataFrame({"source_key": ["b", "c", "d"]})
+    movement = _one_step_target_movements(
+        table(100, 0.0),
+        table(200, 0.25),
+        old_summary,
+        new_summary,
+    )
+
+    assert movement["old_source_count"] == 3
+    assert movement["new_source_count"] == 3
+    assert movement["common_source_count"] == 2
+    assert movement["common_pair_row_count"] == 4
+    assert movement["movement_alignment"] == "COMMON_FIXED_SOURCE_KEYS_ONLY"
+    assert movement["Hatc_target_move"] > 0.0
 
 
 def test_a800_launcher_enforces_single_gpu_and_formal_modes():

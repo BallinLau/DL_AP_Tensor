@@ -56,7 +56,6 @@ from analysis.macro_parent_state_bank import (  # noqa: E402
     distribution_coverage,
     effective_capture_times,
     harvest_available_macro_parent_schedule_with_candidate,
-    harvest_macro_parent_schedule,
     harvest_macro_parent_schedule_with_candidate,
     load_schedule,
     parent_summary_movement,
@@ -678,17 +677,51 @@ def _path_and_target_movements(old: pd.DataFrame, new: pd.DataFrame) -> dict[str
     return result
 
 
-def _one_step_target_movements(old: Any, new: Any) -> dict[str, float]:
-    left = _to_frame(old).sort_values(["path", "t", "branch"]).reset_index(drop=True)
-    right = _to_frame(new).sort_values(["path", "t", "branch"]).reset_index(drop=True)
-    identity = ["path", "t", "branch"]
-    if not left[identity].equals(right[identity]):
-        raise RuntimeError("one-step target rows are not source-key aligned")
-    result = {}
+def _pairs_with_source_keys(pairs: Any, summary: pd.DataFrame) -> pd.DataFrame:
+    frame = _to_frame(pairs).copy()
+    paths = sorted(map(int, frame["path"].unique()))
+    keys = list(map(str, summary["source_key"].tolist()))
+    if len(paths) != len(keys):
+        raise RuntimeError(
+            "one-step pair/source-key cardinality mismatch: "
+            f"paths={len(paths)}, source_keys={len(keys)}"
+        )
+    frame["source_key"] = frame["path"].map(dict(zip(paths, keys)))
+    if frame["source_key"].isna().any():
+        raise RuntimeError("one-step pair rows could not be mapped to source keys")
+    return frame
+
+
+def _one_step_target_movements(
+    old: Any,
+    new: Any,
+    old_summary: pd.DataFrame,
+    new_summary: pd.DataFrame,
+) -> dict[str, Any]:
+    left = _pairs_with_source_keys(old, old_summary)
+    right = _pairs_with_source_keys(new, new_summary)
+    identity = ["source_key", "t", "branch"]
+    aligned = left.merge(
+        right,
+        on=identity,
+        how="inner",
+        suffixes=("_old", "_new"),
+        validate="one_to_one",
+    ).sort_values(identity).reset_index(drop=True)
+    if aligned.empty:
+        raise RuntimeError("one-step target movement has no common source keys")
+    common_sources = int(aligned["source_key"].nunique())
+    result: dict[str, Any] = {
+        "old_source_count": int(len(old_summary)),
+        "new_source_count": int(len(new_summary)),
+        "common_source_count": common_sources,
+        "common_pair_row_count": int(len(aligned)),
+        "movement_alignment": "COMMON_FIXED_SOURCE_KEYS_ONLY",
+    }
     for column, label in (("Hatc_t1", "Hatc"), ("LnK_t1", "LnK")):
         metrics = movement_metrics(
-            torch.as_tensor(left[column].to_numpy()),
-            torch.as_tensor(right[column].to_numpy()),
+            torch.as_tensor(aligned[f"{column}_old"].to_numpy()),
+            torch.as_tensor(aligned[f"{column}_new"].to_numpy()),
             label.lower(),
         )
         result[f"{label}_target_move"] = metrics[f"{label.lower()}_nmae"]
@@ -1989,7 +2022,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 atomic_write_json(macro_inner_root / "sdf" / "summary.json", sdf_summary)
                 simulation_started = time.perf_counter()
-                post_train_harvest = harvest_macro_parent_schedule(
+                (
+                    _,
+                    post_train_harvest,
+                    _,
+                    _,
+                    post_train_availability,
+                ) = harvest_available_macro_parent_schedule_with_candidate(
                     models=models,
                     episode=episode,
                     initial_state=macro_train_initial,
@@ -1998,7 +2037,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     branch_num=args.branch_num,
                     device=device,
                 )
-                post_validation_harvest = harvest_macro_parent_schedule(
+                (
+                    _,
+                    post_validation_harvest,
+                    _,
+                    _,
+                    post_validation_availability,
+                ) = harvest_available_macro_parent_schedule_with_candidate(
                     models=models,
                     episode=episode,
                     initial_state=macro_validation_initial,
@@ -2038,6 +2083,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     post_validation_harvest,
                     post_train_dataset,
                     post_validation_dataset,
+                    {
+                        "train": post_train_availability,
+                        "validation": post_validation_availability,
+                    },
                     time.perf_counter() - simulation_started,
                 )
 
@@ -2056,6 +2105,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 current_validation_harvest,
                 current_train_dataset,
                 current_validation_dataset,
+                source_availability,
                 simulation_seconds,
             ) = result
             atomic_write_json(
@@ -2067,6 +2117,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "validation_pair_rows": len(current_validation_dataset.pairs),
                     "train_parent_batch_size": current_train_dataset.used_parent_batch_size,
                     "validation_parent_batch_size": current_validation_dataset.used_parent_batch_size,
+                    "source_availability": source_availability,
                     "long_rollout_training_used": False,
                 },
             )
@@ -2087,10 +2138,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     old_functions[name], current_functions[name], name
                 )
             target_moves = _one_step_target_movements(
-                old_validation_pairs, current_validation_dataset.pairs
+                old_validation_pairs,
+                current_validation_dataset.pairs,
+                old_validation_parent_summary,
+                current_validation_harvest.summary,
             )
             parent_moves = parent_summary_movement(
                 old_validation_parent_summary, current_validation_harvest.summary
+            )
+            atomic_write_json(
+                macro_inner_root / "source_availability_audit.json",
+                {
+                    **source_availability,
+                    "target_movement_alignment": {
+                        key: value for key, value in target_moves.items()
+                        if key not in {"Hatc_target_move", "LnK_target_move"}
+                    },
+                    "parent_movement_alignment": {
+                        key: value for key, value in parent_moves.items()
+                        if not key.endswith(("_nmae", "_p90"))
+                    },
+                },
             )
             atomic_write_json(
                 macro_inner_root / "parent_bank_summary_movement.json", parent_moves
@@ -2117,7 +2185,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "path_gate_pass": False,
                 "long_path_metrics_deferred_to_diagnostic": True,
                 "parent_bank_summary_movement_max": max(
-                    value for value in parent_moves.values() if math.isfinite(value)
+                    value for key, value in parent_moves.items()
+                    if key.endswith(("_nmae", "_p90"))
+                    and math.isfinite(value)
                 ),
                 "FC1_C_val_R2": fc1_summary["best_validation"].get("hatc_r2", float("nan")),
                 "FC1_K_val_R2": fc1_summary["best_validation"].get("lnk_r2", float("nan")),

@@ -19,6 +19,7 @@ from analysis.macro_parent_state_bank import (
     effective_capture_times,
     harvest_macro_parent_schedule,
     initial_cross_section_hash_audit,
+    parent_summary_movement,
     prepare_macro_parent_schedule,
     restrict_schedule_to_available_sources,
     run_short_rollout_harvest,
@@ -320,6 +321,23 @@ def test_global_schedule_censors_extinct_sources_without_replacement():
     assert audit["missing_extinct_source_count"] == 3
     assert audit["availability_rate"] == pytest.approx(0.4)
     assert audit["replacement_sources_used"] is False
+
+
+def test_parent_summary_movement_aligns_common_sources_after_censoring():
+    frame = _candidate_frame(4)
+    old = frame.iloc[[0, 1, 2]].copy()
+    new = frame.iloc[[1, 2, 3]].copy()
+    new.loc[:, "b_mean"] += 0.1
+
+    movement = parent_summary_movement(old, new)
+
+    assert movement["old_source_count"] == 3
+    assert movement["new_source_count"] == 3
+    assert movement["common_source_count"] == 2
+    assert movement["dropped_source_count"] == 1
+    assert movement["added_source_count"] == 1
+    assert movement["movement_alignment"] == "COMMON_FIXED_SOURCE_KEYS_ONLY"
+    assert movement["b_mean_nmae"] > 0.0
 
 
 def test_macro_training_does_not_require_horizon_100_and_long_rollout_not_primary():
