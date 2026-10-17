@@ -66,6 +66,20 @@ def test_recursive_sdf_and_fc2_are_rejected():
         parse_args(["--cold-start", "--no-disable-fc2"])
 
 
+def test_a800_launcher_enforces_single_gpu_and_formal_modes():
+    source = (ROOT / "slurm" / "run_full_nested_equilibrium_a800.slurm").read_text(
+        encoding="utf-8"
+    )
+    assert "#SBATCH -p a01" in source
+    assert "#SBATCH --gres=gpu:a800:1" in source
+    assert "export CUDA_VISIBLE_DEVICES=0" in source
+    assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in source
+    assert "--sdf-recursive-epochs 0" in source
+    assert "--disable-fc2" in source
+    assert "--q-solver picard" in source
+    assert 'REQUIRED_COMMIT="${REQUIRED_COMMIT:?' in source
+
+
 def test_atomic_json_has_no_partial_generation(tmp_path: Path):
     path = tmp_path / "state.json"
     atomic_write_json(path, {"generation": 1})
