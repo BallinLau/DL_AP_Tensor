@@ -918,7 +918,7 @@ def fresh_macro_model(
 
 
 def run_l0(args: argparse.Namespace, output: Path, device: torch.device) -> dict[str, Any]:
-    episode, _, models, provenance = fresh_macro_model(args, device)
+    episode, models, provenance = fresh_macro_model(args, device)
     fc2 = models.get("fc2")
     fc2_counter = {"calls": 0}
     fc2_hash_before = module_hash(fc2)
