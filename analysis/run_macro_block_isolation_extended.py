@@ -136,6 +136,35 @@ def verify_resume_probe(
     }
 
 
+def _finite_pair(
+    left: torch.Tensor, right: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    left = left.detach().reshape(-1).to(torch.float64)
+    right = right.detach().reshape(-1).to(torch.float64)
+    if left.shape != right.shape:
+        raise ValueError(
+            f"diagnostic vectors must share a keyed shape, got {left.shape} and {right.shape}"
+        )
+    finite = torch.isfinite(left) & torch.isfinite(right)
+    if not bool(finite.any()):
+        raise ValueError("diagnostic vectors have no common finite observations")
+    return left[finite], right[finite], finite
+
+
+def finite_movement_metrics(
+    old: torch.Tensor, new: torch.Tensor, prefix: str = ""
+) -> dict[str, float]:
+    old_finite, new_finite, common = _finite_pair(old, new)
+    result = movement_metrics(old_finite, new_finite, prefix)
+    tag = f"{prefix}_" if prefix else ""
+    union = torch.isfinite(old.detach().reshape(-1)) | torch.isfinite(
+        new.detach().reshape(-1)
+    )
+    result[f"{tag}n_common"] = int(common.sum())
+    result[f"{tag}overlap_share"] = float(common.sum() / union.sum().clamp_min(1))
+    return result
+
+
 def strict_cycle_fields(
     two_back: torch.Tensor,
     previous: torch.Tensor,
@@ -144,25 +173,72 @@ def strict_cycle_fields(
 ) -> dict[str, Any]:
     delta_previous = previous - two_back
     delta_current = current - previous
-    relation = movement_relation(delta_previous, delta_current)
-    distance_one = torch.linalg.vector_norm(delta_current.reshape(-1).to(torch.float64))
-    distance_two = torch.linalg.vector_norm((current - two_back).reshape(-1).to(torch.float64))
+    previous_finite, current_finite, common = _finite_pair(
+        delta_previous, delta_current
+    )
+    relation = movement_relation(previous_finite, current_finite)
+    distance_one = torch.linalg.vector_norm(current_finite)
+    distance_two = torch.linalg.vector_norm(
+        (current - two_back).reshape(-1).to(torch.float64)[common]
+    )
     return {
         **relation,
         "two_step_to_one_step": float(distance_two / (distance_one + 1e-12)),
+        "n_common": int(common.sum()),
+        "overlap_share": float(common.to(torch.float64).mean()),
         "negative_directional_movement": bool(relation["movement_cosine"] < 0.0),
         "damped_oscillation": bool(
             relation["movement_cosine"] < config.cosine_max
             and relation["norm_gain"] < config.amplitude_ratio_min
         ),
         "two_cycle_candidate": two_cycle_detect(
-            two_back, previous, current, config=config
+            two_back.reshape(-1)[common],
+            previous.reshape(-1)[common],
+            current.reshape(-1)[common],
+            config=config,
         ),
     }
 
 
-def sorted_macro_vectors(frame: pd.DataFrame) -> dict[str, torch.Tensor]:
-    ordered = frame.sort_values(["path", "t", "branch"])
+def sorted_macro_vectors(
+    frame: pd.DataFrame,
+    *,
+    expected_paths: Optional[int] = None,
+    expected_horizon: Optional[int] = None,
+    branch_num: Optional[int] = None,
+) -> dict[str, torch.Tensor]:
+    keys = ["path", "t", "branch"]
+    if frame.duplicated(keys).any():
+        duplicates = int(frame.duplicated(keys, keep=False).sum())
+        raise ValueError(
+            f"macro diagnostics require unique {keys}; duplicates={duplicates}"
+        )
+    paths = (
+        np.arange(expected_paths)
+        if expected_paths is not None
+        else np.arange(int(frame["path"].min()), int(frame["path"].max()) + 1)
+    )
+    times = (
+        np.arange(expected_horizon + 1)
+        if expected_horizon is not None
+        else np.arange(int(frame["t"].min()), int(frame["t"].max()) + 1)
+    )
+    branches = (
+        np.arange(-1, branch_num)
+        if branch_num is not None
+        else np.sort(frame["branch"].unique())
+    )
+    observed = frame[keys]
+    if (
+        not observed["path"].between(int(paths.min()), int(paths.max())).all()
+        or not observed["t"].between(int(times.min()), int(times.max())).all()
+        or not observed["branch"].isin(branches).all()
+    ):
+        raise ValueError(
+            "macro diagnostic key lies outside the requested fixed lattice"
+        )
+    full_index = pd.MultiIndex.from_product([paths, times, branches], names=keys)
+    ordered = frame.set_index(keys).sort_index().reindex(full_index)
     return {
         "target_hatc": torch.from_numpy(ordered["Hatc"].to_numpy(np.float64)),
         "target_lnk": torch.from_numpy(ordered["LnK"].to_numpy(np.float64)),
@@ -177,8 +253,21 @@ def combined_vectors(
     functions: Mapping[str, torch.Tensor], frame: pd.DataFrame
 ) -> dict[str, torch.Tensor]:
     result = sorted_macro_vectors(frame)
-    result.update({f"function_{name}": functions[name].detach().cpu() for name in FUNCTION_NAMES})
+    result.update(
+        {f"function_{name}": functions[name].detach().cpu() for name in FUNCTION_NAMES}
+    )
     return result
+
+
+def simulation_macro_vectors(
+    args: argparse.Namespace, frame: pd.DataFrame
+) -> dict[str, torch.Tensor]:
+    return sorted_macro_vectors(
+        frame,
+        expected_paths=args.validation_paths,
+        expected_horizon=args.simulation_horizon,
+        branch_num=args.branch_num,
+    )
 
 
 def add_transition_metrics(
@@ -192,7 +281,7 @@ def add_transition_metrics(
     any_negative = False
     for name, values in histories.items():
         if len(values) >= 2:
-            row.update(movement_metrics(values[-2], values[-1], name))
+            row.update(finite_movement_metrics(values[-2], values[-1], name))
         if len(values) < 3:
             continue
         diagnostics = strict_cycle_fields(values[-3], values[-2], values[-1], config)
@@ -205,7 +294,9 @@ def add_transition_metrics(
         row[f"{name}_possible_two_cycle_strict"] = strict
         any_strict = any_strict or strict
         any_damped = any_damped or bool(diagnostics["damped_oscillation"])
-        any_negative = any_negative or bool(diagnostics["negative_directional_movement"])
+        any_negative = any_negative or bool(
+            diagnostics["negative_directional_movement"]
+        )
     row["possible_two_cycle_strict"] = any_strict
     row["damped_oscillation_flag"] = any_damped
     row["negative_directional_movement"] = any_negative
@@ -215,7 +306,12 @@ def _prefix_metrics(prefix: str, values: Mapping[str, float]) -> dict[str, float
     return {f"{prefix}_{key}": float(value) for key, value in values.items()}
 
 
-def build_initial_states(args: argparse.Namespace, episode: Any, models: Mapping[str, Any], device: torch.device):
+def build_initial_states(
+    args: argparse.Namespace,
+    episode: Any,
+    models: Mapping[str, Any],
+    device: torch.device,
+):
     train = make_initial_state(
         models=models,
         episode=episode,
@@ -277,7 +373,9 @@ def simulate_state(
     }
 
 
-def _old_function_history(old_root: Path, branch: str, end_outer: int) -> dict[str, list[torch.Tensor]]:
+def _old_function_history(
+    old_root: Path, branch: str, end_outer: int
+) -> dict[str, list[torch.Tensor]]:
     start = max(0, end_outer - 2)
     states = [
         torch.load(
@@ -293,7 +391,9 @@ def _old_function_history(old_root: Path, branch: str, end_outer: int) -> dict[s
     }
 
 
-def _save_checkpoint(path: Path, model: torch.nn.Module, metadata: Mapping[str, Any]) -> None:
+def _save_checkpoint(
+    path: Path, model: torch.nn.Module, metadata: Mapping[str, Any]
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"sdf_fc1": model.state_dict(), "metadata": dict(metadata)}, path)
 
@@ -304,6 +404,88 @@ def _load_old_metrics(old_root: Path, branch: str) -> pd.DataFrame:
     frame.insert(0, "experiment", branch)
     frame.insert(1, "source", "original")
     return frame
+
+
+def partial_resume_outer(
+    root: Path, *, baseline_outer: int, final_outer: int, enabled: bool
+) -> Optional[int]:
+    if not root.exists():
+        ensure_new_output(root)
+        return None
+    if not enabled:
+        ensure_new_output(root)
+        return None
+    if (root / "summary.json").exists() or (root / "metrics.csv").exists():
+        raise FileExistsError(f"refusing to resume an already finalized branch: {root}")
+    allowed_names = {
+        "checkpoints",
+        f"functions_outer_{baseline_outer + 1:03d}_start.pt",
+        f"outer_{baseline_outer:03d}_fc1_solve",
+    }
+    unexpected = sorted(
+        path.name for path in root.iterdir() if path.name not in allowed_names
+    )
+    if unexpected:
+        raise RuntimeError(
+            f"partial recovery found unexpected artifacts in {root}: {unexpected}"
+        )
+    metrics = root / "metrics_extended_only.csv"
+    if metrics.exists():
+        raise FileExistsError(
+            "partial recovery currently requires failure before the first metric row; "
+            f"found {metrics}"
+        )
+    checkpoints = sorted((root / "checkpoints").glob("outer_*.pt"))
+    if len(checkpoints) != 1:
+        raise RuntimeError(
+            f"expected exactly one durable partial checkpoint in {root}, got {checkpoints}"
+        )
+    try:
+        recovered = int(checkpoints[0].stem.split("_")[-1])
+    except ValueError as exc:
+        raise RuntimeError(f"cannot parse partial checkpoint {checkpoints[0]}") from exc
+    if recovered != baseline_outer + 1 or recovered > final_outer:
+        raise RuntimeError(
+            f"unexpected partial checkpoint outer={recovered}; "
+            f"expected {baseline_outer + 1} and <= {final_outer}"
+        )
+    required = (
+        root / f"functions_outer_{recovered:03d}_start.pt",
+        root / f"outer_{recovered - 1:03d}_fc1_solve" / "summary.json",
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"partial recovery is missing durable artifacts: {missing}")
+    return recovered
+
+
+def branch_state_checkpoint(
+    old_root: Path,
+    extended_root: Path,
+    branch: str,
+    baseline_outer: int,
+    outer: int,
+) -> Path:
+    if outer <= baseline_outer:
+        return checkpoint_for_outer(old_root, branch, outer)
+    path = extended_root / "checkpoints" / f"outer_{outer:03d}.pt"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def branch_function_snapshot(
+    old_root: Path,
+    extended_root: Path,
+    branch: str,
+    baseline_outer: int,
+    outer: int,
+) -> Path:
+    base = old_root / "l1" / branch if outer <= baseline_outer else extended_root
+    path = base / f"functions_outer_{outer:03d}_start.pt"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
 
 
 def run_resumed_branch(
@@ -321,60 +503,133 @@ def run_resumed_branch(
     if branch not in {"fc1_only", "joint"}:
         raise ValueError(branch)
     root = args.output_dir / "l1" / output_name
-    ensure_new_output(root)
+    recovered_outer = partial_resume_outer(
+        root,
+        baseline_outer=resume_outer,
+        final_outer=final_outer,
+        enabled=args.recover_partial,
+    )
+    active_resume_outer = recovered_outer or resume_outer
     episode, models, _ = fresh_macro_model(args, device)
     model = models["sdf_fc1"]
     firm = models["policy_value"].requires_grad_(False).eval()
-    resume_checkpoint = checkpoint_for_outer(args.old_output_root, branch, resume_outer)
+    baseline_checkpoint = checkpoint_for_outer(
+        args.old_output_root, branch, resume_outer
+    )
+    load_full_state(baseline_checkpoint, model)
+    initial_sdf_hash = (
+        module_hash(model.sdf_model) + ":" + module_hash(model.value_model)
+    )
+    initial_fc1_hash = module_hash(model.fc1_model)
+    resume_checkpoint = branch_state_checkpoint(
+        args.old_output_root, root, branch, resume_outer, active_resume_outer
+    )
     load_full_state(resume_checkpoint, model)
     parity = verify_resume_probe(
         model,
         probe_parents,
         probe_children,
-        args.old_output_root / "l1" / branch / f"functions_outer_{resume_outer:03d}_start.pt",
+        branch_function_snapshot(
+            args.old_output_root, root, branch, resume_outer, active_resume_outer
+        ),
     )
     initial_firm_hashes = firm_hashes(firm)
-    initial_sdf_hash = module_hash(model.sdf_model) + ":" + module_hash(model.value_model)
-    initial_fc1_hash = module_hash(model.fc1_model)
     fc2 = models.get("fc2")
     fc2_counter = {"calls": 0}
     fc2_hash = module_hash(fc2)
     install_fc2_guard(fc2, fc2_counter)
-    train_initial, validation_initial, crn = build_initial_states(args, episode, models, device)
-
-    # Re-simulate only the preceding state to construct the first gain denominator.
-    previous_checkpoint = checkpoint_for_outer(args.old_output_root, branch, resume_outer - 1)
-    load_full_state(previous_checkpoint, model)
-    previous_sim = simulate_state(
-        args, episode, models, train_initial, validation_initial, device
+    train_initial, validation_initial, crn = build_initial_states(
+        args, episode, models, device
     )
-    previous_functions = snapshot_functions(model, probe_parents, probe_children)
+
+    # Re-simulate the last three durable states.  Besides supplying the gain
+    # denominator, this makes crash recovery independent of variable survivor
+    # counts because macro vectors are keyed on a fixed path/t/branch lattice.
+    history_outers = list(
+        range(max(1, active_resume_outer - 2), active_resume_outer + 1)
+    )
+    histories = {f"function_{name}": [] for name in FUNCTION_NAMES}
+    simulations: list[dict[str, Any]] = []
+    for outer in history_outers:
+        checkpoint = branch_state_checkpoint(
+            args.old_output_root, root, branch, resume_outer, outer
+        )
+        load_full_state(checkpoint, model)
+        simulation = simulate_state(
+            args, episode, models, train_initial, validation_initial, device
+        )
+        simulations.append(simulation)
+        actual_functions = snapshot_functions(model, probe_parents, probe_children)
+        expected_functions = torch.load(
+            branch_function_snapshot(
+                args.old_output_root, root, branch, resume_outer, outer
+            ),
+            map_location="cpu",
+            weights_only=True,
+        )
+        for name in FUNCTION_NAMES:
+            if not torch.equal(actual_functions[name].cpu(), expected_functions[name]):
+                raise RuntimeError(
+                    f"resumed {branch} function history mismatch for {name} at outer {outer}"
+                )
+            histories[f"function_{name}"].append(actual_functions[name].cpu())
+        vectors = simulation_macro_vectors(args, simulation["validation_frame"])
+        for key, value in vectors.items():
+            histories.setdefault(key, []).append(value)
+    current_sim = simulations[-1]
     load_full_state(resume_checkpoint, model)
-    current_sim = simulate_state(
-        args, episode, models, train_initial, validation_initial, device
-    )
-    current_functions = snapshot_functions(model, probe_parents, probe_children)
-
-    histories = _old_function_history(args.old_output_root, branch, resume_outer)
-    for key, value in sorted_macro_vectors(previous_sim["validation_frame"]).items():
-        histories[key] = [value]
-    for key, value in sorted_macro_vectors(current_sim["validation_frame"]).items():
-        histories[key].append(value)
-    # The checkpoint-derived function history is authoritative; these checks
-    # ensure diagnostic re-simulation did not silently alter the resumed state.
-    for name in FUNCTION_NAMES:
-        if not torch.equal(histories[f"function_{name}"][-1], current_functions[name].cpu()):
-            raise RuntimeError(f"resumed {branch} function history mismatch for {name}")
-        if not torch.equal(histories[f"function_{name}"][-2], previous_functions[name].cpu()):
-            raise RuntimeError(f"previous {branch} function history mismatch for {name}")
 
     rows: list[dict[str, Any]] = []
     cycle_counts = {name: 0 for name in TRACKED_VECTOR_NAMES}
     strict_config = args.two_cycle_config
     convergence_streak = 0
     stop_reason = "max_outer"
-    current_outer = resume_outer
+    current_outer = active_resume_outer
     minimum_outer = min(final_outer, resume_outer + (4 if branch == "joint" else 1))
+
+    if recovered_outer is not None:
+        solve_summary = read_json(
+            root / f"outer_{current_outer - 1:03d}_fc1_solve" / "summary.json"
+        )
+        row = {
+            "experiment": branch,
+            "source": "extended_recovered",
+            "outer": current_outer,
+            "conditional_source_outer": current_outer - 1,
+            "simulation_seconds": current_sim["seconds"],
+            "conditional_solve_seconds": float("nan"),
+            "target_hash": current_sim["target_hash"],
+            "M_data_hash": current_sim["data_hash_including_M"],
+            "crn_hash": stable_json_hash(crn),
+            "firm_hash_invariant": firm_hashes(firm) == initial_firm_hashes,
+            "fc2_hash_invariant": module_hash(fc2) == fc2_hash,
+            "fc2_forward_calls": fc2_counter["calls"],
+            "recovered_from_durable_checkpoint": True,
+            **_prefix_metrics("conditional_train", solve_summary["best_train"]),
+            **_prefix_metrics(
+                "conditional_validation", solve_summary["best_validation"]
+            ),
+        }
+        add_transition_metrics(row, histories, cycle_counts, strict_config)
+        joint_gate = (
+            row.get("function_fc1_c_nmae", math.inf) < 0.005
+            and row.get("function_fc1_k_nmae", math.inf) < 0.005
+            and (branch != "joint" or row.get("function_m_nmae", math.inf) < 0.005)
+            and row.get("target_hatc_nmae", math.inf) < 0.01
+            and row.get("target_lnk_nmae", math.inf) < 0.01
+        )
+        convergence_streak = 1 if joint_gate else 0
+        row["conditional_macro_fixed_point_streak"] = convergence_streak
+        row["conditional_macro_fixed_point_reached"] = False
+        rows.append(row)
+        pd.DataFrame(rows).to_csv(root / "metrics_extended_only.csv", index=False)
+        print(
+            json.dumps(
+                {"branch": branch, "outer_recovered": current_outer, **row},
+                default=str,
+            ),
+            flush=True,
+        )
 
     while current_outer < final_outer:
         before_firm = firm_hashes(firm)
@@ -387,7 +642,9 @@ def run_resumed_branch(
                 current_sim["batches"]["fc1_validation"],
                 root / f"outer_{current_outer:03d}_fc1_solve",
                 block="joint",
-                production_epochs=min(args.production_fc1_epochs, budgets["fc1_epochs"]),
+                production_epochs=min(
+                    args.production_fc1_epochs, budgets["fc1_epochs"]
+                ),
                 max_epochs=budgets["fc1_epochs"],
                 patience=args.fc1_patience,
                 log_interval=args.log_interval,
@@ -400,7 +657,9 @@ def run_resumed_branch(
                 current_sim["batches"]["fc1_validation"],
                 root / f"outer_{current_outer:03d}_fc1_solve",
                 block="joint",
-                production_epochs=min(args.production_fc1_epochs, budgets["fc1_epochs"]),
+                production_epochs=min(
+                    args.production_fc1_epochs, budgets["fc1_epochs"]
+                ),
                 max_epochs=budgets["fc1_epochs"],
                 patience=args.fc1_patience,
                 log_interval=args.log_interval,
@@ -424,14 +683,20 @@ def run_resumed_branch(
         _save_checkpoint(
             root / "checkpoints" / f"outer_{current_outer:03d}.pt",
             model,
-            {"branch": branch, "outer": current_outer, "source_outer": current_outer - 1},
+            {
+                "branch": branch,
+                "outer": current_outer,
+                "source_outer": current_outer - 1,
+            },
         )
         next_sim = simulate_state(
             args, episode, models, train_initial, validation_initial, device
         )
         for name in FUNCTION_NAMES:
             histories[f"function_{name}"].append(functions[name].detach().cpu())
-        for key, value in sorted_macro_vectors(next_sim["validation_frame"]).items():
+        for key, value in simulation_macro_vectors(
+            args, next_sim["validation_frame"]
+        ).items():
             histories[key].append(value)
 
         row: dict[str, Any] = {
@@ -467,14 +732,21 @@ def run_resumed_branch(
         row["conditional_macro_fixed_point_reached"] = convergence_streak >= 2
         rows.append(row)
         pd.DataFrame(rows).to_csv(root / "metrics_extended_only.csv", index=False)
-        print(json.dumps({"branch": branch, "outer_complete": current_outer, **row}, default=str), flush=True)
+        print(
+            json.dumps(
+                {"branch": branch, "outer_complete": current_outer, **row}, default=str
+            ),
+            flush=True,
+        )
 
         if firm_hashes(firm) != before_firm or firm_hashes(firm) != initial_firm_hashes:
             raise RuntimeError(f"firm hashes changed in resumed {branch}")
         if module_hash(fc2) != before_fc2 or fc2_counter["calls"]:
             raise RuntimeError(f"FC2 invariant failed in resumed {branch}")
         if branch == "fc1_only":
-            current_sdf_hash = module_hash(model.sdf_model) + ":" + module_hash(model.value_model)
+            current_sdf_hash = (
+                module_hash(model.sdf_model) + ":" + module_hash(model.value_model)
+            )
             if current_sdf_hash != initial_sdf_hash:
                 raise RuntimeError("SDF changed in FC1-only continuation")
         if (
@@ -487,7 +759,11 @@ def run_resumed_branch(
         current_sim = next_sim
 
     extended = pd.DataFrame(rows)
-    combined = pd.concat([_load_old_metrics(args.old_output_root, branch), extended], ignore_index=True, sort=False)
+    combined = pd.concat(
+        [_load_old_metrics(args.old_output_root, branch), extended],
+        ignore_index=True,
+        sort=False,
+    )
     combined.to_csv(root / "metrics.csv", index=False)
     summary = {
         "branch": branch,
@@ -501,8 +777,11 @@ def run_resumed_branch(
         "firm_final_hashes": firm_hashes(firm),
         "firm_hash_invariant": firm_hashes(firm) == initial_firm_hashes,
         "sdf_hash_invariant": (
-            module_hash(model.sdf_model) + ":" + module_hash(model.value_model)
-        ) == initial_sdf_hash if branch == "fc1_only" else None,
+            (module_hash(model.sdf_model) + ":" + module_hash(model.value_model))
+            == initial_sdf_hash
+            if branch == "fc1_only"
+            else None
+        ),
         "fc1_initial_hash": initial_fc1_hash,
         "crn": crn,
         "crn_hash": stable_json_hash(crn),
@@ -523,7 +802,9 @@ def run_sdf_only(
     budgets: Mapping[str, int],
 ) -> dict[str, Any]:
     root = args.output_dir / "l1" / "sdf_only"
-    allowed = ("dependency_audit.json",) if args.output_dir == args.old_output_root else ()
+    allowed = (
+        ("dependency_audit.json",) if args.output_dir == args.old_output_root else ()
+    )
     ensure_new_output(root, allowed_existing=allowed)
     episode, models, _ = fresh_macro_model(args, device)
     model = models["sdf_fc1"]
@@ -534,27 +815,40 @@ def run_sdf_only(
     fc2_counter = {"calls": 0}
     fc2_hash = module_hash(fc2)
     install_fc2_guard(fc2, fc2_counter)
-    train_initial, validation_initial, crn = build_initial_states(args, episode, models, device)
-    current_sim = simulate_state(args, episode, models, train_initial, validation_initial, device)
+    train_initial, validation_initial, crn = build_initial_states(
+        args, episode, models, device
+    )
+    current_sim = simulate_state(
+        args, episode, models, train_initial, validation_initial, device
+    )
     functions = snapshot_functions(model, probe_parents, probe_children)
     torch.save(functions, root / "functions_outer_000_start.pt")
     histories = {f"function_{name}": [functions[name].cpu()] for name in FUNCTION_NAMES}
-    histories.update({key: [value] for key, value in sorted_macro_vectors(current_sim["validation_frame"]).items()})
-    rows: list[dict[str, Any]] = [{
-        "experiment": "sdf_only",
-        "source": "extended",
-        "outer": 0,
-        "simulation_seconds": current_sim["seconds"],
-        "target_hash": current_sim["target_hash"],
-        "M_data_hash": current_sim["data_hash_including_M"],
-        "crn_hash": stable_json_hash(crn),
-        "firm_hash_invariant": True,
-        "fc1_hash_invariant": True,
-        "fc2_hash_invariant": True,
-        "fc2_forward_calls": 0,
-        **_prefix_metrics("conditional_train", current_sim["train_fit"]),
-        **_prefix_metrics("conditional_validation", current_sim["validation_fit"]),
-    }]
+    histories.update(
+        {
+            key: [value]
+            for key, value in simulation_macro_vectors(
+                args, current_sim["validation_frame"]
+            ).items()
+        }
+    )
+    rows: list[dict[str, Any]] = [
+        {
+            "experiment": "sdf_only",
+            "source": "extended",
+            "outer": 0,
+            "simulation_seconds": current_sim["seconds"],
+            "target_hash": current_sim["target_hash"],
+            "M_data_hash": current_sim["data_hash_including_M"],
+            "crn_hash": stable_json_hash(crn),
+            "firm_hash_invariant": True,
+            "fc1_hash_invariant": True,
+            "fc2_hash_invariant": True,
+            "fc2_forward_calls": 0,
+            **_prefix_metrics("conditional_train", current_sim["train_fit"]),
+            **_prefix_metrics("conditional_validation", current_sim["validation_fit"]),
+        }
+    ]
     cycle_counts = {name: 0 for name in TRACKED_VECTOR_NAMES}
     current_outer = 0
     while current_outer < args.sdf_final_outer:
@@ -582,10 +876,14 @@ def run_sdf_only(
             model,
             {"branch": "sdf_only", "outer": current_outer},
         )
-        next_sim = simulate_state(args, episode, models, train_initial, validation_initial, device)
+        next_sim = simulate_state(
+            args, episode, models, train_initial, validation_initial, device
+        )
         for name in FUNCTION_NAMES:
             histories[f"function_{name}"].append(functions[name].detach().cpu())
-        for key, value in sorted_macro_vectors(next_sim["validation_frame"]).items():
+        for key, value in simulation_macro_vectors(
+            args, next_sim["validation_frame"]
+        ).items():
             histories[key].append(value)
         row: dict[str, Any] = {
             "experiment": "sdf_only",
@@ -610,10 +908,19 @@ def run_sdf_only(
         add_transition_metrics(row, histories, cycle_counts, args.two_cycle_config)
         rows.append(row)
         pd.DataFrame(rows).to_csv(root / "metrics.csv", index=False)
-        print(json.dumps({"branch": "sdf_only", "outer_complete": current_outer, **row}, default=str), flush=True)
+        print(
+            json.dumps(
+                {"branch": "sdf_only", "outer_complete": current_outer, **row},
+                default=str,
+            ),
+            flush=True,
+        )
         if firm_hashes(firm) != before_firm or firm_hashes(firm) != initial_firm_hashes:
             raise RuntimeError("firm changed in SDF-only")
-        if module_hash(model.fc1_model) != before_fc1 or module_hash(model.fc1_model) != initial_fc1_hash:
+        if (
+            module_hash(model.fc1_model) != before_fc1
+            or module_hash(model.fc1_model) != initial_fc1_hash
+        ):
             raise RuntimeError("FC1 changed in SDF-only")
         if module_hash(fc2) != fc2_hash or fc2_counter["calls"]:
             raise RuntimeError("FC2 invariant failed in SDF-only")
@@ -640,7 +947,9 @@ def run_sdf_only(
     return summary
 
 
-def used_m_trace(raw: torch.Tensor, args: argparse.Namespace) -> dict[str, torch.Tensor]:
+def used_m_trace(
+    raw: torch.Tensor, args: argparse.Namespace
+) -> dict[str, torch.Tensor]:
     return {
         "raw_M": raw,
         "post_transform_M": raw,
@@ -664,8 +973,12 @@ def audit_recursive_sdf_tail(
     fc2 = models.get("fc2")
     fc2_counter = {"calls": 0}
     install_fc2_guard(fc2, fc2_counter)
-    train_initial, validation_initial, crn = build_initial_states(args, episode, models, device)
-    simulation = simulate_state(args, episode, models, train_initial, validation_initial, device)
+    train_initial, validation_initial, crn = build_initial_states(
+        args, episode, models, device
+    )
+    simulation = simulate_state(
+        args, episode, models, train_initial, validation_initial, device
+    )
     for name, expected in (
         ("pv_m_clamp_min", args.pv_m_clamp_min),
         ("pv_m_clamp_max", args.pv_m_clamp_max),
@@ -674,11 +987,17 @@ def audit_recursive_sdf_tail(
     ):
         actual = float(getattr(episode.hyperparams, name))
         if actual != float(expected):
-            raise RuntimeError(f"{name} audit mismatch: runtime={actual}, requested={expected}")
+            raise RuntimeError(
+                f"{name} audit mismatch: runtime={actual}, requested={expected}"
+            )
     mode_flags = {
         "pv_fixed_sdf": bool(getattr(episode.hyperparams, "pv_fixed_sdf", False)),
-        "pv_use_clipped_m": bool(getattr(episode.hyperparams, "pv_use_clipped_m", True)),
-        "q_use_detached_m": bool(getattr(episode.hyperparams, "q_use_detached_m", True)),
+        "pv_use_clipped_m": bool(
+            getattr(episode.hyperparams, "pv_use_clipped_m", True)
+        ),
+        "q_use_detached_m": bool(
+            getattr(episode.hyperparams, "q_use_detached_m", True)
+        ),
     }
     if mode_flags != {
         "pv_fixed_sdf": False,
@@ -691,8 +1010,15 @@ def audit_recursive_sdf_tail(
     )
     col = {name: index for index, name in enumerate(pairs.columns)}
     required = {
-        "path", "t", "branch", "x_t", "x_t1", "Hatcf_t", "LnKF_t",
-        "Hatc_t", "LnK_t",
+        "path",
+        "t",
+        "branch",
+        "x_t",
+        "x_t1",
+        "Hatcf_t",
+        "LnKF_t",
+        "Hatc_t",
+        "LnK_t",
     }
     if missing := sorted(required - set(col)):
         raise RuntimeError(f"tail audit pair table missing columns: {missing}")
@@ -705,12 +1031,12 @@ def audit_recursive_sdf_tail(
     model.eval()
     with torch.no_grad():
         for start in range(0, int(pair_data.shape[0]), args.macro_batch_size):
-            rows = pair_data[start:start + args.macro_batch_size]
+            rows = pair_data[start : start + args.macro_batch_size]
             _, _, raw, forecast_hatc, forecast_lnk = model.forward_step(
-                x_prev=rows[:, col["x_t"]:col["x_t"] + 1],
-                x_curr=rows[:, col["x_t1"]:col["x_t1"] + 1],
-                hatcf_prev=rows[:, col["Hatcf_t"]:col["Hatcf_t"] + 1],
-                lnkf_prev=rows[:, col["LnKF_t"]:col["LnKF_t"] + 1],
+                x_prev=rows[:, col["x_t"] : col["x_t"] + 1],
+                x_curr=rows[:, col["x_t1"] : col["x_t1"] + 1],
+                hatcf_prev=rows[:, col["Hatcf_t"] : col["Hatcf_t"] + 1],
+                lnkf_prev=rows[:, col["LnKF_t"] : col["LnKF_t"] + 1],
                 return_physical=True,
             )
             raw = raw.reshape(-1)
@@ -719,23 +1045,29 @@ def audit_recursive_sdf_tail(
             recursive_state = rows[:, [col["Hatcf_t"], col["LnKF_t"]]].to(torch.float64)
             zdist = torch.sqrt((((recursive_state - mean) / std) ** 2).sum(dim=1))
             numpy_col = lambda name: rows[:, col[name]].detach().cpu().numpy()
-            frame = pd.DataFrame({
-                "path": numpy_col("path"),
-                "t": numpy_col("t"),
-                "child_branch": numpy_col("branch"),
-                "x": numpy_col("x_t"),
-                "Hatc": numpy_col("Hatc_t"),
-                "LnK": numpy_col("LnK_t"),
-                "recursive_Hatc": numpy_col("Hatcf_t"),
-                "recursive_LnK": numpy_col("LnKF_t"),
-                "forecast_Hatc": forecast_hatc.reshape(-1).detach().cpu().numpy(),
-                "forecast_LnK": forecast_lnk.reshape(-1).detach().cpu().numpy(),
-                "teacher_state_z_distance": zdist.detach().cpu().numpy(),
-                "raw_M": traced["raw_M"].reshape(-1).detach().cpu().numpy(),
-                "post_transform_M": traced["post_transform_M"].reshape(-1).detach().cpu().numpy(),
-                "used_P_M": traced["used_P_M"].reshape(-1).detach().cpu().numpy(),
-                "used_Q_M": traced["used_Q_M"].reshape(-1).detach().cpu().numpy(),
-            })
+            frame = pd.DataFrame(
+                {
+                    "path": numpy_col("path"),
+                    "t": numpy_col("t"),
+                    "child_branch": numpy_col("branch"),
+                    "x": numpy_col("x_t"),
+                    "Hatc": numpy_col("Hatc_t"),
+                    "LnK": numpy_col("LnK_t"),
+                    "recursive_Hatc": numpy_col("Hatcf_t"),
+                    "recursive_LnK": numpy_col("LnKF_t"),
+                    "forecast_Hatc": forecast_hatc.reshape(-1).detach().cpu().numpy(),
+                    "forecast_LnK": forecast_lnk.reshape(-1).detach().cpu().numpy(),
+                    "teacher_state_z_distance": zdist.detach().cpu().numpy(),
+                    "raw_M": traced["raw_M"].reshape(-1).detach().cpu().numpy(),
+                    "post_transform_M": traced["post_transform_M"]
+                    .reshape(-1)
+                    .detach()
+                    .cpu()
+                    .numpy(),
+                    "used_P_M": traced["used_P_M"].reshape(-1).detach().cpu().numpy(),
+                    "used_Q_M": traced["used_Q_M"].reshape(-1).detach().cpu().numpy(),
+                }
+            )
             records.append(frame)
     detail = pd.concat(records, ignore_index=True)
     tail = detail[detail["raw_M"] > 10.0].copy()
@@ -748,17 +1080,35 @@ def audit_recursive_sdf_tail(
     counts = []
     for threshold in (10.0, 100.0, 1000.0):
         mask = detail["raw_M"] > threshold
-        counts.append({
-            "threshold": threshold,
-            "count": int(mask.sum()),
-            "share": float(mask.mean()),
-            "used_P_min": float(detail.loc[mask, "used_P_M"].min()) if mask.any() else float("nan"),
-            "used_P_max": float(detail.loc[mask, "used_P_M"].max()) if mask.any() else float("nan"),
-            "used_Q_min": float(detail.loc[mask, "used_Q_M"].min()) if mask.any() else float("nan"),
-            "used_Q_max": float(detail.loc[mask, "used_Q_M"].max()) if mask.any() else float("nan"),
-            "recursive_enters_simulation_or_aggregate": False,
-            "recursive_enters_P_or_Q_training": False,
-        })
+        counts.append(
+            {
+                "threshold": threshold,
+                "count": int(mask.sum()),
+                "share": float(mask.mean()),
+                "used_P_min": (
+                    float(detail.loc[mask, "used_P_M"].min())
+                    if mask.any()
+                    else float("nan")
+                ),
+                "used_P_max": (
+                    float(detail.loc[mask, "used_P_M"].max())
+                    if mask.any()
+                    else float("nan")
+                ),
+                "used_Q_min": (
+                    float(detail.loc[mask, "used_Q_M"].min())
+                    if mask.any()
+                    else float("nan")
+                ),
+                "used_Q_max": (
+                    float(detail.loc[mask, "used_Q_M"].max())
+                    if mask.any()
+                    else float("nan")
+                ),
+                "recursive_enters_simulation_or_aggregate": False,
+                "recursive_enters_P_or_Q_training": False,
+            }
+        )
     pd.DataFrame(counts).to_csv(root / "tail_counts.csv", index=False)
     dataflow = {
         "raw_sdf_definition": "models/sdf_fc1.py::SDFFC1Combined.forward_step -> SDFModel.get_M -> compute_sdf",
@@ -820,7 +1170,9 @@ def build_comparison(output: Path) -> pd.DataFrame:
         if "experiment" not in frame:
             frame.insert(0, "experiment", branch.replace("_extended", ""))
         frames.append(frame)
-    comparison = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    comparison = (
+        pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    )
     comparison.to_csv(output / "l1_extended_summary.csv", index=False)
     return comparison
 
@@ -833,31 +1185,49 @@ def _trend(frame: pd.DataFrame, column: str) -> str:
     return "damping" if ratio < 0.8 else "flat_or_rising"
 
 
-def write_extended_report(args: argparse.Namespace, summaries: Mapping[str, Any]) -> None:
+def write_extended_report(
+    args: argparse.Namespace, summaries: Mapping[str, Any]
+) -> None:
     fc1 = pd.read_csv(args.output_dir / "l1" / "fc1_only_extended" / "metrics.csv")
     sdf = pd.read_csv(args.output_dir / "l1" / "sdf_only" / "metrics.csv")
     joint = pd.read_csv(args.output_dir / "l1" / "joint_extended" / "metrics.csv")
     tail = summaries["sdf_tail_audit"]
     fc1_last, sdf_last, joint_last = fc1.iloc[-1], sdf.iloc[-1], joint.iloc[-1]
-    strict_fc1 = bool(fc1.get("possible_two_cycle_strict", pd.Series(False)).fillna(False).any())
-    strict_sdf = bool(sdf.get("possible_two_cycle_strict", pd.Series(False)).fillna(False).any())
-    strict_joint = bool(joint.get("possible_two_cycle_strict", pd.Series(False)).fillna(False).any())
+    strict_fc1 = bool(
+        fc1.get("possible_two_cycle_strict", pd.Series(False)).fillna(False).any()
+    )
+    strict_sdf = bool(
+        sdf.get("possible_two_cycle_strict", pd.Series(False)).fillna(False).any()
+    )
+    strict_joint = bool(
+        joint.get("possible_two_cycle_strict", pd.Series(False)).fillna(False).any()
+    )
     reached = bool(joint_last.get("conditional_macro_fixed_point_reached", False))
     late = joint[joint["outer"] >= 8]
     movement_columns = [
-        "function_m_nmae", "function_fc1_c_nmae", "function_fc1_k_nmae",
-        "target_hatc_nmae", "target_lnk_nmae",
+        "function_m_nmae",
+        "function_fc1_c_nmae",
+        "function_fc1_k_nmae",
+        "target_hatc_nmae",
+        "target_lnk_nmae",
     ]
     driver = max(
         movement_columns,
-        key=lambda column: float(joint_last.get(column, float("-inf")))
-        if pd.notna(joint_last.get(column, float("nan"))) else float("-inf"),
+        key=lambda column: (
+            float(joint_last.get(column, float("-inf")))
+            if pd.notna(joint_last.get(column, float("nan")))
+            else float("-inf")
+        ),
     )
     if strict_joint:
         classification = "C. true limit cycle"
     elif reached:
         classification = "A. clearly damping and convergent"
-    elif all(_trend(late, column) == "damping" for column in movement_columns if column in late):
+    elif all(
+        _trend(late, column) == "damping"
+        for column in movement_columns
+        if column in late
+    ):
         classification = "B. damping but slow / nonzero floor"
     else:
         classification = "G. inconclusive"
@@ -899,14 +1269,16 @@ def write_extended_report(args: argparse.Namespace, summaries: Mapping[str, Any]
         "",
     ]
     lines.extend(f"{index}. {q[index]}" for index in range(1, 16))
-    lines.extend([
-        "",
-        "## Final classification",
-        "",
-        classification,
-        "",
-        "No economic equation, calibration, network architecture, optimizer, P/Q/policy/firm block, FC2 path, damping, Anderson method, or Newton method was changed.",
-    ])
+    lines.extend(
+        [
+            "",
+            "## Final classification",
+            "",
+            classification,
+            "",
+            "No economic equation, calibration, network architecture, optimizer, P/Q/policy/firm block, FC2 path, damping, Anderson method, or Newton method was changed.",
+        ]
+    )
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -922,7 +1294,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--old-output-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
-    parser.add_argument("--experiment", choices=("all", "fc1_only", "sdf_only", "joint", "tail_audit"), default="all")
+    parser.add_argument(
+        "--experiment",
+        choices=("all", "fc1_only", "sdf_only", "joint", "tail_audit"),
+        default="all",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=20261017)
     parser.add_argument("--simulation-paths", type=int, default=400)
@@ -947,6 +1323,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pv-m-clamp-max", type=float, default=1.3)
     parser.add_argument("--q-m-clamp-min", type=float, default=0.5)
     parser.add_argument("--q-m-clamp-max", type=float, default=1.5)
+    parser.add_argument(
+        "--recover-partial",
+        action="store_true",
+        help=(
+            "resume only a validated first-outer durable checkpoint left before "
+            "the first metrics row; completed branches are never overwritten"
+        ),
+    )
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
 
@@ -994,7 +1378,9 @@ def validate_extended_limits(args: argparse.Namespace) -> None:
         raise ValueError("joint must resume from completed outer 8")
     minimum_joint = args.joint_resume_outer + (1 if smoke else 4)
     if not minimum_joint <= args.joint_final_outer <= 14:
-        raise ValueError("joint continuation must add 4-6 outer solves and stop by outer 14")
+        raise ValueError(
+            "joint continuation must add 4-6 outer solves and stop by outer 14"
+        )
 
 
 def main() -> None:
@@ -1057,17 +1443,33 @@ def main() -> None:
         completed_joint_outer = int(
             summaries.get("joint", {}).get("final_outer", args.joint_final_outer)
         )
-        checkpoint = args.output_dir / "l1" / "joint_extended" / "checkpoints" / f"outer_{completed_joint_outer:03d}.pt"
+        checkpoint = (
+            args.output_dir
+            / "l1"
+            / "joint_extended"
+            / "checkpoints"
+            / f"outer_{completed_joint_outer:03d}.pt"
+        )
         if not checkpoint.is_file():
-            checkpoint = checkpoint_for_outer(args.old_output_root, "joint", args.joint_resume_outer)
+            checkpoint = checkpoint_for_outer(
+                args.old_output_root, "joint", args.joint_resume_outer
+            )
         summaries["sdf_tail_audit"] = audit_recursive_sdf_tail(args, device, checkpoint)
     comparison = build_comparison(args.output_dir)
     if args.experiment == "all":
         write_extended_report(args, summaries)
     metadata = {
-        "branch": subprocess.check_output(["git", "branch", "--show-current"], cwd=ROOT, text=True).strip(),
-        "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-        "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items() if key != "two_cycle_config"},
+        "branch": subprocess.check_output(
+            ["git", "branch", "--show-current"], cwd=ROOT, text=True
+        ).strip(),
+        "git_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip(),
+        "args": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+            if key != "two_cycle_config"
+        },
         "two_cycle_config": vars(args.two_cycle_config),
         "summaries": summaries,
         "comparison_rows": int(len(comparison)),
