@@ -52,6 +52,8 @@ echo "Commit: $OBSERVED_COMMIT"
 echo "Run root: $RUN_ROOT"
 echo "Smoke: $NESTED_SMOKE"
 echo "Python: $(command -v python3)"
+echo "MACRO_PRIMARY_TRAINING=MANY_PARENT_ONE_STEP"
+echo "LONG_TRAJECTORY_100_PRIMARY_TRAINING=NO"
 
 python3 - <<'PY'
 import torch
@@ -99,12 +101,22 @@ python3 -u analysis/run_full_nested_equilibrium.py \
   --q-fit-steps 100 \
   --q-lr 1e-4 \
   --macro-inner-max 20 \
-  --simulation-paths 400 \
-  --validation-paths 400 \
   --firms-per-path 200 \
-  --simulation-horizon 100 \
   --branch-num 2 \
+  --macro-bank-candidate-paths 1024 \
+  --macro-bank-validation-paths 256 \
+  --macro-bank-rollout-horizon 8 \
+  --macro-bank-capture-times 0,2,4,6,8 \
+  --macro-train-parent-count 4096 \
+  --macro-validation-parent-count 1024 \
+  --macro-bank-candidate-multiplier 1.5 \
+  --macro-bank-coverage-fraction 0.20 \
+  --macro-parent-batch-size 256 \
+  --macro-bank-shard-size 128 \
   --macro-batch-size 4096 \
+  --long-diagnostic-paths 50 \
+  --long-diagnostic-horizon 100 \
+  --no-use-long-rollout-for-macro-training \
   --fc1-production-epochs 10 \
   --fc1-max-epochs 100 \
   --fc1-patience 20 \

@@ -50,6 +50,23 @@ from analysis.nested_equilibrium_utils import (  # noqa: E402
     stable_json_hash,
     tensor_hash,
 )
+from analysis.macro_parent_state_bank import (  # noqa: E402
+    MacroParentSourceSchedule,
+    build_one_step_macro_dataset,
+    distribution_coverage,
+    effective_capture_times,
+    harvest_macro_parent_schedule,
+    harvest_macro_parent_schedule_with_candidate,
+    load_schedule,
+    parent_summary_movement,
+    parse_capture_times,
+    prepare_macro_parent_schedule,
+    save_bank_shards,
+    save_schedule,
+    source_overlap,
+    write_coverage_artifacts,
+    write_macro_inner_movement_figure,
+)
 from analysis.run_coupled_fixed_macro import (  # noqa: E402
     build_coupled_view,
     coupled_transition_metrics,
@@ -199,14 +216,17 @@ def _args_fingerprint(args: argparse.Namespace) -> str:
 
 def _configure_hyperparams(args: argparse.Namespace):
     hp = build_hyperparams()
-    hp.n_paths = int(args.simulation_paths)
+    hp.n_paths = int(args.macro_train_parent_count)
     hp.batch_size = int(args.macro_batch_size)
-    hp.simulate_horizon = int(args.simulation_horizon)
+    hp.simulate_horizon = int(args.macro_bank_rollout_horizon)
     hp.fc1_only_epochs = int(args.fc1_production_epochs)
     hp.sdf_true_only_epochs = int(args.sdf_chunks * args.sdf_epochs_per_chunk)
     hp.sdf_recursive_only_epochs = 0
     hp.fc1_max_rounds = 1
-    hp.fc1_rollout_diagnostic_enabled = True
+    # Recursive FC1 diagnostics belong to the separate long-horizon rollout.
+    # Enabling this on a one-step primary table makes the production batch
+    # builder demand unavailable future rows and discard every valid parent.
+    hp.fc1_rollout_diagnostic_enabled = False
     hp.bp_distill_epochs = int(args.policy_distill_max_epochs)
     hp.bp_distill_patience = int(args.policy_distill_patience)
     hp.bp_distill_max_optimizer_steps = int(args.policy_distill_max_steps)
@@ -657,6 +677,23 @@ def _path_and_target_movements(old: pd.DataFrame, new: pd.DataFrame) -> dict[str
     return result
 
 
+def _one_step_target_movements(old: Any, new: Any) -> dict[str, float]:
+    left = _to_frame(old).sort_values(["path", "t", "branch"]).reset_index(drop=True)
+    right = _to_frame(new).sort_values(["path", "t", "branch"]).reset_index(drop=True)
+    identity = ["path", "t", "branch"]
+    if not left[identity].equals(right[identity]):
+        raise RuntimeError("one-step target rows are not source-key aligned")
+    result = {}
+    for column, label in (("Hatc_t1", "Hatc"), ("LnK_t1", "LnK")):
+        metrics = movement_metrics(
+            torch.as_tensor(left[column].to_numpy()),
+            torch.as_tensor(right[column].to_numpy()),
+            label.lower(),
+        )
+        result[f"{label}_target_move"] = metrics[f"{label.lower()}_nmae"]
+    return result
+
+
 def _macro_gate(row: Mapping[str, Any]) -> bool:
     return bool(
         float(row["M_function_move"]) < 0.005
@@ -690,15 +727,15 @@ def _simulation_pair(
     started = time.perf_counter()
     train_out = run_simulation(
         models=models, episode=episode, initial_state=train_initial,
-        paths=args.simulation_paths, firms=args.firms_per_path,
-        horizon=args.simulation_horizon, branch_num=args.branch_num,
+        paths=args.long_diagnostic_paths, firms=args.firms_per_path,
+        horizon=args.long_diagnostic_horizon, branch_num=args.branch_num,
         transition_seed=args.seed + 1011, entry_seed=args.seed + 1012,
         device=device,
     )
     validation_out = run_simulation(
         models=models, episode=episode, initial_state=validation_initial,
-        paths=args.validation_paths, firms=args.firms_per_path,
-        horizon=args.simulation_horizon, branch_num=args.branch_num,
+        paths=args.long_diagnostic_paths, firms=args.firms_per_path,
+        horizon=args.long_diagnostic_horizon, branch_num=args.branch_num,
         transition_seed=args.seed + 2011, entry_seed=args.seed + 2012,
         device=device,
     )
@@ -726,12 +763,71 @@ def _write_simulation_metadata(
         "train_entry_seed": args.seed + 1012,
         "validation_transition_seed": args.seed + 2011,
         "validation_entry_seed": args.seed + 2012,
-        "paths": args.simulation_paths,
-        "validation_paths": args.validation_paths,
+        "paths": args.long_diagnostic_paths,
+        "validation_paths": args.long_diagnostic_paths,
         "firms_per_path": args.firms_per_path,
-        "horizon": args.simulation_horizon,
+        "horizon": args.long_diagnostic_horizon,
         "branch_num": args.branch_num,
+        "purpose": "LONG_HORIZON_DIAGNOSTIC_ONLY",
+        "used_for_primary_macro_training": False,
     })
+
+
+def _write_long_diagnostic_artifacts(
+    output: Path,
+    *,
+    train_out: Any,
+    validation_out: Any,
+) -> dict[str, Any]:
+    output.mkdir(parents=True, exist_ok=True)
+    summaries = {}
+    keep_macro = [
+        "path", "t", "branch", "Hatc", "LnK", "C", "K", "n_firms",
+        "M", "x", "hatcf", "lnkf",
+    ]
+    for split, simulation in (("train", train_out), ("validation", validation_out)):
+        macro = _to_frame(simulation.macro)
+        firm = _to_frame(simulation.firm)
+        atomic_write_csv(output / f"{split}_macro_paths.csv", macro.loc[:, keep_macro])
+        diagnostics = macro_diagnostics(macro)
+        diagnostics.update(simulation_policy_metrics(firm))
+        parent = macro[macro["branch"] == -1].copy()
+        if parent.empty:
+            raise RuntimeError(f"long diagnostic {split} has no parent rows")
+        for forecast, realized, label in (
+            ("hatcf", "Hatc", "recursive_fc1_hatc"),
+            ("lnkf", "LnK", "recursive_fc1_lnk"),
+        ):
+            diagnostics[f"{label}_nmae"] = movement_metrics(
+                torch.as_tensor(parent[forecast].to_numpy()),
+                torch.as_tensor(parent[realized].to_numpy()),
+                label,
+            )[f"{label}_nmae"]
+        tail_start = int(math.floor(0.8 * float(parent["t"].max())))
+        tail = parent[parent["t"] >= tail_start]
+        diagnostics.update({
+            "tail_start_t": tail_start,
+            "tail_M_mean": float(tail["M"].mean()),
+            "tail_M_std": float(tail["M"].std(ddof=0)),
+            "tail_Hatc_mean": float(tail["Hatc"].mean()),
+            "tail_LnK_mean": float(tail["LnK"].mean()),
+            "tail_C_mean": float(tail["C"].mean()),
+            "tail_K_mean": float(tail["K"].mean()),
+            "tail_mean_firms": float(tail["n_firms"].mean()),
+            "stationary_mean_b": float(
+                firm[firm["t"] >= tail_start]["b"].mean()
+            ),
+            "stationary_mean_z": float(
+                firm[firm["t"] >= tail_start]["z"].mean()
+            ),
+        })
+        summaries[split] = diagnostics
+    atomic_write_json(output / "summary.json", {
+        "purpose": "LONG_HORIZON_DIAGNOSTIC_ONLY",
+        "used_for_primary_macro_training": False,
+        "splits": summaries,
+    })
+    return summaries
 
 
 def _write_metadata(
@@ -759,11 +855,233 @@ def _write_metadata(
         "bank_hashes": bank_hashes, "cuda": cuda,
         "fc2": "COMPLETELY_DISABLED",
         "sdf_mode": "SDF_TRUE_ONLY", "sdf_recursive_epochs": 0,
+        "macro_primary_training_source": "MANY_PARENT_CROSS_SECTIONS_ONE_STEP",
+        "macro_parent_generation": "SHORT_ENDOGENOUS_ROLLOUT_HARVEST",
+        "macro_short_rollout_horizon": int(args.macro_bank_rollout_horizon),
+        "macro_one_step_horizon": 1,
+        "long_rollout_training_used": False,
+        "long_rollout_horizon": int(args.long_diagnostic_horizon),
         "m_semantics": "CURRENT_SDF_CHILD shared by P and Q; one common clamp",
         "model_hashes_at_initialization": {
             name: module_hash(model) for name, model in models.items()
         },
     })
+
+
+def _schedule_report(
+    *,
+    candidate: pd.DataFrame,
+    selected: pd.DataFrame,
+    schedule: MacroParentSourceSchedule,
+    initial_audit: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "candidate_count": int(len(candidate)),
+        "requested_count": int(len(schedule.source_keys)),
+        "selected_count": int(len(selected)),
+        "endogenous_frequency_count": int(round(
+            len(selected) * schedule.endogenous_frequency_share
+        )),
+        "coverage_aware_count": int(round(
+            len(selected) * schedule.coverage_aware_share
+        )),
+        "endogenous_frequency_share": schedule.endogenous_frequency_share,
+        "coverage_aware_share": schedule.coverage_aware_share,
+        "candidate_shortfall": 0,
+        "schedule_fingerprint": schedule.fingerprint,
+        "candidate_coverage": distribution_coverage(candidate),
+        "selected_coverage": distribution_coverage(selected),
+        "unique_source_paths": int(selected["initial_path_id"].nunique()),
+        "capture_time_distribution": {
+            str(int(key)): int(value)
+            for key, value in selected["capture_time"].value_counts().sort_index().items()
+        },
+        "initial_cross_sections": dict(initial_audit),
+    }
+
+
+def _build_or_refresh_macro_parent_context(
+    *,
+    args: argparse.Namespace,
+    run_root: Path,
+    outer_root: Path,
+    equilibrium_outer: int,
+    models: Mapping[str, torch.nn.Module],
+    episode: Episode,
+    device: torch.device,
+) -> tuple[
+    Mapping[str, torch.Tensor],
+    Mapping[str, torch.Tensor],
+    MacroParentSourceSchedule,
+    MacroParentSourceSchedule,
+    Any,
+    Any,
+]:
+    parent_root = outer_root / "macro_parent_bank"
+    parent_root.mkdir(parents=True, exist_ok=True)
+    requested_times = parse_capture_times(args.macro_bank_capture_times)
+
+    train_seed = int(args.seed + 30_000 + equilibrium_outer * 100_000)
+    train_transition_seed = train_seed + 11
+    train_entry_seed = train_seed + 12
+    train_initial_path = parent_root / "train_initial_state.pt"
+    if train_initial_path.is_file():
+        macro_train_initial = torch.load(
+            train_initial_path, map_location="cpu", weights_only=True
+        )
+    else:
+        macro_train_initial = make_initial_state(
+            models=models,
+            episode=episode,
+            paths=args.macro_bank_candidate_paths,
+            firms=args.firms_per_path,
+            horizon=args.macro_bank_rollout_horizon,
+            branch_num=args.branch_num,
+            seed=train_seed,
+            device=device,
+        )
+        atomic_torch_save(train_initial_path, macro_train_initial)
+
+    train_schedule_path = parent_root / "train_source_schedule.json"
+    if train_schedule_path.is_file():
+        train_schedule = load_schedule(train_schedule_path)
+        train_harvest, train_candidate, train_candidate_occupancy = (
+            harvest_macro_parent_schedule_with_candidate(
+                models=models,
+                episode=episode,
+                initial_state=macro_train_initial,
+                schedule=train_schedule,
+                source_episode=equilibrium_outer,
+                branch_num=args.branch_num,
+                device=device,
+            )
+        )
+        train_report = _schedule_report(
+            candidate=train_candidate,
+            selected=train_harvest.summary,
+            schedule=train_schedule,
+            initial_audit=train_harvest.initial_hash_audit,
+        )
+    else:
+        (
+            train_schedule,
+            train_harvest,
+            train_candidate,
+            train_candidate_occupancy,
+            train_report,
+        ) = prepare_macro_parent_schedule(
+            models=models,
+            episode=episode,
+            initial_state=macro_train_initial,
+            split=f"train_outer_{equilibrium_outer:03d}",
+            source_episode=equilibrium_outer,
+            initial_state_seed=train_seed,
+            transition_seed=train_transition_seed,
+            entry_seed=train_entry_seed,
+            short_rollout_horizon=args.macro_bank_rollout_horizon,
+            capture_times=requested_times,
+            branch_num=args.branch_num,
+            target_count=args.macro_train_parent_count,
+            coverage_fraction=args.macro_bank_coverage_fraction,
+            selection_seed=train_seed + 21,
+            device=device,
+        )
+        save_schedule(train_schedule_path, train_schedule)
+
+    global_validation_root = run_root / "fixed_point" / "macro_global_validation"
+    global_validation_root.mkdir(parents=True, exist_ok=True)
+    validation_seed = int(args.seed + 40_000)
+    validation_initial_path = global_validation_root / "initial_state.pt"
+    if validation_initial_path.is_file():
+        macro_validation_initial = torch.load(
+            validation_initial_path, map_location="cpu", weights_only=True
+        )
+    else:
+        macro_validation_initial = make_initial_state(
+            models=models,
+            episode=episode,
+            paths=args.macro_bank_validation_paths,
+            firms=args.firms_per_path,
+            horizon=args.macro_bank_rollout_horizon,
+            branch_num=args.branch_num,
+            seed=validation_seed,
+            device=device,
+        )
+        atomic_torch_save(validation_initial_path, macro_validation_initial)
+
+    validation_schedule_path = global_validation_root / "validation_source_schedule.json"
+    if validation_schedule_path.is_file():
+        validation_schedule = load_schedule(validation_schedule_path)
+        validation_harvest, validation_candidate, validation_candidate_occupancy = (
+            harvest_macro_parent_schedule_with_candidate(
+                models=models,
+                episode=episode,
+                initial_state=macro_validation_initial,
+                schedule=validation_schedule,
+                source_episode=equilibrium_outer,
+                branch_num=args.branch_num,
+                device=device,
+            )
+        )
+        validation_report = _schedule_report(
+            candidate=validation_candidate,
+            selected=validation_harvest.summary,
+            schedule=validation_schedule,
+            initial_audit=validation_harvest.initial_hash_audit,
+        )
+    else:
+        (
+            validation_schedule,
+            validation_harvest,
+            validation_candidate,
+            validation_candidate_occupancy,
+            validation_report,
+        ) = prepare_macro_parent_schedule(
+            models=models,
+            episode=episode,
+            initial_state=macro_validation_initial,
+            split="global_validation",
+            source_episode=equilibrium_outer,
+            initial_state_seed=validation_seed,
+            transition_seed=validation_seed + 11,
+            entry_seed=validation_seed + 12,
+            short_rollout_horizon=args.macro_bank_rollout_horizon,
+            capture_times=requested_times,
+            branch_num=args.branch_num,
+            target_count=args.macro_validation_parent_count,
+            coverage_fraction=args.macro_bank_coverage_fraction,
+            selection_seed=validation_seed + 21,
+            device=device,
+        )
+        save_schedule(validation_schedule_path, validation_schedule)
+    save_schedule(parent_root / "validation_source_schedule.json", validation_schedule)
+
+    split_audit = source_overlap(train_schedule, validation_schedule)
+    if split_audit["overlap_count"]:
+        raise RuntimeError(f"macro train/validation parent leakage: {split_audit}")
+    write_coverage_artifacts(
+        parent_root,
+        train_candidate=train_candidate,
+        train_selected=train_harvest.summary,
+        validation_candidate=validation_candidate,
+        validation_selected=validation_harvest.summary,
+        train_candidate_occupancy=train_candidate_occupancy,
+        train_selected_occupancy=train_harvest.occupancy,
+        validation_candidate_occupancy=validation_candidate_occupancy,
+        validation_selected_occupancy=validation_harvest.occupancy,
+        train_schedule=train_schedule,
+        validation_schedule=validation_schedule,
+        train_report=train_report,
+        validation_report=validation_report,
+    )
+    return (
+        macro_train_initial,
+        macro_validation_initial,
+        train_schedule,
+        validation_schedule,
+        train_harvest,
+        validation_harvest,
+    )
 
 
 def _resolve_resume(args: argparse.Namespace) -> tuple[Optional[Path], Optional[Path]]:
@@ -798,6 +1116,15 @@ def _apply_smoke(args: argparse.Namespace) -> None:
     args.firms_per_path = 32
     args.simulation_horizon = 8
     args.bootstrap_horizon = 8
+    args.macro_bank_candidate_paths = 8
+    args.macro_bank_validation_paths = 4
+    args.macro_bank_rollout_horizon = 3
+    args.macro_bank_capture_times = "0,1,2"
+    args.macro_train_parent_count = 16
+    args.macro_validation_parent_count = 8
+    args.macro_parent_batch_size = 4
+    args.long_diagnostic_paths = 4
+    args.long_diagnostic_horizon = 8
     args.train_limit = 64
     args.validation_limit = 32
     args.child_shocks = 2
@@ -842,11 +1169,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--q-fit-steps", type=int, default=100)
     parser.add_argument("--q-lr", type=float, default=1e-4)
     parser.add_argument("--macro-inner-max", type=int, default=20)
-    parser.add_argument("--simulation-paths", type=int, default=400)
-    parser.add_argument("--validation-paths", type=int, default=400)
+    parser.add_argument("--simulation-paths", type=int, default=400, help="deprecated; not used for primary Macro training")
+    parser.add_argument("--validation-paths", type=int, default=400, help="deprecated; not used for primary Macro training")
     parser.add_argument("--bootstrap-paths", type=int, default=64)
     parser.add_argument("--firms-per-path", type=int, default=200)
-    parser.add_argument("--simulation-horizon", type=int, default=100)
+    parser.add_argument("--simulation-horizon", type=int, default=100, help="deprecated; not used for primary Macro training")
     parser.add_argument("--bootstrap-horizon", type=int, default=100)
     parser.add_argument("--branch-num", type=int, default=2)
     parser.add_argument("--train-limit", type=int, default=8192)
@@ -854,6 +1181,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--child-shocks", type=int, default=16)
     parser.add_argument("--macro-probe-size", type=int, default=2048)
     parser.add_argument("--macro-batch-size", type=int, default=4096)
+    parser.add_argument("--macro-bank-candidate-paths", type=int, default=1024)
+    parser.add_argument("--macro-bank-validation-paths", type=int, default=256)
+    parser.add_argument("--macro-bank-rollout-horizon", type=int, default=8)
+    parser.add_argument("--macro-bank-capture-times", default="0,2,4,6,8")
+    parser.add_argument("--macro-train-parent-count", type=int, default=4096)
+    parser.add_argument("--macro-validation-parent-count", type=int, default=1024)
+    parser.add_argument("--macro-bank-candidate-multiplier", type=float, default=1.5)
+    parser.add_argument("--macro-bank-coverage-fraction", type=float, default=0.20)
+    parser.add_argument("--macro-parent-batch-size", type=int, default=256)
+    parser.add_argument("--macro-bank-shard-size", type=int, default=128)
+    parser.add_argument("--long-diagnostic-paths", type=int, default=50)
+    parser.add_argument("--long-diagnostic-horizon", type=int, default=100)
+    parser.add_argument(
+        "--use-long-rollout-for-macro-training",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--fc1-production-epochs", type=int, default=10)
     parser.add_argument("--fc1-max-epochs", type=int, default=100)
     parser.add_argument("--fc1-patience", type=int, default=20)
@@ -872,6 +1216,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("formal nested training requires --disable-fc2")
     if args.sdf_recursive_epochs != 0:
         parser.error("formal nested training requires --sdf-recursive-epochs 0")
+    if args.use_long_rollout_for_macro_training:
+        parser.error("long rollout is diagnostic-only and cannot enter primary Macro training")
+    if args.branch_num != 2:
+        parser.error("one-step conditional SDF training requires --branch-num 2")
+    parse_capture_times(args.macro_bank_capture_times)
+    if not 0.0 <= args.macro_bank_coverage_fraction <= 1.0:
+        parser.error("--macro-bank-coverage-fraction must be in [0, 1]")
     for name in ("equilibrium_outer_max", "firm_inner_max", "p_policy_outer_max",
                  "q_picard_outer_max", "macro_inner_max"):
         if int(getattr(args, name)) < 1:
@@ -938,13 +1289,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         validation_initial = torch.load(validation_initial_path, map_location="cpu", weights_only=True)
     else:
         train_initial = make_initial_state(
-            models=models, episode=episode, paths=args.simulation_paths,
-            firms=args.firms_per_path, horizon=args.simulation_horizon,
+            models=models, episode=episode, paths=args.long_diagnostic_paths,
+            firms=args.firms_per_path, horizon=args.long_diagnostic_horizon,
             branch_num=args.branch_num, seed=args.seed + 1000, device=device,
         )
         validation_initial = make_initial_state(
-            models=models, episode=episode, paths=args.validation_paths,
-            firms=args.firms_per_path, horizon=args.simulation_horizon,
+            models=models, episode=episode, paths=args.long_diagnostic_paths,
+            firms=args.firms_per_path, horizon=args.long_diagnostic_horizon,
             branch_num=args.branch_num, seed=args.seed + 2000, device=device,
         )
         if state_hash(train_initial) == state_hash(validation_initial):
@@ -966,11 +1317,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "crn_validation_initial": state_hash(validation_initial),
         "crn_train_shocks": stable_json_hash([
             args.seed + 1011, args.seed + 1012, args.branch_num,
-            args.simulation_horizon,
+            args.long_diagnostic_horizon,
         ]),
         "crn_validation_shocks": stable_json_hash([
             args.seed + 2011, args.seed + 2012, args.branch_num,
-            args.simulation_horizon,
+            args.long_diagnostic_horizon,
         ]),
     })
     if resume_checkpoint is not None and expected_banks != bank_hashes:
@@ -1363,12 +1714,66 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             function_history = [
                 {key: value.detach().cpu() for key, value in current_functions.items()}
             ]
-        train_out, validation_out, _ = _simulation_pair(
+        (
+            macro_train_initial,
+            macro_validation_initial,
+            train_source_schedule,
+            validation_source_schedule,
+            current_train_harvest,
+            current_validation_harvest,
+        ) = _build_or_refresh_macro_parent_context(
+            args=args,
+            run_root=run_root,
+            outer_root=outer_root,
+            equilibrium_outer=equilibrium_outer,
+            models=models,
+            episode=episode,
+            device=device,
+        )
+        long_start_train, long_start_validation, _ = _simulation_pair(
             args=args, episode=episode, models=models,
             train_initial=train_initial, validation_initial=validation_initial,
             device=device,
         )
-        current_validation_frame = _to_frame(validation_out.macro)
+        _write_simulation_metadata(
+            macro_root / "long_diagnostic_start.json",
+            args=args,
+            train_out=long_start_train,
+            validation_out=long_start_validation,
+            train_initial=train_initial,
+            validation_initial=validation_initial,
+            label=f"equilibrium_outer_{equilibrium_outer}_macro_start",
+        )
+        _write_long_diagnostic_artifacts(
+            macro_root / "long_diagnostic_start",
+            train_out=long_start_train,
+            validation_out=long_start_validation,
+        )
+        current_train_dataset = build_one_step_macro_dataset(
+            models=models,
+            episode=episode,
+            parent_bank=current_train_harvest,
+            parent_batch_size=args.macro_parent_batch_size,
+            macro_batch_size=args.macro_batch_size,
+            branch_num=args.branch_num,
+            transition_seed=train_source_schedule.transition_seed + 1000,
+            entry_seed=train_source_schedule.entry_seed + 1000,
+            device=device,
+            path_offset=0,
+        )
+        current_validation_dataset = build_one_step_macro_dataset(
+            models=models,
+            episode=episode,
+            parent_bank=current_validation_harvest,
+            parent_batch_size=args.macro_parent_batch_size,
+            macro_batch_size=args.macro_batch_size,
+            branch_num=args.branch_num,
+            transition_seed=validation_source_schedule.transition_seed + 1000,
+            entry_seed=validation_source_schedule.entry_seed + 1000,
+            device=device,
+            path_offset=1_000_000,
+        )
+        current_validation_frame = _to_frame(current_validation_dataset.macro)
         last_macro_row: dict[str, Any] = {}
         macro_history_path = macro_root / "macro_history.csv"
         if start_macro_inner > 0 and macro_history_path.is_file():
@@ -1388,32 +1793,94 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for macro_inner in range(start_macro_inner, args.macro_inner_max):
             macro_inner_root = macro_root / f"macro_inner_{macro_inner:03d}"
             macro_inner_root.mkdir(parents=True, exist_ok=True)
-            _write_simulation_metadata(
-                macro_inner_root / "input_simulation_metadata.json",
-                args=args, train_out=train_out, validation_out=validation_out,
-                train_initial=train_initial, validation_initial=validation_initial,
-                label=f"equilibrium_outer_{equilibrium_outer}_macro_inner_{macro_inner}_input",
+            atomic_write_json(
+                macro_inner_root / "input_parent_bank_metadata.json",
+                {
+                    "macro_primary_training_source": "MANY_PARENT_CROSS_SECTIONS_ONE_STEP",
+                    "train_parent_count": current_train_harvest.n_parents,
+                    "validation_parent_count": current_validation_harvest.n_parents,
+                    "short_rollout_horizon": args.macro_bank_rollout_horizon,
+                    "effective_capture_times": list(effective_capture_times(
+                        args.macro_bank_capture_times,
+                        args.macro_bank_rollout_horizon,
+                    )),
+                    "one_step_horizon": 1,
+                    "branch_num": args.branch_num,
+                    "long_rollout_training_used": False,
+                    "train_schedule_fingerprint": train_source_schedule.fingerprint,
+                    "validation_schedule_fingerprint": validation_source_schedule.fingerprint,
+                    "firm_hashes": firm_hash_for_macro,
+                },
             )
+            atomic_write_json(
+                macro_inner_root / "one_step_pairing_audit.json",
+                {
+                    "train": current_train_dataset.pairing_audit,
+                    "validation": current_validation_dataset.pairing_audit,
+                    "train_validation_source_split": source_overlap(
+                        train_source_schedule, validation_source_schedule
+                    ),
+                },
+            )
+            if macro_inner == 0:
+                save_bank_shards(
+                    macro_root / "macro_parent_bank" / "macro_inner_000_train",
+                    current_train_harvest,
+                    shard_size=args.macro_bank_shard_size,
+                )
+                save_bank_shards(
+                    macro_root / "macro_parent_bank" / "macro_inner_000_validation",
+                    current_validation_harvest,
+                    shard_size=args.macro_bank_shard_size,
+                )
             block_start = _model_states(models)
             old_functions = current_functions
             old_validation_frame = current_validation_frame
+            old_validation_pairs = current_validation_dataset.pairs
+            old_validation_parent_summary = current_validation_harvest.summary
 
             def run_macro(batch_size: int):
-                local_args = argparse.Namespace(**vars(args))
-                local_args.macro_batch_size = batch_size
-                batches = build_in_memory_batches(
-                    episode, train_out.macro.to(device), validation_out.macro.to(device),
-                    local_args,
+                target_batches = int(getattr(
+                    episode.hyperparams, "sdf_true_target_batches", 20
+                ))
+                min_parents = int(getattr(
+                    episode.hyperparams, "sdf_min_parent_groups_per_batch", 256
+                ))
+                train_fc1_batches = episode._create_sdf_batches_from_macro_tensor(
+                    current_train_dataset.pairs,
+                    batch_size=batch_size,
+                    n_branches=args.branch_num,
+                )
+                validation_fc1_batches = episode._create_sdf_batches_from_macro_tensor(
+                    current_validation_dataset.pairs,
+                    batch_size=batch_size,
+                    n_branches=args.branch_num,
+                )
+                train_sdf_batches = episode._create_sdf_batches_from_macro_tensor(
+                    current_train_dataset.pairs,
+                    batch_size=batch_size,
+                    n_branches=args.branch_num,
+                    target_num_batches=target_batches,
+                    min_parent_groups_per_batch=min_parents,
+                )
+                validation_sdf_batches = episode._create_sdf_batches_from_macro_tensor(
+                    current_validation_dataset.pairs,
+                    batch_size=batch_size,
+                    n_branches=args.branch_num,
                 )
                 fc1_summary = run_fc1_fit(
-                    episode, batches["fc1_train"], batches["fc1_validation"],
+                    episode,
+                    train_fc1_batches,
+                    validation_fc1_batches,
                     macro_inner_root / "fc1", block="joint",
                     production_epochs=args.fc1_production_epochs,
                     max_epochs=args.fc1_max_epochs, patience=args.fc1_patience,
                     log_interval=1_000_000,
                 )
                 sdf_summary = run_sdf_chunks(
-                    episode, batches["sdf_train"], batches["sdf_validation"],
+                    episode,
+                    train_sdf_batches,
+                    validation_sdf_batches,
                     probe_parents, probe_children, macro_inner_root / "sdf",
                     chunks=args.sdf_chunks,
                     epochs_per_chunk=args.sdf_epochs_per_chunk,
@@ -1445,12 +1912,58 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     ("objective", "moment1", "moment2"),
                 )
                 atomic_write_json(macro_inner_root / "sdf" / "summary.json", sdf_summary)
-                post_train, post_validation, seconds = _simulation_pair(
-                    args=args, episode=episode, models=models,
-                    train_initial=train_initial, validation_initial=validation_initial,
+                simulation_started = time.perf_counter()
+                post_train_harvest = harvest_macro_parent_schedule(
+                    models=models,
+                    episode=episode,
+                    initial_state=macro_train_initial,
+                    schedule=train_source_schedule,
+                    source_episode=equilibrium_outer,
+                    branch_num=args.branch_num,
                     device=device,
                 )
-                return fc1_summary, sdf_summary, post_train, post_validation, seconds
+                post_validation_harvest = harvest_macro_parent_schedule(
+                    models=models,
+                    episode=episode,
+                    initial_state=macro_validation_initial,
+                    schedule=validation_source_schedule,
+                    source_episode=equilibrium_outer,
+                    branch_num=args.branch_num,
+                    device=device,
+                )
+                post_train_dataset = build_one_step_macro_dataset(
+                    models=models,
+                    episode=episode,
+                    parent_bank=post_train_harvest,
+                    parent_batch_size=args.macro_parent_batch_size,
+                    macro_batch_size=batch_size,
+                    branch_num=args.branch_num,
+                    transition_seed=train_source_schedule.transition_seed + 1000,
+                    entry_seed=train_source_schedule.entry_seed + 1000,
+                    device=device,
+                    path_offset=0,
+                )
+                post_validation_dataset = build_one_step_macro_dataset(
+                    models=models,
+                    episode=episode,
+                    parent_bank=post_validation_harvest,
+                    parent_batch_size=args.macro_parent_batch_size,
+                    macro_batch_size=batch_size,
+                    branch_num=args.branch_num,
+                    transition_seed=validation_source_schedule.transition_seed + 1000,
+                    entry_seed=validation_source_schedule.entry_seed + 1000,
+                    device=device,
+                    path_offset=1_000_000,
+                )
+                return (
+                    fc1_summary,
+                    sdf_summary,
+                    post_train_harvest,
+                    post_validation_harvest,
+                    post_train_dataset,
+                    post_validation_dataset,
+                    time.perf_counter() - simulation_started,
+                )
 
             result, used_batch = run_with_oom_fallback(
                 block="MACRO", initial_batch_size=args.macro_batch_size,
@@ -1460,12 +1973,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 events=oom_events, events_path=oom_events_path, device=device,
                 indices={"equilibrium_outer": equilibrium_outer, "firm_inner": -1, "macro_inner": macro_inner},
             )
-            fc1_summary, sdf_summary, train_out, validation_out, simulation_seconds = result
-            _write_simulation_metadata(
-                macro_inner_root / "output_simulation_metadata.json",
-                args=args, train_out=train_out, validation_out=validation_out,
-                train_initial=train_initial, validation_initial=validation_initial,
-                label=f"equilibrium_outer_{equilibrium_outer}_macro_inner_{macro_inner}_output",
+            (
+                fc1_summary,
+                sdf_summary,
+                current_train_harvest,
+                current_validation_harvest,
+                current_train_dataset,
+                current_validation_dataset,
+                simulation_seconds,
+            ) = result
+            atomic_write_json(
+                macro_inner_root / "output_parent_bank_metadata.json",
+                {
+                    "train_bank_hash": table_hash(current_train_dataset.macro),
+                    "validation_bank_hash": table_hash(current_validation_dataset.macro),
+                    "train_pair_rows": len(current_train_dataset.pairs),
+                    "validation_pair_rows": len(current_validation_dataset.pairs),
+                    "train_parent_batch_size": current_train_dataset.used_parent_batch_size,
+                    "validation_parent_batch_size": current_validation_dataset.used_parent_batch_size,
+                    "long_rollout_training_used": False,
+                },
             )
             if firm_hashes(models["policy_value"]) != firm_hash_for_macro:
                 raise RuntimeError("Firm hash changed during MacroSolve")
@@ -1477,17 +2004,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             function_history.append({
                 key: value.detach().cpu() for key, value in current_functions.items()
             })
-            current_validation_frame = _to_frame(validation_out.macro)
+            current_validation_frame = _to_frame(current_validation_dataset.macro)
             function_moves = {}
             for name in ("m", "fc1_c", "fc1_k"):
                 function_moves[name] = movement_metrics(
                     old_functions[name], current_functions[name], name
                 )
-            path_moves = _path_and_target_movements(
-                old_validation_frame, current_validation_frame
+            target_moves = _one_step_target_movements(
+                old_validation_pairs, current_validation_dataset.pairs
+            )
+            parent_moves = parent_summary_movement(
+                old_validation_parent_summary, current_validation_harvest.summary
+            )
+            atomic_write_json(
+                macro_inner_root / "parent_bank_summary_movement.json", parent_moves
             )
             macro_diag = macro_diagnostics(current_validation_frame)
-            macro_diag.update(simulation_policy_metrics(_to_frame(validation_out.firm)))
+            macro_diag.update(simulation_policy_metrics(
+                _to_frame(current_validation_harvest.simulation_output.firm)
+            ))
             final_sdf = sdf_summary.get("final_row", {})
             production_sdf = sdf_summary["production_metrics"]
             last_macro_row = {
@@ -1497,17 +2032,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "M_function_move": function_moves["m"]["m_nmae"],
                 "FC1_C_function_move": function_moves["fc1_c"]["fc1_c_nmae"],
                 "FC1_K_function_move": function_moves["fc1_k"]["fc1_k_nmae"],
-                "Hatc_target_move": path_moves["Hatc_target_move"],
-                "LnK_target_move": path_moves["LnK_target_move"],
-                "Hatc_path_move": path_moves["Hatc_path_move"],
-                "LnK_path_move": path_moves["LnK_path_move"],
-                "C_path_move": path_moves["C_path_move"],
-                "K_path_move": path_moves["K_path_move"],
-                "path_gate_pass": bool(
-                    path_moves["Hatc_path_move"] < 0.01
-                    and path_moves["LnK_path_move"] < 0.01
-                    and path_moves["C_path_move"] < 0.01
-                    and path_moves["K_path_move"] < 0.01
+                "Hatc_target_move": target_moves["Hatc_target_move"],
+                "LnK_target_move": target_moves["LnK_target_move"],
+                "Hatc_path_move": float("nan"),
+                "LnK_path_move": float("nan"),
+                "C_path_move": float("nan"),
+                "K_path_move": float("nan"),
+                "path_gate_pass": False,
+                "long_path_metrics_deferred_to_diagnostic": True,
+                "parent_bank_summary_movement_max": max(
+                    value for value in parent_moves.values() if math.isfinite(value)
                 ),
                 "FC1_C_val_R2": fc1_summary["best_validation"].get("hatc_r2", float("nan")),
                 "FC1_K_val_R2": fc1_summary["best_validation"].get("lnk_r2", float("nan")),
@@ -1568,6 +2102,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 macro_history_path,
                 pd.concat([existing, pd.DataFrame([last_macro_row])], ignore_index=True),
             )
+            write_macro_inner_movement_figure(
+                pd.read_csv(macro_history_path),
+                macro_root / "macro_parent_bank" / "figures",
+            )
             atomic_torch_save(macro_root / "macro_probe_history.pt", function_history)
             state = {
                 **state, "equilibrium_outer": equilibrium_outer,
@@ -1596,8 +2134,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "CONDITIONAL_FIXED_POINT_REACHED"
             if macro_reached else "MAX_INNER_BUT_STABLE"
         )
+        save_bank_shards(
+            macro_root / "macro_parent_bank" / "final_train",
+            current_train_harvest,
+            shard_size=args.macro_bank_shard_size,
+        )
+        save_bank_shards(
+            macro_root / "macro_parent_bank" / "final_validation",
+            current_validation_harvest,
+            shard_size=args.macro_bank_shard_size,
+        )
+        long_final_train, long_final_validation, long_final_seconds = _simulation_pair(
+            args=args,
+            episode=episode,
+            models=models,
+            train_initial=train_initial,
+            validation_initial=validation_initial,
+            device=device,
+        )
+        _write_simulation_metadata(
+            macro_root / "long_diagnostic_final.json",
+            args=args,
+            train_out=long_final_train,
+            validation_out=long_final_validation,
+            train_initial=train_initial,
+            validation_initial=validation_initial,
+            label=f"equilibrium_outer_{equilibrium_outer}_macro_final_and_boundary",
+        )
+        _write_long_diagnostic_artifacts(
+            macro_root / "long_diagnostic_final",
+            train_out=long_final_train,
+            validation_out=long_final_validation,
+        )
+        long_path_moves = _path_and_target_movements(
+            _to_frame(long_start_validation.macro),
+            _to_frame(long_final_validation.macro),
+        )
+        atomic_write_json(
+            macro_root / "long_diagnostic_movement.json",
+            {**long_path_moves, "simulation_seconds": long_final_seconds},
+        )
         if last_macro_row:
             last_macro_row["macro_stop_reason"] = macro_stop_reason
+            last_macro_row.update({
+                key: value
+                for key, value in long_path_moves.items()
+                if key.endswith("_path_move")
+            })
         atomic_torch_save(macro_root / "sdf_fc1.pt", models["sdf_fc1"].state_dict())
         current_firm_probe = build_coupled_view(models["policy_value"], build_problem(
             episode, models["policy_value"], validation_parents,

@@ -35,9 +35,18 @@ def test_production_defaults_match_formal_protocol():
     assert args.p_batch_size == 1024
     assert args.q_batch_size == 2048
     assert args.macro_batch_size == 4096
-    assert args.simulation_paths == args.validation_paths == 400
+    assert args.macro_bank_candidate_paths == 1024
+    assert args.macro_bank_validation_paths == 256
+    assert args.macro_train_parent_count == 4096
+    assert args.macro_validation_parent_count == 1024
+    assert args.macro_bank_rollout_horizon == 8
+    assert args.macro_bank_capture_times == "0,2,4,6,8"
+    assert args.macro_parent_batch_size == 256
+    assert args.macro_bank_coverage_fraction == 0.20
+    assert args.long_diagnostic_paths == 50
+    assert args.long_diagnostic_horizon == 100
+    assert not args.use_long_rollout_for_macro_training
     assert args.firms_per_path == 200
-    assert args.simulation_horizon == 100
     assert args.branch_num == 2
     assert args.q_solver == "picard"
     assert args.sdf_chunks == 4
@@ -55,6 +64,12 @@ def test_smoke_overrides_only_scale_and_budget():
     assert args.macro_inner_max == 1
     assert (args.simulation_paths, args.validation_paths) == (4, 4)
     assert (args.firms_per_path, args.simulation_horizon) == (32, 8)
+    assert args.macro_bank_candidate_paths == 8
+    assert args.macro_bank_validation_paths == 4
+    assert args.macro_train_parent_count == 16
+    assert args.macro_validation_parent_count == 8
+    assert args.macro_bank_rollout_horizon == 3
+    assert args.macro_parent_batch_size == 4
     assert args.sdf_recursive_epochs == 0
     assert args.disable_fc2
 
@@ -77,6 +92,11 @@ def test_a800_launcher_enforces_single_gpu_and_formal_modes():
     assert "--sdf-recursive-epochs 0" in source
     assert "--disable-fc2" in source
     assert "--q-solver picard" in source
+    assert "MACRO_PRIMARY_TRAINING=MANY_PARENT_ONE_STEP" in source
+    assert "--macro-bank-candidate-paths 1024" in source
+    assert "--macro-train-parent-count 4096" in source
+    assert "--long-diagnostic-horizon 100" in source
+    assert "--no-use-long-rollout-for-macro-training" in source
     assert 'REQUIRED_COMMIT="${REQUIRED_COMMIT:?' in source
 
 
