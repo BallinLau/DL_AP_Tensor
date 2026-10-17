@@ -100,6 +100,7 @@ def test_a800_launcher_enforces_single_gpu_and_formal_modes():
     assert 'REQUIRED_COMMIT="${REQUIRED_COMMIT:?' in source
     assert 'RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"' in source
     assert 'MODE_ARGS=(--resume "$RESUME_CHECKPOINT")' in source
+    assert "TEE_ARGS=(-a)" in source
     assert "--allow-code-mismatch" in source
 
 

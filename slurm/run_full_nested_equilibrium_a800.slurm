@@ -85,8 +85,10 @@ if [[ "$NESTED_SMOKE" == "1" ]]; then
   EXTRA_ARGS+=(--smoke)
 fi
 MODE_ARGS=(--cold-start)
+TEE_ARGS=()
 if [[ -n "$RESUME_CHECKPOINT" ]]; then
   MODE_ARGS=(--resume "$RESUME_CHECKPOINT")
+  TEE_ARGS=(-a)
   if [[ "$ALLOW_CODE_MISMATCH" == "1" ]]; then
     MODE_ARGS+=(--allow-code-mismatch)
   fi
@@ -135,6 +137,6 @@ python3 -u analysis/run_full_nested_equilibrium.py \
   --sdf-recursive-epochs 0 \
   --disable-fc2 \
   "${EXTRA_ARGS[@]}" \
-  2>&1 | tee "$RUN_ROOT/logs/run.log"
+  2>&1 | tee "${TEE_ARGS[@]}" "$RUN_ROOT/logs/run.log"
 
 echo "Job finished: $(date)"
