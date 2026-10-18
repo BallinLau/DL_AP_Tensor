@@ -162,3 +162,14 @@ dimension is 5632 but corresponding boolean dimension is 512
 根因是 `PolicyView.investment_selector` 的生产形状为 `[parent, i_grid] = [512, 11]`。旧报告把它 flatten 成 5632 行，再用 512 个 parent 的 eta mask 索引。经济训练和 root gate 不受影响。
 
 报告修复不再 flatten grid selector；investment boundary 按每个已存 parent 的实际 `i`，使用同一 parent 上的 `PI > P0` 定义。所有 Firm surface 标量都新增 parent-count shape gate；回归测试显式使用 `[B,11]` selector，要求生成 eta 0/1 的 14 张 surface/boundary 图而不发生广播或静默错位。
+
+### 7.7 Job 695304：Tiny 全通过，Small 暴露 tolerance 分层错误
+
+job 695304 的 Tiny runner、数值 stage gate 与完整 report 均通过，并自动以 Tiny final checkpoint 启动 Small。Small 第一个 128-path bootstrap 节点在 path 10 被标记为 `FP64_REPLAY_RESIDUAL_FAILED`。
+
+复核发现 7.5 节引入的 `5e-6` 内部搜索接纳线被错误地同时用于最终 FP64 replay。正确的分层应是：
+
+- candidate coarse/refinement/verification admission：`5e-6`，主动留出 replay 裕度；
+- final FP64 replay、production committed replay、Firm bank gate：公开经济合约 `1e-5`。
+
+修复只恢复这一分层，不改变公开 residual tolerance，也不增加 tolerance slack。严格失败异常现在同时输出 selected normalized residual、内部 candidate tolerance 与公开 tolerance，后续若仍失败可直接判定是合法经济/数值 blocker，而不是丢失证据的泛化状态码。

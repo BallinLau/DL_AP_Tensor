@@ -621,7 +621,7 @@ class MarketClearingController:
 
         fp64_replay_failed = torch.isfinite(selected_h) & (
             ~torch.isfinite(selected_normalized)
-            | (selected_normalized.abs() > self._root_acceptance_tolerance)
+            | (selected_normalized.abs() > self.config.residual_tolerance)
         )
         no_root = ~torch.isfinite(selected_h) | fp64_replay_failed
         if bool(no_root.any()):
@@ -647,12 +647,30 @@ class MarketClearingController:
                         "status": status,
                         "h_belief": float(belief[parent]),
                         "bracket_count": int(bracket_count[parent]),
+                        "selected_h": (
+                            float(selected_h[parent])
+                            if torch.isfinite(selected_h[parent]) else None
+                        ),
+                        "selected_normalized_residual": (
+                            float(selected_normalized[parent])
+                            if torch.isfinite(selected_normalized[parent]) else None
+                        ),
+                        "root_candidate_acceptance_tolerance": (
+                            self._root_acceptance_tolerance
+                        ),
+                        "public_residual_tolerance": (
+                            float(self.config.residual_tolerance)
+                        ),
                     }
                 )
             raise MarketClearingError(
                 "strict market clearing found no valid root; "
                 f"t={t}, branch={branch}, paths={bad.detach().cpu().tolist()[:20]}, "
-                f"statuses={statuses[:20]}"
+                f"statuses={statuses[:20]}, "
+                f"selected_normalized_residuals="
+                f"{selected_normalized[bad].detach().cpu().tolist()[:20]}, "
+                f"candidate_tolerance={self._root_acceptance_tolerance}, "
+                f"public_tolerance={self.config.residual_tolerance}"
             )
 
         # Matched belief/root replay records whether resolving the market root

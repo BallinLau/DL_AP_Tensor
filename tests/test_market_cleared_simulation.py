@@ -200,6 +200,7 @@ def test_root_candidate_admission_is_stricter_than_public_commit_gate():
         controller.summary()["root_candidate_acceptance_tolerance"]
         == pytest.approx(5.0e-6)
     )
+    assert controller.config.residual_tolerance == pytest.approx(1.0e-5)
 
 
 def test_committed_parity_checks_cleared_node_even_after_all_firms_exit():
