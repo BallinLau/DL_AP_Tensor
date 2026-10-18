@@ -238,11 +238,22 @@ def test_inner_fixed_point_unconfigured_bellman_gate_is_explicit():
 def test_collocation_bank_is_deterministic_for_same_seed():
     econ = AnalysisEconomicConfig.from_current_config()
     rng = np.random.default_rng(4)
-    firm = pd.DataFrame({"z": rng.normal(size=100)})
+    path = np.arange(100)
+    firm = pd.DataFrame({
+        "path": path, "t": np.zeros(100), "branch": -np.ones(100),
+        "economic_node_id": path, "b": rng.uniform(size=100),
+        "z": rng.normal(size=100), "ETA": rng.integers(0, 2, size=100),
+        "i": rng.uniform(size=100), "x": rng.normal(size=100),
+        "Hatcf": rng.normal(size=100), "LnKF": rng.normal(size=100),
+    })
     macro = pd.DataFrame({
-        "x": rng.normal(size=100),
+        "path": path, "t": np.zeros(100), "branch": -np.ones(100),
+        "economic_node_id": path,
+        "x": firm["x"],
         "hatcf": rng.normal(size=100),
         "lnkf": rng.normal(size=100),
+        "Hatc": rng.normal(size=100),
+        "LnK": rng.normal(size=100),
     })
     first = build_collocation_bank(
         firm, macro, n_parents=64, seed=99, split="train", economic_config=econ

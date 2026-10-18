@@ -128,20 +128,29 @@ def refresh_transition_bank(
     parents: torch.Tensor,
     children: torch.Tensor,
     *,
+    parent_macro_context: torch.Tensor,
     m_min: float,
     m_max: float,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Replace Hatcf/LnKF/M with the current macro operator on fixed shocks."""
+    """Apply the production calculated-parent -> child-forecast operator."""
     if parents.shape[-1] < 7 or children.shape[-1] < 7:
         raise ValueError("transition bank must contain the seven firm state columns")
     if not m_min < m_max:
         raise ValueError("invalid common M clamp")
+    if parent_macro_context is None:
+        raise ValueError("parent_macro_context is required; f->f fallback is forbidden")
+    if parent_macro_context.shape != (parents.shape[0], 2):
+        raise ValueError(
+            "parent_macro_context must have shape [N,2] containing Hatc_cal_t/LnK_cal_t"
+        )
+    if not torch.isfinite(parent_macro_context).all():
+        raise ValueError("parent_macro_context contains NaN/Inf")
     with torch.no_grad():
         _, _, m_raw, hatc, lnk = sdf_fc1.forward_step(
             x_prev=parents[:, 4:5],
             x_curr=children[:, :, 4:5],
-            hatcf_prev=parents[:, 5:6],
-            lnkf_prev=parents[:, 6:7],
+            hatcf_prev=parent_macro_context[:, 0:1],
+            lnkf_prev=parent_macro_context[:, 1:2],
             return_physical=True,
         )
         m = m_raw.clamp(m_min, m_max)
@@ -156,6 +165,10 @@ def refresh_transition_bank(
     flat = m.detach().reshape(-1).to(torch.float64)
     return refreshed, {
         "m_source": "CURRENT_SDF_FC1_CHILD_CLAMPED_ONCE",
+        "macro_transition_semantics": "cal_t_to_f_t1",
+        "parent_macro_context_hash": _tensor_digest([
+            ("parent_macro_context", parent_macro_context)
+        ]),
         "m_hash": _tensor_digest([("m", m)]),
         "m_mean": float(flat.mean()),
         "m_p10": float(torch.quantile(flat, 0.10)),
@@ -200,14 +213,17 @@ def audit_m_parity(episode: Any, children: torch.Tensor) -> dict[str, Any]:
 
 
 def function_snapshot(
-    sdf_fc1: torch.nn.Module, parents: torch.Tensor, children: torch.Tensor
+    sdf_fc1: torch.nn.Module, parents: torch.Tensor, children: torch.Tensor,
+    *, parent_macro_context: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
+    if parent_macro_context.shape != (parents.shape[0], 2):
+        raise ValueError("parent_macro_context must have shape [N,2]")
     with torch.no_grad():
         _, _, m, hatc, lnk = sdf_fc1.forward_step(
             x_prev=parents[:, 4:5],
             x_curr=children[:, :, 4:5],
-            hatcf_prev=parents[:, 5:6],
-            lnkf_prev=parents[:, 6:7],
+            hatcf_prev=parent_macro_context[:, 0:1],
+            lnkf_prev=parent_macro_context[:, 1:2],
             return_physical=True,
         )
     return {"m": m.detach(), "hatc": hatc.detach(), "lnk": lnk.detach()}
@@ -369,12 +385,14 @@ def _simulation_kwargs(episode: Any, transition_seed: int, entry_seed: int) -> d
         "preserve_global_rng_around_entry",
     )
     kwargs = {name: getattr(episode.hyperparams, name) for name in names}
+    # Resolve the action source through Episode so grid mode uses the formal
+    # BPGridTeacher-backed resolver rather than a second economic objective.
+    kwargs = episode._prepare_simulation_kwargs(kwargs)
     kwargs.update({
         "entry_rng_seed": entry_seed,
         "entry_rng_mode": "stable_economic_identity",
         "common_transition_seed": transition_seed,
         "transition_rng_mode": "stable_firm_identity",
-        "bp_action_source": "head",
     })
     return kwargs
 
@@ -717,6 +735,13 @@ def main() -> None:
     n_val = min(args.validation_limit, int(val_payload["parent_states"].shape[0]))
     train_parents = train_payload["parent_states"][:n_train, :7].to(device)
     val_parents = val_payload["parent_states"][:n_val, :7].to(device)
+    if "parent_macro_cal" not in train_payload or "parent_macro_cal" not in val_payload:
+        raise RuntimeError(
+            "source fixed-point bank predates unified_firm_macro_bank_v1 and has no "
+            "node-matched calculated macro context; refusing f->f fallback"
+        )
+    train_macro_context = train_payload["parent_macro_cal"][:n_train].to(device)
+    val_macro_context = val_payload["parent_macro_cal"][:n_val].to(device)
     base_train_children = child_payload["train"]["children"][:n_train].to(device)
     base_val_children = child_payload["validation"]["children"][:n_val].to(device)
     m_min = float(getattr(hp, "pv_m_clamp_min", 0.7))
@@ -759,10 +784,12 @@ def main() -> None:
         outer_started = time.perf_counter()
         train_children, train_m_diag = refresh_transition_bank(
             models["sdf_fc1"], train_parents, base_train_children,
+            parent_macro_context=train_macro_context,
             m_min=m_min, m_max=m_max,
         )
         val_children, val_m_diag = refresh_transition_bank(
             models["sdf_fc1"], val_parents, base_val_children,
+            parent_macro_context=val_macro_context,
             m_min=m_min, m_max=m_max,
         )
         m_parity = audit_m_parity(episode, val_children)
@@ -899,7 +926,10 @@ def main() -> None:
         }
         rows.append(row)
         pd.DataFrame(p_history).to_csv(outer_dir / "inner_summary.csv", index=False)
-        snapshot = function_snapshot(models["sdf_fc1"], val_parents, base_val_children)
+        snapshot = function_snapshot(
+            models["sdf_fc1"], val_parents, base_val_children,
+            parent_macro_context=val_macro_context,
+        )
         function_states.append({name: value.cpu() for name, value in snapshot.items()})
         save_outer_checkpoint(
             checkpoints, outer, models["sdf_fc1"], firm,
@@ -922,7 +952,10 @@ def main() -> None:
         if outer == args.macro_outer_max:
             break
 
-        macro_before = function_snapshot(models["sdf_fc1"], val_parents, base_val_children)
+        macro_before = function_snapshot(
+            models["sdf_fc1"], val_parents, base_val_children,
+            parent_macro_context=val_macro_context,
+        )
         macro_summary, macro_seconds = train_macro_block(
             episode, models, train_out.macro, fc1_epochs=args.fc1_epochs,
             sdf_epochs=args.sdf_epochs, recursive_epochs=args.recursive_epochs,
@@ -931,7 +964,10 @@ def main() -> None:
             fc1_rollout_diagnostic=args.fc1_rollout_diagnostic,
         )
         set_stage_trainability(models, "frozen")
-        macro_after = function_snapshot(models["sdf_fc1"], val_parents, base_val_children)
+        macro_after = function_snapshot(
+            models["sdf_fc1"], val_parents, base_val_children,
+            parent_macro_context=val_macro_context,
+        )
         flat_macro = flatten_numeric(macro_summary)
         pending = {
             "previous_p_post": p_post["normalized_mae"],

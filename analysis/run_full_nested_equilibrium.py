@@ -173,6 +173,13 @@ def _load_parent_bank(path: Path) -> InnerFPCollocationBank:
         parent_states=payload["parent_states"],
         source_kind=payload["source_kind"],
         seed=int(payload["seed"]), split=str(payload["split"]),
+        parent_macro_cal=payload.get("parent_macro_cal"),
+        path_id=payload.get("path_id"),
+        economic_node_id=payload.get("economic_node_id"),
+        lineage_id=payload.get("lineage_id"),
+        distribution_id=payload.get("distribution_id"),
+        parent_t=payload.get("parent_t"),
+        bank_version=str(payload.get("bank_version", "legacy_firm_only_v0")),
         metadata=dict(payload.get("metadata", {})),
     )
     if bank.fingerprint != payload.get("fingerprint"):
@@ -395,11 +402,15 @@ def _refresh_children(
     m_max = float(getattr(hp, "pv_m_clamp_max", 1.3))
     train, train_diag = refresh_transition_bank(
         models["sdf_fc1"], train_bank.parent_states.to(device),
-        train_children.children.to(device), m_min=m_min, m_max=m_max,
+        train_children.children.to(device),
+        parent_macro_context=train_bank.require_macro_context().to(device),
+        m_min=m_min, m_max=m_max,
     )
     validation, validation_diag = refresh_transition_bank(
         models["sdf_fc1"], validation_bank.parent_states.to(device),
-        validation_children.children.to(device), m_min=m_min, m_max=m_max,
+        validation_children.children.to(device),
+        parent_macro_context=validation_bank.require_macro_context().to(device),
+        m_min=m_min, m_max=m_max,
     )
     parity = audit_m_parity(episode, validation)
     return train, validation, {

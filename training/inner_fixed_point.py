@@ -93,6 +93,13 @@ class InnerFPCollocationBank:
     source_kind: torch.Tensor
     seed: int
     split: str
+    parent_macro_cal: Optional[torch.Tensor] = None
+    path_id: Optional[torch.Tensor] = None
+    economic_node_id: Optional[torch.Tensor] = None
+    lineage_id: Optional[torch.Tensor] = None
+    distribution_id: Optional[torch.Tensor] = None
+    parent_t: Optional[torch.Tensor] = None
+    bank_version: str = "legacy_firm_only_v0"
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -102,23 +109,57 @@ class InnerFPCollocationBank:
             raise ValueError("source_kind must have shape [N]")
         if not torch.isfinite(self.parent_states).all():
             raise ValueError("collocation bank contains non-finite states")
+        if self.parent_macro_cal is not None:
+            if self.parent_macro_cal.shape != (self.parent_states.shape[0], 2):
+                raise ValueError("parent_macro_cal must have shape [N,2]")
+            if not torch.isfinite(self.parent_macro_cal).all():
+                raise ValueError("parent_macro_cal contains non-finite states")
+        for name in ("path_id", "economic_node_id", "lineage_id", "distribution_id", "parent_t"):
+            value = getattr(self, name)
+            if value is not None and value.shape != (self.parent_states.shape[0],):
+                raise ValueError(f"{name} must have shape [N]")
+
+    def require_macro_context(self) -> torch.Tensor:
+        if self.parent_macro_cal is None:
+            raise ValueError(
+                "Firm bank has no matched calculated macro context. Legacy seven-column "
+                "banks cannot be silently upgraded; regenerate unified_firm_macro_bank_v1."
+            )
+        return self.parent_macro_cal
 
     @property
     def fingerprint(self) -> str:
-        return _tensor_hash((
+        tensors: List[Tuple[str, torch.Tensor]] = [
             ("parent_states", self.parent_states),
             ("source_kind", self.source_kind),
-        ))
+        ]
+        for name in (
+            "parent_macro_cal", "path_id", "economic_node_id", "lineage_id",
+            "distribution_id", "parent_t",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                tensors.append((name, value))
+        return _tensor_hash(tensors)
 
     def payload(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "parent_states": self.parent_states.detach().cpu(),
             "source_kind": self.source_kind.detach().cpu(),
             "seed": int(self.seed),
             "split": self.split,
+            "bank_version": self.bank_version,
             "metadata": dict(self.metadata),
             "fingerprint": self.fingerprint,
         }
+        for name in (
+            "parent_macro_cal", "path_id", "economic_node_id", "lineage_id",
+            "distribution_id", "parent_t",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                payload[name] = value.detach().cpu()
+        return payload
 
 
 @dataclass(frozen=True)
@@ -182,96 +223,106 @@ def build_collocation_bank(
     seed: int,
     split: str,
     economic_config: AnalysisEconomicConfig,
-    on_support_share: float = 0.60,
+    on_support_share: float = 0.75,
     coverage_expansion: float = 0.15,
 ) -> InnerFPCollocationBank:
-    """Build a deterministic joint-macro, broad-micro parent bank."""
+    """Build a node-matched seven-dimensional Firm bank plus macro context.
+
+    Forecast state remains in ``parent_states[:, 5:7]`` because it is part of
+    the Firm network input.  Realized calculated macro state is stored only in
+    ``parent_macro_cal`` and is never inferred from those forecast columns.
+    """
     if n_parents < 2:
         raise ValueError("n_parents must be at least 2")
     if not 0.0 < on_support_share < 1.0:
         raise ValueError("on_support_share must be in (0,1)")
     rng = np.random.default_rng(int(seed))
 
-    firm = firm_frame.rename(columns={"ETA": "eta"})
-    macro = macro_frame.rename(columns={"hatcf": "Hatcf", "lnkf": "LnKF"})
-    macro_support = _finite_frame(macro, ("x", "Hatcf", "LnKF"))
-    z_support = _finite_frame(firm, ("z",))
-    if macro_support.empty or z_support.empty:
-        raise ValueError("Episode-1 artifacts do not contain finite macro/z support")
+    firm = firm_frame.rename(columns={"ETA": "eta"}).copy()
+    macro = macro_frame.rename(columns={"hatcf": "Hatcf", "lnkf": "LnKF"}).copy()
+    key_candidates = ["path", "t", "branch", "economic_node_id"]
+    keys = [name for name in key_candidates if name in firm and name in macro]
+    if not {"path", "t", "branch"}.issubset(keys):
+        raise ValueError("node-matched bank requires path/t/branch in firm and macro tables")
+    required_firm = {"b", "z", "eta", "i", "x", "Hatcf", "LnKF"}
+    required_macro = {"Hatc", "LnK"}
+    missing = sorted((required_firm - set(firm)) | (required_macro - set(macro)))
+    if missing:
+        raise ValueError(
+            "cannot create unified_firm_macro_bank_v1 without calculated macro context; "
+            f"missing={missing}"
+        )
+    macro_cols = keys + ["Hatc", "LnK"]
+    for optional in ("distribution_id", "lineage_id"):
+        if optional in macro and optional not in macro_cols:
+            macro_cols.append(optional)
+    joined = firm.merge(
+        macro[macro_cols].drop_duplicates(keys), on=keys, how="inner",
+        suffixes=("", "_macro"), validate="many_to_one",
+    )
+    finite_cols = [*required_firm, *required_macro]
+    numeric = joined.loc[:, finite_cols].apply(pd.to_numeric, errors="coerce")
+    joined = joined.loc[np.isfinite(numeric.to_numpy(dtype=np.float64)).all(axis=1)].reset_index(drop=True)
+    if joined.empty:
+        raise ValueError("no finite node-matched Firm/Macro rows were found")
 
-    macro_values = macro_support.to_numpy(dtype=np.float64)
-    z_values = z_support["z"].to_numpy(dtype=np.float64)
     n_on = int(round(n_parents * on_support_share))
     n_cov = n_parents - n_on
-    on_idx = rng.integers(0, macro_values.shape[0], size=n_on)
-    on_macro = macro_values[on_idx]
-
-    q01 = np.quantile(macro_values, 0.01, axis=0)
-    q99 = np.quantile(macro_values, 0.99, axis=0)
-    robust_width = np.maximum(q99 - q01, 1e-6)
-    cov_base = macro_values[rng.integers(0, macro_values.shape[0], size=n_cov)]
-    standardized = (macro_values - np.median(macro_values, axis=0)) / robust_width
-    if standardized.shape[0] > 100_000:
-        standardized = standardized[rng.choice(standardized.shape[0], 100_000, replace=False)]
-    corr = np.cov(standardized, rowvar=False)
-    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
-    corr = corr + np.eye(3) * 1e-8
-    noise = rng.multivariate_normal(
-        np.zeros(3), corr * float(coverage_expansion) ** 2, size=n_cov
-    )
-    cov_macro = cov_base + noise * robust_width
-    lower = q01 - coverage_expansion * robust_width
-    upper = q99 + coverage_expansion * robust_width
-    cov_macro = np.clip(cov_macro, lower, upper)
-    macro_draws = np.concatenate([on_macro, cov_macro], axis=0)
+    selected = np.concatenate([
+        rng.integers(0, len(joined), size=n_on),
+        rng.integers(0, len(joined), size=n_cov),
+    ])
+    sample = joined.iloc[selected].reset_index(drop=True)
+    parent = sample[["b", "z", "eta", "i", "x", "Hatcf", "LnKF"]].to_numpy(np.float64)
+    macro_cal = sample[["Hatc", "LnK"]].to_numpy(np.float64)
     source_kind = np.concatenate([
         np.zeros(n_on, dtype=np.int64),
         np.ones(n_cov, dtype=np.int64),
     ])
-
-    b = _stratified_unit(n_parents, rng)
-    # Q0 is an actual boundary equation, not a limit as b -> 0.  Reserve a
-    # deterministic slice at the exact boundary while retaining broad support.
-    n_zero = max(1, int(round(0.05 * n_parents)))
-    b[:n_zero] = 0.0
-    if n_parents > n_zero:
-        b[n_zero] = 1.0
-    i = float(economic_config.I_THRESHOLD) * _stratified_unit(n_parents, rng)
-    eta = np.tile(np.array([0.0, 1.0]), int(math.ceil(n_parents / 2)))[:n_parents]
-    eta = eta[rng.permutation(n_parents)]
-
-    z = z_values[rng.integers(0, z_values.size, size=n_parents)]
+    # Coverage is conditional on an actual macro node.  Only micro state is
+    # perturbed; the forecast/calculated macro pairing is kept intact.
     if n_cov:
+        cov = slice(n_on, n_parents)
+        parent[cov, 0] = _stratified_unit(n_cov, rng)
+        n_zero = max(1, int(round(0.05 * n_cov)))
+        parent[n_on:n_on + n_zero, 0] = 0.0
+        parent[cov, 2] = rng.integers(0, 2, size=n_cov)
+        parent[cov, 3] = float(economic_config.I_THRESHOLD) * _stratified_unit(n_cov, rng)
         stationary_std = float(economic_config.SIGMA_Z) / math.sqrt(
             max(1.0 - float(economic_config.RHO_Z) ** 2, 1e-12)
         )
         broad = rng.normal(float(economic_config.ZBAR), stationary_std, size=n_cov)
+        z_values = joined["z"].to_numpy(np.float64)
         z_lo = min(float(np.quantile(z_values, 0.005)), float(economic_config.ZBAR - 4 * stationary_std))
         z_hi = max(float(np.quantile(z_values, 0.995)), float(economic_config.ZBAR + 4 * stationary_std))
-        z[n_on:] = np.clip(broad, z_lo, z_hi)
+        parent[cov, 1] = np.clip(broad, z_lo, z_hi)
 
-    parent = np.column_stack([
-        b,
-        z,
-        eta,
-        i,
-        macro_draws[:, 0],
-        macro_draws[:, 1],
-        macro_draws[:, 2],
-    ])
+    def ids(name: str, fallback: np.ndarray) -> np.ndarray:
+        return pd.to_numeric(sample[name], errors="coerce").fillna(-1).to_numpy(np.int64) if name in sample else fallback
+
+    path_id = ids("path", np.arange(n_parents, dtype=np.int64))
+    parent_t = ids("t", np.zeros(n_parents, dtype=np.int64))
+    economic_node_id = ids("economic_node_id", parent_t)
+    lineage_id = ids("lineage_id", path_id)
+    distribution_id = ids("distribution_id", path_id)
     order = rng.permutation(n_parents)
     parent = parent[order]
+    macro_cal = macro_cal[order]
     source_kind = source_kind[order]
+    path_id, parent_t = path_id[order], parent_t[order]
+    economic_node_id, lineage_id = economic_node_id[order], lineage_id[order]
+    distribution_id = distribution_id[order]
     metadata = {
-        "definition": "episode1_joint_macro_support_plus_robust_coverage",
+        "definition": "node_matched_on_support_plus_conditional_micro_coverage",
+        "bank_version": "unified_firm_macro_bank_v1",
         "state_columns": list(STATE_COLUMNS),
+        "macro_context_columns": ["Hatc_cal", "LnK_cal"],
         "n_parents": int(n_parents),
         "on_support_share": float(on_support_share),
+        "coverage_share": float(1.0 - on_support_share),
         "coverage_expansion": float(coverage_expansion),
-        "macro_q01": dict(zip(("x", "Hatcf", "LnKF"), q01.tolist())),
-        "macro_q99": dict(zip(("x", "Hatcf", "LnKF"), q99.tolist())),
-        "z_source_p005": float(np.quantile(z_values, 0.005)),
-        "z_source_p995": float(np.quantile(z_values, 0.995)),
+        "node_match_keys": keys,
+        "synthetic_micro_coverage_semantics": "conditional_on_fixed_actual_macro_node",
         "eta0_count": int((parent[:, 2] <= 0.5).sum()),
         "eta1_count": int((parent[:, 2] > 0.5).sum()),
         "exact_b0_count": int((parent[:, 0] == 0.0).sum()),
@@ -281,6 +332,13 @@ def build_collocation_bank(
         source_kind=torch.as_tensor(source_kind, dtype=torch.long),
         seed=int(seed),
         split=str(split),
+        parent_macro_cal=torch.as_tensor(macro_cal, dtype=torch.float32),
+        path_id=torch.as_tensor(path_id, dtype=torch.long),
+        economic_node_id=torch.as_tensor(economic_node_id, dtype=torch.long),
+        lineage_id=torch.as_tensor(lineage_id, dtype=torch.long),
+        distribution_id=torch.as_tensor(distribution_id, dtype=torch.long),
+        parent_t=torch.as_tensor(parent_t, dtype=torch.long),
+        bank_version="unified_firm_macro_bank_v1",
         metadata=metadata,
     )
 
@@ -298,6 +356,7 @@ def build_child_bank(
     if n_child_shocks < 2:
         raise ValueError("n_child_shocks must be at least 2")
     parent = parent_bank.parent_states.to(device)
+    parent_macro_cal = parent_bank.require_macro_context().to(device)
     shock = ConvergenceShockBank.create(
         parent.shape[0], n_child_shocks, seed=seed, device=device, dtype=parent.dtype
     )
@@ -308,8 +367,8 @@ def build_child_bank(
             sdf_fc1,
             parent,
             MacroTransitionContext(
-                hatc_cal=parent[:, 5:6],
-                lnk_cal=parent[:, 6:7],
+                hatc_cal=parent_macro_cal[:, 0:1],
+                lnk_cal=parent_macro_cal[:, 1:2],
             ),
             shock,
             economic_config=economic_config,
@@ -340,6 +399,8 @@ def build_child_bank(
             "continuous_child_shocks": int(j),
             "effective_eta_expanded_children": int(2 * j),
             "parent_fingerprint": parent_bank.fingerprint,
+            "macro_context_hash": _tensor_hash((("parent_macro_cal", parent_macro_cal),)),
+            "macro_semantics": "calculated_parent_to_child_forecast",
             "sdf_fc1_hash": sdf_hash_before,
         },
     )

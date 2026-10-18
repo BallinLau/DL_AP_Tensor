@@ -125,8 +125,15 @@ def test_sdf_m_update_changes_p_operator_rhs():
 
 def test_fc1_update_changes_firm_macro_inputs():
     parent, child = banks()
-    old, old_diag = refresh_transition_bank(ToyMacro(0.9, 0.0), parent, child, m_min=0.7, m_max=1.3)
-    new, new_diag = refresh_transition_bank(ToyMacro(0.9, 0.2), parent, child, m_min=0.7, m_max=1.3)
+    context = torch.tensor([[-1.5, 3.5]]).expand(parent.shape[0], -1)
+    old, old_diag = refresh_transition_bank(
+        ToyMacro(0.9, 0.0), parent, child,
+        parent_macro_context=context, m_min=0.7, m_max=1.3,
+    )
+    new, new_diag = refresh_transition_bank(
+        ToyMacro(0.9, 0.2), parent, child,
+        parent_macro_context=context, m_min=0.7, m_max=1.3,
+    )
     assert old_diag["macro_input_hash"] != new_diag["macro_input_hash"]
     assert not torch.allclose(old[..., 5:7], new[..., 5:7])
 
