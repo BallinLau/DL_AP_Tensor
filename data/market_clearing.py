@@ -349,6 +349,76 @@ class MarketClearingController:
         )
         return grid[None, :].expand(belief.shape[0], -1)
 
+    @staticmethod
+    def _merge_active_paths(
+        state: Dict[str, torch.Tensor],
+        cleared: Dict[str, torch.Tensor],
+        active_index: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Scatter root-clearing outputs back into the full path batch.
+
+        The production simulator keeps extinct paths in the padded batch so
+        surviving paths can continue.  Those rows are not economic nodes and
+        must not be sent through the root operator, but the full-sized state is
+        still needed by the vectorized transition code.  Undefined diagnostics
+        therefore remain NaN/false/zero on extinct rows while active rows are
+        copied exactly from the independently-cleared sub-batch.
+        """
+        batch_size = int(state["b"].shape[0])
+        active_size = int(active_index.numel())
+        undefined_float = {
+            "hatc_cleared",
+            "market_root_residual",
+            "market_root_residual_normalized",
+            "market_root_C",
+            "market_root_K",
+        }
+        minus_one_integer = {"market_root_refinement_rounds"}
+        belief = state["hatcf"].detach().clone()
+
+        for name, value in cleared.items():
+            if (
+                not torch.is_tensor(value)
+                or value.ndim == 0
+                or int(value.shape[0]) != active_size
+            ):
+                state[name] = value
+                continue
+
+            existing = state.get(name)
+            if (
+                torch.is_tensor(existing)
+                and existing.ndim == value.ndim
+                and int(existing.shape[0]) == batch_size
+                and tuple(existing.shape[1:]) == tuple(value.shape[1:])
+            ):
+                full = existing.detach().clone()
+            else:
+                shape = (batch_size, *value.shape[1:])
+                if name == "hatc_belief":
+                    full = belief.to(dtype=value.dtype)
+                elif name == "market_previous_root":
+                    full = state.get("market_previous_root", belief).detach().clone()
+                elif name in undefined_float and value.is_floating_point():
+                    full = torch.full(
+                        shape,
+                        float("nan"),
+                        device=value.device,
+                        dtype=value.dtype,
+                    )
+                elif name in minus_one_integer:
+                    full = torch.full(
+                        shape,
+                        -1,
+                        device=value.device,
+                        dtype=value.dtype,
+                    )
+                else:
+                    full = torch.zeros(shape, device=value.device, dtype=value.dtype)
+            full.index_copy_(0, active_index, value)
+            state[name] = full
+        return state
+
     @torch.inference_mode()
     def clear_state(
         self,
@@ -366,23 +436,36 @@ class MarketClearingController:
         belief = state["hatcf"].detach().clone()
         active = state["alive"].any(dim=1) | candidates.mask.any(dim=1)
         if not bool(active.all()):
-            bad = torch.nonzero(~active, as_tuple=False).reshape(-1)
-            for parent in bad.detach().cpu().tolist():
-                self.failure_records.append(
-                    {
-                        "t": int(t),
-                        "branch": int(branch),
-                        "path": int(parent),
-                        "status": "NO_ACTIVE_FIRM_OR_ENTRY_CANDIDATE",
-                        "h_belief": float(belief[parent]),
-                        "bracket_count": 0,
-                    }
+            active_index = torch.nonzero(active, as_tuple=False).reshape(-1)
+            if active_index.numel() == 0:
+                raise MarketClearingError(
+                    "strict market clearing received a batch with no active "
+                    f"economic node; t={t}, branch={branch}"
                 )
-            raise MarketClearingError(
-                "strict market clearing cannot define an economic node without "
-                "an incumbent or entry candidate; "
-                f"t={t}, branch={branch}, paths={bad.detach().cpu().tolist()[:20]}"
+            active_state = {
+                name: value.index_select(0, active_index)
+                if (
+                    torch.is_tensor(value)
+                    and value.ndim > 0
+                    and int(value.shape[0]) == B
+                )
+                else value
+                for name, value in state.items()
+            }
+            active_candidates = EntryCandidates(
+                **{
+                    name: getattr(candidates, name).index_select(0, active_index)
+                    for name in candidates.__dataclass_fields__
+                }
             )
+            cleared = self.clear_state(
+                sim,
+                active_state,
+                active_candidates,
+                t=t,
+                branch=branch,
+            )
+            return self._merge_active_paths(state, cleared, active_index)
         h_coarse = self._support(state)
         coarse = self.evaluate(sim, state, candidates, h_coarse)
         crossings = self._crossings(coarse)

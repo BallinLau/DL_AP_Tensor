@@ -18,6 +18,7 @@ from data.market_clearing import (
     MarketClearingError,
 )
 from data.simulate_ts import SimulateTS
+from data.simulate_ts_parallel import _initialize_batched_state
 from analysis.market_cleared_banks import build_market_cleared_transition_bank
 
 
@@ -216,3 +217,25 @@ def test_committed_parity_checks_cleared_node_even_after_all_firms_exit():
     }
     with pytest.raises(MarketClearingError, match="commit parity failed"):
         controller.validate_committed(state, t=0, branch=-1)
+
+
+def test_market_clearing_skips_extinct_padding_path_and_clears_survivor():
+    seed_sim = _sim(market_clearing_mode="disabled")
+    initial_state = _initialize_batched_state(seed_sim, max_firms=3)
+    initial_state["alive"][0] = False
+    initial_state["initial_cohort"][0] = False
+
+    sim = _sim(initial_state=initial_state)
+    output = sim.simulate_tensor()
+    columns = {name: i for i, name in enumerate(output.macro.columns)}
+    macro = output.macro.data
+
+    assert macro.shape[0] == 3
+    assert set(macro[:, columns["path"]].to(torch.long).tolist()) == {1}
+    assert set(macro[:, columns["branch"]].to(torch.long).tolist()) == {-1, 0, 1}
+    assert torch.all(macro[:, columns["market_root_found"]] == 1.0)
+    assert torch.max(
+        macro[:, columns["market_committed_residual_normalized"]].abs()
+    ) <= 2.0e-5
+    assert output.meta["market_clearing"]["node_count"] == 3
+    assert output.meta["market_clearing"]["failure_count"] == 0
