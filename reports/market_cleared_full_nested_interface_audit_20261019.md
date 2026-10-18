@@ -149,3 +149,16 @@ declared tolerance                = 1.0000000000000000e-05
 4. 新增回归测试，验证内部接纳线和“全部 firm 退出后仍必须检查 committed parity”。
 
 因此 job 695290 同样保留为失败证据；它没有进入 Firm/FC1/SDF 训练，不得作为数值结果解释。
+
+### 7.6 Job 695297：Tiny 数值 gate 通过，报告层失败
+
+严格残差修复后的 job 695297 完整执行了 Tiny 的 Firm、BP grid distillation、root-cleared re-simulation、FC1 与 SDF：runner return code 为 0，stage gate 为 PASS，train/validation root summary 均为 `failure_count=0`，FC2 forward calls 为 0。该 job 随后只在 post-run surface report 中失败：
+
+```text
+IndexError: boolean index did not match indexed array along dimension 0;
+dimension is 5632 but corresponding boolean dimension is 512
+```
+
+根因是 `PolicyView.investment_selector` 的生产形状为 `[parent, i_grid] = [512, 11]`。旧报告把它 flatten 成 5632 行，再用 512 个 parent 的 eta mask 索引。经济训练和 root gate 不受影响。
+
+报告修复不再 flatten grid selector；investment boundary 按每个已存 parent 的实际 `i`，使用同一 parent 上的 `PI > P0` 定义。所有 Firm surface 标量都新增 parent-count shape gate；回归测试显式使用 `[B,11]` selector，要求生成 eta 0/1 的 14 张 surface/boundary 图而不发生广播或静默错位。

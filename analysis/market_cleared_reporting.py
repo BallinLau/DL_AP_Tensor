@@ -272,15 +272,36 @@ def _plot_firm_probe_surfaces(run_root: Path) -> None:
     for path in probes:
         payload = torch.load(path, map_location="cpu", weights_only=True)
         parents = payload["parent_states"].numpy()
+        parent_count = int(parents.shape[0])
         outer = int(path.parent.name.rsplit("_", 1)[-1])
         output = run_root / f"equilibrium_outer_{outer:03d}" / "figures" / "firm_surfaces"
         output.mkdir(parents=True, exist_ok=True)
+        scalar_values: dict[str, np.ndarray] = {}
+        for name in ("P0", "PI", "Q", "bp0", "bpI"):
+            values = payload[name].reshape(-1).numpy()
+            if values.shape[0] != parent_count:
+                raise RuntimeError(
+                    f"firm probe {name} has {values.shape[0]} rows for "
+                    f"{parent_count} parent states"
+                )
+            scalar_values[name] = values
+        # ``PolicyView.investment_selector`` is [parent, i_grid].  Flattening
+        # it silently multiplies the observation count by the grid size.  The
+        # b-z boundary requested here is the decision at each stored parent
+        # state, whose actual i is already used by the scalar PI and P0 heads.
+        investment_at_parent = scalar_values["PI"] > scalar_values["P0"]
+        survival = payload["survival"].reshape(-1).bool().numpy()
+        if survival.shape[0] != parent_count:
+            raise RuntimeError(
+                f"firm probe survival has {survival.shape[0]} rows for "
+                f"{parent_count} parent states"
+            )
         for eta in (0, 1):
             mask = np.isclose(parents[:, 2], eta)
             if not mask.any():
                 continue
             for name in ("P0", "PI", "Q", "bp0", "bpI"):
-                values = payload[name].reshape(-1).numpy()
+                values = scalar_values[name]
                 grid = _binned_surface(
                     parents[mask, 0], parents[mask, 1], values[mask], b_edges, z_edges
                 )
@@ -292,8 +313,8 @@ def _plot_firm_probe_surfaces(run_root: Path) -> None:
                 fig.savefig(output / f"outer_{outer:03d}_{name}_eta{eta}_3d.png", dpi=170)
                 plt.close(fig)
             for name, values in (
-                ("investment_boundary", payload["investment"].reshape(-1).numpy()),
-                ("default_boundary", (~payload["survival"].reshape(-1).bool()).numpy()),
+                ("investment_boundary", investment_at_parent),
+                ("default_boundary", ~survival),
             ):
                 grid = _binned_surface(
                     parents[mask, 0], parents[mask, 1], values[mask].astype(float), b_edges, z_edges
