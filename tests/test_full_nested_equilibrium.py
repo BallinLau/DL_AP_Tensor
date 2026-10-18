@@ -18,7 +18,11 @@ from analysis.nested_equilibrium_utils import (
     publish_checkpoint,
     run_with_oom_fallback,
 )
-from analysis.run_full_nested_equilibrium import _one_step_target_movements, parse_args
+from analysis.run_full_nested_equilibrium import (
+    _configure_hyperparams,
+    _one_step_target_movements,
+    parse_args,
+)
 from data.tensor_data import TensorTable
 
 
@@ -81,6 +85,29 @@ def test_recursive_sdf_and_fc2_are_rejected():
         parse_args(["--cold-start", "--sdf-recursive-epochs", "1"])
     with pytest.raises(SystemExit):
         parse_args(["--cold-start", "--no-disable-fc2"])
+
+
+def test_market_clearing_locks_audited_production_economic_configuration():
+    args = parse_args([
+        "--cold-start",
+        "--market-clearing-mode",
+        "market_cleared_experimental_v1",
+    ])
+    hp = _configure_hyperparams(args)
+
+    assert hp.entry_mode == "investment_compare"
+    assert hp.entry_spec_version == "investment_compare_v1"
+    assert hp.entry_capital_ratio == pytest.approx(0.05)
+    assert hp.entry_size_ratio == pytest.approx(1.0)
+    assert hp.entry_cost_max == pytest.approx(0.5)
+    assert hp.entry_dummy_i == pytest.approx(0.0)
+    assert hp.entry_rng_mode == "stable_economic_identity"
+    assert hp.transition_rng_mode == "stable_firm_identity"
+    assert hp.consumption_aggregation_mode == "raw"
+    assert hp.consumption_floor == pytest.approx(0.0)
+    assert hp.node_accounting_mode == "economic_node_ledger"
+    assert hp.simulation_bp_action_source == "grid"
+    assert hp.simulation_bp_grid_n_child_shocks == 2
 
 
 def test_one_step_target_movement_aligns_common_sources_after_censoring():

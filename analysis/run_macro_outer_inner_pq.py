@@ -404,13 +404,20 @@ def _simulation_kwargs(episode: Any, transition_seed: int, entry_seed: int) -> d
         name: getattr(episode.hyperparams, name, default)
         for name, default in market_defaults.items()
     })
+    source = str(
+        getattr(episode.hyperparams, "simulation_bp_action_source", "head")
+    ).strip().lower()
+    if source not in {"head", "grid"}:
+        raise ValueError(f"invalid simulation_bp_action_source={source!r}")
     kwargs.update({
         "entry_rng_seed": entry_seed,
         "entry_rng_mode": "stable_economic_identity",
         "common_transition_seed": transition_seed,
         "transition_rng_mode": "stable_firm_identity",
-        "bp_action_source": "head",
+        "bp_action_source": source,
     })
+    if source == "grid":
+        kwargs["bp_grid_policy"] = episode._build_simulation_bp_grid_policy()
     return kwargs
 
 

@@ -265,6 +265,21 @@ def _configure_hyperparams(args: argparse.Namespace):
     hp.market_clearing_candidate_chunk_size = int(
         args.market_clearing_candidate_chunk_size
     )
+    if hp.market_clearing_mode != "disabled":
+        # Lock to the already-audited Gomes/root-diagnostic economic setup.
+        hp.entry_mode = "investment_compare"
+        hp.entry_spec_version = "investment_compare_v1"
+        hp.entry_capital_ratio = 0.05
+        hp.entry_size_ratio = 1.0
+        hp.entry_cost_max = 0.5
+        hp.entry_dummy_i = 0.0
+        hp.entry_rng_mode = "stable_economic_identity"
+        hp.transition_rng_mode = "stable_firm_identity"
+        hp.consumption_aggregation_mode = "raw"
+        hp.consumption_floor = 0.0
+        hp.node_accounting_mode = "economic_node_ledger"
+        hp.simulation_bp_action_source = "grid"
+        hp.simulation_bp_grid_n_child_shocks = 2
     return hp
 
 

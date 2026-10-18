@@ -25,6 +25,7 @@ from analysis.run_macro_outer_inner_pq import (
     stable_json_hash,
     state_hash,
     _write_report,
+    _simulation_kwargs,
 )
 from analysis.test_frozen_policy_root_solve import FrozenBranchPolicy, dynamic_rhs
 
@@ -60,6 +61,29 @@ class ToyEpisode:
         return children, raw_m, used_m, None
 
 
+class ToyGridEpisode:
+    def __init__(self):
+        self.hyperparams = SimpleNamespace(
+            entry_mode="investment_compare",
+            entry_spec_version="investment_compare_v1",
+            entry_capital_ratio=0.05,
+            entry_size_ratio=1.0,
+            entry_cost_max=0.5,
+            entry_dummy_i=0.0,
+            entry_inference_chunk_size=1024,
+            consumption_aggregation_mode="raw",
+            consumption_floor=0.0,
+            node_accounting_mode="economic_node_ledger",
+            entry_independent_resource_validation_enabled=True,
+            preserve_global_rng_around_entry=True,
+            simulation_bp_action_source="grid",
+        )
+        self.grid_policy = object()
+
+    def _build_simulation_bp_grid_policy(self):
+        return self.grid_policy
+
+
 def banks():
     parent = torch.zeros(4, 7)
     parent[:, 5] = -2.0
@@ -79,6 +103,15 @@ def test_fc2_forward_patched_to_raise_but_outer_skeleton_succeeds():
     assert counter["calls"] == 0
     with pytest.raises(RuntimeError, match="FC2 MUST NOT BE USED"):
         fc2(torch.ones(1, 1))
+
+
+def test_market_simulation_kwargs_preserve_grid_bp_source():
+    episode = ToyGridEpisode()
+    kwargs = _simulation_kwargs(episode, transition_seed=11, entry_seed=13)
+    assert kwargs["bp_action_source"] == "grid"
+    assert kwargs["bp_grid_policy"] is episode.grid_policy
+    assert kwargs["entry_rng_mode"] == "stable_economic_identity"
+    assert kwargs["transition_rng_mode"] == "stable_firm_identity"
 
 
 def test_fc2_hash_invariant_without_access():

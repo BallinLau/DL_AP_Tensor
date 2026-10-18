@@ -85,3 +85,47 @@
 - Missing: 5（列于第 4 节，属于完整实验集成层）
 
 接口审计结论：既有 investment/K 经济口径没有发现需要先修改的确定矛盾；允许在不改变经济方程的前提下继续实现实验性一维 current-Hatc clearing，但必须保留其条件固定点解释范围。
+
+---
+
+## 7. 实现后复核与首次 Slurm 预检失败
+
+本节记录实现后的状态；前六节保留为实现前的审计基线，不能用其 65% 分数描述当前代码。
+
+### 7.1 已接入组件
+
+- `data/market_clearing.py` 已实现 GPU 向量化 coarse-to-fine 搜索、全部 bracket 保留、逐根完整经济节点重放、跳跃交叉分类、确定性多根选择和 FP64 最终残差复核。
+- `SimulateTS` / `SimulateTSParallel` 仅在显式 `market_cleared_experimental_v1` 下，对 parent 与两个 child 节点分别清算；默认 `disabled` 的 legacy 路径保持不变。
+- Firm transition bank 使用同一 production simulation 的 root-cleared parent 与两个 matched child，不用人为 B-only child 替代。
+- full nested runner 按 Firm -> root-cleared simulation -> FC1 -> root-cleared re-simulation -> SDF 顺序运行，并保留 FC2 禁用、hash invariant、同一当前 SDF 的 P/Q parity 以及 legacy-direct 对照。
+- stage gate、checkpoint、CSV/JSON 报告、固定 probe surfaces、代表路径图和 GPU profiling 已接入 Tiny -> Small -> Formal 链。
+
+### 7.2 Job 695282 的失败证据与根因
+
+首次服务器提交（source commit `bcd2d808bc7321152174345d52a810f9e3ee0b1b`）在进入训练前即停止，错误为：
+
+```text
+ValueError: market_cleared_experimental_v1 requires entry_mode='investment_compare'
+```
+
+这证明严格入口 gate 正常工作，也证明链式 runner 当时只打开了 market-clearing mode，却没有把生产经济配置同步为已审计的 Gomes/root-diagnostic 配置。该失败没有产生可解释的训练结果，也没有污染后续 checkpoint；job 和日志应永久保留为失败现场。
+
+### 7.3 配置修复
+
+market-clearing mode 现在显式锁定以下生产口径：
+
+| 项目 | 固定值 |
+|---|---|
+| entry | `investment_compare / investment_compare_v1` |
+| entry capital ratio | `0.05` |
+| entry size ratio / max cost / dummy i | `1.0 / 0.5 / 0.0` |
+| consumption | `raw`, floor `0.0` |
+| accounting | `economic_node_ledger` |
+| BP action | production `grid`, 2 child shocks |
+| RNG identity | stable entry and stable firm transition identity |
+
+下游 simulation helper 不再硬编码 `bp_action_source="head"`；它读取同一 hyperparameter，并在 grid 模式下构造 production grid resolver。新增回归测试覆盖精确经济配置和 BP source 传播。
+
+### 7.4 当前判定
+
+代码层面缺失的五个集成组件已经补齐，但数值方法仍只应称为 `conditional current-Hatc equilibrium`。完整实验是否通过，只能由新的、隔离输出目录中的 Tiny 数值 gate 决定；在 Tiny 完成前，不得把实现完成等同于经济/数值验证完成。
