@@ -59,10 +59,13 @@ def _parallel_state() -> dict[str, torch.Tensor]:
         "bar_i": torch.zeros(1, 2),
         "bar_z": torch.zeros(1, 2),
         "bp": torch.tensor([[0.7, 0.4]]),
+        "economic_node_id": torch.zeros(1, dtype=torch.long),
     }
 
 
-def _sim(override=None, *, source="head", grid_policy=None) -> SimulateTS:
+def _sim(
+    override=None, *, source="head", grid_policy=None, trace_enabled=False
+) -> SimulateTS:
     return SimulateTS(
         models={"policy_value": _DummyPolicy(), "sdf_fc1": None, "fc2": None},
         config=Config,
@@ -76,6 +79,7 @@ def _sim(override=None, *, source="head", grid_policy=None) -> SimulateTS:
         bp_action_override=override,
         bp_action_source=source,
         bp_grid_policy=grid_policy,
+        bp_actual_use_trace_enabled=trace_enabled,
     )
 
 
@@ -148,6 +152,82 @@ def test_grid_source_uses_resolver_and_current_parent_eta(monkeypatch):
     expected = torch.tensor([[0.3, 0.4]])
     torch.testing.assert_close(branches[0]["b"], expected)
     torch.testing.assert_close(branches[1]["b"], expected)
+
+
+def test_grid_policy_does_not_silently_route_child_branch_to_head(monkeypatch):
+    teacher = _GridTeacher()
+    monkeypatch.setattr(
+        "training.bp_simulation_policy.BPGridTeacher.from_hyperparams",
+        lambda *_args, **_kwargs: teacher,
+    )
+    policy = GridBPSimulationPolicy(
+        target_model=_GridTarget(),
+        sdf_fc1_model=_GridSDF(),
+        p0_loss=object(),
+        pi_loss=object(),
+        hyperparams=SimpleNamespace(pv_use_clipped_m=False),
+        economic_config=Config,
+        n_child_shocks=2,
+        shock_seed=77,
+        require_cuda=False,
+    )
+    firm_state = torch.tensor(
+        [[0.2, -0.1, 1.0, 0.1, 0.0, -2.0, 4.0]], dtype=torch.float32
+    )
+    context = {
+        "branch": 1,
+        "firm_state": firm_state,
+        "hatc_cal": torch.tensor([[-2.1]]),
+        "lnk_cal": torch.tensor([[4.1]]),
+        "bp_head": torch.tensor([[0.6]]),
+    }
+    action = policy(**context)
+    torch.testing.assert_close(action, torch.tensor([[0.6]]))
+    # The chosen value happens to equal this fixture's head, so actual routing
+    # is established by the two teacher calls rather than value equality.
+    assert policy.instrumentation()["calls"] == 1
+    assert len(teacher.devices) == 2
+
+
+def test_actual_use_trace_separates_child_diagnostic_from_parent_execution(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        simulate_ts_parallel,
+        "forward_policy_value_for_simulation",
+        lambda _model, state: _policy_output(state),
+    )
+
+    def grid_policy(**context):
+        return torch.full_like(context["bp_head"], 0.35)
+
+    sim = _sim(
+        source="grid", grid_policy=grid_policy, trace_enabled=True
+    )
+    parent_state = _parallel_state()
+    simulate_ts_parallel._process_node_batched(sim, parent_state, 0, -1)
+    parent_record = sim.bp_actual_use_trace[0]
+    assert parent_record["configured_bp_source"] == "grid"
+    assert parent_record["evaluated_bp_source"] == "grid"
+    assert parent_record["executed_bp_source"] == "grid"
+    assert parent_record["bp_execution_applicable"] is True
+    assert parent_record["bp_executed"] == pytest.approx(0.35)
+    assert parent_record["child_b_written"] == pytest.approx(0.35)
+
+    child_state = _parallel_state()
+    simulate_ts_parallel._process_node_batched(sim, child_state, 1, 1)
+    child_record = next(
+        row for row in sim.bp_actual_use_trace if row["branch_id"] == 1
+    )
+    assert child_record["evaluated_bp_source"] == "grid"
+    assert child_record["executed_bp_source"] == "NOT_APPLICABLE"
+    assert child_record["bp_execution_applicable"] is False
+    assert np.isnan(child_record["bp_executed"])
+    assert np.isnan(child_record["child_b_written"])
+
+    output = sim.write_bp_actual_use_trace(tmp_path / "actual_bp_routing.csv")
+    trace = pd.read_csv(output)
+    assert set(trace["branch_id"]) == {-1, 1}
 
 
 class _GridTarget(torch.nn.Module):

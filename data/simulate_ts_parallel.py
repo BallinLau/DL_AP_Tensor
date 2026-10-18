@@ -1426,6 +1426,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
     use_resolved_bp = (
         getattr(sim, "bp_action_override", None) is not None
         or getattr(sim, "bp_action_source", "head") == "grid"
+        or bool(getattr(sim, "bp_actual_use_trace_enabled", False))
     )
     if use_resolved_bp:
         if output is None:
@@ -1441,8 +1442,15 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             lnk_cal=LnK[path_idx].detach().reshape(-1, 1),
             path_index=path_idx.detach(),
             firm_id=firm_id.detach(),
+            economic_node_id=state["economic_node_id"][path_idx].detach(),
             t=int(t),
             branch=int(branch_k),
+            decision_stage=(
+                "parent_transition_policy"
+                if int(branch_k) == -1
+                else "child_observation_policy"
+            ),
+            bp_execution_applicable=(int(branch_k) == -1),
         )
         if not torch.is_tensor(overridden):
             raise TypeError("resolved BP action must return a torch.Tensor")

@@ -244,8 +244,13 @@ class GridBPSimulationPolicy:
 
     @torch.inference_mode()
     def __call__(self, **context: Any) -> torch.Tensor:
-        if int(context["branch"]) != -1:
-            return context["bp_head"]
+        # ``simulation_bp_action_source='grid'`` is an execution contract, not
+        # merely a parent-node diagnostic label.  Child views may ultimately
+        # be marked execution-inapplicable by the simulator (because no
+        # transition is committed from that view), but any policy value that
+        # is evaluated under the grid configuration must come from this same
+        # production resolver.  Never silently substitute the BP head based on
+        # branch id.
         return self.evaluate_actions(
             firm_state=context["firm_state"],
             hatc_cal=context["hatc_cal"],

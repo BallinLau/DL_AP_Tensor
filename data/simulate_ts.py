@@ -9,6 +9,8 @@ SimulateTS 类：树状分支模拟器
 """
 
 import math
+import csv
+from pathlib import Path
 
 import torch
 import pandas as pd
@@ -123,6 +125,7 @@ class SimulateTS:
         bp_action_override: Optional[Callable[..., torch.Tensor]] = None,
         bp_action_source: str = "head",
         bp_grid_policy: Optional[Callable[..., torch.Tensor]] = None,
+        bp_actual_use_trace_enabled: bool = False,
         entry_mode: str = "legacy",
         entry_spec_version: str = "value_cost_v1",
         entry_capital_ratio: float = 0.10,
@@ -177,6 +180,8 @@ class SimulateTS:
             bp_action_override: 可选实验回调；优先于配置的 action source。
             bp_action_source: ``head`` 沿用网络 BP，``grid`` 使用正式 grid policy。
             bp_grid_policy: 复用整个 rollout 的冻结 grid-policy resolver。
+            bp_actual_use_trace_enabled: 保存逐企业 BP 评估/执行来源；默认关闭，
+                避免正式大样本 simulation 产生无界 Python 记录。
             initial_state: 可选完整 batched parent-ready state。None 严格保留
                 fresh initialization；非 None 时不会调用 fresh initializer。
             state_bank_capture: 可选 parent-ready State Bank capture policy。
@@ -201,6 +206,8 @@ class SimulateTS:
         self.bp_grid_policy = bp_grid_policy
         if self.bp_action_source == "grid" and self.bp_grid_policy is None:
             raise ValueError("bp_action_source='grid' requires bp_grid_policy")
+        self.bp_actual_use_trace_enabled = bool(bp_actual_use_trace_enabled)
+        self.bp_actual_use_trace: List[Dict[str, object]] = []
         self.entry_mode = str(entry_mode).strip().lower()
         self.entry_spec_version = str(entry_spec_version)
         self.entry_capital_ratio = float(entry_capital_ratio)
@@ -557,6 +564,14 @@ class SimulateTS:
             "gpu_memory_after_bytes": memory_after,
             "peak_gpu_memory_bytes": peak_memory,
             "bp_grid": bp_metrics,
+            "bp_actual_use_trace": {
+                "enabled": self.bp_actual_use_trace_enabled,
+                "row_count": len(self.bp_actual_use_trace),
+                "semantics": (
+                    "evaluated policy is distinct from economically executed "
+                    "parent-to-child leverage"
+                ),
+            },
             "market_clearing": (
                 {"mode": MARKET_CLEARING_DISABLED}
                 if self.market_clearing_controller is None
@@ -591,10 +606,105 @@ class SimulateTS:
     def _resolve_bp_action(self, **context) -> torch.Tensor:
         """Resolve the actual leverage action at one vectorized node."""
         if self.bp_action_override is not None:
-            return self.bp_action_override(**context)
-        if self.bp_action_source == "grid":
-            return self.bp_grid_policy(**context)
-        return context["bp_head"]
+            action = self.bp_action_override(**context)
+            evaluated_source = "override"
+        elif self.bp_action_source == "grid":
+            action = self.bp_grid_policy(**context)
+            evaluated_source = "grid"
+        else:
+            action = context["bp_head"]
+            evaluated_source = "head"
+        if self.bp_actual_use_trace_enabled:
+            self._record_bp_actual_use(
+                context=context,
+                action=action,
+                evaluated_source=evaluated_source,
+            )
+        return action
+
+    def _record_bp_actual_use(
+        self,
+        *,
+        context: Dict[str, object],
+        action: torch.Tensor,
+        evaluated_source: str,
+    ) -> None:
+        """Record evaluation separately from an economically committed BP.
+
+        A child branch row is a current-node observation.  Its policy can be
+        evaluated for diagnostics, but leverage is only written to a child
+        state when that node is expanded as a parent.  The trace therefore
+        refuses to call a child-view policy an executed financing decision.
+        """
+        action_tensor = action.detach().reshape(-1)
+        head = context["bp_head"].detach().reshape(-1)
+        firm_state = context["firm_state"].detach()
+        applicable = bool(context.get("bp_execution_applicable", False))
+        child_b = apply_refinancing_policy(
+            b_current=firm_state[:, 0],
+            bp_candidate=action_tensor,
+            eta_current=firm_state[:, 2],
+        )
+        path = context["path_index"].detach().reshape(-1)
+        firm_id = context["firm_id"].detach().reshape(-1)
+        node_id = context["economic_node_id"].detach().reshape(-1)
+        branch = int(context["branch"])
+        decision_stage = str(context["decision_stage"])
+        executed_source = evaluated_source if applicable else "NOT_APPLICABLE"
+        # One host transfer per vector keeps this opt-in diagnostic from
+        # introducing a GPU synchronization for every firm row.
+        node_values = node_id.cpu().tolist()
+        path_values = path.cpu().tolist()
+        firm_values = firm_id.cpu().tolist()
+        action_values = action_tensor.cpu().tolist()
+        head_values = head.cpu().tolist()
+        child_values = child_b.cpu().tolist()
+        for row in range(action_tensor.numel()):
+            self.bp_actual_use_trace.append(
+                {
+                    "economic_node_id": int(node_values[row]),
+                    "path": int(path_values[row]),
+                    "firm_id": int(firm_values[row]),
+                    "branch_id": branch,
+                    "decision_stage": decision_stage,
+                    "configured_bp_source": self.bp_action_source,
+                    "evaluated_bp_source": evaluated_source,
+                    "executed_bp_source": executed_source,
+                    "bp_grid": (
+                        float(action_values[row])
+                        if evaluated_source == "grid" else float("nan")
+                    ),
+                    "bp_head": float(head_values[row]),
+                    "bp_executed": (
+                        float(action_values[row]) if applicable else float("nan")
+                    ),
+                    "child_b_written": (
+                        float(child_values[row]) if applicable else float("nan")
+                    ),
+                    "bp_execution_applicable": applicable,
+                }
+            )
+
+    def write_bp_actual_use_trace(self, path: str | Path) -> Path:
+        """Write the bounded opt-in BP actual-use trace as a CSV artifact."""
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fields = (
+            list(self.bp_actual_use_trace[0])
+            if self.bp_actual_use_trace
+            else [
+                "economic_node_id", "path", "firm_id", "branch_id",
+                "decision_stage", "configured_bp_source",
+                "evaluated_bp_source", "executed_bp_source", "bp_grid",
+                "bp_head", "bp_executed", "child_b_written",
+                "bp_execution_applicable",
+            ]
+        )
+        with output.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(self.bp_actual_use_trace)
+        return output
     
     def _simulate_path(self, path_idx: int) -> Tuple[List, List]:
         """
