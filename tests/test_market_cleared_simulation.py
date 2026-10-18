@@ -239,3 +239,47 @@ def test_market_clearing_skips_extinct_padding_path_and_clears_survivor():
     ) <= 2.0e-5
     assert output.meta["market_clearing"]["node_count"] == 3
     assert output.meta["market_clearing"]["failure_count"] == 0
+
+
+def test_active_path_merge_does_not_replace_production_state_tensors():
+    state = {
+        "b": torch.zeros((2, 1)),
+        "hatcf": torch.tensor([-2.0, -1.0]),
+        "entry": torch.zeros((2, 1)),
+        "alive": torch.tensor([[False], [True]]),
+    }
+    entry_tensor = state["entry"]
+    active_index = torch.tensor([1], dtype=torch.long)
+    cleared = {
+        "b": torch.ones((1, 1)),
+        "entry": torch.ones((1, 1)),
+        "hatcf": torch.tensor([-1.4]),
+        "hatc_belief": torch.tensor([-1.0]),
+        "hatc_cleared": torch.tensor([-1.4]),
+        "market_previous_root": torch.tensor([-1.4]),
+        "market_previous_branch_id": torch.tensor([0]),
+        "market_root_branch_id": torch.tensor([0]),
+        "market_root_branch_switch": torch.tensor([False]),
+        "market_root_found": torch.tensor([True]),
+        "market_root_count": torch.tensor([1]),
+        "market_root_residual": torch.tensor([0.0]),
+        "market_root_residual_normalized": torch.tensor([0.0]),
+        "market_root_C": torch.tensor([1.0]),
+        "market_root_K": torch.tensor([1.0]),
+        "market_root_refinement_rounds": torch.tensor([1]),
+        "market_root_policy_jump": torch.tensor([False]),
+        "market_investment_flip_vs_belief": torch.tensor([0.0]),
+        "market_default_flip_vs_belief": torch.tensor([0.0]),
+        "market_entry_flip_vs_belief": torch.tensor([0.0]),
+        "market_root_bracket_count": torch.tensor([1]),
+        "market_root_operator_evaluations": torch.tensor([31]),
+    }
+
+    merged = MarketClearingController._merge_active_paths(
+        state, cleared, active_index
+    )
+
+    assert merged["entry"] is entry_tensor
+    assert torch.equal(merged["entry"], torch.zeros((2, 1)))
+    assert torch.equal(merged["b"], torch.zeros((2, 1)))
+    assert torch.equal(merged["market_root_found"], torch.tensor([False, True]))

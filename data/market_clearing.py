@@ -375,15 +375,31 @@ class MarketClearingController:
         }
         minus_one_integer = {"market_root_refinement_rounds"}
         belief = state["hatcf"].detach().clone()
+        root_output_fields = (
+            "hatcf",
+            "hatc_belief",
+            "hatc_cleared",
+            "market_previous_root",
+            "market_previous_branch_id",
+            "market_root_branch_id",
+            "market_root_branch_switch",
+            "market_root_found",
+            "market_root_count",
+            "market_root_residual",
+            "market_root_residual_normalized",
+            "market_root_C",
+            "market_root_K",
+            "market_root_refinement_rounds",
+            "market_root_policy_jump",
+            "market_investment_flip_vs_belief",
+            "market_default_flip_vs_belief",
+            "market_entry_flip_vs_belief",
+            "market_root_bracket_count",
+            "market_root_operator_evaluations",
+        )
 
-        for name, value in cleared.items():
-            if (
-                not torch.is_tensor(value)
-                or value.ndim == 0
-                or int(value.shape[0]) != active_size
-            ):
-                state[name] = value
-                continue
+        for name in root_output_fields:
+            value = cleared[name]
 
             existing = state.get(name)
             if (
