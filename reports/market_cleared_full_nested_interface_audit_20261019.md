@@ -129,3 +129,23 @@ market-clearing mode 现在显式锁定以下生产口径：
 ### 7.4 当前判定
 
 代码层面缺失的五个集成组件已经补齐，但数值方法仍只应称为 `conditional current-Hatc equilibrium`。完整实验是否通过，只能由新的、隔离输出目录中的 Tiny 数值 gate 决定；在 Tiny 完成前，不得把实现完成等同于经济/数值验证完成。
+
+### 7.5 Job 695290 的边界残差失败与严格修复
+
+配置修复后的 job 695290 已成功完成两次 5-period bootstrap simulation，证明 `entry_mode`、生产 grid-BP 与 root operator 已实际进入执行；随后 Firm bank 的严格 gate 拒绝了一个节点：
+
+```text
+max committed normalized residual = 1.0004542673414107e-05
+declared tolerance                = 1.0000000000000000e-05
+```
+
+这不是允许放宽阈值的理由。复核发现，candidate search 以公开阈值作为提前停止线，而 committed parity 只检查提交后仍存在活跃公司的节点。于是靠近边界的候选可能因 reduction/replay 的浮点差异略微越界；若该节点提交后全部公司退出，simulation 内 gate 还会漏检，直到 bank gate 才报错。
+
+严格修复为：
+
+1. 公开 committed/bank residual tolerance 保持 `1e-5` 不变；
+2. root candidate 的内部接纳线收紧为公开阈值的 `0.5`，即 `5e-6`，为 production replay 留确定的数值裕度；
+3. committed parity 覆盖每个 `market_root_found` 节点，不再以提交后的 alive mask 跳过清算检查；
+4. 新增回归测试，验证内部接纳线和“全部 firm 退出后仍必须检查 committed parity”。
+
+因此 job 695290 同样保留为失败证据；它没有进入 Firm/FC1/SDF 训练，不得作为数值结果解释。

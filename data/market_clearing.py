@@ -26,6 +26,7 @@ from .simulation_forward import forward_policy_value_for_simulation
 
 MARKET_CLEARING_DISABLED = "disabled"
 MARKET_CLEARING_V1 = "market_cleared_experimental_v1"
+ROOT_ACCEPTANCE_SAFETY_FACTOR = 0.5
 
 
 class MarketClearingError(RuntimeError):
@@ -95,6 +96,19 @@ class MarketClearingController:
         self.multiple_root_nodes = 0
         self.failure_records: list[dict[str, Any]] = []
         self.root_records: list[dict[str, Any]] = []
+
+    @property
+    def _root_acceptance_tolerance(self) -> float:
+        """Use a strict internal margin before the public commit gate.
+
+        Candidate evaluation and the production replay are algebraically
+        identical but need not have identical floating-point reduction order.
+        Stopping at the public boundary can therefore produce a committed
+        residual slightly above it.  The public economic contract remains
+        ``residual_tolerance``; this tighter admission threshold ensures that
+        replay must satisfy that contract without adding a tolerance slack.
+        """
+        return float(self.config.residual_tolerance) * ROOT_ACCEPTANCE_SAFETY_FACTOR
 
     @staticmethod
     def _sync(device: torch.device) -> None:
@@ -383,7 +397,7 @@ class MarketClearingController:
         candidate_jump: list[torch.Tensor] = []
         exact = torch.nonzero(
             coarse["resource_feasible"]
-            & (coarse["G_normalized"].abs() <= self.config.residual_tolerance),
+            & (coarse["G_normalized"].abs() <= self._root_acceptance_tolerance),
             as_tuple=False,
         )
         if exact.numel():
@@ -435,7 +449,7 @@ class MarketClearingController:
                 torch.full_like(refined["G_normalized"], float("inf")),
             )
             best_residual, best_column = feasible_residual.min(dim=1)
-            small = best_residual <= self.config.residual_tolerance
+            small = best_residual <= self._root_acceptance_tolerance
             if bool(small.any()):
                 rows = torch.nonzero(small, as_tuple=False).reshape(-1)
                 candidate_parent.append(active_parent[rows])
@@ -528,7 +542,10 @@ class MarketClearingController:
             evaluations.scatter_add_(0, parents, torch.ones_like(parents))
             valid = (
                 verified["resource_feasible"][:, 0]
-                & (verified["G_normalized"][:, 0].abs() <= self.config.residual_tolerance)
+                & (
+                    verified["G_normalized"][:, 0].abs()
+                    <= self._root_acceptance_tolerance
+                )
             )
             previous = state.get("market_previous_root", belief)
             for parent in range(B):
@@ -604,7 +621,7 @@ class MarketClearingController:
 
         fp64_replay_failed = torch.isfinite(selected_h) & (
             ~torch.isfinite(selected_normalized)
-            | (selected_normalized.abs() > self.config.residual_tolerance)
+            | (selected_normalized.abs() > self._root_acceptance_tolerance)
         )
         no_root = ~torch.isfinite(selected_h) | fp64_replay_failed
         if bool(no_root.any()):
@@ -726,8 +743,11 @@ class MarketClearingController:
         state["market_committed_residual_normalized"] = normalized.detach().to(
             state["accounting_C_raw"].dtype
         )
-        active = state["alive"].any(dim=1)
-        invalid = active & (
+        cleared = state.get(
+            "market_root_found",
+            torch.ones_like(normalized, dtype=torch.bool),
+        ).bool()
+        invalid = cleared & (
             ~torch.isfinite(normalized)
             | (C <= 0.0)
             | (K <= 0.0)
@@ -738,7 +758,8 @@ class MarketClearingController:
             raise MarketClearingError(
                 "market-clearing evaluator/production commit parity failed; "
                 f"t={t}, branch={branch}, paths={bad.detach().cpu().tolist()[:20]}, "
-                f"normalized_residual={normalized[bad].detach().cpu().tolist()[:20]}"
+                f"normalized_residual={normalized[bad].detach().cpu().tolist()[:20]}, "
+                f"tolerance={self.config.residual_tolerance}"
             )
 
     def summary(self) -> dict[str, Any]:
@@ -757,6 +778,9 @@ class MarketClearingController:
             "accounting_seconds": float(self.accounting_seconds),
             "root_search_seconds": float(self.root_search_seconds),
             "failure_count": len(self.failure_records),
+            "root_candidate_acceptance_tolerance": (
+                self._root_acceptance_tolerance
+            ),
             "root_records": list(self.root_records),
             "failure_records": list(self.failure_records),
             "config": {

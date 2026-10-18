@@ -11,7 +11,12 @@ from torch import nn
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
-from data.market_clearing import MARKET_CLEARING_V1, MarketClearingError
+from data.market_clearing import (
+    MARKET_CLEARING_V1,
+    MarketClearingConfig,
+    MarketClearingController,
+    MarketClearingError,
+)
 from data.simulate_ts import SimulateTS
 from analysis.market_cleared_banks import build_market_cleared_transition_bank
 
@@ -184,3 +189,29 @@ def test_firm_bank_uses_two_matched_root_cleared_children():
     )
     assert children.metadata["artificial_b_only_used"] is False
     assert audit["child_branches"] == [0, 1]
+
+
+def test_root_candidate_admission_is_stricter_than_public_commit_gate():
+    controller = MarketClearingController(
+        MarketClearingConfig(residual_tolerance=1.0e-5)
+    )
+    assert controller._root_acceptance_tolerance == pytest.approx(5.0e-6)
+    assert (
+        controller.summary()["root_candidate_acceptance_tolerance"]
+        == pytest.approx(5.0e-6)
+    )
+
+
+def test_committed_parity_checks_cleared_node_even_after_all_firms_exit():
+    controller = MarketClearingController(
+        MarketClearingConfig(residual_tolerance=1.0e-5)
+    )
+    state = {
+        "accounting_K_total": torch.tensor([1.0]),
+        "accounting_C_raw": torch.tensor([2.0]),
+        "hatc_cleared": torch.tensor([0.0]),
+        "alive": torch.zeros((1, 2), dtype=torch.bool),
+        "market_root_found": torch.tensor([True]),
+    }
+    with pytest.raises(MarketClearingError, match="commit parity failed"):
+        controller.validate_committed(state, t=0, branch=-1)
