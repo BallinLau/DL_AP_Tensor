@@ -22,6 +22,11 @@ import torch
 
 from .entry import EntryCandidates
 from .simulation_forward import forward_policy_value_for_simulation
+from .consistent_aggregation import (
+    NodeDecisionRecord,
+    assert_candidate_commit_parity,
+    tensor_snapshot_hash,
+)
 
 
 MARKET_CLEARING_DISABLED = "disabled"
@@ -94,6 +99,8 @@ class MarketClearingController:
         self.accounting_seconds = 0.0
         self.root_search_seconds = 0.0
         self.multiple_root_nodes = 0
+        self.candidate_commit_parity_pass_count = 0
+        self._validated_decision_records: set[tuple[str, bytes]] = set()
         self.failure_records: list[dict[str, Any]] = []
         self.root_records: list[dict[str, Any]] = []
 
@@ -137,13 +144,18 @@ class MarketClearingController:
     def _firm_policy(
         self, model: torch.nn.Module, states: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-        pieces = {name: [] for name in ("bar_i", "bar_z", "bp", "P0", "PI")}
+        pieces = {
+            name: [] for name in ("bar_i", "bar_z", "bp", "P0", "PI", "Phat")
+        }
         for start in range(0, states.shape[0], self.config.candidate_chunk_size):
             output = forward_policy_value_for_simulation(
                 model, states[start : start + self.config.candidate_chunk_size]
             )
             for name in pieces:
-                pieces[name].append(getattr(output, name).reshape(-1))
+                value = getattr(output, name, None)
+                if value is None:
+                    value = torch.full_like(output.P0, float("nan"))
+                pieces[name].append(value.reshape(-1))
             self.network_forward_calls += 1
         return {name: torch.cat(values) for name, values in pieces.items()}
 
@@ -224,6 +236,31 @@ class MarketClearingController:
         alive = torch.cat(
             (state["alive"][:, None, :].expand(B, H, N), accepted), dim=2
         ).bool()
+        incumbent_mass = state.get(
+            "firm_mass", state["alive"].to(dtype)
+        )[:, None, :].expand(B, H, N)
+        if E:
+            if getattr(sim, "aggregation_mode", "legacy_mixed_replay") == (
+                "continuum_mass_consistent_v1"
+            ):
+                represented_capital = (
+                    candidates.K_birth * candidates.mask.to(dtype)
+                ).sum(dim=1)
+                mass_per_candidate = torch.where(
+                    represented_capital > 0.0,
+                    candidates.potential_capital_nominal
+                    / represented_capital.clamp_min(1.0e-12),
+                    torch.zeros_like(represented_capital),
+                )
+                candidate_mass = (
+                    mass_per_candidate[:, None] * candidates.mask.to(dtype)
+                )
+            else:
+                candidate_mass = candidates.mask.to(dtype)
+            entry_mass = candidate_mass[:, None, :].expand(B, H, E)
+        else:
+            entry_mass = torch.empty((B, H, 0), device=device, dtype=dtype)
+        economic_mass = torch.cat((incumbent_mass, entry_mass), dim=2)
         economic_time = state["economic_time"].to(state["birth_time"].dtype)
         incumbent_birth = (
             (state["initial_cohort"] < 0.5)
@@ -254,8 +291,20 @@ class MarketClearingController:
         self.policy_forward_seconds += time.perf_counter() - policy_started
 
         accounting_started = time.perf_counter()
-        bar_i = torch.where(birth, torch.zeros_like(policy["bar_i"]), policy["bar_i"])
-        bar_z = policy["bar_z"]
+        if bool(getattr(sim, "hard_realized_aggregation", False)):
+            if not torch.isfinite(policy["Phat"]).all():
+                raise MarketClearingError(
+                    "hard aggregation requires finite policy Phat output"
+                )
+            survival = policy["Phat"] > 0.0
+            bar_i_policy = (
+                survival & (policy["PI"] >= policy["P0"])
+            ).to(dtype)
+            bar_z = (~survival).to(dtype)
+        else:
+            bar_i_policy = policy["bar_i"]
+            bar_z = policy["bar_z"]
+        bar_i = torch.where(birth, torch.zeros_like(bar_i_policy), bar_i_policy)
         maintenance = alive & ~birth
         flat = B * H * total_slots
         Y, I_oper, Phi, C_firm, I_maintenance = sim._resource_accounting(
@@ -275,13 +324,18 @@ class MarketClearingController:
         Y, I_oper, Phi, C_firm, I_maintenance = map(
             shaped, (Y, I_oper, Phi, C_firm, I_maintenance)
         )
-        mask = alive.to(dtype)
+        mask = alive.to(dtype) * economic_mass
         entry_spend = (
             candidates.entry_cost[:, None, :]
             * candidates.K_birth[:, None, :]
             * accepted.to(dtype)
+            * entry_mass
         ).sum(dim=2)
         K_total = (capital * mask).sum(dim=2)
+        Y_total = (Y * mask).sum(dim=2)
+        I_oper_total = (I_oper * mask).sum(dim=2)
+        liquidation_total = (Phi * mask).sum(dim=2)
+        maintenance_total = (I_maintenance * mask).sum(dim=2)
         C_oper = (C_firm * mask).sum(dim=2)
         C_raw = C_oper - entry_spend
         G = torch.exp(h) * K_total - C_raw
@@ -292,18 +346,32 @@ class MarketClearingController:
         feasible = finite & (C_raw > 0.0) & (K_total > 0.0)
         hard_i = (bar_i >= 0.5) & alive
         hard_z = (bar_z >= 0.5) & alive
+        investment_mass = (economic_mass * hard_i.to(dtype)).sum(dim=2)
+        default_mass = (economic_mass * hard_z.to(dtype)).sum(dim=2)
+        accepted_entry_mass = (
+            entry_mass * accepted.to(dtype)
+        ).sum(dim=2)
         result = {
             "h": h,
             "G": G,
             "G_normalized": G / scale,
             "C_raw": C_raw,
+            "C_oper": C_oper,
             "K_total": K_total,
+            "Y_total": Y_total,
+            "I_oper_total": I_oper_total,
+            "I_entry_total": entry_spend,
+            "Liquidation_total": liquidation_total,
+            "I_maintenance_total": maintenance_total,
             "resource_feasible": feasible,
             "finite": finite,
             "investment_count": hard_i.sum(dim=2),
             "default_count": hard_z.sum(dim=2),
             "entry_count": accepted.sum(dim=2),
-            "firm_count": alive.sum(dim=2),
+            "firm_count": (economic_mass * alive.to(dtype)).sum(dim=2),
+            "investment_mass": investment_mass,
+            "default_mass": default_mass,
+            "entry_mass": accepted_entry_mass,
         }
         if detail:
             result.update(
@@ -314,6 +382,10 @@ class MarketClearingController:
                     "bp_firm": policy["bp"],
                     "P0_firm": policy["P0"],
                     "PI_firm": policy["PI"],
+                    "Phat_firm": policy["Phat"],
+                    "economic_mass": economic_mass,
+                    "entry_candidate_mass": entry_mass,
+                    "firm_state": policy_state,
                 }
             )
         self._sync(device)
@@ -348,6 +420,109 @@ class MarketClearingController:
             + (self.config.support_upper - self.config.support_lower) * alpha
         )
         return grid[None, :].expand(belief.shape[0], -1)
+
+    @torch.inference_mode()
+    def _commit_selected_decision_record(
+        self,
+        sim: Any,
+        state: Dict[str, torch.Tensor],
+        candidates: EntryCandidates,
+        selected_h: torch.Tensor,
+        detail: dict[str, torch.Tensor],
+        *,
+        t: int,
+        branch: int,
+    ) -> None:
+        """Attach the exact selected hard decisions for the production commit."""
+        if not bool(getattr(sim, "hard_realized_aggregation", False)):
+            return
+        B, N = state["b"].shape
+        E = int(candidates.mask.shape[1])
+        bar_i_all = detail["bar_i_firm"][:, 0]
+        bar_z_all = detail["bar_z_firm"][:, 0]
+        bp_all = detail["bp_firm"][:, 0].detach().clone()
+
+        # Only a parent node commits b_t -> b_{t+1}.  Resolve its grid action
+        # now and reuse it in _process_node_batched; child observation rows are
+        # explicitly non-applicable and will be resolved when promoted to a
+        # parent node.
+        if int(branch) == -1:
+            active = state["alive"]
+            path_grid = torch.arange(B, device=state["b"].device)[:, None].expand(B, N)
+            active_pos = torch.nonzero(active.reshape(-1), as_tuple=False).reshape(-1)
+            if active_pos.numel():
+                firm_state = detail["firm_state"][:, 0, :N].reshape(B * N, 7)[active_pos]
+                head = bp_all[:, :N].reshape(-1)[active_pos].reshape(-1, 1)
+                needs_resolver = (
+                    getattr(sim, "bp_action_override", None) is not None
+                    or getattr(sim, "bp_action_source", "head") == "grid"
+                    or bool(getattr(sim, "bp_actual_use_trace_enabled", False))
+                )
+                if needs_resolver:
+                    path_index = path_grid.reshape(-1)[active_pos]
+                    resolved = sim._resolve_bp_action(
+                        sim=sim,
+                        firm_state=firm_state,
+                        model_output=None,
+                        bp_head=head,
+                        hatc_cal=selected_h[path_index, None],
+                        lnk_cal=torch.log(
+                            detail["K_total"][:, 0].clamp_min(1.0e-30)
+                        )[path_index, None],
+                        path_index=path_index,
+                        firm_id=state["firm_id"].reshape(-1)[active_pos],
+                        economic_node_id=state["economic_node_id"][path_index],
+                        t=int(t),
+                        branch=int(branch),
+                        decision_stage="parent_transition_policy",
+                        bp_execution_applicable=True,
+                    ).reshape(-1)
+                    bp_incumbent = bp_all[:, :N].clone().reshape(-1)
+                    bp_incumbent[active_pos] = resolved
+                    bp_all[:, :N] = bp_incumbent.reshape(B, N)
+
+        ledger = {
+            "C_raw": detail["C_raw"][:, 0],
+            "C_oper": detail["C_oper"][:, 0],
+            "K_total": detail["K_total"][:, 0],
+            "Y_total": detail["Y_total"][:, 0],
+            "I_oper_total": detail["I_oper_total"][:, 0],
+            "I_entry_total": detail["I_entry_total"][:, 0],
+            "Liquidation_total": detail["Liquidation_total"][:, 0],
+            "I_maintenance_total": detail["I_maintenance_total"][:, 0],
+        }
+        record = NodeDecisionRecord(
+            snapshot_hash=tensor_snapshot_hash(state),
+            candidate_h=selected_h,
+            bar_i=bar_i_all[:, :N],
+            bar_z=bar_z_all[:, :N],
+            bp=bp_all[:, :N],
+            accepted_entry=detail["accepted_entry"][:, 0],
+            entry_bar_i=bar_i_all[:, N : N + E],
+            entry_bar_z=bar_z_all[:, N : N + E],
+            firm_mass=detail["economic_mass"][:, 0, :N],
+            entry_mass=detail["entry_candidate_mass"][:, 0],
+            ledger=ledger,
+            provenance={
+                "t": int(t),
+                "branch": int(branch),
+                "aggregation_mode": str(sim.aggregation_mode),
+                "configured_bp_source": str(sim.bp_action_source),
+                "bp_execution_applicable": int(branch) == -1,
+                "root_selection": "coarse_to_fine_selected_record",
+            },
+        ).detached()
+        state["_selected_decision_record"] = record
+        state["decision_record_bar_i"] = record.bar_i
+        state["decision_record_bar_z"] = record.bar_z
+        state["decision_record_bp"] = record.bp
+        state["decision_record_valid"] = torch.ones(
+            B, device=state["b"].device, dtype=torch.bool
+        )
+        state["pending_entry_accepted"] = record.accepted_entry
+        state["pending_entry_bar_i"] = record.entry_bar_i
+        state["pending_entry_bar_z"] = record.entry_bar_z
+        state["pending_entry_mass"] = record.entry_mass
 
     @staticmethod
     def _merge_active_paths(
@@ -604,6 +779,13 @@ class MarketClearingController:
                 x0 = new_left[terminal]
                 x1 = new_right[terminal]
                 proposed = x0 - g0 * (x1 - x0) / (g1 - g0)
+                mass_jump = torch.zeros_like(g0, dtype=torch.bool)
+                for mass_name in ("investment_mass", "default_mass", "entry_mass"):
+                    if mass_name in refined:
+                        mass_jump |= (
+                            refined[mass_name][terminal_row, terminal_col]
+                            - refined[mass_name][terminal_row, terminal_col + 1]
+                        ).abs() > 1.0e-10
                 jump = (
                     (refined["investment_count"][terminal_row, terminal_col]
                      != refined["investment_count"][terminal_row, terminal_col + 1])
@@ -611,6 +793,7 @@ class MarketClearingController:
                        != refined["default_count"][terminal_row, terminal_col + 1])
                     | (refined["entry_count"][terminal_row, terminal_col]
                        != refined["entry_count"][terminal_row, terminal_col + 1])
+                    | mass_jump
                 )
                 jump_parent = new_parent[terminal][jump]
                 discontinuity_bracket_count.scatter_add_(
@@ -865,6 +1048,15 @@ class MarketClearingController:
         root_detail = self.evaluate(
             sim, state, candidates, selected_h[:, None], detail=True
         )
+        self._commit_selected_decision_record(
+            sim,
+            state,
+            candidates,
+            selected_h,
+            root_detail,
+            t=t,
+            branch=branch,
+        )
         belief_detail = self.evaluate(
             sim, state, candidates, belief[:, None], detail=True
         )
@@ -966,6 +1158,40 @@ class MarketClearingController:
                 f"normalized_residual={normalized[bad].detach().cpu().tolist()[:20]}, "
                 f"tolerance={self.config.residual_tolerance}"
             )
+        record = state.get("_selected_decision_record")
+        if record is not None:
+            committed = {
+                "C_raw": state["accounting_C_raw"],
+                "C_oper": state["accounting_C_oper"],
+                "K_total": state["accounting_K_total"],
+                "Y_total": state["accounting_Y_total"],
+                "I_oper_total": state["accounting_I_oper"],
+                "I_entry_total": state["accounting_I_entry"],
+                "Liquidation_total": state["accounting_Liquidation_total"],
+                "I_maintenance_total": state["accounting_I_maintenance"],
+            }
+            try:
+                assert_candidate_commit_parity(
+                    record,
+                    committed,
+                    atol=5.0e-6,
+                    rtol=5.0e-6,
+                )
+            except AssertionError as exc:
+                raise MarketClearingError(
+                    "selected DecisionRecord differs from committed ledger; "
+                    f"t={t}, branch={branch}"
+                ) from exc
+            state["candidate_commit_parity_passed"] = torch.ones_like(
+                cleared, dtype=torch.bool
+            )
+            validation_key = (
+                record.snapshot_hash,
+                record.candidate_h.detach().to(device="cpu").contiguous().numpy().tobytes(),
+            )
+            if validation_key not in self._validated_decision_records:
+                self._validated_decision_records.add(validation_key)
+                self.candidate_commit_parity_pass_count += int(cleared.sum())
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -977,6 +1203,9 @@ class MarketClearingController:
             "TRAINING_PERFORMED": False,
             "node_count": int(self.node_count),
             "multiple_root_nodes": int(self.multiple_root_nodes),
+            "candidate_commit_parity_pass_count": int(
+                self.candidate_commit_parity_pass_count
+            ),
             "total_operator_evaluations": int(self.operator_evaluations),
             "network_forward_calls": int(self.network_forward_calls),
             "policy_forward_seconds": float(self.policy_forward_seconds),

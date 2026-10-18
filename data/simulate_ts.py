@@ -40,6 +40,12 @@ from .market_clearing import (
     MarketClearingConfig,
     MarketClearingController,
 )
+from .consistent_aggregation import (
+    AGGREGATION_MODES,
+    LEGACY_MIXED_REPLAY,
+    HARD_REALIZED_REFERENCE,
+    CONTINUUM_MASS_CONSISTENT_V1,
+)
 from utils.firm_transition import apply_refinancing_policy
 
 
@@ -62,7 +68,8 @@ class SimulateTS:
         'entry_P0', 'entry_PI', 'entry_value_gap',
         'economic_node_id', 'node_view', 'accounting_stage',
         'eps_z_transition', 'u_eta_transition', 'u_i_transition',
-        'birth_at_node', 'maintenance_eligible', 'I_maintenance'
+        'birth_at_node', 'maintenance_eligible', 'I_maintenance',
+        'firm_mass'
     ]
     MACRO_COLUMNS = [
         'path', 't', 'branch', 'K', 'C', 'LnK', 'Hatc',
@@ -107,7 +114,9 @@ class SimulateTS:
         'market_entry_flip_vs_belief',
         'market_root_operator_evaluations',
         'market_committed_residual',
-        'market_committed_residual_normalized'
+        'market_committed_residual_normalized',
+        'slot_count', 'firm_mass', 'aggregate_debt',
+        'distribution_projection_error'
     ]
 
     def __init__(
@@ -126,6 +135,10 @@ class SimulateTS:
         bp_action_source: str = "head",
         bp_grid_policy: Optional[Callable[..., torch.Tensor]] = None,
         bp_actual_use_trace_enabled: bool = False,
+        aggregation_mode: str = LEGACY_MIXED_REPLAY,
+        continuum_i_points: int = 9,
+        continuum_z_points: int = 7,
+        continuum_projection_tolerance: float = 1.0e-6,
         entry_mode: str = "legacy",
         entry_spec_version: str = "value_cost_v1",
         entry_capital_ratio: float = 0.10,
@@ -208,6 +221,25 @@ class SimulateTS:
             raise ValueError("bp_action_source='grid' requires bp_grid_policy")
         self.bp_actual_use_trace_enabled = bool(bp_actual_use_trace_enabled)
         self.bp_actual_use_trace: List[Dict[str, object]] = []
+        self.aggregation_mode = str(aggregation_mode).strip().lower()
+        if self.aggregation_mode not in AGGREGATION_MODES:
+            raise ValueError(
+                f"unknown aggregation_mode={aggregation_mode!r}; "
+                f"expected one of {sorted(AGGREGATION_MODES)}"
+            )
+        self.continuum_i_points = int(continuum_i_points)
+        self.continuum_z_points = int(continuum_z_points)
+        self.continuum_projection_tolerance = float(
+            continuum_projection_tolerance
+        )
+        if self.continuum_i_points < 2 or self.continuum_z_points < 2:
+            raise ValueError("continuum quadrature requires at least two points")
+        if self.continuum_projection_tolerance <= 0.0:
+            raise ValueError("continuum projection tolerance must be positive")
+        self.hard_realized_aggregation = self.aggregation_mode in {
+            HARD_REALIZED_REFERENCE,
+            CONTINUUM_MASS_CONSISTENT_V1,
+        }
         self.entry_mode = str(entry_mode).strip().lower()
         self.entry_spec_version = str(entry_spec_version)
         self.entry_capital_ratio = float(entry_capital_ratio)
@@ -571,6 +603,22 @@ class SimulateTS:
                     "evaluated policy is distinct from economically executed "
                     "parent-to-child leverage"
                 ),
+            },
+            "aggregation": {
+                "mode": self.aggregation_mode,
+                "ECONOMIC_CALIBRATION_CHANGED": False,
+                "AGGREGATION_SEMANTICS_CHANGED": (
+                    self.aggregation_mode != LEGACY_MIXED_REPLAY
+                ),
+                "NUMERICAL_STATE_REPRESENTATION_CHANGED": (
+                    self.aggregation_mode == CONTINUUM_MASS_CONSISTENT_V1
+                ),
+                "ARTIFICIAL_SMOOTHING_ADDED": False,
+                "CONSUMPTION_FLOOR_ADDED": self.consumption_floor > 0.0,
+                "FAILED_CHILDREN_DROPPED": False,
+                "continuum_i_points": self.continuum_i_points,
+                "continuum_z_points": self.continuum_z_points,
+                "projection_tolerance": self.continuum_projection_tolerance,
             },
             "market_clearing": (
                 {"mode": MARKET_CLEARING_DISABLED}
@@ -1008,6 +1056,7 @@ class SimulateTS:
                 torch.zeros_like(K),
                 torch.ones_like(K),
                 I_maintenance,
+                torch.ones_like(K),
             ],
             dim=1
         ).to(torch.float32)

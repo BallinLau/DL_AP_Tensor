@@ -125,6 +125,12 @@ def build_market_cleared_transition_bank(
 
     if paired.empty:
         raise RuntimeError("root-cleared rollout produced no matched Firm transitions")
+    aggregation_mode = str(
+        getattr(output, "meta", {}).get("aggregation", {}).get(
+            "mode", "legacy_mixed_replay"
+        )
+    )
+    mass_column = parent_column("firm_mass") if "firm_mass" in firm.columns else None
     finite_columns = [parent_column(name) for name in PARENT_COLUMNS]
     for branch in (0, 1):
         finite_columns.extend(column(name, branch) for name in CHILD_COLUMNS)
@@ -142,7 +148,17 @@ def build_market_cleared_transition_bank(
             f"available={len(paired)}, requested={n_parents}"
         )
     rng = np.random.default_rng(int(seed))
-    chosen = rng.choice(len(paired), size=int(n_parents), replace=False)
+    probabilities = None
+    if aggregation_mode == "continuum_mass_consistent_v1":
+        if mass_column is None:
+            raise RuntimeError("continuum Firm bank is missing firm_mass")
+        mass = paired[mass_column].to_numpy(dtype=np.float64)
+        if not np.isfinite(mass).all() or (mass <= 0.0).any():
+            raise RuntimeError("continuum Firm bank contains invalid mass")
+        probabilities = mass / mass.sum()
+    chosen = rng.choice(
+        len(paired), size=int(n_parents), replace=False, p=probabilities
+    )
     paired = paired.iloc[chosen].reset_index(drop=True)
 
     parent_tensor = torch.as_tensor(
@@ -180,6 +196,8 @@ def build_market_cleared_transition_bank(
             "state_columns": list(PARENT_COLUMNS),
             "sampling": "without_replacement",
             "available_matched_transitions": available,
+            "aggregation_mode": aggregation_mode,
+            "sampling_mass_weighted": probabilities is not None,
         },
     )
     child_bank = InnerFPChildBank(
@@ -206,5 +224,7 @@ def build_market_cleared_transition_bank(
         "child_branches": [0, 1],
         "root_tolerance": float(root_tolerance),
         "artificial_b_only_used": False,
+        "aggregation_mode": aggregation_mode,
+        "sampling_mass_weighted": probabilities is not None,
     }
     return parent_bank, child_bank, audit

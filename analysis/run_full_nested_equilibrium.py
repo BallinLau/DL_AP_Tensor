@@ -265,6 +265,13 @@ def _configure_hyperparams(args: argparse.Namespace):
     hp.market_clearing_candidate_chunk_size = int(
         args.market_clearing_candidate_chunk_size
     )
+    hp.aggregation_mode = str(args.aggregation_mode)
+    hp.continuum_i_points = int(args.continuum_i_points)
+    hp.continuum_z_points = int(args.continuum_z_points)
+    hp.continuum_projection_tolerance = float(
+        args.continuum_projection_tolerance
+    )
+    hp.bp_actual_use_trace_enabled = bool(args.bp_actual_use_trace)
     if hp.market_clearing_mode != "disabled":
         # Lock to the already-audited Gomes/root-diagnostic economic setup.
         hp.entry_mode = "investment_compare"
@@ -1715,6 +1722,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--market-clearing-candidate-chunk-size", type=int, default=262144
     )
+    parser.add_argument(
+        "--aggregation-mode",
+        choices=(
+            "legacy_mixed_replay",
+            "hard_realized_reference",
+            "continuum_mass_consistent_v1",
+        ),
+        default="legacy_mixed_replay",
+    )
+    parser.add_argument("--continuum-i-points", type=int, default=9)
+    parser.add_argument("--continuum-z-points", type=int, default=7)
+    parser.add_argument(
+        "--continuum-projection-tolerance", type=float, default=1.0e-6
+    )
+    parser.add_argument(
+        "--bp-actual-use-trace",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args(argv)
     if args.smoke:
@@ -1727,6 +1753,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("long rollout is diagnostic-only and cannot enter primary Macro training")
     if args.branch_num != 2:
         parser.error("one-step conditional SDF training requires --branch-num 2")
+    if (
+        args.aggregation_mode != "legacy_mixed_replay"
+        and args.market_clearing_mode == "disabled"
+    ):
+        parser.error("hard/continuum aggregation requires market clearing")
+    if args.continuum_i_points < 2 or args.continuum_z_points < 2:
+        parser.error("continuum quadrature point counts must be at least two")
     if args.bootstrap_validation_paths < 1:
         parser.error("--bootstrap-validation-paths must be positive")
     parse_capture_times(args.macro_bank_capture_times)
