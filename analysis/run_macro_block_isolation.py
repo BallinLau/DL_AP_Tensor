@@ -257,7 +257,7 @@ def regression_metrics(target: torch.Tensor, prediction: torch.Tensor) -> dict[s
     result = {"n": int(target.numel())}
     if target.numel() < 2:
         return {**result, **{key: float("nan") for key in (
-            "mse", "rmse", "r2", "corr", "slope", "bias", "target_std", "prediction_std"
+            "mse", "rmse", "mae", "r2", "corr", "slope", "bias", "target_std", "prediction_std"
         )}}
     error = prediction - target
     target_centered = target - target.mean()
@@ -268,6 +268,7 @@ def regression_metrics(target: torch.Tensor, prediction: torch.Tensor) -> dict[s
         **result,
         "mse": float(error.square().mean()),
         "rmse": float(torch.sqrt(error.square().mean())),
+        "mae": float(error.abs().mean()),
         "r2": float(1.0 - error.square().sum() / sst) if sst > 0 else float("nan"),
         "corr": float(torch.dot(target_centered, pred_centered) / corr_denom) if corr_denom > 0 else float("nan"),
         "slope": float(torch.dot(target_centered, pred_centered) / sst) if sst > 0 else float("nan"),
@@ -278,7 +279,7 @@ def regression_metrics(target: torch.Tensor, prediction: torch.Tensor) -> dict[s
 
 
 def evaluate_fc1(model: torch.nn.Module, batches: Sequence[Mapping[str, Any]]) -> dict[str, float]:
-    targets_c, targets_k, predictions_c, predictions_k = [], [], [], []
+    targets_c, targets_k, predictions_c, predictions_k, parent_k = [], [], [], [], []
     was_training = model.training
     model.eval()
     with torch.no_grad():
@@ -300,6 +301,9 @@ def evaluate_fc1(model: torch.nn.Module, batches: Sequence[Mapping[str, Any]]) -
             targets_k.append(target_k)
             predictions_c.append(pred_c)
             predictions_k.append(pred_k)
+            parent_k.append(
+                parent[:, 8:9].unsqueeze(1).expand_as(target_k)
+            )
     model.train(was_training)
     result = {}
     for name, target, prediction in (
@@ -307,6 +311,14 @@ def evaluate_fc1(model: torch.nn.Module, batches: Sequence[Mapping[str, Any]]) -
         ("lnk", torch.cat(targets_k), torch.cat(predictions_k)),
     ):
         result.update({f"{name}_{key}": value for key, value in regression_metrics(target, prediction).items()})
+    parent_k_tensor = torch.cat(parent_k)
+    result.update({
+        f"delta_lnk_{key}": value
+        for key, value in regression_metrics(
+            torch.cat(targets_k) - parent_k_tensor,
+            torch.cat(predictions_k) - parent_k_tensor,
+        ).items()
+    })
     return result
 
 
@@ -707,6 +719,14 @@ def run_fc1_fit(
         "early_stop_patience": patience,
         "best_train": final_train,
         "best_validation": final_validation,
+        "initial_train": {
+            key.removeprefix("train_"): value
+            for key, value in rows[0].items() if key.startswith("train_")
+        },
+        "initial_validation": {
+            key.removeprefix("validation_"): value
+            for key, value in rows[0].items() if key.startswith("validation_")
+        },
         "invariants": invariants,
     }
     write_json(output / "summary.json", summary)

@@ -32,6 +32,12 @@ from .data_utils import (
 from .tensor_data import TensorTable, TensorSimulationOutput, cat_rows
 from .simulate_ts_parallel import simulate_tensor_parallel
 from .simulation_forward import forward_policy_value_for_simulation
+from .market_clearing import (
+    MARKET_CLEARING_DISABLED,
+    MARKET_CLEARING_V1,
+    MarketClearingConfig,
+    MarketClearingController,
+)
 from utils.firm_transition import apply_refinancing_policy
 
 
@@ -86,7 +92,20 @@ class SimulateTS:
         'K_maintenance_base', 'K_birth_current_node',
         'I_maintenance', 'I_maintenance_rebuilt',
         'maintenance_accounting_residual', 'birth_maintenance_exemption',
-        'consumption_floor', 'consumption_floor_applied'
+        'consumption_floor', 'consumption_floor_applied',
+        'Hatc_belief', 'Hatc_cleared', 'Hatc_firm_input',
+        'LnK_belief', 'LnK_calculated',
+        'market_root_found', 'market_root_count',
+        'market_root_residual', 'market_root_residual_normalized',
+        'market_root_bracket_count', 'market_root_refinement_rounds',
+        'market_root_branch_id', 'market_root_branch_switch',
+        'market_root_policy_jump',
+        'market_investment_flip_vs_belief',
+        'market_default_flip_vs_belief',
+        'market_entry_flip_vs_belief',
+        'market_root_operator_evaluations',
+        'market_committed_residual',
+        'market_committed_residual_normalized'
     ]
 
     def __init__(
@@ -127,6 +146,16 @@ class SimulateTS:
         entry_hatc_failure_episode_id: int = -1,
         initial_state: Optional[Dict[str, torch.Tensor]] = None,
         state_bank_capture=None,
+        market_clearing_mode: str = MARKET_CLEARING_DISABLED,
+        market_clearing_coarse_points: int = 10,
+        market_clearing_refinement_points: int = 20,
+        market_clearing_max_refinement_rounds: int = 4,
+        market_clearing_support_lower: float = -8.0,
+        market_clearing_support_upper: float = 2.0,
+        market_clearing_support_padding: float = 2.0,
+        market_clearing_residual_tolerance: float = 1.0e-5,
+        market_clearing_width_tolerance: float = 1.0e-5,
+        market_clearing_candidate_chunk_size: int = 262144,
     ):
         """
         Args:
@@ -249,6 +278,58 @@ class SimulateTS:
         )
         self.initial_state = initial_state
         self.state_bank_capture = state_bank_capture
+        self.market_clearing_mode = str(market_clearing_mode).strip().lower()
+        if self.market_clearing_mode not in {
+            MARKET_CLEARING_DISABLED,
+            MARKET_CLEARING_V1,
+        }:
+            raise ValueError(
+                "market_clearing_mode must be 'disabled' or "
+                f"'{MARKET_CLEARING_V1}'"
+            )
+        self.market_clearing_controller = None
+        self._market_entry_candidates_override = None
+        if self.market_clearing_mode == MARKET_CLEARING_V1:
+            if self.entry_mode != "investment_compare":
+                raise ValueError(
+                    f"{MARKET_CLEARING_V1} requires entry_mode='investment_compare'"
+                )
+            if self.entry_rng_mode != "stable_economic_identity":
+                raise ValueError(
+                    f"{MARKET_CLEARING_V1} requires "
+                    "entry_rng_mode='stable_economic_identity'"
+                )
+            if self.consumption_aggregation_mode != "raw":
+                raise ValueError(
+                    f"{MARKET_CLEARING_V1} requires raw consumption accounting"
+                )
+            if self.consumption_floor != 0.0:
+                raise ValueError(
+                    f"{MARKET_CLEARING_V1} forbids a positive consumption floor"
+                )
+            if self.node_accounting_mode != "economic_node_ledger":
+                raise ValueError(
+                    f"{MARKET_CLEARING_V1} requires economic_node_ledger"
+                )
+            self.market_clearing_controller = MarketClearingController(
+                MarketClearingConfig(
+                    coarse_points=int(market_clearing_coarse_points),
+                    refinement_points=int(market_clearing_refinement_points),
+                    max_refinement_rounds=int(
+                        market_clearing_max_refinement_rounds
+                    ),
+                    support_lower=float(market_clearing_support_lower),
+                    support_upper=float(market_clearing_support_upper),
+                    support_padding=float(market_clearing_support_padding),
+                    residual_tolerance=float(
+                        market_clearing_residual_tolerance
+                    ),
+                    width_tolerance=float(market_clearing_width_tolerance),
+                    candidate_chunk_size=int(
+                        market_clearing_candidate_chunk_size
+                    ),
+                )
+            )
         if self.initial_state is not None:
             if "b" not in self.initial_state or self.initial_state["b"].ndim != 2:
                 raise ValueError("initial_state must contain two-dimensional 'b'")
@@ -476,6 +557,11 @@ class SimulateTS:
             "gpu_memory_after_bytes": memory_after,
             "peak_gpu_memory_bytes": peak_memory,
             "bp_grid": bp_metrics,
+            "market_clearing": (
+                {"mode": MARKET_CLEARING_DISABLED}
+                if self.market_clearing_controller is None
+                else self.market_clearing_controller.summary()
+            ),
             "entry": {
                 "base_commit": "4b236eaacf47b2ac7cb506508e54b21a199e89b0",
                 **self.entry_configuration,

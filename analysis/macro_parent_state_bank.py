@@ -304,6 +304,22 @@ def _simulation_kwargs(episode: Any, transition_seed: int, entry_seed: int) -> d
         "preserve_global_rng_around_entry",
     )
     kwargs = {name: getattr(episode.hyperparams, name) for name in names}
+    market_defaults = {
+        "market_clearing_mode": "disabled",
+        "market_clearing_coarse_points": 10,
+        "market_clearing_refinement_points": 20,
+        "market_clearing_max_refinement_rounds": 4,
+        "market_clearing_support_lower": -8.0,
+        "market_clearing_support_upper": 2.0,
+        "market_clearing_support_padding": 2.0,
+        "market_clearing_residual_tolerance": 1.0e-5,
+        "market_clearing_width_tolerance": 1.0e-5,
+        "market_clearing_candidate_chunk_size": 262144,
+    }
+    kwargs.update({
+        name: getattr(episode.hyperparams, name, default)
+        for name, default in market_defaults.items()
+    })
     kwargs.update(
         {
             "entry_rng_seed": int(entry_seed),

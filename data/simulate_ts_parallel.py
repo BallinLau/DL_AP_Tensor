@@ -28,6 +28,7 @@ from .entry import (
 )
 from .simulation_forward import forward_policy_value_for_simulation
 from .tensor_data import TensorSimulationOutput, TensorTable, cat_rows
+from .market_clearing import empty_entry_candidates
 from utils.firm_transition import apply_refinancing_policy
 
 
@@ -513,11 +514,31 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
 
     for t in tqdm(range(sim.horizon), desc="Simulating steps (tensor)"):
         state_bank_capture = getattr(sim, "state_bank_capture", None)
-        if state_bank_capture is not None:
+        market_controller = getattr(sim, "market_clearing_controller", None)
+        if state_bank_capture is not None and market_controller is None:
             # State Bank v1 contract: capture the complete parent-ready state
             # before any node processing mutates policy/accounting fields.
             state_bank_capture.capture_parent_ready(state, time_index=t)
+        committed = state.get("market_node_committed")
+        if market_controller is not None and (
+            committed is None or not bool(committed.all())
+        ):
+            state = market_controller.clear_state(
+                sim,
+                state,
+                empty_entry_candidates(state),
+                t=t,
+                branch=-1,
+            )
+        if state_bank_capture is not None and market_controller is not None:
+            # Experimental v1 captures the root-cleared parent-ready state.
+            state_bank_capture.capture_parent_ready(state, time_index=t)
         parent_firm, parent_macro = _process_node_batched(sim, state, t, branch_k=-1)
+        if market_controller is not None:
+            market_controller.validate_committed(state, t=t, branch=-1)
+            state["market_node_committed"] = torch.ones(
+                state["b"].shape[0], dtype=torch.bool, device=device
+            )
         firm_rows.append(parent_firm)
         macro_rows.append(parent_macro)
         completed_parent_steps += 1
@@ -527,11 +548,32 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
             sim, parent_firm, state, branch_states[sim.main_branch]
         )
         for branch_k, branch_state in enumerate(branch_states):
+            market_candidates = None
+            if market_controller is not None:
+                market_candidates = _prepare_market_entry_candidates(
+                    sim, branch_state, enable_entry=bool(sim.enable_entry)
+                )
+                branch_state = market_controller.clear_state(
+                    sim,
+                    branch_state,
+                    market_candidates,
+                    t=t + 1,
+                    branch=branch_k,
+                )
+                if sim.enable_entry:
+                    sim._market_entry_candidates_override = market_candidates
             if sim.enable_entry:
                 branch_state = _apply_entry_batched(sim, branch_state, n_potential)
                 branch_states[branch_k] = branch_state
 
             branch_firm, branch_macro = _process_node_batched(sim, branch_state, t + 1, branch_k=branch_k)
+            if market_controller is not None:
+                market_controller.validate_committed(
+                    branch_state, t=t + 1, branch=branch_k
+                )
+                branch_state["market_node_committed"] = torch.ones(
+                    branch_state["b"].shape[0], dtype=torch.bool, device=device
+                )
             firm_rows.append(branch_firm)
             macro_rows.append(branch_macro)
 
@@ -584,6 +626,27 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
             "path_stop_times": path_stop_times,
         },
     )
+
+
+def _prepare_market_entry_candidates(sim, state, *, enable_entry: bool) -> EntryCandidates:
+    """Freeze the exact candidate draw used by root search and node commit."""
+    if not enable_entry:
+        return empty_entry_candidates(state)
+    if getattr(sim, "entry_mode", "legacy") != "investment_compare":
+        raise RuntimeError(
+            "experimental market clearing supports only investment_compare entry"
+        )
+    if getattr(sim, "entry_rng_mode", "legacy_sequential") != "stable_economic_identity":
+        raise RuntimeError(
+            "experimental market clearing requires stable economic entry identity"
+        )
+    reference = compute_entry_reference(
+        state["transition_previous_K"],
+        state["transition_previous_alive"],
+        entry_capital_ratio=sim.entry_capital_ratio,
+        entry_size_ratio=sim.entry_size_ratio,
+    )
+    return _stable_entry_candidates(sim, state, reference)
 
 
 def _initialize_batched_state(sim, max_firms: int) -> Dict[str, torch.Tensor]:
@@ -1489,6 +1552,80 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                 device=device,
             ),
             consumption_floor_applied.to(torch.float32),
+            state.get("hatc_belief", state["hatcf"]).to(torch.float32),
+            state.get("hatc_cleared", state["hatcf"]).to(torch.float32),
+            state["hatcf"].to(torch.float32),
+            state["lnkf"].to(torch.float32),
+            LnK.to(torch.float32),
+            state.get(
+                "market_root_found",
+                torch.zeros(n_paths, dtype=torch.bool, device=device),
+            ).to(torch.float32),
+            state.get(
+                "market_root_count", torch.zeros(n_paths, device=device)
+            ).to(torch.float32),
+            state.get(
+                "market_root_residual",
+                torch.full((n_paths,), float("nan"), device=device),
+            ).to(torch.float32),
+            state.get(
+                "market_root_residual_normalized",
+                torch.full((n_paths,), float("nan"), device=device),
+            ).to(torch.float32),
+            state.get(
+                "market_root_bracket_count", torch.zeros(n_paths, device=device)
+            ).to(torch.float32),
+            state.get(
+                "market_root_refinement_rounds",
+                torch.full((n_paths,), -1, device=device),
+            ).to(torch.float32),
+            state.get(
+                "market_root_branch_id", torch.zeros(n_paths, device=device)
+            ).to(torch.float32),
+            state.get(
+                "market_root_branch_switch",
+                torch.zeros(n_paths, dtype=torch.bool, device=device),
+            ).to(torch.float32),
+            state.get(
+                "market_root_policy_jump",
+                torch.zeros(n_paths, dtype=torch.bool, device=device),
+            ).to(torch.float32),
+            state.get(
+                "market_investment_flip_vs_belief",
+                torch.zeros(n_paths, device=device),
+            ).to(torch.float32),
+            state.get(
+                "market_default_flip_vs_belief",
+                torch.zeros(n_paths, device=device),
+            ).to(torch.float32),
+            state.get(
+                "market_entry_flip_vs_belief",
+                torch.zeros(n_paths, device=device),
+            ).to(torch.float32),
+            state.get(
+                "market_root_operator_evaluations",
+                torch.zeros(n_paths, device=device),
+            ).to(torch.float32),
+            (
+                torch.exp(state.get("hatc_cleared", state["hatcf"]))
+                * K_total
+                - C_raw_total
+                if getattr(sim, "market_clearing_controller", None) is not None
+                else torch.full((n_paths,), float("nan"), device=device)
+            ).to(torch.float32),
+            (
+                (
+                    torch.exp(state.get("hatc_cleared", state["hatcf"]))
+                    * K_total
+                    - C_raw_total
+                )
+                / torch.maximum(
+                    torch.ones_like(K_total),
+                    torch.maximum(K_total.abs(), C_raw_total.abs()),
+                )
+                if getattr(sim, "market_clearing_controller", None) is not None
+                else torch.full((n_paths,), float("nan"), device=device)
+            ).to(torch.float32),
         ],
         dim=1,
     ).to(torch.float32)
@@ -1624,6 +1761,9 @@ def _expand_branches_batched(
                 "hatcf": hatcf_out,
                 "lnkf": lnkf_out,
                 "M": M_out,
+                "market_previous_root": state.get(
+                    "hatc_cleared", state["hatcf"]
+                ).clone(),
                 "alive": state["alive"].clone(),
                 "entry": torch.zeros_like(state["entry"]),
                 "initial_cohort": state["initial_cohort"].clone(),
@@ -1890,7 +2030,11 @@ def _apply_value_cost_entry_batched(sim, state: Dict[str, torch.Tensor]) -> Dict
         entry_capital_ratio=sim.entry_capital_ratio,
         entry_size_ratio=sim.entry_size_ratio,
     )
-    if getattr(sim, "entry_rng_mode", "legacy_sequential") == "stable_economic_identity":
+    override = getattr(sim, "_market_entry_candidates_override", None)
+    if override is not None:
+        candidates = override
+        sim._market_entry_candidates_override = None
+    elif getattr(sim, "entry_rng_mode", "legacy_sequential") == "stable_economic_identity":
         candidates = _stable_entry_candidates(sim, state, reference)
     else:
         candidates = draw_value_cost_candidates(

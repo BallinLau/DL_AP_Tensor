@@ -108,6 +108,33 @@ def atomic_torch_save(path: Path, payload: Any) -> None:
     _fsync_directory(path.parent)
 
 
+def safe_torch_load(
+    path: Path | str,
+    *,
+    map_location: str | torch.device = "cpu",
+) -> Any:
+    """Load tensor checkpoints without enabling arbitrary pickle globals.
+
+    Nested-equilibrium checkpoints include NumPy's uint32 RNG array.  These
+    primitive array/dtype globals are allowlisted while PyTorch's weights-only
+    unpickler remains active.
+    """
+    numpy_globals = [
+        np.core.multiarray._reconstruct,
+        np.ndarray,
+        np.dtype,
+        type(np.dtype(np.float16)),
+        type(np.dtype(np.float32)),
+        type(np.dtype(np.float64)),
+        type(np.dtype(np.int32)),
+        type(np.dtype(np.int64)),
+        type(np.dtype(np.uint32)),
+        type(np.dtype(np.uint64)),
+    ]
+    with torch.serialization.safe_globals(numpy_globals):
+        return torch.load(path, map_location=map_location, weights_only=True)
+
+
 def capture_rng_state() -> dict[str, Any]:
     state: dict[str, Any] = {
         "python": random.getstate(),
@@ -293,7 +320,7 @@ def publish_checkpoint(
     run_root: Path,
 ) -> None:
     atomic_torch_save(path, dict(payload))
-    loaded = torch.load(path, map_location="cpu", weights_only=False)
+    loaded = safe_torch_load(path, map_location="cpu")
     verify_checkpoint_payload(loaded)
     latest_path = run_root / "latest_checkpoint.json"
     previous: Optional[str] = None
@@ -323,7 +350,7 @@ def load_checkpoint(
     allow_code_mismatch: bool,
     restore_rng: bool = True,
 ) -> dict[str, Any]:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload = safe_torch_load(path, map_location="cpu")
     verify_checkpoint_payload(payload)
     mismatches = {}
     if payload.get("git_head") != git_head:

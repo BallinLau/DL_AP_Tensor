@@ -131,6 +131,25 @@ def test_fc1_update_changes_firm_macro_inputs():
     assert not torch.allclose(old[..., 5:7], new[..., 5:7])
 
 
+def test_market_cleared_bank_preserves_realized_child_macro_while_refreshing_m():
+    parent, child = banks()
+    child[..., 5] = -3.25
+    child[..., 6] = 2.75
+    refreshed, diagnostics = refresh_transition_bank(
+        ToyMacro(1.1, 0.4),
+        parent,
+        child,
+        m_min=0.7,
+        m_max=1.3,
+        preserve_child_macro=True,
+    )
+    assert torch.equal(refreshed[..., 5:7], child[..., 5:7])
+    assert torch.allclose(refreshed[..., 7], torch.full_like(refreshed[..., 7], 1.1))
+    assert diagnostics["child_macro_source"] == (
+        "REALIZED_MARKET_CLEARING_ROOT_AND_CALCULATED_CAPITAL"
+    )
+
+
 def test_common_random_number_fingerprint_constant_across_outer():
     spec = [20261028, 2, 100, "stable_firm_identity"]
     assert stable_json_hash(spec) == stable_json_hash(spec)

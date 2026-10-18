@@ -130,8 +130,15 @@ def refresh_transition_bank(
     *,
     m_min: float,
     m_max: float,
+    preserve_child_macro: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Replace Hatcf/LnKF/M with the current macro operator on fixed shocks."""
+    """Refresh Macro values on fixed shocks.
+
+    Market-cleared full-economy banks already contain realized child clearing
+    roots and calculated capital.  Those columns must remain fixed while the
+    current SDF M is refreshed.  Legacy shock-only banks continue to use the
+    current FC1 forecasts for their child macro columns.
+    """
     if parents.shape[-1] < 7 or children.shape[-1] < 7:
         raise ValueError("transition bank must contain the seven firm state columns")
     if not m_min < m_max:
@@ -150,8 +157,9 @@ def refresh_transition_bank(
             (*children.shape[:-1], width), device=children.device, dtype=children.dtype
         )
         refreshed[..., : children.shape[-1]] = children
-        refreshed[..., 5:6] = hatc
-        refreshed[..., 6:7] = lnk
+        if not preserve_child_macro:
+            refreshed[..., 5:6] = hatc
+            refreshed[..., 6:7] = lnk
         refreshed[..., 7:8] = m
     flat = m.detach().reshape(-1).to(torch.float64)
     return refreshed, {
@@ -165,6 +173,17 @@ def refresh_transition_bank(
         "macro_input_hash": _tensor_digest([
             ("hatc", hatc), ("lnk", lnk), ("m", m)
         ]),
+        "child_macro_source": (
+            "REALIZED_MARKET_CLEARING_ROOT_AND_CALCULATED_CAPITAL"
+            if preserve_child_macro
+            else "CURRENT_FC1_FORECAST"
+        ),
+        "child_hatc_prediction_mae": float(
+            (hatc - children[..., 5:6]).abs().mean()
+        ),
+        "child_lnk_prediction_mae": float(
+            (lnk - children[..., 6:7]).abs().mean()
+        ),
     }
 
 
@@ -369,6 +388,22 @@ def _simulation_kwargs(episode: Any, transition_seed: int, entry_seed: int) -> d
         "preserve_global_rng_around_entry",
     )
     kwargs = {name: getattr(episode.hyperparams, name) for name in names}
+    market_defaults = {
+        "market_clearing_mode": "disabled",
+        "market_clearing_coarse_points": 10,
+        "market_clearing_refinement_points": 20,
+        "market_clearing_max_refinement_rounds": 4,
+        "market_clearing_support_lower": -8.0,
+        "market_clearing_support_upper": 2.0,
+        "market_clearing_support_padding": 2.0,
+        "market_clearing_residual_tolerance": 1.0e-5,
+        "market_clearing_width_tolerance": 1.0e-5,
+        "market_clearing_candidate_chunk_size": 262144,
+    }
+    kwargs.update({
+        name: getattr(episode.hyperparams, name, default)
+        for name, default in market_defaults.items()
+    })
     kwargs.update({
         "entry_rng_seed": entry_seed,
         "entry_rng_mode": "stable_economic_identity",
