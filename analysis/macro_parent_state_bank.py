@@ -304,6 +304,25 @@ def _simulation_kwargs(episode: Any, transition_seed: int, entry_seed: int) -> d
         "preserve_global_rng_around_entry",
     )
     kwargs = {name: getattr(episode.hyperparams, name) for name in names}
+    kwargs.update(
+        {
+            "aggregation_mode": getattr(
+                episode.hyperparams, "aggregation_mode", "legacy_mixed_replay"
+            ),
+            "continuum_i_points": getattr(
+                episode.hyperparams, "continuum_i_points", 9
+            ),
+            "continuum_z_points": getattr(
+                episode.hyperparams, "continuum_z_points", 7
+            ),
+            "continuum_projection_tolerance": getattr(
+                episode.hyperparams, "continuum_projection_tolerance", 1.0e-6
+            ),
+            "bp_actual_use_trace_enabled": getattr(
+                episode.hyperparams, "bp_actual_use_trace_enabled", False
+            ),
+        }
+    )
     market_defaults = {
         "market_clearing_mode": "disabled",
         "market_clearing_coarse_points": 10,
