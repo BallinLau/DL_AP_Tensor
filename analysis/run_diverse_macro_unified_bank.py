@@ -363,7 +363,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _json(out / "economic_config.json", {**AnalysisEconomicConfig.from_current_config().to_dict(), **entry_audit})
     save_provenance(out / "provenance.json", train_cfg, summary)
     _json(out / "summary.json", summary)
-    _report(ROOT / "reports/diverse_macro_unified_bank_20261018.md", summary)
+    _report(out / "reports/diverse_macro_unified_bank_20261018.md", summary)
     print(json.dumps(summary, indent=2, default=str))
     return 0
 
