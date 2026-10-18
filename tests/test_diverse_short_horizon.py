@@ -9,6 +9,7 @@ import torch
 
 from analysis.economic_config import AnalysisEconomicConfig
 from analysis.run_macro_outer_inner_pq import refresh_transition_bank
+from analysis.run_diverse_macro_unified_bank import parse_args
 from data.diverse_short_horizon import (
     DISTRIBUTION_FAMILIES,
     DiverseShortHorizonConfig,
@@ -203,9 +204,15 @@ def test_short_horizon_pair_count():
 
 
 def test_entry_mode_explicit():
-    params = SimulateTS.__init__.__annotations__
-    assert "entry_mode" in SimulateTS.__init__.__code__.co_varnames
-    assert "entry_spec_version" in SimulateTS.__init__.__code__.co_varnames
+    args = parse_args([
+        "--firm-checkpoint", "firm.pt", "--macro-checkpoint", "macro.pt",
+        "--output-dir", "output",
+    ])
+    assert args.entry_mode == "investment_compare"
+    assert args.entry_spec_version == "investment_compare_v1"
+    assert args.entry_cost_max == pytest.approx(0.5)
+    assert args.consumption_aggregation_mode == "raw"
+    assert args.node_accounting_mode == "economic_node_ledger"
 
 
 def test_grid_bp_applied_to_transition():

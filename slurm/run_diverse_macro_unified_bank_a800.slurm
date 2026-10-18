@@ -74,7 +74,7 @@ python3 -u analysis/run_diverse_macro_unified_bank.py \
   --entry-spec-version investment_compare_v1 \
   --entry-capital-ratio 0.05 \
   --entry-size-ratio 1.0 \
-  --entry-cost-max 1.0 \
+  --entry-cost-max 0.5 \
   --consumption-aggregation-mode raw \
   --node-accounting-mode economic_node_ledger \
   --bp-action-source grid

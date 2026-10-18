@@ -238,7 +238,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--entry-spec-version", default="investment_compare_v1")
     parser.add_argument("--entry-capital-ratio", type=float, default=0.05)
     parser.add_argument("--entry-size-ratio", type=float, default=1.0)
-    parser.add_argument("--entry-cost-max", type=float, default=1.0)
+    parser.add_argument("--entry-cost-max", type=float, default=0.5)
     parser.add_argument("--consumption-aggregation-mode", default="raw")
     parser.add_argument("--node-accounting-mode", default="economic_node_ledger")
     parser.add_argument("--bp-action-source", choices=("head", "grid"), default="grid")
