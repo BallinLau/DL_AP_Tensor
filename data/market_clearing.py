@@ -513,6 +513,10 @@ class MarketClearingController:
         active_left = coarse["h"][crossings[:, 0], crossings[:, 1]]
         active_right = coarse["h"][crossings[:, 0], crossings[:, 1] + 1]
         unresolved_discontinuity = torch.zeros(B, device=device, dtype=torch.bool)
+        discontinuity_bracket_count = torch.zeros(
+            B, device=device, dtype=torch.long
+        )
+        unresolved_bracket_count = torch.zeros(B, device=device, dtype=torch.long)
         alpha = torch.linspace(
             0.0,
             1.0,
@@ -569,12 +573,20 @@ class MarketClearingController:
             if sub.numel():
                 sub = sub[~small[sub[:, 0]]]
             if sub.numel() == 0:
-                unresolved_discontinuity[active_parent[~small]] = True
+                unresolved_parent = active_parent[~small]
+                unresolved_discontinuity[unresolved_parent] = True
+                unresolved_bracket_count.scatter_add_(
+                    0, unresolved_parent, torch.ones_like(unresolved_parent)
+                )
                 active_parent = torch.empty(0, device=device, dtype=torch.long)
                 break
             represented = torch.bincount(sub[:, 0], minlength=len(active_parent)) > 0
             missing = (~small) & (~represented)
-            unresolved_discontinuity[active_parent[missing]] = True
+            missing_parent = active_parent[missing]
+            unresolved_discontinuity[missing_parent] = True
+            unresolved_bracket_count.scatter_add_(
+                0, missing_parent, torch.ones_like(missing_parent)
+            )
             row = sub[:, 0]
             col = sub[:, 1]
             new_parent = active_parent[row]
@@ -599,6 +611,10 @@ class MarketClearingController:
                        != refined["default_count"][terminal_row, terminal_col + 1])
                     | (refined["entry_count"][terminal_row, terminal_col]
                        != refined["entry_count"][terminal_row, terminal_col + 1])
+                )
+                jump_parent = new_parent[terminal][jump]
+                discontinuity_bracket_count.scatter_add_(
+                    0, jump_parent, torch.ones_like(jump_parent)
                 )
                 candidate_parent.append(new_parent[terminal])
                 candidate_h.append(proposed)
@@ -628,6 +644,7 @@ class MarketClearingController:
         selected_normalized = torch.full_like(belief, float("nan"))
         selected_c = torch.full_like(belief, float("nan"))
         selected_k = torch.full_like(belief, float("nan"))
+        candidate_rejection_reasons: list[list[str]] = [[] for _ in range(B)]
         if candidate_parent:
             parents = torch.cat(candidate_parent)
             values = torch.cat(candidate_h)
@@ -665,6 +682,30 @@ class MarketClearingController:
                 verified["resource_feasible"][:, 0]
                 & (verified["G_normalized"][:, 0].abs() <= replay_tolerance)
             )
+            rejected = ~valid
+            if bool(rejected.any()):
+                rejected_positions = torch.nonzero(
+                    rejected, as_tuple=False
+                ).reshape(-1)
+                verified_finite = verified["finite"][:, 0]
+                verified_feasible = verified["resource_feasible"][:, 0]
+                for position in rejected_positions.detach().cpu().tolist():
+                    parent = int(parents[position])
+                    if not bool(verified_finite[position]):
+                        reason = "NONFINITE_CANDIDATE"
+                    elif not bool(verified_feasible[position]):
+                        reason = "ECONOMICALLY_INFEASIBLE_CANDIDATE"
+                    else:
+                        reason = "RESIDUAL_TOLERANCE_FAILED"
+                    candidate_rejection_reasons[parent].append(reason)
+
+                    # A terminal policy jump is a discontinuity only when the
+                    # proposed candidate itself is finite.  NaN/Inf candidates
+                    # retain their numerical-failure classification instead of
+                    # being relabelled as an economic discontinuity.
+                    if bool(jumps[position]) and bool(verified_finite[position]):
+                        unresolved_discontinuity[parent] = True
+                        unresolved_bracket_count[parent] += 1
             previous = state.get("market_previous_root", belief)
             for parent in range(B):
                 positions = torch.nonzero(
@@ -734,6 +775,17 @@ class MarketClearingController:
                         ),
                         "selected_branch_id": int(selected_index),
                         "root_count": len(keep),
+                        "valid_root_count": len(keep),
+                        "discontinuity_bracket_count": int(
+                            discontinuity_bracket_count[parent]
+                        ),
+                        "unresolved_bracket_count": int(
+                            unresolved_bracket_count[parent]
+                        ),
+                        "candidate_rejection_reason": list(
+                            candidate_rejection_reasons[parent]
+                        ),
+                        "terminal_status": "ROOT_FOUND",
                         "candidate_prequalified_at_internal_tolerance": bool(
                             prequalified[chosen]
                         ),
@@ -771,6 +823,17 @@ class MarketClearingController:
                         "status": status,
                         "h_belief": float(belief[parent]),
                         "bracket_count": int(bracket_count[parent]),
+                        "valid_root_count": int(root_count[parent]),
+                        "discontinuity_bracket_count": int(
+                            discontinuity_bracket_count[parent]
+                        ),
+                        "unresolved_bracket_count": int(
+                            unresolved_bracket_count[parent]
+                        ),
+                        "candidate_rejection_reason": list(
+                            candidate_rejection_reasons[parent]
+                        ),
+                        "terminal_status": status,
                         "selected_h": (
                             float(selected_h[parent])
                             if torch.isfinite(selected_h[parent]) else None
