@@ -149,6 +149,11 @@ def test_no_future_cal_leakage():
     assert not np.allclose(pairs.Hatc_cal_t, pairs.Hatc_cal_t1)
     report = transition_parity(ToyMacro(), pairs, m_min=0.7, m_max=1.3, device=torch.device("cpu"))
     assert report["semantic_input"].endswith("Hatc_cal_t,LnK_cal_t)")
+    assert report["atol_by_variable"]["M_raw"] == pytest.approx(2e-5)
+    wrong = pairs.copy()
+    wrong["Hatc_cal_t"] += 0.25
+    with pytest.raises(RuntimeError, match="transition parity failed"):
+        transition_parity(ToyMacro(), wrong, m_min=0.7, m_max=1.3, device=torch.device("cpu"))
 
 
 def test_unified_bank_serialization_roundtrip(tmp_path):

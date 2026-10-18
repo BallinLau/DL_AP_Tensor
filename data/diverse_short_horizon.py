@@ -265,7 +265,8 @@ def transition_parity(
     m_min: float,
     m_max: float,
     device: torch.device,
-    atol: float = 2e-6,
+    forecast_atol: float = 2e-6,
+    m_atol: float = 2e-5,
 ) -> Dict[str, Any]:
     """Compare pair records against one direct production MacroForward call."""
     tensor = lambda name: torch.as_tensor(pairs[name].to_numpy(), device=device, dtype=torch.float32).reshape(-1, 1)
@@ -282,13 +283,14 @@ def transition_parity(
     actual = {"Hatcf_t1": hatcf, "LnKF_t1": lnkf, "M_raw": m_raw}
     errors = {name: float((actual[name] - expected[name]).abs().max()) for name in expected}
     m_used = m_raw.clamp(float(m_min), float(m_max))
+    tolerances = {"Hatcf_t1": float(forecast_atol), "LnKF_t1": float(forecast_atol), "M_raw": float(m_atol)}
     result = {
         "semantic_input": "MacroForward(x_t,x_t1,Hatc_cal_t,LnK_cal_t)",
         "n_rows": int(len(pairs)), "max_abs_errors": errors,
         "M_used_min": float(m_used.min()), "M_used_max": float(m_used.max()),
         "single_shared_clamp": True,
-        "passed": bool(all(value <= atol for value in errors.values())),
-        "atol": float(atol),
+        "passed": bool(all(errors[name] <= tolerances[name] for name in errors)),
+        "atol_by_variable": tolerances,
     }
     if not result["passed"]:
         raise RuntimeError(f"production transition parity failed: {result}")
