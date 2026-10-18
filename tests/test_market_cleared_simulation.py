@@ -16,6 +16,7 @@ from data.market_clearing import (
     MarketClearingConfig,
     MarketClearingController,
     MarketClearingError,
+    empty_entry_candidates,
 )
 from data.simulate_ts import SimulateTS
 from data.simulate_ts_parallel import _initialize_batched_state
@@ -283,3 +284,76 @@ def test_active_path_merge_does_not_replace_production_state_tensors():
     assert torch.equal(merged["entry"], torch.zeros((2, 1)))
     assert torch.equal(merged["b"], torch.zeros((2, 1)))
     assert torch.equal(merged["market_root_found"], torch.tensor([False, True]))
+
+
+def test_prequalified_candidate_uses_public_tolerance_for_independent_replay(
+    monkeypatch,
+):
+    controller = MarketClearingController(
+        MarketClearingConfig(
+            coarse_points=3,
+            refinement_points=3,
+            max_refinement_rounds=1,
+            support_lower=-1.0,
+            support_upper=1.0,
+            residual_tolerance=1.0e-5,
+        )
+    )
+    state = {
+        "b": torch.zeros((1, 1)),
+        "hatcf": torch.zeros(1),
+        "lnkf": torch.zeros(1),
+        "alive": torch.ones((1, 1), dtype=torch.bool),
+        "transition_path_id": torch.zeros(1, dtype=torch.long),
+    }
+    candidates = empty_entry_candidates(state)
+    calls = 0
+
+    def fake_evaluate(_sim, eval_state, _candidates, h, *, detail=False):
+        nonlocal calls
+        calls += 1
+        batch, points = h.shape
+        normalized = torch.ones_like(h)
+        if calls == 1:
+            normalized[:, 1] = 4.99e-6
+        elif calls == 2:
+            normalized[:] = 5.03e-6
+        else:
+            normalized[:] = 0.0
+        result = {
+            "h": h,
+            "G": normalized.clone(),
+            "G_normalized": normalized,
+            "C_raw": torch.ones_like(h),
+            "K_total": torch.ones_like(h),
+            "resource_feasible": torch.ones_like(h, dtype=torch.bool),
+            "finite": torch.ones_like(h, dtype=torch.bool),
+            "investment_count": torch.zeros_like(h, dtype=torch.long),
+            "default_count": torch.zeros_like(h, dtype=torch.long),
+            "entry_count": torch.zeros_like(h, dtype=torch.long),
+            "firm_count": torch.ones_like(h, dtype=torch.long),
+        }
+        if detail:
+            result.update(
+                {
+                    "accepted_entry": torch.zeros(
+                        (batch, points, 0), dtype=torch.bool
+                    ),
+                    "bar_i_firm": torch.zeros((batch, points, 1)),
+                    "bar_z_firm": torch.zeros((batch, points, 1)),
+                    "bp_firm": torch.zeros((batch, points, 1)),
+                    "P0_firm": torch.zeros((batch, points, 1)),
+                    "PI_firm": torch.zeros((batch, points, 1)),
+                }
+            )
+        return result
+
+    monkeypatch.setattr(controller, "evaluate", fake_evaluate)
+    cleared = controller.clear_state(
+        SimpleNamespace(), state, candidates, t=0, branch=-1
+    )
+
+    assert bool(cleared["market_root_found"][0])
+    record = controller.root_records[-1]
+    assert record["candidate_prequalified_at_internal_tolerance"] is True
+    assert record["candidate_verification_tolerance"] == pytest.approx(1.0e-5)

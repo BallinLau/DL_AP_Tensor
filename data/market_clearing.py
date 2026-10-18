@@ -494,6 +494,7 @@ class MarketClearingController:
         candidate_h: list[torch.Tensor] = []
         candidate_round: list[torch.Tensor] = []
         candidate_jump: list[torch.Tensor] = []
+        candidate_prequalified: list[torch.Tensor] = []
         exact = torch.nonzero(
             coarse["resource_feasible"]
             & (coarse["G_normalized"].abs() <= self._root_acceptance_tolerance),
@@ -504,6 +505,9 @@ class MarketClearingController:
             candidate_h.append(coarse["h"][exact[:, 0], exact[:, 1]])
             candidate_round.append(torch.zeros(len(exact), device=device, dtype=torch.long))
             candidate_jump.append(torch.zeros(len(exact), device=device, dtype=torch.bool))
+            candidate_prequalified.append(
+                torch.ones(len(exact), device=device, dtype=torch.bool)
+            )
 
         active_parent = crossings[:, 0]
         active_left = coarse["h"][crossings[:, 0], crossings[:, 1]]
@@ -557,6 +561,9 @@ class MarketClearingController:
                     torch.full((len(rows),), round_index, device=device, dtype=torch.long)
                 )
                 candidate_jump.append(torch.zeros(len(rows), device=device, dtype=torch.bool))
+                candidate_prequalified.append(
+                    torch.ones(len(rows), device=device, dtype=torch.bool)
+                )
 
             sub = self._crossings(refined)
             if sub.numel():
@@ -604,6 +611,9 @@ class MarketClearingController:
                     )
                 )
                 candidate_jump.append(jump)
+                candidate_prequalified.append(
+                    torch.zeros(int(terminal.sum()), device=device, dtype=torch.bool)
+                )
             keep = ~terminal
             active_parent = new_parent[keep]
             active_left = new_left[keep]
@@ -623,6 +633,7 @@ class MarketClearingController:
             values = torch.cat(candidate_h)
             rounds = torch.cat(candidate_round)
             jumps = torch.cat(candidate_jump)
+            prequalified = torch.cat(candidate_prequalified)
             gathered_state = {
                 name: value.index_select(0, parents)
                 if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == B
@@ -639,12 +650,20 @@ class MarketClearingController:
                 sim, gathered_state, gathered_candidates, values[:, None], detail=True
             )
             evaluations.scatter_add_(0, parents, torch.ones_like(parents))
+            replay_tolerance = torch.where(
+                prequalified,
+                torch.full_like(
+                    verified["G_normalized"][:, 0],
+                    float(self.config.residual_tolerance),
+                ),
+                torch.full_like(
+                    verified["G_normalized"][:, 0],
+                    self._root_acceptance_tolerance,
+                ),
+            )
             valid = (
                 verified["resource_feasible"][:, 0]
-                & (
-                    verified["G_normalized"][:, 0].abs()
-                    <= self._root_acceptance_tolerance
-                )
+                & (verified["G_normalized"][:, 0].abs() <= replay_tolerance)
             )
             previous = state.get("market_previous_root", belief)
             for parent in range(B):
@@ -715,6 +734,12 @@ class MarketClearingController:
                         ),
                         "selected_branch_id": int(selected_index),
                         "root_count": len(keep),
+                        "candidate_prequalified_at_internal_tolerance": bool(
+                            prequalified[chosen]
+                        ),
+                        "candidate_verification_tolerance": float(
+                            replay_tolerance[chosen]
+                        ),
                     }
                 )
 
