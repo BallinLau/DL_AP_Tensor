@@ -139,6 +139,25 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         dtype = state["b"].dtype
         h = h.to(device=device, dtype=dtype)
         B, H = h.shape
+        # Dense boundary scans combined with all root-search h candidates can
+        # otherwise materialize an investment scan tensor above PyTorch's
+        # INT_MAX indexing limit.  Chunk only the candidate axis; every chunk
+        # still evaluates all active components and policy regions in batched
+        # GPU calls.  Accepted-root detail evaluation already has H=1.
+        if (
+            not detail
+            and H > 1
+            and self.integration.z_scan_points >= 257
+        ):
+            pieces = [
+                self.evaluate(sim, state, candidates, h[:, index : index + 1])
+                for index in range(H)
+            ]
+            names = pieces[0].keys()
+            return {
+                name: torch.cat([piece[name] for piece in pieces], dim=1)
+                for name in names
+            }
         L = int(state["b"].shape[1])
         if candidates.mask.shape[0] != B:
             raise ValueError("entry candidates do not match distribution batch")
@@ -1006,6 +1025,9 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                 "t": int(t),
                 "branch": int(branch),
                 "representation": "boundary_aware_continuum_v1",
+                "dense_candidate_h_chunk_size": (
+                    1 if self.integration.z_scan_points >= 257 else None
+                ),
                 "root_selection": "existing_coarse_to_fine_selected_record",
                 "component_mean_hard_default_used": False,
             },
@@ -1071,6 +1093,9 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                 "investment_boundary_count": int(self.investment_boundary_count),
                 "boundary_search_seconds": float(self.boundary_search_seconds),
                 "resource_integration_seconds": float(self.resource_integration_seconds),
+                "dense_candidate_h_chunk_size": (
+                    1 if self.integration.z_scan_points >= 257 else None
+                ),
                 "scan_tail_probability_mass": float(
                     self.tail_probability_mass_scanned_outside
                 ),
