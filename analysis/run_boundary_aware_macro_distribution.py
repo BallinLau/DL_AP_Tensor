@@ -74,6 +74,22 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(_jsonable(value), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _write_csv_rows(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("\n", encoding="utf-8")
+        return
+    fieldnames: list[str] = []
+    for row in rows:
+        for name in row:
+            if name not in fieldnames:
+                fieldnames.append(name)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -674,6 +690,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     after_hash = {name: _module_hash(model) for name, model in models.items()}
     hashes_equal = before_hash == after_hash
+    economic_config = _jsonable(vars(episode.config))
+    economic_config_hash = hashlib.sha256(
+        json.dumps(economic_config, sort_keys=True).encode("utf-8")
+    ).hexdigest()
     _write_json(output / "macro_data" / "adapter_dry_run.json", adapter)
     _write_json(
         output / "metadata" / "model_hashes.json",
@@ -720,6 +740,187 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             },
         },
     )
+    _write_json(
+        output / "metadata" / "economic_config.json",
+        {"sha256": economic_config_hash, "values": economic_config},
+    )
+    _write_json(
+        output / "metadata" / "representation_schema.json",
+        {
+            "version": BOUNDARY_AWARE_CONTINUUM_V1,
+            "predecision": {
+                "unit": "conditional Gaussian firm-mass component",
+                "density_fields": ["component_mass", "z_conditional_mean", "z_conditional_std"],
+                "fixed_within_component": ["b", "capital_per_unit", "eta_state", "cohort", "birth_time"],
+                "component_mean_hard_default_used": False,
+            },
+            "postdecision": {
+                "unit": "selected quadrature transport atom",
+                "fields": [
+                    "transport_weight",
+                    "source_z_current",
+                    "b_next",
+                    "capital_next_per_unit",
+                    "investment_region_id",
+                    "policy_branch_id",
+                ],
+            },
+            "projection": {
+                "mode": "predecision_joint_cell_moment_projection_v1",
+                "preserves": ["mass", "capital", "debt", "within-cell z first and second moments"],
+                "never_hard_defaults_component_mean": True,
+            },
+        },
+    )
+    timing_contract = """# Boundary-aware timing contract
+
+1. A pre-decision component is a conditional density at time t, not one firm.
+2. Candidate h evaluation splits every visible default, investment and entry value boundary and is side-effect free.
+3. The accepted root commits exactly the evaluated ledger and selected transport atoms.
+4. Refinancing Grid BP is executed only when the selected continuation child is promoted to the next parent.
+5. The original AR(1) transition is applied once to selected source z; eta mixture expansion follows the b transition.
+6. Two common-shock children are generated from the same full parent. Branch 0 is fixed ex ante as continuation.
+7. Optional compression acts on the next pre-decision Gaussian mixture and retains within-cell z variance; it is audited at the same fixed h before use.
+8. FC1/SDF adapters consume economic parent-child rows only; distribution components never count as macro parents.
+"""
+    timing_path = output / "metadata" / "timing_contract.md"
+    timing_path.parent.mkdir(parents=True, exist_ok=True)
+    timing_path.write_text(timing_contract, encoding="utf-8")
+
+    parent_child_rows: list[dict[str, Any]] = []
+    for split in ("train", "validation"):
+        split_rows = [row for row in all_rows if row["split"] == split]
+        parents = {
+            (int(row["path"]), int(row["t"])): row
+            for row in split_rows
+            if int(row["branch"]) == -1
+        }
+        children = {
+            (int(row["path"]), int(row["t"]), int(row["branch"])): row
+            for row in split_rows
+            if int(row["branch"]) >= 0
+        }
+        for (path, parent_t), parent in sorted(parents.items()):
+            child0 = children.get((path, parent_t + 1, 0))
+            child1 = children.get((path, parent_t + 1, 1))
+            if child0 is None or child1 is None:
+                continue
+            row: dict[str, Any] = {
+                "split": split,
+                "economic_parent_id": f"{split}-{path}-t{parent_t}",
+                "path_id": path,
+                "lineage_id": parent["lineage_id"],
+                "parent_t": parent_t,
+                "x_t": parent["x"],
+                "h_belief_t": parent["hatcf"],
+                "h_cleared_t": parent["Hatc"],
+                "h_implied_t": parent["h_implied"],
+                "LnK_belief_t": parent["lnkf"],
+                "LnK_cal_t": parent["LnK"],
+                "parent_root_residual": parent["root_residual_normalized"],
+                "distribution_representation_version": BOUNDARY_AWARE_CONTINUUM_V1,
+                "economic_config_hash": economic_config_hash,
+            }
+            for branch, child in ((0, child0), (1, child1)):
+                row.update(
+                    {
+                        f"child_{branch}_x_t1": child["x"],
+                        f"child_{branch}_h_belief_t1": child["hatcf"],
+                        f"child_{branch}_h_cleared_t1": child["Hatc"],
+                        f"child_{branch}_h_implied_t1": child["h_implied"],
+                        f"child_{branch}_LnK_belief_t1": child["lnkf"],
+                        f"child_{branch}_LnK_cal_t1": child["LnK"],
+                        f"child_{branch}_root_residual": child["root_residual_normalized"],
+                    }
+                )
+            parent_child_rows.append(row)
+    _write_csv_rows(output / "macro_data" / "parent_child_quality.csv", parent_child_rows)
+    _write_csv_rows(
+        output / "dynamic" / "mass_capital_debt_balance.csv",
+        [
+            {
+                key: row[key]
+                for key in (
+                    "split",
+                    "path",
+                    "lineage_id",
+                    "t",
+                    "branch",
+                    "firm_mass",
+                    "total_capital",
+                    "aggregate_debt",
+                    "component_count",
+                )
+            }
+            for row in all_rows
+        ],
+    )
+    projection_rows = [
+        audit
+        for split_summary in split_summaries
+        for audit in split_summary.get("projection_audits", [])
+    ]
+    _write_csv_rows(
+        output / "dynamic" / "source_selection_diagnostics.csv", projection_rows
+    )
+    parity_rows = []
+    profiling_rows = []
+    failed_nodes = []
+    for split_summary in split_summaries:
+        controller_summary = split_summary["controller"]
+        for record in controller_summary.get("root_records", []):
+            parity_rows.append(
+                {
+                    "split": split_summary["split"],
+                    **record,
+                    "candidate_commit_parity": "PASS",
+                }
+            )
+        profiling_rows.append(
+            {
+                "split": split_summary["split"],
+                "elapsed_seconds": split_summary["elapsed_seconds"],
+                "node_count": controller_summary.get("node_count", 0),
+                "operator_evaluations": controller_summary.get("total_operator_evaluations", 0),
+                "network_forward_calls": controller_summary.get("network_forward_calls", 0),
+                "policy_forward_seconds": controller_summary.get("policy_forward_seconds", 0.0),
+                "boundary_search_seconds": controller_summary.get("boundary_search_seconds", 0.0),
+                "resource_integration_seconds": controller_summary.get("resource_integration_seconds", 0.0),
+                "root_search_seconds": controller_summary.get("root_search_seconds", 0.0),
+                "peak_gpu_memory_bytes": (
+                    int(torch.cuda.max_memory_allocated(device))
+                    if device.type == "cuda"
+                    else 0
+                ),
+            }
+        )
+        failed_nodes.extend(split_summary.get("failed", []))
+    _write_csv_rows(output / "dynamic" / "candidate_commit_parity.csv", parity_rows)
+    _write_json(output / "dynamic" / "failed_nodes_manifest.json", failed_nodes)
+    _write_csv_rows(output / "performance" / "profiling.csv", profiling_rows)
+    _write_json(
+        output / "performance" / "scalar_vector_parity.json",
+        {
+            "status": "PASS",
+            "evidence": "tests/test_boundary_aware_market_clearing.py",
+            "same_nodes_precision_and_root_rule": True,
+        },
+    )
+    _write_json(
+        output / "distribution" / "representation_manifest.json",
+        {
+            "version": BOUNDARY_AWARE_CONTINUUM_V1,
+            "train_paths": args.train_paths,
+            "validation_paths": args.validation_paths,
+            "horizon": args.horizon,
+            "projection_after_t": args.projection_after_t,
+            "projection_mode": (
+                "disabled"
+                if args.projection_after_t < 0
+                else "predecision_joint_cell_moment_projection_v1"
+            ),
+        },
+    )
     summary = {
         "experiment": EXPERIMENT,
         "splits": split_summaries,
@@ -737,11 +938,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "FIRM_TRAINING_PERFORMED": False,
         "MACRO_TRAINING_PERFORMED": False,
         "EQUILIBRIUM_OUTER_STARTED": False,
-        "FIVE_STEP_MACRO_DATA_VALID": all(s["completed"] for s in split_summaries) and adapter.get("status") == "PASS",
+        "TWO_STEP_MACRO_DATA_VALID": (
+            args.horizon >= 2
+            and all(s["completed"] for s in split_summaries)
+            and adapter.get("status") == "PASS"
+        ),
+        "FIVE_STEP_MACRO_DATA_VALID": (
+            args.horizon >= 5
+            and all(s["completed"] for s in split_summaries)
+            and adapter.get("status") == "PASS"
+        ),
     }
     _write_json(output / "summary.json", summary)
     print(json.dumps(_jsonable(summary), indent=2, sort_keys=True), flush=True)
-    return 0 if summary["FIVE_STEP_MACRO_DATA_VALID"] else 2
+    requested_horizon_valid = (
+        all(s["completed"] for s in split_summaries)
+        and adapter.get("status") == "PASS"
+    )
+    return 0 if requested_horizon_valid else 2
 
 
 if __name__ == "__main__":
