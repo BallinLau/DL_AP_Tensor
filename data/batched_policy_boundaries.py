@@ -197,17 +197,33 @@ def interval_bounds_from_boundaries(
         raise ValueError("boundary coordinate and mask must match")
     if not lower < upper:
         raise ValueError("invalid interval support")
-    task_count, capacity = boundary_coordinate.shape
+    task_count, _capacity = boundary_coordinate.shape
     count = boundary_mask.sum(dim=1)
+    # ``locate_all_policy_boundaries`` deliberately returns a conservative
+    # padded capacity (twice the scan size).  Carrying that unused capacity
+    # into quadrature would create logical tensors of shape
+    # ``[tasks, 2 * scan_points + 1, quadrature_points]`` even when every task
+    # has only zero or one actual boundary.  At high-resolution reference
+    # audits that can exceed PyTorch's INT_MAX indexing limit without using
+    # meaningful GPU memory.  Boundaries have already been compacted to the
+    # left, so trimming to the maximum *observed* count is exact and changes no
+    # interval, weight, or policy evaluation.
+    max_count = int(count.max().item()) if count.numel() else 0
+    compact_coordinate = boundary_coordinate[:, :max_count]
+    compact_mask = boundary_mask[:, :max_count]
     left = torch.full(
-        (task_count, capacity + 1), float(lower),
+        (task_count, max_count + 1), float(lower),
         device=boundary_coordinate.device, dtype=boundary_coordinate.dtype,
     )
     right = torch.full_like(left, float(upper))
-    safe = torch.where(boundary_mask, boundary_coordinate, torch.full_like(boundary_coordinate, float(upper)))
+    safe = torch.where(
+        compact_mask,
+        compact_coordinate,
+        torch.full_like(compact_coordinate, float(upper)),
+    )
     left[:, 1:] = safe
     right[:, :-1] = safe
-    position = torch.arange(capacity + 1, device=boundary_coordinate.device)[None, :]
+    position = torch.arange(max_count + 1, device=boundary_coordinate.device)[None, :]
     interval_mask = position <= count[:, None]
     interval_mask &= right > left
     return left, right, interval_mask

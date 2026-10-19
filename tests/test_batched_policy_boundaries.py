@@ -41,8 +41,28 @@ def test_all_visible_boundaries_are_refined_in_one_active_batch():
     )
     assert mask[0].sum().item() == 4
     assert mask[1].sum().item() == 2
+    # The interval tensor carries only the maximum number of observed
+    # boundaries, not the conservative 2 * scan_points search capacity.
+    assert left.shape == right.shape == mask.shape == (2, 4)
     assert left[0, 0].item() == pytest.approx(-2.0)
     assert right[0, 3].item() == pytest.approx(2.0)
+
+
+def test_interval_padding_is_trimmed_without_changing_empty_rows():
+    boundary = torch.tensor(
+        [[0.25, float("nan"), float("nan"), float("nan")],
+         [float("nan"), float("nan"), float("nan"), float("nan")]],
+        dtype=torch.float64,
+    )
+    boundary_mask = torch.isfinite(boundary)
+    left, right, mask = interval_bounds_from_boundaries(
+        boundary, boundary_mask, lower=0.0, upper=1.0
+    )
+    assert left.shape == right.shape == mask.shape == (2, 2)
+    torch.testing.assert_close(left[0], torch.tensor([0.0, 0.25], dtype=torch.float64))
+    torch.testing.assert_close(right[0], torch.tensor([0.25, 1.0], dtype=torch.float64))
+    assert mask[0].tolist() == [True, True]
+    assert mask[1].tolist() == [True, False]
 
 
 def test_nonfinite_segment_does_not_create_false_boundary():
