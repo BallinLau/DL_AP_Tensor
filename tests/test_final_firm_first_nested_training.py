@@ -14,6 +14,7 @@ from analysis.macro_parent_state_bank import (
     MACRO_CANDIDATE_STATUS_VALID,
     build_macro_candidate_schedule,
     build_one_step_macro_dataset,
+    boundary_macro_rows,
     lock_validation_candidate_ids,
     make_boundary_candidate_initial_state,
 )
@@ -182,6 +183,27 @@ def test_b_only_initializer_changes_only_b_and_preserves_mass_capital_laws():
     )
     assert len(manifest) == 4
     assert preservation["only_b_replaced"] is True
+
+    state["hatc_belief"] = state["hatcf"].clone()
+    state["hatc_cleared"] = state["hatcf"] + 0.25
+    state["hatc_cal"] = state["hatc_cleared"].clone()
+    state["hatcf"] = state["hatc_cleared"].clone()
+    state["lnk_cal"] = state["lnkf"] + 0.5
+    ones = torch.ones(4)
+    zeros = torch.zeros(4)
+    state.update({
+        "accounting_C_raw": ones,
+        "accounting_K_total": ones,
+        "accounting_I_oper": zeros,
+        "accounting_I_entry": zeros,
+        "accounting_I_maintenance": zeros,
+        "market_root_residual": zeros,
+        "market_root_residual_normalized": zeros,
+    })
+    rows = boundary_macro_rows(state, t=0, branch=-1, split="train")
+    assert rows[0]["hatcf"] == rows[0]["Hatc"]
+    assert rows[0]["lnkf"] == rows[0]["LnK"]
+    assert rows[0]["lnk_belief"] != rows[0]["lnkf"]
 
 
 def test_partial_failure_isolation_23_valid_9_failed_and_chunk_invariant(

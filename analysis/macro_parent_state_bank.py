@@ -955,6 +955,8 @@ def boundary_macro_rows(
         h_belief = float(state.get("hatc_belief", state["hatcf"])[local])
         h_cleared = float(state["hatc_cleared"][local])
         h_firm_input = float(state["hatcf"][local])
+        lnk_belief = float(state["lnkf"][local])
+        lnk_current = float(state["lnk_cal"][local])
         candidate_id = int(path_ids[local])
         rows.append(
             {
@@ -966,9 +968,12 @@ def boundary_macro_rows(
                 "branch": int(branch),
                 "x": float(state["x"][local]),
                 "hatcf": h_firm_input,
-                "lnkf": float(state["lnkf"][local]),
+                # The FC1 pair builder consumes ``hatcf``/``lnkf``.  On a
+                # cleared node these columns must be the true current cleared
+                # state, while beliefs remain separate audit-only columns.
+                "lnkf": lnk_current,
                 "Hatc": h_cleared,
-                "LnK": float(state["lnk_cal"][local]),
+                "LnK": lnk_current,
                 "M": float(state.get("M", torch.ones_like(state["x"]))[local]),
                 "C": float(C),
                 "K": float(K),
@@ -996,6 +1001,7 @@ def boundary_macro_rows(
                     / distribution.component_mass[local].sum().clamp_min(1.0e-30)
                 ),
                 "h_belief": h_belief,
+                "lnk_belief": lnk_belief,
                 "h_selected_root": h_cleared,
                 "h_implied_from_accounting": h_implied,
                 "h_used_in_firm_policy": h_firm_input,
