@@ -321,9 +321,18 @@ def _macro_adapter_dry_run(episode: Any, rows: list[dict[str, Any]], device: tor
     )
     table = TensorTable(data=data, columns=columns)
     paired = episode._build_sdf_pairs_from_macro_tensor(table)
-    batches = episode._create_sdf_batches_from_macro_tensor(
-        paired, batch_size=max(len(rows), 1), n_branches=2
-    )
+    # The production episode can be configured to train FC1 only after t>2.
+    # A structural adapter dry-run must still validate a one-transition smoke,
+    # so temporarily select its existing two-time pairing mode.  No loss,
+    # backward pass, or optimizer step is executed.
+    original_train_mode = episode.train_mode
+    try:
+        episode.train_mode = "2time"
+        batches = episode._create_sdf_batches_from_macro_tensor(
+            paired, batch_size=max(len(rows), 1), n_branches=2
+        )
+    finally:
+        episode.train_mode = original_train_mode
     expected_pairs = sum(1 for row in rows if int(row["branch"]) >= 0)
     return {
         "status": "PASS" if len(paired.data) == expected_pairs and bool(batches) else "FAIL",
@@ -530,7 +539,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
                 writer.writeheader()
                 writer.writerows(rows)
-    adapter = _macro_adapter_dry_run(episode, all_rows, device) if all_rows else {"status": "FAIL", "reason": "no rows"}
+    adapter_by_split = {
+        split: _macro_adapter_dry_run(
+            episode,
+            [row for row in all_rows if row["split"] == split],
+            device,
+        )
+        for split in ("train", "validation")
+        if any(row["split"] == split for row in all_rows)
+    }
+    adapter = {
+        "status": (
+            "PASS"
+            if adapter_by_split
+            and all(value.get("status") == "PASS" for value in adapter_by_split.values())
+            else "FAIL"
+        ),
+        "splits": adapter_by_split,
+    }
     after_hash = {name: _module_hash(model) for name, model in models.items()}
     hashes_equal = before_hash == after_hash
     _write_json(output / "macro_data" / "adapter_dry_run.json", adapter)

@@ -780,12 +780,18 @@ class MarketClearingController:
                 x1 = new_right[terminal]
                 proposed = x0 - g0 * (x1 - x0) / (g1 - g0)
                 mass_jump = torch.zeros_like(g0, dtype=torch.bool)
-                for mass_name in ("investment_mass", "default_mass", "entry_mass"):
-                    if mass_name in refined:
-                        mass_jump |= (
-                            refined[mass_name][terminal_row, terminal_col]
-                            - refined[mass_name][terminal_row, terminal_col + 1]
-                        ).abs() > 1.0e-10
+                continuous_mass = refined.get("policy_mass_continuous")
+                policy_mass_is_continuous = (
+                    torch.is_tensor(continuous_mass)
+                    and bool(continuous_mass.to(torch.bool).all())
+                )
+                if not policy_mass_is_continuous:
+                    for mass_name in ("investment_mass", "default_mass", "entry_mass"):
+                        if mass_name in refined:
+                            mass_jump |= (
+                                refined[mass_name][terminal_row, terminal_col]
+                                - refined[mass_name][terminal_row, terminal_col + 1]
+                            ).abs() > 1.0e-10
                 jump = (
                     (refined["investment_count"][terminal_row, terminal_col]
                      != refined["investment_count"][terminal_row, terminal_col + 1])

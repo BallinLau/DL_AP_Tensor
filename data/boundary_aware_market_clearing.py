@@ -650,6 +650,12 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
             "investment_mass": shaped(investment_mass),
             "default_mass": shaped(default_mass),
             "entry_mass": shaped(entry_mass_accepted),
+            # Policy-region mass moves continuously with a refined value
+            # boundary.  A nonzero change over a finite h bracket is therefore
+            # not, by itself, a discrete policy jump.
+            "policy_mass_continuous": torch.ones(
+                (B, H), device=device, dtype=torch.bool
+            ),
         }
         if detail:
             survivor_atom_mask = (~atom_default) & (atom_weight > 0.0)
