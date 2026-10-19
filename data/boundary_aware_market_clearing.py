@@ -30,7 +30,13 @@ from .boundary_aware_distribution import (
     predecision_fingerprint_from_state,
 )
 from .entry import EntryCandidates
-from .market_clearing import MarketClearingConfig, MarketClearingController, MarketClearingError
+from .market_clearing import (
+    ECONOMIC_NODE_ACTIVE,
+    ECONOMIC_NODE_EXTINCT_AFTER_DECISION,
+    MarketClearingConfig,
+    MarketClearingController,
+    MarketClearingError,
+)
 from utils.firm_transition import apply_refinancing_policy
 
 
@@ -87,6 +93,149 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         self.tail_probability_mass_scanned_outside = 2.0 * float(
             integration.scan_tail_probability
         )
+
+    @staticmethod
+    def _empty_transport_atoms(
+        state: Dict[str, torch.Tensor],
+        *,
+        t: int,
+    ) -> PostDecisionTransportAtoms:
+        """Create a padded, zero-mass transport object for terminal paths."""
+        B = int(state["b"].shape[0])
+        device = state["b"].device
+        dtype = state["b"].dtype
+        shape = (B, 1)
+        zeros = torch.zeros(shape, device=device, dtype=dtype)
+        minus_one = torch.full(shape, -1, device=device, dtype=torch.long)
+        return PostDecisionTransportAtoms(
+            transport_weight=zeros.clone(),
+            source_z_current=zeros.clone(),
+            b_next=zeros.clone(),
+            capital_next_per_unit=torch.ones(shape, device=device, dtype=dtype),
+            atom_mask=torch.zeros(shape, device=device, dtype=torch.bool),
+            source_component_id=minus_one.clone(),
+            survival_region_id=minus_one.clone(),
+            investment_region_id=minus_one.clone(),
+            policy_branch_id=minus_one.clone(),
+            economic_node_id=minus_one.clone(),
+            source_time=torch.full(shape, int(t), device=device, dtype=torch.long),
+            destination_time=torch.full(
+                shape, int(t + 1), device=device, dtype=torch.long
+            ),
+            cohort=minus_one.clone(),
+            birth_time=minus_one.clone(),
+            maintenance_eligibility=torch.zeros(
+                shape, device=device, dtype=torch.bool
+            ),
+            origin_kind=minus_one.clone(),
+            origin_source_id=minus_one.clone(),
+        ).validate()
+
+    @staticmethod
+    def _expand_active_transport_atoms(
+        active: PostDecisionTransportAtoms,
+        *,
+        batch_size: int,
+        active_index: torch.Tensor,
+    ) -> PostDecisionTransportAtoms:
+        """Scatter a sub-batch transport record into the original path order."""
+        values: dict[str, torch.Tensor] = {}
+        for field in active.__dataclass_fields__.values():
+            name = field.name
+            value = getattr(active, name)
+            shape = (batch_size, *value.shape[1:])
+            if name == "capital_next_per_unit":
+                full = torch.ones(shape, device=value.device, dtype=value.dtype)
+            elif value.dtype == torch.bool:
+                full = torch.zeros(shape, device=value.device, dtype=value.dtype)
+            elif value.is_floating_point():
+                full = torch.zeros(shape, device=value.device, dtype=value.dtype)
+            else:
+                full = torch.full(shape, -1, device=value.device, dtype=value.dtype)
+            full.index_copy_(0, active_index, value)
+            values[name] = full
+        return PostDecisionTransportAtoms(**values).validate()
+
+    def _merge_active_paths(
+        self,
+        state: Dict[str, torch.Tensor],
+        cleared: Dict[str, torch.Tensor],
+        active_index: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Merge tensors and the immutable boundary decision/transport record."""
+        state = super()._merge_active_paths(state, cleared, active_index)
+        active_record = cleared.get("_boundary_decision_record")
+        if active_record is None:
+            raise MarketClearingError(
+                "active boundary-aware sub-batch lacks its selected decision record"
+            )
+        transport = self._expand_active_transport_atoms(
+            active_record.transport_atoms,
+            batch_size=int(state["b"].shape[0]),
+            active_index=active_index,
+        )
+        ledger = {
+            "C_raw": state["accounting_C_raw"].to(torch.float64),
+            "C_oper": state["accounting_C_oper"].to(torch.float64),
+            "K_total": state["accounting_K_total"].to(torch.float64),
+            "Y_total": state["accounting_Y_total"].to(torch.float64),
+            "I_oper_total": state["accounting_I_oper"].to(torch.float64),
+            "I_entry_total": state["accounting_I_entry"].to(torch.float64),
+            "Liquidation_total": state["accounting_Liquidation_total"].to(torch.float64),
+            "I_maintenance_total": state["accounting_I_maintenance"].to(torch.float64),
+        }
+        record = BoundaryAwareDecisionRecord(
+            predecision_fingerprint=predecision_fingerprint_from_state(state),
+            candidate_h=state["hatc_cal"].detach().clone(),
+            ledger=ledger,
+            transport_atoms=transport,
+            provenance={
+                **active_record.provenance,
+                "partial_batch_merge": True,
+                "active_path_indices": active_index.detach().cpu().tolist(),
+                "full_batch_size": int(state["b"].shape[0]),
+            },
+        ).detached()
+        state["_boundary_decision_record"] = record
+        state["_selected_transport_atoms"] = record.transport_atoms
+        return state
+
+    def _mark_fully_extinct_state(
+        self,
+        state: Dict[str, torch.Tensor],
+        *,
+        t: int,
+        branch: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Terminate a zero-mass batch while preserving its path identities."""
+        fingerprint = predecision_fingerprint_from_state(state)
+        state = super()._mark_fully_extinct_state(state, t=t, branch=branch)
+        transport = self._empty_transport_atoms(state, t=t)
+        ledger = {
+            "C_raw": state["accounting_C_raw"].to(torch.float64),
+            "C_oper": state["accounting_C_oper"].to(torch.float64),
+            "K_total": state["accounting_K_total"].to(torch.float64),
+            "Y_total": state["accounting_Y_total"].to(torch.float64),
+            "I_oper_total": state["accounting_I_oper"].to(torch.float64),
+            "I_entry_total": state["accounting_I_entry"].to(torch.float64),
+            "Liquidation_total": state["accounting_Liquidation_total"].to(torch.float64),
+            "I_maintenance_total": state["accounting_I_maintenance"].to(torch.float64),
+        }
+        record = BoundaryAwareDecisionRecord(
+            predecision_fingerprint=fingerprint,
+            candidate_h=state["hatc_cal"].detach().clone(),
+            ledger=ledger,
+            transport_atoms=transport,
+            provenance={
+                "t": int(t),
+                "branch": int(branch),
+                "representation": "boundary_aware_continuum_v1",
+                "terminal_batch": True,
+            },
+        ).detached()
+        state["_boundary_decision_record"] = record
+        state["_selected_transport_atoms"] = record.transport_atoms
+        return state
 
     @staticmethod
     def _required_distribution_fields(state: Dict[str, torch.Tensor]) -> None:
@@ -1045,6 +1194,45 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         state["accounting_Liquidation_total"] = ledger["Liquidation_total"].to(dtype)
         state["accounting_I_maintenance"] = ledger["I_maintenance_total"].to(dtype)
         state["accounting_valid"] = torch.ones(B, device=device, dtype=torch.bool)
+        state["decision_firm_mass"] = detail["firm_count"][:, 0].to(dtype)
+        state["decision_default_mass"] = detail["default_mass"][:, 0].to(dtype)
+        state["decision_investment_mass"] = detail["investment_mass"][:, 0].to(dtype)
+        state["decision_entry_accepted_mass"] = detail["entry_mass"][:, 0].to(dtype)
+        state["decision_entry_potential_mass"] = detail[
+            "entry_candidate_mass"
+        ][:, 0].sum(dim=1).to(dtype)
+        incumbent = transport.origin_kind == 0
+        entrant = transport.origin_kind == 1
+        state["decision_survival_mass"] = torch.where(
+            transport.atom_mask & incumbent,
+            transport.transport_weight,
+            torch.zeros_like(transport.transport_weight),
+        ).sum(dim=1).to(dtype)
+        state["decision_entry_transport_mass"] = torch.where(
+            transport.atom_mask & entrant,
+            transport.transport_weight,
+            torch.zeros_like(transport.transport_weight),
+        ).sum(dim=1).to(dtype)
+        state["decision_transport_mass"] = transport.total_mass().to(dtype)
+        state["decision_transport_atom_count"] = transport.atom_mask.sum(dim=1)
+        extinct_after_decision = transport.total_mass() <= 0.0
+        state["economic_node_status"] = torch.where(
+            extinct_after_decision,
+            torch.full(
+                (B,),
+                ECONOMIC_NODE_EXTINCT_AFTER_DECISION,
+                device=device,
+                dtype=torch.long,
+            ),
+            torch.full(
+                (B,), ECONOMIC_NODE_ACTIVE, device=device, dtype=torch.long
+            ),
+        )
+        # The selected current-period root/ledger remains economically defined
+        # even when its decisions leave zero continuation mass.
+        state["economic_state_defined"] = torch.ones(
+            B, device=device, dtype=torch.bool
+        )
 
     def validate_committed(
         self,
@@ -1079,9 +1267,10 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                 torch.ones_like(state["accounting_C_raw"], dtype=torch.bool),
             ).bool()
             self.candidate_commit_parity_pass_count += int(cleared.sum())
-        state["candidate_commit_parity_passed"] = torch.ones_like(
-            state["accounting_C_raw"], dtype=torch.bool
-        )
+        state["candidate_commit_parity_passed"] = state.get(
+            "accounting_valid",
+            torch.ones_like(state["accounting_C_raw"], dtype=torch.bool),
+        ).bool()
 
     def summary(self) -> dict[str, Any]:
         result = super().summary()

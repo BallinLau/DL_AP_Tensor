@@ -12,6 +12,14 @@ from data.boundary_aware_market_clearing import (
 from data.market_clearing import MarketClearingConfig, empty_entry_candidates
 from data.entry import EntryCandidates
 from data.boundary_aware_distribution import propagate_ar1_to_predecision
+from data.boundary_aware_distribution import (
+    BoundaryAwareDecisionRecord,
+    PostDecisionTransportAtoms,
+)
+from data.market_clearing import (
+    ECONOMIC_NODE_ACTIVE,
+    ECONOMIC_NODE_EXTINCT_BEFORE_NODE,
+)
 
 
 class _BoundaryPolicy(torch.nn.Module):
@@ -252,4 +260,162 @@ def test_selected_candidate_commits_same_ledger_and_transport():
     )
     assert t2.total_mass().item() == pytest.approx(50.0, abs=2e-4)
     assert t2.total_capital().item() == pytest.approx(53.5, abs=4e-4)
+
+
+def _synthetic_transport(batch_size: int) -> PostDecisionTransportAtoms:
+    shape = (batch_size, 1)
+    weight = torch.arange(1, batch_size + 1, dtype=torch.float64)[:, None]
+    zeros = torch.zeros(shape)
+    ids = torch.arange(batch_size, dtype=torch.long)[:, None]
+    return PostDecisionTransportAtoms(
+        transport_weight=weight,
+        source_z_current=zeros.clone(),
+        b_next=zeros.clone(),
+        capital_next_per_unit=torch.ones(shape),
+        atom_mask=torch.ones(shape, dtype=torch.bool),
+        source_component_id=ids.clone(),
+        survival_region_id=torch.zeros(shape, dtype=torch.long),
+        investment_region_id=torch.zeros(shape, dtype=torch.long),
+        policy_branch_id=torch.zeros(shape, dtype=torch.long),
+        economic_node_id=ids.clone(),
+        source_time=torch.ones(shape, dtype=torch.long),
+        destination_time=torch.full(shape, 2, dtype=torch.long),
+        cohort=torch.zeros(shape, dtype=torch.long),
+        birth_time=torch.full(shape, -1, dtype=torch.long),
+        maintenance_eligibility=torch.ones(shape, dtype=torch.bool),
+        origin_kind=torch.zeros(shape, dtype=torch.long),
+        origin_source_id=ids.clone(),
+    ).validate()
+
+
+def test_partial_batch_merge_scatter_all_commit_outputs_and_transport_in_order():
+    controller = BoundaryAwareMarketClearingController(
+        MarketClearingConfig(), BoundaryIntegrationConfig()
+    )
+    batch_size = 8
+    active_size = 6
+    active_index = torch.arange(active_size, dtype=torch.long)
+    state = {
+        "b": torch.zeros((batch_size, 1)),
+        "alive": torch.tensor([[True]] * active_size + [[False], [False]]),
+        "hatcf": torch.arange(batch_size, dtype=torch.float32),
+        "component_mass": torch.tensor([[1.0]] * active_size + [[0.0], [0.0]]),
+        "component_mask": torch.tensor([[True]] * active_size + [[False], [False]]),
+        "K": torch.ones((batch_size, 1)),
+        "z_conditional_mean": torch.zeros((batch_size, 1)),
+        "z_conditional_std": torch.ones((batch_size, 1)),
+        "economic_node_id_component": torch.arange(batch_size)[:, None],
+        "component_id": torch.arange(batch_size)[:, None],
+        "origin_kind": torch.zeros((batch_size, 1), dtype=torch.long),
+        "origin_source_id": torch.arange(batch_size)[:, None],
+        "origin_time": torch.zeros((batch_size, 1), dtype=torch.long),
+        "evaluation_time": torch.zeros((batch_size, 1), dtype=torch.long),
+        "cohort": torch.zeros((batch_size, 1), dtype=torch.long),
+        "birth_time": torch.full((batch_size, 1), -1, dtype=torch.long),
+        "maintenance_eligibility": torch.ones((batch_size, 1), dtype=torch.bool),
+        "eta": torch.zeros((batch_size, 1)),
+    }
+    h = torch.linspace(-1.0, -0.5, active_size)
+    accounting = torch.arange(1, active_size + 1, dtype=torch.float32)
+    ledger = {
+        "C_raw": accounting.to(torch.float64),
+        "C_oper": accounting.to(torch.float64),
+        "K_total": accounting.to(torch.float64),
+        "Y_total": accounting.to(torch.float64),
+        "I_oper_total": accounting.to(torch.float64),
+        "I_entry_total": torch.zeros(active_size, dtype=torch.float64),
+        "Liquidation_total": torch.zeros(active_size, dtype=torch.float64),
+        "I_maintenance_total": torch.zeros(active_size, dtype=torch.float64),
+    }
+    record = BoundaryAwareDecisionRecord(
+        predecision_fingerprint="six-path-reference",
+        candidate_h=h,
+        ledger=ledger,
+        transport_atoms=_synthetic_transport(active_size),
+        provenance={"test": True},
+    )
+    cleared = {
+        "hatcf": h.clone(),
+        "hatc_belief": h + 0.1,
+        "hatc_cleared": h.clone(),
+        "hatc_cal": h.clone(),
+        "lnk_cal": torch.log(accounting),
+        "market_previous_root": h.clone(),
+        "market_previous_branch_id": torch.zeros(active_size, dtype=torch.long),
+        "market_root_branch_id": torch.zeros(active_size, dtype=torch.long),
+        "market_root_branch_switch": torch.zeros(active_size, dtype=torch.bool),
+        "market_root_found": torch.ones(active_size, dtype=torch.bool),
+        "market_root_count": torch.ones(active_size, dtype=torch.long),
+        "market_root_residual": torch.zeros(active_size),
+        "market_root_residual_normalized": torch.zeros(active_size),
+        "market_root_C": accounting.clone(),
+        "market_root_K": accounting.clone(),
+        "market_root_refinement_rounds": torch.ones(active_size, dtype=torch.long),
+        "market_root_policy_jump": torch.zeros(active_size, dtype=torch.bool),
+        "market_investment_flip_vs_belief": torch.zeros(active_size),
+        "market_default_flip_vs_belief": torch.zeros(active_size),
+        "market_entry_flip_vs_belief": torch.zeros(active_size),
+        "market_root_bracket_count": torch.ones(active_size, dtype=torch.long),
+        "market_root_operator_evaluations": torch.full(
+            (active_size,), 30, dtype=torch.long
+        ),
+        "accounting_C_raw": accounting.clone(),
+        "accounting_C_oper": accounting.clone(),
+        "accounting_K_total": accounting.clone(),
+        "accounting_Y_total": accounting.clone(),
+        "accounting_I_oper": accounting.clone(),
+        "accounting_I_entry": torch.zeros(active_size),
+        "accounting_Liquidation_total": torch.zeros(active_size),
+        "accounting_I_maintenance": torch.zeros(active_size),
+        "accounting_valid": torch.ones(active_size, dtype=torch.bool),
+        "economic_node_status": torch.full(
+            (active_size,), ECONOMIC_NODE_ACTIVE, dtype=torch.long
+        ),
+        "economic_state_defined": torch.ones(active_size, dtype=torch.bool),
+        "_boundary_decision_record": record,
+    }
+
+    merged = controller._merge_active_paths(state, cleared, active_index)
+
+    torch.testing.assert_close(merged["accounting_C_raw"][:active_size], accounting)
+    assert torch.equal(merged["accounting_C_raw"][active_size:], torch.zeros(2))
+    torch.testing.assert_close(merged["hatc_cleared"][:active_size], h)
+    assert torch.isnan(merged["hatc_cleared"][active_size:]).all()
+    assert torch.equal(
+        merged["economic_node_status"],
+        torch.tensor(
+            [ECONOMIC_NODE_ACTIVE] * active_size
+            + [ECONOMIC_NODE_EXTINCT_BEFORE_NODE] * 2
+        ),
+    )
+    atoms = merged["_selected_transport_atoms"]
+    torch.testing.assert_close(
+        atoms.transport_weight[:active_size, 0],
+        torch.arange(1, active_size + 1, dtype=torch.float64),
+    )
+    assert not bool(atoms.atom_mask[active_size:].any())
+    merged["_boundary_decision_record"].assert_ledger_parity(
+        merged["_boundary_decision_record"].ledger
+    )
+
+
+def test_fully_extinct_batch_returns_explicit_terminal_without_fake_macro_state():
+    controller = BoundaryAwareMarketClearingController(
+        MarketClearingConfig(), BoundaryIntegrationConfig()
+    )
+    state = _state()
+    state["component_mass"].zero_()
+    state["firm_mass"].zero_()
+    state["component_mask"].zero_()
+    state["alive"].zero_()
+    cleared = controller.clear_state(
+        SimpleNamespace(), state, empty_entry_candidates(state), t=4, branch=0
+    )
+    controller.validate_committed(cleared, t=4, branch=0)
+    assert int(cleared["economic_node_status"][0]) == ECONOMIC_NODE_EXTINCT_BEFORE_NODE
+    assert not bool(cleared["economic_state_defined"][0])
+    assert torch.isnan(cleared["hatc_cleared"][0])
+    assert torch.isnan(cleared["lnk_cal"][0])
+    assert float(cleared["accounting_C_raw"][0]) == 0.0
+    assert not bool(cleared["_selected_transport_atoms"].atom_mask.any())
 

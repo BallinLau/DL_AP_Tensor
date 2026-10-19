@@ -33,6 +33,22 @@ MARKET_CLEARING_DISABLED = "disabled"
 MARKET_CLEARING_V1 = "market_cleared_experimental_v1"
 ROOT_ACCEPTANCE_SAFETY_FACTOR = 0.5
 
+# Per-path lifecycle codes.  These are tensors (rather than Python strings) so
+# they survive GPU sub-batching without introducing device synchronizations.
+# Human-readable labels are emitted only by the diagnostic/output layer.
+ECONOMIC_NODE_ACTIVE = 0
+ECONOMIC_NODE_EXTINCT_BEFORE_NODE = 1
+ECONOMIC_NODE_EXTINCT_AFTER_DECISION = 2
+ECONOMIC_NODE_NO_VALID_CLEARING_ROOT = 3
+ECONOMIC_NODE_NUMERICAL_MASS_LOSS = 4
+ECONOMIC_NODE_STATUS_LABELS = {
+    ECONOMIC_NODE_ACTIVE: "ACTIVE_NODE",
+    ECONOMIC_NODE_EXTINCT_BEFORE_NODE: "EXTINCT_BEFORE_NODE",
+    ECONOMIC_NODE_EXTINCT_AFTER_DECISION: "EXTINCT_AFTER_DECISION",
+    ECONOMIC_NODE_NO_VALID_CLEARING_ROOT: "NO_VALID_CLEARING_ROOT",
+    ECONOMIC_NODE_NUMERICAL_MASS_LOSS: "NUMERICAL_MASS_LOSS",
+}
+
 
 class MarketClearingError(RuntimeError):
     """Raised when strict experimental market clearing cannot commit a node."""
@@ -542,18 +558,25 @@ class MarketClearingController:
         batch_size = int(state["b"].shape[0])
         active_size = int(active_index.numel())
         undefined_float = {
+            "hatcf",
             "hatc_cleared",
+            "hatc_cal",
+            "lnk_cal",
             "market_root_residual",
             "market_root_residual_normalized",
             "market_root_C",
             "market_root_K",
+            "market_committed_residual",
+            "market_committed_residual_normalized",
         }
         minus_one_integer = {"market_root_refinement_rounds"}
         belief = state["hatcf"].detach().clone()
-        root_output_fields = (
+        root_output_fields = {
             "hatcf",
             "hatc_belief",
             "hatc_cleared",
+            "hatc_cal",
+            "lnk_cal",
             "market_previous_root",
             "market_previous_branch_id",
             "market_root_branch_id",
@@ -571,13 +594,53 @@ class MarketClearingController:
             "market_entry_flip_vs_belief",
             "market_root_bracket_count",
             "market_root_operator_evaluations",
+            "market_committed_residual",
+            "market_committed_residual_normalized",
+            "candidate_commit_parity_passed",
+            "economic_node_status",
+            "economic_state_defined",
+            "decision_record_valid",
+        }
+        output_prefixes = (
+            "accounting_",
+            "decision_",
+            "pending_entry_",
         )
 
-        for name in root_output_fields:
-            value = cleared[name]
+        # Inactive rows are terminal economic paths.  Accounting flows are
+        # physically zero, while market states that never existed are NaN.
+        # This prevents an extinct lineage from silently inheriting a finite
+        # Hatc/LnK value from the previous node.
+        default_status = torch.full(
+            (batch_size,),
+            ECONOMIC_NODE_EXTINCT_BEFORE_NODE,
+            device=active_index.device,
+            dtype=torch.long,
+        )
+        state["economic_node_status"] = default_status
+        state["economic_state_defined"] = torch.zeros(
+            batch_size, device=active_index.device, dtype=torch.bool
+        )
+
+        for name, value in cleared.items():
+            if not torch.is_tensor(value) or value.ndim == 0:
+                continue
+            if int(value.shape[0]) != active_size:
+                continue
+            if name not in root_output_fields and not name.startswith(output_prefixes):
+                continue
 
             existing = state.get(name)
+            preserve_existing = name in {
+                "hatc_belief",
+                "market_previous_root",
+                "market_previous_branch_id",
+                "economic_node_status",
+                "economic_state_defined",
+            }
             if (
+                preserve_existing
+                and
                 torch.is_tensor(existing)
                 and existing.ndim == value.ndim
                 and int(existing.shape[0]) == batch_size
@@ -604,10 +667,80 @@ class MarketClearingController:
                         device=value.device,
                         dtype=value.dtype,
                     )
+                elif name.startswith("accounting_") and value.is_floating_point():
+                    full = torch.zeros(shape, device=value.device, dtype=value.dtype)
                 else:
                     full = torch.zeros(shape, device=value.device, dtype=value.dtype)
             full.index_copy_(0, active_index, value)
             state[name] = full
+        return state
+
+    @staticmethod
+    def _mark_fully_extinct_state(
+        state: Dict[str, torch.Tensor],
+        *,
+        t: int,
+        branch: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Return an explicit terminal batch without fabricating a macro node."""
+        del t, branch
+        B = int(state["b"].shape[0])
+        device = state["b"].device
+        dtype = state["b"].dtype
+        float_nan = torch.full((B,), float("nan"), device=device, dtype=dtype)
+        zeros = torch.zeros(B, device=device, dtype=dtype)
+        false = torch.zeros(B, device=device, dtype=torch.bool)
+        state.update(
+            {
+                "hatcf": float_nan.clone(),
+                "hatc_belief": float_nan.clone(),
+                "hatc_cleared": float_nan.clone(),
+                "hatc_cal": float_nan.clone(),
+                "lnk_cal": float_nan.clone(),
+                "market_root_found": false.clone(),
+                "market_root_count": torch.zeros(B, device=device, dtype=torch.long),
+                "market_root_residual": float_nan.clone(),
+                "market_root_residual_normalized": float_nan.clone(),
+                "market_root_C": float_nan.clone(),
+                "market_root_K": float_nan.clone(),
+                "market_root_refinement_rounds": torch.full(
+                    (B,), -1, device=device, dtype=torch.long
+                ),
+                "market_root_policy_jump": false.clone(),
+                "market_root_bracket_count": torch.zeros(B, device=device, dtype=torch.long),
+                "market_root_operator_evaluations": torch.zeros(
+                    B, device=device, dtype=torch.long
+                ),
+                "accounting_C_raw": zeros.clone(),
+                "accounting_C_oper": zeros.clone(),
+                "accounting_K_total": zeros.clone(),
+                "accounting_Y_total": zeros.clone(),
+                "accounting_I_oper": zeros.clone(),
+                "accounting_I_entry": zeros.clone(),
+                "accounting_Liquidation_total": zeros.clone(),
+                "accounting_I_maintenance": zeros.clone(),
+                "accounting_valid": false.clone(),
+                "decision_firm_mass": zeros.clone(),
+                "decision_default_mass": zeros.clone(),
+                "decision_investment_mass": zeros.clone(),
+                "decision_entry_accepted_mass": zeros.clone(),
+                "decision_entry_potential_mass": zeros.clone(),
+                "decision_survival_mass": zeros.clone(),
+                "decision_entry_transport_mass": zeros.clone(),
+                "decision_transport_mass": zeros.clone(),
+                "decision_transport_atom_count": torch.zeros(
+                    B, device=device, dtype=torch.long
+                ),
+                "candidate_commit_parity_passed": false.clone(),
+                "economic_node_status": torch.full(
+                    (B,),
+                    ECONOMIC_NODE_EXTINCT_BEFORE_NODE,
+                    device=device,
+                    dtype=torch.long,
+                ),
+                "economic_state_defined": false.clone(),
+            }
+        )
         return state
 
     @torch.inference_mode()
@@ -629,10 +762,7 @@ class MarketClearingController:
         if not bool(active.all()):
             active_index = torch.nonzero(active, as_tuple=False).reshape(-1)
             if active_index.numel() == 0:
-                raise MarketClearingError(
-                    "strict market clearing received a batch with no active "
-                    f"economic node; t={t}, branch={branch}"
-                )
+                return self._mark_fully_extinct_state(state, t=t, branch=branch)
             active_state = {
                 name: value.index_select(0, active_index)
                 if (
@@ -1054,6 +1184,12 @@ class MarketClearingController:
         root_detail = self.evaluate(
             sim, state, candidates, selected_h[:, None], detail=True
         )
+        state["economic_node_status"] = torch.full(
+            (B,), ECONOMIC_NODE_ACTIVE, device=device, dtype=torch.long
+        )
+        state["economic_state_defined"] = torch.ones(
+            B, device=device, dtype=torch.bool
+        )
         self._commit_selected_decision_record(
             sim,
             state,
@@ -1150,6 +1286,10 @@ class MarketClearingController:
             "market_root_found",
             torch.ones_like(normalized, dtype=torch.bool),
         ).bool()
+        accounting_valid = state.get(
+            "accounting_valid", torch.ones_like(cleared, dtype=torch.bool)
+        ).bool()
+        cleared = cleared & accounting_valid
         invalid = cleared & (
             ~torch.isfinite(normalized)
             | (C <= 0.0)
