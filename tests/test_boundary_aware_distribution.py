@@ -211,3 +211,21 @@ def test_next_eta_is_enumerated_after_b_transition_without_changing_mass():
         distribution.b[:, 0::2], distribution.b[:, 1::2], atol=0, rtol=0
     )
 
+
+def test_fp64_mass_does_not_promote_firm_network_state_dtype():
+    atoms = _toy_transport_atoms(points=8)
+    atoms = PostDecisionTransportAtoms(
+        **{
+            **atoms.state_dict(),
+            "b_next": atoms.b_next.float(),
+            "capital_next_per_unit": atoms.capital_next_per_unit.float(),
+            "source_z_current": atoms.source_z_current.float(),
+        }
+    ).validate()
+    distribution = propagate_ar1_with_eta_mixture(
+        atoms, rho_z=0.8, sigma_z=0.1, z_bar=0.0, zeta=0.2
+    )
+    assert distribution.component_mass.dtype == torch.float64
+    assert distribution.b.dtype == torch.float32
+    assert distribution.eta_state.dtype == torch.float32
+

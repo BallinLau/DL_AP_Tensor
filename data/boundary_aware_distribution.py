@@ -462,7 +462,7 @@ def propagate_ar1_with_eta_mixture(
     eta = torch.tensor(
         [0.0, 1.0],
         device=base.component_mass.device,
-        dtype=base.component_mass.dtype,
+        dtype=base.b.dtype,
     )[None, None, :].expand(base.batch_size, base.capacity, 2).reshape(
         base.batch_size, 2 * base.capacity
     )
