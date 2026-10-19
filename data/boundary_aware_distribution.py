@@ -518,3 +518,245 @@ def exact_merge_key(distribution: PreDecisionDistribution) -> Sequence[str]:
     distribution.validate()
     return tuple(field.name for field in fields(distribution) if field.name != "component_mass")
 
+
+def conservative_project_transport_atoms(
+    atoms: PostDecisionTransportAtoms,
+    *,
+    b_points: int,
+    capital_points: int,
+    output_points: int,
+) -> tuple[PostDecisionTransportAtoms, Dict[str, torch.Tensor | int | str]]:
+    """Project selected source atoms by nonnegative trilinear interpolation.
+
+    Coordinates are ``b``, capital per unit ``k`` and output productivity
+    ``u=exp(z_source)``.  Tensor-product linear interpolation preserves, atom
+    by atom, mass, ``mass*k``, ``mass*b*k`` and ``mass*u*k``.  Projection is
+    performed only after a policy/root is committed; it is never part of a
+    candidate h evaluation.
+
+    Discrete origin, cohort, birth and investment-region attributes are kept
+    in separate grids.  This is a declared approximation to the remaining
+    within-cell joint distribution, not an exact merge.
+    """
+    atoms.validate()
+    if min(int(b_points), int(capital_points), int(output_points)) < 2:
+        raise ValueError("conservative projection grids need at least two points")
+    device = atoms.transport_weight.device
+    dtype = atoms.b_next.dtype
+    batch_size = int(atoms.transport_weight.shape[0])
+    output_by_name: Dict[str, list[torch.Tensor]] = {
+        field.name: [] for field in fields(atoms) if field.name != "atom_mask"
+    }
+    output_path: list[torch.Tensor] = []
+    input_count = int(atoms.atom_mask.sum())
+
+    def grid_and_coordinates(value: torch.Tensor, points: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        lower = value.min()
+        upper = value.max()
+        if bool((upper - lower).abs() <= torch.finfo(value.dtype).eps * 16):
+            grid = torch.linspace(
+                lower - 0.5,
+                lower + 0.5,
+                points,
+                device=device,
+                dtype=value.dtype,
+            )
+            low = torch.full_like(value, points // 2 - 1, dtype=torch.long)
+            alpha = torch.full_like(value, 0.5)
+            # Recenter the bracketing pair exactly on the constant value.
+            grid[points // 2 - 1] = lower
+            grid[points // 2] = lower
+            alpha.zero_()
+            return grid, low, alpha
+        grid = torch.linspace(lower, upper, points, device=device, dtype=value.dtype)
+        low = torch.searchsorted(grid, value, right=True) - 1
+        low = low.clamp(0, points - 2)
+        left = grid[low]
+        right = grid[low + 1]
+        alpha = (value - left) / (right - left).clamp_min(torch.finfo(value.dtype).tiny)
+        return grid, low, alpha.clamp(0.0, 1.0)
+
+    for path in range(batch_size):
+        active = atoms.atom_mask[path] & (atoms.transport_weight[path] > 0.0)
+        position = torch.nonzero(active, as_tuple=False).reshape(-1)
+        if position.numel() == 0:
+            continue
+        discrete = torch.stack(
+            (
+                atoms.origin_kind[path, position],
+                atoms.cohort[path, position],
+                atoms.birth_time[path, position],
+                atoms.investment_region_id[path, position],
+            ),
+            dim=1,
+        )
+        unique_group, inverse = torch.unique(discrete, dim=0, return_inverse=True)
+        for group_index in range(int(unique_group.shape[0])):
+            group_position = position[inverse == group_index]
+            weight = atoms.transport_weight[path, group_position]
+            b = atoms.b_next[path, group_position]
+            capital = atoms.capital_next_per_unit[path, group_position]
+            productivity = torch.exp(atoms.source_z_current[path, group_position])
+            b_grid, b_low, b_alpha = grid_and_coordinates(b, int(b_points))
+            k_grid, k_low, k_alpha = grid_and_coordinates(capital, int(capital_points))
+            u_grid, u_low, u_alpha = grid_and_coordinates(productivity, int(output_points))
+            corner = torch.arange(8, device=device, dtype=torch.long)
+            choose_b = ((corner >> 2) & 1).to(torch.bool)
+            choose_k = ((corner >> 1) & 1).to(torch.bool)
+            choose_u = (corner & 1).to(torch.bool)
+            ib = b_low[:, None] + choose_b.to(torch.long)[None, :]
+            ik = k_low[:, None] + choose_k.to(torch.long)[None, :]
+            iu = u_low[:, None] + choose_u.to(torch.long)[None, :]
+            wb = torch.where(choose_b[None, :], b_alpha[:, None], 1.0 - b_alpha[:, None])
+            wk = torch.where(choose_k[None, :], k_alpha[:, None], 1.0 - k_alpha[:, None])
+            wu = torch.where(choose_u[None, :], u_alpha[:, None], 1.0 - u_alpha[:, None])
+            corner_weight = weight[:, None] * wb.to(weight.dtype) * wk.to(weight.dtype) * wu.to(weight.dtype)
+            cell = (
+                ib * (int(capital_points) * int(output_points))
+                + ik * int(output_points)
+                + iu
+            ).reshape(-1)
+            cell_weight = torch.zeros(
+                int(b_points) * int(capital_points) * int(output_points),
+                device=device,
+                dtype=weight.dtype,
+            )
+            cell_weight.index_add_(0, cell, corner_weight.reshape(-1))
+            occupied = torch.nonzero(cell_weight > 0.0, as_tuple=False).reshape(-1)
+            if occupied.numel() == 0:
+                continue
+            ib_out = torch.div(
+                occupied,
+                int(capital_points) * int(output_points),
+                rounding_mode="floor",
+            )
+            remainder = occupied % (int(capital_points) * int(output_points))
+            ik_out = torch.div(remainder, int(output_points), rounding_mode="floor")
+            iu_out = remainder % int(output_points)
+            count = int(occupied.numel())
+            exemplar = group_position[0]
+            output_path.append(torch.full((count,), path, device=device, dtype=torch.long))
+            output_by_name["transport_weight"].append(cell_weight[occupied])
+            output_by_name["source_z_current"].append(torch.log(u_grid[iu_out].clamp_min(1e-30)))
+            output_by_name["b_next"].append(b_grid[ib_out])
+            output_by_name["capital_next_per_unit"].append(k_grid[ik_out])
+            output_by_name["source_component_id"].append(occupied.to(torch.long))
+            for name in (
+                "survival_region_id",
+                "investment_region_id",
+                "policy_branch_id",
+                "economic_node_id",
+                "source_time",
+                "destination_time",
+                "cohort",
+                "birth_time",
+                "maintenance_eligibility",
+                "origin_kind",
+                "origin_source_id",
+            ):
+                value = getattr(atoms, name)[path, exemplar]
+                output_by_name[name].append(value.expand(count).clone())
+
+    if output_path:
+        flat_path = torch.cat(output_path)
+        flat = {name: torch.cat(parts) for name, parts in output_by_name.items()}
+    else:
+        flat_path = torch.empty(0, device=device, dtype=torch.long)
+        flat = {}
+        for field in fields(atoms):
+            if field.name == "atom_mask":
+                continue
+            source = getattr(atoms, field.name)
+            flat[field.name] = source.new_empty((0,))
+    counts = torch.bincount(flat_path, minlength=batch_size)
+    capacity = max(int(counts.max().item()) if counts.numel() else 0, 1)
+    order = torch.argsort(
+        flat_path * (flat_path.numel() + 1)
+        + torch.arange(flat_path.numel(), device=device)
+    ) if flat_path.numel() else flat_path
+    sorted_path = flat_path[order] if flat_path.numel() else flat_path
+    if flat_path.numel():
+        change = torch.ones_like(sorted_path, dtype=torch.bool)
+        change[1:] = sorted_path[1:] != sorted_path[:-1]
+        starts = torch.nonzero(change, as_tuple=False).reshape(-1)
+        lengths = torch.diff(
+            torch.cat((starts, torch.tensor([flat_path.numel()], device=device)))
+        )
+        rank = torch.arange(flat_path.numel(), device=device) - torch.repeat_interleave(starts, lengths)
+    else:
+        rank = flat_path
+    packed: Dict[str, torch.Tensor] = {}
+    for name, value in flat.items():
+        fill_value: float | int | bool
+        if name == "capital_next_per_unit":
+            fill_value = 1.0
+        elif value.dtype == torch.bool:
+            fill_value = False
+        elif value.dtype.is_floating_point:
+            fill_value = 0.0
+        else:
+            fill_value = -1
+        output = torch.full(
+            (batch_size, capacity), fill_value, device=device, dtype=value.dtype
+        )
+        if flat_path.numel():
+            output[sorted_path, rank] = value[order]
+        packed[name] = output
+    packed["atom_mask"] = (
+        torch.arange(capacity, device=device)[None, :] < counts[:, None]
+    )
+    projected = PostDecisionTransportAtoms(**packed).validate()
+    mass_before = atoms.total_mass()
+    capital_before = atoms.total_capital()
+    debt_before = atoms.aggregate_debt()
+    output_before = torch.where(
+        atoms.atom_mask,
+        atoms.transport_weight
+        * atoms.capital_next_per_unit
+        * torch.exp(atoms.source_z_current),
+        torch.zeros_like(atoms.transport_weight),
+    ).sum(dim=1)
+    mass_after = projected.total_mass()
+    capital_after = projected.total_capital()
+    debt_after = projected.aggregate_debt()
+    output_after = torch.where(
+        projected.atom_mask,
+        projected.transport_weight
+        * projected.capital_next_per_unit
+        * torch.exp(projected.source_z_current),
+        torch.zeros_like(projected.transport_weight),
+    ).sum(dim=1)
+    scales = torch.stack(
+        (
+            mass_before.abs().clamp_min(1e-30),
+            capital_before.abs().clamp_min(1e-30),
+            debt_before.abs().clamp_min(1e-30),
+            output_before.abs().clamp_min(1e-30),
+        ),
+        dim=1,
+    )
+    error = torch.stack(
+        (
+            (mass_after - mass_before).abs(),
+            (capital_after - capital_before).abs(),
+            (debt_after - debt_before).abs(),
+            (output_after - output_before).abs(),
+        ),
+        dim=1,
+    ) / scales
+    audit: Dict[str, torch.Tensor | int | str] = {
+        "mode": "source_atom_conservative_projection_v1",
+        "input_atom_count": input_count,
+        "output_atom_count": int(projected.atom_mask.sum()),
+        "mass_before": mass_before,
+        "mass_after": mass_after,
+        "capital_before": capital_before,
+        "capital_after": capital_after,
+        "debt_before": debt_before,
+        "debt_after": debt_after,
+        "output_proxy_before": output_before,
+        "output_proxy_after": output_after,
+        "max_balance_relative_error": error.max(),
+    }
+    return projected, audit
+

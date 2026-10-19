@@ -32,7 +32,9 @@ from analysis.macro_parent_state_bank import _allowed_simulation_models, _simula
 from analysis.run_consistent_aggregation_diagnostics import _load_base_args
 from data.boundary_aware_distribution import (
     BOUNDARY_AWARE_CONTINUUM_V1,
+    BoundaryAwareDecisionRecord,
     PreDecisionDistribution,
+    conservative_project_transport_atoms,
     gaussian_mixture_moments,
     propagate_ar1_with_eta_mixture,
 )
@@ -358,6 +360,10 @@ def _run_split(
     device: torch.device,
     integration: BoundaryIntegrationConfig,
     root_config: MarketClearingConfig,
+    projection_after_t: int,
+    projection_b_points: int,
+    projection_k_points: int,
+    projection_u_points: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     sim = SimulateTS(
         models=_allowed_simulation_models(models),
@@ -376,6 +382,7 @@ def _run_split(
     rows: list[dict[str, Any]] = []
     component_rows: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    projection_audits: list[dict[str, Any]] = []
     distribution_dir = output / "distribution" / split
     distribution_dir.mkdir(parents=True, exist_ok=True)
     torch.save(_distribution_from_state(state).state_dict(), distribution_dir / "predecision_components_t0.pt")
@@ -391,6 +398,77 @@ def _run_split(
             distribution_dir / "transport_atoms_t0.pt",
         )
         for t in range(horizon):
+            if projection_after_t >= 0 and t >= projection_after_t:
+                old_record = state["_boundary_decision_record"]
+                projected, audit = conservative_project_transport_atoms(
+                    old_record.transport_atoms,
+                    b_points=projection_b_points,
+                    capital_points=projection_k_points,
+                    output_points=projection_u_points,
+                )
+                audit_row = {
+                    "split": split,
+                    "t": int(t),
+                    **_jsonable(audit),
+                }
+                projection_audits.append(audit_row)
+                if float(audit["max_balance_relative_error"]) > 1.0e-8:
+                    raise RuntimeError(
+                        "source-atom projection failed accounting preservation: "
+                        f"t={t}, error={float(audit['max_balance_relative_error'])}"
+                    )
+                projected_record = BoundaryAwareDecisionRecord(
+                    predecision_fingerprint=old_record.predecision_fingerprint,
+                    candidate_h=old_record.candidate_h,
+                    ledger=old_record.ledger,
+                    transport_atoms=projected,
+                    provenance={
+                        **old_record.provenance,
+                        "transport_projection": "source_atom_conservative_projection_v1",
+                    },
+                ).detached()
+                # Compare exact and projected next distributions at the same
+                # branch-0 macro shock and the same frozen h.  This is an
+                # operator approximation audit, not a comparison at two
+                # separately optimized roots.
+                exact_parent = dict(state)
+                projected_parent = dict(state)
+                projected_parent["_boundary_decision_record"] = projected_record
+                exact_child = _child_state(
+                    sim, exact_parent, child_t=t + 1, branch=0
+                )
+                projected_child = _child_state(
+                    sim, projected_parent, child_t=t + 1, branch=0
+                )
+                projection_entry = _entry_descriptor(
+                    sim, _distribution_from_state(state)
+                )
+                fixed_h = exact_child["hatcf"][:, None]
+                exact_operator = controller.evaluate(
+                    sim, exact_child, projection_entry, fixed_h
+                )
+                projected_operator = controller.evaluate(
+                    sim, projected_child, projection_entry, fixed_h
+                )
+                for path in range(paths):
+                    for name in (
+                        "C_raw",
+                        "K_total",
+                        "G",
+                        "default_mass",
+                        "investment_mass",
+                        "entry_mass",
+                    ):
+                        exact_value = exact_operator[name][path, 0].to(torch.float64)
+                        projected_value = projected_operator[name][path, 0].to(torch.float64)
+                        scale = exact_value.abs().clamp_min(1.0)
+                        audit_row[f"fixed_h_{name}_exact_path{path}"] = float(exact_value)
+                        audit_row[f"fixed_h_{name}_projected_path{path}"] = float(projected_value)
+                        audit_row[f"fixed_h_{name}_relative_error_path{path}"] = float(
+                            (projected_value - exact_value).abs() / scale
+                        )
+                state["_boundary_decision_record"] = projected_record
+                state["_selected_transport_atoms"] = projected_record.transport_atoms
             parent_distribution = _distribution_from_state(state)
             entry = _entry_descriptor(sim, parent_distribution)
             children: list[Dict[str, torch.Tensor]] = []
@@ -411,6 +489,14 @@ def _run_split(
             controller._commit_selected_decision_record(
                 sim, state, entry, state["hatc_cleared"], detail, t=t + 1, branch=-1
             )
+            # The selected branch-zero child is also the parent of the next
+            # transition.  Production macro pairing identifies parents by
+            # branch=-1, so write that parent view explicitly.  The child row
+            # remains in the table as the realized outcome of the preceding
+            # transition; the two rows have different time semantics even
+            # though they share the same cleared economic state.
+            if t + 1 < horizon:
+                rows.extend(_node_rows(state, t=t + 1, branch=-1, split=split))
             if t < 2:
                 torch.save(
                     _distribution_from_state(state).state_dict(),
@@ -449,6 +535,10 @@ def _run_split(
         )
         writer.writeheader()
         writer.writerows(component_rows)
+    _write_json(
+        output / "dynamic" / f"source_projection_audit_{split}.json",
+        projection_audits,
+    )
     return rows, {
         "split": split,
         "completed": not failed,
@@ -456,6 +546,8 @@ def _run_split(
         "rows": len(rows),
         "failed": failed,
         "controller": controller.summary(),
+        "projection_enabled": projection_after_t >= 0,
+        "projection_audits": projection_audits,
     }
 
 
@@ -474,6 +566,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--z-quadrature-points", type=int, default=2)
     parser.add_argument("--i-scan-points", type=int, default=33)
     parser.add_argument("--i-quadrature-points", type=int, default=2)
+    parser.add_argument(
+        "--projection-after-t",
+        type=int,
+        default=-1,
+        help="-1 disables lossy projection; nonnegative values enable it only after committed policies",
+    )
+    parser.add_argument("--projection-b-points", type=int, default=6)
+    parser.add_argument("--projection-k-points", type=int, default=6)
+    parser.add_argument("--projection-u-points", type=int, default=12)
     return parser.parse_args(argv)
 
 
@@ -529,6 +630,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             device=device,
             integration=integration,
             root_config=root_config,
+            projection_after_t=args.projection_after_t,
+            projection_b_points=args.projection_b_points,
+            projection_k_points=args.projection_k_points,
+            projection_u_points=args.projection_u_points,
         )
         all_rows.extend(rows)
         split_summaries.append(summary)
@@ -585,6 +690,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "branches": 2,
             "firms_per_path": args.firms,
             "integration": _jsonable(integration.__dict__),
+            "projection_after_t": args.projection_after_t,
+            "projection_grid": {
+                "b_points": args.projection_b_points,
+                "capital_points": args.projection_k_points,
+                "output_points": args.projection_u_points,
+            },
         },
     )
     summary = {

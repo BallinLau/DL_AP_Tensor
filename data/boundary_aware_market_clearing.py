@@ -83,6 +83,7 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         self.resource_integration_seconds = 0.0
         self.default_boundary_count = 0
         self.investment_boundary_count = 0
+        self._validated_boundary_records: set[tuple[str, bytes]] = set()
         self.tail_probability_mass_scanned_outside = 2.0 * float(
             integration.scan_tail_probability
         )
@@ -1022,6 +1023,20 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
             "I_maintenance_total": state["accounting_I_maintenance"].to(torch.float64),
         }
         record.assert_ledger_parity(committed, atol=5e-6, rtol=5e-6)
+        validation_key = (
+            record.predecision_fingerprint,
+            record.candidate_h.detach().to(device="cpu").contiguous().numpy().tobytes(),
+        )
+        if validation_key not in self._validated_boundary_records:
+            self._validated_boundary_records.add(validation_key)
+            cleared = state.get(
+                "market_root_found",
+                torch.ones_like(state["accounting_C_raw"], dtype=torch.bool),
+            ).bool()
+            self.candidate_commit_parity_pass_count += int(cleared.sum())
+        state["candidate_commit_parity_passed"] = torch.ones_like(
+            state["accounting_C_raw"], dtype=torch.bool
+        )
 
     def summary(self) -> dict[str, Any]:
         result = super().summary()

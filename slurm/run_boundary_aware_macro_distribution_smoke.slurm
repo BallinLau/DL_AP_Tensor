@@ -26,6 +26,10 @@ Z_SCAN_POINTS="${Z_SCAN_POINTS:-17}"
 Z_QUADRATURE_POINTS="${Z_QUADRATURE_POINTS:-2}"
 I_SCAN_POINTS="${I_SCAN_POINTS:-9}"
 I_QUADRATURE_POINTS="${I_QUADRATURE_POINTS:-2}"
+PROJECTION_AFTER_T="${PROJECTION_AFTER_T:--1}"
+PROJECTION_B_POINTS="${PROJECTION_B_POINTS:-6}"
+PROJECTION_K_POINTS="${PROJECTION_K_POINTS:-6}"
+PROJECTION_U_POINTS="${PROJECTION_U_POINTS:-12}"
 
 mkdir -p "$(dirname "$OUTPUT_DIR")/logs" "$OUTPUT_DIR" /home/fit/zhuyingz/WORK/LiuHao/.mplcache
 cd "$REPO_DIR"
@@ -56,5 +60,9 @@ python3 analysis/run_boundary_aware_macro_distribution.py \
   --z-scan-points "$Z_SCAN_POINTS" \
   --z-quadrature-points "$Z_QUADRATURE_POINTS" \
   --i-scan-points "$I_SCAN_POINTS" \
-  --i-quadrature-points "$I_QUADRATURE_POINTS"
+  --i-quadrature-points "$I_QUADRATURE_POINTS" \
+  --projection-after-t "$PROJECTION_AFTER_T" \
+  --projection-b-points "$PROJECTION_B_POINTS" \
+  --projection-k-points "$PROJECTION_K_POINTS" \
+  --projection-u-points "$PROJECTION_U_POINTS"
 

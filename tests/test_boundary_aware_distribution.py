@@ -14,6 +14,7 @@ from data.boundary_aware_distribution import (
     normal_quantile,
     propagate_ar1_to_predecision,
     propagate_ar1_with_eta_mixture,
+    conservative_project_transport_atoms,
 )
 
 
@@ -228,4 +229,41 @@ def test_fp64_mass_does_not_promote_firm_network_state_dtype():
     assert distribution.component_mass.dtype == torch.float64
     assert distribution.b.dtype == torch.float32
     assert distribution.eta_state.dtype == torch.float32
+
+
+def test_source_atom_projection_preserves_four_accounting_moments():
+    points = 97
+    generator = torch.Generator().manual_seed(19)
+    weight = torch.rand((1, points), generator=generator, dtype=DTYPE)
+    b = 0.1 + 0.8 * torch.rand((1, points), generator=generator, dtype=DTYPE)
+    capital = 0.5 + 2.0 * torch.rand((1, points), generator=generator, dtype=DTYPE)
+    z = -0.3 + 0.6 * torch.rand((1, points), generator=generator, dtype=DTYPE)
+    zeros = torch.zeros((1, points), dtype=torch.long)
+    atoms = PostDecisionTransportAtoms(
+        transport_weight=weight,
+        source_z_current=z,
+        b_next=b,
+        capital_next_per_unit=capital,
+        atom_mask=torch.ones((1, points), dtype=torch.bool),
+        source_component_id=torch.arange(points)[None, :],
+        survival_region_id=zeros,
+        investment_region_id=zeros,
+        policy_branch_id=zeros,
+        economic_node_id=zeros,
+        source_time=zeros,
+        destination_time=torch.ones((1, points), dtype=torch.long),
+        cohort=zeros,
+        birth_time=zeros,
+        maintenance_eligibility=torch.ones((1, points), dtype=torch.bool),
+        origin_kind=zeros,
+        origin_source_id=zeros,
+    ).validate()
+    projected, audit = conservative_project_transport_atoms(
+        atoms, b_points=5, capital_points=5, output_points=7
+    )
+    assert int(audit["output_atom_count"]) <= 5 * 5 * 7
+    assert float(audit["max_balance_relative_error"]) < 1e-12
+    torch.testing.assert_close(projected.total_mass(), atoms.total_mass(), atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(projected.total_capital(), atoms.total_capital(), atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(projected.aggregate_debt(), atoms.aggregate_debt(), atol=1e-12, rtol=1e-12)
 
