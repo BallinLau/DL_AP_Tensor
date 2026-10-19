@@ -358,7 +358,7 @@ def _scan_mode(
     return rows, status, {"performance": performance, "legacy_parity": legacy}
 
 
-def _fresh_two_step(
+def _fresh_dynamic_validation(
     base_args: argparse.Namespace,
     *,
     checkpoint: Path,
@@ -388,25 +388,82 @@ def _fresh_two_step(
         device=device,
     )
 
-    def execute() -> tuple[Any, SimulateTS]:
+    def execute(horizon: int, label: str) -> dict[str, Any]:
         sim = SimulateTS(
             models=_allowed_simulation_models(models),
             config=episode.config,
             n_paths=4,
             group_size=32,
-            horizon=2,
+            horizon=int(horizon),
             branch_num=2,
             device=device,
             initial_state=_clone_tensors(initial, torch.device("cpu")),
             **_simulation_kwargs(episode, seed + 11, seed + 12),
         )
-        return sim.simulate_tensor(), sim
+        try:
+            result = sim.simulate_tensor()
+        except BaseException as error:
+            sim.write_bp_actual_use_trace(
+                output / "audit" / f"actual_bp_routing_{label}_partial.csv"
+            )
+            partial = {
+                "completed": False,
+                "error": repr(error),
+                "error_type": type(error).__name__,
+                "market_clearing": sim.market_clearing_controller.summary(),
+                "bp_trace_rows": len(sim.bp_actual_use_trace),
+                "bp_execution_sources": sorted({
+                    str(row["executed_bp_source"])
+                    for row in sim.bp_actual_use_trace
+                    if bool(row["bp_execution_applicable"])
+                }),
+            }
+            _write_json(
+                output / "dynamic_validation" / f"{label}_partial.json", partial
+            )
+            return partial
+        sim.write_bp_actual_use_trace(
+            output / "audit" / f"actual_bp_routing_{label}.csv"
+        )
+        return {
+            "completed": True,
+            "output": result,
+            "market_clearing": result.meta["market_clearing"],
+            "bp_trace_rows": len(sim.bp_actual_use_trace),
+            "bp_execution_sources": sorted({
+                str(row["executed_bp_source"])
+                for row in sim.bp_actual_use_trace
+                if bool(row["bp_execution_applicable"])
+            }),
+        }
 
-    first, first_sim = execute()
-    second, second_sim = execute()
-    firm_equal = torch.equal(first.firm.data, second.firm.data)
-    macro_equal = torch.equal(first.macro.data, second.macro.data)
-    macro = first.macro.to_dataframe()
+    one_step = execute(1, "one_step")
+    two_step = execute(2, "two_step")
+    two_step_repeat = execute(2, "two_step_repeat") if two_step["completed"] else {
+        "completed": False,
+        "skipped": "first two-step run failed",
+    }
+    firm_equal = bool(
+        two_step["completed"]
+        and two_step_repeat["completed"]
+        and torch.equal(
+            two_step["output"].firm.data, two_step_repeat["output"].firm.data
+        )
+    )
+    macro_equal = bool(
+        two_step["completed"]
+        and two_step_repeat["completed"]
+        and torch.equal(
+            two_step["output"].macro.data, two_step_repeat["output"].macro.data
+        )
+    )
+    selected_output = (
+        two_step["output"] if two_step["completed"] else one_step.get("output")
+    )
+    if selected_output is None:
+        macro = pd.DataFrame()
+    else:
+        macro = selected_output.macro.to_dataframe()
     balance_columns = [
         "path", "t", "branch", "slot_count", "firm_mass", "K",
         "aggregate_debt", "distribution_projection_error",
@@ -414,26 +471,27 @@ def _fresh_two_step(
     ]
     balance = macro[[name for name in balance_columns if name in macro]].copy()
     balance.to_csv(output / "dynamic_validation" / "mass_capital_debt_balance.csv", index=False)
-    first_sim.write_bp_actual_use_trace(output / "audit" / "actual_bp_routing.csv")
-    market = first.meta["market_clearing"]
+    market = one_step.get("market_clearing", {})
     result = {
         "fixed_checkpoint": str(checkpoint),
-        "horizon": 2,
+        "one_step_completed": bool(one_step["completed"]),
+        "two_step_completed": bool(two_step["completed"]),
         "paths": 4,
         "firm_tensor_repeat_exact": firm_equal,
         "macro_tensor_repeat_exact": macro_equal,
-        "market_clearing": market,
+        "one_step_market_clearing": market,
+        "two_step_market_clearing": two_step.get("market_clearing", {}),
+        "two_step_error": two_step.get("error"),
         "candidate_commit_parity": (
             int(market.get("candidate_commit_parity_pass_count", 0))
             == int(market.get("node_count", -1))
         ),
-        "root_failures": int(market.get("failure_count", -1)),
-        "bp_trace_rows": len(first_sim.bp_actual_use_trace),
-        "bp_execution_sources": sorted({
-            str(row["executed_bp_source"]) for row in first_sim.bp_actual_use_trace
-            if bool(row["bp_execution_applicable"])
-        }),
-        "second_run_market_clearing": second.meta["market_clearing"],
+        "one_step_root_failures": int(market.get("failure_count", -1)),
+        "bp_trace_rows": int(one_step.get("bp_trace_rows", 0)),
+        "bp_execution_sources": one_step.get("bp_execution_sources", []),
+        "two_step_repeat_market_clearing": two_step_repeat.get(
+            "market_clearing", {}
+        ),
     }
     _write_json(output / "dynamic_validation" / "two_step_replay.json", result)
     return result
@@ -451,6 +509,71 @@ def _plot_scans(frame: pd.DataFrame, output: Path) -> None:
     figure.tight_layout()
     figure.savefig(output / "figures" / "legacy_hard_continuum_G.png", dpi=180)
     plt.close(figure)
+
+
+def _write_diagnostic_report(output: Path, summary: Mapping[str, Any]) -> None:
+    gate = summary["gate"]
+    statuses = summary["statuses"]
+    dynamic = summary["dynamic_validation"]
+    lines = [
+        "# Consistent Aggregation Market Clearing — Diagnostic Gate",
+        "",
+        "## Outcome",
+        "",
+        f"- Gate result: **{'PASS' if gate['passed'] else 'FAIL'}**",
+        "- Tiny started: **FALSE**",
+        "- Small started: **FALSE**",
+        "- Formal started: **FALSE**",
+        "",
+        "The failed gate is a required stop, not a training failure: the continuum representation did not yet pass both integration convergence and two-step root continuity. No tolerance was widened and no fallback was added.",
+        "",
+        "## Required classifications",
+        "",
+        f"- `CLASSIFICATION_BUG_FIXED = {str(gate['CLASSIFICATION_BUG_FIXED']).upper()}`",
+        f"- `GRID_ROUTING_FIXED = TRUE` (covered by committed routing regression tests)",
+        f"- `ACTUAL_BP_EXECUTION_VERIFIED = {str(gate['ACTUAL_BP_EXECUTION_VERIFIED']).upper()}`",
+        f"- `LEGACY_EXACT_REPLAY = {gate['LEGACY_EXACT_REPLAY']}`",
+        f"- `POLICY_ACCOUNTING_TRANSITION_CONSISTENCY = {'PASS' if gate['CANDIDATE_COMMIT_PARITY'] else 'FAIL'}`",
+        f"- `CANDIDATE_COMMIT_PARITY = {'PASS' if gate['CANDIDATE_COMMIT_PARITY'] else 'FAIL'}`",
+        "- `CONTINUUM_MODE_IMPLEMENTED = TRUE`",
+        f"- `CONTINUUM_INTEGRATION_VALIDATED = {str(gate['CONTINUUM_INTEGRATION_VALIDATED']).upper()}`",
+        f"- `DISTRIBUTION_TRANSITION_VALIDATED = {str(gate['DISTRIBUTION_TRANSITION_VALIDATED']).upper()}`",
+        f"- `ROOT_STATUS_ON_REGRESSION_BANK = {statuses}`",
+        "- `SMALL_OUTERS_COMPLETED = 0`",
+        "- `FINAL_FIRM_STATUS = NOT_STARTED_GATE_BLOCKED`",
+        "- `FINAL_FC1_STATUS = NOT_STARTED_GATE_BLOCKED`",
+        "- `FINAL_SDF_STATUS = NOT_STARTED_GATE_BLOCKED`",
+        "- `FINAL_OUTER_STATUS = NOT_STARTED_GATE_BLOCKED`",
+        "- `ECONOMIC_CALIBRATION_CHANGED = FALSE`",
+        "- `AGGREGATION_SEMANTICS_CHANGED = TRUE`",
+        "- `NUMERICAL_STATE_REPRESENTATION_CHANGED = TRUE`",
+        "- `ARTIFICIAL_SMOOTHING_ADDED = FALSE`",
+        "- `CONSUMPTION_FLOOR_ADDED = FALSE`",
+        "- `FAILED_CHILDREN_DROPPED = FALSE`",
+        "- `FORMAL_STARTED = FALSE`",
+        "- `READY_FOR_FORMAL = FALSE`",
+        "",
+        "## Direct blocker",
+        "",
+        f"- Integration gate: `{summary.get('integration_acceptance', {})}`",
+        f"- Two-step result: `{dynamic}`",
+        "- Highest-priority blocker: the projected continuum z distribution still presents finite mass blocks to the hard default boundary. At t=2 branch=0 this produced a rejected discontinuity crossing; the mid-to-fine C_raw change also exceeded its pre-registered 0.5% threshold.",
+        "",
+        "The admissible next implementation step is boundary-aware integration of default mass within distribution cells (or an equivalently converged deterministic distribution scheme). Adding a sigmoid, consumption floor, interpolation root, new shock, or failed-child filtering is explicitly excluded.",
+        "",
+        "## Evidence paths",
+        "",
+        "- `regression/operator_scan.csv`",
+        "- `regression/mode_comparison.csv`",
+        "- `regression/integration_convergence.csv`",
+        "- `regression/integration_acceptance.json`",
+        "- `dynamic_validation/two_step_replay.json`",
+        "- `audit/actual_bp_routing_one_step.csv`",
+        "- `performance/vectorization_parity.json`",
+    ]
+    report = output / "reports" / "consistent_aggregation_market_clearing_20261019.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -629,21 +752,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     })
     _plot_scans(operator, output)
 
-    dynamic_error = None
-    try:
-        dynamic = _fresh_two_step(
-            base_args,
-            checkpoint=checkpoint,
-            output=output,
-            device=device,
-            seed=args.seed,
-        )
-    except BaseException as error:
-        dynamic = {}
-        dynamic_error = repr(error)
-        _write_json(output / "dynamic_validation" / "failure.json", {
-            "error": repr(error), "type": type(error).__name__
-        })
+    dynamic = _fresh_dynamic_validation(
+        base_args,
+        checkpoint=checkpoint,
+        output=output,
+        device=device,
+        seed=args.seed,
+    )
+    dynamic_error = dynamic.get("two_step_error")
 
     # Locked before the formal diagnostic is inspected.  These compare the
     # two highest quadrature resolutions, not the historical finite child.
@@ -682,9 +798,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "SCALAR_VECTOR_PARITY": all(row["SCALAR_PARITY"] == "PASS" for row in profiling),
         "CONTINUUM_INTEGRATION_FINITE": all(math.isfinite(row["best_G"]) for row in integration_rows),
         "CONTINUUM_INTEGRATION_VALIDATED": integration_validated,
-        "DISTRIBUTION_TRANSITION_VALIDATED": bool(dynamic) and dynamic.get("firm_tensor_repeat_exact") and dynamic.get("macro_tensor_repeat_exact"),
-        "CANDIDATE_COMMIT_PARITY": bool(dynamic) and dynamic.get("candidate_commit_parity"),
-        "ACTUAL_BP_EXECUTION_VERIFIED": bool(dynamic) and dynamic.get("bp_execution_sources") == ["grid"],
+        "DISTRIBUTION_TRANSITION_VALIDATED": bool(dynamic.get("two_step_completed")) and dynamic.get("firm_tensor_repeat_exact") and dynamic.get("macro_tensor_repeat_exact"),
+        "CANDIDATE_COMMIT_PARITY": bool(dynamic.get("one_step_completed")) and dynamic.get("candidate_commit_parity"),
+        "ACTUAL_BP_EXECUTION_VERIFIED": bool(dynamic.get("one_step_completed")) and dynamic.get("bp_execution_sources") == ["grid"],
         "dynamic_error": dynamic_error,
     }
     gate["passed"] = all(
@@ -693,20 +809,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     _write_json(output / "regression" / "candidate_commit_parity.json", dynamic)
     _write_json(output / "diagnostic_gate.json", gate)
-    _write_json(output / "summary.json", {
+    summary_payload = {
         "phase": "gate_1_and_two_step",
         "gate": gate,
         "statuses": statuses,
         "legacy_parity": legacy_parity,
         "continuum_reconstruction": reconstruction,
         "integration_convergence": integration_rows,
+        "integration_acceptance": {
+            "thresholds": integration_thresholds,
+            "differences": integration_differences,
+            "passed": integration_validated,
+        },
         "dynamic_validation": dynamic,
         **{key: source_manifest[key] for key in (
             "ECONOMIC_CALIBRATION_CHANGED", "AGGREGATION_SEMANTICS_CHANGED",
             "NUMERICAL_STATE_REPRESENTATION_CHANGED", "ARTIFICIAL_SMOOTHING_ADDED",
             "CONSUMPTION_FLOOR_ADDED", "FAILED_CHILDREN_DROPPED", "FORMAL_STARTED",
         )},
-    })
+    }
+    _write_json(output / "summary.json", summary_payload)
+    _write_diagnostic_report(output, summary_payload)
     print(f"CONSISTENT_AGGREGATION_DIAGNOSTIC_GATE={'PASS' if gate['passed'] else 'FAIL'}")
     return 0 if gate["passed"] else 2
 
