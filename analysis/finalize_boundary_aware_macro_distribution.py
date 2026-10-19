@@ -82,6 +82,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _copy_tree(pilot / directory, output / directory)
     _copy_tree(integration / "regression", output / "regression")
     shutil.copy2(pilot / "summary.json", output / "summary.json")
+    component_rows: list[dict[str, Any]] = []
+    for split in ("train", "validation"):
+        path = pilot / "dynamic" / f"component_counts_{split}.csv"
+        if path.exists():
+            component_rows.extend(_read_csv(path))
+    _write_csv(output / "dynamic" / "component_counts.csv", component_rows)
 
     tests = output / "tests"
     tests.mkdir(parents=True, exist_ok=True)
