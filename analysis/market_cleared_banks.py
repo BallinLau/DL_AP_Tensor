@@ -34,7 +34,7 @@ def _require_root_cleared_macro(
     tolerance: float,
     *,
     solver_mode: str = "strict_global",
-) -> dict[str, Any]:
+) -> tuple[pd.Series, dict[str, Any]]:
     required = {
         "market_root_found",
         "market_committed_residual_normalized",
@@ -79,29 +79,24 @@ def _require_root_cleared_macro(
             & (improvement >= 0.90)
         )
     accepted = strict | approximate
-    if not accepted.all():
-        columns = ["path", "t", "branch", "market_root_found"]
-        for name in (
-            "fast_solver_status",
-            "corrected_normalized_residual",
-            "h_policy_minus_h_cal",
-            "improvement_fraction",
-        ):
-            if name in macro.columns:
-                columns.append(name)
-        bad = macro.loc[~accepted, columns]
-        raise RuntimeError(
-            "Firm transition bank contains a node outside the declared strict/"
-            "approximate clearing gates: "
-            f"{bad.head(20).to_dict(orient='records')}"
-        )
     if not np.allclose(
         macro["Hatc_cleared"], macro["Hatc_firm_input"], atol=0.0, rtol=0.0
     ):
         raise RuntimeError("cleared Hatc was not the Firm input at every node")
-    return {
+    rejection_columns = ["path", "t", "branch", "market_root_found"]
+    for name in (
+        "fast_solver_status",
+        "corrected_normalized_residual",
+        "h_policy_minus_h_cal",
+        "improvement_fraction",
+    ):
+        if name in macro.columns:
+            rejection_columns.append(name)
+    audit = {
         "solver_mode": str(solver_mode),
         "node_count": int(len(macro)),
+        "accepted_node_count": int(accepted.sum()),
+        "rejected_node_count": int((~accepted).sum()),
         "strict_node_count": int(strict.sum()),
         "approximate_node_count": int(approximate.sum()),
         "strict_clearing_share": float(strict.mean()),
@@ -110,7 +105,11 @@ def _require_root_cleared_macro(
         "approximate_normalized_residual_tolerance": 1.0e-3,
         "approximate_log_mismatch_tolerance": 0.005,
         "approximate_minimum_improvement": 0.90,
+        "rejected_nodes": macro.loc[
+            ~accepted, rejection_columns
+        ].to_dict(orient="records"),
     }
+    return accepted, audit
 
 
 def build_market_cleared_transition_bank(
@@ -125,8 +124,22 @@ def build_market_cleared_transition_bank(
     """Match each incumbent parent firm to both independently-cleared children."""
     firm = _frame(output.firm)
     macro = _frame(output.macro)
-    clearing_audit = _require_root_cleared_macro(
+    accepted_nodes, clearing_audit = _require_root_cleared_macro(
         macro, root_tolerance, solver_mode=solver_mode
+    )
+    # A rejected node removes the complete natural transition that depends on
+    # it.  It is never replaced, redrawn, or paired with a sibling from another
+    # parent.  Filtering node keys before the three-way Firm merge preserves
+    # every failure in ``clearing_audit`` while allowing the remaining complete
+    # Parent--Child0--Child1 transitions to train.
+    accepted_keys = macro.loc[
+        accepted_nodes, ["path", "t", "branch"]
+    ].drop_duplicates()
+    firm = firm.merge(
+        accepted_keys,
+        on=["path", "t", "branch"],
+        how="inner",
+        validate="many_to_one",
     )
     if "eps_x_transition" not in firm.columns:
         if "eps_x_transition" not in macro.columns:

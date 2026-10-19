@@ -217,15 +217,16 @@ def test_firm_bank_accepts_only_predeclared_bounded_approximate_nodes():
     assert audit["clearing_gate"]["approximate_node_count"] == 1
 
     output.macro.data[row, columns["improvement_fraction"]] = 0.89
-    with pytest.raises(RuntimeError, match="strict/approximate clearing gates"):
-        build_market_cleared_transition_bank(
-            output,
-            n_parents=4,
-            seed=19,
-            split="train",
-            root_tolerance=2.0e-5,
-            solver_mode="fc1_bounded_improvement_pilot",
-        )
+    _, _, rejected_audit = build_market_cleared_transition_bank(
+        output,
+        n_parents=2,
+        seed=19,
+        split="train",
+        root_tolerance=2.0e-5,
+        solver_mode="fc1_bounded_improvement_pilot",
+    )
+    assert rejected_audit["clearing_gate"]["rejected_node_count"] == 1
+    assert len(rejected_audit["clearing_gate"]["rejected_nodes"]) == 1
 
 
 def test_root_candidate_admission_is_stricter_than_public_commit_gate():
