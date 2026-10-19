@@ -760,3 +760,226 @@ def conservative_project_transport_atoms(
     }
     return projected, audit
 
+
+def moment_project_predecision_distribution(
+    distribution: PreDecisionDistribution,
+    *,
+    b_points: int,
+    capital_points: int,
+    z_points: int,
+) -> tuple[PreDecisionDistribution, Dict[str, torch.Tensor | int | str]]:
+    """Compress a conditional-density mixture without creating hard-z blocks.
+
+    Components are assigned to deterministic joint ``(b,k,mu_z)`` cells
+    separately for each discrete eta/origin/cohort/birth/maintenance group.
+    Each occupied cell preserves mass, capital and debt exactly up to the
+    stored floating-point coordinate precision.  Its conditional Gaussian
+    matches the mass-weighted first two z moments, including the between-mean
+    variance.  Consequently a projected component remains a density that is
+    split again at value boundaries; it is never a representative firm whose
+    mean is hard-defaulted.
+    """
+    distribution.validate()
+    if min(int(b_points), int(capital_points), int(z_points)) < 2:
+        raise ValueError("moment projection grids need at least two points")
+    device = distribution.component_mass.device
+    batch_size = distribution.batch_size
+    output_path: list[torch.Tensor] = []
+    output: Dict[str, list[torch.Tensor]] = {
+        field.name: [] for field in fields(distribution) if field.name != "component_mask"
+    }
+    input_count = int(distribution.component_mask.sum())
+
+    def cell_index(value: torch.Tensor, points: int) -> torch.Tensor:
+        lower = value.min()
+        upper = value.max()
+        span = upper - lower
+        if bool(span.abs() <= torch.finfo(value.dtype).eps * 16):
+            return torch.zeros_like(value, dtype=torch.long)
+        normalized = ((value - lower) / span).clamp(0.0, 1.0)
+        return torch.floor(normalized * points).to(torch.long).clamp(0, points - 1)
+
+    for path in range(batch_size):
+        active = distribution.component_mask[path] & (
+            distribution.component_mass[path] > 0.0
+        )
+        position = torch.nonzero(active, as_tuple=False).reshape(-1)
+        if position.numel() == 0:
+            continue
+        discrete = torch.stack(
+            (
+                distribution.eta_state[path, position].round().to(torch.long),
+                distribution.origin_kind[path, position],
+                distribution.cohort[path, position],
+                distribution.birth_time[path, position],
+                distribution.maintenance_eligibility[path, position].to(torch.long),
+            ),
+            dim=1,
+        )
+        unique_group, inverse = torch.unique(discrete, dim=0, return_inverse=True)
+        for group_index in range(int(unique_group.shape[0])):
+            group_position = position[inverse == group_index]
+            weight = distribution.component_mass[path, group_position].to(torch.float64)
+            b = distribution.b[path, group_position].to(torch.float64)
+            capital = distribution.capital_per_unit[path, group_position].to(torch.float64)
+            mean = distribution.z_conditional_mean[path, group_position].to(torch.float64)
+            std = distribution.z_conditional_std[path, group_position].to(torch.float64)
+            ib = cell_index(b, int(b_points))
+            ik = cell_index(capital, int(capital_points))
+            iz = cell_index(mean, int(z_points))
+            cell = (
+                ib * (int(capital_points) * int(z_points))
+                + ik * int(z_points)
+                + iz
+            )
+            cell_count = int(b_points) * int(capital_points) * int(z_points)
+
+            def reduce(value: torch.Tensor) -> torch.Tensor:
+                result = torch.zeros(cell_count, device=device, dtype=torch.float64)
+                result.index_add_(0, cell, value)
+                return result
+
+            mass = reduce(weight)
+            occupied = torch.nonzero(mass > 0.0, as_tuple=False).reshape(-1)
+            if occupied.numel() == 0:
+                continue
+            capital_total = reduce(weight * capital)
+            debt_total = reduce(weight * capital * b)
+            z_first = reduce(weight * mean)
+            z_second = reduce(weight * (std.square() + mean.square()))
+            count = int(occupied.numel())
+            exemplar = group_position[0]
+            cell_mass = mass[occupied]
+            cell_capital_total = capital_total[occupied]
+            cell_mean = z_first[occupied] / cell_mass
+            cell_variance = (
+                z_second[occupied] / cell_mass - cell_mean.square()
+            ).clamp_min(1.0e-14)
+            output_path.append(
+                torch.full((count,), path, device=device, dtype=torch.long)
+            )
+            output["component_mass"].append(cell_mass)
+            output["b"].append(debt_total[occupied] / cell_capital_total.clamp_min(1e-30))
+            output["capital_per_unit"].append(cell_capital_total / cell_mass)
+            output["z_conditional_mean"].append(cell_mean)
+            output["z_conditional_std"].append(torch.sqrt(cell_variance))
+            output["component_id"].append(occupied.to(torch.long))
+            output["origin_source_id"].append(
+                torch.full((count,), -1, device=device, dtype=torch.long)
+            )
+            for name in (
+                "economic_node_id",
+                "origin_kind",
+                "origin_time",
+                "evaluation_time",
+                "cohort",
+                "birth_time",
+                "maintenance_eligibility",
+                "eta_state",
+            ):
+                value = getattr(distribution, name)[path, exemplar]
+                output[name].append(value.expand(count).clone())
+
+    if output_path:
+        flat_path = torch.cat(output_path)
+        flat = {name: torch.cat(parts) for name, parts in output.items()}
+    else:
+        flat_path = torch.empty(0, device=device, dtype=torch.long)
+        flat = {
+            field.name: getattr(distribution, field.name).new_empty((0,))
+            for field in fields(distribution)
+            if field.name != "component_mask"
+        }
+    counts = torch.bincount(flat_path, minlength=batch_size)
+    capacity = max(int(counts.max().item()) if counts.numel() else 0, 1)
+    if flat_path.numel():
+        order = torch.argsort(
+            flat_path * (flat_path.numel() + 1)
+            + torch.arange(flat_path.numel(), device=device)
+        )
+        sorted_path = flat_path[order]
+        change = torch.ones_like(sorted_path, dtype=torch.bool)
+        change[1:] = sorted_path[1:] != sorted_path[:-1]
+        starts = torch.nonzero(change, as_tuple=False).reshape(-1)
+        lengths = torch.diff(
+            torch.cat((starts, torch.tensor([flat_path.numel()], device=device)))
+        )
+        rank = torch.arange(flat_path.numel(), device=device) - torch.repeat_interleave(
+            starts, lengths
+        )
+    else:
+        order = flat_path
+        sorted_path = flat_path
+        rank = flat_path
+    packed: Dict[str, torch.Tensor] = {}
+    for name, value in flat.items():
+        if name == "capital_per_unit":
+            fill_value: float | int | bool = 1.0
+        elif name == "z_conditional_std":
+            fill_value = 1.0
+        elif value.dtype == torch.bool:
+            fill_value = False
+        elif value.dtype.is_floating_point:
+            fill_value = 0.0
+        else:
+            fill_value = -1
+        target_dtype = getattr(distribution, name).dtype
+        packed_value = torch.full(
+            (batch_size, capacity), fill_value, device=device, dtype=target_dtype
+        )
+        if flat_path.numel():
+            packed_value[sorted_path, rank] = value[order].to(target_dtype)
+        packed[name] = packed_value
+    packed["component_mask"] = (
+        torch.arange(capacity, device=device)[None, :] < counts[:, None]
+    )
+    projected = PreDecisionDistribution(**packed).validate()
+
+    def output_proxy(value: PreDecisionDistribution) -> torch.Tensor:
+        expectation = torch.exp(
+            value.z_conditional_mean.to(torch.float64)
+            + 0.5 * value.z_conditional_std.to(torch.float64).square()
+        )
+        return torch.where(
+            value.component_mask,
+            value.component_mass.to(torch.float64)
+            * value.capital_per_unit.to(torch.float64)
+            * expectation,
+            torch.zeros_like(expectation),
+        ).sum(dim=1)
+
+    before = torch.stack(
+        (
+            distribution.total_mass().to(torch.float64),
+            distribution.total_capital().to(torch.float64),
+            distribution.aggregate_debt().to(torch.float64),
+            output_proxy(distribution),
+        ),
+        dim=1,
+    )
+    after = torch.stack(
+        (
+            projected.total_mass().to(torch.float64),
+            projected.total_capital().to(torch.float64),
+            projected.aggregate_debt().to(torch.float64),
+            output_proxy(projected),
+        ),
+        dim=1,
+    )
+    relative = (after - before).abs() / before.abs().clamp_min(1e-30)
+    audit: Dict[str, torch.Tensor | int | str] = {
+        "mode": "predecision_joint_cell_moment_projection_v1",
+        "input_component_count": input_count,
+        "output_component_count": int(projected.component_mask.sum()),
+        "mass_before": before[:, 0],
+        "mass_after": after[:, 0],
+        "capital_before": before[:, 1],
+        "capital_after": after[:, 1],
+        "debt_before": before[:, 2],
+        "debt_after": after[:, 2],
+        "output_proxy_before": before[:, 3],
+        "output_proxy_after": after[:, 3],
+        "max_balance_relative_error": relative.max(),
+    }
+    return projected, audit
+

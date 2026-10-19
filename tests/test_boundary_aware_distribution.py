@@ -15,6 +15,7 @@ from data.boundary_aware_distribution import (
     propagate_ar1_to_predecision,
     propagate_ar1_with_eta_mixture,
     conservative_project_transport_atoms,
+    moment_project_predecision_distribution,
 )
 
 
@@ -266,4 +267,39 @@ def test_source_atom_projection_preserves_four_accounting_moments():
     torch.testing.assert_close(projected.total_mass(), atoms.total_mass(), atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(projected.total_capital(), atoms.total_capital(), atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(projected.aggregate_debt(), atoms.aggregate_debt(), atol=1e-12, rtol=1e-12)
+
+
+def test_predecision_projection_keeps_within_cell_z_dispersion():
+    mass = torch.tensor([[0.25, 0.75]], dtype=DTYPE)
+    zeros = torch.zeros((1, 2), dtype=torch.long)
+    distribution = PreDecisionDistribution(
+        component_mass=mass,
+        b=torch.tensor([[0.2, 0.4]], dtype=torch.float32),
+        capital_per_unit=torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+        z_conditional_mean=torch.tensor([[-0.4, 0.6]], dtype=torch.float32),
+        z_conditional_std=torch.tensor([[0.1, 0.2]], dtype=torch.float32),
+        component_mask=torch.ones((1, 2), dtype=torch.bool),
+        economic_node_id=zeros,
+        component_id=torch.tensor([[0, 1]], dtype=torch.long),
+        origin_kind=zeros,
+        origin_source_id=torch.tensor([[11, 12]], dtype=torch.long),
+        origin_time=zeros,
+        evaluation_time=zeros,
+        cohort=zeros,
+        birth_time=zeros,
+        maintenance_eligibility=torch.ones((1, 2), dtype=torch.bool),
+        eta_state=torch.zeros((1, 2), dtype=torch.float32),
+    ).validate()
+    projected, audit = moment_project_predecision_distribution(
+        distribution, b_points=2, capital_points=2, z_points=2
+    )
+    assert float(audit["max_balance_relative_error"]) < 1e-6
+    assert bool((projected.z_conditional_std[projected.component_mask] > 0.0).all())
+    assert projected.total_mass().item() == pytest.approx(1.0)
+    torch.testing.assert_close(
+        projected.total_capital(), distribution.total_capital(), atol=1e-6, rtol=1e-6
+    )
+    torch.testing.assert_close(
+        projected.aggregate_debt(), distribution.aggregate_debt(), atol=1e-6, rtol=1e-6
+    )
 

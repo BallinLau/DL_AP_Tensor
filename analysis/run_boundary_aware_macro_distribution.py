@@ -32,10 +32,9 @@ from analysis.macro_parent_state_bank import _allowed_simulation_models, _simula
 from analysis.run_consistent_aggregation_diagnostics import _load_base_args
 from data.boundary_aware_distribution import (
     BOUNDARY_AWARE_CONTINUUM_V1,
-    BoundaryAwareDecisionRecord,
     PreDecisionDistribution,
-    conservative_project_transport_atoms,
     gaussian_mixture_moments,
+    moment_project_predecision_distribution,
     propagate_ar1_with_eta_mixture,
 )
 from data.boundary_aware_market_clearing import (
@@ -400,108 +399,91 @@ def _run_split(
             distribution_dir / "transport_atoms_t0.pt",
         )
         for t in range(horizon):
-            if projection_after_t >= 0 and t >= projection_after_t:
-                old_record = state["_boundary_decision_record"]
-                projected, audit = conservative_project_transport_atoms(
-                    old_record.transport_atoms,
-                    b_points=projection_b_points,
-                    capital_points=projection_k_points,
-                    output_points=projection_u_points,
-                )
-                audit_row = {
-                    "split": split,
-                    "t": int(t),
-                    **_jsonable(audit),
-                }
-                projection_audits.append(audit_row)
-                if (
-                    float(audit["max_balance_relative_error"])
-                    > PROJECTION_BALANCE_RELATIVE_TOLERANCE
-                ):
-                    raise RuntimeError(
-                        "source-atom projection failed accounting preservation: "
-                        f"t={t}, error={float(audit['max_balance_relative_error'])}"
-                    )
-                projected_record = BoundaryAwareDecisionRecord(
-                    predecision_fingerprint=old_record.predecision_fingerprint,
-                    candidate_h=old_record.candidate_h,
-                    ledger=old_record.ledger,
-                    transport_atoms=projected,
-                    provenance={
-                        **old_record.provenance,
-                        "transport_projection": "source_atom_conservative_projection_v1",
-                    },
-                ).detached()
-                # Compare exact and projected next distributions at the same
-                # branch-0 macro shock and the same frozen h.  This is an
-                # operator approximation audit, not a comparison at two
-                # separately optimized roots.
-                exact_parent = dict(state)
-                projected_parent = dict(state)
-                projected_parent["_boundary_decision_record"] = projected_record
-                exact_child = _child_state(
-                    sim, exact_parent, child_t=t + 1, branch=0
-                )
-                projected_child = _child_state(
-                    sim, projected_parent, child_t=t + 1, branch=0
-                )
-                projection_entry = _entry_descriptor(
-                    sim, _distribution_from_state(state)
-                )
-                fixed_h = exact_child["hatcf"][:, None]
-                exact_operator = controller.evaluate(
-                    sim, exact_child, projection_entry, fixed_h
-                )
-                projected_operator = controller.evaluate(
-                    sim, projected_child, projection_entry, fixed_h
-                )
-                for path in range(paths):
-                    for name in (
-                        "C_raw",
-                        "K_total",
-                        "G",
-                        "default_mass",
-                        "investment_mass",
-                        "entry_mass",
-                    ):
-                        exact_value = exact_operator[name][path, 0].to(torch.float64)
-                        projected_value = projected_operator[name][path, 0].to(torch.float64)
-                        scale = exact_value.abs().clamp_min(1.0)
-                        audit_row[f"fixed_h_{name}_exact_path{path}"] = float(exact_value)
-                        audit_row[f"fixed_h_{name}_projected_path{path}"] = float(projected_value)
-                        audit_row[f"fixed_h_{name}_relative_error_path{path}"] = float(
-                            (projected_value - exact_value).abs() / scale
-                        )
-                fixed_h_errors = [
-                    float(value)
-                    for key, value in audit_row.items()
-                    if key.startswith("fixed_h_") and "_relative_error_path" in key
-                ]
-                audit_row["max_fixed_h_operator_relative_error"] = max(
-                    fixed_h_errors, default=0.0
-                )
-                audit_row["balance_relative_tolerance"] = (
-                    PROJECTION_BALANCE_RELATIVE_TOLERANCE
-                )
-                audit_row["fixed_h_operator_tolerance"] = (
-                    PROJECTION_FIXED_H_OPERATOR_TOLERANCE
-                )
-                if (
-                    audit_row["max_fixed_h_operator_relative_error"]
-                    > PROJECTION_FIXED_H_OPERATOR_TOLERANCE
-                ):
-                    raise RuntimeError(
-                        "source-atom projection failed fixed-h operator parity: "
-                        f"t={t}, error={audit_row['max_fixed_h_operator_relative_error']}, "
-                        f"tolerance={PROJECTION_FIXED_H_OPERATOR_TOLERANCE}"
-                    )
-                state["_boundary_decision_record"] = projected_record
-                state["_selected_transport_atoms"] = projected_record.transport_atoms
             parent_distribution = _distribution_from_state(state)
             entry = _entry_descriptor(sim, parent_distribution)
             children: list[Dict[str, torch.Tensor]] = []
             for branch in range(2):
                 child = _child_state(sim, state, child_t=t + 1, branch=branch)
+                if projection_after_t >= 0 and t >= projection_after_t:
+                    exact_child = child
+                    exact_distribution = _distribution_from_state(exact_child)
+                    projected_distribution, audit = moment_project_predecision_distribution(
+                        exact_distribution,
+                        b_points=projection_b_points,
+                        capital_points=projection_k_points,
+                        z_points=projection_u_points,
+                    )
+                    projected_child = dict(exact_child)
+                    projected_child.update(projected_distribution.as_state_tensors())
+                    projected_child["firm_id"] = projected_distribution.component_id
+                    projected_entry = _entry_descriptor(sim, projected_distribution)
+                    exact_entry = _entry_descriptor(sim, exact_distribution)
+                    fixed_h = exact_child["hatcf"][:, None]
+                    exact_operator = controller.evaluate(
+                        sim, exact_child, exact_entry, fixed_h
+                    )
+                    projected_operator = controller.evaluate(
+                        sim, projected_child, projected_entry, fixed_h
+                    )
+                    audit_row = {
+                        "split": split,
+                        "parent_t": int(t),
+                        "child_t": int(t + 1),
+                        "branch": int(branch),
+                        **_jsonable(audit),
+                    }
+                    projection_audits.append(audit_row)
+                    for path in range(paths):
+                        for name in (
+                            "C_raw",
+                            "K_total",
+                            "G",
+                            "default_mass",
+                            "investment_mass",
+                            "entry_mass",
+                        ):
+                            exact_value = exact_operator[name][path, 0].to(torch.float64)
+                            projected_value = projected_operator[name][path, 0].to(torch.float64)
+                            scale = exact_value.abs().clamp_min(1.0)
+                            audit_row[f"fixed_h_{name}_exact_path{path}"] = float(exact_value)
+                            audit_row[f"fixed_h_{name}_projected_path{path}"] = float(projected_value)
+                            audit_row[f"fixed_h_{name}_relative_error_path{path}"] = float(
+                                (projected_value - exact_value).abs() / scale
+                            )
+                    fixed_h_errors = [
+                        float(value)
+                        for key, value in audit_row.items()
+                        if key.startswith("fixed_h_") and "_relative_error_path" in key
+                    ]
+                    audit_row["max_fixed_h_operator_relative_error"] = max(
+                        fixed_h_errors, default=0.0
+                    )
+                    audit_row["balance_relative_tolerance"] = (
+                        PROJECTION_BALANCE_RELATIVE_TOLERANCE
+                    )
+                    audit_row["fixed_h_operator_tolerance"] = (
+                        PROJECTION_FIXED_H_OPERATOR_TOLERANCE
+                    )
+                    if (
+                        float(audit["max_balance_relative_error"])
+                        > PROJECTION_BALANCE_RELATIVE_TOLERANCE
+                    ):
+                        raise RuntimeError(
+                            "predecision projection failed accounting preservation: "
+                            f"t={t + 1}, branch={branch}, "
+                            f"error={float(audit['max_balance_relative_error'])}"
+                        )
+                    if (
+                        audit_row["max_fixed_h_operator_relative_error"]
+                        > PROJECTION_FIXED_H_OPERATOR_TOLERANCE
+                    ):
+                        raise RuntimeError(
+                            "predecision projection failed fixed-h operator parity: "
+                            f"t={t + 1}, branch={branch}, "
+                            f"error={audit_row['max_fixed_h_operator_relative_error']}, "
+                            f"tolerance={PROJECTION_FIXED_H_OPERATOR_TOLERANCE}"
+                        )
+                    child = projected_child
                 child = controller.clear_state(
                     sim, child, entry, t=t + 1, branch=branch
                 )
