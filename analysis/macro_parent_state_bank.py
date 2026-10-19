@@ -34,6 +34,7 @@ from data.boundary_aware_market_clearing import (
 )
 from data.entry import EntryCandidates
 from data.market_clearing import (
+    FAST_STATUS_LABELS,
     MarketClearingConfig,
     MarketClearingError,
     empty_entry_candidates,
@@ -1101,8 +1102,12 @@ def boundary_macro_rows(
             else float("nan")
         )
         h_belief = float(state.get("hatc_belief", state["hatcf"])[local])
-        h_cleared = float(state["hatc_cleared"][local])
-        h_firm_input = float(state["hatcf"][local])
+        h_policy = state.get("h_policy_input", state["hatcf"])
+        h_calculated = state.get(
+            "h_cal_from_ledger", state.get("hatc_cal", state["hatc_cleared"])
+        )
+        h_cleared = float(h_calculated[local])
+        h_firm_input = float(h_policy[local])
         lnk_belief = float(state["lnkf"][local])
         lnk_current = float(state["lnk_cal"][local])
         candidate_id = int(path_ids[local])
@@ -1153,7 +1158,26 @@ def boundary_macro_rows(
                 "h_selected_root": h_cleared,
                 "h_implied_from_accounting": h_implied,
                 "h_used_in_firm_policy": h_firm_input,
-                "root_status": "ROOT_FOUND",
+                "root_status": (
+                    FAST_STATUS_LABELS[int(state["fast_solver_status"][local])]
+                    if "fast_solver_status" in state
+                    else "ROOT_FOUND"
+                ),
+                "h_fc1_original": float(
+                    state.get("h_fc1_original", state.get("hatc_belief", state["hatcf"]))[local]
+                ),
+                "h_policy_input": h_firm_input,
+                "h_cal_from_ledger": h_cleared,
+                "h_policy_minus_h_cal": h_firm_input - h_cleared,
+                "baseline_G": float(
+                    state.get("baseline_G", torch.full_like(state["x"], float("nan")))[local]
+                ),
+                "corrected_G": float(
+                    state.get("corrected_G", torch.full_like(state["x"], float("nan")))[local]
+                ),
+                "G_evaluation_count": int(
+                    state.get("G_evaluation_count", torch.zeros_like(path_ids))[local]
+                ),
                 "root_residual": float(state["market_root_residual"][local]),
                 "root_residual_normalized": float(
                     state["market_root_residual_normalized"][local]
@@ -2015,6 +2039,7 @@ def build_one_step_macro_dataset(
     require_cached_shards: bool = False,
     integration: Optional[BoundaryIntegrationConfig] = None,
     root_config: Optional[MarketClearingConfig] = None,
+    source_checkpoint_provenance: Optional[Mapping[str, Any]] = None,
 ) -> OneStepMacroDataset:
     """Canonical boundary-aware one-step Macro dataset builder.
 
@@ -2060,6 +2085,12 @@ def build_one_step_macro_dataset(
             name: _model_state_digest(model)
             for name, model in sorted(models.items())
         },
+        "source_checkpoint_provenance": dict(
+            source_checkpoint_provenance or {
+                "policy": "CURRENT_FIRM_MODEL_STATE",
+                "fc1_sdf": "CURRENT_MACRO_MODEL_STATE",
+            }
+        ),
     }
     provenance["fingerprint"] = _json_hash(provenance)
     if output is not None:
@@ -2074,8 +2105,10 @@ def build_one_step_macro_dataset(
                 "firms_per_parent",
                 "integration_config",
                 "root_config",
+                "model_hashes_at_generation",
+                "source_checkpoint_provenance",
             ):
-                if recorded.get(key) != provenance.get(key):
+                if _json_hash(recorded.get(key)) != _json_hash(provenance.get(key)):
                     raise RuntimeError(
                         f"candidate dataset resume provenance mismatch: {key}"
                     )
@@ -2252,6 +2285,11 @@ def build_one_step_macro_dataset(
         "accepted_for_training", pd.Series(dtype=bool)
     ).astype(bool)
     coverage = {
+        "original_candidate_count": int(
+            len(candidate_ids)
+            if candidate_ids is not None
+            else candidate_schedule.initial_candidate_budget
+        ),
         "attempted_candidate_count": int(len(candidate_frame)),
         "valid_complete_pair_count": int(
             (candidate_frame.get("status") == MACRO_CANDIDATE_STATUS_VALID).sum()
@@ -2277,6 +2315,36 @@ def build_one_step_macro_dataset(
         "failure_status_counts": (
             candidate_frame.loc[~acceptance, "status"].value_counts().to_dict()
             if not candidate_frame.empty else {}
+        ),
+        "failed_parent_count": int(
+            (candidate_frame.get("status") == "PARENT_CLEARING_FAILED").sum()
+        ) if not candidate_frame.empty else 0,
+        "failed_child0_count": int(
+            (candidate_frame.get("status") == "CHILD_0_CLEARING_FAILED").sum()
+        ) if not candidate_frame.empty else 0,
+        "failed_child1_count": int(
+            (candidate_frame.get("status") == "CHILD_1_CLEARING_FAILED").sum()
+        ) if not candidate_frame.empty else 0,
+        "extinct_count": int(
+            (candidate_frame.get("status") == "CHILD_EXTINCT").sum()
+        ) if not candidate_frame.empty else 0,
+        "strict_root_failure_count": int(
+            candidate_frame.get("status", pd.Series(dtype=str)).isin(
+                [
+                    "PARENT_CLEARING_FAILED",
+                    "CHILD_0_CLEARING_FAILED",
+                    "CHILD_1_CLEARING_FAILED",
+                ]
+            ).sum()
+        ) if not candidate_frame.empty else 0,
+        "valid_subset_fraction": float(
+            accepted_count
+            / max(
+                len(candidate_ids)
+                if candidate_ids is not None
+                else candidate_schedule.initial_candidate_budget,
+                1,
+            )
         ),
         "selection_interpretation": "conditional_on_complete_parent_two_child_pair",
         "outcome_by_distribution_family": (
@@ -2319,6 +2387,53 @@ def build_one_step_macro_dataset(
         distribution_manifest=manifest_frame,
         dataset_status=dataset_status,
     )
+
+
+def validation_coverage_record(
+    *,
+    original_candidate_ids: Sequence[int],
+    before: OneStepMacroDataset,
+    after: OneStepMacroDataset,
+) -> dict[str, Any]:
+    """Report fixed-schedule validation coverage without imputing failures."""
+
+    original = tuple(map(int, original_candidate_ids))
+    before_coverage = before.pairing_audit.get("candidate_coverage", {})
+    after_coverage = after.pairing_audit.get("candidate_coverage", {})
+    before_ids = set(map(int, before_coverage.get("accepted_candidate_ids", [])))
+    after_ids = set(map(int, after_coverage.get("accepted_candidate_ids", [])))
+    unexpected = sorted((before_ids | after_ids).difference(original))
+    if unexpected:
+        raise RuntimeError(
+            "validation coverage contains replacement identities: "
+            f"{unexpected[:20]}"
+        )
+    failure_counts = after_coverage.get("failure_status_counts", {})
+    matched = before_ids & after_ids
+    return {
+        "original_validation_candidate_count": len(original),
+        "valid_before_fc1": len(before_ids),
+        "valid_after_fc1": len(after_ids),
+        "matched_valid_subset_count": len(matched),
+        "failed_parent_count": int(
+            failure_counts.get("PARENT_CLEARING_FAILED", 0)
+        ),
+        "failed_child0_count": int(
+            failure_counts.get("CHILD_0_CLEARING_FAILED", 0)
+        ),
+        "failed_child1_count": int(
+            failure_counts.get("CHILD_1_CLEARING_FAILED", 0)
+        ),
+        "extinct_count": int(failure_counts.get("CHILD_EXTINCT", 0)),
+        "strict_root_failure_count": int(
+            failure_counts.get("PARENT_CLEARING_FAILED", 0)
+            + failure_counts.get("CHILD_0_CLEARING_FAILED", 0)
+            + failure_counts.get("CHILD_1_CLEARING_FAILED", 0)
+        ),
+        "valid_subset_fraction": float(len(after_ids) / max(len(original), 1)),
+        "metrics_interpretation": "conditional_on_matched_valid_subset",
+        "coverage_interpretation": "fixed_original_schedule_no_replacement",
+    }
 
 
 def distribution_coverage(frame: pd.DataFrame) -> dict[str, Any]:

@@ -121,6 +121,45 @@ def test_candidate_evaluation_integrates_default_and_investment_boundaries():
     assert controller.investment_boundary_count > 0
 
 
+def test_candidate_h_microbatching_preserves_boundary_operator_values():
+    sim = SimpleNamespace(
+        models={"policy_value": _BoundaryPolicy()},
+        config=_Config,
+        delta=0.0,
+    )
+    state = _state()
+    h = torch.linspace(-0.3, 0.3, 8).reshape(1, 8)
+    results = []
+    for chunk in (1, 4, 8):
+        controller = BoundaryAwareMarketClearingController(
+            MarketClearingConfig(candidate_chunk_size=100_000),
+            BoundaryIntegrationConfig(
+                z_scan_points=17,
+                z_quadrature_points=6,
+                i_scan_points=9,
+                i_quadrature_points=6,
+                boundary_refinement_rounds=8,
+                candidate_h_microbatch_size=chunk,
+            ),
+        )
+        results.append(
+            controller.evaluate(
+                sim, state, empty_entry_candidates(state), h, detail=False
+            )
+        )
+    for name in (
+        "G",
+        "G_normalized",
+        "C_raw",
+        "K_total",
+        "investment_mass",
+        "default_mass",
+        "entry_mass",
+    ):
+        torch.testing.assert_close(results[0][name], results[1][name])
+        torch.testing.assert_close(results[0][name], results[2][name])
+
+
 def test_entry_is_integrated_over_continuous_z_and_cost_boundaries():
     controller = BoundaryAwareMarketClearingController(
         MarketClearingConfig(candidate_chunk_size=100_000),

@@ -13,10 +13,14 @@ sys.path.insert(0, str(ROOT))
 
 from analysis.nested_equilibrium_utils import (
     atomic_write_json,
+    capture_episode_runtime_state,
+    capture_training_transaction,
     load_checkpoint,
     make_checkpoint_payload,
     publish_checkpoint,
+    restore_training_transaction,
     run_with_oom_fallback,
+    stable_json_hash,
 )
 from analysis.run_full_nested_equilibrium import (
     _configure_hyperparams,
@@ -31,6 +35,43 @@ def _models() -> dict[str, torch.nn.Module]:
         "policy_value": torch.nn.Linear(2, 2),
         "sdf_fc1": torch.nn.Linear(2, 1),
     }
+
+
+class _Scheduler:
+    def __init__(self):
+        self.step_count = 0
+
+    def step(self):
+        self.step_count += 1
+
+    def state_dict(self):
+        return {"step_count": self.step_count}
+
+    def load_state_dict(self, state):
+        self.step_count = int(state["step_count"])
+
+
+class _RuntimeEpisode:
+    def __init__(self):
+        self._sdf_al_state = {
+            "lambda_mean_low": 0.1,
+            "lambda_mean_high": 0.2,
+            "lambda_var_high": 0.3,
+            "rho": 2.0,
+        }
+        self.lr_schedulers = {"model": _Scheduler()}
+        self.weight_scheduler = _Scheduler()
+        self.sdf_training_phase = "sdf_true_only"
+        self._checkpoint_continuation_counters = {
+            "accepted_primal_epochs_since_dual_update": 2,
+            "last_dual_update_epoch": 7,
+        }
+
+    def _get_sdf_al_state(self):
+        return dict(self._sdf_al_state)
+
+    def set_sdf_training_phase(self, phase):
+        self.sdf_training_phase = phase
 
 
 def test_production_defaults_match_formal_protocol():
@@ -259,3 +300,139 @@ def test_oom_second_failure_hard_stops(tmp_path: Path):
             events_path=tmp_path / "oom_events.json", device=torch.device("cpu"),
             indices={},
         )
+
+
+def test_checkpoint_restores_complete_episode_al_scheduler_and_counters(tmp_path):
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    episode = _RuntimeEpisode()
+    episode.lr_schedulers["model"].step()
+    episode.weight_scheduler.step()
+    episode._sdf_al_state["lambda_mean_low"] = 0.75
+    loss = model(torch.ones((4, 2))).square().mean()
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    payload = make_checkpoint_payload(
+        models={"model": model},
+        optimizers={"model": optimizer},
+        schedulers=episode.lr_schedulers,
+        episode_runtime_state=capture_episode_runtime_state(episode),
+        state={"sdf_chunk": 3, "al_active_phase": "sdf_true_only"},
+        git_head="resume-test",
+        hyperparameter_fingerprint="fixed",
+    )
+    path = tmp_path / "complete.pt"
+    publish_checkpoint(path=path, payload=payload, run_root=tmp_path)
+
+    restored_model = torch.nn.Linear(2, 1)
+    restored_optimizer = torch.optim.Adam(restored_model.parameters(), lr=0.5)
+    restored_episode = _RuntimeEpisode()
+    restored_episode._sdf_al_state = {
+        "lambda_mean_low": 9.0,
+        "lambda_mean_high": 9.0,
+        "lambda_var_high": 9.0,
+        "rho": 9.0,
+    }
+    loaded = load_checkpoint(
+        path,
+        models={"model": restored_model},
+        optimizers={"model": restored_optimizer},
+        schedulers=restored_episode.lr_schedulers,
+        episode=restored_episode,
+        git_head="resume-test",
+        hyperparameter_fingerprint="fixed",
+        allow_code_mismatch=False,
+    )
+    assert loaded["state"]["sdf_chunk"] == 3
+    assert restored_episode._get_sdf_al_state() == episode._get_sdf_al_state()
+    assert restored_episode.lr_schedulers["model"].state_dict() == {"step_count": 1}
+    assert restored_episode.weight_scheduler.state_dict() == {"step_count": 1}
+    assert restored_episode._checkpoint_continuation_counters == (
+        episode._checkpoint_continuation_counters
+    )
+    assert stable_json_hash(restored_optimizer.state_dict()) == stable_json_hash(
+        optimizer.state_dict()
+    )
+
+
+def test_oom_transaction_rolls_back_model_optimizer_al_scheduler_and_rng(tmp_path):
+    torch.manual_seed(1234)
+    model = torch.nn.Linear(3, 1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    episode = _RuntimeEpisode()
+    snapshot = capture_training_transaction(
+        models={"model": model},
+        optimizers={"model": optimizer},
+        episode=episode,
+        stage_progress={"stage": "sdf"},
+        dataset_provenance={"fingerprint": "immutable"},
+    )
+    calls = 0
+    cleanup_calls = 0
+
+    def one_step(target_model, target_optimizer, target_episode):
+        x = torch.randn((8, 3))
+        target_optimizer.zero_grad(set_to_none=True)
+        loss = target_model(x).square().mean()
+        loss.backward()
+        target_optimizer.step()
+        target_episode._sdf_al_state["lambda_mean_low"] += 0.1
+        target_episode.lr_schedulers["model"].step()
+        return float(loss.detach())
+
+    def execute(_batch_size):
+        nonlocal calls
+        calls += 1
+        value = one_step(model, optimizer, episode)
+        if calls == 1:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+        return value
+
+    def cleanup():
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+
+    run_with_oom_fallback(
+        block="SDF",
+        initial_batch_size=64,
+        fallback_batch_size=32,
+        execute=execute,
+        reload_block_start=lambda: restore_training_transaction(
+            snapshot,
+            models={"model": model},
+            optimizers={"model": optimizer},
+            episode=episode,
+        ),
+        cleanup_failed_attempt=cleanup,
+        events=[],
+        events_path=tmp_path / "oom.json",
+        device=torch.device("cpu"),
+        indices={"macro_inner": 0},
+    )
+    actual_model = {
+        key: value.detach().clone() for key, value in model.state_dict().items()
+    }
+    actual_optimizer_hash = stable_json_hash(optimizer.state_dict())
+    actual_runtime = capture_episode_runtime_state(episode)
+    actual_rng = torch.get_rng_state().clone()
+
+    reference_model = torch.nn.Linear(3, 1)
+    reference_optimizer = torch.optim.Adam(reference_model.parameters(), lr=0.01)
+    reference_episode = _RuntimeEpisode()
+    restore_training_transaction(
+        snapshot,
+        models={"model": reference_model},
+        optimizers={"model": reference_optimizer},
+        episode=reference_episode,
+    )
+    one_step(reference_model, reference_optimizer, reference_episode)
+
+    assert calls == 2
+    assert cleanup_calls == 1
+    for key, value in reference_model.state_dict().items():
+        torch.testing.assert_close(actual_model[key], value, rtol=0.0, atol=0.0)
+    assert actual_optimizer_hash == stable_json_hash(reference_optimizer.state_dict())
+    assert actual_runtime == capture_episode_runtime_state(reference_episode)
+    torch.testing.assert_close(actual_rng, torch.get_rng_state(), rtol=0.0, atol=0.0)

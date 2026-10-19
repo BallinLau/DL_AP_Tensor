@@ -8,6 +8,7 @@ operators remain in the validated production/analysis modules imported by
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 from hashlib import sha256
 import json
 import math
@@ -233,6 +234,7 @@ def run_with_oom_fallback(
     events_path: Path,
     device: torch.device,
     indices: Mapping[str, int],
+    cleanup_failed_attempt: Optional[Callable[[], None]] = None,
 ) -> tuple[T, int]:
     """Run one block and retry exactly once from its checkpoint after CUDA OOM."""
     batch_size = int(initial_batch_size)
@@ -258,6 +260,8 @@ def run_with_oom_fallback(
         events.append(_jsonable(event.__dict__))
         atomic_write_json(events_path, events)
         reload_block_start()
+        if cleanup_failed_attempt is not None:
+            cleanup_failed_attempt()
         if device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
         try:
@@ -283,10 +287,148 @@ def _optimizer_state_to_cpu(value: Any) -> Any:
     return value
 
 
+def capture_episode_runtime_state(episode: Any) -> dict[str, Any]:
+    """Capture mutable training state owned by an ``Episode``.
+
+    This is intentionally separate from model/optimizer state.  In particular,
+    SDF augmented-Lagrangian multipliers and custom scheduler objects live on
+    ``Episode`` and otherwise silently restart after a process-level resume.
+    """
+
+    schedulers = {
+        str(name): deepcopy(scheduler.state_dict())
+        for name, scheduler in getattr(episode, "lr_schedulers", {}).items()
+    }
+    weight_scheduler = getattr(episode, "weight_scheduler", None)
+    runtime: dict[str, Any] = {
+        "sdf_al_state": deepcopy(episode._get_sdf_al_state()),
+        "lr_schedulers": schedulers,
+        "weight_scheduler": (
+            deepcopy(weight_scheduler.state_dict())
+            if weight_scheduler is not None
+            and hasattr(weight_scheduler, "state_dict")
+            else None
+        ),
+        "sdf_training_phase": str(
+            getattr(getattr(episode, "sdf_training_phase", None), "value", None)
+            or getattr(episode, "sdf_training_phase", "")
+        ),
+        "continuation_counters": deepcopy(
+            getattr(episode, "_checkpoint_continuation_counters", {})
+        ),
+    }
+    return _optimizer_state_to_cpu(runtime)
+
+
+def restore_episode_runtime_state(episode: Any, state: Mapping[str, Any]) -> None:
+    """Restore the exact mutable ``Episode`` state captured above."""
+
+    required_al = {
+        "lambda_mean_low",
+        "lambda_mean_high",
+        "lambda_var_high",
+        "rho",
+    }
+    al_state = state.get("sdf_al_state")
+    if not isinstance(al_state, Mapping) or set(al_state) != required_al:
+        raise RuntimeError("checkpoint is missing the complete SDF AL state")
+    episode._sdf_al_state = {key: float(al_state[key]) for key in required_al}
+
+    saved_schedulers = state.get("lr_schedulers", {})
+    current_schedulers = getattr(episode, "lr_schedulers", {})
+    if set(saved_schedulers) != set(current_schedulers):
+        raise RuntimeError(
+            "resume scheduler set mismatch: "
+            f"saved={sorted(saved_schedulers)}, current={sorted(current_schedulers)}"
+        )
+    for name, scheduler in current_schedulers.items():
+        scheduler.load_state_dict(saved_schedulers[name])
+
+    weight_state = state.get("weight_scheduler")
+    weight_scheduler = getattr(episode, "weight_scheduler", None)
+    if weight_state is not None:
+        if weight_scheduler is None or not hasattr(weight_scheduler, "load_state_dict"):
+            raise RuntimeError("checkpoint has weight-scheduler state but Episode does not")
+        weight_scheduler.load_state_dict(weight_state)
+
+    phase = str(state.get("sdf_training_phase", ""))
+    if phase and hasattr(episode, "set_sdf_training_phase"):
+        # Import lazily to keep this orchestration module independent of the
+        # training package during lightweight unit tests.
+        current = getattr(episode, "sdf_training_phase", None)
+        enum_type = type(current)
+        try:
+            episode.set_sdf_training_phase(enum_type(phase))
+        except (TypeError, ValueError):
+            # A string phase is still useful for small test doubles.
+            episode.sdf_training_phase = phase
+    episode._checkpoint_continuation_counters = deepcopy(
+        state.get("continuation_counters", {})
+    )
+
+
+def capture_training_transaction(
+    *,
+    models: Mapping[str, torch.nn.Module],
+    optimizers: Mapping[str, torch.optim.Optimizer],
+    episode: Optional[Any] = None,
+    stage_progress: Optional[Mapping[str, Any]] = None,
+    dataset_provenance: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Create an in-memory block-start snapshot for transactional OOM retry."""
+
+    return {
+        "models": {
+            name: {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+            for name, model in models.items()
+        },
+        "optimizers": {
+            name: _optimizer_state_to_cpu(optimizer.state_dict())
+            for name, optimizer in optimizers.items()
+        },
+        "episode_runtime": (
+            capture_episode_runtime_state(episode) if episode is not None else None
+        ),
+        "rng_state": capture_rng_state(),
+        "stage_progress": deepcopy(dict(stage_progress or {})),
+        "dataset_provenance": deepcopy(dict(dataset_provenance or {})),
+    }
+
+
+def restore_training_transaction(
+    snapshot: Mapping[str, Any],
+    *,
+    models: Mapping[str, torch.nn.Module],
+    optimizers: Mapping[str, torch.optim.Optimizer],
+    episode: Optional[Any] = None,
+) -> None:
+    """Rollback every mutable training object to a block-start snapshot."""
+
+    if set(snapshot["models"]) != set(models):
+        raise RuntimeError("transaction model set mismatch")
+    if set(snapshot["optimizers"]) != set(optimizers):
+        raise RuntimeError("transaction optimizer set mismatch")
+    for name, model in models.items():
+        model.load_state_dict(snapshot["models"][name], strict=True)
+    for name, optimizer in optimizers.items():
+        optimizer.load_state_dict(snapshot["optimizers"][name])
+    if episode is not None:
+        runtime = snapshot.get("episode_runtime")
+        if not isinstance(runtime, Mapping):
+            raise RuntimeError("transaction is missing Episode runtime state")
+        restore_episode_runtime_state(episode, runtime)
+    restore_rng_state(snapshot["rng_state"])
+
+
 def make_checkpoint_payload(
     *,
     models: Mapping[str, torch.nn.Module],
     optimizers: Optional[Mapping[str, torch.optim.Optimizer]] = None,
+    schedulers: Optional[Mapping[str, Any]] = None,
+    episode_runtime_state: Optional[Mapping[str, Any]] = None,
     state: Mapping[str, Any],
     git_head: str,
     hyperparameter_fingerprint: str,
@@ -300,6 +442,10 @@ def make_checkpoint_payload(
         name: _optimizer_state_to_cpu(optimizer.state_dict())
         for name, optimizer in (optimizers or {}).items()
     }
+    scheduler_states = {
+        name: _optimizer_state_to_cpu(scheduler.state_dict())
+        for name, scheduler in (schedulers or {}).items()
+    }
     return {
         "format": "full_nested_equilibrium_v1",
         "git_head": git_head,
@@ -312,6 +458,14 @@ def make_checkpoint_payload(
             name: stable_json_hash(value)
             for name, value in optimizer_states.items()
         },
+        "schedulers": scheduler_states,
+        "scheduler_state_hashes": {
+            name: stable_json_hash(value)
+            for name, value in scheduler_states.items()
+        },
+        "episode_runtime_state": _optimizer_state_to_cpu(
+            dict(episode_runtime_state or {})
+        ),
         "rng_state": capture_rng_state(),
         "optimizer_state_restored": bool(optimizer_states),
         "extra": dict(extra or {}),
@@ -341,6 +495,14 @@ def verify_checkpoint_payload(payload: Mapping[str, Any]) -> None:
         expected = payload.get("optimizer_state_hashes", {}).get(name)
         if observed != expected:
             raise ValueError(f"checkpoint optimizer hash mismatch: {name}")
+    scheduler_states = payload.get("schedulers", {})
+    if not isinstance(scheduler_states, Mapping):
+        raise ValueError("checkpoint scheduler states are malformed")
+    for name, state in scheduler_states.items():
+        observed = stable_json_hash(state)
+        expected = payload.get("scheduler_state_hashes", {}).get(name)
+        if observed != expected:
+            raise ValueError(f"checkpoint scheduler hash mismatch: {name}")
 
 
 def publish_checkpoint(
@@ -376,6 +538,8 @@ def load_checkpoint(
     *,
     models: Mapping[str, torch.nn.Module],
     optimizers: Optional[Mapping[str, torch.optim.Optimizer]] = None,
+    schedulers: Optional[Mapping[str, Any]] = None,
+    episode: Optional[Any] = None,
     git_head: str,
     hyperparameter_fingerprint: str,
     allow_code_mismatch: bool,
@@ -407,6 +571,20 @@ def load_checkpoint(
             )
         for name, optimizer in optimizers.items():
             optimizer.load_state_dict(saved_optimizers[name])
+    if schedulers is not None:
+        saved_schedulers = payload.get("schedulers", {})
+        if set(saved_schedulers) != set(schedulers):
+            raise RuntimeError(
+                "resume scheduler set mismatch: "
+                f"saved={sorted(saved_schedulers)}, current={sorted(schedulers)}"
+            )
+        for name, scheduler in schedulers.items():
+            scheduler.load_state_dict(saved_schedulers[name])
+    if episode is not None:
+        runtime = payload.get("episode_runtime_state")
+        if not isinstance(runtime, Mapping) or not runtime:
+            raise RuntimeError("resume checkpoint is missing Episode runtime state")
+        restore_episode_runtime_state(episode, runtime)
     if restore_rng:
         restore_rng_state(payload["rng_state"])
     return dict(payload)

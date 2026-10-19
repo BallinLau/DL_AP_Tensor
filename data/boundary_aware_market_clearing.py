@@ -50,6 +50,7 @@ class BoundaryIntegrationConfig:
     scan_tail_probability: float = 1.0e-8
     boundary_coordinate_tolerance: float = 1.0e-9
     boundary_value_tolerance: float = 1.0e-8
+    candidate_h_microbatch_size: int = 1
 
     def validate(self) -> None:
         if self.z_scan_points < 5 or self.i_scan_points < 5:
@@ -60,6 +61,8 @@ class BoundaryIntegrationConfig:
             raise ValueError("boundary refinement rounds must be positive")
         if not 0.0 < self.scan_tail_probability < 0.5:
             raise ValueError("scan_tail_probability must be in (0,0.5)")
+        if self.candidate_h_microbatch_size < 1:
+            raise ValueError("candidate_h_microbatch_size must be positive")
 
 
 def _scatter_sum(
@@ -293,14 +296,11 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         # INT_MAX indexing limit.  Chunk only the candidate axis; every chunk
         # still evaluates all active components and policy regions in batched
         # GPU calls.  Accepted-root detail evaluation already has H=1.
-        if (
-            not detail
-            and H > 1
-            and self.integration.z_scan_points >= 257
-        ):
+        h_chunk = int(self.integration.candidate_h_microbatch_size)
+        if not detail and H > h_chunk:
             pieces = [
-                self.evaluate(sim, state, candidates, h[:, index : index + 1])
-                for index in range(H)
+                self.evaluate(sim, state, candidates, h[:, index : index + h_chunk])
+                for index in range(0, H, h_chunk)
             ]
             names = pieces[0].keys()
             return {
@@ -1174,8 +1174,8 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                 "t": int(t),
                 "branch": int(branch),
                 "representation": "boundary_aware_continuum_v1",
-                "dense_candidate_h_chunk_size": (
-                    1 if self.integration.z_scan_points >= 257 else None
+                "dense_candidate_h_chunk_size": int(
+                    self.integration.candidate_h_microbatch_size
                 ),
                 "root_selection": "existing_coarse_to_fine_selected_record",
                 "component_mean_hard_default_used": False,
@@ -1282,8 +1282,8 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                 "investment_boundary_count": int(self.investment_boundary_count),
                 "boundary_search_seconds": float(self.boundary_search_seconds),
                 "resource_integration_seconds": float(self.resource_integration_seconds),
-                "dense_candidate_h_chunk_size": (
-                    1 if self.integration.z_scan_points >= 257 else None
+                "dense_candidate_h_chunk_size": int(
+                    self.integration.candidate_h_microbatch_size
                 ),
                 "scan_tail_probability_mass": float(
                     self.tail_probability_mass_scanned_outside

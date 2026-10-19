@@ -463,6 +463,42 @@ def test_candidate_resume_loads_committed_shards_without_re_evaluation(
     )
 
 
+def test_candidate_cache_rejects_model_version_mismatch(monkeypatch, tmp_path):
+    schedule = _schedule("train")
+    output = tmp_path / "model_version"
+    monkeypatch.setattr(
+        bank_module,
+        "_evaluate_boundary_candidates_with_isolation",
+        _fake_candidate_evaluator,
+    )
+    model = torch.nn.Linear(2, 1)
+    build_one_step_macro_dataset(
+        models={"policy_value": model},
+        episode=_FakeEpisode(),
+        candidate_schedule=schedule,
+        parent_batch_size=4,
+        macro_batch_size=64,
+        device=torch.device("cpu"),
+        output_dir=output,
+    )
+    with torch.no_grad():
+        model.weight.add_(1.0)
+    with pytest.raises(
+        RuntimeError,
+        match="candidate dataset resume provenance mismatch: model_hashes_at_generation",
+    ):
+        build_one_step_macro_dataset(
+            models={"policy_value": model},
+            episode=_FakeEpisode(),
+            candidate_schedule=schedule,
+            parent_batch_size=4,
+            macro_batch_size=64,
+            device=torch.device("cpu"),
+            output_dir=output,
+            require_cached_shards=True,
+        )
+
+
 def test_two_outer_firm_first_control_flow_and_resume():
     fresh = run_firm_first_orchestration_mock(outer_count=2)
     resumed = run_firm_first_orchestration_mock(outer_count=2, resume_after=7)

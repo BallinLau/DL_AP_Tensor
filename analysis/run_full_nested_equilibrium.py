@@ -40,6 +40,8 @@ from analysis.nested_equilibrium_utils import (  # noqa: E402
     atomic_torch_save,
     atomic_write_csv,
     atomic_write_json,
+    capture_episode_runtime_state,
+    capture_training_transaction,
     cuda_memory,
     load_checkpoint,
     make_checkpoint_payload,
@@ -47,6 +49,7 @@ from analysis.nested_equilibrium_utils import (  # noqa: E402
     publish_checkpoint,
     require_finite_metrics,
     require_finite_module,
+    restore_training_transaction,
     run_with_oom_fallback,
     safe_torch_load,
     seed_all,
@@ -63,6 +66,7 @@ from analysis.macro_parent_state_bank import (  # noqa: E402
     one_step_macro_dataset_fingerprint,
     save_candidate_schedule,
     save_committed_one_step_macro_dataset,
+    validation_coverage_record,
 )
 from analysis.market_cleared_banks import (  # noqa: E402
     build_market_cleared_transition_bank,
@@ -398,8 +402,10 @@ def _candidate_operator_configs(
         i_quadrature_points=int(args.boundary_i_quadrature_points),
         boundary_refinement_rounds=int(args.boundary_refinement_rounds),
         scan_tail_probability=float(args.boundary_scan_tail_probability),
+        candidate_h_microbatch_size=int(args.boundary_candidate_h_microbatch_size),
     )
     root = MarketClearingConfig(
+        solver_mode=str(args.macro_clearing_solver_mode),
         coarse_points=int(args.market_clearing_coarse_points),
         refinement_points=int(args.market_clearing_refinement_points),
         max_refinement_rounds=int(args.market_clearing_max_refinement_rounds),
@@ -477,11 +483,16 @@ def _fixed_bank_hashes(
 def _save_stage_checkpoint(
     *, run_root: Path, path: Path, models: Mapping[str, torch.nn.Module],
     optimizers: Mapping[str, torch.optim.Optimizer],
+    episode: Episode,
     state: Mapping[str, Any], git_head: str, fingerprint: str,
     bank_hashes: Mapping[str, str], extra: Optional[Mapping[str, Any]] = None,
 ) -> None:
     payload = make_checkpoint_payload(
-        models=models, optimizers=optimizers, state=state, git_head=git_head,
+        models=models,
+        optimizers=optimizers,
+        schedulers=getattr(episode, "lr_schedulers", {}),
+        episode_runtime_state=capture_episode_runtime_state(episode),
+        state=state, git_head=git_head,
         hyperparameter_fingerprint=fingerprint,
         extra={"bank_hashes": dict(bank_hashes), **dict(extra or {})},
     )
@@ -1842,6 +1853,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="market_cleared_experimental_v1",
     )
     parser.add_argument("--market-clearing-coarse-points", type=int, default=10)
+    parser.add_argument(
+        "--macro-clearing-solver-mode",
+        choices=("strict_global", "fc1_bounded_improvement_pilot"),
+        default="strict_global",
+    )
     parser.add_argument("--market-clearing-refinement-points", type=int, default=20)
     parser.add_argument(
         "--market-clearing-max-refinement-rounds", type=int, default=4
@@ -1877,6 +1893,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--boundary-i-scan-points", type=int, default=33)
     parser.add_argument("--boundary-i-quadrature-points", type=int, default=8)
     parser.add_argument("--boundary-refinement-rounds", type=int, default=16)
+    parser.add_argument(
+        "--boundary-candidate-h-microbatch-size", type=int, default=1
+    )
     parser.add_argument(
         "--boundary-scan-tail-probability", type=float, default=1.0e-8
     )
@@ -1987,6 +2006,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if resume_checkpoint is not None:
         payload = load_checkpoint(
             resume_checkpoint, models=models, optimizers=episode.optimizers,
+            schedulers=getattr(episode, "lr_schedulers", {}), episode=episode,
             git_head=git_head,
             hyperparameter_fingerprint=fingerprint,
             allow_code_mismatch=args.allow_code_mismatch,
@@ -2225,7 +2245,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             p_start = int(state.get("p_policy_outer", 0)) if phase == "firm_p" and firm_inner == start_firm_inner else 0
             if phase != "firm_q" or firm_inner != start_firm_inner:
                 for p_outer in range(p_start, args.p_policy_outer_max):
-                    block_start = _model_states(models)
+                    block_start = capture_training_transaction(
+                        models=models,
+                        optimizers=episode.optimizers,
+                        episode=episode,
+                        stage_progress={
+                            **state,
+                            "equilibrium_outer": equilibrium_outer,
+                            "phase": "firm_p",
+                            "firm_inner": firm_inner,
+                            "p_policy_outer": p_outer,
+                        },
+                    )
 
                     def run_p(batch_size: int):
                         return _p_policy_outer(
@@ -2240,7 +2271,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         block="P", initial_batch_size=args.p_batch_size,
                         fallback_batch_size=max(1, args.p_batch_size // 2),
                         execute=run_p,
-                        reload_block_start=lambda: _restore_model_states(models, block_start),
+                        reload_block_start=lambda: restore_training_transaction(
+                            block_start,
+                            models=models,
+                            optimizers=episode.optimizers,
+                            episode=episode,
+                        ),
                         events=oom_events, events_path=oom_events_path, device=device,
                         indices={"equilibrium_outer": equilibrium_outer, "firm_inner": firm_inner, "macro_inner": -1},
                     )
@@ -2268,7 +2304,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     _save_stage_checkpoint(
                         run_root=run_root,
                         path=p_root / f"policy_outer_{p_outer:03d}.pt",
-                        models=models, optimizers=episode.optimizers,
+                        models=models, optimizers=episode.optimizers, episode=episode,
                         state=next_state, git_head=git_head,
                         fingerprint=fingerprint, bank_hashes=bank_hashes,
                         extra={"row": row, "m_parity": m_diag["parity"]},
@@ -2300,7 +2336,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             q_streak = 0
             q_start = int(state.get("q_picard_outer", 0)) if phase == "firm_q" and firm_inner == start_firm_inner else 0
             for q_outer in range(q_start, args.q_picard_outer_max):
-                block_start = _model_states(models)
+                block_start = capture_training_transaction(
+                    models=models,
+                    optimizers=episode.optimizers,
+                    episode=episode,
+                    stage_progress={
+                        **state,
+                        "equilibrium_outer": equilibrium_outer,
+                        "phase": "firm_q",
+                        "firm_inner": firm_inner,
+                        "q_picard_outer": q_outer,
+                    },
+                )
 
                 def run_q(batch_size: int):
                     return _q_picard_outer(
@@ -2315,7 +2362,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     block="Q", initial_batch_size=args.q_batch_size,
                     fallback_batch_size=max(1, args.q_batch_size // 2),
                     execute=run_q,
-                    reload_block_start=lambda: _restore_model_states(models, block_start),
+                    reload_block_start=lambda: restore_training_transaction(
+                        block_start,
+                        models=models,
+                        optimizers=episode.optimizers,
+                        episode=episode,
+                    ),
                     events=oom_events, events_path=oom_events_path, device=device,
                     indices={"equilibrium_outer": equilibrium_outer, "firm_inner": firm_inner, "macro_inner": -1},
                 )
@@ -2338,7 +2390,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 _save_stage_checkpoint(
                     run_root=run_root,
                     path=q_root / f"picard_outer_{q_outer:03d}.pt",
-                    models=models, optimizers=episode.optimizers,
+                    models=models, optimizers=episode.optimizers, episode=episode,
                     state=next_state, git_head=git_head,
                     fingerprint=fingerprint, bank_hashes=bank_hashes,
                     extra={"row": row, "m_parity": m_diag["parity"]},
@@ -2413,7 +2465,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _save_stage_checkpoint(
                 run_root=run_root,
                 path=firm_inner_root / "firm_inner_complete.pt",
-                models=models, optimizers=episode.optimizers,
+                models=models, optimizers=episode.optimizers, episode=episode,
                 state=state, git_head=git_head,
                 fingerprint=fingerprint, bank_hashes=bank_hashes,
                 extra={"row": last_firm_row, "m_parity": m_diag["parity"]},
@@ -2433,7 +2485,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         policy_root = firm_root / "policy_distill"
         policy_root.mkdir(parents=True, exist_ok=True)
         if phase != "macro_inner":
-            block_start = _model_states(models)
+            block_start = capture_training_transaction(
+                models=models,
+                optimizers=episode.optimizers,
+                episode=episode,
+                stage_progress=state,
+            )
 
             def run_policy(batch_size: int):
                 return _distill_policy_heads(
@@ -2446,7 +2503,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             policy_summary, _ = run_with_oom_fallback(
                 block="POLICY_BP", initial_batch_size=args.p_batch_size,
                 fallback_batch_size=max(1, args.p_batch_size // 2), execute=run_policy,
-                reload_block_start=lambda: _restore_model_states(models, block_start),
+                reload_block_start=lambda: restore_training_transaction(
+                    block_start,
+                    models=models,
+                    optimizers=episode.optimizers,
+                    episode=episode,
+                ),
                 events=oom_events, events_path=oom_events_path, device=device,
                 indices={"equilibrium_outer": equilibrium_outer, "firm_inner": -1, "macro_inner": -1},
             )
@@ -2469,7 +2531,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             }
             _save_stage_checkpoint(
                 run_root=run_root, path=policy_root / "policy_distill_complete.pt",
-                models=models, optimizers=episode.optimizers,
+                models=models, optimizers=episode.optimizers, episode=episode,
                 state=state, git_head=git_head,
                 fingerprint=fingerprint, bank_hashes=bank_hashes,
                 extra={"policy_summary": policy_summary},
@@ -2642,6 +2704,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 path=macro_root / "candidate_generation_complete.pt",
                 models=models,
                 optimizers=episode.optimizers,
+                episode=episode,
                 state={
                     **state,
                     "equilibrium_outer": equilibrium_outer,
@@ -2715,7 +2778,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "train_validation_source_split": train_validation_split_audit,
                 },
             )
-            block_start = _model_states(models)
+            block_start = capture_training_transaction(
+                models=models,
+                optimizers=episode.optimizers,
+                episode=episode,
+                stage_progress={
+                    **state,
+                    "equilibrium_outer": equilibrium_outer,
+                    "macro_inner": macro_inner,
+                    "macro_stage": resume_macro_stage,
+                },
+                dataset_provenance=input_dataset_fingerprints,
+            )
             input_function_path = macro_inner_root / "input_function_snapshot.pt"
             if input_function_path.is_file():
                 old_functions_cpu = torch.load(
@@ -2791,6 +2865,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         path=macro_inner_root / "fc1_complete.pt",
                         models=models,
                         optimizers=episode.optimizers,
+                        episode=episode,
                         state={
                             **state,
                             "equilibrium_outer": equilibrium_outer,
@@ -2947,6 +3022,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     raise RuntimeError(
                         "post-FC1 fixed validation refresh lost the minimum valid pairs"
                     )
+                validation_coverage = validation_coverage_record(
+                    original_candidate_ids=(
+                        validation_candidate_schedule.locked_candidate_ids
+                        or accepted_validation_ids
+                    ),
+                    before=current_validation_dataset,
+                    after=post_validation_dataset,
+                )
                 if macro_inner == args.macro_inner_max - 1:
                     _record_firm_first_stage(
                         run_root,
@@ -2959,6 +3042,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         path=macro_inner_root / "post_fc1_refresh_complete.pt",
                         models=models,
                         optimizers=episode.optimizers,
+                        episode=episode,
                         state={
                             **state,
                             "equilibrium_outer": equilibrium_outer,
@@ -3078,6 +3162,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             path=macro_inner_root / "sdf_complete.pt",
                             models=models,
                             optimizers=episode.optimizers,
+                            episode=episode,
                             state={
                                 **state,
                                 "equilibrium_outer": equilibrium_outer,
@@ -3103,6 +3188,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     {
                         "train": post_train_dataset.pairing_audit["candidate_coverage"],
                         "validation": post_validation_dataset.pairing_audit["candidate_coverage"],
+                        "validation_coverage": validation_coverage,
                     },
                     time.perf_counter() - simulation_started,
                 )
@@ -3111,7 +3197,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 block="MACRO", initial_batch_size=args.macro_batch_size,
                 fallback_batch_size=max(1, args.macro_batch_size // 2),
                 execute=run_macro,
-                reload_block_start=lambda: _restore_model_states(models, block_start),
+                reload_block_start=lambda: restore_training_transaction(
+                    block_start,
+                    models=models,
+                    optimizers=episode.optimizers,
+                    episode=episode,
+                ),
                 events=oom_events, events_path=oom_events_path, device=device,
                 indices={"equilibrium_outer": equilibrium_outer, "firm_inner": -1, "macro_inner": macro_inner},
             )
@@ -3123,6 +3214,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 source_availability,
                 simulation_seconds,
             ) = result
+            append_summary_row(
+                run_root / "validation_coverage.csv",
+                {
+                    "equilibrium_outer": equilibrium_outer,
+                    "macro_inner": macro_inner,
+                    **source_availability["validation_coverage"],
+                },
+            )
             atomic_write_json(
                 macro_inner_root / "output_parent_bank_metadata.json",
                 {
@@ -3278,6 +3377,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     path=macro_inner_root / "macro_inner_complete.pt",
                     models=models,
                     optimizers=episode.optimizers,
+                    episode=episode,
                     state=state,
                     git_head=git_head,
                     fingerprint=fingerprint,
@@ -3422,7 +3522,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _save_stage_checkpoint(
                 run_root=run_root,
                 path=macro_inner_root / "macro_inner_complete.pt",
-                models=models, optimizers=episode.optimizers,
+                models=models, optimizers=episode.optimizers, episode=episode,
                 state=state, git_head=git_head,
                 fingerprint=fingerprint, bank_hashes=bank_hashes,
                 extra={
@@ -3692,7 +3792,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _save_stage_checkpoint(
             run_root=run_root,
             path=checkpoints / "equilibrium_outer_complete.pt",
-            models=models, optimizers=episode.optimizers,
+            models=models, optimizers=episode.optimizers, episode=episode,
             state=next_state, git_head=git_head,
             fingerprint=fingerprint, bank_hashes=bank_hashes,
             extra={"row": summary_row, "m_parity": m_diag["parity"]},
@@ -3710,7 +3810,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     final_state = {**state, "phase": "complete", "status": final_status}
     _save_stage_checkpoint(
         run_root=run_root, path=run_root / "checkpoints" / "final.pt",
-        models=models, optimizers=episode.optimizers,
+        models=models, optimizers=episode.optimizers, episode=episode,
         state=final_state, git_head=git_head,
         fingerprint=fingerprint, bank_hashes=bank_hashes,
         extra={"fc2_forward_calls": fc2_counter["calls"]},

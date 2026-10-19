@@ -37,6 +37,7 @@ from .simulation_forward import forward_policy_value_for_simulation
 from .market_clearing import (
     MARKET_CLEARING_DISABLED,
     MARKET_CLEARING_V1,
+    STRICT_GLOBAL,
     MarketClearingConfig,
     MarketClearingController,
 )
@@ -163,6 +164,7 @@ class SimulateTS:
         initial_state: Optional[Dict[str, torch.Tensor]] = None,
         state_bank_capture=None,
         market_clearing_mode: str = MARKET_CLEARING_DISABLED,
+        macro_clearing_solver_mode: str = STRICT_GLOBAL,
         market_clearing_coarse_points: int = 10,
         market_clearing_refinement_points: int = 20,
         market_clearing_max_refinement_rounds: int = 4,
@@ -318,6 +320,9 @@ class SimulateTS:
         self.initial_state = initial_state
         self.state_bank_capture = state_bank_capture
         self.market_clearing_mode = str(market_clearing_mode).strip().lower()
+        self.macro_clearing_solver_mode = str(
+            macro_clearing_solver_mode
+        ).strip().lower()
         if self.market_clearing_mode not in {
             MARKET_CLEARING_DISABLED,
             MARKET_CLEARING_V1,
@@ -352,6 +357,7 @@ class SimulateTS:
                 )
             self.market_clearing_controller = MarketClearingController(
                 MarketClearingConfig(
+                    solver_mode=self.macro_clearing_solver_mode,
                     coarse_points=int(market_clearing_coarse_points),
                     refinement_points=int(market_clearing_refinement_points),
                     max_refinement_rounds=int(

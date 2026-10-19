@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
 from data.market_clearing import (  # noqa: E402
+    FC1_BOUNDED_IMPROVEMENT_PILOT,
+    FAST_STATUS_LABELS,
     MarketClearingConfig,
     MarketClearingController,
     MarketClearingError,
@@ -33,7 +35,6 @@ class _SyntheticController(MarketClearingController):
             )
         )
         self.scenario = scenario
-
     @torch.inference_mode()
     def evaluate(self, sim, state, candidates, h, *, detail=False):
         del sim, candidates
@@ -93,6 +94,22 @@ class _SyntheticController(MarketClearingController):
                 }
             )
         return result
+
+
+class _FastSyntheticController(_SyntheticController):
+    def __init__(self, scenario: str):
+        super().__init__(scenario)
+        self.config = MarketClearingConfig(
+            solver_mode=FC1_BOUNDED_IMPROVEMENT_PILOT,
+            coarse_points=10,
+            refinement_points=20,
+            max_refinement_rounds=3,
+            support_lower=-1.0,
+            support_upper=1.0,
+            residual_tolerance=1.0e-5,
+            width_tolerance=1.0e-8,
+            fast_max_evaluations=8,
+        )
 
 
 def _state() -> dict[str, torch.Tensor]:
@@ -157,4 +174,37 @@ def test_nonfinite_candidate_is_not_relabelled_as_discontinuity():
     record = _run_failure("nan_candidate")
     assert record["terminal_status"] != "DISCONTINUITY_CROSSING"
     assert "NONFINITE_CANDIDATE" in record["candidate_rejection_reason"]
+
+
+def test_fast_bounded_improvement_uses_true_operator_and_hard_budget():
+    controller = _FastSyntheticController("continuous")
+    state = _state()
+    cleared = controller.clear_state(
+        object(), state, empty_entry_candidates(state), t=0, branch=-1
+    )
+    assert int(cleared["G_evaluation_count"][0]) == 8
+    assert float(cleared["corrected_normalized_residual"][0]) < float(
+        cleared["baseline_normalized_residual"][0]
+    )
+    assert float(cleared["h_policy_input"][0]) > 0.1
+    assert float(cleared["h_cal_from_ledger"][0]) > float(
+        cleared["h_policy_input"][0]
+    )
+    assert FAST_STATUS_LABELS[int(cleared["fast_solver_status"][0])] == (
+        "IMPROVED_APPROXIMATE"
+    )
+
+
+def test_fast_bounded_improvement_does_not_fabricate_strict_success():
+    controller = _FastSyntheticController("none")
+    state = _state()
+    cleared = controller.clear_state(
+        object(), state, empty_entry_candidates(state), t=0, branch=-1
+    )
+    assert not bool(cleared["market_root_found"][0])
+    assert FAST_STATUS_LABELS[int(cleared["fast_solver_status"][0])] in {
+        "IMPROVED_APPROXIMATE",
+        "BASELINE_NOT_IMPROVED",
+    }
+    assert int(cleared["G_evaluation_count"][0]) <= 8
 

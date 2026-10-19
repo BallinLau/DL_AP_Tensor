@@ -31,7 +31,22 @@ from .consistent_aggregation import (
 
 MARKET_CLEARING_DISABLED = "disabled"
 MARKET_CLEARING_V1 = "market_cleared_experimental_v1"
+STRICT_GLOBAL = "strict_global"
+FC1_BOUNDED_IMPROVEMENT_PILOT = "fc1_bounded_improvement_pilot"
 ROOT_ACCEPTANCE_SAFETY_FACTOR = 0.5
+
+FAST_STATUS_STRICT_ROOT_FOUND = 0
+FAST_STATUS_IMPROVED_APPROXIMATE = 1
+FAST_STATUS_BASELINE_NOT_IMPROVED = 2
+FAST_STATUS_NO_FEASIBLE_CANDIDATE = 3
+FAST_STATUS_UNDEFINED_ECONOMIC_STATE = 4
+FAST_STATUS_LABELS = {
+    FAST_STATUS_STRICT_ROOT_FOUND: "STRICT_ROOT_FOUND",
+    FAST_STATUS_IMPROVED_APPROXIMATE: "IMPROVED_APPROXIMATE",
+    FAST_STATUS_BASELINE_NOT_IMPROVED: "BASELINE_NOT_IMPROVED",
+    FAST_STATUS_NO_FEASIBLE_CANDIDATE: "NO_FEASIBLE_CANDIDATE",
+    FAST_STATUS_UNDEFINED_ECONOMIC_STATE: "UNDEFINED_ECONOMIC_STATE",
+}
 
 # Per-path lifecycle codes.  These are tensors (rather than Python strings) so
 # they survive GPU sub-batching without introducing device synchronizations.
@@ -56,6 +71,7 @@ class MarketClearingError(RuntimeError):
 
 @dataclass(frozen=True)
 class MarketClearingConfig:
+    solver_mode: str = STRICT_GLOBAL
     coarse_points: int = 10
     refinement_points: int = 20
     max_refinement_rounds: int = 4
@@ -65,8 +81,17 @@ class MarketClearingConfig:
     residual_tolerance: float = 1.0e-5
     width_tolerance: float = 1.0e-5
     candidate_chunk_size: int = 262_144
+    fast_alphas: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125)
+    fast_local_correction_rounds: int = 2
+    fast_max_evaluations: int = 8
+    fast_improvement_noise_tolerance: float = 1.0e-10
 
     def validate(self) -> None:
+        if self.solver_mode not in {
+            STRICT_GLOBAL,
+            FC1_BOUNDED_IMPROVEMENT_PILOT,
+        }:
+            raise ValueError(f"unknown market-clearing solver mode: {self.solver_mode}")
         if self.coarse_points < 3:
             raise ValueError("market clearing coarse_points must be at least 3")
         if self.refinement_points < 3:
@@ -81,6 +106,22 @@ class MarketClearingConfig:
             raise ValueError("market clearing tolerances must be positive")
         if self.candidate_chunk_size <= 0:
             raise ValueError("market clearing candidate_chunk_size must be positive")
+        if not self.fast_alphas or any(
+            not (0.0 < float(value) <= 1.0) for value in self.fast_alphas
+        ):
+            raise ValueError("fast_alphas must be nonempty and lie in (0,1]")
+        if self.fast_local_correction_rounds < 0:
+            raise ValueError("fast_local_correction_rounds must be nonnegative")
+        # One initial evaluation and one final accepted-record reconstruction
+        # are both real economic-operator calls and count against the budget.
+        required = 2 + len(self.fast_alphas) + self.fast_local_correction_rounds
+        if self.fast_max_evaluations < required:
+            raise ValueError(
+                "fast_max_evaluations does not cover the configured bounded search: "
+                f"required={required}, budget={self.fast_max_evaluations}"
+            )
+        if self.fast_improvement_noise_tolerance < 0.0:
+            raise ValueError("fast_improvement_noise_tolerance must be nonnegative")
 
 
 def empty_entry_candidates(state: Dict[str, torch.Tensor]) -> EntryCandidates:
@@ -753,6 +794,293 @@ class MarketClearingController:
         t: int,
         branch: int,
     ) -> Dict[str, torch.Tensor]:
+        if self.config.solver_mode == FC1_BOUNDED_IMPROVEMENT_PILOT:
+            return self._clear_state_bounded_improvement(
+                sim, state, candidates, t=t, branch=branch
+            )
+        return self._clear_state_strict(sim, state, candidates, t=t, branch=branch)
+
+    @torch.inference_mode()
+    def _clear_state_bounded_improvement(
+        self,
+        sim: Any,
+        state: Dict[str, torch.Tensor],
+        candidates: EntryCandidates,
+        *,
+        t: int,
+        branch: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Bounded true-operator correction around the current FC1 forecast."""
+
+        started = time.perf_counter()
+        B = int(state["b"].shape[0])
+        device = state["b"].device
+        dtype = state["b"].dtype
+        h_fc1 = state["hatcf"].detach().clone()
+        active = state["alive"].any(dim=1) | candidates.mask.any(dim=1)
+        if not bool(active.all()):
+            active_index = torch.nonzero(active, as_tuple=False).reshape(-1)
+            if active_index.numel() == 0:
+                return self._mark_fully_extinct_state(state, t=t, branch=branch)
+            active_state = {
+                name: value.index_select(0, active_index)
+                if torch.is_tensor(value)
+                and value.ndim > 0
+                and int(value.shape[0]) == B
+                else value
+                for name, value in state.items()
+            }
+            active_candidates = EntryCandidates(
+                **{
+                    name: getattr(candidates, name).index_select(0, active_index)
+                    for name in candidates.__dataclass_fields__
+                }
+            )
+            cleared = self._clear_state_bounded_improvement(
+                sim,
+                active_state,
+                active_candidates,
+                t=t,
+                branch=branch,
+            )
+            return self._merge_active_paths(state, cleared, active_index)
+
+        # Evaluation 1: FC1 baseline.  Detail is retained only for matched
+        # policy-movement diagnostics; the accepted record is reconstructed
+        # once at the final selected h below.
+        baseline = self.evaluate(
+            sim, state, candidates, h_fc1[:, None], detail=True
+        )
+        base_residual = baseline["G_normalized"][:, 0].abs()
+        base_feasible = baseline["resource_feasible"][:, 0]
+        base_c = baseline["C_raw"][:, 0]
+        base_k = baseline["K_total"][:, 0]
+        safe_ratio = torch.where(
+            base_feasible,
+            base_c.to(torch.float64) / base_k.to(torch.float64),
+            torch.ones_like(base_c, dtype=torch.float64),
+        )
+        h_implied = torch.log(safe_ratio.clamp_min(1.0e-300)).to(dtype)
+        alphas = torch.as_tensor(
+            self.config.fast_alphas, device=device, dtype=dtype
+        )
+        proposed_h = h_fc1[:, None] + alphas[None, :] * (
+            h_implied - h_fc1
+        )[:, None]
+
+        # Evaluations 2..(1+A): all first-round candidates are one batched
+        # operator call, while operator_evaluations records the true B*A work.
+        proposed = self.evaluate(sim, state, candidates, proposed_h, detail=False)
+        all_h = torch.cat((h_fc1[:, None], proposed_h), dim=1)
+        all_residual = torch.cat(
+            (base_residual[:, None], proposed["G_normalized"].abs()), dim=1
+        )
+        all_feasible = torch.cat(
+            (base_feasible[:, None], proposed["resource_feasible"]), dim=1
+        )
+        score = torch.where(
+            all_feasible,
+            all_residual,
+            torch.full_like(all_residual, float("inf")),
+        )
+        best_column = torch.argmin(score, dim=1)
+        row = torch.arange(B, device=device)
+        selected_h = all_h[row, best_column]
+        selected_residual = score[row, best_column]
+        selected_c = torch.cat(
+            (base_c[:, None], proposed["C_raw"]), dim=1
+        )[row, best_column]
+        selected_k = torch.cat(
+            (base_k[:, None], proposed["K_total"]), dim=1
+        )[row, best_column]
+        feasible_any = all_feasible.any(dim=1)
+        noise = float(self.config.fast_improvement_noise_tolerance)
+        improved = feasible_any & (
+            (~base_feasible) | (selected_residual + noise < base_residual)
+        )
+
+        evaluations = torch.full(
+            (B,), 1 + len(self.config.fast_alphas),
+            device=device,
+            dtype=torch.long,
+        )
+        # At most two default local updates are possible under the hard budget
+        # of eight because final decision-record reconstruction counts too.
+        for _round in range(self.config.fast_local_correction_rounds):
+            local_implied = torch.log(
+                (selected_c.to(torch.float64) / selected_k.to(torch.float64))
+                .clamp_min(1.0e-300)
+            ).to(dtype)
+            local = self.evaluate(
+                sim, state, candidates, local_implied[:, None], detail=False
+            )
+            evaluations += 1
+            local_residual = local["G_normalized"][:, 0].abs()
+            local_feasible = local["resource_feasible"][:, 0]
+            take = local_feasible & (
+                (~feasible_any) | (local_residual + noise < selected_residual)
+            )
+            selected_h = torch.where(take, local_implied, selected_h)
+            selected_residual = torch.where(
+                take, local_residual, selected_residual
+            )
+            selected_c = torch.where(take, local["C_raw"][:, 0], selected_c)
+            selected_k = torch.where(take, local["K_total"][:, 0], selected_k)
+            feasible_any |= local_feasible
+            improved |= take
+
+        if bool((~feasible_any).any()):
+            bad = torch.nonzero(~feasible_any, as_tuple=False).reshape(-1)
+            raise MarketClearingError(
+                "bounded improvement found no feasible economic candidate; "
+                f"t={t}, branch={branch}, paths={bad.detach().cpu().tolist()[:20]}"
+            )
+
+        # Final evaluation is deliberately counted.  It creates the exact
+        # immutable decision record used by commit/transport; no interpolated
+        # candidate is ever written into Macro data.
+        final = self.evaluate(
+            sim, state, candidates, selected_h[:, None], detail=True
+        )
+        evaluations += 1
+        if bool((evaluations > self.config.fast_max_evaluations).any()):
+            raise RuntimeError("bounded improvement exceeded its G-evaluation budget")
+        final_feasible = final["resource_feasible"][:, 0]
+        if not bool(final_feasible.all()):
+            raise MarketClearingError(
+                "bounded improvement final decision reconstruction became infeasible"
+            )
+        final_g = final["G"][:, 0]
+        final_normalized = final["G_normalized"][:, 0]
+        final_c = final["C_raw"][:, 0]
+        final_k = final["K_total"][:, 0]
+        h_cal = torch.log(
+            (final_c.to(torch.float64) / final_k.to(torch.float64))
+            .clamp_min(1.0e-300)
+        ).to(dtype)
+        strict = final_normalized.abs() <= self.config.residual_tolerance
+        improved = improved & (
+            (~base_feasible) | (final_normalized.abs() + noise < base_residual)
+        )
+        status = torch.full(
+            (B,),
+            FAST_STATUS_BASELINE_NOT_IMPROVED,
+            device=device,
+            dtype=torch.long,
+        )
+        status = torch.where(
+            improved,
+            torch.full_like(status, FAST_STATUS_IMPROVED_APPROXIMATE),
+            status,
+        )
+        status = torch.where(
+            strict,
+            torch.full_like(status, FAST_STATUS_STRICT_ROOT_FOUND),
+            status,
+        )
+
+        self._commit_selected_decision_record(
+            sim, state, candidates, selected_h, final, t=t, branch=branch
+        )
+        baseline_i = baseline["bar_i_firm"][:, 0] >= 0.5
+        final_i = final["bar_i_firm"][:, 0] >= 0.5
+        baseline_z = baseline["bar_z_firm"][:, 0] >= 0.5
+        final_z = final["bar_z_firm"][:, 0] >= 0.5
+        policy_slots = max(int(final_i.shape[1]), 1)
+        investment_flip = (baseline_i != final_i).sum(dim=1).to(dtype) / policy_slots
+        default_flip = (baseline_z != final_z).sum(dim=1).to(dtype) / policy_slots
+        entry_slots = max(int(final["accepted_entry"].shape[2]), 1)
+        entry_flip = (
+            baseline["accepted_entry"][:, 0] != final["accepted_entry"][:, 0]
+        ).sum(dim=1).to(dtype) / entry_slots
+
+        state["h_fc1_original"] = h_fc1
+        state["h_policy_input"] = selected_h.detach()
+        state["h_cal_from_ledger"] = h_cal.detach()
+        state["hatc_belief"] = h_fc1
+        state["hatc_cleared"] = selected_h.detach()
+        state["hatc_cal"] = h_cal.detach()
+        state["hatcf"] = selected_h.detach()
+        state["market_previous_root"] = selected_h.detach()
+        state["market_root_found"] = strict
+        state["market_root_count"] = strict.to(torch.long)
+        state["market_root_residual"] = final_g.to(dtype)
+        state["market_root_residual_normalized"] = final_normalized.to(dtype)
+        state["market_root_C"] = final_c.to(dtype)
+        state["market_root_K"] = final_k.to(dtype)
+        state["market_root_refinement_rounds"] = torch.full(
+            (B,),
+            self.config.fast_local_correction_rounds,
+            device=device,
+            dtype=torch.long,
+        )
+        state["market_root_policy_jump"] = (
+            (investment_flip > 0) | (default_flip > 0) | (entry_flip > 0)
+        )
+        state["market_investment_flip_vs_belief"] = investment_flip
+        state["market_default_flip_vs_belief"] = default_flip
+        state["market_entry_flip_vs_belief"] = entry_flip
+        state["market_root_bracket_count"] = torch.zeros(
+            B, device=device, dtype=torch.long
+        )
+        state["market_root_operator_evaluations"] = evaluations
+        state["fast_solver_status"] = status
+        state["baseline_G"] = baseline["G"][:, 0].to(dtype)
+        state["corrected_G"] = final_g.to(dtype)
+        state["baseline_normalized_residual"] = baseline[
+            "G_normalized"
+        ][:, 0].abs().to(dtype)
+        state["corrected_normalized_residual"] = final_normalized.abs().to(dtype)
+        state["improvement_fraction"] = torch.where(
+            base_residual > noise,
+            (base_residual - final_normalized.abs()) / base_residual,
+            torch.zeros_like(base_residual),
+        ).to(dtype)
+        state["h_policy_minus_h_cal"] = (selected_h - h_cal).to(dtype)
+        state["G_evaluation_count"] = evaluations
+        state["economic_node_status"] = torch.full(
+            (B,), ECONOMIC_NODE_ACTIVE, device=device, dtype=torch.long
+        )
+        state["economic_state_defined"] = torch.ones(
+            B, device=device, dtype=torch.bool
+        )
+        for path in range(B):
+            self.root_records.append(
+                {
+                    "t": int(t),
+                    "branch": int(branch),
+                    "path": int(path),
+                    "solver_mode": FC1_BOUNDED_IMPROVEMENT_PILOT,
+                    "root_status": FAST_STATUS_LABELS[int(status[path])],
+                    "h_fc1_original": float(h_fc1[path]),
+                    "h_policy_input": float(selected_h[path]),
+                    "h_cal_from_ledger": float(h_cal[path]),
+                    "baseline_G": float(baseline["G"][path, 0]),
+                    "corrected_G": float(final_g[path]),
+                    "baseline_normalized_residual": float(base_residual[path]),
+                    "corrected_normalized_residual": float(
+                        final_normalized[path].abs()
+                    ),
+                    "improvement_fraction": float(
+                        state["improvement_fraction"][path]
+                    ),
+                    "G_evaluation_count": int(evaluations[path]),
+                }
+            )
+        self.node_count += B
+        self.root_search_seconds += time.perf_counter() - started
+        return state
+
+    @torch.inference_mode()
+    def _clear_state_strict(
+        self,
+        sim: Any,
+        state: Dict[str, torch.Tensor],
+        candidates: EntryCandidates,
+        *,
+        t: int,
+        branch: int,
+    ) -> Dict[str, torch.Tensor]:
         """Solve all active paths, select a deterministic root, and set ``hatcf``."""
         started = time.perf_counter()
         B = int(state["b"].shape[0])
@@ -779,7 +1107,7 @@ class MarketClearingController:
                     for name in candidates.__dataclass_fields__
                 }
             )
-            cleared = self.clear_state(
+            cleared = self._clear_state_strict(
                 sim,
                 active_state,
                 active_candidates,
@@ -1342,6 +1670,7 @@ class MarketClearingController:
     def summary(self) -> dict[str, Any]:
         return {
             "mode": MARKET_CLEARING_V1,
+            "solver_mode": self.config.solver_mode,
             "VECTORIZED_EVALUATOR": True,
             "VECTORIZED_COARSE_SEARCH": True,
             "VECTORIZED_REFINEMENT": True,
