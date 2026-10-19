@@ -36,8 +36,8 @@ from data.simulate_ts import SimulateTS
 RESOLUTIONS: Mapping[str, tuple[int, int, int, int]] = {
     "low": (65, 8, 33, 8),
     "medium": (129, 16, 65, 16),
-    "high": (513, 32, 257, 32),
-    "reference": (1025, 48, 513, 48),
+    "high": (1025, 48, 513, 48),
+    "reference": (2049, 64, 1025, 64),
 }
 
 
