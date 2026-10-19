@@ -57,6 +57,8 @@ from analysis.nested_equilibrium_utils import (  # noqa: E402
     tensor_hash,
 )
 from analysis.macro_parent_state_bank import (  # noqa: E402
+    MACRO_CANDIDATE_DISTRIBUTION_DESIGNS,
+    RESTRICTED_BETA_FULL_OUTER_V1,
     MacroCandidateSchedule,
     build_macro_candidate_schedule,
     build_one_step_macro_dataset,
@@ -331,6 +333,10 @@ def _configure_hyperparams(args: argparse.Namespace):
     hp.fc1_only_epochs = int(args.fc1_production_epochs)
     hp.sdf_true_only_epochs = int(args.sdf_chunks * args.sdf_epochs_per_chunk)
     hp.sdf_recursive_only_epochs = 0
+    hp.sdf_true_target_batches = int(args.sdf_target_batches)
+    hp.sdf_min_parent_groups_per_batch = int(
+        args.sdf_min_parent_groups_per_batch
+    )
     hp.fc1_max_rounds = 1
     # Recursive FC1 diagnostics belong to the separate long-horizon rollout.
     # Enabling this on a one-step primary table makes the production batch
@@ -1478,7 +1484,21 @@ def _write_metadata(
             if device.type == "cuda" else 0
         ),
     }
-    atomic_write_json(run_root / "metadata" / "run.json", {
+    code_paths = (
+        ROOT / "analysis" / "run_full_nested_equilibrium.py",
+        ROOT / "analysis" / "macro_parent_state_bank.py",
+        ROOT / "data" / "market_clearing.py",
+        ROOT / "data" / "boundary_aware_market_clearing.py",
+        ROOT / "training" / "episode.py",
+    )
+    code_hashes = {}
+    for path in code_paths:
+        digest = sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        code_hashes[str(path.relative_to(ROOT))] = digest.hexdigest()
+    metadata = {
         "initialization_mode": (
             "WARM_START_CHECKPOINT" if initial_checkpoint is not None else "COLD_START"
         ),
@@ -1492,6 +1512,17 @@ def _write_metadata(
         "sdf_mode": "SDF_TRUE_ONLY", "sdf_recursive_epochs": 0,
         "macro_primary_training_source": "MANY_PARENT_CROSS_SECTIONS_ONE_STEP",
         "macro_parent_generation": "PATH_SPECIFIC_BETA_ONE_STEP_BOUNDARY_AWARE",
+        "macro_candidate_distribution_design": (
+            args.macro_candidate_distribution_design
+        ),
+        "max_initial_weighted_b_mean": args.max_initial_weighted_b_mean,
+        "INITIAL_MACRO_STATE_DISTRIBUTION_RESTRICTED": bool(
+            args.initial_total_k_min is not None
+        ),
+        "initial_total_K_bounds": [
+            args.initial_total_k_min,
+            args.initial_total_k_max,
+        ],
         "macro_candidate_budgets": {
             "train": {
                 "target": args.macro_train_target_valid,
@@ -1512,6 +1543,22 @@ def _write_metadata(
         "model_hashes_at_initialization": {
             name: module_hash(model) for name, model in models.items()
         },
+        "code_hashes": code_hashes,
+    }
+    atomic_write_json(run_root / "metadata" / "run.json", metadata)
+    atomic_write_json(run_root / "metadata" / "source_manifest.json", {
+        "branch": metadata["branch"],
+        "git_commit": git_head,
+        "code_hashes": code_hashes,
+    })
+    atomic_write_json(
+        run_root / "metadata" / "economic_config.json",
+        metadata["economic_config"],
+    )
+    atomic_write_json(run_root / "metadata" / "training_config.json", vars(args))
+    atomic_write_json(run_root / "metadata" / "checkpoint_hashes.json", {
+        "initial_checkpoint": initial_checkpoint,
+        "model_hashes_at_initialization": metadata["model_hashes_at_initialization"],
     })
 
 
@@ -1534,6 +1581,44 @@ def _candidate_schedule_overlap(
     if overlap:
         raise RuntimeError(f"macro train/validation candidate leakage: {audit}")
     return audit
+
+
+def _candidate_dataset_coverage_metrics(
+    dataset: Any, *, prefix: str
+) -> dict[str, float]:
+    audit = dataset.candidate_audit.copy()
+    attempted = int(len(audit))
+    accepted = (
+        audit.get("accepted_for_training", pd.Series(dtype=bool))
+        .fillna(False)
+        .astype(bool)
+    )
+    accepted_frame = audit.loc[accepted]
+    clearing = []
+    for column in (
+        "parent_clearing_status",
+        "child_0_clearing_status",
+        "child_1_clearing_status",
+    ):
+        if column in accepted_frame:
+            clearing.extend(accepted_frame[column].dropna().astype(str).tolist())
+    denominator = max(len(clearing), 1)
+    return {
+        f"{prefix}_attempted_candidates": float(attempted),
+        f"{prefix}_accepted_pairs": float(int(accepted.sum())),
+        f"{prefix}_complete_pair_rate": float(int(accepted.sum()) / max(attempted, 1)),
+        f"{prefix}_extinction_rate": float(
+            (audit.get("status", pd.Series(dtype=str)) == "CHILD_EXTINCT").sum()
+            / max(attempted, 1)
+        ),
+        f"{prefix}_strict_clearing_share": float(
+            sum(value == "STRICT_ROOT" for value in clearing) / denominator
+        ),
+        f"{prefix}_approximate_clearing_share": float(
+            sum(value == "APPROXIMATE_PILOT_ACCEPTED" for value in clearing)
+            / denominator
+        ),
+    }
 
 
 def _load_committed_macro_inner_inputs(
@@ -1616,6 +1701,8 @@ def _build_or_refresh_macro_candidate_context(
             firms_per_parent=args.firms_per_path,
             seed=int(args.seed + 30_000 + equilibrium_outer * 100_000),
             candidate_id_offset=int(equilibrium_outer * 10_000_000),
+            max_initial_weighted_b_mean=args.max_initial_weighted_b_mean,
+            distribution_design=args.macro_candidate_distribution_design,
         )
         save_candidate_schedule(train_path, train)
 
@@ -1635,6 +1722,8 @@ def _build_or_refresh_macro_candidate_context(
             firms_per_parent=args.firms_per_path,
             seed=int(args.seed + 40_000),
             candidate_id_offset=1_000_000_000,
+            max_initial_weighted_b_mean=args.max_initial_weighted_b_mean,
+            distribution_design=args.macro_candidate_distribution_design,
         )
         save_candidate_schedule(validation_path, validation)
 
@@ -1728,6 +1817,7 @@ def _record_firm_first_stage(
 
 def _apply_smoke(args: argparse.Namespace) -> None:
     args.equilibrium_outer_max = 1
+    args.overall_gate_min_completed_outers = 1
     args.firm_inner_max = 1
     args.p_policy_outer_max = 1
     args.q_picard_outer_max = 1
@@ -1766,6 +1856,8 @@ def _apply_smoke(args: argparse.Namespace) -> None:
     args.fc1_patience = 1
     args.sdf_chunks = 1
     args.sdf_epochs_per_chunk = 1
+    args.sdf_target_batches = 2
+    args.sdf_min_parent_groups_per_batch = 1
     args.policy_distill_max_epochs = 1
     args.policy_distill_max_steps = 2
 
@@ -1825,6 +1917,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--macro-minimum-partial-train", type=int, default=1024)
     parser.add_argument("--macro-minimum-partial-validation", type=int, default=256)
     parser.add_argument("--macro-parent-batch-size", type=int, default=256)
+    parser.add_argument(
+        "--macro-candidate-distribution-design",
+        choices=MACRO_CANDIDATE_DISTRIBUTION_DESIGNS,
+        default=RESTRICTED_BETA_FULL_OUTER_V1,
+    )
+    parser.add_argument(
+        "--max-initial-weighted-b-mean", type=float, default=0.30
+    )
+    parser.add_argument("--initial-total-k-min", type=float, default=45.0)
+    parser.add_argument("--initial-total-k-max", type=float, default=85.0)
+    parser.add_argument(
+        "--overall-gate-min-completed-outers", type=int, default=2
+    )
     parser.add_argument("--long-diagnostic-paths", type=int, default=50)
     parser.add_argument("--long-diagnostic-horizon", type=int, default=100)
     parser.add_argument(
@@ -1842,6 +1947,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--fc1-patience", type=int, default=20)
     parser.add_argument("--sdf-chunks", type=int, default=4)
     parser.add_argument("--sdf-epochs-per-chunk", type=int, default=100)
+    parser.add_argument("--sdf-target-batches", type=int, default=20)
+    parser.add_argument(
+        "--sdf-min-parent-groups-per-batch", type=int, default=64
+    )
     parser.add_argument("--sdf-recursive-epochs", type=int, default=0)
     parser.add_argument("--policy-distill-max-epochs", type=int, default=1000)
     parser.add_argument("--policy-distill-max-steps", type=int, default=1000)
@@ -1955,6 +2064,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                  "q_picard_outer_max", "macro_inner_max"):
         if int(getattr(args, name)) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if not 0.0 < args.max_initial_weighted_b_mean <= 1.0:
+        parser.error("--max-initial-weighted-b-mean must be in (0, 1]")
+    if not 0.0 < args.initial_total_k_min <= args.initial_total_k_max:
+        parser.error("initial total K bounds must be positive and ordered")
+    if not 1 <= args.overall_gate_min_completed_outers <= args.equilibrium_outer_max:
+        parser.error(
+            "--overall-gate-min-completed-outers must lie within the Outer budget"
+        )
+    if args.sdf_target_batches < 1 or args.sdf_min_parent_groups_per_batch < 1:
+        parser.error("SDF batching counts must be positive")
+    if args.sdf_min_parent_groups_per_batch > args.macro_minimum_partial_train:
+        parser.error(
+            "SDF minimum parent groups cannot exceed the minimum partial train target"
+        )
     return args
 
 
@@ -2641,6 +2764,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 require_cached_shards=str(state.get("macro_stage", "")) in {
                     "post_fc1_refresh", "sdf_fit", "outer_evaluation"
                 },
+                initial_total_k_min=args.initial_total_k_min,
+                initial_total_k_max=args.initial_total_k_max,
             )
             current_validation_dataset = build_one_step_macro_dataset(
                 models=models,
@@ -2661,6 +2786,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 require_cached_shards=str(state.get("macro_stage", "")) in {
                     "post_fc1_refresh", "sdf_fit", "outer_evaluation"
                 },
+                initial_total_k_min=args.initial_total_k_min,
+                initial_total_k_max=args.initial_total_k_max,
             )
         if current_train_dataset.dataset_status == "INSUFFICIENT_VALID_PAIRS":
             raise RuntimeError("insufficient valid train parent-two-child pairs")
@@ -2778,6 +2905,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "train_validation_source_split": train_validation_split_audit,
                 },
             )
+            input_dataset_fingerprints = {
+                "train": one_step_macro_dataset_fingerprint(
+                    current_train_dataset
+                ),
+                "validation": one_step_macro_dataset_fingerprint(
+                    current_validation_dataset
+                ),
+            }
             block_start = capture_training_transaction(
                 models=models,
                 optimizers=episode.optimizers,
@@ -2813,15 +2948,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             old_validation_frame = current_validation_frame
             old_validation_pairs = current_validation_dataset.pairs
-            input_dataset_fingerprints = {
-                "train": one_step_macro_dataset_fingerprint(
-                    current_train_dataset
-                ),
-                "validation": one_step_macro_dataset_fingerprint(
-                    current_validation_dataset
-                ),
-            }
-
             def run_macro(batch_size: int):
                 target_batches = int(getattr(
                     episode.hyperparams, "sdf_true_target_batches", 20
@@ -2925,6 +3051,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         allow_replenishment=True,
                         integration=boundary_integration,
                         root_config=candidate_root_config,
+                        initial_total_k_min=args.initial_total_k_min,
+                        initial_total_k_max=args.initial_total_k_max,
                     )
                     post_validation_dataset = build_one_step_macro_dataset(
                         models=models,
@@ -2938,6 +3066,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         allow_replenishment=False,
                         integration=boundary_integration,
                         root_config=candidate_root_config,
+                        initial_total_k_min=args.initial_total_k_min,
+                        initial_total_k_max=args.initial_total_k_max,
                     )
                     train_output_fingerprint = save_committed_one_step_macro_dataset(
                         committed_train_path, post_train_dataset
@@ -3407,6 +3537,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 continue
             final_sdf = sdf_summary.get("final_row", {})
             production_sdf = sdf_summary["production_metrics"]
+            coverage_metrics = {
+                **_candidate_dataset_coverage_metrics(
+                    current_train_dataset, prefix="train"
+                ),
+                **_candidate_dataset_coverage_metrics(
+                    current_validation_dataset, prefix="validation"
+                ),
+            }
             last_macro_row = {
                 "equilibrium_outer": equilibrium_outer,
                 "macro_inner": macro_inner,
@@ -3449,9 +3587,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "default_rate": macro_diag.get("default_rate", float("nan")),
                 "mean_b": macro_diag.get("b_mean", float("nan")),
                 "mean_M": macro_diag.get("sdf_M_mean", float("nan")),
+                "M_std": float(current_validation_frame["M"].std(ddof=0)),
+                "M_p90": float(current_validation_frame["M"].quantile(0.90)),
+                "M_p99": float(current_validation_frame["M"].quantile(0.99)),
+                "M_clip_low_ratio": next(
+                    (
+                        float(value)
+                        for key, value in final_sdf.items()
+                        if str(key).endswith("M_clip_low_ratio")
+                    ),
+                    float("nan"),
+                ),
+                "M_clip_high_ratio": next(
+                    (
+                        float(value)
+                        for key, value in final_sdf.items()
+                        if str(key).endswith("M_clip_high_ratio")
+                    ),
+                    float("nan"),
+                ),
                 "mean_firms": macro_diag.get("mean_firms", float("nan")),
                 "mean_C": float(current_validation_frame["C"].mean()),
                 "mean_K": float(current_validation_frame["K"].mean()),
+                **coverage_metrics,
             }
             if len(function_history) >= 3:
                 for name in ("m", "fc1_c", "fc1_k"):
@@ -3759,7 +3917,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "FC1_delta_LnK_post_R2", "FC1_delta_LnK_resim_R2",
                 "SDF_objective", "SDF_moment1", "SDF_moment2",
                 "within_D_M_movement", "investment_rate", "default_rate",
-                "mean_b", "mean_M", "mean_firms", "mean_C", "mean_K",
+                "mean_b", "mean_M", "M_std", "M_p90", "M_p99",
+                "M_clip_low_ratio", "M_clip_high_ratio", "mean_firms",
+                "mean_C", "mean_K", "train_complete_pair_rate",
+                "validation_complete_pair_rate", "train_extinction_rate",
+                "validation_extinction_rate", "train_strict_clearing_share",
+                "validation_strict_clearing_share",
+                "train_approximate_clearing_share",
+                "validation_approximate_clearing_share",
             )},
             "firm_conditional_fixed_point_reached": firm_reached,
             "macro_conditional_fixed_point_reached": macro_reached,
@@ -3799,7 +3964,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         state = next_state
         print(json.dumps({"equilibrium_outer_complete": equilibrium_outer, **summary_row}, default=str), flush=True)
-        if overall_gate_streak >= 2:
+        if (
+            overall_gate_streak >= 2
+            and equilibrium_outer + 1
+            >= args.overall_gate_min_completed_outers
+        ):
             final_status = "OVERALL_EQUILIBRIUM_CONVERGED"
             break
 

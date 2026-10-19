@@ -162,6 +162,70 @@ def _plot_lines(
 def _write_dashboard_figures(run_root: Path, dashboard: pd.DataFrame) -> None:
     figures = run_root / "figures"
     specs = {
+        "outer_bellman_residual.png": (
+            (
+                "P0_residual", "PI_residual", "Q_residual",
+                "P0_residual_post_macro", "PI_residual_post_macro",
+                "Q_residual_post_macro",
+            ),
+            "normalized Bellman residual",
+            True,
+        ),
+        "outer_fc1_c_r2.png": (
+            ("FC1_C_pre_R2", "FC1_C_post_R2", "FC1_C_resim_R2"),
+            "FC1-C R2",
+            False,
+        ),
+        "outer_fc1_k_r2.png": (
+            ("FC1_K_pre_R2", "FC1_K_post_R2", "FC1_K_resim_R2"),
+            "FC1-K R2",
+            False,
+        ),
+        "outer_sdf_moments.png": (
+            ("SDF_moment1", "SDF_moment2"),
+            "moment violation",
+            True,
+        ),
+        "outer_function_movement.png": (
+            (
+                "P0_move_p90", "PI_move_p90", "Q_move_p90",
+                "FC1_C_function_move", "FC1_K_function_move",
+                "M_function_move",
+            ),
+            "normalized function movement",
+            True,
+        ),
+        "outer_macro_targets.png": (
+            ("Hatc_target_move", "LnK_target_move"),
+            "conditional target movement",
+            True,
+        ),
+        "outer_firm_mass_capital.png": (
+            ("mean_firms", "mean_K", "default_rate", "investment_rate"),
+            "mass, capital, and policy rates",
+            False,
+        ),
+        "outer_data_coverage.png": (
+            (
+                "train_complete_pair_rate", "validation_complete_pair_rate",
+                "train_extinction_rate", "validation_extinction_rate",
+                "train_strict_clearing_share",
+                "validation_strict_clearing_share",
+                "train_approximate_clearing_share",
+                "validation_approximate_clearing_share",
+            ),
+            "share",
+            False,
+        ),
+        "outer_cross_block_residual.png": (
+            (
+                "P0_residual", "PI_residual", "Q_residual",
+                "P0_residual_post_macro", "PI_residual_post_macro",
+                "Q_residual_post_macro",
+            ),
+            "pre/post Macro Firm residual",
+            True,
+        ),
         "outer_firm_bellman_residual.png": (
             (
                 "P0_residual", "PI_residual", "Q_residual",
@@ -473,6 +537,40 @@ def generate_stage_report(run_root: Path) -> dict[str, Any]:
     statuses = _classify(dashboard, str(runner.get("status", "BLOCKED")))
     last = dashboard.iloc[-1].to_dict() if not dashboard.empty else {}
     first = dashboard.iloc[0].to_dict() if not dashboard.empty else {}
+    completed_outer_ids = set(
+        pd.to_numeric(
+            dashboard.get("equilibrium_outer", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna().astype(int).tolist()
+    )
+    execution: dict[str, Any] = {}
+    firm_all = fc1_all = sdf_all = True
+    for outer in range(4):
+        root = run_root / f"equilibrium_outer_{outer:03d}"
+        completed = bool(
+            outer in completed_outer_ids
+            and (root / "checkpoints" / "equilibrium_outer_complete.pt").is_file()
+        )
+        firm_executed = bool(
+            list(root.glob("firm/firm_inner_*/p/optimizer_*.csv"))
+            and list(root.glob("firm/firm_inner_*/q/optimizer_*.csv"))
+            and (
+                root / "firm" / "policy_distill" / "policy_head_summary.json"
+            ).is_file()
+        )
+        fc1_executed = bool(list(root.glob("macro/macro_inner_*/fc1/history.csv")))
+        sdf_executed = bool(list(root.glob("macro/macro_inner_*/sdf/history.csv")))
+        execution.update(
+            {
+                f"OUTER_{outer}_COMPLETED": completed,
+                f"OUTER_{outer}_FIRM_OPTIMIZER_EXECUTED": firm_executed,
+                f"OUTER_{outer}_FC1_OPTIMIZER_EXECUTED": fc1_executed,
+                f"OUTER_{outer}_SDF_OPTIMIZER_EXECUTED": sdf_executed,
+            }
+        )
+        firm_all &= firm_executed
+        fc1_all &= fc1_executed
+        sdf_all &= sdf_executed
     root_success = _finite(last.get("market_root_success_rate"))
     clip_values = [
         value for value in (
@@ -482,6 +580,7 @@ def generate_stage_report(run_root: Path) -> dict[str, Any]:
     ]
     final = {
         **runner,
+        **execution,
         "MARKET_CLEARING_INTEGRATED": True,
         "ROOT_POLICY_TIMING_PARITY": "PASS" if root_success == 1.0 else "FAIL",
         "ROOT_ACCOUNTING_PARITY": "PASS" if root_success == 1.0 else "FAIL",
@@ -491,6 +590,19 @@ def generate_stage_report(run_root: Path) -> dict[str, Any]:
         "FC1_CONDITIONAL_TRAINING_EXECUTED": bool(len(dashboard)),
         "SDF_CONDITIONAL_TRAINING_EXECUTED": bool(len(dashboard)),
         "OUTER_EPISODES_COMPLETED": int(len(dashboard)),
+        "FULL_TRAINING_OUTERS_COMPLETED": int(len(completed_outer_ids)),
+        "ALL_FOUR_OUTERS_FIRM_OPTIMIZER_EXECUTED": firm_all,
+        "ALL_FOUR_OUTERS_FC1_OPTIMIZER_EXECUTED": fc1_all,
+        "ALL_FOUR_OUTERS_SDF_OPTIMIZER_EXECUTED": sdf_all,
+        "FOUR_OUTER_TRAINING_COMPLETED": bool(
+            completed_outer_ids.issuperset({0, 1, 2, 3})
+            and firm_all and fc1_all and sdf_all
+        ),
+        "ECONOMIC_EQUILIBRIUM_CONVERGED": (
+            "TRUE"
+            if str(runner.get("status")) == "OVERALL_EQUILIBRIUM_CONVERGED"
+            else "FALSE"
+        ),
         "FINAL_FIRM_STATUS": statuses["firm"],
         "FINAL_FC1_STATUS": statuses["fc1"],
         "FINAL_SDF_STATUS": statuses["sdf"],
@@ -542,6 +654,15 @@ def generate_stage_report(run_root: Path) -> dict[str, Any]:
         "FINAL_P0_RESIDUAL", "FINAL_PI_RESIDUAL", "FINAL_Q_RESIDUAL",
         "FINAL_SDF_AIO", "FINAL_ROOT_SUCCESS_RATE", "FINAL_M_CLIPPING",
         "ECONOMIC_EQUATIONS_CHANGED", "READY_FOR_FURTHER_OUTER",
+    ):
+        lines.append(f"{key} = {final.get(key)}")
+    for key in (
+        "OUTER_0_COMPLETED", "OUTER_1_COMPLETED", "OUTER_2_COMPLETED",
+        "OUTER_3_COMPLETED", "ALL_FOUR_OUTERS_FIRM_OPTIMIZER_EXECUTED",
+        "ALL_FOUR_OUTERS_FC1_OPTIMIZER_EXECUTED",
+        "ALL_FOUR_OUTERS_SDF_OPTIMIZER_EXECUTED",
+        "FULL_TRAINING_OUTERS_COMPLETED", "FOUR_OUTER_TRAINING_COMPLETED",
+        "ECONOMIC_EQUILIBRIUM_CONVERGED",
     ):
         lines.append(f"{key} = {final.get(key)}")
     lines.extend([

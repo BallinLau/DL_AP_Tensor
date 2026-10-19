@@ -88,6 +88,32 @@ B_DISTRIBUTION_STRATA: tuple[tuple[str, tuple[float, float], tuple[float, float]
     ("two_tail_concentration", (0.25, 0.90), (0.25, 0.90)),
 )
 
+# New candidate schedules default to the leverage neighborhood of validation
+# candidate 42000000 (observed mean 0.254999).  Existing serialized schedules
+# remain replayable because the cap is applied only while constructing a new
+# schedule; it never rewrites or clips an already committed distribution.
+DEFAULT_MAX_INITIAL_WEIGHTED_B_MEAN = 0.30
+DEFAULT_MACRO_CANDIDATE_DISTRIBUTION_DESIGN = "stratified_beta_v1"
+RESTRICTED_BETA_FULL_OUTER_V1 = "restricted_beta_full_outer_v1"
+MACRO_CANDIDATE_DISTRIBUTION_DESIGNS = (
+    DEFAULT_MACRO_CANDIDATE_DISTRIBUTION_DESIGN,
+    RESTRICTED_BETA_FULL_OUTER_V1,
+)
+RESTRICTED_BETA_FULL_OUTER_ALPHA_RANGE = (1.8, 3.2)
+RESTRICTED_BETA_FULL_OUTER_BETA_RANGE = (4.8, 7.8)
+
+
+def midpoint_beta_mean(alpha: float, beta: float, points: int) -> float:
+    """Mean of the exact midpoint-quantile representation used at simulation."""
+
+    if float(alpha) <= 0.0 or float(beta) <= 0.0 or int(points) < 2:
+        raise ValueError("Beta parameters must be positive and points >= 2")
+    quantiles = (np.arange(int(points), dtype=np.float64) + 0.5) / float(points)
+    values = betaincinv(float(alpha), float(beta), quantiles)
+    if not np.isfinite(values).all():
+        raise RuntimeError("Beta inverse quantiles are nonfinite")
+    return float(np.mean(values))
+
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -531,6 +557,10 @@ def build_macro_candidate_schedule(
     firms_per_parent: int,
     seed: int,
     candidate_id_offset: int,
+    max_initial_weighted_b_mean: Optional[float] = (
+        DEFAULT_MAX_INITIAL_WEIGHTED_B_MEAN
+    ),
+    distribution_design: str = DEFAULT_MACRO_CANDIDATE_DISTRIBUTION_DESIGN,
 ) -> MacroCandidateSchedule:
     """Create a fixed path-specific Beta schedule before any model evaluation.
 
@@ -541,22 +571,65 @@ def build_macro_candidate_schedule(
 
     if max_candidate_budget < 1:
         raise ValueError("max_candidate_budget must be positive")
+    if distribution_design not in MACRO_CANDIDATE_DISTRIBUTION_DESIGNS:
+        raise ValueError(
+            f"unknown macro candidate distribution design: {distribution_design}"
+        )
+    if max_initial_weighted_b_mean is not None and not (
+        0.0 < float(max_initial_weighted_b_mean) <= 1.0
+    ):
+        raise ValueError("max_initial_weighted_b_mean must be in (0, 1]")
+    # Draw a deterministic oversupply and accept only laws whose *actual*
+    # midpoint-quantile mean passes the cap.  This avoids relying on the
+    # analytical Beta mean when the simulator uses a finite quadrature.
+    draw_budget = (
+        int(max_candidate_budget)
+        if max_initial_weighted_b_mean is None
+        else max(1024, int(max_candidate_budget) * 16)
+    )
     sobol = torch.quasirandom.SobolEngine(
         dimension=2, scramble=True, seed=int(seed)
-    ).draw(int(max_candidate_budget)).to(torch.float64)
+    ).draw(draw_budget).to(torch.float64)
     # Rotate the balanced family allocation by a seed-dependent offset.  This
     # is stratification; alpha/beta themselves are not repeated templates.
-    rotation = int(seed) % len(B_DISTRIBUTION_STRATA)
+    strata = (
+        (
+            (
+                RESTRICTED_BETA_FULL_OUTER_V1,
+                RESTRICTED_BETA_FULL_OUTER_ALPHA_RANGE,
+                RESTRICTED_BETA_FULL_OUTER_BETA_RANGE,
+            ),
+        )
+        if distribution_design == RESTRICTED_BETA_FULL_OUTER_V1
+        else B_DISTRIBUTION_STRATA
+    )
+    rotation = int(seed) % len(strata)
     specs: list[MacroCandidateSpec] = []
-    for position in range(int(max_candidate_budget)):
-        family_index = (position + rotation) % len(B_DISTRIBUTION_STRATA)
-        family, alpha_range, beta_range = B_DISTRIBUTION_STRATA[family_index]
-        alpha = alpha_range[0] + float(sobol[position, 0]) * (
+    for draw_index in range(draw_budget):
+        family_index = (draw_index + rotation) % len(strata)
+        family, alpha_range, beta_range = strata[family_index]
+        alpha = alpha_range[0] + float(sobol[draw_index, 0]) * (
             alpha_range[1] - alpha_range[0]
         )
-        beta = beta_range[0] + float(sobol[position, 1]) * (
+        beta = beta_range[0] + float(sobol[draw_index, 1]) * (
             beta_range[1] - beta_range[0]
         )
+        # The analytical mean is only a cheap rejection prefilter. Every
+        # accepted law is checked against the exact finite midpoint-quantile
+        # representation used by the simulator below.
+        if (
+            max_initial_weighted_b_mean is not None
+            and alpha / (alpha + beta)
+            > float(max_initial_weighted_b_mean) + 0.01
+        ):
+            continue
+        observed_mean = midpoint_beta_mean(alpha, beta, firms_per_parent)
+        if (
+            max_initial_weighted_b_mean is not None
+            and observed_mean > float(max_initial_weighted_b_mean) + 1.0e-12
+        ):
+            continue
+        position = len(specs)
         candidate_id = int(candidate_id_offset + position)
         specs.append(
             MacroCandidateSpec(
@@ -573,6 +646,15 @@ def build_macro_candidate_schedule(
                 shock_key_child_0=int(candidate_id * 2),
                 shock_key_child_1=int(candidate_id * 2 + 1),
             )
+        )
+        if len(specs) >= int(max_candidate_budget):
+            break
+    if len(specs) != int(max_candidate_budget):
+        raise RuntimeError(
+            "unable to construct enough candidate distributions under "
+            f"max_initial_weighted_b_mean={max_initial_weighted_b_mean}: "
+            f"accepted={len(specs)}, required={max_candidate_budget}, "
+            f"draw_budget={draw_budget}"
         )
     schedule = MacroCandidateSchedule(
         split=str(split),
@@ -794,6 +876,8 @@ def make_boundary_candidate_initial_state(
     specs: Sequence[MacroCandidateSpec],
     *,
     firms: int,
+    initial_total_k_min: Optional[float] = None,
+    initial_total_k_max: Optional[float] = None,
 ) -> tuple[dict[str, torch.Tensor], pd.DataFrame, dict[str, Any]]:
     """Build path-specific B-only initial distributions with keyed CRN.
 
@@ -830,15 +914,32 @@ def make_boundary_candidate_initial_state(
         shock_type=101,
         dtype=dtype,
     )
-    lnkf = 4.0 + _keyed_normal(
-        seed=seed,
-        path_id=candidate_ids,
-        economic_time=0,
-        branch_id=-1,
-        identity=torch.zeros_like(candidate_ids),
-        shock_type=102,
-        dtype=dtype,
-    )
+    if (initial_total_k_min is None) != (initial_total_k_max is None):
+        raise ValueError("initial total K bounds must be provided together")
+    if initial_total_k_min is not None:
+        if not 0.0 < float(initial_total_k_min) <= float(initial_total_k_max):
+            raise ValueError("initial total K bounds must be positive and ordered")
+        log_k_min = math.log(float(initial_total_k_min))
+        log_k_max = math.log(float(initial_total_k_max))
+        lnkf = log_k_min + (log_k_max - log_k_min) * _keyed_uniform(
+            seed=seed,
+            path_id=candidate_ids,
+            economic_time=0,
+            branch_id=-1,
+            identity=torch.zeros_like(candidate_ids),
+            shock_type=102,
+            dtype=dtype,
+        )
+    else:
+        lnkf = 4.0 + _keyed_normal(
+            seed=seed,
+            path_id=candidate_ids,
+            economic_time=0,
+            branch_id=-1,
+            identity=torch.zeros_like(candidate_ids),
+            shock_type=102,
+            dtype=dtype,
+        )
     hatcf = -2.0 + _keyed_normal(
         seed=seed,
         path_id=candidate_ids,
@@ -970,7 +1071,15 @@ def make_boundary_candidate_initial_state(
         "z_conditional_law_unchanged": True,
         "eta_law_unchanged": True,
         "investment_cost_law_unchanged": True,
-        "initial_K_unchanged": True,
+        "initial_K_unchanged": initial_total_k_min is None,
+        "initial_macro_state_distribution_restricted": (
+            initial_total_k_min is not None
+        ),
+        "initial_total_K_bounds": (
+            None
+            if initial_total_k_min is None
+            else [float(initial_total_k_min), float(initial_total_k_max)]
+        ),
         "initial_x_unchanged": True,
         "firm_mass_unchanged": True,
         "baseline_b_hash": hashlib.sha256(
@@ -1756,6 +1865,8 @@ def _evaluate_boundary_candidate_batch(
     device: torch.device,
     integration: BoundaryIntegrationConfig,
     root_config: MarketClearingConfig,
+    initial_total_k_min: Optional[float] = None,
+    initial_total_k_max: Optional[float] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Evaluate one vectorized candidate batch or raise a typed economic failure."""
 
@@ -1781,7 +1892,11 @@ def _evaluate_boundary_candidate_batch(
     sim.market_clearing_controller = controller
     try:
         state, manifest, preservation = make_boundary_candidate_initial_state(
-            sim, specs, firms=firms
+            sim,
+            specs,
+            firms=firms,
+            initial_total_k_min=initial_total_k_min,
+            initial_total_k_max=initial_total_k_max,
         )
     except (ValueError, FloatingPointError) as error:
         raise _CandidateEconomicFailure(
@@ -1824,29 +1939,50 @@ def _evaluate_boundary_candidate_batch(
     }
     for row in (*parent_rows, *child_rows):
         rows_by_id[int(row["candidate_id"])].append(row)
-    records: list[dict[str, Any]] = []
-    valid_rows: list[dict[str, Any]] = []
-    manifest_rows = manifest.to_dict("records")
-    for local, spec in enumerate(specs):
-        parent_valid = bool(state["market_root_found"][local]) and bool(
-            state.get(
+    def clearing_validity(
+        cleared: Mapping[str, torch.Tensor], local: int
+    ) -> tuple[bool, str]:
+        defined = bool(
+            cleared.get(
                 "economic_state_defined",
                 torch.ones(len(specs), device=device, dtype=torch.bool),
             )[local]
         )
+        if not defined:
+            return False, "UNDEFINED_ECONOMIC_STATE"
+        if bool(cleared["market_root_found"][local]):
+            return True, "STRICT_ROOT"
+        if root_config.solver_mode != "fc1_bounded_improvement_pilot":
+            return False, "STRICT_ROOT_NOT_FOUND"
+        normalized = abs(float(cleared["corrected_normalized_residual"][local]))
+        log_mismatch = abs(float(cleared["h_policy_minus_h_cal"][local]))
+        improvement = float(cleared["improvement_fraction"][local])
+        accepted = bool(
+            normalized <= 1.0e-3
+            and log_mismatch <= 0.005
+            and improvement >= 0.90
+        )
+        return accepted, (
+            "APPROXIMATE_PILOT_ACCEPTED"
+            if accepted
+            else "APPROXIMATE_PILOT_REJECTED"
+        )
+
+    records: list[dict[str, Any]] = []
+    valid_rows: list[dict[str, Any]] = []
+    manifest_rows = manifest.to_dict("records")
+    for local, spec in enumerate(specs):
+        parent_valid, parent_clearing_status = clearing_validity(state, local)
         child_validity = []
+        child_clearing_status = []
         for child in children:
+            valid, clearing_status = clearing_validity(child, local)
             child_validity.append(
-                bool(child["market_root_found"][local])
-                and bool(
-                    child.get(
-                        "economic_state_defined",
-                        torch.ones(len(specs), device=device, dtype=torch.bool),
-                    )[local]
-                )
+                valid
                 and bool(child["accounting_C_raw"][local] > 0.0)
                 and bool(child["accounting_K_total"][local] > 0.0)
             )
+            child_clearing_status.append(clearing_status)
         if not parent_valid:
             status = "PARENT_CLEARING_FAILED"
         elif not child_validity[0] or not child_validity[1]:
@@ -1860,6 +1996,9 @@ def _evaluate_boundary_candidate_batch(
             "parent_status": "VALID" if parent_valid else "INVALID",
             "child_0_status": "VALID" if child_validity[0] else "INVALID",
             "child_1_status": "VALID" if child_validity[1] else "INVALID",
+            "parent_clearing_status": parent_clearing_status,
+            "child_0_clearing_status": child_clearing_status[0],
+            "child_1_clearing_status": child_clearing_status[1],
             "status": status,
             "failure_reason": "" if status == MACRO_CANDIDATE_STATUS_VALID else status,
             "accepted_for_training": False,
@@ -2040,6 +2179,8 @@ def build_one_step_macro_dataset(
     integration: Optional[BoundaryIntegrationConfig] = None,
     root_config: Optional[MarketClearingConfig] = None,
     source_checkpoint_provenance: Optional[Mapping[str, Any]] = None,
+    initial_total_k_min: Optional[float] = None,
+    initial_total_k_max: Optional[float] = None,
 ) -> OneStepMacroDataset:
     """Canonical boundary-aware one-step Macro dataset builder.
 
@@ -2081,6 +2222,11 @@ def build_one_step_macro_dataset(
         "firms_per_parent": candidate_schedule.firms_per_parent,
         "integration_config": asdict(integration),
         "root_config": asdict(root_config),
+        "initial_total_K_bounds": (
+            None
+            if initial_total_k_min is None
+            else [float(initial_total_k_min), float(initial_total_k_max)]
+        ),
         "model_hashes_at_generation": {
             name: _model_state_digest(model)
             for name, model in sorted(models.items())
@@ -2107,6 +2253,7 @@ def build_one_step_macro_dataset(
                 "root_config",
                 "model_hashes_at_generation",
                 "source_checkpoint_provenance",
+                "initial_total_K_bounds",
             ):
                 if _json_hash(recorded.get(key)) != _json_hash(provenance.get(key)):
                     raise RuntimeError(
@@ -2154,6 +2301,8 @@ def build_one_step_macro_dataset(
                     device=device,
                     integration=integration,
                     root_config=root_config,
+                    initial_total_k_min=initial_total_k_min,
+                    initial_total_k_max=initial_total_k_max,
                 )
             )
             if shard_path is not None:
@@ -2364,7 +2513,11 @@ def build_one_step_macro_dataset(
             json.dumps(
                 {
                     "schedule_fingerprint": candidate_schedule.fingerprint,
-                    "sampling_design": "sobol_stratified_beta_midpoint_quantiles_v1",
+                    "sampling_design": (
+                        candidate_schedule.candidate_specs[0].distribution_family
+                        if candidate_schedule.candidate_specs
+                        else "UNKNOWN"
+                    ),
                     "b_support": [
                         float(episode.config.SIM_B_INIT_MIN),
                         float(episode.config.SIM_B_INIT_MAX),

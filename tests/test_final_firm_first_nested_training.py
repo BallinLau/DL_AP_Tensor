@@ -14,6 +14,8 @@ import analysis.macro_parent_state_bank as bank_module
 import analysis.run_full_nested_equilibrium as runner
 from analysis.macro_parent_state_bank import (
     B_DISTRIBUTION_STRATA,
+    DEFAULT_MAX_INITIAL_WEIGHTED_B_MEAN,
+    RESTRICTED_BETA_FULL_OUTER_V1,
     MACRO_CANDIDATE_STATUS_VALID,
     OneStepMacroDataset,
     build_macro_candidate_schedule,
@@ -22,6 +24,7 @@ from analysis.macro_parent_state_bank import (
     load_committed_one_step_macro_dataset,
     lock_validation_candidate_ids,
     make_boundary_candidate_initial_state,
+    midpoint_beta_mean,
     one_step_macro_dataset_fingerprint,
     save_committed_one_step_macro_dataset,
     _macro_rows_to_table,
@@ -248,10 +251,51 @@ def test_b_only_schedule_is_reproducible_diverse_and_disjoint():
     validation = _schedule("validation", 1)
     assert train.fingerprint == repeat.fingerprint
     assert len({(spec.alpha, spec.beta) for spec in train.candidate_specs}) == 32
-    assert len({spec.distribution_family for spec in train.candidate_specs}) == len(
+    assert all(
+        midpoint_beta_mean(spec.alpha, spec.beta, train.firms_per_parent)
+        <= DEFAULT_MAX_INITIAL_WEIGHTED_B_MEAN + 1.0e-12
+        for spec in train.candidate_specs
+    )
+    assert len({spec.distribution_family for spec in train.candidate_specs}) >= 3
+    assert _candidate_schedule_overlap(train, validation)["disjoint"] is True
+
+
+def test_b_only_schedule_can_explicitly_replay_uncapped_legacy_support():
+    legacy = build_macro_candidate_schedule(
+        split="legacy", namespace="legacy", target_valid=23,
+        initial_candidate_budget=32, max_candidate_budget=32,
+        minimum_partial_valid=16, firms_per_parent=16, seed=17,
+        candidate_id_offset=90_000_000, max_initial_weighted_b_mean=None,
+    )
+    assert len({spec.distribution_family for spec in legacy.candidate_specs}) == len(
         B_DISTRIBUTION_STRATA
     )
-    assert _candidate_schedule_overlap(train, validation)["disjoint"] is True
+    assert any(
+        midpoint_beta_mean(spec.alpha, spec.beta, legacy.firms_per_parent)
+        > DEFAULT_MAX_INITIAL_WEIGHTED_B_MEAN
+        for spec in legacy.candidate_specs
+    )
+
+
+def test_restricted_full_outer_schedule_uses_declared_ranges_and_exact_mean_cap():
+    schedule = build_macro_candidate_schedule(
+        split="train", namespace="restricted", target_valid=64,
+        initial_candidate_budget=128, max_candidate_budget=256,
+        minimum_partial_valid=32, firms_per_parent=200, seed=20291018,
+        candidate_id_offset=70_000_000,
+        max_initial_weighted_b_mean=0.30,
+        distribution_design=RESTRICTED_BETA_FULL_OUTER_V1,
+    )
+    assert all(
+        spec.distribution_family == RESTRICTED_BETA_FULL_OUTER_V1
+        for spec in schedule.candidate_specs
+    )
+    assert all(1.8 <= spec.alpha <= 3.2 for spec in schedule.candidate_specs)
+    assert all(4.8 <= spec.beta <= 7.8 for spec in schedule.candidate_specs)
+    assert all(
+        midpoint_beta_mean(spec.alpha, spec.beta, 200) <= 0.30 + 1.0e-12
+        for spec in schedule.candidate_specs
+    )
 
 
 def test_canonical_entry_cannot_call_legacy_rollout_parent_harvest():
@@ -297,6 +341,21 @@ def test_b_only_initializer_changes_only_b_and_preserves_mass_capital_laws():
     )
     assert len(manifest) == 4
     assert preservation["only_b_replaced"] is True
+
+    restricted, restricted_manifest, restricted_preservation = (
+        make_boundary_candidate_initial_state(
+            sim,
+            specs,
+            firms=16,
+            initial_total_k_min=45.0,
+            initial_total_k_max=85.0,
+        )
+    )
+    restricted_total_k = torch.exp(restricted["lnkf"])
+    assert bool(((restricted_total_k >= 45.0) & (restricted_total_k <= 85.0)).all())
+    assert restricted_manifest["K_total"].between(45.0, 85.0).all()
+    assert restricted_preservation["initial_K_unchanged"] is False
+    assert restricted_preservation["initial_macro_state_distribution_restricted"] is True
 
     state["hatc_belief"] = state["hatcf"].clone()
     state["hatc_cleared"] = state["hatcf"] + 0.25
