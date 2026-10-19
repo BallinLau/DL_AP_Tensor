@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -71,9 +72,21 @@ from data.simulate_ts import SimulateTS  # noqa: E402
 
 
 def _git_head() -> str:
-    return subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-    ).strip()
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        source_commit = os.environ.get("SOURCE_COMMIT", "").strip()
+        if not source_commit:
+            raise RuntimeError(
+                "Git metadata is unavailable; exported source archives must set "
+                "SOURCE_COMMIT to the exact generating commit"
+            )
+        return source_commit
 
 
 def _clone_state(state: Mapping[str, Any]) -> dict[str, Any]:
