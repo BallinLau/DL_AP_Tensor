@@ -165,11 +165,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "h_root": float("nan"),
                     "own_operator_G": float("nan"),
                     "own_operator_G_normalized": float("nan"),
+                    "error": repr(error),
+                    "failure_records": json.dumps(
+                        controllers[name].failure_records, sort_keys=True
+                    ),
                 }
             )
-    if "high" not in roots:
-        raise RuntimeError("high-resolution operator did not produce a reference fixed h")
-    fixed_h = torch.tensor([[roots["high"]]], device=device, dtype=state["b"].dtype)
+    anchor_resolution = next(
+        (name for name in ("high", "medium", "low") if name in roots), None
+    )
+    if anchor_resolution is None:
+        _write_csv(
+            output / "regression" / "roots_under_reference_integrator.csv",
+            root_rows,
+        )
+        raise RuntimeError("no audited integration resolution produced a candidate root")
+    fixed_h_value = roots[anchor_resolution]
+    fixed_h = torch.tensor([[fixed_h_value]], device=device, dtype=state["b"].dtype)
     fixed_rows: list[dict[str, Any]] = []
     aggregate_debt = float(
         (state["component_mass"] * state["K"] * state["b"])[
@@ -185,7 +197,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "z_quadrature_points": values[1],
                 "i_scan_points": values[2],
                 "i_quadrature_points": values[3],
-                "fixed_h": roots["high"],
+                "fixed_h": fixed_h_value,
                 "default_mass": float(result["default_mass"][0, 0]),
                 "investment_mass": float(result["investment_mass"][0, 0]),
                 "entry_mass": float(result["entry_mass"][0, 0]),
@@ -249,8 +261,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     operator_scan_rows: list[dict[str, Any]] = []
     if args.operator_scan_points > 1:
         scan_h = torch.linspace(
-            max(-1.6, roots["high"] - 0.5),
-            min(-0.2, roots["high"] + 0.5),
+            max(-1.6, fixed_h_value - 0.5),
+            min(-0.2, fixed_h_value + 0.5),
             args.operator_scan_points,
             device=device,
             dtype=state["b"].dtype,
@@ -291,7 +303,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for name in convergence_fields
     )
     summary = {
-        "fixed_h": roots["high"],
+        "fixed_h": fixed_h_value,
+        "fixed_h_anchor_resolution": anchor_resolution,
         "max_high_vs_reference_fixed_h_relative_error": max_fixed_h_relative_error,
         "fixed_h_convergence_tolerance": 5e-3,
         "FIXED_H_INTEGRATION_CONVERGENCE": max_fixed_h_relative_error <= 5e-3,
