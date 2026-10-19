@@ -67,6 +67,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--unit-test-results", type=Path)
+    parser.add_argument(
+        "--operator-scan",
+        type=Path,
+        help="Optional earlier full operator scan used only for G/default-mass figures.",
+    )
     return parser.parse_args(argv)
 
 
@@ -81,6 +86,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for directory in ("metadata", "distribution", "dynamic", "macro_data", "performance"):
         _copy_tree(pilot / directory, output / directory)
     _copy_tree(integration / "regression", output / "regression")
+    operator_scan_path = integration / "regression" / "operator_scan.csv"
+    operator_scan_provenance = {
+        "source": str(operator_scan_path),
+        "role": "same-audited-node diagnostic figure source",
+        "note": "The latest ultra audit may omit the expensive multi-h scan; its fixed-h and root checks remain authoritative.",
+    }
+    if args.operator_scan is not None:
+        operator_scan_path = args.operator_scan.resolve()
+        shutil.copy2(operator_scan_path, output / "regression" / "operator_scan.csv")
+        operator_scan_provenance["source"] = str(operator_scan_path)
+        operator_scan_provenance["note"] = (
+            "Imported from the earlier completed same-node audit for figures only; "
+            "latest ultra fixed-h/root tables are authoritative."
+        )
+    (output / "regression" / "operator_scan_provenance.json").write_text(
+        json.dumps(operator_scan_provenance, indent=2) + "\n", encoding="utf-8"
+    )
     shutil.copy2(pilot / "summary.json", output / "summary.json")
     component_rows: list[dict[str, Any]] = []
     for split in ("train", "validation"):
@@ -179,7 +201,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     plt.savefig(figures / "z_density_t1_to_t2.png", dpi=180)
     plt.close()
 
-    operator = _read_csv(integration / "regression" / "operator_scan.csv")
+    operator = _read_csv(output / "regression" / "operator_scan.csv")
     if operator:
         plt.figure(figsize=(8, 5))
         for resolution in ("high", "reference"):
@@ -298,6 +320,7 @@ At every parent, both macro children share the full parent distribution and rece
 - Root tolerance was kept at `1e-5`; no tolerance widening, interpolation root, consumption floor, or failed-child filtering was used.
 
 The detailed values are in `regression/fixed_h_integration_convergence.csv`, `regression/roots_under_reference_integrator.csv`, and `regression/operator_scan.csv`.
+The multi-h scan used for the G/default-mass figures has explicit provenance in `regression/operator_scan_provenance.json`; the latest ultra fixed-h and root checks above are authoritative.
 
 ## 5. Multi-period data result
 
