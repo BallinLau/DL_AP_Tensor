@@ -149,10 +149,20 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         task_path = torch.arange(B, device=device)[:, None, None].expand(B, H, L).reshape(-1)
         task_h_column = torch.arange(H, device=device)[None, :, None].expand(B, H, L).reshape(-1)
         task_component = torch.arange(L, device=device)[None, None, :].expand(B, H, L).reshape(-1)
-        task_valid = component_mask[:, None, :].expand(B, H, L).reshape(-1)
+        # A path can have zero surviving incumbents yet retain economically
+        # valid potential entry mass inherited from its parent reference.  One
+        # zero-mass storage slot is evaluated only to keep tensor ranks stable;
+        # it is never counted, exported, or transported as an economic atom.
+        evaluation_component_mask = component_mask.clone()
+        entry_only_path = (~component_mask.any(dim=1)) & candidates.mask.any(dim=1)
+        if bool(entry_only_path.any()):
+            evaluation_component_mask[entry_only_path, 0] = True
+        task_valid = evaluation_component_mask[:, None, :].expand(B, H, L).reshape(-1)
         task_position = torch.nonzero(task_valid, as_tuple=False).reshape(-1)
         if task_position.numel() == 0:
-            raise MarketClearingError("boundary-aware clearing received no active component")
+            raise MarketClearingError(
+                "boundary-aware clearing received neither incumbent mass nor potential entry mass"
+            )
         path = task_path[task_position]
         h_column = task_h_column[task_position]
         component = task_component[task_position]
@@ -642,7 +652,7 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
             "entry_mass": shaped(entry_mass_accepted),
         }
         if detail:
-            survivor_atom_mask = ~atom_default
+            survivor_atom_mask = (~atom_default) & (atom_weight > 0.0)
             detail_state = self._states_for_coordinates(
                 b=b_task[atom_task],
                 z=atom_z,

@@ -154,6 +154,48 @@ def test_entry_is_integrated_over_continuous_z_and_cost_boundaries():
     )
 
 
+def test_entry_only_node_does_not_require_a_fake_incumbent():
+    controller = BoundaryAwareMarketClearingController(
+        MarketClearingConfig(candidate_chunk_size=100_000),
+        BoundaryIntegrationConfig(
+            z_scan_points=33,
+            z_quadrature_points=8,
+            i_scan_points=17,
+            i_quadrature_points=8,
+        ),
+    )
+    sim = SimpleNamespace(
+        models={"policy_value": _BoundaryPolicy()},
+        config=_Config,
+        delta=0.0,
+        effective_entry_cost_max=0.5,
+    )
+    state = _state()
+    state["component_mass"].zero_()
+    state["firm_mass"].zero_()
+    state["component_mask"].zero_()
+    state["alive"].zero_()
+    candidates = EntryCandidates(
+        counts=torch.tensor([1]),
+        mask=torch.tensor([[True]]),
+        z=torch.zeros((1, 1)),
+        entry_cost=torch.zeros((1, 1)),
+        K_birth=torch.ones((1, 1)),
+        potential_capital_nominal=torch.tensor([10.0]),
+        candidate_capital_realized=torch.tensor([1.0]),
+    )
+    result = controller.evaluate(
+        sim, state, candidates, torch.tensor([[0.0]]), detail=True
+    )
+    assert result["entry_mass"].item() == pytest.approx(5.0, abs=5e-4)
+    assert result["K_total"].item() == pytest.approx(5.0, abs=5e-4)
+    assert result["firm_count"].item() == pytest.approx(5.0, abs=5e-4)
+    assert result["entry_transport_atom_weight"].sum().item() == pytest.approx(
+        2.5, abs=5e-4
+    )
+    assert result["transport_atom_weight"].numel() == 0
+
+
 def test_candidate_evaluation_has_no_distribution_side_effect():
     controller = BoundaryAwareMarketClearingController(
         MarketClearingConfig(candidate_chunk_size=100_000),
