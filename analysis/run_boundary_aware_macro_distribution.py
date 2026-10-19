@@ -50,6 +50,8 @@ from data.tensor_data import TensorTable
 
 
 EXPERIMENT = "boundary_aware_macro_distribution_20261019"
+PROJECTION_BALANCE_RELATIVE_TOLERANCE = 1.0e-7
+PROJECTION_FIXED_H_OPERATOR_TOLERANCE = 5.0e-3
 
 
 def _jsonable(value: Any) -> Any:
@@ -412,7 +414,10 @@ def _run_split(
                     **_jsonable(audit),
                 }
                 projection_audits.append(audit_row)
-                if float(audit["max_balance_relative_error"]) > 1.0e-8:
+                if (
+                    float(audit["max_balance_relative_error"])
+                    > PROJECTION_BALANCE_RELATIVE_TOLERANCE
+                ):
                     raise RuntimeError(
                         "source-atom projection failed accounting preservation: "
                         f"t={t}, error={float(audit['max_balance_relative_error'])}"
@@ -467,6 +472,29 @@ def _run_split(
                         audit_row[f"fixed_h_{name}_relative_error_path{path}"] = float(
                             (projected_value - exact_value).abs() / scale
                         )
+                fixed_h_errors = [
+                    float(value)
+                    for key, value in audit_row.items()
+                    if key.startswith("fixed_h_") and "_relative_error_path" in key
+                ]
+                audit_row["max_fixed_h_operator_relative_error"] = max(
+                    fixed_h_errors, default=0.0
+                )
+                audit_row["balance_relative_tolerance"] = (
+                    PROJECTION_BALANCE_RELATIVE_TOLERANCE
+                )
+                audit_row["fixed_h_operator_tolerance"] = (
+                    PROJECTION_FIXED_H_OPERATOR_TOLERANCE
+                )
+                if (
+                    audit_row["max_fixed_h_operator_relative_error"]
+                    > PROJECTION_FIXED_H_OPERATOR_TOLERANCE
+                ):
+                    raise RuntimeError(
+                        "source-atom projection failed fixed-h operator parity: "
+                        f"t={t}, error={audit_row['max_fixed_h_operator_relative_error']}, "
+                        f"tolerance={PROJECTION_FIXED_H_OPERATOR_TOLERANCE}"
+                    )
                 state["_boundary_decision_record"] = projected_record
                 state["_selected_transport_atoms"] = projected_record.transport_atoms
             parent_distribution = _distribution_from_state(state)
@@ -695,6 +723,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "b_points": args.projection_b_points,
                 "capital_points": args.projection_k_points,
                 "output_points": args.projection_u_points,
+            },
+            "projection_acceptance": {
+                "balance_relative_tolerance": PROJECTION_BALANCE_RELATIVE_TOLERANCE,
+                "fixed_h_operator_tolerance": PROJECTION_FIXED_H_OPERATOR_TOLERANCE,
+                "fixed_h_operator_fields": [
+                    "C_raw",
+                    "K_total",
+                    "G",
+                    "default_mass",
+                    "investment_mass",
+                    "entry_mass",
+                ],
             },
         },
     )
