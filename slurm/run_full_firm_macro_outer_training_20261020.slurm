@@ -7,6 +7,8 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=256G
 #SBATCH --time=7-00:00:00
+#SBATCH --output=/home/fit/zhuyingz/WORK/LiuHao/cachedir/full_firm_macro_outer_training_20261020/logs/slurm.%j.out
+#SBATCH --error=/home/fit/zhuyingz/WORK/LiuHao/cachedir/full_firm_macro_outer_training_20261020/logs/slurm.%j.err
 
 set -euo pipefail
 
