@@ -50,6 +50,9 @@ from analysis.run_full_nested_equilibrium import (  # noqa: E402
     _setup_fresh,
     parse_args as parse_nested_args,
 )
+from analysis.fast_macro_clearing_reporting import (  # noqa: E402
+    finalize_pre_fc1_gate_failure,
+)
 from analysis.run_macro_block_isolation import (  # noqa: E402
     run_fc1_fit,
 )
@@ -822,8 +825,24 @@ def main() -> int:
             integration=fast_batch_integration, root_config=fast_batch_root,
             source_checkpoint_provenance={"stage": "pre_fc1", "checkpoint": str(args.initial_checkpoint)},
         )
-        if pre_train.dataset_status == "INSUFFICIENT_VALID_PAIRS" or pre_validation.dataset_status == "INSUFFICIENT_VALID_PAIRS":
-            raise RuntimeError("fast conditional smoke lacks complete parent/two-child pairs")
+        if (
+            pre_train.dataset_status == "INSUFFICIENT_VALID_PAIRS"
+            or pre_validation.dataset_status == "INSUFFICIENT_VALID_PAIRS"
+        ):
+            blocker = (
+                "fast conditional smoke lacks complete parent/two-child pairs: "
+                f"train={pre_train.dataset_status}, "
+                f"validation={pre_validation.dataset_status}"
+            )
+            gate_summary = finalize_pre_fc1_gate_failure(
+                output=output,
+                generating_commit=git_head,
+                reporting_commit=git_head,
+                initial_checkpoint=str(args.initial_checkpoint.resolve()),
+                blocker=blocker,
+            )
+            print(json.dumps(gate_summary, indent=2, sort_keys=True))
+            return 0
         fc1_summary = run_fc1_fit(
             episode, pre_train.batches["fc1"], pre_validation.batches["fc1"],
             output / "smoke" / "fc1", block="joint",
