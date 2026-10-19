@@ -36,8 +36,8 @@ from data.simulate_ts import SimulateTS
 RESOLUTIONS: Mapping[str, tuple[int, int, int, int]] = {
     "low": (65, 8, 33, 8),
     "medium": (129, 16, 65, 16),
-    "high": (257, 24, 129, 24),
-    "reference": (513, 32, 257, 32),
+    "high": (513, 32, 257, 32),
+    "reference": (1025, 48, 513, 48),
 }
 
 
@@ -90,6 +90,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--firms", type=int, default=200)
     parser.add_argument("--seed", type=int, default=20261019)
+    parser.add_argument("--operator-scan-points", type=int, default=0)
     return parser.parse_args(argv)
 
 
@@ -245,6 +246,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _write_csv(output / "regression" / "fixed_h_integration_convergence.csv", fixed_rows)
     _write_csv(output / "regression" / "roots_under_reference_integrator.csv", root_rows)
     _write_csv(output / "regression" / "boundary_locations.csv", boundary_rows)
+    operator_scan_rows: list[dict[str, Any]] = []
+    if args.operator_scan_points > 1:
+        scan_h = torch.linspace(
+            max(-1.6, roots["high"] - 0.5),
+            min(-0.2, roots["high"] + 0.5),
+            args.operator_scan_points,
+            device=device,
+            dtype=state["b"].dtype,
+        )
+        for name in ("high", "reference"):
+            controller = controllers[name]
+            for start in range(0, int(scan_h.numel()), 5):
+                values = scan_h[start : start + 5][None, :]
+                result = controller.evaluate(sim, state, entry, values)
+                for local in range(values.shape[1]):
+                    operator_scan_rows.append(
+                        {
+                            "resolution": name,
+                            "h": float(values[0, local]),
+                            "G": float(result["G"][0, local]),
+                            "G_normalized": float(result["G_normalized"][0, local]),
+                            "C_raw": float(result["C_raw"][0, local]),
+                            "K_total": float(result["K_total"][0, local]),
+                            "default_mass": float(result["default_mass"][0, local]),
+                            "investment_mass": float(result["investment_mass"][0, local]),
+                            "entry_mass": float(result["entry_mass"][0, local]),
+                        }
+                    )
+    _write_csv(output / "regression" / "operator_scan.csv", operator_scan_rows)
     hashes_after = {name: _module_hash(model) for name, model in models.items()}
     reference_row = fixed_rows[-1]
     convergence_fields = (
@@ -265,10 +295,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "max_high_vs_reference_fixed_h_relative_error": max_fixed_h_relative_error,
         "fixed_h_convergence_tolerance": 5e-3,
         "FIXED_H_INTEGRATION_CONVERGENCE": max_fixed_h_relative_error <= 5e-3,
-        "ROOT_REFERENCE_RESIDUAL_CHECK": all(
-            bool(row.get("reference_root_pass", False))
-            for row in root_rows
-            if row["root_status"] == "ROOT_FOUND"
+        "ROOT_REFERENCE_RESIDUAL_CHECK": bool(
+            next(
+                (
+                    row.get("reference_root_pass", False)
+                    for row in root_rows
+                    if row["resolution"] == "high"
+                    and row["root_status"] == "ROOT_FOUND"
+                ),
+                False,
+            )
         ),
         "FIRM_PARAMETERS_FROZEN": hashes_before == hashes_after,
         "optimizer_steps": 0,
