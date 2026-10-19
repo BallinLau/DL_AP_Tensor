@@ -382,18 +382,27 @@ class MarketClearingController:
             shaped, (Y, I_oper, Phi, C_firm, I_maintenance)
         )
         mask = alive.to(dtype) * economic_mass
-        entry_spend = (
+        # Candidate evaluation and the independent production commit traverse
+        # firms with different tensor layouts (dense reduction here versus a
+        # path-indexed reduction in ``_process_node_batched``).  Accumulate the
+        # same float32 firm contributions in float64 before casting the final
+        # ledger back to the production dtype.  This removes GPU reduction-
+        # order noise without changing any decision or economic equation.
+        def ledger_sum(value: torch.Tensor) -> torch.Tensor:
+            return value.to(torch.float64).sum(dim=2).to(dtype)
+
+        entry_spend = ledger_sum(
             candidates.entry_cost[:, None, :]
             * candidates.K_birth[:, None, :]
             * accepted.to(dtype)
             * entry_mass
-        ).sum(dim=2)
-        K_total = (capital * mask).sum(dim=2)
-        Y_total = (Y * mask).sum(dim=2)
-        I_oper_total = (I_oper * mask).sum(dim=2)
-        liquidation_total = (Phi * mask).sum(dim=2)
-        maintenance_total = (I_maintenance * mask).sum(dim=2)
-        C_oper = (C_firm * mask).sum(dim=2)
+        )
+        K_total = ledger_sum(capital * mask)
+        Y_total = ledger_sum(Y * mask)
+        I_oper_total = ledger_sum(I_oper * mask)
+        liquidation_total = ledger_sum(Phi * mask)
+        maintenance_total = ledger_sum(I_maintenance * mask)
+        C_oper = ledger_sum(C_firm * mask)
         C_raw = C_oper - entry_spend
         G = torch.exp(h) * K_total - C_raw
         scale = torch.maximum(

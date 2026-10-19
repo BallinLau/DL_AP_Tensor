@@ -1022,32 +1022,36 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         return_maintenance=True,
     )
 
-    K_total_computed = torch.zeros(n_paths, device=device)
-    Y_total_computed = torch.zeros(n_paths, device=device)
-    Phi_total_computed = torch.zeros(n_paths, device=device)
-    I_oper_computed = torch.zeros(n_paths, device=device)
-    K_maintenance_base_computed = torch.zeros(n_paths, device=device)
-    K_birth_current_node_computed = torch.zeros(n_paths, device=device)
-    I_maintenance_computed = torch.zeros(n_paths, device=device)
-    K_total_computed.index_add_(0, path_idx, K * firm_mass)
-    Y_total_computed.index_add_(0, path_idx, Y * firm_mass)
-    Phi_total_computed.index_add_(0, path_idx, Phi * firm_mass)
-    I_oper_computed.index_add_(0, path_idx, I * firm_mass)
-    K_maintenance_base_computed.index_add_(
-        0, path_idx, K * firm_mass * maintenance_eligible.to(K.dtype)
+    def ledger_index_add(value: torch.Tensor) -> torch.Tensor:
+        total = torch.zeros(n_paths, device=device, dtype=torch.float64)
+        total.index_add_(0, path_idx, value.to(torch.float64))
+        return total.to(K.dtype)
+
+    K_total_computed = ledger_index_add(K * firm_mass)
+    Y_total_computed = ledger_index_add(Y * firm_mass)
+    Phi_total_computed = ledger_index_add(Phi * firm_mass)
+    I_oper_computed = ledger_index_add(I * firm_mass)
+    K_maintenance_base_computed = ledger_index_add(
+        K * firm_mass * maintenance_eligible.to(K.dtype)
     )
-    K_birth_current_node_computed.index_add_(
-        0, path_idx, K * firm_mass * birth_at_node.to(K.dtype)
+    K_birth_current_node_computed = ledger_index_add(
+        K * firm_mass * birth_at_node.to(K.dtype)
     )
-    I_maintenance_computed.index_add_(0, path_idx, I_maintenance * firm_mass)
-    I_entry_event = state.get("event_I_entry", torch.zeros(n_paths, device=device))
+    I_maintenance_computed = ledger_index_add(I_maintenance * firm_mass)
+    I_entry_event = state.get(
+        "event_I_entry", torch.zeros(n_paths, device=device, dtype=K.dtype)
+    )
     resources = aggregate_node_resources(
-        C * firm_mass,
+        (C * firm_mass).to(torch.float64),
         path_idx,
         n_paths=n_paths,
-        I_entry=I_entry_event,
+        I_entry=I_entry_event.to(torch.float64),
         mode=getattr(sim, "consumption_aggregation_mode", "legacy_per_firm_clamp"),
     )
+    resources = {
+        name: value.to(K.dtype) if value.is_floating_point() else value
+        for name, value in resources.items()
+    }
     firm_mass_by_path = torch.zeros(n_paths, device=device, dtype=K.dtype)
     firm_mass_by_path.index_add_(0, path_idx, firm_mass)
     aggregate_debt = torch.zeros(n_paths, device=device, dtype=K.dtype)
@@ -2669,7 +2673,7 @@ def _apply_value_cost_entry_batched(sim, state: Dict[str, torch.Tensor]) -> Dict
         accepted,
         candidates.entry_cost * candidates.K_birth * candidate_mass,
         torch.zeros_like(candidates.entry_cost),
-    ).sum(dim=1)
+    ).to(torch.float64).sum(dim=1).to(candidates.entry_cost.dtype)
     state["event_K_entry_gross"] = torch.where(
         accepted,
         candidates.K_birth * candidate_mass,

@@ -271,7 +271,12 @@ def assert_candidate_commit_parity(
         actual = committed.get(name)
         if actual is None:
             raise RuntimeError(f"committed ledger is missing {name}")
-        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        try:
+            torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        except AssertionError as exc:
+            raise AssertionError(
+                f"candidate/commit ledger mismatch for {name}: {exc}"
+            ) from exc
 
 
 def attach_default_mass(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
