@@ -314,6 +314,41 @@ def test_engineering_failure_is_fail_fast(monkeypatch):
         )
 
 
+def test_candidate_resume_loads_committed_shards_without_re_evaluation(
+    monkeypatch, tmp_path
+):
+    schedule = _schedule("train")
+    output = tmp_path / "resume"
+    monkeypatch.setattr(
+        bank_module,
+        "_evaluate_boundary_candidates_with_isolation",
+        _fake_candidate_evaluator,
+    )
+    first = build_one_step_macro_dataset(
+        models={}, episode=_FakeEpisode(), candidate_schedule=schedule,
+        parent_batch_size=4, macro_batch_size=64, device=torch.device("cpu"),
+        output_dir=output,
+    )
+
+    def must_not_run(**_kwargs):
+        raise AssertionError("committed candidate shard was re-evaluated")
+
+    monkeypatch.setattr(
+        bank_module,
+        "_evaluate_boundary_candidates_with_isolation",
+        must_not_run,
+    )
+    resumed = build_one_step_macro_dataset(
+        models={}, episode=_FakeEpisode(), candidate_schedule=schedule,
+        parent_batch_size=4, macro_batch_size=64, device=torch.device("cpu"),
+        output_dir=output, require_cached_shards=True,
+    )
+    assert (
+        resumed.pairing_audit["candidate_coverage"]["accepted_candidate_ids"]
+        == first.pairing_audit["candidate_coverage"]["accepted_candidate_ids"]
+    )
+
+
 def test_two_outer_firm_first_control_flow_and_resume():
     fresh = run_firm_first_orchestration_mock(outer_count=2)
     resumed = run_firm_first_orchestration_mock(outer_count=2, resume_after=7)

@@ -2335,6 +2335,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir=macro_root / "candidate_data" / "pre_fc1_train",
             integration=boundary_integration,
             root_config=candidate_root_config,
+            require_cached_shards=str(state.get("macro_stage", "")) in {
+                "post_fc1_refresh", "sdf_fit", "outer_evaluation"
+            },
         )
         current_validation_dataset = build_one_step_macro_dataset(
             models=models,
@@ -2352,6 +2355,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ),
             integration=boundary_integration,
             root_config=candidate_root_config,
+            require_cached_shards=str(state.get("macro_stage", "")) in {
+                "post_fc1_refresh", "sdf_fit", "outer_evaluation"
+            },
         )
         if current_train_dataset.dataset_status == "INSUFFICIENT_VALID_PAIRS":
             raise RuntimeError("insufficient valid train parent-two-child pairs")
@@ -2543,6 +2549,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     allow_replenishment=False,
                     integration=boundary_integration,
                     root_config=candidate_root_config,
+                    require_cached_shards=resume_macro_stage in {
+                        "sdf_fit", "outer_evaluation"
+                    },
                 )
                 post_validation_dataset = build_one_step_macro_dataset(
                     models=models,
@@ -2556,6 +2565,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     allow_replenishment=False,
                     integration=boundary_integration,
                     root_config=candidate_root_config,
+                    require_cached_shards=resume_macro_stage in {
+                        "sdf_fit", "outer_evaluation"
+                    },
                 )
                 if post_train_dataset.dataset_status == "INSUFFICIENT_VALID_PAIRS":
                     raise RuntimeError("post-FC1 train refresh lost the minimum valid pairs")

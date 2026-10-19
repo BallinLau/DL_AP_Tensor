@@ -1803,6 +1803,7 @@ def build_one_step_macro_dataset(
     output_dir: Optional[Path] = None,
     candidate_ids: Optional[Sequence[int]] = None,
     allow_replenishment: bool = True,
+    require_cached_shards: bool = False,
     integration: Optional[BoundaryIntegrationConfig] = None,
     root_config: Optional[MarketClearingConfig] = None,
 ) -> OneStepMacroDataset:
@@ -1898,6 +1899,10 @@ def build_one_step_macro_dataset(
             batch_records = list(payload["records"])
             batch_manifest = list(payload["manifest"])
         else:
+            if require_cached_shards and shard_path is not None:
+                raise RuntimeError(
+                    f"resume requires committed candidate shard: {shard_path}"
+                )
             batch_rows, batch_records, batch_manifest = (
                 _evaluate_boundary_candidates_with_isolation(
                     models=models,
