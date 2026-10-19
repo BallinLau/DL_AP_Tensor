@@ -176,7 +176,7 @@ def test_continuum_two_step_simulation_tracks_mass_separately_from_slots():
     sim = SimulateTS(
         models={"policy_value": _HardPolicy(), "sdf_fc1": None},
         config=_ContinuumConfig,
-        n_paths=1,
+        n_paths=3,
         group_size=2,
         horizon=2,
         branch_num=2,
@@ -200,7 +200,8 @@ def test_continuum_two_step_simulation_tracks_mass_separately_from_slots():
     )
     output = sim.simulate_tensor()
     macro = output.macro.to_dataframe()
-    assert len(macro) == 6
+    assert len(macro) == 18
+    assert macro["path"].nunique() == 3
     assert (macro["slot_count"] >= macro["firm_mass"]).all()
     assert (macro["firm_mass"] > 0.0).all()
     assert macro["distribution_projection_error"].max() < 1.0e-5

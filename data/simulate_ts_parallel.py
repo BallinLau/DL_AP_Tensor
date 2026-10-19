@@ -2170,112 +2170,144 @@ def _expand_and_project_continuum_distribution(
     )
     z_lo = float(sim.config.ZBAR) - 4.0 * stationary_std
     z_hi = float(sim.config.ZBAR) + 4.0 * stationary_std
-    projected_rows: list[dict[str, torch.Tensor]] = []
-    projection_error = torch.zeros(B, device=device, dtype=dtype)
-
-    for path in range(B):
-        valid = alive[path] & (mass[path] > 0.0)
-        if not bool(valid.any()):
-            projected_rows.append({})
-            continue
-        m = mass[path, valid]
-        bp = b[path, valid]
-        zp = z[path, valid]
-        etap = eta[path, valid]
-        ip = investment_cost[path, valid]
-        kp = K[path, valid]
-        initial = repeat(state["initial_cohort"])[path, valid]
-        birth = repeat(state["birth_time"])[path, valid]
-        klog = torch.log(kp.clamp_min(1.0e-30))
-        kmin, kmax = klog.min(), klog.max()
-        kspan = (kmax - kmin).clamp_min(1.0e-12)
-        b_key = torch.clamp((bp * b_bins).floor().to(torch.long), 0, b_bins - 1)
-        z_key = torch.clamp(
-            (((zp - z_lo) / max(z_hi - z_lo, 1.0e-12)) * z_bins)
-            .floor()
-            .to(torch.long),
-            0,
-            z_bins - 1,
-        )
-        k_key = torch.clamp(
-            (((klog - kmin) / kspan) * k_bins).floor().to(torch.long),
-            0,
-            k_bins - 1,
-        )
-        eta_key = (etap > 0.5).to(torch.long)
-        i_key = torch.clamp(
-            (ip / max(float(sim.config.I_THRESHOLD), 1.0e-12) * Ji)
-            .floor()
-            .to(torch.long),
-            0,
-            Ji - 1,
-        )
-        birth_key = torch.where(
-            initial >= 0.5,
-            torch.zeros_like(birth, dtype=torch.long),
-            birth.round().to(torch.long).clamp_min(0) + 1,
-        )
-        birth_base = max(int(birth_key.max().item()) + 1, 2)
-        key = (((((b_key * z_bins + z_key) * k_bins + k_key) * 2 + eta_key)
-                 * Ji + i_key) * birth_base + birth_key)
-        unique, inverse = torch.unique(key, sorted=True, return_inverse=True)
-        groups = int(unique.numel())
-
-        def reduce_sum(value: torch.Tensor) -> torch.Tensor:
-            out = torch.zeros(groups, device=device, dtype=dtype)
-            out.scatter_add_(0, inverse, value)
-            return out
-
-        m_out = reduce_sum(m)
-        capital_total = reduce_sum(m * kp)
-        debt_total = reduce_sum(m * kp * bp)
-        output_proxy = reduce_sum(m * kp * torch.exp(zp))
-        k_out = capital_total / m_out.clamp_min(1.0e-30)
-        b_out = debt_total / capital_total.clamp_min(1.0e-30)
-        z_out = torch.log(output_proxy / capital_total.clamp_min(1.0e-30))
-        eta_out = reduce_sum(m * etap) / m_out.clamp_min(1.0e-30)
-        i_out = reduce_sum(m * ip) / m_out.clamp_min(1.0e-30)
-        initial_out = reduce_sum(m * initial) / m_out.clamp_min(1.0e-30)
-        birth_out = reduce_sum(m * birth) / m_out.clamp_min(1.0e-30)
-        eps_out = reduce_sum(m * eps_z[path, valid]) / m_out.clamp_min(1.0e-30)
-        ueta_out = reduce_sum(m * u_eta[path, valid]) / m_out.clamp_min(1.0e-30)
-        ui_out = reduce_sum(m * u_i[path, valid]) / m_out.clamp_min(1.0e-30)
-
-        before = torch.stack(
-            (m.sum(), (m * kp).sum(), (m * kp * bp).sum(),
-             (m * kp * torch.exp(zp)).sum())
-        )
-        after = torch.stack(
-            (m_out.sum(), capital_total.sum(), debt_total.sum(), output_proxy.sum())
-        )
-        projection_error[path] = ((after - before).abs() / before.abs().clamp_min(1.0e-12)).max()
-        projected_rows.append(
-            {
-                "b": b_out,
-                "z": z_out,
-                "eta": eta_out,
-                "i": i_out,
-                "K": k_out,
-                "firm_mass": m_out,
-                "initial_cohort": initial_out,
-                "birth_time": birth_out,
-                "transition_eps_z": eps_out,
-                "transition_u_eta": ueta_out,
-                "transition_u_i": ui_out,
-            }
-        )
-
-    max_groups = max((int(row.get("b", torch.empty(0)).numel()) for row in projected_rows), default=0)
-    if max_groups == 0:
+    # Build one path-qualified group key and reduce every distribution unit in
+    # one GPU scatter.  This avoids the old Python loop over economic paths and
+    # keeps the numerical representation separate from firm mass.
+    valid = alive & (mass > 0.0)
+    if not bool(valid.any()):
         return state
-    projected_names = tuple(next(row for row in projected_rows if row).keys())
-    for name in projected_names:
+
+    initial = repeat(state["initial_cohort"])
+    birth = repeat(state["birth_time"])
+    klog = torch.log(K.clamp_min(1.0e-30))
+    inf = torch.full_like(klog, float("inf"))
+    kmin = torch.where(valid, klog, inf).amin(dim=1)
+    kmax = torch.where(valid, klog, -inf).amax(dim=1)
+    any_valid = valid.any(dim=1)
+    kmin = torch.where(any_valid, kmin, torch.zeros_like(kmin))
+    kmax = torch.where(any_valid, kmax, kmin)
+    kspan = (kmax - kmin).clamp_min(1.0e-12)
+
+    b_key = torch.clamp((b * b_bins).floor().to(torch.long), 0, b_bins - 1)
+    z_key = torch.clamp(
+        (((z - z_lo) / max(z_hi - z_lo, 1.0e-12)) * z_bins)
+        .floor()
+        .to(torch.long),
+        0,
+        z_bins - 1,
+    )
+    k_key = torch.clamp(
+        (((klog - kmin[:, None]) / kspan[:, None]) * k_bins)
+        .floor()
+        .to(torch.long),
+        0,
+        k_bins - 1,
+    )
+    eta_key = (eta > 0.5).to(torch.long)
+    i_key = torch.clamp(
+        (investment_cost / max(float(sim.config.I_THRESHOLD), 1.0e-12) * Ji)
+        .floor()
+        .to(torch.long),
+        0,
+        Ji - 1,
+    )
+    birth_key = torch.where(
+        initial >= 0.5,
+        torch.zeros_like(birth, dtype=torch.long),
+        birth.round().to(torch.long).clamp_min(0) + 1,
+    )
+    birth_base = max(int(birth_key[valid].max().item()) + 1, 2)
+    local_key = (
+        (((((b_key * z_bins + z_key) * k_bins + k_key) * 2 + eta_key)
+           * Ji + i_key) * birth_base + birth_key)
+    )
+    local_key_space = b_bins * z_bins * k_bins * 2 * Ji * birth_base
+    path_grid = torch.arange(B, device=device, dtype=torch.long)[:, None].expand_as(local_key)
+    global_key = path_grid * local_key_space + local_key
+    flat_valid = valid.reshape(-1)
+    keys = global_key.reshape(-1)[flat_valid]
+    unique, inverse = torch.unique(keys, sorted=True, return_inverse=True)
+    groups = int(unique.numel())
+    group_path = torch.div(unique, local_key_space, rounding_mode="floor")
+
+    def flatten(value: torch.Tensor) -> torch.Tensor:
+        return value.reshape(-1)[flat_valid]
+
+    def reduce_sum(value: torch.Tensor) -> torch.Tensor:
+        # Moment construction is an accounting operation, so accumulate it in
+        # FP64 even though the policy networks continue to consume FP32 state.
+        out = torch.zeros(groups, device=device, dtype=torch.float64)
+        out.scatter_add_(0, inverse, flatten(value).to(torch.float64))
+        return out
+
+    m_out = reduce_sum(mass)
+    capital_total = reduce_sum(mass * K)
+    debt_total = reduce_sum(mass * K * b)
+    output_proxy = reduce_sum(mass * K * torch.exp(z))
+    k_out = capital_total / m_out.clamp_min(1.0e-30)
+    b_out = debt_total / capital_total.clamp_min(1.0e-30)
+    z_out = torch.log(output_proxy / capital_total.clamp_min(1.0e-30))
+    projected = {
+        "b": b_out.to(dtype),
+        "z": z_out.to(dtype),
+        "eta": (reduce_sum(mass * eta) / m_out.clamp_min(1.0e-30)).to(dtype),
+        "i": (reduce_sum(mass * investment_cost) / m_out.clamp_min(1.0e-30)).to(dtype),
+        "K": k_out.to(dtype),
+        "firm_mass": m_out.to(dtype),
+        "initial_cohort": (
+            reduce_sum(mass * initial) / m_out.clamp_min(1.0e-30)
+        ).to(dtype),
+        "birth_time": (
+            reduce_sum(mass * birth) / m_out.clamp_min(1.0e-30)
+        ).to(dtype),
+        "transition_eps_z": (
+            reduce_sum(mass * eps_z) / m_out.clamp_min(1.0e-30)
+        ).to(dtype),
+        "transition_u_eta": (
+            reduce_sum(mass * u_eta) / m_out.clamp_min(1.0e-30)
+        ).to(dtype),
+        "transition_u_i": (
+            reduce_sum(mass * u_i) / m_out.clamp_min(1.0e-30)
+        ).to(dtype),
+    }
+
+    counts = torch.bincount(group_path, minlength=B)
+    max_groups = int(counts.max().item())
+    starts = torch.cumsum(counts, dim=0) - counts
+    group_rank = torch.arange(groups, device=device) - starts[group_path]
+    for name, values in projected.items():
         fill = float("nan") if name.startswith("transition_") else 0.0
         target = torch.full((B, max_groups), fill, device=device, dtype=dtype)
-        for path, row in enumerate(projected_rows):
-            if row:
-                target[path, : row[name].numel()] = row[name]
+        target[group_path, group_rank] = values
         state[name] = target
+
+    # Audit aggregation before and after compression using the same path-wise
+    # GPU reductions.  Explicit default/entry mass changes occur elsewhere.
+    before_terms = torch.stack(
+        (mass, mass * K, mass * K * b, mass * K * torch.exp(z)), dim=-1
+    ).to(torch.float64)
+    before = torch.zeros((B, 4), device=device, dtype=torch.float64)
+    before.scatter_add_(
+        0,
+        path_grid.reshape(-1, 1).expand(-1, 4),
+        before_terms.reshape(-1, 4),
+    )
+    projected_mass = state["firm_mass"].to(torch.float64)
+    projected_k = state["K"].to(torch.float64)
+    projected_b = state["b"].to(torch.float64)
+    projected_z = state["z"].to(torch.float64)
+    after = torch.stack(
+        (
+            projected_mass.sum(dim=1),
+            (projected_mass * projected_k).sum(dim=1),
+            (projected_mass * projected_k * projected_b).sum(dim=1),
+            (projected_mass * projected_k * torch.exp(projected_z)).sum(dim=1),
+        ),
+        dim=1,
+    )
+    projection_error = (
+        (after - before).abs() / before.abs().clamp_min(1.0e-12)
+    ).amax(dim=1).to(dtype)
     alive_projected = state["firm_mass"] > 0.0
     state["alive"] = alive_projected
     state["entry"] = torch.zeros((B, max_groups), device=device, dtype=dtype)
