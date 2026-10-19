@@ -465,13 +465,13 @@ def _run_split(
                         PROJECTION_FIXED_H_OPERATOR_TOLERANCE
                     )
                     if (
-                        float(audit["max_balance_relative_error"])
+                        float(audit["max_accounting_relative_error"])
                         > PROJECTION_BALANCE_RELATIVE_TOLERANCE
                     ):
                         raise RuntimeError(
                             "predecision projection failed accounting preservation: "
                             f"t={t + 1}, branch={branch}, "
-                            f"error={float(audit['max_balance_relative_error'])}"
+                            f"error={float(audit['max_accounting_relative_error'])}"
                         )
                     if (
                         audit_row["max_fixed_h_operator_relative_error"]

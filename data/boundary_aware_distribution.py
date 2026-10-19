@@ -979,6 +979,8 @@ def moment_project_predecision_distribution(
         "debt_after": after[:, 2],
         "output_proxy_before": before[:, 3],
         "output_proxy_after": after[:, 3],
+        "max_accounting_relative_error": relative[:, :3].max(),
+        "output_proxy_relative_error": relative[:, 3].max(),
         "max_balance_relative_error": relative.max(),
     }
     return projected, audit

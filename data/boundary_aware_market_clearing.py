@@ -247,6 +247,19 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         # PI-P0 boundary in the original uniform cost probability coordinate.
         default_z_position = torch.nonzero(~z_survival, as_tuple=False).reshape(-1)
         survivor_z_position = torch.nonzero(z_survival, as_tuple=False).reshape(-1)
+        investment_boundary_probability = torch.empty(
+            (0, 0), device=device, dtype=dtype
+        )
+        investment_boundary_mask = torch.empty(
+            (0, 0), device=device, dtype=torch.bool
+        )
+        investment_boundary_residual = torch.empty(
+            (0, 0), device=device, dtype=dtype
+        )
+        investment_boundary_source_task = torch.empty(
+            0, device=device, dtype=torch.long
+        )
+        investment_boundary_source_z = torch.empty(0, device=device, dtype=dtype)
         if survivor_z_position.numel():
             S = int(survivor_z_position.numel())
             survivor_task = z_task_index[survivor_z_position]
@@ -286,6 +299,11 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                 coordinate_tolerance=self.integration.boundary_coordinate_tolerance,
                 zero_tolerance=self.integration.boundary_value_tolerance,
             )
+            investment_boundary_probability = investment_boundaries.boundary_coordinate
+            investment_boundary_mask = investment_boundaries.boundary_mask
+            investment_boundary_residual = investment_boundaries.residual
+            investment_boundary_source_task = survivor_task
+            investment_boundary_source_z = survivor_z
             self.investment_boundary_count += int(investment_boundaries.boundary_mask.sum())
             i_left, i_right, i_interval_mask = interval_bounds_from_boundaries(
                 investment_boundaries.boundary_coordinate,
@@ -712,6 +730,11 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                     "default_boundary_mask": default_boundaries.boundary_mask,
                     "default_boundary_residual": default_boundaries.residual,
                     "default_boundary_task_position": task_position,
+                    "investment_boundary_probability": investment_boundary_probability,
+                    "investment_boundary_mask": investment_boundary_mask,
+                    "investment_boundary_residual": investment_boundary_residual,
+                    "investment_boundary_source_task": investment_boundary_source_task,
+                    "investment_boundary_source_z": investment_boundary_source_z,
                 }
             )
         self._sync(device)
