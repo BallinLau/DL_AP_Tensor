@@ -18,6 +18,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-/home/fit/zhuyingz/WORK/LiuHao/cachedir/boundary_aware
 OLD_COMMAND="${OLD_COMMAND:-/WORK/PUBLIC/zhuyingz_work/LiuHao/cachedir/market_cleared_full_nested_equilibrium_20261019_r8/logs/small_command.json}"
 CHECKPOINT="${CHECKPOINT:-/WORK/PUBLIC/zhuyingz_work/LiuHao/cachedir/market_cleared_full_nested_equilibrium_20261019_r8/small/equilibrium_outer_000/firm/policy_distill/policy_distill_complete.pt}"
 FIRMS="${FIRMS:-200}"
+OPERATOR_SCAN_POINTS="${OPERATOR_SCAN_POINTS:-0}"
 
 mkdir -p "$OUTPUT_DIR" /home/fit/zhuyingz/WORK/LiuHao/.mplcache
 cd "$REPO_DIR"
@@ -34,4 +35,5 @@ python3 analysis/run_boundary_aware_integration_audit.py \
   --old-command "$OLD_COMMAND" \
   --checkpoint "$CHECKPOINT" \
   --device cuda:0 \
-  --firms "$FIRMS"
+  --firms "$FIRMS" \
+  --operator-scan-points "$OPERATOR_SCAN_POINTS"

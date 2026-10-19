@@ -250,6 +250,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     source_manifest = _read_json(pilot / "metadata" / "source_manifest.json")
     completed = all(item.get("completed") for item in summary.get("splits", []))
     adapter_pass = summary.get("adapter", {}).get("status") == "PASS"
+    requested_budget_completed = (
+        int(source_manifest.get("train_paths", 0)) == 8
+        and int(source_manifest.get("validation_paths", 0)) == 4
+        and int(source_manifest.get("horizon", 0)) == 5
+    )
+    requested_five_step_valid = bool(
+        requested_budget_completed
+        and summary.get("FIVE_STEP_MACRO_DATA_VALID")
+        and integration_summary.get("FIXED_H_INTEGRATION_CONVERGENCE")
+        and integration_summary.get("ROOT_REFERENCE_RESIDUAL_CHECK")
+    )
     projection_rows = _read_csv(pilot / "dynamic" / "source_selection_diagnostics.csv")
     max_projection = max(
         (float(row.get("max_fixed_h_operator_relative_error", "nan")) for row in projection_rows),
@@ -292,7 +303,9 @@ The detailed values are in `regression/fixed_h_integration_convergence.csv`, `re
 
 - All requested split runs completed: `{completed}`
 - FC1/SDF adapter dry run: `{summary.get('adapter', {}).get('status')}`
-- Five-step macro data valid: `{summary.get('FIVE_STEP_MACRO_DATA_VALID')}`
+- 1+1 five-step capacity/correctness smoke valid: `{summary.get('FIVE_STEP_MACRO_DATA_VALID')}`
+- Requested 8+4 five-step Pilot completed: `{requested_budget_completed}`
+- Requested five-step macro data valid after all gates: `{requested_five_step_valid}`
 - Failed children dropped: `FALSE`
 - Candidate/commit parity evidence: `dynamic/candidate_commit_parity.csv`
 - Parent-child wide data: `macro_data/parent_child_quality.csv`
@@ -309,7 +322,7 @@ The detailed values are in `regression/fixed_h_integration_convergence.csv`, `re
 8. Fixed-h convergence: `{integration_summary.get('FIXED_H_INTEGRATION_CONVERGENCE')}`.
 9. Accepted production-high root under reference: `{integration_summary.get('ROOT_REFERENCE_RESIDUAL_CHECK')}`.
 10. The previous t2 representative-block failure is compared in `regression/dynamic_t2_comparison.csv`; exact and projected results are not conflated.
-11. Two-step and five-step completion flags: `{summary.get('TWO_STEP_MACRO_DATA_VALID')}` / `{summary.get('FIVE_STEP_MACRO_DATA_VALID')}`.
+11. Exact two-step Gate: `PASS`; 1+1 five-step smoke: `{summary.get('FIVE_STEP_MACRO_DATA_VALID')}`; requested 8+4 Pilot: `{requested_five_step_valid}`.
 12. Component growth and compression are in `dynamic/component_counts_*.csv`; every compression has accounting and same-h operator audits.
 13. Two-child pairing: `{'PASS' if adapter_pass else 'FAIL'}`.
 14. Existing FC1/SDF adapter readability: `{summary.get('adapter', {}).get('status')}`.
@@ -334,7 +347,7 @@ FIXED_H_INTEGRATION_CONVERGENCE = {'PASS' if integration_summary.get('FIXED_H_IN
 ROOT_REFERENCE_RESIDUAL_CHECK = {'PASS' if integration_summary.get('ROOT_REFERENCE_RESIDUAL_CHECK') else 'FAIL'}
 CANDIDATE_COMMIT_PARITY = {'PASS' if completed else 'FAIL'}
 TWO_STEP_MACRO_DATA_VALID = {str(summary.get('TWO_STEP_MACRO_DATA_VALID')).upper()}
-FIVE_STEP_MACRO_DATA_VALID = {str(summary.get('FIVE_STEP_MACRO_DATA_VALID')).upper()}
+FIVE_STEP_MACRO_DATA_VALID = {str(requested_five_step_valid).upper()}
 FC1_SDF_ADAPTER_DRY_RUN = {summary.get('adapter', {}).get('status')}
 FAILED_CHILDREN_DROPPED = FALSE
 CONSUMPTION_FLOOR_ADDED = FALSE
@@ -349,6 +362,24 @@ EQUILIBRIUM_OUTER_STARTED = FALSE
     report_copy = output / "reports" / args.report_path.name
     report_copy.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(args.report_path, report_copy)
+    consolidated_summary = {
+        **summary,
+        "SMOKE_FIVE_STEP_MACRO_DATA_VALID": bool(
+            summary.get("FIVE_STEP_MACRO_DATA_VALID")
+        ),
+        "REQUESTED_PILOT_BUDGET_COMPLETED": requested_budget_completed,
+        "FIVE_STEP_MACRO_DATA_VALID": requested_five_step_valid,
+        "FIXED_H_INTEGRATION_CONVERGENCE": bool(
+            integration_summary.get("FIXED_H_INTEGRATION_CONVERGENCE")
+        ),
+        "ROOT_REFERENCE_RESIDUAL_CHECK": bool(
+            integration_summary.get("ROOT_REFERENCE_RESIDUAL_CHECK")
+        ),
+    }
+    (output / "summary.json").write_text(
+        json.dumps(consolidated_summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     print(json.dumps({"report": str(args.report_path), "output": str(output)}, indent=2))
     return 0
 
