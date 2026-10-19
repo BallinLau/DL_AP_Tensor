@@ -340,14 +340,16 @@ def test_parent_summary_movement_aligns_common_sources_after_censoring():
     assert movement["b_mean_nmae"] > 0.0
 
 
-def test_macro_training_does_not_require_horizon_100_and_long_rollout_not_primary():
+def test_macro_training_is_one_step_candidate_based_and_long_rollout_optional():
     args = parse_args(["--cold-start", "--smoke"])
-    assert args.macro_bank_rollout_horizon == 3
-    assert effective_capture_times(args.macro_bank_capture_times, 3) == (1, 2)
+    assert args.macro_train_target_valid == 8
+    assert args.macro_validation_target_valid == 4
+    assert args.macro_train_max_candidate_budget == 32
     assert args.long_diagnostic_horizon == 8
     assert not args.use_long_rollout_for_macro_training
+    assert not args.run_long_diagnostics
     source = Path("analysis/run_full_nested_equilibrium.py").read_text(encoding="utf-8")
-    assert "MANY_PARENT_CROSS_SECTIONS_ONE_STEP" in source
+    assert "PATH_SPECIFIC_BETA_BOUNDARY_AWARE_ONE_STEP" in source
     assert '"long_rollout_training_used": False' in source
 
 

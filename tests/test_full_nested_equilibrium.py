@@ -41,17 +41,21 @@ def test_production_defaults_match_formal_protocol():
     assert args.p_batch_size == 1024
     assert args.q_batch_size == 2048
     assert args.macro_batch_size == 4096
-    assert args.macro_bank_candidate_paths == 1024
-    assert args.macro_bank_validation_paths == 256
-    assert args.macro_train_parent_count == 4096
-    assert args.macro_validation_parent_count == 1024
-    assert args.macro_bank_rollout_horizon == 8
-    assert args.macro_bank_capture_times == "0,2,4,6,8"
+    assert args.macro_train_target_valid == 2048
+    assert args.macro_validation_target_valid == 512
+    assert args.macro_train_initial_candidate_budget == 4096
+    assert args.macro_train_max_candidate_budget == 8192
+    assert args.macro_validation_initial_candidate_budget == 1024
+    assert args.macro_validation_max_candidate_budget == 2048
+    assert args.macro_minimum_partial_train == 1024
+    assert args.macro_minimum_partial_validation == 256
     assert args.macro_parent_batch_size == 256
-    assert args.macro_bank_coverage_fraction == 0.20
     assert args.long_diagnostic_paths == 50
     assert args.long_diagnostic_horizon == 100
     assert not args.use_long_rollout_for_macro_training
+    assert not args.run_long_diagnostics
+    assert args.market_clearing_mode == "market_cleared_experimental_v1"
+    assert args.aggregation_mode == "continuum_mass_consistent_v1"
     assert args.firms_per_path == 200
     assert args.branch_num == 2
     assert args.q_solver == "picard"
@@ -70,11 +74,12 @@ def test_smoke_overrides_only_scale_and_budget():
     assert args.macro_inner_max == 1
     assert (args.simulation_paths, args.validation_paths) == (4, 4)
     assert (args.firms_per_path, args.simulation_horizon) == (32, 8)
-    assert args.macro_bank_candidate_paths == 8
-    assert args.macro_bank_validation_paths == 4
-    assert args.macro_train_parent_count == 16
-    assert args.macro_validation_parent_count == 8
-    assert args.macro_bank_rollout_horizon == 3
+    assert args.macro_train_target_valid == 8
+    assert args.macro_validation_target_valid == 4
+    assert args.macro_train_initial_candidate_budget == 16
+    assert args.macro_train_max_candidate_budget == 32
+    assert args.macro_validation_initial_candidate_budget == 8
+    assert args.macro_validation_max_candidate_budget == 16
     assert args.macro_parent_batch_size == 4
     assert args.sdf_recursive_epochs == 0
     assert args.disable_fc2

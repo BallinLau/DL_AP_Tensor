@@ -54,25 +54,18 @@ from analysis.nested_equilibrium_utils import (  # noqa: E402
     tensor_hash,
 )
 from analysis.macro_parent_state_bank import (  # noqa: E402
-    MacroParentSourceSchedule,
+    MacroCandidateSchedule,
+    build_macro_candidate_schedule,
     build_one_step_macro_dataset,
-    distribution_coverage,
-    effective_capture_times,
-    harvest_available_macro_parent_schedule_with_candidate,
-    harvest_macro_parent_schedule_with_candidate,
-    load_schedule,
-    parent_summary_movement,
-    parse_capture_times,
-    prepare_macro_parent_schedule,
-    save_bank_shards,
-    save_schedule,
-    source_overlap,
-    write_coverage_artifacts,
-    write_macro_inner_movement_figure,
+    load_candidate_schedule,
+    lock_validation_candidate_ids,
+    save_candidate_schedule,
 )
 from analysis.market_cleared_banks import (  # noqa: E402
     build_market_cleared_transition_bank,
 )
+from data.boundary_aware_market_clearing import BoundaryIntegrationConfig  # noqa: E402
+from data.market_clearing import MarketClearingConfig  # noqa: E402
 from analysis.run_coupled_fixed_macro import (  # noqa: E402
     build_coupled_view,
     coupled_transition_metrics,
@@ -223,9 +216,9 @@ def _args_fingerprint(args: argparse.Namespace) -> str:
 
 def _configure_hyperparams(args: argparse.Namespace):
     hp = build_hyperparams()
-    hp.n_paths = int(args.macro_train_parent_count)
+    hp.n_paths = int(args.macro_train_target_valid)
     hp.batch_size = int(args.macro_batch_size)
-    hp.simulate_horizon = int(args.macro_bank_rollout_horizon)
+    hp.simulate_horizon = 1
     hp.fc1_only_epochs = int(args.fc1_production_epochs)
     hp.sdf_true_only_epochs = int(args.sdf_chunks * args.sdf_epochs_per_chunk)
     hp.sdf_recursive_only_epochs = 0
@@ -288,6 +281,33 @@ def _configure_hyperparams(args: argparse.Namespace):
         hp.simulation_bp_action_source = "grid"
         hp.simulation_bp_grid_n_child_shocks = 2
     return hp
+
+
+def _candidate_operator_configs(
+    args: argparse.Namespace,
+) -> tuple[BoundaryIntegrationConfig, MarketClearingConfig]:
+    integration = BoundaryIntegrationConfig(
+        z_scan_points=int(args.boundary_z_scan_points),
+        z_quadrature_points=int(args.boundary_z_quadrature_points),
+        i_scan_points=int(args.boundary_i_scan_points),
+        i_quadrature_points=int(args.boundary_i_quadrature_points),
+        boundary_refinement_rounds=int(args.boundary_refinement_rounds),
+        scan_tail_probability=float(args.boundary_scan_tail_probability),
+    )
+    root = MarketClearingConfig(
+        coarse_points=int(args.market_clearing_coarse_points),
+        refinement_points=int(args.market_clearing_refinement_points),
+        max_refinement_rounds=int(args.market_clearing_max_refinement_rounds),
+        support_lower=float(args.market_clearing_support_lower),
+        support_upper=float(args.market_clearing_support_upper),
+        support_padding=float(args.market_clearing_support_padding),
+        residual_tolerance=float(args.market_clearing_residual_tolerance),
+        width_tolerance=float(args.market_clearing_width_tolerance),
+        candidate_chunk_size=int(args.market_clearing_candidate_chunk_size),
+    )
+    integration.validate()
+    root.validate()
+    return integration, root
 
 
 def _setup_fresh(args: argparse.Namespace, device: torch.device):
@@ -907,6 +927,38 @@ def _one_step_target_movements(
     return result
 
 
+def _candidate_target_movements(old: Any, new: Any) -> dict[str, Any]:
+    """Align one-step targets on immutable candidate/branch identity."""
+
+    left = _to_frame(old)
+    right = _to_frame(new)
+    identity = ["path", "t", "branch"]
+    aligned = left.merge(
+        right,
+        on=identity,
+        how="inner",
+        suffixes=("_old", "_new"),
+        validate="one_to_one",
+    ).sort_values(identity).reset_index(drop=True)
+    if aligned.empty:
+        raise RuntimeError("candidate target movement has no common identities")
+    result: dict[str, Any] = {
+        "old_pair_count": int(len(left)),
+        "new_pair_count": int(len(right)),
+        "common_pair_count": int(len(aligned)),
+        "common_candidate_count": int(aligned["path"].nunique()),
+        "movement_alignment": "IMMUTABLE_CANDIDATE_BRANCH_IDENTITY",
+    }
+    for column, label in (("Hatc_t1", "Hatc"), ("LnK_t1", "LnK")):
+        metrics = movement_metrics(
+            torch.as_tensor(aligned[f"{column}_old"].to_numpy()),
+            torch.as_tensor(aligned[f"{column}_new"].to_numpy()),
+            label.lower(),
+        )
+        result[f"{label}_target_move"] = metrics[f"{label.lower()}_nmae"]
+    return result
+
+
 def _macro_gate(row: Mapping[str, Any]) -> bool:
     return bool(
         float(row["M_function_move"]) < 0.005
@@ -1270,10 +1322,22 @@ def _write_metadata(
         "fc2": "COMPLETELY_DISABLED",
         "sdf_mode": "SDF_TRUE_ONLY", "sdf_recursive_epochs": 0,
         "macro_primary_training_source": "MANY_PARENT_CROSS_SECTIONS_ONE_STEP",
-        "macro_parent_generation": "SHORT_ENDOGENOUS_ROLLOUT_HARVEST",
-        "macro_short_rollout_horizon": int(args.macro_bank_rollout_horizon),
+        "macro_parent_generation": "PATH_SPECIFIC_BETA_ONE_STEP_BOUNDARY_AWARE",
+        "macro_candidate_budgets": {
+            "train": {
+                "target": args.macro_train_target_valid,
+                "initial": args.macro_train_initial_candidate_budget,
+                "maximum": args.macro_train_max_candidate_budget,
+            },
+            "validation": {
+                "target": args.macro_validation_target_valid,
+                "initial": args.macro_validation_initial_candidate_budget,
+                "maximum": args.macro_validation_max_candidate_budget,
+            },
+        },
         "macro_one_step_horizon": 1,
         "long_rollout_training_used": False,
+        "long_rollout_diagnostics_enabled": bool(args.run_long_diagnostics),
         "long_rollout_horizon": int(args.long_diagnostic_horizon),
         "m_semantics": "CURRENT_SDF_CHILD shared by P and Q; one common clamp",
         "model_hashes_at_initialization": {
@@ -1282,315 +1346,166 @@ def _write_metadata(
     })
 
 
-def _schedule_report(
-    *,
-    candidate: pd.DataFrame,
-    selected: pd.DataFrame,
-    schedule: MacroParentSourceSchedule,
-    initial_audit: Mapping[str, Any],
+def _candidate_schedule_overlap(
+    train: MacroCandidateSchedule,
+    validation: MacroCandidateSchedule,
 ) -> dict[str, Any]:
-    return {
-        "candidate_count": int(len(candidate)),
-        "requested_count": int(len(schedule.source_keys)),
-        "selected_count": int(len(selected)),
-        "endogenous_frequency_count": int(round(
-            len(selected) * schedule.endogenous_frequency_share
-        )),
-        "coverage_aware_count": int(round(
-            len(selected) * schedule.coverage_aware_share
-        )),
-        "endogenous_frequency_share": schedule.endogenous_frequency_share,
-        "coverage_aware_share": schedule.coverage_aware_share,
-        "candidate_shortfall": 0,
-        "schedule_fingerprint": schedule.fingerprint,
-        "candidate_coverage": distribution_coverage(candidate),
-        "selected_coverage": distribution_coverage(selected),
-        "unique_source_paths": int(selected["initial_path_id"].nunique()),
-        "capture_time_distribution": {
-            str(int(key)): int(value)
-            for key, value in selected["capture_time"].value_counts().sort_index().items()
-        },
-        "initial_cross_sections": dict(initial_audit),
+    train_ids = {spec.candidate_id for spec in train.candidate_specs}
+    validation_ids = {spec.candidate_id for spec in validation.candidate_specs}
+    overlap = sorted(train_ids.intersection(validation_ids))
+    audit = {
+        "train_namespace": train.namespace,
+        "validation_namespace": validation.namespace,
+        "train_candidate_count": len(train_ids),
+        "validation_candidate_count": len(validation_ids),
+        "overlap_count": len(overlap),
+        "overlap_candidate_ids": overlap[:20],
+        "disjoint": not overlap,
     }
+    if overlap:
+        raise RuntimeError(f"macro train/validation candidate leakage: {audit}")
+    return audit
 
 
-def _build_or_refresh_macro_parent_context(
+def _build_or_refresh_macro_candidate_context(
     *,
     args: argparse.Namespace,
     run_root: Path,
     outer_root: Path,
     equilibrium_outer: int,
-    models: Mapping[str, torch.nn.Module],
-    episode: Episode,
-    device: torch.device,
-) -> tuple[
-    Mapping[str, torch.Tensor],
-    Mapping[str, torch.Tensor],
-    MacroParentSourceSchedule,
-    MacroParentSourceSchedule,
-    Any,
-    Any,
-]:
-    parent_root = outer_root / "macro_parent_bank"
-    parent_root.mkdir(parents=True, exist_ok=True)
-    requested_times = parse_capture_times(args.macro_bank_capture_times)
+) -> tuple[MacroCandidateSchedule, MacroCandidateSchedule, dict[str, Any]]:
+    """Create immutable train/validation candidate schedules before simulation.
 
-    train_seed = int(args.seed + 30_000 + equilibrium_outer * 100_000)
-    train_transition_seed = train_seed + 11
-    train_entry_seed = train_seed + 12
-    train_initial_path = parent_root / "train_initial_state.pt"
-    if train_initial_path.is_file():
-        macro_train_initial = torch.load(
-            train_initial_path, map_location="cpu", weights_only=True
-        )
-    else:
-        macro_train_initial = make_initial_state(
-            models=models,
-            episode=episode,
-            paths=args.macro_bank_candidate_paths,
-            firms=args.firms_per_path,
-            horizon=args.macro_bank_rollout_horizon,
-            branch_num=args.branch_num,
-            seed=train_seed,
-            device=device,
-        )
-        atomic_torch_save(train_initial_path, macro_train_initial)
+    The train schedule is outer-specific.  Validation parameters, shocks and
+    candidate identities live under a global run directory and are reused by
+    every outer.  Neither schedule depends on Firm/FC1/SDF outputs or candidate
+    success, which makes replenishment and resume deterministic.
+    """
 
-    train_schedule_path = parent_root / "train_source_schedule.json"
-    if train_schedule_path.is_file():
-        train_schedule = load_schedule(train_schedule_path)
-        train_harvest, train_candidate, train_candidate_occupancy = (
-            harvest_macro_parent_schedule_with_candidate(
-                models=models,
-                episode=episode,
-                initial_state=macro_train_initial,
-                schedule=train_schedule,
-                source_episode=equilibrium_outer,
-                branch_num=args.branch_num,
-                device=device,
-            )
-        )
-        train_report = _schedule_report(
-            candidate=train_candidate,
-            selected=train_harvest.summary,
-            schedule=train_schedule,
-            initial_audit=train_harvest.initial_hash_audit,
-        )
+    candidate_root = outer_root / "macro_candidates"
+    candidate_root.mkdir(parents=True, exist_ok=True)
+    train_path = candidate_root / "train_candidate_schedule.json"
+    if train_path.is_file():
+        train = load_candidate_schedule(train_path)
     else:
-        (
-            train_schedule,
-            train_harvest,
-            train_candidate,
-            train_candidate_occupancy,
-            train_report,
-        ) = prepare_macro_parent_schedule(
-            models=models,
-            episode=episode,
-            initial_state=macro_train_initial,
+        train = build_macro_candidate_schedule(
             split=f"train_outer_{equilibrium_outer:03d}",
-            source_episode=equilibrium_outer,
-            initial_state_seed=train_seed,
-            transition_seed=train_transition_seed,
-            entry_seed=train_entry_seed,
-            short_rollout_horizon=args.macro_bank_rollout_horizon,
-            capture_times=requested_times,
-            branch_num=args.branch_num,
-            target_count=args.macro_train_parent_count,
-            coverage_fraction=args.macro_bank_coverage_fraction,
-            selection_seed=train_seed + 21,
-            device=device,
+            namespace=f"train_outer_{equilibrium_outer:03d}",
+            target_valid=args.macro_train_target_valid,
+            initial_candidate_budget=args.macro_train_initial_candidate_budget,
+            max_candidate_budget=args.macro_train_max_candidate_budget,
+            minimum_partial_valid=args.macro_minimum_partial_train,
+            firms_per_parent=args.firms_per_path,
+            seed=int(args.seed + 30_000 + equilibrium_outer * 100_000),
+            candidate_id_offset=int(equilibrium_outer * 10_000_000),
         )
-        save_schedule(train_schedule_path, train_schedule)
+        save_candidate_schedule(train_path, train)
 
-    global_validation_root = run_root / "fixed_point" / "macro_global_validation"
-    global_validation_root.mkdir(parents=True, exist_ok=True)
-    validation_seed = int(args.seed + 40_000)
-    validation_initial_path = global_validation_root / "initial_state.pt"
-    if validation_initial_path.is_file():
-        macro_validation_initial = torch.load(
-            validation_initial_path, map_location="cpu", weights_only=True
-        )
+    validation_root = run_root / "fixed_point" / "macro_global_validation"
+    validation_root.mkdir(parents=True, exist_ok=True)
+    validation_path = validation_root / "validation_candidate_schedule.json"
+    if validation_path.is_file():
+        validation = load_candidate_schedule(validation_path)
     else:
-        macro_validation_initial = make_initial_state(
-            models=models,
-            episode=episode,
-            paths=args.macro_bank_validation_paths,
-            firms=args.firms_per_path,
-            horizon=args.macro_bank_rollout_horizon,
-            branch_num=args.branch_num,
-            seed=validation_seed,
-            device=device,
-        )
-        atomic_torch_save(validation_initial_path, macro_validation_initial)
-
-    global_validation_schedule_path = (
-        global_validation_root / "validation_source_schedule.json"
-    )
-    outer_validation_schedule_path = parent_root / "validation_source_schedule.json"
-    global_validation_created = False
-    if global_validation_schedule_path.is_file():
-        global_validation_schedule = load_schedule(global_validation_schedule_path)
-    else:
-        global_validation_created = True
-        (
-            global_validation_schedule,
-            validation_harvest,
-            validation_candidate,
-            validation_candidate_occupancy,
-            validation_report,
-        ) = prepare_macro_parent_schedule(
-            models=models,
-            episode=episode,
-            initial_state=macro_validation_initial,
+        validation = build_macro_candidate_schedule(
             split="global_validation",
-            source_episode=equilibrium_outer,
-            initial_state_seed=validation_seed,
-            transition_seed=validation_seed + 11,
-            entry_seed=validation_seed + 12,
-            short_rollout_horizon=args.macro_bank_rollout_horizon,
-            capture_times=requested_times,
-            branch_num=args.branch_num,
-            target_count=args.macro_validation_parent_count,
-            coverage_fraction=args.macro_bank_coverage_fraction,
-            selection_seed=validation_seed + 21,
-            device=device,
+            namespace="global_validation",
+            target_valid=args.macro_validation_target_valid,
+            initial_candidate_budget=args.macro_validation_initial_candidate_budget,
+            max_candidate_budget=args.macro_validation_max_candidate_budget,
+            minimum_partial_valid=args.macro_minimum_partial_validation,
+            firms_per_parent=args.firms_per_path,
+            seed=int(args.seed + 40_000),
+            candidate_id_offset=1_000_000_000,
         )
-        save_schedule(global_validation_schedule_path, global_validation_schedule)
+        save_candidate_schedule(validation_path, validation)
 
-    if outer_validation_schedule_path.is_file():
-        validation_schedule = load_schedule(outer_validation_schedule_path)
-        validation_harvest, validation_candidate, validation_candidate_occupancy = (
-            harvest_macro_parent_schedule_with_candidate(
-                models=models,
-                episode=episode,
-                initial_state=macro_validation_initial,
-                schedule=validation_schedule,
-                source_episode=equilibrium_outer,
-                branch_num=args.branch_num,
-                device=device,
-            )
-        )
-        validation_report = _schedule_report(
-            candidate=validation_candidate,
-            selected=validation_harvest.summary,
-            schedule=validation_schedule,
-            initial_audit=validation_harvest.initial_hash_audit,
-        )
-        global_keys = {
-            key.canonical for key in global_validation_schedule.source_keys
-        }
-        active_keys = {key.canonical for key in validation_schedule.source_keys}
-        if not active_keys.issubset(global_keys):
-            raise RuntimeError(
-                "outer validation schedule is not a subset of the fixed global schedule"
-            )
-        missing_keys = [
-            key for key in global_validation_schedule.source_keys
-            if key.canonical not in active_keys
-        ]
-        validation_availability = {
-            "global_schedule_fingerprint": global_validation_schedule.fingerprint,
-            "active_schedule_fingerprint": validation_schedule.fingerprint,
-            "scheduled_source_count": len(global_validation_schedule.source_keys),
-            "available_source_count": len(validation_schedule.source_keys),
-            "missing_extinct_source_count": len(missing_keys),
-            "availability_rate": float(
-                len(validation_schedule.source_keys)
-                / max(len(global_validation_schedule.source_keys), 1)
-            ),
-            "missing_extinct_source_keys": [key.to_dict() for key in missing_keys],
-            "replacement_sources_used": False,
-            "censoring_reason": "PRODUCTION_ROLLOUT_PATH_EXTINCT",
-        }
-    elif not global_validation_created:
-        (
-            validation_schedule,
-            validation_harvest,
-            validation_candidate,
-            validation_candidate_occupancy,
-            validation_availability,
-        ) = harvest_available_macro_parent_schedule_with_candidate(
-            models=models,
-            episode=episode,
-            initial_state=macro_validation_initial,
-            schedule=global_validation_schedule,
-            source_episode=equilibrium_outer,
-            branch_num=args.branch_num,
-            device=device,
-        )
-        validation_report = _schedule_report(
-            candidate=validation_candidate,
-            selected=validation_harvest.summary,
-            schedule=validation_schedule,
-            initial_audit=validation_harvest.initial_hash_audit,
-        )
-        save_schedule(outer_validation_schedule_path, validation_schedule)
+    outer_validation_path = candidate_root / "validation_candidate_schedule.json"
+    if outer_validation_path.is_file():
+        outer_validation = load_candidate_schedule(outer_validation_path)
+        if outer_validation.fingerprint != validation.fingerprint:
+            raise RuntimeError("outer/global validation candidate schedule mismatch")
     else:
-        validation_schedule = global_validation_schedule
-        save_schedule(outer_validation_schedule_path, validation_schedule)
-        validation_availability = {
-            "global_schedule_fingerprint": global_validation_schedule.fingerprint,
-            "active_schedule_fingerprint": validation_schedule.fingerprint,
-            "scheduled_source_count": len(global_validation_schedule.source_keys),
-            "available_source_count": len(validation_schedule.source_keys),
-            "missing_extinct_source_count": 0,
-            "availability_rate": 1.0,
-            "missing_extinct_source_keys": [],
-            "replacement_sources_used": False,
-            "censoring_reason": "PRODUCTION_ROLLOUT_PATH_EXTINCT",
-        }
-    validation_report["global_validation_availability"] = validation_availability
+        save_candidate_schedule(outer_validation_path, validation)
+    split_audit = _candidate_schedule_overlap(train, validation)
+    atomic_write_json(candidate_root / "train_validation_split_audit.json", split_audit)
+    return train, validation, split_audit
+
+
+FIRM_FIRST_STAGE_ORDER = (
+    "firm_solve",
+    "macro_candidate_generation",
+    "fc1_fit",
+    "post_fc1_refresh",
+    "sdf_fit",
+    "outer_evaluation",
+)
+
+
+def validate_firm_first_stage_trace(trace: Sequence[str], outer_count: int) -> None:
+    expected = list(FIRM_FIRST_STAGE_ORDER) * int(outer_count)
+    if list(trace) != expected:
+        raise RuntimeError(
+            f"Firm-first orchestration order mismatch: expected={expected}, actual={list(trace)}"
+        )
+
+
+def run_firm_first_orchestration_mock(
+    *, outer_count: int, resume_after: int = 0
+) -> dict[str, Any]:
+    """Exercise the production stage contract without models or simulation."""
+
+    full = list(FIRM_FIRST_STAGE_ORDER) * int(outer_count)
+    if not 0 <= int(resume_after) <= len(full):
+        raise ValueError("resume_after is outside the mock stage trace")
+    persisted = full[: int(resume_after)]
+    executed = full[int(resume_after) :]
+    trace = persisted + executed
+    validate_firm_first_stage_trace(trace, outer_count)
+    return {
+        "outer_count": int(outer_count),
+        "resume_after": int(resume_after),
+        "persisted_trace": persisted,
+        "executed_trace": executed,
+        "full_trace": trace,
+        "status": "PASS",
+    }
+
+
+def _record_firm_first_stage(
+    run_root: Path, *, equilibrium_outer: int, stage: str
+) -> None:
+    if stage not in FIRM_FIRST_STAGE_ORDER:
+        raise ValueError(f"unknown Firm-first stage: {stage}")
+    path = run_root / "metadata" / "firm_first_stage_trace.json"
+    payload = (
+        json.loads(path.read_text(encoding="utf-8"))
+        if path.is_file()
+        else {"entries": []}
+    )
+    entries = list(payload.get("entries", []))
+    identity = {"equilibrium_outer": int(equilibrium_outer), "stage": stage}
+    if identity in entries:
+        return
+    expected_index = len(entries)
+    expected_outer = expected_index // len(FIRM_FIRST_STAGE_ORDER)
+    expected_stage = FIRM_FIRST_STAGE_ORDER[
+        expected_index % len(FIRM_FIRST_STAGE_ORDER)
+    ]
+    if int(equilibrium_outer) != expected_outer or stage != expected_stage:
+        raise RuntimeError(
+            "Firm-first stage transition violation: "
+            f"expected outer={expected_outer} stage={expected_stage}, got {identity}"
+        )
+    entries.append(identity)
     atomic_write_json(
-        parent_root / "global_validation_availability.json",
-        validation_availability,
+        path,
+        {
+            "stage_order": list(FIRM_FIRST_STAGE_ORDER),
+            "entries": entries,
+            "completed_outer_count": len(entries) // len(FIRM_FIRST_STAGE_ORDER),
+        },
     )
-
-    split_audit = source_overlap(train_schedule, validation_schedule)
-    if split_audit["overlap_count"]:
-        raise RuntimeError(f"macro train/validation parent leakage: {split_audit}")
-    write_coverage_artifacts(
-        parent_root,
-        train_candidate=train_candidate,
-        train_selected=train_harvest.summary,
-        validation_candidate=validation_candidate,
-        validation_selected=validation_harvest.summary,
-        train_candidate_occupancy=train_candidate_occupancy,
-        train_selected_occupancy=train_harvest.occupancy,
-        validation_candidate_occupancy=validation_candidate_occupancy,
-        validation_selected_occupancy=validation_harvest.occupancy,
-        train_schedule=train_schedule,
-        validation_schedule=validation_schedule,
-        train_report=train_report,
-        validation_report=validation_report,
-    )
-    return (
-        macro_train_initial,
-        macro_validation_initial,
-        train_schedule,
-        validation_schedule,
-        train_harvest,
-        validation_harvest,
-    )
-
-
-def _resolve_resume(args: argparse.Namespace) -> tuple[Optional[Path], Optional[Path]]:
-    if args.resume is None:
-        return None, None
-    supplied = args.resume.expanduser().resolve()
-    if supplied.suffix.lower() == ".json":
-        pointer = json.loads(supplied.read_text(encoding="utf-8"))
-        target = pointer.get("checkpoint") or pointer.get("latest")
-        if not target:
-            raise RuntimeError(f"resume JSON has no checkpoint/latest pointer: {supplied}")
-        checkpoint = Path(target).expanduser().resolve()
-    else:
-        checkpoint = supplied
-    for candidate in (supplied.parent, *supplied.parents):
-        if (candidate / "metadata" / "run.json").is_file() and (
-            candidate / "fixed_point"
-        ).is_dir():
-            return candidate, checkpoint
-    raise RuntimeError(f"cannot locate nested-equilibrium run root above {supplied}")
 
 
 def _apply_smoke(args: argparse.Namespace) -> None:
@@ -1606,12 +1521,14 @@ def _apply_smoke(args: argparse.Namespace) -> None:
     args.firms_per_path = 32
     args.simulation_horizon = 8
     args.bootstrap_horizon = 8
-    args.macro_bank_candidate_paths = 8
-    args.macro_bank_validation_paths = 4
-    args.macro_bank_rollout_horizon = 3
-    args.macro_bank_capture_times = "0,1,2"
-    args.macro_train_parent_count = 16
-    args.macro_validation_parent_count = 8
+    args.macro_train_target_valid = 8
+    args.macro_validation_target_valid = 4
+    args.macro_train_initial_candidate_budget = 16
+    args.macro_train_max_candidate_budget = 32
+    args.macro_validation_initial_candidate_budget = 8
+    args.macro_validation_max_candidate_budget = 16
+    args.macro_minimum_partial_train = 4
+    args.macro_minimum_partial_validation = 2
     args.macro_parent_batch_size = 4
     args.long_diagnostic_paths = 4
     args.long_diagnostic_horizon = 8
@@ -1673,18 +1590,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--child-shocks", type=int, default=16)
     parser.add_argument("--macro-probe-size", type=int, default=2048)
     parser.add_argument("--macro-batch-size", type=int, default=4096)
-    parser.add_argument("--macro-bank-candidate-paths", type=int, default=1024)
-    parser.add_argument("--macro-bank-validation-paths", type=int, default=256)
-    parser.add_argument("--macro-bank-rollout-horizon", type=int, default=8)
-    parser.add_argument("--macro-bank-capture-times", default="0,2,4,6,8")
-    parser.add_argument("--macro-train-parent-count", type=int, default=4096)
-    parser.add_argument("--macro-validation-parent-count", type=int, default=1024)
-    parser.add_argument("--macro-bank-candidate-multiplier", type=float, default=1.5)
-    parser.add_argument("--macro-bank-coverage-fraction", type=float, default=0.20)
+    parser.add_argument("--macro-train-target-valid", type=int, default=2048)
+    parser.add_argument("--macro-validation-target-valid", type=int, default=512)
+    parser.add_argument(
+        "--macro-train-initial-candidate-budget", type=int, default=4096
+    )
+    parser.add_argument(
+        "--macro-train-max-candidate-budget", type=int, default=8192
+    )
+    parser.add_argument(
+        "--macro-validation-initial-candidate-budget", type=int, default=1024
+    )
+    parser.add_argument(
+        "--macro-validation-max-candidate-budget", type=int, default=2048
+    )
+    parser.add_argument("--macro-minimum-partial-train", type=int, default=1024)
+    parser.add_argument("--macro-minimum-partial-validation", type=int, default=256)
     parser.add_argument("--macro-parent-batch-size", type=int, default=256)
-    parser.add_argument("--macro-bank-shard-size", type=int, default=128)
     parser.add_argument("--long-diagnostic-paths", type=int, default=50)
     parser.add_argument("--long-diagnostic-horizon", type=int, default=100)
+    parser.add_argument(
+        "--run-long-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--use-long-rollout-for-macro-training",
         action=argparse.BooleanOptionalAction,
@@ -1703,7 +1632,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--market-clearing-mode",
         choices=("disabled", "market_cleared_experimental_v1"),
-        default="disabled",
+        default="market_cleared_experimental_v1",
     )
     parser.add_argument("--market-clearing-coarse-points", type=int, default=10)
     parser.add_argument("--market-clearing-refinement-points", type=int, default=20)
@@ -1729,12 +1658,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "hard_realized_reference",
             "continuum_mass_consistent_v1",
         ),
-        default="legacy_mixed_replay",
+        default="continuum_mass_consistent_v1",
     )
     parser.add_argument("--continuum-i-points", type=int, default=9)
     parser.add_argument("--continuum-z-points", type=int, default=7)
     parser.add_argument(
         "--continuum-projection-tolerance", type=float, default=1.0e-6
+    )
+    parser.add_argument("--boundary-z-scan-points", type=int, default=65)
+    parser.add_argument("--boundary-z-quadrature-points", type=int, default=8)
+    parser.add_argument("--boundary-i-scan-points", type=int, default=33)
+    parser.add_argument("--boundary-i-quadrature-points", type=int, default=8)
+    parser.add_argument("--boundary-refinement-rounds", type=int, default=16)
+    parser.add_argument(
+        "--boundary-scan-tail-probability", type=float, default=1.0e-8
     )
     parser.add_argument(
         "--bp-actual-use-trace",
@@ -1760,11 +1697,34 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("hard/continuum aggregation requires market clearing")
     if args.continuum_i_points < 2 or args.continuum_z_points < 2:
         parser.error("continuum quadrature point counts must be at least two")
+    try:
+        _candidate_operator_configs(args)
+    except ValueError as error:
+        parser.error(str(error))
     if args.bootstrap_validation_paths < 1:
         parser.error("--bootstrap-validation-paths must be positive")
-    parse_capture_times(args.macro_bank_capture_times)
-    if not 0.0 <= args.macro_bank_coverage_fraction <= 1.0:
-        parser.error("--macro-bank-coverage-fraction must be in [0, 1]")
+    budget_triplets = (
+        (
+            args.macro_train_target_valid,
+            args.macro_train_initial_candidate_budget,
+            args.macro_train_max_candidate_budget,
+            args.macro_minimum_partial_train,
+            "train",
+        ),
+        (
+            args.macro_validation_target_valid,
+            args.macro_validation_initial_candidate_budget,
+            args.macro_validation_max_candidate_budget,
+            args.macro_minimum_partial_validation,
+            "validation",
+        ),
+    )
+    for target, initial, maximum, partial, label in budget_triplets:
+        if not (1 <= partial <= target <= initial <= maximum):
+            parser.error(
+                f"invalid {label} candidate budgets: require "
+                "1 <= partial <= target <= initial <= maximum"
+            )
     for name in ("equilibrium_outer_max", "firm_inner_max", "p_policy_outer_max",
                  "q_picard_outer_max", "macro_inner_max"):
         if int(getattr(args, name)) < 1:
@@ -2304,6 +2264,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "total_elapsed": time.time() - started_at,
             })
 
+        _record_firm_first_stage(
+            run_root, equilibrium_outer=equilibrium_outer, stage="firm_solve"
+        )
         firm_hash_for_macro = firm_hashes(models["policy_value"])
         macro_gate_streak = int(state.get("macro_gate_streak", 0))
         macro_reached = macro_gate_streak >= 2
@@ -2331,63 +2294,119 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 {key: value.detach().cpu() for key, value in current_functions.items()}
             ]
         (
-            macro_train_initial,
-            macro_validation_initial,
-            train_source_schedule,
-            validation_source_schedule,
-            current_train_harvest,
-            current_validation_harvest,
-        ) = _build_or_refresh_macro_parent_context(
+            train_candidate_schedule,
+            validation_candidate_schedule,
+            train_validation_split_audit,
+        ) = _build_or_refresh_macro_candidate_context(
             args=args,
             run_root=run_root,
             outer_root=outer_root,
             equilibrium_outer=equilibrium_outer,
-            models=models,
-            episode=episode,
-            device=device,
         )
-        long_start_train, long_start_validation, _ = _simulation_pair(
-            args=args, episode=episode, models=models,
-            train_initial=train_initial, validation_initial=validation_initial,
-            device=device,
-        )
-        _write_simulation_metadata(
-            macro_root / "long_diagnostic_start.json",
-            args=args,
-            train_out=long_start_train,
-            validation_out=long_start_validation,
-            train_initial=train_initial,
-            validation_initial=validation_initial,
-            label=f"equilibrium_outer_{equilibrium_outer}_macro_start",
-        )
-        _write_long_diagnostic_artifacts(
-            macro_root / "long_diagnostic_start",
-            train_out=long_start_train,
-            validation_out=long_start_validation,
-        )
+        boundary_integration, candidate_root_config = _candidate_operator_configs(args)
+        long_start_train = long_start_validation = None
+        if args.run_long_diagnostics:
+            long_start_train, long_start_validation, _ = _simulation_pair(
+                args=args, episode=episode, models=models,
+                train_initial=train_initial, validation_initial=validation_initial,
+                device=device,
+            )
+            _write_simulation_metadata(
+                macro_root / "long_diagnostic_start.json",
+                args=args,
+                train_out=long_start_train,
+                validation_out=long_start_validation,
+                train_initial=train_initial,
+                validation_initial=validation_initial,
+                label=f"equilibrium_outer_{equilibrium_outer}_macro_start",
+            )
+            _write_long_diagnostic_artifacts(
+                macro_root / "long_diagnostic_start",
+                train_out=long_start_train,
+                validation_out=long_start_validation,
+            )
         current_train_dataset = build_one_step_macro_dataset(
             models=models,
             episode=episode,
-            parent_bank=current_train_harvest,
+            candidate_schedule=train_candidate_schedule,
             parent_batch_size=args.macro_parent_batch_size,
             macro_batch_size=args.macro_batch_size,
-            branch_num=args.branch_num,
-            transition_seed=train_source_schedule.transition_seed + 1000,
-            entry_seed=train_source_schedule.entry_seed + 1000,
             device=device,
-            path_offset=0,
+            output_dir=macro_root / "candidate_data" / "pre_fc1_train",
+            integration=boundary_integration,
+            root_config=candidate_root_config,
         )
         current_validation_dataset = build_one_step_macro_dataset(
             models=models,
             episode=episode,
-            parent_bank=current_validation_harvest,
+            candidate_schedule=validation_candidate_schedule,
             parent_batch_size=args.macro_parent_batch_size,
             macro_batch_size=args.macro_batch_size,
-            branch_num=args.branch_num,
-            transition_seed=validation_source_schedule.transition_seed + 1000,
-            entry_seed=validation_source_schedule.entry_seed + 1000,
             device=device,
-            path_offset=1_000_000,
+            output_dir=macro_root / "candidate_data" / "pre_fc1_validation",
+            candidate_ids=(
+                validation_candidate_schedule.locked_candidate_ids or None
+            ),
+            allow_replenishment=not bool(
+                validation_candidate_schedule.locked_candidate_ids
+            ),
+            integration=boundary_integration,
+            root_config=candidate_root_config,
+        )
+        if current_train_dataset.dataset_status == "INSUFFICIENT_VALID_PAIRS":
+            raise RuntimeError("insufficient valid train parent-two-child pairs")
+        if current_validation_dataset.dataset_status == "INSUFFICIENT_VALID_PAIRS":
+            raise RuntimeError("insufficient valid validation parent-two-child pairs")
+        accepted_validation_ids = current_validation_dataset.pairing_audit[
+            "candidate_coverage"
+        ]["accepted_candidate_ids"]
+        locked_validation = lock_validation_candidate_ids(
+            validation_candidate_schedule, accepted_validation_ids
+        )
+        global_validation_schedule_path = (
+            run_root / "fixed_point" / "macro_global_validation"
+            / "validation_candidate_schedule.json"
+        )
+        if validation_candidate_schedule.locked_candidate_ids:
+            if tuple(accepted_validation_ids) != tuple(
+                validation_candidate_schedule.locked_candidate_ids
+            ):
+                raise RuntimeError("fixed validation candidate identity drift")
+        else:
+            save_candidate_schedule(global_validation_schedule_path, locked_validation)
+            save_candidate_schedule(
+                outer_root / "macro_candidates" / "validation_candidate_schedule.json",
+                locked_validation,
+            )
+            validation_candidate_schedule = locked_validation
+        if str(state.get("macro_stage", "candidate_generation")) in {
+            "candidate_generation", "fc1_fit"
+        }:
+            _save_stage_checkpoint(
+                run_root=run_root,
+                path=macro_root / "candidate_generation_complete.pt",
+                models=models,
+                state={
+                    **state,
+                    "equilibrium_outer": equilibrium_outer,
+                    "phase": "macro_inner",
+                    "macro_inner": start_macro_inner,
+                    "macro_stage": "fc1_fit",
+                },
+                git_head=git_head,
+                fingerprint=fingerprint,
+                bank_hashes=bank_hashes,
+                extra={
+                    "train_schedule_fingerprint": train_candidate_schedule.fingerprint,
+                    "validation_schedule_fingerprint": validation_candidate_schedule.fingerprint,
+                    "train_pairing": current_train_dataset.pairing_audit,
+                    "validation_pairing": current_validation_dataset.pairing_audit,
+                },
+            )
+        _record_firm_first_stage(
+            run_root,
+            equilibrium_outer=equilibrium_outer,
+            stage="macro_candidate_generation",
         )
         current_validation_frame = _to_frame(current_validation_dataset.macro)
         last_macro_row: dict[str, Any] = {}
@@ -2409,22 +2428,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for macro_inner in range(start_macro_inner, args.macro_inner_max):
             macro_inner_root = macro_root / f"macro_inner_{macro_inner:03d}"
             macro_inner_root.mkdir(parents=True, exist_ok=True)
+            resume_macro_stage = (
+                str(state.get("macro_stage", "fc1_fit"))
+                if macro_inner == start_macro_inner
+                else "fc1_fit"
+            )
             atomic_write_json(
                 macro_inner_root / "input_parent_bank_metadata.json",
                 {
-                    "macro_primary_training_source": "MANY_PARENT_CROSS_SECTIONS_ONE_STEP",
-                    "train_parent_count": current_train_harvest.n_parents,
-                    "validation_parent_count": current_validation_harvest.n_parents,
-                    "short_rollout_horizon": args.macro_bank_rollout_horizon,
-                    "effective_capture_times": list(effective_capture_times(
-                        args.macro_bank_capture_times,
-                        args.macro_bank_rollout_horizon,
-                    )),
+                    "macro_primary_training_source": "PATH_SPECIFIC_BETA_BOUNDARY_AWARE_ONE_STEP",
+                    "train_parent_count": current_train_dataset.pairing_audit[
+                        "candidate_coverage"
+                    ]["accepted_training_pair_count"],
+                    "validation_parent_count": current_validation_dataset.pairing_audit[
+                        "candidate_coverage"
+                    ]["accepted_training_pair_count"],
                     "one_step_horizon": 1,
                     "branch_num": args.branch_num,
                     "long_rollout_training_used": False,
-                    "train_schedule_fingerprint": train_source_schedule.fingerprint,
-                    "validation_schedule_fingerprint": validation_source_schedule.fingerprint,
+                    "train_schedule_fingerprint": train_candidate_schedule.fingerprint,
+                    "validation_schedule_fingerprint": validation_candidate_schedule.fingerprint,
                     "firm_hashes": firm_hash_for_macro,
                 },
             )
@@ -2433,27 +2456,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 {
                     "train": current_train_dataset.pairing_audit,
                     "validation": current_validation_dataset.pairing_audit,
-                    "train_validation_source_split": source_overlap(
-                        train_source_schedule, validation_source_schedule
-                    ),
+                    "train_validation_source_split": train_validation_split_audit,
                 },
             )
-            if macro_inner == 0:
-                save_bank_shards(
-                    macro_root / "macro_parent_bank" / "macro_inner_000_train",
-                    current_train_harvest,
-                    shard_size=args.macro_bank_shard_size,
-                )
-                save_bank_shards(
-                    macro_root / "macro_parent_bank" / "macro_inner_000_validation",
-                    current_validation_harvest,
-                    shard_size=args.macro_bank_shard_size,
-                )
             block_start = _model_states(models)
             old_functions = current_functions
             old_validation_frame = current_validation_frame
             old_validation_pairs = current_validation_dataset.pairs
-            old_validation_parent_summary = current_validation_harvest.summary
 
             def run_macro(batch_size: int):
                 target_batches = int(getattr(
@@ -2472,70 +2481,114 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     batch_size=batch_size,
                     n_branches=args.branch_num,
                 )
-                fc1_summary = run_fc1_fit(
-                    episode,
-                    train_fc1_batches,
-                    validation_fc1_batches,
-                    macro_inner_root / "fc1", block="joint",
-                    production_epochs=args.fc1_production_epochs,
-                    max_epochs=args.fc1_max_epochs, patience=args.fc1_patience,
-                    log_interval=1_000_000,
-                )
+                fc1_summary_path = macro_inner_root / "fc1" / "summary.json"
+                if resume_macro_stage in {
+                    "post_fc1_refresh", "sdf_fit", "outer_evaluation"
+                }:
+                    if not fc1_summary_path.is_file():
+                        raise RuntimeError(
+                            "FC1 resume stage is missing fc1/summary.json"
+                        )
+                    fc1_summary = json.loads(
+                        fc1_summary_path.read_text(encoding="utf-8")
+                    )
+                else:
+                    fc1_summary = run_fc1_fit(
+                        episode,
+                        train_fc1_batches,
+                        validation_fc1_batches,
+                        macro_inner_root / "fc1", block="joint",
+                        production_epochs=args.fc1_production_epochs,
+                        max_epochs=args.fc1_max_epochs, patience=args.fc1_patience,
+                        log_interval=1_000_000,
+                    )
+                    _save_stage_checkpoint(
+                        run_root=run_root,
+                        path=macro_inner_root / "fc1_complete.pt",
+                        models=models,
+                        state={
+                            **state,
+                            "equilibrium_outer": equilibrium_outer,
+                            "phase": "macro_inner",
+                            "macro_inner": macro_inner,
+                            "macro_stage": "post_fc1_refresh",
+                        },
+                        git_head=git_head,
+                        fingerprint=fingerprint,
+                        bank_hashes=bank_hashes,
+                        extra={"fc1_summary": fc1_summary},
+                    )
+                if macro_inner == args.macro_inner_max - 1:
+                    _record_firm_first_stage(
+                        run_root,
+                        equilibrium_outer=equilibrium_outer,
+                        stage="fc1_fit",
+                    )
                 simulation_started = time.perf_counter()
-                (
-                    _,
-                    post_train_harvest,
-                    _,
-                    _,
-                    post_train_availability,
-                ) = harvest_available_macro_parent_schedule_with_candidate(
-                    models=models,
-                    episode=episode,
-                    initial_state=macro_train_initial,
-                    schedule=train_source_schedule,
-                    source_episode=equilibrium_outer,
-                    branch_num=args.branch_num,
-                    device=device,
-                )
-                (
-                    _,
-                    post_validation_harvest,
-                    _,
-                    _,
-                    post_validation_availability,
-                ) = harvest_available_macro_parent_schedule_with_candidate(
-                    models=models,
-                    episode=episode,
-                    initial_state=macro_validation_initial,
-                    schedule=validation_source_schedule,
-                    source_episode=equilibrium_outer,
-                    branch_num=args.branch_num,
-                    device=device,
-                )
+                accepted_train_ids = current_train_dataset.pairing_audit[
+                    "candidate_coverage"
+                ]["accepted_candidate_ids"]
+                accepted_validation_ids = current_validation_dataset.pairing_audit[
+                    "candidate_coverage"
+                ]["accepted_candidate_ids"]
                 post_train_dataset = build_one_step_macro_dataset(
                     models=models,
                     episode=episode,
-                    parent_bank=post_train_harvest,
+                    candidate_schedule=train_candidate_schedule,
                     parent_batch_size=args.macro_parent_batch_size,
                     macro_batch_size=batch_size,
-                    branch_num=args.branch_num,
-                    transition_seed=train_source_schedule.transition_seed + 1000,
-                    entry_seed=train_source_schedule.entry_seed + 1000,
                     device=device,
-                    path_offset=0,
+                    output_dir=macro_inner_root / "post_fc1_train",
+                    candidate_ids=accepted_train_ids,
+                    allow_replenishment=False,
+                    integration=boundary_integration,
+                    root_config=candidate_root_config,
                 )
                 post_validation_dataset = build_one_step_macro_dataset(
                     models=models,
                     episode=episode,
-                    parent_bank=post_validation_harvest,
+                    candidate_schedule=validation_candidate_schedule,
                     parent_batch_size=args.macro_parent_batch_size,
                     macro_batch_size=batch_size,
-                    branch_num=args.branch_num,
-                    transition_seed=validation_source_schedule.transition_seed + 1000,
-                    entry_seed=validation_source_schedule.entry_seed + 1000,
                     device=device,
-                    path_offset=1_000_000,
+                    output_dir=macro_inner_root / "post_fc1_validation",
+                    candidate_ids=accepted_validation_ids,
+                    allow_replenishment=False,
+                    integration=boundary_integration,
+                    root_config=candidate_root_config,
                 )
+                if post_train_dataset.dataset_status == "INSUFFICIENT_VALID_PAIRS":
+                    raise RuntimeError("post-FC1 train refresh lost the minimum valid pairs")
+                if post_validation_dataset.dataset_status == "INSUFFICIENT_VALID_PAIRS":
+                    raise RuntimeError(
+                        "post-FC1 fixed validation refresh lost the minimum valid pairs"
+                    )
+                if macro_inner == args.macro_inner_max - 1:
+                    _record_firm_first_stage(
+                        run_root,
+                        equilibrium_outer=equilibrium_outer,
+                        stage="post_fc1_refresh",
+                    )
+                if resume_macro_stage != "outer_evaluation":
+                    _save_stage_checkpoint(
+                        run_root=run_root,
+                        path=macro_inner_root / "post_fc1_refresh_complete.pt",
+                        models=models,
+                        state={
+                            **state,
+                            "equilibrium_outer": equilibrium_outer,
+                            "phase": "macro_inner",
+                            "macro_inner": macro_inner,
+                            "macro_stage": "sdf_fit",
+                        },
+                        git_head=git_head,
+                        fingerprint=fingerprint,
+                        bank_hashes=bank_hashes,
+                        extra={
+                            "train_pairing": post_train_dataset.pairing_audit,
+                            "validation_pairing": post_validation_dataset.pairing_audit,
+                        },
+                    )
                 # Frozen-target post-fit metrics are produced inside
                 # run_fc1_fit.  These are the re-simulation metrics on the new
                 # endogenous root-cleared paths, before any SDF update.
@@ -2581,53 +2634,80 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         batch_size=batch_size,
                         n_branches=args.branch_num,
                     )
-                    sdf_summary = run_sdf_chunks(
-                        episode,
-                        train_sdf_batches,
-                        validation_sdf_batches,
-                        probe_parents, probe_children, macro_inner_root / "sdf",
-                        chunks=args.sdf_chunks,
-                        epochs_per_chunk=args.sdf_epochs_per_chunk,
-                        log_interval=1_000_000,
-                    )
-                    chunk_detail_path = (
-                        macro_inner_root / "sdf" /
-                        f"history_chunk_{args.sdf_chunks:03d}.json"
-                    )
-                    if not chunk_detail_path.is_file():
-                        raise RuntimeError(f"missing SDF chunk diagnostics: {chunk_detail_path}")
-                    chunk_detail = json.loads(chunk_detail_path.read_text(encoding="utf-8"))
-                    chunk_history = chunk_detail.get("history", [])
-                    final_losses = (
-                        chunk_history[-1].get("train_summary", {}).get("final_losses", {})
-                        if chunk_history else {}
-                    )
-                    sdf_summary["production_metrics"] = {
-                        "objective": final_losses.get("sdf"),
-                        "moment1": final_losses.get("sdf_normalized_r1_abs_mean"),
-                        "moment2": final_losses.get("sdf_normalized_r2_abs_mean"),
-                        "moment_loss": final_losses.get("sdf_moment_loss"),
-                        "constraint_max_violation": final_losses.get(
-                            "sdf_constraint_max_violation"
-                        ),
-                    }
-                    require_finite_metrics(
-                        "SDF production", sdf_summary["production_metrics"],
-                        ("objective", "moment1", "moment2"),
-                    )
-                    atomic_write_json(
-                        macro_inner_root / "sdf" / "summary.json", sdf_summary
+                    sdf_summary_path = macro_inner_root / "sdf" / "summary.json"
+                    if resume_macro_stage == "outer_evaluation":
+                        if not sdf_summary_path.is_file():
+                            raise RuntimeError(
+                                "SDF resume stage is missing sdf/summary.json"
+                            )
+                        sdf_summary = json.loads(
+                            sdf_summary_path.read_text(encoding="utf-8")
+                        )
+                    else:
+                        sdf_summary = run_sdf_chunks(
+                            episode,
+                            train_sdf_batches,
+                            validation_sdf_batches,
+                            probe_parents, probe_children, macro_inner_root / "sdf",
+                            chunks=args.sdf_chunks,
+                            epochs_per_chunk=args.sdf_epochs_per_chunk,
+                            log_interval=1_000_000,
+                        )
+                        chunk_detail_path = (
+                            macro_inner_root / "sdf" /
+                            f"history_chunk_{args.sdf_chunks:03d}.json"
+                        )
+                        if not chunk_detail_path.is_file():
+                            raise RuntimeError(f"missing SDF chunk diagnostics: {chunk_detail_path}")
+                        chunk_detail = json.loads(chunk_detail_path.read_text(encoding="utf-8"))
+                        chunk_history = chunk_detail.get("history", [])
+                        final_losses = (
+                            chunk_history[-1].get("train_summary", {}).get("final_losses", {})
+                            if chunk_history else {}
+                        )
+                        sdf_summary["production_metrics"] = {
+                            "objective": final_losses.get("sdf"),
+                            "moment1": final_losses.get("sdf_normalized_r1_abs_mean"),
+                            "moment2": final_losses.get("sdf_normalized_r2_abs_mean"),
+                            "moment_loss": final_losses.get("sdf_moment_loss"),
+                            "constraint_max_violation": final_losses.get(
+                                "sdf_constraint_max_violation"
+                            ),
+                        }
+                        require_finite_metrics(
+                            "SDF production", sdf_summary["production_metrics"],
+                            ("objective", "moment1", "moment2"),
+                        )
+                        atomic_write_json(sdf_summary_path, sdf_summary)
+                        _save_stage_checkpoint(
+                            run_root=run_root,
+                            path=macro_inner_root / "sdf_complete.pt",
+                            models=models,
+                            state={
+                                **state,
+                                "equilibrium_outer": equilibrium_outer,
+                                "phase": "macro_inner",
+                                "macro_inner": macro_inner,
+                                "macro_stage": "outer_evaluation",
+                            },
+                            git_head=git_head,
+                            fingerprint=fingerprint,
+                            bank_hashes=bank_hashes,
+                            extra={"sdf_summary": sdf_summary},
+                        )
+                    _record_firm_first_stage(
+                        run_root,
+                        equilibrium_outer=equilibrium_outer,
+                        stage="sdf_fit",
                     )
                 return (
                     fc1_summary,
                     sdf_summary,
-                    post_train_harvest,
-                    post_validation_harvest,
                     post_train_dataset,
                     post_validation_dataset,
                     {
-                        "train": post_train_availability,
-                        "validation": post_validation_availability,
+                        "train": post_train_dataset.pairing_audit["candidate_coverage"],
+                        "validation": post_validation_dataset.pairing_audit["candidate_coverage"],
                     },
                     time.perf_counter() - simulation_started,
                 )
@@ -2643,8 +2723,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             (
                 fc1_summary,
                 sdf_summary,
-                current_train_harvest,
-                current_validation_harvest,
                 current_train_dataset,
                 current_validation_dataset,
                 source_availability,
@@ -2679,14 +2757,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 function_moves[name] = movement_metrics(
                     old_functions[name], current_functions[name], name
                 )
-            target_moves = _one_step_target_movements(
-                old_validation_pairs,
-                current_validation_dataset.pairs,
-                old_validation_parent_summary,
-                current_validation_harvest.summary,
-            )
-            parent_moves = parent_summary_movement(
-                old_validation_parent_summary, current_validation_harvest.summary
+            target_moves = _candidate_target_movements(
+                old_validation_pairs, current_validation_dataset.pairs
             )
             atomic_write_json(
                 macro_inner_root / "source_availability_audit.json",
@@ -2696,19 +2768,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         key: value for key, value in target_moves.items()
                         if key not in {"Hatc_target_move", "LnK_target_move"}
                     },
-                    "parent_movement_alignment": {
-                        key: value for key, value in parent_moves.items()
-                        if not key.endswith(("_nmae", "_p90"))
-                    },
+                    "candidate_identity_alignment": "IMMUTABLE_CANDIDATE_BRANCH_IDENTITY",
                 },
             )
-            atomic_write_json(
-                macro_inner_root / "parent_bank_summary_movement.json", parent_moves
-            )
             macro_diag = macro_diagnostics(current_validation_frame)
-            macro_diag.update(simulation_policy_metrics(
-                _to_frame(current_validation_harvest.simulation_output.firm)
-            ))
+            positive_mass = current_validation_frame["n_firms"].clip(lower=1.0e-30)
+            macro_diag.update({
+                "investment_rate_firm": float(
+                    (current_validation_frame["investment_mass"] / positive_mass).mean()
+                ),
+                "default_rate": float(
+                    (current_validation_frame["default_mass"] / positive_mass).mean()
+                ),
+                "b_mean": float(current_validation_frame["mean_b"].mean()),
+            })
             if sdf_summary is None:
                 fc1_round_row = {
                     "equilibrium_outer": equilibrium_outer,
@@ -2826,9 +2899,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "path_gate_pass": False,
                 "long_path_metrics_deferred_to_diagnostic": True,
                 "parent_bank_summary_movement_max": max(
-                    value for key, value in parent_moves.items()
-                    if key.endswith(("_nmae", "_p90"))
-                    and math.isfinite(value)
+                    float(target_moves["Hatc_target_move"]),
+                    float(target_moves["LnK_target_move"]),
                 ),
                 "FC1_C_val_R2": fc1_summary["best_validation"].get("hatc_r2", float("nan")),
                 "FC1_K_val_R2": fc1_summary["best_validation"].get("lnk_r2", float("nan")),
@@ -2898,10 +2970,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 macro_history_path,
                 pd.concat([existing, pd.DataFrame([last_macro_row])], ignore_index=True),
             )
-            write_macro_inner_movement_figure(
-                pd.read_csv(macro_history_path),
-                macro_root / "macro_parent_bank" / "figures",
-            )
             atomic_torch_save(macro_root / "macro_probe_history.pt", function_history)
             state = {
                 **state, "equilibrium_outer": equilibrium_outer,
@@ -2930,65 +2998,60 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "CONDITIONAL_FIXED_POINT_REACHED"
             if macro_reached else "MAX_INNER_BUT_STABLE"
         )
-        save_bank_shards(
-            macro_root / "macro_parent_bank" / "final_train",
-            current_train_harvest,
-            shard_size=args.macro_bank_shard_size,
-        )
-        save_bank_shards(
-            macro_root / "macro_parent_bank" / "final_validation",
-            current_validation_harvest,
-            shard_size=args.macro_bank_shard_size,
-        )
-        long_final_train, long_final_validation, long_final_seconds = _simulation_pair(
-            args=args,
-            episode=episode,
-            models=models,
-            train_initial=train_initial,
-            validation_initial=validation_initial,
-            device=device,
-        )
-        _write_simulation_metadata(
-            macro_root / "long_diagnostic_final.json",
-            args=args,
-            train_out=long_final_train,
-            validation_out=long_final_validation,
-            train_initial=train_initial,
-            validation_initial=validation_initial,
-            label=f"equilibrium_outer_{equilibrium_outer}_macro_final_and_boundary",
-        )
-        _write_long_diagnostic_artifacts(
-            macro_root / "long_diagnostic_final",
-            train_out=long_final_train,
-            validation_out=long_final_validation,
-        )
-        if args.market_clearing_mode != "disabled" and equilibrium_outer == 0:
-            _matched_legacy_market_comparison(
-                output=(
-                    run_root
-                    / "evaluation"
-                    / "historical_canonical"
-                    / "outer_000"
-                ),
-                label="after_outer_000",
+        long_path_moves: dict[str, Any] = {
+            "long_diagnostics_executed": False,
+            "long_rollout_training_used": False,
+        }
+        if args.run_long_diagnostics:
+            long_final_train, long_final_validation, long_final_seconds = _simulation_pair(
                 args=args,
                 episode=episode,
                 models=models,
-                initial_state=validation_initial,
-                market_output=long_final_validation,
-                paths=args.long_diagnostic_paths,
-                transition_seed=args.seed + 2011,
-                entry_seed=args.seed + 2012,
+                train_initial=train_initial,
+                validation_initial=validation_initial,
                 device=device,
             )
-        long_path_moves = _path_and_target_movements(
-            _to_frame(long_start_validation.macro),
-            _to_frame(long_final_validation.macro),
-        )
-        atomic_write_json(
-            macro_root / "long_diagnostic_movement.json",
-            {**long_path_moves, "simulation_seconds": long_final_seconds},
-        )
+            _write_simulation_metadata(
+                macro_root / "long_diagnostic_final.json",
+                args=args,
+                train_out=long_final_train,
+                validation_out=long_final_validation,
+                train_initial=train_initial,
+                validation_initial=validation_initial,
+                label=f"equilibrium_outer_{equilibrium_outer}_macro_final_and_boundary",
+            )
+            _write_long_diagnostic_artifacts(
+                macro_root / "long_diagnostic_final",
+                train_out=long_final_train,
+                validation_out=long_final_validation,
+            )
+            if args.market_clearing_mode != "disabled" and equilibrium_outer == 0:
+                _matched_legacy_market_comparison(
+                    output=run_root / "evaluation" / "historical_canonical" / "outer_000",
+                    label="after_outer_000",
+                    args=args,
+                    episode=episode,
+                    models=models,
+                    initial_state=validation_initial,
+                    market_output=long_final_validation,
+                    paths=args.long_diagnostic_paths,
+                    transition_seed=args.seed + 2011,
+                    entry_seed=args.seed + 2012,
+                    device=device,
+                )
+            assert long_start_validation is not None
+            long_path_moves = _path_and_target_movements(
+                _to_frame(long_start_validation.macro),
+                _to_frame(long_final_validation.macro),
+            )
+            long_path_moves.update({
+                "long_diagnostics_executed": True,
+                "long_rollout_training_used": False,
+            })
+            atomic_write_json(
+                macro_root / "long_diagnostic_movement.json",
+                {**long_path_moves, "simulation_seconds": long_final_seconds},
+            )
         (
             _post_macro_train_children,
             post_macro_validation_children,
@@ -3161,11 +3224,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         overall_gate_streak = overall_gate_streak + 1 if _overall_gate(summary_row) else 0
         summary_row["overall_gate_pass"] = _overall_gate(summary_row)
         summary_row["overall_gate_streak"] = overall_gate_streak
+        _record_firm_first_stage(
+            run_root,
+            equilibrium_outer=equilibrium_outer,
+            stage="outer_evaluation",
+        )
         append_summary_row(summary_path, summary_row)
         next_state = {
             **state, "equilibrium_outer": equilibrium_outer + 1,
             "phase": "firm_p", "firm_inner": 0, "p_policy_outer": 0,
             "q_picard_outer": 0, "macro_inner": 0, "sdf_chunk": 0,
+            "macro_stage": "candidate_generation",
             "firm_gate_streak": 0, "macro_gate_streak": 0,
             "overall_gate_streak": overall_gate_streak,
         }

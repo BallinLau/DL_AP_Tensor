@@ -9,7 +9,7 @@ at the top of the production tensor simulation loop and are resumed through
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
@@ -19,9 +19,31 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 import numpy as np
 import pandas as pd
 import torch
+from scipy.special import betaincinv
 
 from config import Config
+from data.boundary_aware_distribution import (
+    BOUNDARY_AWARE_CONTINUUM_V1,
+    PreDecisionDistribution,
+    gaussian_mixture_moments,
+    propagate_ar1_with_eta_mixture,
+)
+from data.boundary_aware_market_clearing import (
+    BoundaryAwareMarketClearingController,
+    BoundaryIntegrationConfig,
+)
+from data.entry import EntryCandidates
+from data.market_clearing import (
+    MarketClearingConfig,
+    MarketClearingError,
+    empty_entry_candidates,
+)
 from data.simulate_ts import SimulateTS
+from data.simulate_ts_parallel import (
+    _keyed_normal,
+    _keyed_uniform,
+    _predict_macro_fc1_batched,
+)
 from data.state_bank import (
     StateBank,
     build_state_bank_compatibility,
@@ -37,6 +59,32 @@ SUMMARY_FEATURES = (
     "z_std",
     "corr_b_z",
     "log_K_total",
+)
+
+
+MACRO_CANDIDATE_STATUS_VALID = "VALID_COMPLETE_PAIR"
+MACRO_CANDIDATE_FAILURE_STATUSES = (
+    "INVALID_INITIAL_DISTRIBUTION",
+    "PARENT_CLEARING_FAILED",
+    "CHILD_0_CLEARING_FAILED",
+    "CHILD_1_CLEARING_FAILED",
+    "CHILD_EXTINCT",
+    "NUMERICAL_MASS_LOSS",
+    "NUMERICAL_FAILURE",
+    "ENGINEERING_FAILURE",
+)
+
+# These strata are a training-support design, not economic calibration.  The
+# intervals deliberately overlap and Sobol coordinates vary alpha/beta inside
+# every stratum, so the schedule is not a short list of repeated fixed laws.
+B_DISTRIBUTION_STRATA: tuple[tuple[str, tuple[float, float], tuple[float, float]], ...] = (
+    ("low_leverage_concentration", (0.65, 2.00), (4.00, 10.00)),
+    ("medium_low_leverage_concentration", (1.50, 3.50), (3.50, 7.00)),
+    ("middle_concentration", (2.00, 8.00), (2.00, 8.00)),
+    ("medium_high_leverage_concentration", (3.50, 7.00), (1.50, 3.50)),
+    ("high_leverage_concentration", (4.00, 10.00), (0.65, 2.00)),
+    ("wide_dispersion", (0.80, 2.25), (0.80, 2.25)),
+    ("two_tail_concentration", (0.25, 0.90), (0.25, 0.90)),
 )
 
 
@@ -57,6 +105,12 @@ def _tensor_digest(items: Iterable[tuple[str, torch.Tensor]]) -> str:
         digest.update(str(tuple(tensor.shape)).encode("utf-8"))
         digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
+
+
+def _model_state_digest(model: torch.nn.Module) -> str:
+    return _tensor_digest(
+        (name, value) for name, value in model.state_dict().items()
+    )
 
 
 def parse_capture_times(value: str | Sequence[int]) -> tuple[int, ...]:
@@ -204,6 +258,214 @@ class OneStepMacroDataset:
     batches: dict[str, list[dict[str, torch.Tensor]]]
     pairing_audit: dict[str, Any]
     used_parent_batch_size: int
+    candidate_audit: Optional[pd.DataFrame] = None
+    distribution_manifest: Optional[pd.DataFrame] = None
+    dataset_status: str = "TARGET_VALID_DATASET"
+
+
+@dataclass(frozen=True)
+class MacroCandidateSpec:
+    candidate_id: int
+    lineage_id: int
+    split: str
+    distribution_parameter_id: int
+    distribution_family: str
+    alpha: float
+    beta: float
+    initial_state_seed: int
+    transition_seed: int
+    entry_seed: int
+    shock_key_child_0: int
+    shock_key_child_1: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MacroCandidateSchedule:
+    split: str
+    namespace: str
+    target_valid: int
+    initial_candidate_budget: int
+    max_candidate_budget: int
+    minimum_partial_valid: int
+    firms_per_parent: int
+    seed: int
+    candidate_specs: tuple[MacroCandidateSpec, ...]
+    locked_candidate_ids: tuple[int, ...] = ()
+
+    def validate(self) -> None:
+        if self.target_valid < 1 or self.firms_per_parent < 2:
+            raise ValueError("candidate schedule requires positive target and firms")
+        if not (
+            self.target_valid <= self.initial_candidate_budget <= self.max_candidate_budget
+        ):
+            raise ValueError("candidate budgets must satisfy target <= initial <= max")
+        if len(self.candidate_specs) != self.max_candidate_budget:
+            raise ValueError("candidate schedule does not cover max_candidate_budget")
+        ids = [spec.candidate_id for spec in self.candidate_specs]
+        if len(ids) != len(set(ids)):
+            raise ValueError("candidate ids must be unique")
+        if any(spec.split != self.split for spec in self.candidate_specs):
+            raise ValueError("candidate split mismatch")
+        if not set(self.locked_candidate_ids).issubset(ids):
+            raise ValueError("locked candidate ids are outside the schedule")
+
+    @property
+    def fingerprint(self) -> str:
+        return _json_hash(self.to_dict(include_fingerprint=False))
+
+    @property
+    def parameter_fingerprint(self) -> str:
+        """Hash candidate parameters/shocks while excluding the lock decision."""
+
+        value = self.to_dict(include_fingerprint=False)
+        value["locked_candidate_ids"] = []
+        return _json_hash(value)
+
+    def to_dict(self, *, include_fingerprint: bool = True) -> dict[str, Any]:
+        value = {
+            "split": self.split,
+            "namespace": self.namespace,
+            "target_valid": self.target_valid,
+            "initial_candidate_budget": self.initial_candidate_budget,
+            "max_candidate_budget": self.max_candidate_budget,
+            "minimum_partial_valid": self.minimum_partial_valid,
+            "firms_per_parent": self.firms_per_parent,
+            "seed": self.seed,
+            "candidate_specs": [spec.to_dict() for spec in self.candidate_specs],
+            "locked_candidate_ids": list(self.locked_candidate_ids),
+        }
+        if include_fingerprint:
+            value["fingerprint"] = self.fingerprint
+            value["parameter_fingerprint"] = self.parameter_fingerprint
+        return value
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "MacroCandidateSchedule":
+        schedule = cls(
+            split=str(value["split"]),
+            namespace=str(value["namespace"]),
+            target_valid=int(value["target_valid"]),
+            initial_candidate_budget=int(value["initial_candidate_budget"]),
+            max_candidate_budget=int(value["max_candidate_budget"]),
+            minimum_partial_valid=int(value["minimum_partial_valid"]),
+            firms_per_parent=int(value["firms_per_parent"]),
+            seed=int(value["seed"]),
+            candidate_specs=tuple(
+                MacroCandidateSpec(**item) for item in value["candidate_specs"]
+            ),
+            locked_candidate_ids=tuple(map(int, value.get("locked_candidate_ids", ()))),
+        )
+        schedule.validate()
+        recorded = value.get("fingerprint")
+        if recorded is not None and str(recorded) != schedule.fingerprint:
+            raise RuntimeError("macro candidate schedule fingerprint mismatch")
+        recorded_parameters = value.get("parameter_fingerprint")
+        if (
+            recorded_parameters is not None
+            and str(recorded_parameters) != schedule.parameter_fingerprint
+        ):
+            raise RuntimeError("macro candidate parameter fingerprint mismatch")
+        return schedule
+
+
+def build_macro_candidate_schedule(
+    *,
+    split: str,
+    namespace: str,
+    target_valid: int,
+    initial_candidate_budget: int,
+    max_candidate_budget: int,
+    minimum_partial_valid: int,
+    firms_per_parent: int,
+    seed: int,
+    candidate_id_offset: int,
+) -> MacroCandidateSchedule:
+    """Create a fixed path-specific Beta schedule before any model evaluation.
+
+    The Sobol points vary the shape continuously within seven declared support
+    strata.  Candidate identity, distribution parameters and shock keys are
+    therefore independent of batch size, failure outcomes and resume timing.
+    """
+
+    if max_candidate_budget < 1:
+        raise ValueError("max_candidate_budget must be positive")
+    sobol = torch.quasirandom.SobolEngine(
+        dimension=2, scramble=True, seed=int(seed)
+    ).draw(int(max_candidate_budget)).to(torch.float64)
+    # Rotate the balanced family allocation by a seed-dependent offset.  This
+    # is stratification; alpha/beta themselves are not repeated templates.
+    rotation = int(seed) % len(B_DISTRIBUTION_STRATA)
+    specs: list[MacroCandidateSpec] = []
+    for position in range(int(max_candidate_budget)):
+        family_index = (position + rotation) % len(B_DISTRIBUTION_STRATA)
+        family, alpha_range, beta_range = B_DISTRIBUTION_STRATA[family_index]
+        alpha = alpha_range[0] + float(sobol[position, 0]) * (
+            alpha_range[1] - alpha_range[0]
+        )
+        beta = beta_range[0] + float(sobol[position, 1]) * (
+            beta_range[1] - beta_range[0]
+        )
+        candidate_id = int(candidate_id_offset + position)
+        specs.append(
+            MacroCandidateSpec(
+                candidate_id=candidate_id,
+                lineage_id=candidate_id,
+                split=str(split),
+                distribution_parameter_id=position,
+                distribution_family=family,
+                alpha=float(alpha),
+                beta=float(beta),
+                initial_state_seed=int(seed),
+                transition_seed=int(seed + 10_000_019),
+                entry_seed=int(seed + 20_000_033),
+                shock_key_child_0=int(candidate_id * 2),
+                shock_key_child_1=int(candidate_id * 2 + 1),
+            )
+        )
+    schedule = MacroCandidateSchedule(
+        split=str(split),
+        namespace=str(namespace),
+        target_valid=int(target_valid),
+        initial_candidate_budget=int(initial_candidate_budget),
+        max_candidate_budget=int(max_candidate_budget),
+        minimum_partial_valid=int(minimum_partial_valid),
+        firms_per_parent=int(firms_per_parent),
+        seed=int(seed),
+        candidate_specs=tuple(specs),
+    )
+    schedule.validate()
+    return schedule
+
+
+def save_candidate_schedule(path: Path, schedule: MacroCandidateSchedule) -> None:
+    schedule.validate()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(schedule.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_candidate_schedule(path: Path) -> MacroCandidateSchedule:
+    return MacroCandidateSchedule.from_dict(
+        json.loads(path.read_text(encoding="utf-8"))
+    )
+
+
+def lock_validation_candidate_ids(
+    schedule: MacroCandidateSchedule, candidate_ids: Sequence[int]
+) -> MacroCandidateSchedule:
+    """Return the immutable validation identity set used by later outers."""
+
+    ids = tuple(map(int, candidate_ids))
+    if len(ids) != len(set(ids)):
+        raise ValueError("validation candidate ids must be unique")
+    locked = replace(schedule, locked_candidate_ids=ids)
+    locked.validate()
+    return locked
 
 
 class ExactTimeStateBankCapture:
@@ -366,6 +628,392 @@ def _allowed_simulation_models(
         for name, model in models.items()
         if name in {"policy_value", "sdf_fc1", "dist_b"}
     }
+
+
+def _candidate_state_hash(state: Mapping[str, torch.Tensor], path: int) -> str:
+    return _tensor_digest(
+        (name, value[path])
+        for name, value in state.items()
+        if torch.is_tensor(value)
+        and value.ndim > 0
+        and int(value.shape[0]) == int(state["b"].shape[0])
+    )
+
+
+def make_boundary_candidate_initial_state(
+    sim: SimulateTS,
+    specs: Sequence[MacroCandidateSpec],
+    *,
+    firms: int,
+) -> tuple[dict[str, torch.Tensor], pd.DataFrame, dict[str, Any]]:
+    """Build path-specific B-only initial distributions with keyed CRN.
+
+    All non-b fields are generated once from the same keyed baseline state and
+    then left byte-identical while b is replaced by the scheduled Beta law.
+    Midpoint quantiles avoid endpoint singularities for alpha/beta below one.
+    """
+
+    if len(specs) != int(sim.n_paths):
+        raise ValueError("candidate spec count must match simulator n_paths")
+    if firms < 2:
+        raise ValueError("at least two weighted components are required")
+    device = sim.device
+    dtype = torch.float32
+    B, N = len(specs), int(firms)
+    candidate_ids = torch.tensor(
+        [spec.candidate_id for spec in specs], device=device, dtype=torch.long
+    )
+    path = candidate_ids[:, None].expand(B, N)
+    identity = torch.arange(N, device=device, dtype=torch.long)[None, :].expand(B, N)
+    seed = int(specs[0].initial_state_seed)
+    if any(int(spec.initial_state_seed) != seed for spec in specs):
+        raise ValueError("a candidate batch must share its initial-state seed")
+
+    stationary_x_std = float(sim.config.SIGMA_X) / math.sqrt(
+        max(1.0 - float(sim.config.RHO_X) ** 2, 1.0e-30)
+    )
+    x = float(sim.config.XBAR) + stationary_x_std * _keyed_normal(
+        seed=seed,
+        path_id=candidate_ids,
+        economic_time=0,
+        branch_id=-1,
+        identity=torch.zeros_like(candidate_ids),
+        shock_type=101,
+        dtype=dtype,
+    )
+    lnkf = 4.0 + _keyed_normal(
+        seed=seed,
+        path_id=candidate_ids,
+        economic_time=0,
+        branch_id=-1,
+        identity=torch.zeros_like(candidate_ids),
+        shock_type=102,
+        dtype=dtype,
+    )
+    hatcf = -2.0 + _keyed_normal(
+        seed=seed,
+        path_id=candidate_ids,
+        economic_time=0,
+        branch_id=-1,
+        identity=torch.zeros_like(candidate_ids),
+        shock_type=103,
+        dtype=dtype,
+    )
+    weights = _keyed_uniform(
+        seed=seed,
+        path_id=path,
+        economic_time=0,
+        branch_id=-1,
+        identity=identity,
+        shock_type=104,
+        dtype=dtype,
+    ).clamp_min(torch.finfo(dtype).eps)
+    weights = weights / weights.sum(dim=1, keepdim=True)
+    capital = torch.exp(lnkf)[:, None] * weights
+    baseline_b = float(sim.config.SIM_B_INIT_MIN) + (
+        float(sim.config.SIM_B_INIT_MAX) - float(sim.config.SIM_B_INIT_MIN)
+    ) * _keyed_uniform(
+        seed=seed,
+        path_id=path,
+        economic_time=0,
+        branch_id=-1,
+        identity=identity,
+        shock_type=105,
+        dtype=dtype,
+    )
+
+    quantiles = (torch.arange(N, dtype=torch.float64) + 0.5) / float(N)
+    order_key = _keyed_uniform(
+        seed=seed,
+        path_id=path,
+        economic_time=0,
+        branch_id=-1,
+        identity=identity,
+        shock_type=106,
+        dtype=torch.float64,
+    )
+    permutation = torch.argsort(order_key, dim=1)
+    q = quantiles.to(device=device)[None, :].expand(B, N)
+    q = torch.gather(q, 1, permutation).cpu().numpy()
+    alpha = np.asarray([spec.alpha for spec in specs], dtype=np.float64)[:, None]
+    beta = np.asarray([spec.beta for spec in specs], dtype=np.float64)[:, None]
+    unit_b = betaincinv(alpha, beta, q)
+    if not np.isfinite(unit_b).all():
+        raise RuntimeError("Beta inverse quantile mapping produced nonfinite b")
+    b = torch.as_tensor(unit_b, device=device, dtype=dtype)
+    b = float(sim.config.SIM_B_INIT_MIN) + (
+        float(sim.config.SIM_B_INIT_MAX) - float(sim.config.SIM_B_INIT_MIN)
+    ) * b
+
+    duplicate = lambda value: torch.repeat_interleave(value, 2, dim=1)
+    eta_probability = torch.tensor(
+        [1.0 - float(sim.config.ZETA), float(sim.config.ZETA)],
+        device=device,
+        dtype=dtype,
+    )[None, None, :]
+    mass = (
+        torch.ones((B, N, 1), device=device, dtype=dtype) * eta_probability
+    ).reshape(B, 2 * N)
+    mask = mass > 0.0
+    component_id = torch.arange(2 * N, device=device, dtype=torch.long)[None, :].expand(B, -1)
+    eta = torch.tensor([0.0, 1.0], device=device, dtype=dtype)[None, None, :]
+    eta = eta.expand(B, N, 2).reshape(B, 2 * N)
+    stationary_z_std = float(sim.config.SIGMA_Z) / math.sqrt(
+        max(1.0 - float(sim.config.RHO_Z) ** 2, 1.0e-30)
+    )
+    zeros_long = torch.zeros((B, 2 * N), device=device, dtype=torch.long)
+    distribution = PreDecisionDistribution(
+        component_mass=mass,
+        b=duplicate(b),
+        capital_per_unit=duplicate(capital),
+        z_conditional_mean=torch.full_like(mass, float(sim.config.ZBAR)),
+        z_conditional_std=torch.full_like(mass, stationary_z_std),
+        component_mask=mask,
+        economic_node_id=zeros_long,
+        component_id=component_id,
+        origin_kind=zeros_long,
+        origin_source_id=component_id,
+        origin_time=zeros_long,
+        evaluation_time=zeros_long,
+        cohort=zeros_long,
+        birth_time=torch.full_like(zeros_long, -1),
+        maintenance_eligibility=torch.ones_like(mask),
+        eta_state=eta,
+    ).validate()
+    state = distribution.as_state_tensors()
+    state.update(
+        {
+            "x": x,
+            "hatcf": hatcf,
+            "lnkf": lnkf,
+            "M": torch.ones(B, device=device, dtype=dtype),
+            "economic_node_id": torch.zeros(B, device=device, dtype=torch.long),
+            "economic_time": torch.zeros(B, device=device, dtype=torch.long),
+            "transition_path_id": candidate_ids,
+            "market_previous_root": hatcf.clone(),
+            "i": torch.zeros_like(mass),
+            "firm_id": component_id,
+        }
+    )
+
+    rows: list[dict[str, Any]] = []
+    for local_path, spec in enumerate(specs):
+        values = b[local_path].to(torch.float64)
+        mean = values.mean()
+        sorted_values = torch.sort(values).values
+        digest = hashlib.sha256(values.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
+        rows.append(
+            {
+                **spec.to_dict(),
+                "weighted_b_mean": float(mean),
+                "weighted_b_std": float(values.std(unbiased=False)),
+                "weighted_b_p10": float(torch.quantile(sorted_values, 0.10)),
+                "weighted_b_p50": float(torch.quantile(sorted_values, 0.50)),
+                "weighted_b_p90": float(torch.quantile(sorted_values, 0.90)),
+                "high_b_mass": float((values >= 0.75).to(torch.float64).mean()),
+                "K_total": float(capital[local_path].sum()),
+                "z_conditional_mean": float(sim.config.ZBAR),
+                "z_conditional_std": stationary_z_std,
+                "distribution_hash": digest,
+            }
+        )
+    preservation = {
+        "z_conditional_law_unchanged": True,
+        "eta_law_unchanged": True,
+        "investment_cost_law_unchanged": True,
+        "initial_K_unchanged": True,
+        "initial_x_unchanged": True,
+        "firm_mass_unchanged": True,
+        "baseline_b_hash": hashlib.sha256(
+            baseline_b.detach().cpu().contiguous().numpy().tobytes()
+        ).hexdigest(),
+        "only_b_replaced": True,
+    }
+    return state, pd.DataFrame(rows), preservation
+
+
+def boundary_distribution_from_state(
+    state: Mapping[str, torch.Tensor],
+) -> PreDecisionDistribution:
+    return PreDecisionDistribution(
+        component_mass=state["component_mass"],
+        b=state["b"],
+        capital_per_unit=state["K"],
+        z_conditional_mean=state["z_conditional_mean"],
+        z_conditional_std=state["z_conditional_std"],
+        component_mask=state["component_mask"],
+        economic_node_id=state["economic_node_id_component"],
+        component_id=state["component_id"],
+        origin_kind=state["origin_kind"],
+        origin_source_id=state["origin_source_id"],
+        origin_time=state["origin_time"],
+        evaluation_time=state["evaluation_time"],
+        cohort=state["cohort"],
+        birth_time=state["birth_time"],
+        maintenance_eligibility=state["maintenance_eligibility"],
+        eta_state=state["eta"],
+    ).validate()
+
+
+def boundary_entry_candidates(
+    sim: SimulateTS, distribution: PreDecisionDistribution
+) -> EntryCandidates:
+    total_mass = distribution.total_mass()
+    total_capital = distribution.total_capital()
+    mean_capital = total_capital / total_mass.clamp_min(1.0e-30)
+    capital_per_entrant = float(sim.entry_size_ratio) * mean_capital
+    potential_capital = float(sim.entry_capital_ratio) * total_capital
+    active = (capital_per_entrant > 0.0) & (potential_capital > 0.0)
+    B = distribution.batch_size
+    dtype = distribution.component_mass.dtype
+    device = distribution.component_mass.device
+    return EntryCandidates(
+        counts=active.to(torch.long),
+        mask=active[:, None],
+        z=torch.zeros((B, 1), device=device, dtype=dtype),
+        entry_cost=torch.zeros((B, 1), device=device, dtype=dtype),
+        K_birth=capital_per_entrant[:, None],
+        potential_capital_nominal=potential_capital,
+        candidate_capital_realized=capital_per_entrant,
+    )
+
+
+def boundary_child_state(
+    sim: SimulateTS,
+    parent: Mapping[str, torch.Tensor],
+    *,
+    branch: int,
+) -> dict[str, torch.Tensor]:
+    record = parent["_boundary_decision_record"]
+    distribution = propagate_ar1_with_eta_mixture(
+        record.transport_atoms,
+        rho_z=float(sim.config.RHO_Z),
+        sigma_z=float(sim.config.SIGMA_Z),
+        z_bar=float(sim.config.ZBAR),
+        zeta=float(sim.config.ZETA),
+    )
+    path_ids = parent["transition_path_id"].to(torch.long)
+    eps = _keyed_normal(
+        seed=int(sim.common_transition_seed),
+        path_id=path_ids,
+        economic_time=torch.ones_like(path_ids),
+        branch_id=int(branch),
+        identity=torch.zeros_like(path_ids),
+        shock_type=1,
+        dtype=parent["x"].dtype,
+    )
+    x_next = (
+        (1.0 - float(sim.config.RHO_X)) * float(sim.config.XBAR)
+        + float(sim.config.RHO_X) * parent["x"]
+        + float(sim.config.SIGMA_X) * eps
+    )
+    hatcf, lnkf, M = _predict_macro_fc1_batched(
+        sim,
+        parent["x"],
+        x_next,
+        parent["hatc_cal"],
+        parent["lnk_cal"],
+    )
+    child = distribution.as_state_tensors()
+    B, L = distribution.component_mass.shape
+    node_id = torch.full(
+        (B,), branch + 1, device=sim.device, dtype=torch.long
+    )
+    child["economic_node_id_component"] = node_id[:, None].expand(B, L)
+    child.update(
+        {
+            "x": x_next,
+            "hatcf": hatcf,
+            "lnkf": lnkf,
+            "M": M,
+            "economic_node_id": node_id,
+            "economic_time": torch.ones(B, device=sim.device, dtype=torch.long),
+            "transition_path_id": path_ids.clone(),
+            "market_previous_root": parent["hatc_cleared"].clone(),
+            "i": torch.zeros((B, L), device=sim.device, dtype=distribution.component_mass.dtype),
+            "firm_id": distribution.component_id,
+        }
+    )
+    return child
+
+
+def boundary_macro_rows(
+    state: Mapping[str, torch.Tensor], *, t: int, branch: int, split: str
+) -> list[dict[str, Any]]:
+    distribution = boundary_distribution_from_state(state)
+    moments = gaussian_mixture_moments(distribution)
+    path_ids = state["transition_path_id"].to(torch.long)
+    rows: list[dict[str, Any]] = []
+    for local in range(distribution.batch_size):
+        C = state["accounting_C_raw"][local]
+        K = state["accounting_K_total"][local]
+        h_implied = (
+            float(torch.log(C / K))
+            if bool((C > 0.0) & (K > 0.0))
+            else float("nan")
+        )
+        h_belief = float(state.get("hatc_belief", state["hatcf"])[local])
+        h_cleared = float(state["hatc_cleared"][local])
+        h_firm_input = float(state["hatcf"][local])
+        candidate_id = int(path_ids[local])
+        rows.append(
+            {
+                "split": str(split),
+                "path": candidate_id,
+                "lineage_id": candidate_id,
+                "candidate_id": candidate_id,
+                "t": int(t),
+                "branch": int(branch),
+                "x": float(state["x"][local]),
+                "hatcf": h_firm_input,
+                "lnkf": float(state["lnkf"][local]),
+                "Hatc": h_cleared,
+                "LnK": float(state["lnk_cal"][local]),
+                "M": float(state.get("M", torch.ones_like(state["x"]))[local]),
+                "C": float(C),
+                "K": float(K),
+                "I_oper": float(state["accounting_I_oper"][local]),
+                "I_entry": float(state["accounting_I_entry"][local]),
+                "I_maintenance": float(
+                    state["accounting_I_maintenance"][local]
+                ),
+                "n_firms": float(distribution.total_mass()[local]),
+                "default_mass": float(
+                    state.get(
+                        "decision_default_mass", torch.zeros_like(state["x"])
+                    )[local]
+                ),
+                "investment_mass": float(
+                    state.get(
+                        "decision_investment_mass", torch.zeros_like(state["x"])
+                    )[local]
+                ),
+                "mean_b": float(
+                    (
+                        distribution.component_mass[local]
+                        * distribution.b[local]
+                    ).sum()
+                    / distribution.component_mass[local].sum().clamp_min(1.0e-30)
+                ),
+                "h_belief": h_belief,
+                "h_selected_root": h_cleared,
+                "h_implied_from_accounting": h_implied,
+                "h_used_in_firm_policy": h_firm_input,
+                "root_status": "ROOT_FOUND",
+                "root_residual": float(state["market_root_residual"][local]),
+                "root_residual_normalized": float(
+                    state["market_root_residual_normalized"][local]
+                ),
+                "firm_mass": float(distribution.total_mass()[local]),
+                "total_capital": float(distribution.total_capital()[local]),
+                "aggregate_debt": float(distribution.aggregate_debt()[local]),
+                "z_mixture_mean": float(moments["mean"][local]),
+                "z_mixture_variance": float(moments["variance"][local]),
+                "component_count": int(distribution.component_mask[local].sum()),
+                "representation": BOUNDARY_AWARE_CONTINUUM_V1,
+            }
+        )
+    return rows
 
 
 def run_short_rollout_harvest(
@@ -840,7 +1488,7 @@ def audit_one_step_pairing(
     return audit
 
 
-def build_one_step_macro_dataset(
+def build_legacy_harvested_one_step_macro_dataset(
     *,
     models: Mapping[str, torch.nn.Module],
     episode: Any,
@@ -853,6 +1501,7 @@ def build_one_step_macro_dataset(
     device: torch.device,
     path_offset: int = 0,
 ) -> OneStepMacroDataset:
+    """Archived short-rollout interface; canonical training never calls it."""
     macro, used_batch_size = simulate_one_step_chunked(
         models=models,
         episode=episode,
@@ -895,6 +1544,552 @@ def build_one_step_macro_dataset(
         batches=batches,
         pairing_audit=audit,
         used_parent_batch_size=used_batch_size,
+    )
+
+
+class _CandidateEconomicFailure(RuntimeError):
+    def __init__(self, status: str, reason: str) -> None:
+        super().__init__(reason)
+        self.status = str(status)
+        self.reason = str(reason)
+
+
+def _candidate_failure_status(stage: str, reason: str) -> str:
+    upper = reason.upper()
+    if "NO ACTIVE ECONOMIC NODE" in upper or "EXTINCT" in upper:
+        return "CHILD_EXTINCT" if stage.startswith("child") else "PARENT_CLEARING_FAILED"
+    if "NONFINITE" in upper or "NAN" in upper or "INF" in upper:
+        return "NUMERICAL_FAILURE"
+    if stage == "parent":
+        return "PARENT_CLEARING_FAILED"
+    if stage == "child_0":
+        return "CHILD_0_CLEARING_FAILED"
+    if stage == "child_1":
+        return "CHILD_1_CLEARING_FAILED"
+    return "NUMERICAL_FAILURE"
+
+
+def _evaluate_boundary_candidate_batch(
+    *,
+    models: Mapping[str, torch.nn.Module],
+    episode: Any,
+    specs: Sequence[MacroCandidateSpec],
+    firms_per_parent: int,
+    device: torch.device,
+    integration: BoundaryIntegrationConfig,
+    root_config: MarketClearingConfig,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Evaluate one vectorized candidate batch or raise a typed economic failure."""
+
+    if not specs:
+        return [], [], []
+    sim = SimulateTS(
+        models=_allowed_simulation_models(models),
+        config=episode.config,
+        n_paths=len(specs),
+        group_size=int(firms_per_parent),
+        horizon=1,
+        branch_num=2,
+        device=device,
+        **_simulation_kwargs(
+            episode, int(specs[0].transition_seed), int(specs[0].entry_seed)
+        ),
+    )
+    firms = int(firms_per_parent)
+    if firms < 2:
+        raise RuntimeError("candidate evaluator missing firms_per_parent contract")
+    sim.aggregation_mode = BOUNDARY_AWARE_CONTINUUM_V1
+    controller = BoundaryAwareMarketClearingController(root_config, integration)
+    sim.market_clearing_controller = controller
+    try:
+        state, manifest, preservation = make_boundary_candidate_initial_state(
+            sim, specs, firms=firms
+        )
+    except (ValueError, FloatingPointError) as error:
+        raise _CandidateEconomicFailure(
+            "INVALID_INITIAL_DISTRIBUTION", repr(error)
+        ) from error
+
+    initial_state_hashes = [
+        _candidate_state_hash(state, local) for local in range(len(specs))
+    ]
+    stage = "parent"
+    try:
+        state = controller.clear_state(
+            sim, state, empty_entry_candidates(state), t=0, branch=-1
+        )
+        controller.validate_committed(state, t=0, branch=-1)
+        parent_rows = boundary_macro_rows(state, t=0, branch=-1, split=specs[0].split)
+        entry = boundary_entry_candidates(sim, boundary_distribution_from_state(state))
+        children: list[dict[str, torch.Tensor]] = []
+        child_rows: list[dict[str, Any]] = []
+        for branch in range(2):
+            stage = f"child_{branch}"
+            child = boundary_child_state(sim, state, branch=branch)
+            child = controller.clear_state(
+                sim, child, entry, t=1, branch=branch
+            )
+            controller.validate_committed(child, t=1, branch=branch)
+            children.append(child)
+            child_rows.extend(
+                boundary_macro_rows(
+                    child, t=1, branch=branch, split=specs[0].split
+                )
+            )
+    except MarketClearingError as error:
+        raise _CandidateEconomicFailure(
+            _candidate_failure_status(stage, str(error)), str(error)
+        ) from error
+
+    rows_by_id: dict[int, list[dict[str, Any]]] = {
+        spec.candidate_id: [] for spec in specs
+    }
+    for row in (*parent_rows, *child_rows):
+        rows_by_id[int(row["candidate_id"])].append(row)
+    records: list[dict[str, Any]] = []
+    valid_rows: list[dict[str, Any]] = []
+    manifest_rows = manifest.to_dict("records")
+    for local, spec in enumerate(specs):
+        parent_valid = bool(state["market_root_found"][local]) and bool(
+            state.get(
+                "economic_state_defined",
+                torch.ones(len(specs), device=device, dtype=torch.bool),
+            )[local]
+        )
+        child_validity = []
+        for child in children:
+            child_validity.append(
+                bool(child["market_root_found"][local])
+                and bool(
+                    child.get(
+                        "economic_state_defined",
+                        torch.ones(len(specs), device=device, dtype=torch.bool),
+                    )[local]
+                )
+                and bool(child["accounting_C_raw"][local] > 0.0)
+                and bool(child["accounting_K_total"][local] > 0.0)
+            )
+        if not parent_valid:
+            status = "PARENT_CLEARING_FAILED"
+        elif not child_validity[0] or not child_validity[1]:
+            status = "CHILD_EXTINCT"
+        else:
+            status = MACRO_CANDIDATE_STATUS_VALID
+            valid_rows.extend(rows_by_id[spec.candidate_id])
+        record = {
+            **spec.to_dict(),
+            "initial_distribution_hash": initial_state_hashes[local],
+            "parent_status": "VALID" if parent_valid else "INVALID",
+            "child_0_status": "VALID" if child_validity[0] else "INVALID",
+            "child_1_status": "VALID" if child_validity[1] else "INVALID",
+            "status": status,
+            "failure_reason": "" if status == MACRO_CANDIDATE_STATUS_VALID else status,
+            "accepted_for_training": False,
+            "boundary_aware_representation": BOUNDARY_AWARE_CONTINUUM_V1,
+            "root_residual_parent": float(state["market_root_residual_normalized"][local]),
+            "root_residual_child_0": float(children[0]["market_root_residual_normalized"][local]),
+            "root_residual_child_1": float(children[1]["market_root_residual_normalized"][local]),
+            "only_b_replaced": bool(preservation["only_b_replaced"]),
+        }
+        records.append(record)
+        manifest_rows[local]["candidate_status"] = status
+    return valid_rows, records, manifest_rows
+
+
+def _evaluate_boundary_candidates_with_isolation(
+    **kwargs: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    specs = tuple(kwargs.pop("specs"))
+    try:
+        return _evaluate_boundary_candidate_batch(specs=specs, **kwargs)
+    except _CandidateEconomicFailure as error:
+        if len(specs) > 1:
+            middle = len(specs) // 2
+            left = _evaluate_boundary_candidates_with_isolation(
+                specs=specs[:middle], **kwargs
+            )
+            right = _evaluate_boundary_candidates_with_isolation(
+                specs=specs[middle:], **kwargs
+            )
+            return tuple(left[i] + right[i] for i in range(3))  # type: ignore[return-value]
+        spec = specs[0]
+        return [], [
+            {
+                **spec.to_dict(),
+                "initial_distribution_hash": None,
+                "parent_status": "INVALID" if error.status == "PARENT_CLEARING_FAILED" else "UNKNOWN",
+                "child_0_status": "INVALID" if error.status in {"CHILD_0_CLEARING_FAILED", "CHILD_EXTINCT"} else "UNKNOWN",
+                "child_1_status": "INVALID" if error.status in {"CHILD_1_CLEARING_FAILED", "CHILD_EXTINCT"} else "UNKNOWN",
+                "status": error.status,
+                "failure_reason": error.reason,
+                "accepted_for_training": False,
+                "boundary_aware_representation": BOUNDARY_AWARE_CONTINUUM_V1,
+            }
+        ], [{**spec.to_dict(), "candidate_status": error.status}]
+
+
+def _macro_rows_to_table(rows: Sequence[Mapping[str, Any]], device: torch.device) -> TensorTable:
+    columns = [
+        "path", "t", "branch", "x", "hatcf", "lnkf", "Hatc", "LnK",
+        "M", "C", "K", "I_oper", "I_entry", "I_maintenance", "n_firms",
+        "default_mass", "investment_mass", "mean_b",
+        "lineage_id",
+    ]
+    data = torch.tensor(
+        [[float(row[name]) for name in columns] for row in rows],
+        device=device,
+        dtype=torch.float32,
+    )
+    return TensorTable(data=data, columns=columns)
+
+
+def audit_candidate_pairing(
+    pairs: TensorTable, accepted_candidate_ids: Sequence[int]
+) -> dict[str, Any]:
+    col = {name: index for index, name in enumerate(pairs.columns)}
+    required = {"path", "t", "branch", "lineage_id"}
+    if not required.issubset(col):
+        raise RuntimeError("candidate pair table lacks identity fields")
+    data = pairs.data.detach().cpu()
+    expected = set(map(int, accepted_candidate_ids))
+    failures: list[dict[str, Any]] = []
+    for candidate_id in sorted(expected):
+        mask = data[:, col["path"]].to(torch.long) == candidate_id
+        branches = sorted(map(int, data[mask, col["branch"]].tolist()))
+        times = sorted(set(map(int, data[mask, col["t"]].tolist())))
+        lineages = set(map(int, data[mask, col["lineage_id"]].tolist()))
+        if branches != [0, 1] or times != [1] or lineages != {candidate_id}:
+            failures.append(
+                {
+                    "candidate_id": candidate_id,
+                    "branches": branches,
+                    "times": times,
+                    "lineages": sorted(lineages),
+                }
+            )
+    observed = set(map(int, data[:, col["path"]].to(torch.long).tolist()))
+    audit = {
+        "expected_parent_count": len(expected),
+        "observed_parent_count": len(observed),
+        "pair_row_count": len(data),
+        "expected_pair_row_count": 2 * len(expected),
+        "failed_parent_groups": failures,
+        "unexpected_candidate_ids": sorted(observed - expected),
+        "each_parent_has_exact_children": (
+            not failures and observed == expected and len(data) == 2 * len(expected)
+        ),
+        "parent_local_t": 0,
+        "child_local_t": 1,
+    }
+    if not audit["each_parent_has_exact_children"]:
+        raise RuntimeError(f"candidate parent/child pairing invariant failed: {audit}")
+    return audit
+
+
+def build_one_step_macro_dataset(
+    *,
+    models: Mapping[str, torch.nn.Module],
+    episode: Any,
+    candidate_schedule: MacroCandidateSchedule,
+    parent_batch_size: int,
+    macro_batch_size: int,
+    device: torch.device,
+    output_dir: Optional[Path] = None,
+    candidate_ids: Optional[Sequence[int]] = None,
+    allow_replenishment: bool = True,
+    integration: Optional[BoundaryIntegrationConfig] = None,
+    root_config: Optional[MarketClearingConfig] = None,
+) -> OneStepMacroDataset:
+    """Canonical boundary-aware one-step Macro dataset builder.
+
+    Candidate failures are audited and isolated.  Only complete parent/two-
+    child pairs enter optimization batches; engineering/schema errors are not
+    caught here and therefore remain fail-fast.
+    """
+
+    candidate_schedule.validate()
+    if int(parent_batch_size) < 1 or int(macro_batch_size) < 1:
+        raise ValueError("batch sizes must be positive")
+    integration = integration or BoundaryIntegrationConfig()
+    root_config = root_config or MarketClearingConfig()
+    spec_by_id = {spec.candidate_id: spec for spec in candidate_schedule.candidate_specs}
+    if candidate_ids is None:
+        ordered_specs = list(candidate_schedule.candidate_specs)
+    else:
+        requested = tuple(map(int, candidate_ids))
+        missing = sorted(set(requested) - set(spec_by_id))
+        if missing:
+            raise ValueError(f"candidate ids outside schedule: {missing[:10]}")
+        ordered_specs = [spec_by_id[value] for value in requested]
+        if allow_replenishment:
+            used = set(requested)
+            ordered_specs.extend(
+                spec for spec in candidate_schedule.candidate_specs
+                if spec.candidate_id not in used
+            )
+
+    rows: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    manifest_rows: list[dict[str, Any]] = []
+    accepted_ids: list[int] = []
+    attempted_ids: set[int] = set()
+    output = None if output_dir is None else Path(output_dir)
+    provenance = {
+        "candidate_parameter_fingerprint": candidate_schedule.parameter_fingerprint,
+        "split": candidate_schedule.split,
+        "firms_per_parent": candidate_schedule.firms_per_parent,
+        "integration_config": asdict(integration),
+        "root_config": asdict(root_config),
+        "model_hashes_at_generation": {
+            name: _model_state_digest(model)
+            for name, model in sorted(models.items())
+        },
+    }
+    provenance["fingerprint"] = _json_hash(provenance)
+    if output is not None:
+        output.mkdir(parents=True, exist_ok=True)
+        save_candidate_schedule(output / "candidate_schedule.json", candidate_schedule)
+        provenance_path = output / "dataset_provenance.json"
+        if provenance_path.is_file():
+            recorded = json.loads(provenance_path.read_text(encoding="utf-8"))
+            for key in (
+                "candidate_parameter_fingerprint",
+                "split",
+                "firms_per_parent",
+                "integration_config",
+                "root_config",
+            ):
+                if recorded.get(key) != provenance.get(key):
+                    raise RuntimeError(
+                        f"candidate dataset resume provenance mismatch: {key}"
+                    )
+            provenance = recorded
+        else:
+            provenance_path.write_text(
+                json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+    for start in range(0, len(ordered_specs), int(parent_batch_size)):
+        if len(accepted_ids) >= candidate_schedule.target_valid:
+            break
+        batch_specs = ordered_specs[start : start + int(parent_batch_size)]
+        shard_path = (
+            None
+            if output is None
+            else output / "candidate_shards" / f"batch_{start:06d}_{start + len(batch_specs):06d}.pt"
+        )
+        if shard_path is not None and shard_path.is_file():
+            payload = torch.load(shard_path, map_location="cpu", weights_only=False)
+            if (
+                payload["candidate_parameter_fingerprint"]
+                != candidate_schedule.parameter_fingerprint
+            ):
+                raise RuntimeError("candidate shard schedule mismatch")
+            if payload["dataset_provenance_fingerprint"] != provenance["fingerprint"]:
+                raise RuntimeError("candidate shard provenance mismatch")
+            batch_rows = list(payload["rows"])
+            batch_records = list(payload["records"])
+            batch_manifest = list(payload["manifest"])
+        else:
+            batch_rows, batch_records, batch_manifest = (
+                _evaluate_boundary_candidates_with_isolation(
+                    models=models,
+                    episode=episode,
+                    specs=batch_specs,
+                    firms_per_parent=candidate_schedule.firms_per_parent,
+                    device=device,
+                    integration=integration,
+                    root_config=root_config,
+                )
+            )
+            if shard_path is not None:
+                shard_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = shard_path.with_suffix(".tmp")
+                torch.save(
+                    {
+                        "candidate_parameter_fingerprint": (
+                            candidate_schedule.parameter_fingerprint
+                        ),
+                        "dataset_provenance_fingerprint": provenance["fingerprint"],
+                        "rows": batch_rows,
+                        "records": batch_records,
+                        "manifest": batch_manifest,
+                    },
+                    temporary,
+                )
+                temporary.replace(shard_path)
+        rows_by_id: dict[int, list[dict[str, Any]]] = {}
+        for row in batch_rows:
+            rows_by_id.setdefault(int(row["candidate_id"]), []).append(row)
+        for record in batch_records:
+            candidate_id = int(record["candidate_id"])
+            record["candidate_phase"] = (
+                "INITIAL_BUDGET"
+                if int(record["distribution_parameter_id"])
+                < candidate_schedule.initial_candidate_budget
+                else "BOUNDED_REPLENISHMENT"
+            )
+            attempted_ids.add(candidate_id)
+            if (
+                record["status"] == MACRO_CANDIDATE_STATUS_VALID
+                and len(accepted_ids) < candidate_schedule.target_valid
+            ):
+                record["accepted_for_training"] = True
+                accepted_ids.append(candidate_id)
+                rows.extend(rows_by_id[candidate_id])
+            records.append(record)
+        manifest_rows.extend(batch_manifest)
+        if output is not None:
+            cursor = {
+                "schedule_fingerprint": candidate_schedule.fingerprint,
+                "candidate_parameter_fingerprint": (
+                    candidate_schedule.parameter_fingerprint
+                ),
+                "dataset_provenance_fingerprint": provenance["fingerprint"],
+                "candidate_cursor": start + len(batch_specs),
+                "attempted_candidate_ids": sorted(attempted_ids),
+                "accepted_candidate_ids": accepted_ids,
+            }
+            temporary = output / "candidate_cursor.tmp"
+            temporary.write_text(json.dumps(cursor, indent=2, sort_keys=True) + "\n")
+            temporary.replace(output / "candidate_cursor.json")
+
+    accepted_count = len(accepted_ids)
+    if accepted_count >= candidate_schedule.target_valid:
+        dataset_status = "TARGET_VALID_DATASET"
+    elif accepted_count >= candidate_schedule.minimum_partial_valid:
+        dataset_status = "PARTIAL_BOOTSTRAP_TRAINING"
+    else:
+        dataset_status = "INSUFFICIENT_VALID_PAIRS"
+    if not rows:
+        empty = torch.empty((0, 19), device=device, dtype=torch.float32)
+        macro = TensorTable(
+            data=empty,
+            columns=[
+                "path", "t", "branch", "x", "hatcf", "lnkf", "Hatc", "LnK",
+                "M", "C", "K", "I_oper", "I_entry", "I_maintenance", "n_firms",
+                "default_mass", "investment_mass", "mean_b",
+                "lineage_id",
+            ],
+        )
+        pairs = TensorTable(
+            data=torch.empty((0, 12), device=device, dtype=torch.float32),
+            columns=[
+                "path", "t", "branch", "x_t", "x_t1", "Hatcf_t", "LnKF_t",
+                "Hatc_t", "LnK_t", "Hatc_t1", "LnK_t1", "lineage_id",
+            ],
+        )
+        batches = {"fc1": [], "sdf": []}
+        pairing_audit = {
+            "each_parent_has_exact_children": False,
+            "reason": "NO_VALID_COMPLETE_PAIR",
+        }
+    else:
+        macro = _macro_rows_to_table(rows, device)
+        pairs = episode._build_sdf_pairs_from_macro_tensor(macro)
+        pairing_audit = audit_candidate_pairing(pairs, accepted_ids)
+        original_mode = episode.train_mode
+        original_add_fc1 = episode.add_FC1loss
+        try:
+            episode.train_mode = "2time"
+            episode.add_FC1loss = True
+            target_batches = int(
+                getattr(episode.hyperparams, "sdf_true_target_batches", 20)
+            )
+            min_parents = int(
+                getattr(episode.hyperparams, "sdf_min_parent_groups_per_batch", 256)
+            )
+            batches = {
+                "fc1": episode._create_sdf_batches_from_macro_tensor(
+                    pairs, batch_size=macro_batch_size, n_branches=2
+                ),
+                "sdf": episode._create_sdf_batches_from_macro_tensor(
+                    pairs,
+                    batch_size=macro_batch_size,
+                    n_branches=2,
+                    target_num_batches=target_batches,
+                    min_parent_groups_per_batch=min_parents,
+                ),
+            }
+        finally:
+            episode.train_mode = original_mode
+            episode.add_FC1loss = original_add_fc1
+        if dataset_status != "INSUFFICIENT_VALID_PAIRS" and not all(batches.values()):
+            raise RuntimeError("valid candidate pairs produced an empty training stream")
+
+    candidate_frame = pd.DataFrame(records)
+    manifest_frame = pd.DataFrame(manifest_rows)
+    acceptance = candidate_frame.get(
+        "accepted_for_training", pd.Series(dtype=bool)
+    ).astype(bool)
+    coverage = {
+        "attempted_candidate_count": int(len(candidate_frame)),
+        "valid_complete_pair_count": int(
+            (candidate_frame.get("status") == MACRO_CANDIDATE_STATUS_VALID).sum()
+        ) if not candidate_frame.empty else 0,
+        "accepted_training_pair_count": accepted_count,
+        "target_valid": candidate_schedule.target_valid,
+        "candidate_budget_exhausted": len(attempted_ids) >= len(ordered_specs),
+        "initial_candidate_budget": candidate_schedule.initial_candidate_budget,
+        "max_candidate_budget": candidate_schedule.max_candidate_budget,
+        "initial_budget_attempted": int(
+            (
+                candidate_frame.get("candidate_phase") == "INITIAL_BUDGET"
+            ).sum()
+        ) if not candidate_frame.empty else 0,
+        "replenishment_attempted": int(
+            (
+                candidate_frame.get("candidate_phase")
+                == "BOUNDED_REPLENISHMENT"
+            ).sum()
+        ) if not candidate_frame.empty else 0,
+        "dataset_status": dataset_status,
+        "accepted_candidate_ids": accepted_ids,
+        "failure_status_counts": (
+            candidate_frame.loc[~acceptance, "status"].value_counts().to_dict()
+            if not candidate_frame.empty else {}
+        ),
+        "selection_interpretation": "conditional_on_complete_parent_two_child_pair",
+        "outcome_by_distribution_family": (
+            candidate_frame.groupby(["distribution_family", "status"])
+            .size()
+            .rename("count")
+            .reset_index()
+            .to_dict(orient="records")
+            if not candidate_frame.empty else []
+        ),
+    }
+    pairing_audit["candidate_coverage"] = coverage
+    if output is not None:
+        candidate_frame.to_csv(output / "candidate_outcomes.csv", index=False)
+        manifest_frame.to_csv(output / "initial_b_distribution_coverage.csv", index=False)
+        (output / "initial_b_distribution_manifest.json").write_text(
+            json.dumps(
+                {
+                    "schedule_fingerprint": candidate_schedule.fingerprint,
+                    "sampling_design": "sobol_stratified_beta_midpoint_quantiles_v1",
+                    "b_support": [
+                        float(episode.config.SIM_B_INIT_MIN),
+                        float(episode.config.SIM_B_INIT_MAX),
+                    ],
+                    "families": [item[0] for item in B_DISTRIBUTION_STRATA],
+                    "coverage": coverage,
+                },
+                indent=2,
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
+        )
+    return OneStepMacroDataset(
+        macro=macro,
+        pairs=pairs,
+        batches=batches,
+        pairing_audit=pairing_audit,
+        used_parent_batch_size=int(parent_batch_size),
+        candidate_audit=candidate_frame,
+        distribution_manifest=manifest_frame,
+        dataset_status=dataset_status,
     )
 
 
