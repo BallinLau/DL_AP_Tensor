@@ -367,6 +367,7 @@ def _configure_hyperparams(args: argparse.Namespace):
     hp.market_clearing_residual_tolerance = float(
         args.market_clearing_residual_tolerance
     )
+    hp.macro_clearing_solver_mode = str(args.macro_clearing_solver_mode)
     hp.market_clearing_width_tolerance = float(
         args.market_clearing_width_tolerance
     )

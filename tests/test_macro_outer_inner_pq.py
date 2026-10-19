@@ -77,6 +77,7 @@ class ToyGridEpisode:
             entry_independent_resource_validation_enabled=True,
             preserve_global_rng_around_entry=True,
             simulation_bp_action_source="grid",
+            macro_clearing_solver_mode="fc1_bounded_improvement_pilot",
         )
         self.grid_policy = object()
 
@@ -112,6 +113,7 @@ def test_market_simulation_kwargs_preserve_grid_bp_source():
     assert kwargs["bp_grid_policy"] is episode.grid_policy
     assert kwargs["entry_rng_mode"] == "stable_economic_identity"
     assert kwargs["transition_rng_mode"] == "stable_firm_identity"
+    assert kwargs["macro_clearing_solver_mode"] == "fc1_bounded_improvement_pilot"
 
 
 def test_fc2_hash_invariant_without_access():

@@ -407,6 +407,7 @@ def _simulation_kwargs(episode: Any, transition_seed: int, entry_seed: int) -> d
     })
     market_defaults = {
         "market_clearing_mode": "disabled",
+        "macro_clearing_solver_mode": "strict_global",
         "market_clearing_coarse_points": 10,
         "market_clearing_refinement_points": 20,
         "market_clearing_max_refinement_rounds": 4,

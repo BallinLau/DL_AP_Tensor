@@ -106,6 +106,16 @@ def test_production_defaults_match_formal_protocol():
     assert args.disable_fc2
 
 
+def test_configured_macro_clearing_solver_reaches_simulation_hyperparams():
+    args = parse_args([
+        "--cold-start",
+        "--macro-clearing-solver-mode",
+        "fc1_bounded_improvement_pilot",
+    ])
+    hp = _configure_hyperparams(args)
+    assert hp.macro_clearing_solver_mode == "fc1_bounded_improvement_pilot"
+
+
 def test_smoke_overrides_only_scale_and_budget():
     args = parse_args(["--cold-start", "--smoke"])
     assert args.equilibrium_outer_max == 1
