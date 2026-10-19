@@ -3,29 +3,51 @@ from __future__ import annotations
 from types import SimpleNamespace
 import inspect
 from dataclasses import replace
+import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
 import torch
 
 import analysis.macro_parent_state_bank as bank_module
+import analysis.run_full_nested_equilibrium as runner
 from analysis.macro_parent_state_bank import (
     B_DISTRIBUTION_STRATA,
     MACRO_CANDIDATE_STATUS_VALID,
+    OneStepMacroDataset,
     build_macro_candidate_schedule,
     build_one_step_macro_dataset,
     boundary_macro_rows,
+    load_committed_one_step_macro_dataset,
     lock_validation_candidate_ids,
     make_boundary_candidate_initial_state,
+    one_step_macro_dataset_fingerprint,
+    save_committed_one_step_macro_dataset,
+    _macro_rows_to_table,
 )
 from analysis.run_full_nested_equilibrium import (
     FIRM_FIRST_STAGE_ORDER,
+    _args_fingerprint,
+    _build_or_load_fixed_banks,
+    _candidate_target_movements,
     _candidate_schedule_overlap,
     _record_firm_first_stage,
+    _load_committed_macro_inner_inputs,
+    _resume_with_recorded_config,
     main,
+    parse_args,
     run_firm_first_orchestration_mock,
 )
+from analysis.nested_equilibrium_utils import (
+    load_checkpoint,
+    make_checkpoint_payload,
+    publish_checkpoint,
+    stable_json_hash,
+)
 from data.tensor_data import TensorTable
+from training.episode import Episode
+from training.inner_fixed_point import InnerFPChildBank, InnerFPCollocationBank
 
 
 class _FakeEpisode:
@@ -56,10 +78,102 @@ class _FakeEpisode:
                 "LnKF_t", "Hatc_t", "LnK_t", "Hatc_t1", "LnK_t1",
                 "lineage_id",
             ],
+            metadata=dict(macro.metadata),
         )
 
     def _create_sdf_batches_from_macro_tensor(self, table, **_kwargs):
         return [{"rows": table.data}] if len(table) else []
+
+
+def _production_episode_for_pairing() -> Episode:
+    episode = Episode.__new__(Episode)
+    episode.device = torch.device("cpu")
+    episode.train_mode = "2time"
+    episode.add_FC1loss = True
+    episode.hyperparams = SimpleNamespace(
+        fc1_rollout_horizon=0,
+        fc1_recursive_aux_training_enabled=False,
+        fc1_rollout_weight=0.0,
+        fc1_rollout_diagnostic_enabled=False,
+        sdf_true_target_batches=4,
+        sdf_min_parent_groups_per_batch=1,
+    )
+    return episode
+
+
+def _identity_rows(candidate_ids):
+    rows = []
+    for offset, candidate_id in enumerate(candidate_ids):
+        for t, branch in ((0, -1), (1, 0), (1, 1)):
+            rows.append({
+                "path": candidate_id,
+                "candidate_id": candidate_id,
+                "lineage_id": candidate_id,
+                "t": t,
+                "branch": branch,
+                "x": 0.01 * offset + 0.001 * branch,
+                "hatcf": -2.0,
+                "lnkf": 4.0,
+                "Hatc": -1.9 + 0.01 * branch,
+                "LnK": 4.1 + 0.01 * branch,
+                "M": 1.0,
+                "C": 1.0,
+                "K": 1.0,
+                "I_oper": 0.1,
+                "I_entry": 0.0,
+                "I_maintenance": 0.0,
+                "n_firms": 10.0,
+                "default_mass": 0.0,
+                "investment_mass": 1.0,
+                "mean_b": 0.5,
+            })
+    return rows
+
+
+@pytest.mark.parametrize(
+    "candidate_ids",
+    [
+        [1_000_000_000, 1_000_000_001, 1_000_000_002,
+         1_000_000_063, 1_000_000_064, 1_000_000_065],
+        [20_000_000, 20_000_001, 20_000_002],
+        list(range(1_000_000_000, 1_000_000_512)),
+    ],
+)
+def test_production_episode_pairing_preserves_large_canonical_candidate_ids(
+    candidate_ids,
+):
+    episode = _production_episode_for_pairing()
+    macro = _macro_rows_to_table(_identity_rows(candidate_ids), episode.device)
+    pairs = Episode._build_sdf_pairs_from_macro_tensor(episode, macro)
+    audit = bank_module.audit_candidate_pairing(pairs, candidate_ids)
+    batches = Episode._create_sdf_batches_from_macro_tensor(
+        episode, pairs, batch_size=64, n_branches=2
+    )
+
+    assert audit["each_parent_has_exact_children"] is True
+    assert set(map(int, audit["canonical_to_local"])) == set(candidate_ids)
+    assert len(set(audit["canonical_to_local"].values())) == len(candidate_ids)
+    assert sum(batch["parent"].shape[0] for batch in batches) == len(candidate_ids)
+    local_path = pairs.data[:, pairs.columns.index("path")].to(torch.int64)
+    assert int(torch.unique(local_path).numel()) == len(candidate_ids)
+    assert int(local_path.max()) < 16_777_216
+
+
+def test_candidate_target_movement_aligns_canonical_not_dataset_local_ids():
+    episode = _production_episode_for_pairing()
+    candidate_ids = [1_000_000_000, 1_000_000_001]
+    old_macro = _macro_rows_to_table(
+        _identity_rows(candidate_ids), episode.device
+    )
+    new_macro = _macro_rows_to_table(
+        _identity_rows(list(reversed(candidate_ids))), episode.device
+    )
+    old_pairs = Episode._build_sdf_pairs_from_macro_tensor(episode, old_macro)
+    new_pairs = Episode._build_sdf_pairs_from_macro_tensor(episode, new_macro)
+    movement = _candidate_target_movements(old_pairs, new_pairs)
+    assert movement["common_candidate_count"] == 2
+    assert movement["Hatc_target_move"] == pytest.approx(0.0)
+    assert movement["LnK_target_move"] == pytest.approx(0.0)
 
 
 def _fake_candidate_evaluator(*, specs, **_kwargs):
@@ -356,6 +470,398 @@ def test_two_outer_firm_first_control_flow_and_resume():
     assert fresh["full_trace"] == expected
     assert resumed["full_trace"] == expected
     assert resumed["executed_trace"] == expected[7:]
+
+
+def test_resume_restores_original_immutable_configuration_and_rejects_conflict(
+    tmp_path,
+):
+    checkpoint_source = tmp_path / "custom_checkpoint.pt"
+    checkpoint_source.write_bytes(b"checkpoint provenance marker")
+    run_root = tmp_path / "run"
+    (run_root / "metadata").mkdir(parents=True)
+    checkpoint = run_root / "stage.pt"
+    checkpoint.write_bytes(b"stage")
+    original = parse_args([
+        "--cold-start",
+        "--device", "cpu",
+        "--equilibrium-outer-max", "2",
+        "--macro-inner-max", "3",
+        "--macro-train-target-valid", "2048",
+        "--macro-validation-target-valid", "512",
+        "--initial-checkpoint", str(checkpoint_source),
+        "--seed", "314159",
+    ])
+    metadata = {
+        "args": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(original).items()
+        },
+        "hyperparameter_fingerprint": _args_fingerprint(original),
+    }
+    (run_root / "metadata" / "run.json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+    (run_root / "latest_checkpoint.json").write_text(
+        json.dumps({"latest": str(checkpoint)}), encoding="utf-8"
+    )
+
+    resumed = parse_args(["--resume", str(run_root), "--device", "cpu"])
+    resumed, observed_root, observed_checkpoint = _resume_with_recorded_config(
+        resumed, ["--resume", str(run_root), "--device", "cpu"]
+    )
+    assert observed_root == run_root.resolve()
+    assert observed_checkpoint == checkpoint.resolve()
+    assert resumed.equilibrium_outer_max == 2
+    assert resumed.macro_inner_max == 3
+    assert resumed.seed == 314159
+    assert resumed.initial_checkpoint == checkpoint_source
+    assert _args_fingerprint(resumed) == _args_fingerprint(original)
+
+    conflicting = parse_args([
+        "--resume", str(run_root), "--device", "cpu", "--seed", "7"
+    ])
+    with pytest.raises(RuntimeError, match="immutable argument conflict"):
+        _resume_with_recorded_config(
+            conflicting,
+            ["--resume", str(run_root), "--device", "cpu", "--seed", "7"],
+        )
+
+
+def test_committed_macro_dataset_roundtrip_preserves_identity_and_fingerprint(
+    tmp_path,
+):
+    candidate_ids = [1_000_000_000, 1_000_000_001, 1_000_000_064]
+    episode = _production_episode_for_pairing()
+    macro = _macro_rows_to_table(_identity_rows(candidate_ids), episode.device)
+    pairs = Episode._build_sdf_pairs_from_macro_tensor(episode, macro)
+    pairing = bank_module.audit_candidate_pairing(pairs, candidate_ids)
+    pairing["candidate_coverage"] = {
+        "accepted_candidate_ids": candidate_ids,
+        "accepted_training_pair_count": len(candidate_ids),
+    }
+    dataset = OneStepMacroDataset(
+        macro=macro,
+        pairs=pairs,
+        batches={"fc1": [], "sdf": []},
+        pairing_audit=pairing,
+        used_parent_batch_size=2,
+    )
+    path = tmp_path / "committed_dataset.pt"
+    expected = save_committed_one_step_macro_dataset(path, dataset)
+    rng_before = torch.get_rng_state().clone()
+    loaded = load_committed_one_step_macro_dataset(
+        path,
+        episode=episode,
+        macro_batch_size=2,
+        n_branches=2,
+        device=torch.device("cpu"),
+    )
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    assert one_step_macro_dataset_fingerprint(loaded) == expected
+    assert loaded.pairing_audit == pairing
+    assert torch.equal(loaded.macro.data, dataset.macro.data)
+    assert torch.equal(loaded.pairs.data, dataset.pairs.data)
+
+
+def test_uninterrupted_and_resumed_macro_inner_use_same_committed_output(
+    tmp_path,
+):
+    candidate_ids = [20_000_000, 20_000_001, 20_000_002]
+    episode = _production_episode_for_pairing()
+    macro = _macro_rows_to_table(_identity_rows(candidate_ids), episode.device)
+    pairs = Episode._build_sdf_pairs_from_macro_tensor(episode, macro)
+    pairing = bank_module.audit_candidate_pairing(pairs, candidate_ids)
+    pairing["candidate_coverage"] = {
+        "accepted_candidate_ids": candidate_ids,
+        "accepted_training_pair_count": len(candidate_ids),
+    }
+    output = OneStepMacroDataset(
+        macro=macro,
+        pairs=pairs,
+        batches={"fc1": [], "sdf": []},
+        pairing_audit=pairing,
+        used_parent_batch_size=2,
+    )
+    macro_root = tmp_path / "macro"
+    inner0 = macro_root / "macro_inner_000"
+    train_hash = save_committed_one_step_macro_dataset(
+        inner0 / "post_fc1_train" / "committed_dataset.pt", output
+    )
+    validation_hash = save_committed_one_step_macro_dataset(
+        inner0 / "post_fc1_validation" / "committed_dataset.pt", output
+    )
+    (inner0 / "committed_dataset_manifest.json").write_text(
+        json.dumps({
+            "committed_stage": "macro_inner_complete",
+            "output_dataset_fingerprints": {
+                "train": train_hash,
+                "validation": validation_hash,
+            },
+        }),
+        encoding="utf-8",
+    )
+    uninterrupted = {
+        "train": one_step_macro_dataset_fingerprint(output),
+        "validation": one_step_macro_dataset_fingerprint(output),
+    }
+    rng_before = torch.get_rng_state().clone()
+    resumed_train, resumed_validation, manifest = (
+        _load_committed_macro_inner_inputs(
+            macro_root=macro_root,
+            macro_inner=1,
+            episode=episode,
+            macro_batch_size=2,
+            branch_num=2,
+            device=torch.device("cpu"),
+        )
+    )
+    resumed = {
+        "train": one_step_macro_dataset_fingerprint(resumed_train),
+        "validation": one_step_macro_dataset_fingerprint(resumed_validation),
+    }
+    assert resumed == uninterrupted
+    assert manifest["committed_stage"] == "macro_inner_complete"
+    assert torch.equal(torch.get_rng_state(), rng_before)
+
+
+def _fixed_banks_for_test():
+    parent = InnerFPCollocationBank(
+        parent_states=torch.zeros((4, 7)),
+        source_kind=torch.zeros(4, dtype=torch.long),
+        seed=1,
+        split="train",
+    )
+    child = InnerFPChildBank(
+        children=torch.zeros((4, 2, 8)),
+        eps_x=torch.zeros((4, 2, 1)),
+        eps_z=torch.zeros((4, 2, 1)),
+        u_eta=torch.zeros((4, 2, 1)),
+        u_i=torch.zeros((4, 2, 1)),
+        seed=2,
+    )
+    return parent, child
+
+
+def test_market_cleared_firm_bootstrap_is_bounded_to_one_step(
+    monkeypatch, tmp_path,
+):
+    observed_horizons = []
+    parent, child = _fixed_banks_for_test()
+    args = parse_args([
+        "--cold-start", "--smoke", "--device", "cpu",
+        "--output-dir", str(tmp_path),
+    ])
+    monkeypatch.setattr(
+        runner,
+        "make_initial_state",
+        lambda **kwargs: {"x": torch.zeros(kwargs["paths"])},
+    )
+
+    def one_step_only(**kwargs):
+        observed_horizons.append(int(kwargs["horizon"]))
+        assert int(kwargs["horizon"]) == 1
+        return SimpleNamespace(meta={"horizon": 1})
+
+    monkeypatch.setattr(runner, "run_simulation", one_step_only)
+    monkeypatch.setattr(
+        runner,
+        "build_market_cleared_transition_bank",
+        lambda _output, **kwargs: (
+            replace(parent, split=kwargs["split"], seed=kwargs["seed"]),
+            replace(child, seed=kwargs["seed"]),
+            {"split": kwargs["split"], "selected_transitions": kwargs["n_parents"]},
+        ),
+    )
+    _build_or_load_fixed_banks(
+        args=args,
+        run_root=tmp_path,
+        episode=SimpleNamespace(),
+        models={},
+        device=torch.device("cpu"),
+    )
+    assert observed_horizons == [1, 1]
+
+
+def test_real_main_reaches_firm_before_any_unapproved_long_rollout(
+    monkeypatch, tmp_path,
+):
+    class FirmReached(RuntimeError):
+        pass
+
+    parent, child = _fixed_banks_for_test()
+    policy_value = torch.nn.Linear(7, 3)
+    sdf_fc1 = torch.nn.Linear(9, 3)
+    episode = SimpleNamespace(
+        config=SimpleNamespace(),
+        hyperparams=SimpleNamespace(),
+        models={"policy_value": policy_value, "sdf_fc1": sdf_fc1},
+    )
+    monkeypatch.setattr(
+        runner, "_setup_fresh",
+        lambda _args, _device: (
+            episode, SimpleNamespace(), episode.models
+        ),
+    )
+    monkeypatch.setattr(
+        runner, "_build_or_load_fixed_banks",
+        lambda **_kwargs: (parent, replace(parent, split="validation"), child, child),
+    )
+    monkeypatch.setattr(
+        runner, "make_initial_state",
+        lambda **kwargs: {
+            "x": torch.arange(kwargs["paths"], dtype=torch.float32)
+            + float(kwargs["seed"]),
+        },
+    )
+    monkeypatch.setattr(
+        runner, "_build_or_load_macro_probe",
+        lambda **_kwargs: {
+            "parents": torch.zeros((2, 9)),
+            "children": torch.zeros((2, 2, 9)),
+        },
+    )
+    monkeypatch.setattr(
+        runner, "_refresh_children",
+        lambda **_kwargs: (
+            child.children,
+            child.children,
+            {"parity": {"max_abs_m_difference": 0.0}},
+        ),
+    )
+    monkeypatch.setattr(runner, "_write_metadata", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_git_head", lambda: "test-head")
+    monkeypatch.setattr(runner, "_git_branch", lambda: "test-branch")
+    monkeypatch.setattr(
+        runner,
+        "run_simulation",
+        lambda **kwargs: (
+            (_ for _ in ()).throw(AssertionError("Long rollout forbidden"))
+            if int(kwargs["horizon"]) > 1
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "build_problem",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(FirmReached()),
+    )
+    with pytest.raises(FirmReached):
+        main([
+            "--cold-start", "--smoke", "--device", "cpu",
+            "--output-dir", str(tmp_path / "run"),
+            "--no-run-long-diagnostics",
+        ])
+
+
+def test_post_fc1_train_uses_bounded_replenishment_but_validation_does_not(
+    monkeypatch, tmp_path,
+):
+    schedule = build_macro_candidate_schedule(
+        split="train",
+        namespace="train",
+        target_valid=16,
+        initial_candidate_budget=16,
+        max_candidate_budget=24,
+        minimum_partial_valid=8,
+        firms_per_parent=16,
+        seed=77,
+        candidate_id_offset=20_000_000,
+    )
+
+    def evaluator_with_failures(failed_positions):
+        def evaluate(*, specs, **_kwargs):
+            rows, records, manifests = [], [], []
+            for spec in specs:
+                failed = spec.distribution_parameter_id in failed_positions
+                status = (
+                    "PARENT_CLEARING_FAILED"
+                    if failed else MACRO_CANDIDATE_STATUS_VALID
+                )
+                records.append({
+                    **spec.to_dict(),
+                    "status": status,
+                    "failure_reason": status if failed else "",
+                    "accepted_for_training": False,
+                })
+                manifests.append({**spec.to_dict(), "candidate_status": status})
+                if not failed:
+                    rows.extend(_identity_rows([spec.candidate_id]))
+            return rows, records, manifests
+        return evaluate
+
+    monkeypatch.setattr(
+        bank_module,
+        "_evaluate_boundary_candidates_with_isolation",
+        evaluator_with_failures(set()),
+    )
+    pre = build_one_step_macro_dataset(
+        models={}, episode=_FakeEpisode(), candidate_schedule=schedule,
+        parent_batch_size=8, macro_batch_size=32, device=torch.device("cpu"),
+        output_dir=tmp_path / "pre",
+    )
+    pre_ids = pre.pairing_audit["candidate_coverage"]["accepted_candidate_ids"]
+    assert len(pre_ids) == 16
+
+    monkeypatch.setattr(
+        bank_module,
+        "_evaluate_boundary_candidates_with_isolation",
+        evaluator_with_failures({0, 1, 2, 3}),
+    )
+    replenished = build_one_step_macro_dataset(
+        models={}, episode=_FakeEpisode(), candidate_schedule=schedule,
+        parent_batch_size=8, macro_batch_size=32, device=torch.device("cpu"),
+        output_dir=tmp_path / "post_train", candidate_ids=pre_ids,
+        allow_replenishment=True,
+    )
+    fixed = build_one_step_macro_dataset(
+        models={}, episode=_FakeEpisode(), candidate_schedule=schedule,
+        parent_batch_size=8, macro_batch_size=32, device=torch.device("cpu"),
+        output_dir=tmp_path / "post_validation", candidate_ids=pre_ids,
+        allow_replenishment=False,
+    )
+    replenished_ids = replenished.pairing_audit["candidate_coverage"][
+        "accepted_candidate_ids"
+    ]
+    fixed_ids = fixed.pairing_audit["candidate_coverage"]["accepted_candidate_ids"]
+    assert len(replenished_ids) == 16
+    assert len(set(replenished_ids)) == 16
+    assert set(pre_ids[:4]).isdisjoint(replenished_ids)
+    assert set(replenished_ids).difference(pre_ids) == {
+        20_000_016, 20_000_017, 20_000_018, 20_000_019
+    }
+    assert fixed_ids == pre_ids[4:]
+
+
+def test_resume_restores_optimizer_state_without_restart(tmp_path):
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    loss = model(torch.ones((4, 2))).square().mean()
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    expected_optimizer_hash = stable_json_hash(optimizer.state_dict())
+    payload = make_checkpoint_payload(
+        models={"model": model},
+        optimizers={"model": optimizer},
+        state={"macro_inner": 1},
+        git_head="review-fix",
+        hyperparameter_fingerprint="immutable-config",
+    )
+    path = tmp_path / "stage.pt"
+    publish_checkpoint(path=path, payload=payload, run_root=tmp_path)
+
+    restored_model = torch.nn.Linear(2, 1)
+    restored_optimizer = torch.optim.Adam(restored_model.parameters(), lr=0.5)
+    loaded = load_checkpoint(
+        path,
+        models={"model": restored_model},
+        optimizers={"model": restored_optimizer},
+        git_head="review-fix",
+        hyperparameter_fingerprint="immutable-config",
+        allow_code_mismatch=False,
+    )
+    assert loaded["optimizer_state_restored"] is True
+    assert stable_json_hash(restored_optimizer.state_dict()) == expected_optimizer_hash
 
 
 def test_production_stage_recorder_two_outers_and_idempotent_resume(tmp_path):

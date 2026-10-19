@@ -263,6 +263,154 @@ class OneStepMacroDataset:
     dataset_status: str = "TARGET_VALID_DATASET"
 
 
+def _identity_metadata_payload(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(metadata)
+    for key in ("canonical_candidate_ids", "local_path_ids"):
+        value = result.get(key)
+        if torch.is_tensor(value):
+            result[key] = value.detach().cpu().to(torch.int64)
+    return result
+
+
+def one_step_macro_dataset_fingerprint(dataset: OneStepMacroDataset) -> str:
+    """Semantic fingerprint for an immutable committed Macro dataset."""
+
+    identity = _identity_metadata_payload(dataset.pairs.metadata)
+    return _json_hash(
+        {
+            "macro_tensor": _tensor_digest((("macro", dataset.macro.data),)),
+            "pair_tensor": _tensor_digest((("pairs", dataset.pairs.data),)),
+            "macro_columns": list(dataset.macro.columns),
+            "pair_columns": list(dataset.pairs.columns),
+            "identity_schema": identity.get("identity_schema"),
+            "canonical_candidate_ids": (
+                identity.get("canonical_candidate_ids", torch.empty(0, dtype=torch.int64))
+                .tolist()
+            ),
+            "canonical_to_local": identity.get("canonical_to_local", {}),
+            "accepted_candidate_ids": dataset.pairing_audit.get(
+                "candidate_coverage", {}
+            ).get("accepted_candidate_ids", []),
+            "dataset_status": dataset.dataset_status,
+        }
+    )
+
+
+def save_committed_one_step_macro_dataset(
+    path: Path, dataset: OneStepMacroDataset
+) -> str:
+    """Atomically persist exactly the tensors consumed by the next Macro inner."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fingerprint = one_step_macro_dataset_fingerprint(dataset)
+    payload = {
+        "format": "committed_one_step_macro_dataset_v1",
+        "fingerprint": fingerprint,
+        "macro": {
+            "data": dataset.macro.data.detach().cpu(),
+            "columns": list(dataset.macro.columns),
+            "metadata": _identity_metadata_payload(dataset.macro.metadata),
+        },
+        "pairs": {
+            "data": dataset.pairs.data.detach().cpu(),
+            "columns": list(dataset.pairs.columns),
+            "metadata": _identity_metadata_payload(dataset.pairs.metadata),
+        },
+        "pairing_audit": dataset.pairing_audit,
+        "used_parent_batch_size": int(dataset.used_parent_batch_size),
+        "dataset_status": str(dataset.dataset_status),
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+    return fingerprint
+
+
+def load_committed_one_step_macro_dataset(
+    path: Path,
+    *,
+    episode: Any,
+    macro_batch_size: int,
+    n_branches: int,
+    device: torch.device,
+    build_batches: bool = False,
+) -> OneStepMacroDataset:
+    """Load a committed dataset without evaluating or resampling candidates."""
+
+    path = Path(path)
+    if not path.is_file():
+        raise RuntimeError(f"committed Macro dataset is missing: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if payload.get("format") != "committed_one_step_macro_dataset_v1":
+        raise RuntimeError(f"unexpected committed Macro dataset format: {path}")
+    macro_payload = payload["macro"]
+    pair_payload = payload["pairs"]
+    macro = TensorTable(
+        data=macro_payload["data"].to(device),
+        columns=list(macro_payload["columns"]),
+        metadata=dict(macro_payload.get("metadata", {})),
+    )
+    pairs = TensorTable(
+        data=pair_payload["data"].to(device),
+        columns=list(pair_payload["columns"]),
+        metadata=dict(pair_payload.get("metadata", {})),
+    )
+    batches: dict[str, list[dict[str, torch.Tensor]]] = {"fc1": [], "sdf": []}
+    if build_batches:
+        original_mode = episode.train_mode
+        original_add_fc1 = episode.add_FC1loss
+        try:
+            episode.train_mode = "2time"
+            episode.add_FC1loss = True
+            target_batches = int(
+                getattr(episode.hyperparams, "sdf_true_target_batches", 20)
+            )
+            min_parents = int(
+                getattr(episode.hyperparams, "sdf_min_parent_groups_per_batch", 256)
+            )
+            batches = {
+                "fc1": episode._create_sdf_batches_from_macro_tensor(
+                    pairs,
+                    batch_size=int(macro_batch_size),
+                    n_branches=int(n_branches),
+                ),
+                "sdf": episode._create_sdf_batches_from_macro_tensor(
+                    pairs,
+                    batch_size=int(macro_batch_size),
+                    n_branches=int(n_branches),
+                    target_num_batches=target_batches,
+                    min_parent_groups_per_batch=min_parents,
+                ),
+            }
+        finally:
+            episode.train_mode = original_mode
+            episode.add_FC1loss = original_add_fc1
+    candidate_path = path.parent / "candidate_outcomes.csv"
+    manifest_path = path.parent / "initial_b_distribution_coverage.csv"
+    result = OneStepMacroDataset(
+        macro=macro,
+        pairs=pairs,
+        batches=batches,
+        pairing_audit=dict(payload["pairing_audit"]),
+        used_parent_batch_size=int(payload["used_parent_batch_size"]),
+        candidate_audit=(
+            pd.read_csv(candidate_path) if candidate_path.is_file() else None
+        ),
+        distribution_manifest=(
+            pd.read_csv(manifest_path) if manifest_path.is_file() else None
+        ),
+        dataset_status=str(payload["dataset_status"]),
+    )
+    observed = one_step_macro_dataset_fingerprint(result)
+    if observed != payload.get("fingerprint"):
+        raise RuntimeError(
+            f"committed Macro dataset fingerprint mismatch: {observed} != "
+            f"{payload.get('fingerprint')}"
+        )
+    return result
+
+
 @dataclass(frozen=True)
 class MacroCandidateSpec:
     candidate_id: int
@@ -1741,12 +1889,45 @@ def _macro_rows_to_table(rows: Sequence[Mapping[str, Any]], device: torch.device
         "default_mass", "investment_mass", "mean_b",
         "lineage_id",
     ]
+    canonical_ids = list(dict.fromkeys(int(row["candidate_id"]) for row in rows))
+    canonical_to_local = {
+        candidate_id: local_id
+        for local_id, candidate_id in enumerate(canonical_ids)
+    }
+    if len(canonical_to_local) > 16_777_216:
+        raise RuntimeError("dataset-local candidate ids exceed exact float32 range")
+    local_rows = []
+    for row in rows:
+        canonical_id = int(row["candidate_id"])
+        local_id = canonical_to_local[canonical_id]
+        local = dict(row)
+        local["path"] = local_id
+        local["lineage_id"] = local_id
+        local_rows.append(local)
     data = torch.tensor(
-        [[float(row[name]) for name in columns] for row in rows],
+        [[float(row[name]) for name in columns] for row in local_rows],
         device=device,
         dtype=torch.float32,
     )
-    return TensorTable(data=data, columns=columns)
+    return TensorTable(
+        data=data,
+        columns=columns,
+        metadata={
+            "identity_schema": "canonical_candidate_to_local_path_v1",
+            "canonical_candidate_ids": torch.tensor(
+                canonical_ids, dtype=torch.int64
+            ),
+            "local_path_ids": torch.arange(len(canonical_ids), dtype=torch.int64),
+            "canonical_to_local": {
+                str(candidate_id): int(local_id)
+                for candidate_id, local_id in canonical_to_local.items()
+            },
+            "local_to_canonical": {
+                str(local_id): int(candidate_id)
+                for candidate_id, local_id in canonical_to_local.items()
+            },
+        },
+    )
 
 
 def audit_candidate_pairing(
@@ -1758,22 +1939,43 @@ def audit_candidate_pairing(
         raise RuntimeError("candidate pair table lacks identity fields")
     data = pairs.data.detach().cpu()
     expected = set(map(int, accepted_candidate_ids))
+    identity = dict(pairs.metadata)
+    if identity.get("identity_schema") != "canonical_candidate_to_local_path_v1":
+        raise RuntimeError("candidate pair table lacks lossless canonical/local identity metadata")
+    canonical_to_local = {
+        int(candidate_id): int(local_id)
+        for candidate_id, local_id in identity.get("canonical_to_local", {}).items()
+    }
+    local_to_canonical = {
+        int(local_id): int(candidate_id)
+        for local_id, candidate_id in identity.get("local_to_canonical", {}).items()
+    }
+    if set(canonical_to_local) != expected:
+        raise RuntimeError(
+            "candidate identity mapping does not match accepted canonical ids: "
+            f"expected={sorted(expected)[:10]}, mapped={sorted(canonical_to_local)[:10]}"
+        )
+    if any(local_to_canonical.get(local) != canonical for canonical, local in canonical_to_local.items()):
+        raise RuntimeError("candidate canonical/local identity mapping is not bijective")
     failures: list[dict[str, Any]] = []
     for candidate_id in sorted(expected):
-        mask = data[:, col["path"]].to(torch.long) == candidate_id
+        local_id = canonical_to_local[candidate_id]
+        mask = data[:, col["path"]].to(torch.long) == local_id
         branches = sorted(map(int, data[mask, col["branch"]].tolist()))
         times = sorted(set(map(int, data[mask, col["t"]].tolist())))
         lineages = set(map(int, data[mask, col["lineage_id"]].tolist()))
-        if branches != [0, 1] or times != [1] or lineages != {candidate_id}:
+        if branches != [0, 1] or times != [1] or lineages != {local_id}:
             failures.append(
                 {
                     "candidate_id": candidate_id,
+                    "local_path_id": local_id,
                     "branches": branches,
                     "times": times,
                     "lineages": sorted(lineages),
                 }
             )
-    observed = set(map(int, data[:, col["path"]].to(torch.long).tolist()))
+    observed_local = set(map(int, data[:, col["path"]].to(torch.long).tolist()))
+    observed = {local_to_canonical[value] for value in observed_local}
     audit = {
         "expected_parent_count": len(expected),
         "observed_parent_count": len(observed),
@@ -1781,6 +1983,13 @@ def audit_candidate_pairing(
         "expected_pair_row_count": 2 * len(expected),
         "failed_parent_groups": failures,
         "unexpected_candidate_ids": sorted(observed - expected),
+        "identity_schema": identity["identity_schema"],
+        "canonical_to_local": {
+            str(key): value for key, value in sorted(canonical_to_local.items())
+        },
+        "local_to_canonical": {
+            str(key): value for key, value in sorted(local_to_canonical.items())
+        },
         "each_parent_has_exact_children": (
             not failures and observed == expected and len(data) == 2 * len(expected)
         ),
@@ -1983,6 +2192,13 @@ def build_one_step_macro_dataset(
                 "default_mass", "investment_mass", "mean_b",
                 "lineage_id",
             ],
+            metadata={
+                "identity_schema": "canonical_candidate_to_local_path_v1",
+                "canonical_candidate_ids": torch.empty(0, dtype=torch.int64),
+                "local_path_ids": torch.empty(0, dtype=torch.int64),
+                "canonical_to_local": {},
+                "local_to_canonical": {},
+            },
         )
         pairs = TensorTable(
             data=torch.empty((0, 12), device=device, dtype=torch.float32),
@@ -1990,6 +2206,7 @@ def build_one_step_macro_dataset(
                 "path", "t", "branch", "x_t", "x_t1", "Hatcf_t", "LnKF_t",
                 "Hatc_t", "LnK_t", "Hatc_t1", "LnK_t1", "lineage_id",
             ],
+            metadata=dict(macro.metadata),
         )
         batches = {"fc1": [], "sdf": []}
         pairing_audit = {

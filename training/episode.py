@@ -2558,7 +2558,11 @@ class Episode:
             empty = torch.empty(
                 (0, len(output_columns)), device=self.device, dtype=torch.float32
             )
-            return TensorTable(data=empty, columns=output_columns)
+            return TensorTable(
+                data=empty,
+                columns=output_columns,
+                metadata=dict(macro_table.metadata),
+            )
 
         child_take = child_idx[valid]
         parent_take = matched_parent_idx[valid]
@@ -2583,7 +2587,11 @@ class Episode:
                 raise RuntimeError("Macro parent/child lineage ids are inconsistent")
             output_parts.append(child_lineage)
         out = torch.stack(output_parts, dim=1).to(torch.float32)
-        return TensorTable(data=out, columns=output_columns)
+        return TensorTable(
+            data=out,
+            columns=output_columns,
+            metadata=dict(macro_table.metadata),
+        )
 
     def _create_sdf_batches_from_macro_tensor(
         self,

@@ -22,6 +22,7 @@ class TensorTable:
 
     data: torch.Tensor
     columns: Sequence[str]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.data.dim() != 2:
@@ -33,7 +34,11 @@ class TensorTable:
             )
 
     def to(self, device: torch.device) -> "TensorTable":
-        return TensorTable(data=self.data.to(device), columns=list(self.columns))
+        return TensorTable(
+            data=self.data.to(device),
+            columns=list(self.columns),
+            metadata=dict(self.metadata),
+        )
 
     def to_dataframe(self) -> pd.DataFrame:
         arr = self.data.detach().cpu().numpy()

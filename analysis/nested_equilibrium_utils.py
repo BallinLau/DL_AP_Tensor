@@ -271,9 +271,22 @@ def run_with_oom_fallback(
             raise
 
 
+def _optimizer_state_to_cpu(value: Any) -> Any:
+    if torch.is_tensor(value):
+        return value.detach().cpu().clone()
+    if isinstance(value, Mapping):
+        return {key: _optimizer_state_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_optimizer_state_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_optimizer_state_to_cpu(item) for item in value)
+    return value
+
+
 def make_checkpoint_payload(
     *,
     models: Mapping[str, torch.nn.Module],
+    optimizers: Optional[Mapping[str, torch.optim.Optimizer]] = None,
     state: Mapping[str, Any],
     git_head: str,
     hyperparameter_fingerprint: str,
@@ -283,6 +296,10 @@ def make_checkpoint_payload(
         name: {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
         for name, model in models.items()
     }
+    optimizer_states = {
+        name: _optimizer_state_to_cpu(optimizer.state_dict())
+        for name, optimizer in (optimizers or {}).items()
+    }
     return {
         "format": "full_nested_equilibrium_v1",
         "git_head": git_head,
@@ -290,8 +307,13 @@ def make_checkpoint_payload(
         "state": dict(state),
         "models": model_states,
         "model_hashes": {name: tensor_hash(sorted(values.items())) for name, values in model_states.items()},
+        "optimizers": optimizer_states,
+        "optimizer_state_hashes": {
+            name: stable_json_hash(value)
+            for name, value in optimizer_states.items()
+        },
         "rng_state": capture_rng_state(),
-        "optimizer_state_restored": False,
+        "optimizer_state_restored": bool(optimizer_states),
         "extra": dict(extra or {}),
     }
 
@@ -311,6 +333,14 @@ def verify_checkpoint_payload(payload: Mapping[str, Any]) -> None:
         observed = tensor_hash(sorted(state.items()))
         if observed != payload.get("model_hashes", {}).get(name):
             raise ValueError(f"checkpoint hash mismatch: {name}")
+    optimizer_states = payload.get("optimizers", {})
+    if not isinstance(optimizer_states, Mapping):
+        raise ValueError("checkpoint optimizer states are malformed")
+    for name, state in optimizer_states.items():
+        observed = stable_json_hash(state)
+        expected = payload.get("optimizer_state_hashes", {}).get(name)
+        if observed != expected:
+            raise ValueError(f"checkpoint optimizer hash mismatch: {name}")
 
 
 def publish_checkpoint(
@@ -345,6 +375,7 @@ def load_checkpoint(
     path: Path,
     *,
     models: Mapping[str, torch.nn.Module],
+    optimizers: Optional[Mapping[str, torch.optim.Optimizer]] = None,
     git_head: str,
     hyperparameter_fingerprint: str,
     allow_code_mismatch: bool,
@@ -367,6 +398,15 @@ def load_checkpoint(
     for name, model in models.items():
         model.load_state_dict(payload["models"][name], strict=True)
         require_finite_module(name, model)
+    if optimizers is not None:
+        saved_optimizers = payload.get("optimizers", {})
+        if set(saved_optimizers) != set(optimizers):
+            raise RuntimeError(
+                "resume optimizer set mismatch: "
+                f"saved={sorted(saved_optimizers)}, current={sorted(optimizers)}"
+            )
+        for name, optimizer in optimizers.items():
+            optimizer.load_state_dict(saved_optimizers[name])
     if restore_rng:
         restore_rng_state(payload["rng_state"])
     return dict(payload)
