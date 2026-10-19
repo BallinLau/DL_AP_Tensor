@@ -22,10 +22,12 @@ import torch
 LEGACY_MIXED_REPLAY = "legacy_mixed_replay"
 HARD_REALIZED_REFERENCE = "hard_realized_reference"
 CONTINUUM_MASS_CONSISTENT_V1 = "continuum_mass_consistent_v1"
+BOUNDARY_AWARE_CONTINUUM_V1 = "boundary_aware_continuum_v1"
 AGGREGATION_MODES = {
     LEGACY_MIXED_REPLAY,
     HARD_REALIZED_REFERENCE,
     CONTINUUM_MASS_CONSISTENT_V1,
+    BOUNDARY_AWARE_CONTINUUM_V1,
 }
 
 
