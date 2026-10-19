@@ -650,6 +650,17 @@ class MarketClearingController:
             "economic_node_status",
             "economic_state_defined",
             "decision_record_valid",
+            "fast_solver_status",
+            "h_fc1_original",
+            "h_policy_input",
+            "h_cal_from_ledger",
+            "baseline_G",
+            "corrected_G",
+            "baseline_normalized_residual",
+            "corrected_normalized_residual",
+            "improvement_fraction",
+            "h_policy_minus_h_cal",
+            "G_evaluation_count",
         }
         output_prefixes = (
             "accounting_",

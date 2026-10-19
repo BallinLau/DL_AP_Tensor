@@ -187,10 +187,45 @@ def test_firm_bank_uses_two_matched_root_cleared_children():
     assert parents.parent_states.shape == (4, 7)
     assert children.children.shape == (4, 2, 8)
     assert children.metadata["definition"] == (
-        "two_independently_root_cleared_production_children"
+        "two_independently_declared_gate_cleared_production_children"
     )
     assert children.metadata["artificial_b_only_used"] is False
     assert audit["child_branches"] == [0, 1]
+
+
+def test_firm_bank_accepts_only_predeclared_bounded_approximate_nodes():
+    torch.manual_seed(304)
+    output = _sim().simulate_tensor()
+    columns = {name: index for index, name in enumerate(output.macro.columns)}
+    row = 0
+    output.macro.data[row, columns["market_root_found"]] = 0.0
+    output.macro.data[row, columns["market_committed_residual_normalized"]] = 5.0e-4
+    output.macro.data[row, columns["fast_solver_status"]] = 1.0
+    output.macro.data[row, columns["corrected_normalized_residual"]] = 5.0e-4
+    output.macro.data[row, columns["h_policy_minus_h_cal"]] = 1.0e-3
+    output.macro.data[row, columns["improvement_fraction"]] = 0.95
+    output.macro.data[row, columns["resource_feasible"]] = 1.0
+
+    _, _, audit = build_market_cleared_transition_bank(
+        output,
+        n_parents=4,
+        seed=19,
+        split="train",
+        root_tolerance=2.0e-5,
+        solver_mode="fc1_bounded_improvement_pilot",
+    )
+    assert audit["clearing_gate"]["approximate_node_count"] == 1
+
+    output.macro.data[row, columns["improvement_fraction"]] = 0.89
+    with pytest.raises(RuntimeError, match="strict/approximate clearing gates"):
+        build_market_cleared_transition_bank(
+            output,
+            n_parents=4,
+            seed=19,
+            split="train",
+            root_tolerance=2.0e-5,
+            solver_mode="fc1_bounded_improvement_pilot",
+        )
 
 
 def test_root_candidate_admission_is_stricter_than_public_commit_gate():

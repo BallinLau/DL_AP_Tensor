@@ -29,7 +29,12 @@ def _frame(table: Any) -> pd.DataFrame:
     return frame
 
 
-def _require_root_cleared_macro(macro: pd.DataFrame, tolerance: float) -> None:
+def _require_root_cleared_macro(
+    macro: pd.DataFrame,
+    tolerance: float,
+    *,
+    solver_mode: str = "strict_global",
+) -> dict[str, Any]:
     required = {
         "market_root_found",
         "market_committed_residual_normalized",
@@ -39,22 +44,73 @@ def _require_root_cleared_macro(macro: pd.DataFrame, tolerance: float) -> None:
     missing = sorted(required - set(macro.columns))
     if missing:
         raise RuntimeError(f"root-cleared macro table is missing {missing}")
-    if not (macro["market_root_found"] == 1.0).all():
-        bad = macro.loc[macro["market_root_found"] != 1.0, ["path", "t", "branch"]]
-        raise RuntimeError(
-            "Firm transition bank contains a node without a valid root: "
-            f"{bad.head(20).to_dict(orient='records')}"
-        )
     residual = macro["market_committed_residual_normalized"].abs()
-    if not np.isfinite(residual).all() or float(residual.max()) > float(tolerance):
+    strict = (
+        (macro["market_root_found"] == 1.0)
+        & np.isfinite(residual)
+        & (residual <= float(tolerance))
+    )
+    approximate = pd.Series(False, index=macro.index, dtype=bool)
+    if solver_mode == "fc1_bounded_improvement_pilot":
+        approximate_columns = {
+            "fast_solver_status",
+            "corrected_normalized_residual",
+            "improvement_fraction",
+            "h_policy_minus_h_cal",
+            "resource_feasible",
+        }
+        approximate_missing = sorted(approximate_columns - set(macro.columns))
+        if approximate_missing:
+            raise RuntimeError(
+                "bounded-clearing macro table is missing "
+                f"{approximate_missing}"
+            )
+        corrected = macro["corrected_normalized_residual"].abs()
+        mismatch = macro["h_policy_minus_h_cal"].abs()
+        improvement = macro["improvement_fraction"]
+        approximate = (
+            (macro["fast_solver_status"] == 1.0)
+            & (macro["resource_feasible"] == 1.0)
+            & np.isfinite(corrected)
+            & np.isfinite(mismatch)
+            & np.isfinite(improvement)
+            & (corrected <= 1.0e-3)
+            & (mismatch <= 0.005)
+            & (improvement >= 0.90)
+        )
+    accepted = strict | approximate
+    if not accepted.all():
+        columns = ["path", "t", "branch", "market_root_found"]
+        for name in (
+            "fast_solver_status",
+            "corrected_normalized_residual",
+            "h_policy_minus_h_cal",
+            "improvement_fraction",
+        ):
+            if name in macro.columns:
+                columns.append(name)
+        bad = macro.loc[~accepted, columns]
         raise RuntimeError(
-            "Firm transition bank root residual gate failed: "
-            f"max={float(residual.max())}, tolerance={tolerance}"
+            "Firm transition bank contains a node outside the declared strict/"
+            "approximate clearing gates: "
+            f"{bad.head(20).to_dict(orient='records')}"
         )
     if not np.allclose(
         macro["Hatc_cleared"], macro["Hatc_firm_input"], atol=0.0, rtol=0.0
     ):
         raise RuntimeError("cleared Hatc was not the Firm input at every node")
+    return {
+        "solver_mode": str(solver_mode),
+        "node_count": int(len(macro)),
+        "strict_node_count": int(strict.sum()),
+        "approximate_node_count": int(approximate.sum()),
+        "strict_clearing_share": float(strict.mean()),
+        "approximate_clearing_share": float(approximate.mean()),
+        "strict_tolerance": float(tolerance),
+        "approximate_normalized_residual_tolerance": 1.0e-3,
+        "approximate_log_mismatch_tolerance": 0.005,
+        "approximate_minimum_improvement": 0.90,
+    }
 
 
 def build_market_cleared_transition_bank(
@@ -64,11 +120,14 @@ def build_market_cleared_transition_bank(
     seed: int,
     split: str,
     root_tolerance: float,
+    solver_mode: str = "strict_global",
 ) -> tuple[InnerFPCollocationBank, InnerFPChildBank, dict[str, Any]]:
     """Match each incumbent parent firm to both independently-cleared children."""
     firm = _frame(output.firm)
     macro = _frame(output.macro)
-    _require_root_cleared_macro(macro, root_tolerance)
+    clearing_audit = _require_root_cleared_macro(
+        macro, root_tolerance, solver_mode=solver_mode
+    )
     if "eps_x_transition" not in firm.columns:
         if "eps_x_transition" not in macro.columns:
             raise RuntimeError("root-cleared output lacks macro eps_x_transition")
@@ -192,7 +251,7 @@ def build_market_cleared_transition_bank(
         seed=int(seed),
         split=str(split),
         metadata={
-            "definition": "natural_root_cleared_full_economy_parent_firms",
+            "definition": "natural_declared_gate_cleared_full_economy_parent_firms",
             "state_columns": list(PARENT_COLUMNS),
             "sampling": "without_replacement",
             "available_matched_transitions": available,
@@ -208,7 +267,7 @@ def build_market_cleared_transition_bank(
         u_i=shock_tensor["u_i_transition"],
         seed=int(seed),
         metadata={
-            "definition": "two_independently_root_cleared_production_children",
+            "definition": "two_independently_declared_gate_cleared_production_children",
             "continuous_child_shocks": 2,
             "parent_fingerprint": parent_bank.fingerprint,
             "root_tolerance": float(root_tolerance),
@@ -226,5 +285,6 @@ def build_market_cleared_transition_bank(
         "artificial_b_only_used": False,
         "aggregation_mode": aggregation_mode,
         "sampling_mass_weighted": probabilities is not None,
+        "clearing_gate": clearing_audit,
     }
     return parent_bank, child_bank, audit

@@ -116,6 +116,12 @@ class SimulateTS:
         'market_root_operator_evaluations',
         'market_committed_residual',
         'market_committed_residual_normalized',
+        'fast_solver_status',
+        'h_fc1_original', 'h_policy_input', 'h_cal_from_ledger',
+        'baseline_G', 'corrected_G',
+        'baseline_normalized_residual', 'corrected_normalized_residual',
+        'improvement_fraction', 'h_policy_minus_h_cal',
+        'G_evaluation_count',
         'slot_count', 'firm_mass', 'aggregate_debt',
         'distribution_projection_error'
     ]

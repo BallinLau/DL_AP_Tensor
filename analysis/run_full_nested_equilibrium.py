@@ -590,6 +590,7 @@ def _build_or_load_fixed_banks(
                 seed=args.seed + 101,
                 split="train",
                 root_tolerance=args.market_clearing_residual_tolerance,
+                solver_mode=args.macro_clearing_solver_mode,
             )
         )
         validation_bank, validation_children, validation_audit = (
@@ -599,6 +600,7 @@ def _build_or_load_fixed_banks(
                 seed=args.seed + 202,
                 split="validation",
                 root_tolerance=args.market_clearing_residual_tolerance,
+                solver_mode=args.macro_clearing_solver_mode,
             )
         )
         atomic_torch_save(train_path, train_bank.payload())

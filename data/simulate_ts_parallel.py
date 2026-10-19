@@ -1828,6 +1828,53 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                 if getattr(sim, "market_clearing_controller", None) is not None
                 else torch.full((n_paths,), float("nan"), device=device)
             ).to(torch.float32),
+            state.get(
+                "fast_solver_status",
+                torch.full((n_paths,), -1, device=device, dtype=torch.long),
+            ).to(torch.float32),
+            state.get(
+                "h_fc1_original", state.get("hatc_belief", state["hatcf"])
+            ).to(torch.float32),
+            state.get(
+                "h_policy_input", state.get("hatc_cleared", state["hatcf"])
+            ).to(torch.float32),
+            state.get(
+                "h_cal_from_ledger", state.get("hatc_cal", Hatc)
+            ).to(torch.float32),
+            state.get(
+                "baseline_G",
+                torch.full((n_paths,), float("nan"), device=device),
+            ).to(torch.float32),
+            state.get(
+                "corrected_G", state.get(
+                    "market_root_residual",
+                    torch.full((n_paths,), float("nan"), device=device),
+                )
+            ).to(torch.float32),
+            state.get(
+                "baseline_normalized_residual",
+                torch.full((n_paths,), float("nan"), device=device),
+            ).to(torch.float32),
+            state.get(
+                "corrected_normalized_residual", state.get(
+                    "market_root_residual_normalized",
+                    torch.full((n_paths,), float("nan"), device=device),
+                ).abs()
+            ).to(torch.float32),
+            state.get(
+                "improvement_fraction",
+                torch.full((n_paths,), float("nan"), device=device),
+            ).to(torch.float32),
+            state.get(
+                "h_policy_minus_h_cal",
+                state.get("hatc_cleared", state["hatcf"]) - Hatc,
+            ).to(torch.float32),
+            state.get(
+                "G_evaluation_count", state.get(
+                    "market_root_operator_evaluations",
+                    torch.zeros(n_paths, device=device),
+                )
+            ).to(torch.float32),
             n_alive_per_path.to(torch.float32),
             firm_mass_by_path.to(torch.float32),
             aggregate_debt.to(torch.float32),
