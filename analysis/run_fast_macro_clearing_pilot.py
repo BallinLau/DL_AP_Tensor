@@ -272,9 +272,43 @@ def _strict_rows(
     root: MarketClearingConfig,
     device: torch.device,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    batch = int(state["b"].shape[0])
+    controller = BoundaryAwareMarketClearingController(root, integration)
+    local = _clone_state(state)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    started = time.perf_counter()
+    try:
+        cleared = controller.clear_state(
+            sim, local, empty_entry_candidates(local), t=0, branch=-1
+        )
+        controller.validate_committed(cleared, t=0, branch=-1)
+        _sync(device)
+        elapsed = time.perf_counter() - started
+        peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
+        rows = [
+            _row_from_state(
+                mode="STRICT_GLOBAL",
+                parent=parent,
+                state=cleared,
+                elapsed=elapsed / batch,
+                peak=peak,
+                controller=controller,
+            )
+            for parent in range(batch)
+        ]
+        return rows, {
+            "batched": True,
+            "batch_size": batch,
+            "summary": controller.summary(),
+        }
+    except MarketClearingError as batch_error:
+        # A batched failure must not hide which fixed parents failed.  Replay
+        # each identity only for classification; never drop or replace it.
+        batch_failure = str(batch_error)
+
     rows = []
     total_summary = []
-    batch = int(state["b"].shape[0])
     for parent in range(batch):
         controller = BoundaryAwareMarketClearingController(root, integration)
         local = _slice_state(state, parent, batch)
@@ -315,7 +349,11 @@ def _strict_rows(
                 }
             )
         total_summary.append(controller.summary())
-    return rows, {"per_parent": total_summary}
+    return rows, {
+        "batched": False,
+        "batch_failure": batch_failure,
+        "per_parent": total_summary,
+    }
 
 
 def _fast_rows(
