@@ -18,6 +18,14 @@ REPO_DIR="${REPO_DIR:-/home/fit/zhuyingz/WORK/LiuHao/DL_AP_Tensor_boundary_aware
 OUTPUT_DIR="${OUTPUT_DIR:-/home/fit/zhuyingz/WORK/LiuHao/cachedir/boundary_aware_macro_distribution_20261019/smoke}"
 OLD_COMMAND="${OLD_COMMAND:-/WORK/PUBLIC/zhuyingz_work/LiuHao/cachedir/market_cleared_full_nested_equilibrium_20261019_r8/logs/small_command.json}"
 CHECKPOINT="${CHECKPOINT:-/WORK/PUBLIC/zhuyingz_work/LiuHao/cachedir/market_cleared_full_nested_equilibrium_20261019_r8/small/equilibrium_outer_000/firm/policy_distill/policy_distill_complete.pt}"
+TRAIN_PATHS="${TRAIN_PATHS:-1}"
+VALIDATION_PATHS="${VALIDATION_PATHS:-1}"
+FIRMS="${FIRMS:-1}"
+HORIZON="${HORIZON:-1}"
+Z_SCAN_POINTS="${Z_SCAN_POINTS:-17}"
+Z_QUADRATURE_POINTS="${Z_QUADRATURE_POINTS:-2}"
+I_SCAN_POINTS="${I_SCAN_POINTS:-9}"
+I_QUADRATURE_POINTS="${I_QUADRATURE_POINTS:-2}"
 
 mkdir -p "$(dirname "$OUTPUT_DIR")/logs" "$OUTPUT_DIR" /home/fit/zhuyingz/WORK/LiuHao/.mplcache
 cd "$REPO_DIR"
@@ -41,12 +49,12 @@ python3 analysis/run_boundary_aware_macro_distribution.py \
   --old-command "$OLD_COMMAND" \
   --checkpoint "$CHECKPOINT" \
   --device cuda:0 \
-  --train-paths 1 \
-  --validation-paths 1 \
-  --firms 1 \
-  --horizon 1 \
-  --z-scan-points 17 \
-  --z-quadrature-points 2 \
-  --i-scan-points 9 \
-  --i-quadrature-points 2
+  --train-paths "$TRAIN_PATHS" \
+  --validation-paths "$VALIDATION_PATHS" \
+  --firms "$FIRMS" \
+  --horizon "$HORIZON" \
+  --z-scan-points "$Z_SCAN_POINTS" \
+  --z-quadrature-points "$Z_QUADRATURE_POINTS" \
+  --i-scan-points "$I_SCAN_POINTS" \
+  --i-quadrature-points "$I_QUADRATURE_POINTS"
 
