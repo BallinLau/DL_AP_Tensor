@@ -1,0 +1,27 @@
+2026-10-21 Asia/Shanghai
+Review baseline: 7074dca9b4e79dee52cdaacce8f3442315b40a11
+
+Command:
+PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/private/tmp/fc1_mpl_cache /Users/ballinliu/anaconda3/bin/python -m pytest tests/test_final_training_readiness.py tests/test_dynamic_empirical_exit_fix.py tests/test_dynamic_empirical_timing_blocker.py tests/test_finite_direct_large_continuation.py tests/test_finite_direct_outer4_runner.py tests/test_finite_direct_outer4_resume.py tests/test_finite_direct_macro_contract.py tests/test_finite_direct_macro_production_adapter.py tests/test_finite_direct_firm_bank.py tests/test_finite_direct_sampling.py tests/test_finite_direct_approval_metrics_patch.py tests/test_entry_investment_compare.py tests/test_entry_value_cost.py -q --junitxml=/private/tmp/final_training_readiness_tests.xml
+
+Final result: 191 passed, 1 warning in 30.47s. No skip or xfail.
+Warning is an existing intentional BP-head override fixture in tests/test_entry_value_cost.py, not a formal-run override.
+
+New scoped checks (9):
+- Actual nested history_init archives unchanged input bytes under metadata/approval_v4.json, never v3. Disk fixture has approved=false.
+- Default plan-only cannot reach backend or optimizer and creates no output directory.
+- Legacy schema2/schema3 rejected before backend/checkpoint loading (two parameterized cases, only in-memory legacy true flags).
+- Changed initial checkpoint or Sampling Signature rejects old v4 binding (two cases).
+- Complete budget, dimensions, operator and ratio contract unchanged.
+- bash -n plus extraction of the actual Slurm command into the real argparse succeeds; resume flag accepted.
+- Historical v3 review builder refuses dynamic plan without creating output.
+
+Existing non-optimization regressions retained: production CPU Parent-default/Child-exit and Entry/accounting, realized-b capture, dynamic pool update/lineage weights/CDF, actual pool commit and SHA/resume, fixed Validation/CRN, old cache rejection, source learning state and optimizer/AL/RNG restoration without optimizer steps, FC1/SDF production forward-only interfaces.
+
+Additional checks:
+bash -n slurm/run_finite_direct_large_continuation_outer4_11_a800.slurm -> PASS
+git diff --check -> PASS
+review JSON parse -> PASS
+CPU actual local source certification + initial learning digest parity -> PASS (source_checkpoint_audit.json)
+
+No optimizer steps, backward, GPU execution, Slurm submission, remote verification, approved=true file generation, push or merge performed in this task.

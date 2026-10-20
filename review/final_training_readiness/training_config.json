@@ -1,0 +1,7988 @@
+{
+  "approval_created": false,
+  "execute_approved": false,
+  "hardware": "1 x NVIDIA A800 80GB",
+  "physical_batch": {
+    "fc1": 128,
+    "firm": 512,
+    "parent": 128
+  },
+  "plan": {
+    "baseline": "OUTER3_ON_NEW_VALIDATION_BANK_BASELINE",
+    "beta_empirical_ratio": "50:50",
+    "budget": {
+      "equilibrium_outer_max": 8,
+      "fc1_max_epochs": 40,
+      "fc1_min_epochs": 25,
+      "fc1_patience": 10,
+      "firm_inner_max": 3,
+      "macro_inner_max": 2,
+      "p_adam_steps": 200,
+      "p_lbfgs_max_iter": 100,
+      "p_policy_outer_max": 3,
+      "policy_distill_max_steps": 1000,
+      "q_fit_steps": 300,
+      "q_picard_outer_max": 3,
+      "sdf_chunks": 2,
+      "sdf_epochs_per_chunk": 50
+    },
+    "children": 2,
+    "convergence_is_report_only": true,
+    "dynamic_sampling": {
+      "archive_count": 1229,
+      "beta_empirical": "50:50",
+      "cluster": "uniform_source_parent_lineage_then_uniform_available_snapshot_child",
+      "conditional_min_count": 8,
+      "empirical_count": 4096,
+      "initialization": "LOCKED_JOB699894_T0",
+      "last_bank_outer": 11,
+      "missing_recent": "HARD_FAILURE_NO_SUBSTITUTION",
+      "recent_archive": "70:30",
+      "recent_count": 2867,
+      "seed_base": 202610214,
+      "seed_rule": "seed_base + target_outer*100003 + parent_id*97",
+      "source": "POST_SDF_TRAIN_EMPIRICAL_SOURCE",
+      "validation": "FIXED_INITIAL_BANK",
+      "version": "train_dynamic_realized_b_parent_cluster_v1"
+    },
+    "empirical_semantics": "DYNAMIC_TRAIN_ONLY_REALIZED_PRE_DECISION_B",
+    "end_outer": 11,
+    "execution": [
+      {
+        "id": "outer_003/dynamic_initialize",
+        "indices": {},
+        "kind": "dynamic_initialize",
+        "outer": 3
+      },
+      {
+        "id": "outer_003/baseline",
+        "indices": {},
+        "kind": "baseline",
+        "outer": 3
+      },
+      {
+        "id": "outer_004/outer_start",
+        "indices": {},
+        "kind": "outer_start",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/firm_bank",
+        "indices": {},
+        "kind": "firm_bank",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/P/inner0_policy0",
+        "indices": {
+          "inner": 0,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/P/inner0_policy1",
+        "indices": {
+          "inner": 0,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/P/inner0_policy2",
+        "indices": {
+          "inner": 0,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/Q/inner0_picard0",
+        "indices": {
+          "inner": 0,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/Q/inner0_picard1",
+        "indices": {
+          "inner": 0,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/Q/inner0_picard2",
+        "indices": {
+          "inner": 0,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/BP/inner0",
+        "indices": {
+          "inner": 0
+        },
+        "kind": "BP",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/P/inner1_policy0",
+        "indices": {
+          "inner": 1,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/P/inner1_policy1",
+        "indices": {
+          "inner": 1,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/P/inner1_policy2",
+        "indices": {
+          "inner": 1,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/Q/inner1_picard0",
+        "indices": {
+          "inner": 1,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/Q/inner1_picard1",
+        "indices": {
+          "inner": 1,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/Q/inner1_picard2",
+        "indices": {
+          "inner": 1,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/BP/inner1",
+        "indices": {
+          "inner": 1
+        },
+        "kind": "BP",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/P/inner2_policy0",
+        "indices": {
+          "inner": 2,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/P/inner2_policy1",
+        "indices": {
+          "inner": 2,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/P/inner2_policy2",
+        "indices": {
+          "inner": 2,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/Q/inner2_picard0",
+        "indices": {
+          "inner": 2,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/Q/inner2_picard1",
+        "indices": {
+          "inner": 2,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/Q/inner2_picard2",
+        "indices": {
+          "inner": 2,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/BP/inner2",
+        "indices": {
+          "inner": 2
+        },
+        "kind": "BP",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/data/version0",
+        "indices": {
+          "version": 0
+        },
+        "kind": "data",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro0_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/data/version1",
+        "indices": {
+          "version": 1
+        },
+        "kind": "data",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/FC1/macro1_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/data/version2",
+        "indices": {
+          "version": 2
+        },
+        "kind": "data",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/SDF/chunk0",
+        "indices": {
+          "chunk": 0
+        },
+        "kind": "SDF",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/SDF/chunk1",
+        "indices": {
+          "chunk": 1
+        },
+        "kind": "SDF",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/post_sdf_validation",
+        "indices": {},
+        "kind": "post_sdf_validation",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/empirical_source",
+        "indices": {},
+        "kind": "empirical_source",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/EMPIRICAL_POOL_COMMIT",
+        "indices": {},
+        "kind": "EMPIRICAL_POOL_COMMIT",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/cross_block",
+        "indices": {},
+        "kind": "cross_block",
+        "outer": 4
+      },
+      {
+        "id": "outer_004/outer_commit",
+        "indices": {},
+        "kind": "outer_commit",
+        "outer": 4
+      },
+      {
+        "id": "outer_005/outer_start",
+        "indices": {},
+        "kind": "outer_start",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/firm_bank",
+        "indices": {},
+        "kind": "firm_bank",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/P/inner0_policy0",
+        "indices": {
+          "inner": 0,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/P/inner0_policy1",
+        "indices": {
+          "inner": 0,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/P/inner0_policy2",
+        "indices": {
+          "inner": 0,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/Q/inner0_picard0",
+        "indices": {
+          "inner": 0,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/Q/inner0_picard1",
+        "indices": {
+          "inner": 0,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/Q/inner0_picard2",
+        "indices": {
+          "inner": 0,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/BP/inner0",
+        "indices": {
+          "inner": 0
+        },
+        "kind": "BP",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/P/inner1_policy0",
+        "indices": {
+          "inner": 1,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/P/inner1_policy1",
+        "indices": {
+          "inner": 1,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/P/inner1_policy2",
+        "indices": {
+          "inner": 1,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/Q/inner1_picard0",
+        "indices": {
+          "inner": 1,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/Q/inner1_picard1",
+        "indices": {
+          "inner": 1,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/Q/inner1_picard2",
+        "indices": {
+          "inner": 1,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/BP/inner1",
+        "indices": {
+          "inner": 1
+        },
+        "kind": "BP",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/P/inner2_policy0",
+        "indices": {
+          "inner": 2,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/P/inner2_policy1",
+        "indices": {
+          "inner": 2,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/P/inner2_policy2",
+        "indices": {
+          "inner": 2,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/Q/inner2_picard0",
+        "indices": {
+          "inner": 2,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/Q/inner2_picard1",
+        "indices": {
+          "inner": 2,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/Q/inner2_picard2",
+        "indices": {
+          "inner": 2,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/BP/inner2",
+        "indices": {
+          "inner": 2
+        },
+        "kind": "BP",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/data/version0",
+        "indices": {
+          "version": 0
+        },
+        "kind": "data",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro0_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/data/version1",
+        "indices": {
+          "version": 1
+        },
+        "kind": "data",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/FC1/macro1_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/data/version2",
+        "indices": {
+          "version": 2
+        },
+        "kind": "data",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/SDF/chunk0",
+        "indices": {
+          "chunk": 0
+        },
+        "kind": "SDF",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/SDF/chunk1",
+        "indices": {
+          "chunk": 1
+        },
+        "kind": "SDF",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/post_sdf_validation",
+        "indices": {},
+        "kind": "post_sdf_validation",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/empirical_source",
+        "indices": {},
+        "kind": "empirical_source",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/EMPIRICAL_POOL_COMMIT",
+        "indices": {},
+        "kind": "EMPIRICAL_POOL_COMMIT",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/cross_block",
+        "indices": {},
+        "kind": "cross_block",
+        "outer": 5
+      },
+      {
+        "id": "outer_005/outer_commit",
+        "indices": {},
+        "kind": "outer_commit",
+        "outer": 5
+      },
+      {
+        "id": "outer_006/outer_start",
+        "indices": {},
+        "kind": "outer_start",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/firm_bank",
+        "indices": {},
+        "kind": "firm_bank",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/P/inner0_policy0",
+        "indices": {
+          "inner": 0,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/P/inner0_policy1",
+        "indices": {
+          "inner": 0,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/P/inner0_policy2",
+        "indices": {
+          "inner": 0,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/Q/inner0_picard0",
+        "indices": {
+          "inner": 0,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/Q/inner0_picard1",
+        "indices": {
+          "inner": 0,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/Q/inner0_picard2",
+        "indices": {
+          "inner": 0,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/BP/inner0",
+        "indices": {
+          "inner": 0
+        },
+        "kind": "BP",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/P/inner1_policy0",
+        "indices": {
+          "inner": 1,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/P/inner1_policy1",
+        "indices": {
+          "inner": 1,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/P/inner1_policy2",
+        "indices": {
+          "inner": 1,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/Q/inner1_picard0",
+        "indices": {
+          "inner": 1,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/Q/inner1_picard1",
+        "indices": {
+          "inner": 1,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/Q/inner1_picard2",
+        "indices": {
+          "inner": 1,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/BP/inner1",
+        "indices": {
+          "inner": 1
+        },
+        "kind": "BP",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/P/inner2_policy0",
+        "indices": {
+          "inner": 2,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/P/inner2_policy1",
+        "indices": {
+          "inner": 2,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/P/inner2_policy2",
+        "indices": {
+          "inner": 2,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/Q/inner2_picard0",
+        "indices": {
+          "inner": 2,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/Q/inner2_picard1",
+        "indices": {
+          "inner": 2,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/Q/inner2_picard2",
+        "indices": {
+          "inner": 2,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/BP/inner2",
+        "indices": {
+          "inner": 2
+        },
+        "kind": "BP",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/data/version0",
+        "indices": {
+          "version": 0
+        },
+        "kind": "data",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro0_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/data/version1",
+        "indices": {
+          "version": 1
+        },
+        "kind": "data",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/FC1/macro1_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/data/version2",
+        "indices": {
+          "version": 2
+        },
+        "kind": "data",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/SDF/chunk0",
+        "indices": {
+          "chunk": 0
+        },
+        "kind": "SDF",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/SDF/chunk1",
+        "indices": {
+          "chunk": 1
+        },
+        "kind": "SDF",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/post_sdf_validation",
+        "indices": {},
+        "kind": "post_sdf_validation",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/empirical_source",
+        "indices": {},
+        "kind": "empirical_source",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/EMPIRICAL_POOL_COMMIT",
+        "indices": {},
+        "kind": "EMPIRICAL_POOL_COMMIT",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/cross_block",
+        "indices": {},
+        "kind": "cross_block",
+        "outer": 6
+      },
+      {
+        "id": "outer_006/outer_commit",
+        "indices": {},
+        "kind": "outer_commit",
+        "outer": 6
+      },
+      {
+        "id": "outer_007/outer_start",
+        "indices": {},
+        "kind": "outer_start",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/firm_bank",
+        "indices": {},
+        "kind": "firm_bank",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/P/inner0_policy0",
+        "indices": {
+          "inner": 0,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/P/inner0_policy1",
+        "indices": {
+          "inner": 0,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/P/inner0_policy2",
+        "indices": {
+          "inner": 0,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/Q/inner0_picard0",
+        "indices": {
+          "inner": 0,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/Q/inner0_picard1",
+        "indices": {
+          "inner": 0,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/Q/inner0_picard2",
+        "indices": {
+          "inner": 0,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/BP/inner0",
+        "indices": {
+          "inner": 0
+        },
+        "kind": "BP",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/P/inner1_policy0",
+        "indices": {
+          "inner": 1,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/P/inner1_policy1",
+        "indices": {
+          "inner": 1,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/P/inner1_policy2",
+        "indices": {
+          "inner": 1,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/Q/inner1_picard0",
+        "indices": {
+          "inner": 1,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/Q/inner1_picard1",
+        "indices": {
+          "inner": 1,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/Q/inner1_picard2",
+        "indices": {
+          "inner": 1,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/BP/inner1",
+        "indices": {
+          "inner": 1
+        },
+        "kind": "BP",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/P/inner2_policy0",
+        "indices": {
+          "inner": 2,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/P/inner2_policy1",
+        "indices": {
+          "inner": 2,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/P/inner2_policy2",
+        "indices": {
+          "inner": 2,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/Q/inner2_picard0",
+        "indices": {
+          "inner": 2,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/Q/inner2_picard1",
+        "indices": {
+          "inner": 2,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/Q/inner2_picard2",
+        "indices": {
+          "inner": 2,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/BP/inner2",
+        "indices": {
+          "inner": 2
+        },
+        "kind": "BP",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/data/version0",
+        "indices": {
+          "version": 0
+        },
+        "kind": "data",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro0_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/data/version1",
+        "indices": {
+          "version": 1
+        },
+        "kind": "data",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/FC1/macro1_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/data/version2",
+        "indices": {
+          "version": 2
+        },
+        "kind": "data",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/SDF/chunk0",
+        "indices": {
+          "chunk": 0
+        },
+        "kind": "SDF",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/SDF/chunk1",
+        "indices": {
+          "chunk": 1
+        },
+        "kind": "SDF",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/post_sdf_validation",
+        "indices": {},
+        "kind": "post_sdf_validation",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/empirical_source",
+        "indices": {},
+        "kind": "empirical_source",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/EMPIRICAL_POOL_COMMIT",
+        "indices": {},
+        "kind": "EMPIRICAL_POOL_COMMIT",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/cross_block",
+        "indices": {},
+        "kind": "cross_block",
+        "outer": 7
+      },
+      {
+        "id": "outer_007/outer_commit",
+        "indices": {},
+        "kind": "outer_commit",
+        "outer": 7
+      },
+      {
+        "id": "outer_008/outer_start",
+        "indices": {},
+        "kind": "outer_start",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/firm_bank",
+        "indices": {},
+        "kind": "firm_bank",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/P/inner0_policy0",
+        "indices": {
+          "inner": 0,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/P/inner0_policy1",
+        "indices": {
+          "inner": 0,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/P/inner0_policy2",
+        "indices": {
+          "inner": 0,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/Q/inner0_picard0",
+        "indices": {
+          "inner": 0,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/Q/inner0_picard1",
+        "indices": {
+          "inner": 0,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/Q/inner0_picard2",
+        "indices": {
+          "inner": 0,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/BP/inner0",
+        "indices": {
+          "inner": 0
+        },
+        "kind": "BP",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/P/inner1_policy0",
+        "indices": {
+          "inner": 1,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/P/inner1_policy1",
+        "indices": {
+          "inner": 1,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/P/inner1_policy2",
+        "indices": {
+          "inner": 1,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/Q/inner1_picard0",
+        "indices": {
+          "inner": 1,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/Q/inner1_picard1",
+        "indices": {
+          "inner": 1,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/Q/inner1_picard2",
+        "indices": {
+          "inner": 1,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/BP/inner1",
+        "indices": {
+          "inner": 1
+        },
+        "kind": "BP",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/P/inner2_policy0",
+        "indices": {
+          "inner": 2,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/P/inner2_policy1",
+        "indices": {
+          "inner": 2,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/P/inner2_policy2",
+        "indices": {
+          "inner": 2,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/Q/inner2_picard0",
+        "indices": {
+          "inner": 2,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/Q/inner2_picard1",
+        "indices": {
+          "inner": 2,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/Q/inner2_picard2",
+        "indices": {
+          "inner": 2,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/BP/inner2",
+        "indices": {
+          "inner": 2
+        },
+        "kind": "BP",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/data/version0",
+        "indices": {
+          "version": 0
+        },
+        "kind": "data",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro0_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/data/version1",
+        "indices": {
+          "version": 1
+        },
+        "kind": "data",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/FC1/macro1_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/data/version2",
+        "indices": {
+          "version": 2
+        },
+        "kind": "data",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/SDF/chunk0",
+        "indices": {
+          "chunk": 0
+        },
+        "kind": "SDF",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/SDF/chunk1",
+        "indices": {
+          "chunk": 1
+        },
+        "kind": "SDF",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/post_sdf_validation",
+        "indices": {},
+        "kind": "post_sdf_validation",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/empirical_source",
+        "indices": {},
+        "kind": "empirical_source",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/EMPIRICAL_POOL_COMMIT",
+        "indices": {},
+        "kind": "EMPIRICAL_POOL_COMMIT",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/cross_block",
+        "indices": {},
+        "kind": "cross_block",
+        "outer": 8
+      },
+      {
+        "id": "outer_008/outer_commit",
+        "indices": {},
+        "kind": "outer_commit",
+        "outer": 8
+      },
+      {
+        "id": "outer_009/outer_start",
+        "indices": {},
+        "kind": "outer_start",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/firm_bank",
+        "indices": {},
+        "kind": "firm_bank",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/P/inner0_policy0",
+        "indices": {
+          "inner": 0,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/P/inner0_policy1",
+        "indices": {
+          "inner": 0,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/P/inner0_policy2",
+        "indices": {
+          "inner": 0,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/Q/inner0_picard0",
+        "indices": {
+          "inner": 0,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/Q/inner0_picard1",
+        "indices": {
+          "inner": 0,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/Q/inner0_picard2",
+        "indices": {
+          "inner": 0,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/BP/inner0",
+        "indices": {
+          "inner": 0
+        },
+        "kind": "BP",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/P/inner1_policy0",
+        "indices": {
+          "inner": 1,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/P/inner1_policy1",
+        "indices": {
+          "inner": 1,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/P/inner1_policy2",
+        "indices": {
+          "inner": 1,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/Q/inner1_picard0",
+        "indices": {
+          "inner": 1,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/Q/inner1_picard1",
+        "indices": {
+          "inner": 1,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/Q/inner1_picard2",
+        "indices": {
+          "inner": 1,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/BP/inner1",
+        "indices": {
+          "inner": 1
+        },
+        "kind": "BP",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/P/inner2_policy0",
+        "indices": {
+          "inner": 2,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/P/inner2_policy1",
+        "indices": {
+          "inner": 2,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/P/inner2_policy2",
+        "indices": {
+          "inner": 2,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/Q/inner2_picard0",
+        "indices": {
+          "inner": 2,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/Q/inner2_picard1",
+        "indices": {
+          "inner": 2,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/Q/inner2_picard2",
+        "indices": {
+          "inner": 2,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/BP/inner2",
+        "indices": {
+          "inner": 2
+        },
+        "kind": "BP",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/data/version0",
+        "indices": {
+          "version": 0
+        },
+        "kind": "data",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro0_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/data/version1",
+        "indices": {
+          "version": 1
+        },
+        "kind": "data",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/FC1/macro1_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/data/version2",
+        "indices": {
+          "version": 2
+        },
+        "kind": "data",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/SDF/chunk0",
+        "indices": {
+          "chunk": 0
+        },
+        "kind": "SDF",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/SDF/chunk1",
+        "indices": {
+          "chunk": 1
+        },
+        "kind": "SDF",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/post_sdf_validation",
+        "indices": {},
+        "kind": "post_sdf_validation",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/empirical_source",
+        "indices": {},
+        "kind": "empirical_source",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/EMPIRICAL_POOL_COMMIT",
+        "indices": {},
+        "kind": "EMPIRICAL_POOL_COMMIT",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/cross_block",
+        "indices": {},
+        "kind": "cross_block",
+        "outer": 9
+      },
+      {
+        "id": "outer_009/outer_commit",
+        "indices": {},
+        "kind": "outer_commit",
+        "outer": 9
+      },
+      {
+        "id": "outer_010/outer_start",
+        "indices": {},
+        "kind": "outer_start",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/firm_bank",
+        "indices": {},
+        "kind": "firm_bank",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/P/inner0_policy0",
+        "indices": {
+          "inner": 0,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/P/inner0_policy1",
+        "indices": {
+          "inner": 0,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/P/inner0_policy2",
+        "indices": {
+          "inner": 0,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/Q/inner0_picard0",
+        "indices": {
+          "inner": 0,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/Q/inner0_picard1",
+        "indices": {
+          "inner": 0,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/Q/inner0_picard2",
+        "indices": {
+          "inner": 0,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/BP/inner0",
+        "indices": {
+          "inner": 0
+        },
+        "kind": "BP",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/P/inner1_policy0",
+        "indices": {
+          "inner": 1,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/P/inner1_policy1",
+        "indices": {
+          "inner": 1,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/P/inner1_policy2",
+        "indices": {
+          "inner": 1,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/Q/inner1_picard0",
+        "indices": {
+          "inner": 1,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/Q/inner1_picard1",
+        "indices": {
+          "inner": 1,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/Q/inner1_picard2",
+        "indices": {
+          "inner": 1,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/BP/inner1",
+        "indices": {
+          "inner": 1
+        },
+        "kind": "BP",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/P/inner2_policy0",
+        "indices": {
+          "inner": 2,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/P/inner2_policy1",
+        "indices": {
+          "inner": 2,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/P/inner2_policy2",
+        "indices": {
+          "inner": 2,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/Q/inner2_picard0",
+        "indices": {
+          "inner": 2,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/Q/inner2_picard1",
+        "indices": {
+          "inner": 2,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/Q/inner2_picard2",
+        "indices": {
+          "inner": 2,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/BP/inner2",
+        "indices": {
+          "inner": 2
+        },
+        "kind": "BP",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/data/version0",
+        "indices": {
+          "version": 0
+        },
+        "kind": "data",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro0_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/data/version1",
+        "indices": {
+          "version": 1
+        },
+        "kind": "data",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/FC1/macro1_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/data/version2",
+        "indices": {
+          "version": 2
+        },
+        "kind": "data",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/SDF/chunk0",
+        "indices": {
+          "chunk": 0
+        },
+        "kind": "SDF",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/SDF/chunk1",
+        "indices": {
+          "chunk": 1
+        },
+        "kind": "SDF",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/post_sdf_validation",
+        "indices": {},
+        "kind": "post_sdf_validation",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/empirical_source",
+        "indices": {},
+        "kind": "empirical_source",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/EMPIRICAL_POOL_COMMIT",
+        "indices": {},
+        "kind": "EMPIRICAL_POOL_COMMIT",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/cross_block",
+        "indices": {},
+        "kind": "cross_block",
+        "outer": 10
+      },
+      {
+        "id": "outer_010/outer_commit",
+        "indices": {},
+        "kind": "outer_commit",
+        "outer": 10
+      },
+      {
+        "id": "outer_011/outer_start",
+        "indices": {},
+        "kind": "outer_start",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/firm_bank",
+        "indices": {},
+        "kind": "firm_bank",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/P/inner0_policy0",
+        "indices": {
+          "inner": 0,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/P/inner0_policy1",
+        "indices": {
+          "inner": 0,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/P/inner0_policy2",
+        "indices": {
+          "inner": 0,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/Q/inner0_picard0",
+        "indices": {
+          "inner": 0,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/Q/inner0_picard1",
+        "indices": {
+          "inner": 0,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/Q/inner0_picard2",
+        "indices": {
+          "inner": 0,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/BP/inner0",
+        "indices": {
+          "inner": 0
+        },
+        "kind": "BP",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/P/inner1_policy0",
+        "indices": {
+          "inner": 1,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/P/inner1_policy1",
+        "indices": {
+          "inner": 1,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/P/inner1_policy2",
+        "indices": {
+          "inner": 1,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/Q/inner1_picard0",
+        "indices": {
+          "inner": 1,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/Q/inner1_picard1",
+        "indices": {
+          "inner": 1,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/Q/inner1_picard2",
+        "indices": {
+          "inner": 1,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/BP/inner1",
+        "indices": {
+          "inner": 1
+        },
+        "kind": "BP",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/P/inner2_policy0",
+        "indices": {
+          "inner": 2,
+          "policy": 0
+        },
+        "kind": "P",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/P/inner2_policy1",
+        "indices": {
+          "inner": 2,
+          "policy": 1
+        },
+        "kind": "P",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/P/inner2_policy2",
+        "indices": {
+          "inner": 2,
+          "policy": 2
+        },
+        "kind": "P",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/Q/inner2_picard0",
+        "indices": {
+          "inner": 2,
+          "picard": 0
+        },
+        "kind": "Q",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/Q/inner2_picard1",
+        "indices": {
+          "inner": 2,
+          "picard": 1
+        },
+        "kind": "Q",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/Q/inner2_picard2",
+        "indices": {
+          "inner": 2,
+          "picard": 2
+        },
+        "kind": "Q",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/BP/inner2",
+        "indices": {
+          "inner": 2
+        },
+        "kind": "BP",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/data/version0",
+        "indices": {
+          "version": 0
+        },
+        "kind": "data",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro0_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 0
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/data/version1",
+        "indices": {
+          "version": 1
+        },
+        "kind": "data",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch1",
+        "indices": {
+          "epoch": 1,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch2",
+        "indices": {
+          "epoch": 2,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch3",
+        "indices": {
+          "epoch": 3,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch4",
+        "indices": {
+          "epoch": 4,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch5",
+        "indices": {
+          "epoch": 5,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch6",
+        "indices": {
+          "epoch": 6,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch7",
+        "indices": {
+          "epoch": 7,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch8",
+        "indices": {
+          "epoch": 8,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch9",
+        "indices": {
+          "epoch": 9,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch10",
+        "indices": {
+          "epoch": 10,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch11",
+        "indices": {
+          "epoch": 11,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch12",
+        "indices": {
+          "epoch": 12,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch13",
+        "indices": {
+          "epoch": 13,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch14",
+        "indices": {
+          "epoch": 14,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch15",
+        "indices": {
+          "epoch": 15,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch16",
+        "indices": {
+          "epoch": 16,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch17",
+        "indices": {
+          "epoch": 17,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch18",
+        "indices": {
+          "epoch": 18,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch19",
+        "indices": {
+          "epoch": 19,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch20",
+        "indices": {
+          "epoch": 20,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch21",
+        "indices": {
+          "epoch": 21,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch22",
+        "indices": {
+          "epoch": 22,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch23",
+        "indices": {
+          "epoch": 23,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch24",
+        "indices": {
+          "epoch": 24,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch25",
+        "indices": {
+          "epoch": 25,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch26",
+        "indices": {
+          "epoch": 26,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch27",
+        "indices": {
+          "epoch": 27,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch28",
+        "indices": {
+          "epoch": 28,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch29",
+        "indices": {
+          "epoch": 29,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch30",
+        "indices": {
+          "epoch": 30,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch31",
+        "indices": {
+          "epoch": 31,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch32",
+        "indices": {
+          "epoch": 32,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch33",
+        "indices": {
+          "epoch": 33,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch34",
+        "indices": {
+          "epoch": 34,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch35",
+        "indices": {
+          "epoch": 35,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch36",
+        "indices": {
+          "epoch": 36,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch37",
+        "indices": {
+          "epoch": 37,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch38",
+        "indices": {
+          "epoch": 38,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch39",
+        "indices": {
+          "epoch": 39,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/FC1/macro1_epoch40",
+        "indices": {
+          "epoch": 40,
+          "macro": 1
+        },
+        "kind": "FC1",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/data/version2",
+        "indices": {
+          "version": 2
+        },
+        "kind": "data",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/SDF/chunk0",
+        "indices": {
+          "chunk": 0
+        },
+        "kind": "SDF",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/SDF/chunk1",
+        "indices": {
+          "chunk": 1
+        },
+        "kind": "SDF",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/post_sdf_validation",
+        "indices": {},
+        "kind": "post_sdf_validation",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/empirical_source",
+        "indices": {},
+        "kind": "empirical_source",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/EMPIRICAL_POOL_COMMIT",
+        "indices": {},
+        "kind": "EMPIRICAL_POOL_COMMIT",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/cross_block",
+        "indices": {},
+        "kind": "cross_block",
+        "outer": 11
+      },
+      {
+        "id": "outer_011/outer_commit",
+        "indices": {},
+        "kind": "outer_commit",
+        "outer": 11
+      }
+    ],
+    "experiment": "finite_direct_large_continuation_outer4_11_20261020_dynamic_exit_v2",
+    "fc2": false,
+    "firms": 200,
+    "initialization": "CROSS_RUN_CONTINUATION_FROM_COMMITTED_OUTER3",
+    "intra_run_resume": "NEW_STAGEJOURNAL_ONLY",
+    "operator": "finite_direct_parent_exit_before_child_v2",
+    "outers_to_execute": 8,
+    "physical_batch": {
+      "fc1": 128,
+      "firm": 512,
+      "parent": 128
+    },
+    "retention": "KEEP_ALL_TRANSACTIONS_NO_AUTOMATIC_DELETION",
+    "root_search": false,
+    "source_result_limit": "OLD_OPERATOR_LEARNING_STATE_WARM_START_NOT_CONVERGENCE_EVIDENCE",
+    "start_outer": 4,
+    "train_parents": 8192,
+    "validation_parents": 2048
+  },
+  "plan_fingerprint": "7e57eafb0bb855bac26f5559c17f9846d6333d044b3667380222167318e7cbe3"
+}

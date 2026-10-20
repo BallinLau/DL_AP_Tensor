@@ -1,0 +1,102 @@
+{
+  "candidate_initial_pool_exists": false,
+  "candidate_manifest_code_commit": "788fad7efef6c748f48193f30e357e812c4921b3",
+  "deployment_requirement": "Fresh prepared directory; refreshed manifest must bind FINAL_NEW_COMMIT and V4 actual deployed SHA; no old approval reuse",
+  "formal_training_started": false,
+  "learning_state_matches_actual_committed_source": true,
+  "local_file_sha256": {
+    "cachedir/finite_direct_large_continuation_outer4_11_20261020/prepared_v2/continuation_initial_checkpoint.pt": "6ff6b2979735734400eafc9149efe5caf969348bba6d0dcbffa95f10686ec6ad",
+    "cachedir/finite_direct_large_continuation_outer4_11_20261020/prepared_v2/continuation_sampling/sampling_signature.json": "f08cdec937092c44d747da9cef7791d473133942f6a1a4458dc9b72dafc94db1",
+    "cachedir/finite_direct_large_continuation_outer4_11_20261020/prepared_v2/continuation_sampling/train_initial_bank.pt": "bfc2c57de3ced55c13a1dc9f492db3715b201ac6bb942bd127903adf8b924222",
+    "cachedir/finite_direct_large_continuation_outer4_11_20261020/prepared_v2/continuation_sampling/validation_initial_bank.pt": "dbc5d6b2de8a9234335a1a85a97dd148360a72d0ac2b4824e11ed5742ba24263",
+    "cachedir/finite_direct_large_continuation_outer4_11_20261020/prepared_v2/continuation_source_manifest.json": "2807bbd6aee623c5e880d48d9e2968adbf0404ee5370073179159eb35785aa5e"
+  },
+  "new_deployment_artifacts_prepared": false,
+  "review_date": "2026-10-21 Asia/Shanghai",
+  "sampling_fingerprint": "2a730d551131c6478fdb12ffb718d0a102082b3a370546606ef4b0356e41bd54",
+  "server_reverified_this_task": false,
+  "source_audit": {
+    "completed_outer_indices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "episode_runtime_hash": "de1cfed15a1278b2d99351a2478761e50d053acbbd0369bd252bf0c2b488dbeb",
+    "firm_optimizer_semantics": "P/Q Adam/LBFGS STAGE_LOCAL_OPTIMIZER; BP follows production stage creation",
+    "model_hashes": {
+      "fc1_c": "101521ab1ebce4c15b90160a720527e0dbbb8a34a0b399e4f608f082c2d981a0",
+      "fc1_k": "0165523b9b205349b6343fbf9e976acbdb38714d0c5cfe10fa9ce9f53156705d",
+      "firm": "03af1fbfb6ca413457f2e24b39e57316e79e8280c172925f8caef2cfe63a4e66",
+      "sdf": "73e4de1bf0abb10066f3f7b1a8e8170ab7b989d0e7cd900fe3a5c1ffbe4f6a8e",
+      "wealth": "b8d66ca7bf3f640d98f7677abc06bd35a6865989498a3e1ffd096cc5301b3b78"
+    },
+    "optimizers": {
+      "fc1_conditional": {
+        "parameter_group_shapes": [
+          16
+        ],
+        "semantics": "PERSISTENT_OPTIMIZER",
+        "sha256": "ac33ba78a607620e883344e5495734ff915af4eb61fe5a20ea9b1c24398f02c7",
+        "state_entries": 16,
+        "steps": [
+          6728.0
+        ]
+      },
+      "fc2": {
+        "parameter_group_shapes": [
+          8
+        ],
+        "semantics": "UNUSED_EPISODE_OPTIMIZER",
+        "sha256": "1331a93233916fe238cdd08da0710f6f6ad6d7f7f4b0632c702476626e1130a3",
+        "state_entries": 0,
+        "steps": []
+      },
+      "policy_value": {
+        "parameter_group_shapes": [
+          86
+        ],
+        "semantics": "UNUSED_EPISODE_OPTIMIZER",
+        "sha256": "98d8be49ce94377551a8f5ca14cb47d6dc9c7b44ffeecd4d9e501beec527a268",
+        "state_entries": 0,
+        "steps": []
+      },
+      "sdf_fc1": {
+        "parameter_group_shapes": [
+          8,
+          8,
+          16
+        ],
+        "semantics": "PERSISTENT_OPTIMIZER",
+        "sha256": "e84421c0aa038d2362c96ef0f0c9a7da7d06469c7d92e4ca91ac6c2cbcf1ccfe",
+        "state_entries": 8,
+        "steps": [
+          12800.0
+        ]
+      }
+    },
+    "outer_complete_learning_state_parity": "PASS",
+    "outer_complete_sha256": "2ba3ef5a859df102e1c7b33923885406cb357de564861a0b61a527f8acaab369",
+    "production_optimizer_steps": 0,
+    "scheduler_hash": "22feb199c68a4351cf7cdf7b79eb5e326c9cef60700c7b74c3656e2706eb315e",
+    "source_al_hash": "cfe3a121788642a97b1bdbe9ccc6dcbf20f5d47dd7daee54ac6c29e93ab82ecf",
+    "source_al_state": {
+      "lambda_mean_high": 0.0,
+      "lambda_mean_low": 0.07104423291275452,
+      "lambda_var_high": 0.0,
+      "rho": 2.0
+    },
+    "source_fresh_hash": "bc08dac8106f416d6d4390811549a1c8c8a9aef53c1976faf1dbb139dd5d464e",
+    "source_git_commit": "160a4d18ab410dceb75b46f014dc33b5296526a2",
+    "source_job_id": 701387,
+    "source_rng_hash": "6b0e1f5d65e66bbe0d0d39303b0b0b179bd52d8c24330a540c3ab694803f4e27",
+    "source_sdf_epoch": 400,
+    "source_sdf_optimizer_steps": 12800,
+    "source_terminal_checkpoint_sha256": "6899b452c14a04a3a3b1837a8903dbb21249ec08d534293ef50046f99f2bc585",
+    "source_terminal_outer": 3,
+    "source_terminal_stage": "outer_003/outer_commit",
+    "status": "PASS"
+  },
+  "user_training_approval": false,
+  "verification_scope": "LOCAL_CERTIFIED_MIRROR_AND_REVIEWED_INITIAL_BYTES_ONLY"
+}

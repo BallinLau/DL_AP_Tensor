@@ -1,0 +1,39 @@
+PLANNED ONLY — 本轮不得执行。以下占位符必须在用户未来明确批准后解析。
+
+1. 部署最终新commit到独立clean checkout；核对git rev-parse HEAD与git status。
+   FINAL_SHA=<本次最终本地commit完整SHA，不是7074dca>
+   REPO_DIR=/home/fit/zhuyingz/WORK/LiuHao/finite_direct_dynamic_final_20261021/source_${FINAL_SHA}
+   DEPLOY_ROOT=/home/fit/zhuyingz/WORK/LiuHao/finite_direct_dynamic_final_20261021
+   PREPARED=${DEPLOY_ROOT}/prepared_v4_${FINAL_SHA}
+   RUN_ROOT=/home/fit/zhuyingz/WORK/LiuHao/cachedir/finite_direct_dynamic_outer4_11_v2_${FINAL_SHA}_r1
+
+2. CPU准备（未来步骤；本轮未执行，不生成批准）：
+   cd "$REPO_DIR"
+   /home/fit/zhuyingz/.conda/envs/DL_HL/bin/python analysis/prepare_finite_direct_continuation.py \
+     --source-run /home/fit/zhuyingz/WORK/LiuHao/cachedir/full_nested_finite_direct_outer4_20261020_160a4d1_r1 \
+     --template-bank <已核验SHA的原始empirical_template_bank.pt路径> \
+     --output "$PREPARED"
+   原始模板预期SHA f616821c7407230eef850a255ea1205a1df47d3b3e659d1b2820cfd810ebf1d3。
+   不覆盖任何旧prepared/source/job目录。重新核对source/initial/pool/Train/Validation/signature/manifest实际SHA。
+
+3. 用户另行批准后，才基于analysis.finite_direct_dynamic_approval.approval_binding()
+   将实际部署内容、最终commit和plan绑定到独立Approval v4文件。
+   本轮没有执行此步骤，不存在本轮approved=true文件。
+   APPROVAL_FILE=<未来用户批准且完整绑定实际SHA的v4文件>
+
+4. 未来提交前检查没有同一run的作业/提交凭证，RUN_ROOT尚不存在；logs放在run之外，
+   避免fresh-run要求空目录却预先塞入日志。先bash -n再提交一次，不自动重复。
+   mkdir -p "$DEPLOY_ROOT/logs"
+   export REPO_DIR REQUIRED_COMMIT="$FINAL_SHA" RUN_ROOT
+   export SAMPLING_DIR="$PREPARED/continuation_sampling"
+   export INITIAL_CHECKPOINT="$PREPARED/continuation_initial_checkpoint.pt"
+   export SOURCE_MANIFEST="$PREPARED/continuation_source_manifest.json"
+   export APPROVAL_FILE RESUME=0
+   sbatch --parsable --exclude=g02,g03,g14 \
+     --output="$DEPLOY_ROOT/logs/slurm.%j.out" \
+     --error="$DEPLOY_ROOT/logs/slurm.%j.err" \
+     "$REPO_DIR/slurm/run_finite_direct_large_continuation_outer4_11_a800.slurm"
+
+上述sbatch命令仅供未来审查/批准，不在本任务运行。硬件a01、1×A80080GB、8CPU、128G、7天；
+实际CLI Parent128/fit128/Firm512；训练预算见training_config.json，未改变。
+RESUME=1只用于同一新run自己的合法StageJournal，不用于恢复旧Job701387的run目录。

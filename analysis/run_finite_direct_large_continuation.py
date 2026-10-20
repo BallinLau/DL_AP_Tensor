@@ -390,7 +390,7 @@ def main(argv=None):
         result=install_historical_baseline(args.initial_checkpoint.parent,args.output,source)
         atomic_write_bytes(args.output/'metadata/continuation_source_manifest.json',args.source_manifest.read_bytes())
         atomic_write_json(args.output/'metadata/continuation_training_plan.json',plan)
-        atomic_write_bytes(args.output/'metadata/approval_v3.json',args.approval.read_bytes())
+        atomic_write_bytes(args.output/'metadata/approval_v4.json',args.approval.read_bytes())
         return result
     journal.run('initialization/historical_baseline',history_init)
     install_historical_baseline(args.initial_checkpoint.parent,args.output,source,resume=True)

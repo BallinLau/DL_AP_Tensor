@@ -9,6 +9,7 @@
 #SBATCH --time=7-00:00:00
 # PREPARED ONLY. Corrected exit v2 + dynamic Train Empirical requires Approval v4.
 # Old fixed-bank Approval v3 cannot authorize this code. No self-submission.
+# New run archives the supplied approval bytes at metadata/approval_v4.json.
 set -euo pipefail
 source /apps/soft/anaconda3/bin/activate
 conda activate DL_HL

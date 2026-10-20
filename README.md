@@ -113,6 +113,8 @@ Recent/Archive 精确2867/1229，Validation 与 Beta 固定。Outer4 初始模�
 旧 Job701387 只作为完整学习状态初始化，不是新算子的收敛证据。
 必须在用户审查后单独批准 `CONTINUATION_APPROVAL_V4_DYNAMIC_EMPIRICAL`，才可使用
 `--execute-approved`；旧v3批准、旧缓存和旧run journal不能用于本版本。
+新 run 的批准原文留档于 `metadata/approval_v4.json`；最终部署前核对见
+[最终训练准备报告](review/final_training_readiness/implementation_report.md)。
 本分支不自动训练、提交 Slurm、批准或 push。
 完整契约、真实 CLI、源状态审计和验收见
 [退出修正与动态 Empirical 审查报告](review/dynamic_empirical_exit_fix_20261021/dynamic_empirical_implementation_report.md)。

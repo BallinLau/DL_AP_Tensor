@@ -15,6 +15,8 @@ from data.finite_direct_sampling import file_hash
 
 
 def write_review(prepared,output,test_result):
+    if training_plan().get('dynamic_sampling'):
+        raise RuntimeError('Historical Approval v3 review generator is not valid for dynamic v4; use review/final_training_readiness and its v4 contract')
     prepared=Path(prepared);output=Path(output);output.mkdir(parents=True,exist_ok=True)
     source=json.loads((prepared/'continuation_source_manifest.json').read_text())
     coverage=json.loads((prepared/'continuation_sampling/sampling_coverage_summary.json').read_text())
