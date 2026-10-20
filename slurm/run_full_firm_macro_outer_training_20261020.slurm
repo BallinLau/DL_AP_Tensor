@@ -186,7 +186,7 @@ python3 -u analysis/run_full_nested_equilibrium.py \
   --sdf-min-parent-groups-per-batch 64 \
   --sdf-recursive-epochs 0 \
   --macro-clearing-solver-mode fc1_bounded_improvement_pilot \
-  --boundary-candidate-h-microbatch-size 4 \
+  --boundary-candidate-h-microbatch-size 1 \
   --aggregation-mode continuum_mass_consistent_v1 \
   --bp-actual-use-trace \
   --disable-fc2 \

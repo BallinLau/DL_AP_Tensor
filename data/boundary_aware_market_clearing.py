@@ -376,7 +376,7 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                 h=h_task[task_index],
                 lnkf=lnk_task[task_index],
             )
-            return self._firm_policy(model, rows)["Phat"]
+            return self._firm_phat(model, rows)
 
         z_scan_task = torch.arange(T, device=device)[:, None].expand_as(z_scan_u)
         z_scan_value = default_value(z_scan_task.reshape(-1), z_scan_u.reshape(-1)).reshape_as(z_scan_u)

@@ -186,35 +186,86 @@ class MarketClearingController:
         if states.shape[0] == 0:
             empty = states.new_empty((0,))
             return empty, empty
-        p0_parts = []
-        pi_parts = []
+        p0_output = None
+        pi_output = None
         for start in range(0, states.shape[0], self.config.candidate_chunk_size):
+            stop = min(start + self.config.candidate_chunk_size, states.shape[0])
             values = model.forward_value_components(
-                states[start : start + self.config.candidate_chunk_size]
+                states[start:stop]
             )
-            p0_parts.append(values["V0_physical"].reshape(-1))
-            pi_parts.append(values["VI_physical"].reshape(-1))
+            p0 = values["V0_physical"].reshape(-1)
+            pi = values["VI_physical"].reshape(-1)
+            if p0.numel() != stop - start or pi.numel() != stop - start:
+                raise RuntimeError("entry value forward returned a non-scalar row output")
+            if p0_output is None:
+                p0_output = p0.new_empty((states.shape[0],))
+                pi_output = pi.new_empty((states.shape[0],))
+            p0_output[start:stop].copy_(p0)
+            pi_output[start:stop].copy_(pi)
             self.network_forward_calls += 1
-        return torch.cat(p0_parts), torch.cat(pi_parts)
+        if p0_output is None or pi_output is None:
+            raise RuntimeError("entry value forward produced no chunks")
+        return p0_output, pi_output
+
+    @torch.inference_mode()
+    def _firm_phat(
+        self, model: torch.nn.Module, states: torch.Tensor
+    ) -> torch.Tensor:
+        """Evaluate only the scalar default boundary in bounded GPU chunks.
+
+        Boundary scans need ``Phat`` but previously called the full simulation
+        forward and retained six row-wise outputs before discarding five of
+        them.  The production model's ``forward_equity`` computes the identical
+        ``Phat`` path without Q or policy heads.  A compatibility fallback keeps
+        synthetic/legacy models on the audited full-forward route.
+        """
+        if states.shape[0] == 0:
+            return states.new_empty((0,))
+        output = None
+        equity_forward = getattr(model, "forward_equity", None)
+        for start in range(0, states.shape[0], self.config.candidate_chunk_size):
+            stop = min(start + self.config.candidate_chunk_size, states.shape[0])
+            chunk = states[start:stop]
+            if callable(equity_forward):
+                value = equity_forward(chunk)["Phat"]
+            else:
+                value = forward_policy_value_for_simulation(model, chunk).Phat
+            value = value.reshape(-1)
+            if value.numel() != stop - start:
+                raise RuntimeError("firm Phat forward returned a non-scalar row output")
+            if output is None:
+                output = value.new_empty((states.shape[0],))
+            output[start:stop].copy_(value)
+            self.network_forward_calls += 1
+        if output is None:
+            raise RuntimeError("firm Phat forward produced no chunks")
+        return output
 
     @torch.inference_mode()
     def _firm_policy(
         self, model: torch.nn.Module, states: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-        pieces = {
-            name: [] for name in ("bar_i", "bar_z", "bp", "P0", "PI", "Phat")
-        }
+        names = ("bar_i", "bar_z", "bp", "P0", "PI", "Phat")
+        outputs: dict[str, torch.Tensor] = {}
         for start in range(0, states.shape[0], self.config.candidate_chunk_size):
+            stop = min(start + self.config.candidate_chunk_size, states.shape[0])
             output = forward_policy_value_for_simulation(
-                model, states[start : start + self.config.candidate_chunk_size]
+                model, states[start:stop]
             )
-            for name in pieces:
+            for name in names:
                 value = getattr(output, name, None)
                 if value is None:
                     value = torch.full_like(output.P0, float("nan"))
-                pieces[name].append(value.reshape(-1))
+                value = value.reshape(-1)
+                if value.numel() != stop - start:
+                    raise RuntimeError(
+                        f"firm policy {name} returned a non-scalar row output"
+                    )
+                if name not in outputs:
+                    outputs[name] = value.new_empty((states.shape[0],))
+                outputs[name][start:stop].copy_(value)
             self.network_forward_calls += 1
-        return {name: torch.cat(values) for name, values in pieces.items()}
+        return outputs
 
     @torch.inference_mode()
     def evaluate(

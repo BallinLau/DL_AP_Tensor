@@ -59,6 +59,21 @@ class _BoundaryPolicy(torch.nn.Module):
         )
 
 
+class _BoundaryPolicyWithEquity(_BoundaryPolicy):
+    def __init__(self):
+        super().__init__()
+        self.equity_calls = 0
+        self.simulation_calls = 0
+
+    def forward_equity(self, state):
+        self.equity_calls += 1
+        return {"Phat": state[:, 1:2]}
+
+    def forward_simulation(self, state):
+        self.simulation_calls += 1
+        return super().forward_simulation(state)
+
+
 class _Config:
     I_THRESHOLD = 0.5
     PHI = 0.4
@@ -158,6 +173,63 @@ def test_candidate_h_microbatching_preserves_boundary_operator_values():
     ):
         torch.testing.assert_close(results[0][name], results[1][name])
         torch.testing.assert_close(results[0][name], results[2][name])
+
+
+def test_default_boundary_scan_uses_chunked_equity_only_phat_path():
+    model = _BoundaryPolicyWithEquity()
+    controller = BoundaryAwareMarketClearingController(
+        MarketClearingConfig(candidate_chunk_size=3),
+        BoundaryIntegrationConfig(
+            z_scan_points=17,
+            z_quadrature_points=6,
+            i_scan_points=9,
+            i_quadrature_points=6,
+            boundary_refinement_rounds=8,
+            candidate_h_microbatch_size=1,
+        ),
+    )
+    states = torch.tensor(
+        [
+            [0.4, -0.2, 0.0, 0.0, 0.0, -0.1, 0.0],
+            [0.4, -0.1, 0.0, 0.0, 0.0, -0.1, 0.0],
+            [0.4, 0.0, 0.0, 0.0, 0.0, -0.1, 0.0],
+            [0.4, 0.1, 0.0, 0.0, 0.0, -0.1, 0.0],
+            [0.4, 0.2, 0.0, 0.0, 0.0, -0.1, 0.0],
+        ]
+    )
+    phat = controller._firm_phat(model, states)
+    torch.testing.assert_close(phat, states[:, 1])
+    assert model.equity_calls == 2
+    assert model.simulation_calls == 0
+
+
+def test_chunked_policy_and_entry_outputs_match_single_chunk():
+    states = torch.tensor(
+        [
+            [0.4, -0.2, 0.0, 0.05, 0.0, -0.1, 0.0],
+            [0.4, -0.1, 0.0, 0.10, 0.0, -0.1, 0.0],
+            [0.4, 0.0, 0.0, 0.15, 0.0, -0.1, 0.0],
+            [0.4, 0.1, 0.0, 0.20, 0.0, -0.1, 0.0],
+            [0.4, 0.2, 0.0, 0.25, 0.0, -0.1, 0.0],
+        ]
+    )
+    model = _BoundaryPolicy()
+    single = BoundaryAwareMarketClearingController(
+        MarketClearingConfig(candidate_chunk_size=states.shape[0]),
+        BoundaryIntegrationConfig(),
+    )
+    chunked = BoundaryAwareMarketClearingController(
+        MarketClearingConfig(candidate_chunk_size=2),
+        BoundaryIntegrationConfig(),
+    )
+    full_policy = single._firm_policy(model, states)
+    chunked_policy = chunked._firm_policy(model, states)
+    for name in full_policy:
+        torch.testing.assert_close(chunked_policy[name], full_policy[name])
+    full_entry = single._entry_values(model, states)
+    chunked_entry = chunked._entry_values(model, states)
+    torch.testing.assert_close(chunked_entry[0], full_entry[0])
+    torch.testing.assert_close(chunked_entry[1], full_entry[1])
 
 
 def test_entry_is_integrated_over_continuous_z_and_cost_boundaries():
