@@ -278,6 +278,41 @@ class BoundaryAwareDecisionRecord:
     transport_atoms: PostDecisionTransportAtoms
     provenance: Dict[str, Any]
 
+    @classmethod
+    def from_owned_transport(
+        cls,
+        *,
+        predecision_fingerprint: str,
+        candidate_h: torch.Tensor,
+        ledger: Mapping[str, torch.Tensor],
+        transport_atoms: PostDecisionTransportAtoms,
+        provenance: Mapping[str, Any],
+    ) -> "BoundaryAwareDecisionRecord":
+        """Attach a newly packed transport without duplicating its storage.
+
+        The caller transfers exclusive ownership of ``transport_atoms`` and
+        must not retain or mutate its field tensors.  Small ledger/root fields
+        are copied so later state updates cannot alter record provenance.  All
+        tensors are required to be graph-free; this is a lifetime contract,
+        not a shortcut around autograd.
+        """
+        transport_atoms.validate()
+        for field in fields(transport_atoms):
+            value = getattr(transport_atoms, field.name)
+            if value.requires_grad or value.grad_fn is not None:
+                raise ValueError(
+                    f"owned transport field {field.name} retains autograd state"
+                )
+        owned_provenance = dict(provenance)
+        owned_provenance["transport_ownership"] = "single_owner_immutable_v1"
+        return cls(
+            predecision_fingerprint=str(predecision_fingerprint),
+            candidate_h=candidate_h.detach().clone(),
+            ledger={name: value.detach().clone() for name, value in ledger.items()},
+            transport_atoms=transport_atoms,
+            provenance=owned_provenance,
+        )
+
     def detached(self) -> "BoundaryAwareDecisionRecord":
         return BoundaryAwareDecisionRecord(
             predecision_fingerprint=str(self.predecision_fingerprint),

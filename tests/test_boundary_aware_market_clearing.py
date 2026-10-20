@@ -373,6 +373,133 @@ def test_selected_candidate_commits_same_ledger_and_transport():
     assert t2.total_capital().item() == pytest.approx(53.5, abs=4e-4)
 
 
+def test_policy_summary_omits_transport_and_full_firm_state():
+    controller = BoundaryAwareMarketClearingController(
+        MarketClearingConfig(candidate_chunk_size=100_000),
+        BoundaryIntegrationConfig(
+            z_scan_points=17,
+            z_quadrature_points=4,
+            i_scan_points=9,
+            i_quadrature_points=4,
+        ),
+    )
+    sim = SimpleNamespace(
+        models={"policy_value": _BoundaryPolicy()},
+        config=_Config,
+        delta=0.0,
+        g=1.14,
+    )
+    state = _state()
+    result = controller._evaluate_policy_summary(
+        sim,
+        state,
+        empty_entry_candidates(state),
+        torch.tensor([[0.0]]),
+    )
+    assert {"C_raw", "K_total", "G", "resource_feasible"}.issubset(result)
+    assert {"bar_i_firm", "bar_z_firm", "accepted_entry"}.issubset(result)
+    assert "firm_state" not in result
+    assert not any(name.startswith("transport_atom_") for name in result)
+
+
+def test_commit_ready_transport_matches_full_diagnostic_detail():
+    controller = BoundaryAwareMarketClearingController(
+        MarketClearingConfig(candidate_chunk_size=100_000),
+        BoundaryIntegrationConfig(
+            z_scan_points=17,
+            z_quadrature_points=4,
+            i_scan_points=9,
+            i_quadrature_points=4,
+        ),
+    )
+    sim = SimpleNamespace(
+        models={"policy_value": _BoundaryPolicy()},
+        config=_Config,
+        delta=0.0,
+        g=1.14,
+    )
+    state = _state()
+    candidates = empty_entry_candidates(state)
+    selected_h = torch.tensor([[0.0]])
+    diagnostic = controller.evaluate(
+        sim, state, candidates, selected_h, detail=True
+    )
+    commit_ready = controller._evaluate_final_record(
+        sim, state, candidates, selected_h
+    )
+    fields = (
+        "C_raw",
+        "K_total",
+        "G",
+        "bar_i_firm",
+        "bar_z_firm",
+        "accepted_entry",
+        "transport_atom_weight",
+        "transport_atom_source_z",
+        "transport_atom_i",
+        "transport_atom_invest",
+        "transport_atom_bp_head",
+        "entry_transport_atom_weight",
+    )
+    for name in fields:
+        torch.testing.assert_close(
+            commit_ready[name], diagnostic[name], atol=0.0, rtol=0.0
+        )
+    assert "firm_state" not in commit_ready
+    assert "default_boundary_probability" not in commit_ready
+
+
+def test_owned_transport_commit_is_graph_free_and_alias_safe():
+    controller = BoundaryAwareMarketClearingController(
+        MarketClearingConfig(candidate_chunk_size=100_000),
+        BoundaryIntegrationConfig(
+            z_scan_points=17,
+            z_quadrature_points=4,
+            i_scan_points=9,
+            i_quadrature_points=4,
+        ),
+    )
+    sim = SimpleNamespace(
+        models={"policy_value": _BoundaryPolicy()},
+        config=_Config,
+        delta=0.0,
+        g=1.14,
+    )
+    state = _state()
+    candidates = empty_entry_candidates(state)
+    selected_h = torch.tensor([[0.0]])
+    detail = controller._evaluate_final_record(
+        sim, state, candidates, selected_h
+    )
+    flat_weight = detail["transport_atom_weight"]
+    controller._commit_selected_decision_record(
+        sim,
+        state,
+        candidates,
+        selected_h[:, 0],
+        detail,
+        t=1,
+        branch=0,
+    )
+    record = state["_boundary_decision_record"]
+    assert state["_selected_transport_atoms"] is record.transport_atoms
+    assert record.provenance["transport_ownership"] == "single_owner_immutable_v1"
+    before = record.transport_atoms.fingerprint()
+    with torch.inference_mode():
+        flat_weight.zero_()
+    selected_h.fill_(9.0)
+    assert record.transport_atoms.fingerprint() == before
+    assert record.candidate_h.item() == pytest.approx(0.0)
+    pointers = []
+    for field in record.transport_atoms.__dataclass_fields__.values():
+        value = getattr(record.transport_atoms, field.name)
+        assert not value.requires_grad
+        assert value.grad_fn is None
+        if value.numel():
+            pointers.append(value.untyped_storage().data_ptr())
+    assert len(pointers) == len(set(pointers))
+
+
 def _synthetic_transport(batch_size: int) -> PostDecisionTransportAtoms:
     shape = (batch_size, 1)
     weight = torch.arange(1, batch_size + 1, dtype=torch.float64)[:, None]

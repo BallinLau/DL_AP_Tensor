@@ -187,9 +187,9 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
             "Liquidation_total": state["accounting_Liquidation_total"].to(torch.float64),
             "I_maintenance_total": state["accounting_I_maintenance"].to(torch.float64),
         }
-        record = BoundaryAwareDecisionRecord(
+        record = BoundaryAwareDecisionRecord.from_owned_transport(
             predecision_fingerprint=predecision_fingerprint_from_state(state),
-            candidate_h=state["hatc_cal"].detach().clone(),
+            candidate_h=state["hatc_cal"],
             ledger=ledger,
             transport_atoms=transport,
             provenance={
@@ -198,7 +198,7 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                 "active_path_indices": active_index.detach().cpu().tolist(),
                 "full_batch_size": int(state["b"].shape[0]),
             },
-        ).detached()
+        )
         state["_boundary_decision_record"] = record
         state["_selected_transport_atoms"] = record.transport_atoms
         return state
@@ -224,9 +224,9 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
             "Liquidation_total": state["accounting_Liquidation_total"].to(torch.float64),
             "I_maintenance_total": state["accounting_I_maintenance"].to(torch.float64),
         }
-        record = BoundaryAwareDecisionRecord(
+        record = BoundaryAwareDecisionRecord.from_owned_transport(
             predecision_fingerprint=fingerprint,
-            candidate_h=state["hatc_cal"].detach().clone(),
+            candidate_h=state["hatc_cal"],
             ledger=ledger,
             transport_atoms=transport,
             provenance={
@@ -235,7 +235,7 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                 "representation": "boundary_aware_continuum_v1",
                 "terminal_batch": True,
             },
-        ).detached()
+        )
         state["_boundary_decision_record"] = record
         state["_selected_transport_atoms"] = record.transport_atoms
         return state
@@ -272,6 +272,60 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         return torch.stack((b, z, eta, investment_cost, x, h, lnkf), dim=-1)
 
     @torch.inference_mode()
+    def _firm_bp_for_atom_coordinates(
+        self,
+        model: torch.nn.Module,
+        *,
+        source_task: torch.Tensor,
+        b_task: torch.Tensor,
+        z: torch.Tensor,
+        eta_task: torch.Tensor,
+        investment_cost: torch.Tensor,
+        x_task: torch.Tensor,
+        h_task: torch.Tensor,
+        lnk_task: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the production policy on transport atoms without a full 7D bank."""
+        result = z.new_empty((z.numel(),))
+        chunk = int(self.config.candidate_chunk_size)
+        for start in range(0, z.numel(), chunk):
+            stop = min(start + chunk, z.numel())
+            task = source_task[start:stop]
+            states = self._states_for_coordinates(
+                b=b_task[task],
+                z=z[start:stop],
+                eta=eta_task[task],
+                investment_cost=investment_cost[start:stop],
+                x=x_task[task],
+                h=h_task[task],
+                lnkf=lnk_task[task],
+            )
+            result[start:stop].copy_(self._firm_bp(model, states))
+        return result
+
+    def _evaluate_policy_summary(
+        self,
+        sim: Any,
+        state: Dict[str, torch.Tensor],
+        candidates: EntryCandidates,
+        h: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        return self.evaluate(
+            sim, state, candidates, h, policy_summary=True
+        )
+
+    def _evaluate_final_record(
+        self,
+        sim: Any,
+        state: Dict[str, torch.Tensor],
+        candidates: EntryCandidates,
+        h: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        return self.evaluate(
+            sim, state, candidates, h, commit_ready=True
+        )
+
+    @torch.inference_mode()
     def evaluate(
         self,
         sim: Any,
@@ -280,7 +334,11 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         h: torch.Tensor,
         *,
         detail: bool = False,
+        policy_summary: bool = False,
+        commit_ready: bool = False,
     ) -> dict[str, torch.Tensor]:
+        if detail and commit_ready:
+            raise ValueError("detail and commit_ready are mutually exclusive")
         self._required_distribution_fields(state)
         model = sim.models.get("policy_value")
         if model is None:
@@ -297,9 +355,15 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         # still evaluates all active components and policy regions in batched
         # GPU calls.  Accepted-root detail evaluation already has H=1.
         h_chunk = int(self.integration.candidate_h_microbatch_size)
-        if not detail and H > h_chunk:
+        if not detail and not commit_ready and H > h_chunk:
             pieces = [
-                self.evaluate(sim, state, candidates, h[:, index : index + h_chunk])
+                self.evaluate(
+                    sim,
+                    state,
+                    candidates,
+                    h[:, index : index + h_chunk],
+                    policy_summary=policy_summary,
+                )
                 for index in range(0, H, h_chunk)
             ]
             names = pieces[0].keys()
@@ -535,7 +599,6 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         entry_atom_z = torch.empty(0, device=device, dtype=dtype)
         entry_atom_i = torch.empty(0, device=device, dtype=dtype)
         entry_atom_default = torch.empty(0, device=device, dtype=torch.bool)
-        entry_atom_state = torch.empty((0, 7), device=device, dtype=dtype)
         if bool(candidates.mask.any()):
             candidate_count = candidates.mask.sum(dim=1)
             k_entry = torch.where(
@@ -691,15 +754,6 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                     entry_atom_z = entry_z[accepted_z_index]
                     entry_atom_i = entry_i_v_flat[accepted_position] * float(entry_i_max)
                     entry_atom_default = entry_phat[accepted_z_index] <= 0.0
-                    entry_atom_state = self._states_for_coordinates(
-                        b=torch.zeros_like(entry_atom_z),
-                        z=entry_atom_z,
-                        eta=torch.zeros_like(entry_atom_z),
-                        investment_cost=entry_atom_i,
-                        x=entry_x[accepted_local],
-                        h=entry_h[accepted_local],
-                        lnkf=entry_lnk[accepted_local],
-                    )
 
         accounting_started = time.perf_counter()
         productivity = torch.exp(x_task[atom_task].to(torch.float64) + atom_z.to(torch.float64))
@@ -844,25 +898,17 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                 (B, H), device=device, dtype=torch.bool
             ),
         }
-        if detail:
-            survivor_atom_mask = (~atom_default) & (atom_weight > 0.0)
-            detail_state = self._states_for_coordinates(
-                b=b_task[atom_task],
-                z=atom_z,
-                eta=eta_task[atom_task],
-                investment_cost=atom_i,
-                x=x_task[atom_task],
-                h=h_task[atom_task],
-                lnkf=lnk_task[atom_task],
-            )
-            policy_started = time.perf_counter()
-            atom_policy = self._firm_policy(model, detail_state)
-            self.policy_forward_seconds += time.perf_counter() - policy_started
+        if detail or policy_summary or commit_ready:
             result.update(
                 {
                     "accepted_entry": (entry_mass_accepted > 1e-14).reshape(B, H, 1),
                     "bar_i_firm": bar_i,
                     "bar_z_firm": bar_z,
+                }
+            )
+        if detail:
+            result.update(
+                {
                     "bp_firm": torch.zeros((B, H, L), device=device, dtype=dtype),
                     "P0_firm": torch.full((B, H, L), float("nan"), device=device, dtype=dtype),
                     "PI_firm": torch.full((B, H, L), float("nan"), device=device, dtype=dtype),
@@ -881,28 +927,48 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                         ),
                         dim=-1,
                     ),
-                    "transport_atom_parent_h": atom_parent_h[survivor_atom_mask],
-                    "transport_atom_source_task": atom_task[survivor_atom_mask],
-                    "transport_atom_weight": atom_weight[survivor_atom_mask],
-                    "transport_atom_source_z": atom_z[survivor_atom_mask],
-                    "transport_atom_i": atom_i[survivor_atom_mask],
-                    "transport_atom_invest": atom_invest[survivor_atom_mask],
-                    "transport_atom_bp_head": atom_policy["bp"][survivor_atom_mask],
-                    "transport_atom_firm_state": detail_state[survivor_atom_mask],
-                    "entry_transport_atom_parent_h": entry_atom_parent_h[~entry_atom_default],
-                    "entry_transport_atom_weight": entry_atom_weight[~entry_atom_default],
-                    "entry_transport_atom_source_z": entry_atom_z[~entry_atom_default],
-                    "entry_transport_atom_i": entry_atom_i[~entry_atom_default],
-                    "entry_transport_atom_firm_state": entry_atom_state[~entry_atom_default],
                     "default_boundary_probability": default_boundaries.boundary_coordinate,
                     "default_boundary_mask": default_boundaries.boundary_mask,
                     "default_boundary_residual": default_boundaries.residual,
-                    "default_boundary_task_position": task_position,
                     "investment_boundary_probability": investment_boundary_probability,
                     "investment_boundary_mask": investment_boundary_mask,
                     "investment_boundary_residual": investment_boundary_residual,
                     "investment_boundary_source_task": investment_boundary_source_task,
                     "investment_boundary_source_z": investment_boundary_source_z,
+                }
+            )
+        if detail or commit_ready:
+            survivor_atom_mask = (~atom_default) & (atom_weight > 0.0)
+            survivor_task = atom_task[survivor_atom_mask]
+            survivor_z = atom_z[survivor_atom_mask]
+            survivor_i = atom_i[survivor_atom_mask]
+            policy_started = time.perf_counter()
+            survivor_bp = self._firm_bp_for_atom_coordinates(
+                model,
+                source_task=survivor_task,
+                b_task=b_task,
+                z=survivor_z,
+                eta_task=eta_task,
+                investment_cost=survivor_i,
+                x_task=x_task,
+                h_task=h_task,
+                lnk_task=lnk_task,
+            )
+            self.policy_forward_seconds += time.perf_counter() - policy_started
+            result.update(
+                {
+                    "entry_candidate_mass": entry_mass_accepted.reshape(B, H, 1).to(dtype),
+                    "transport_atom_source_task": survivor_task,
+                    "transport_atom_weight": atom_weight[survivor_atom_mask],
+                    "transport_atom_source_z": survivor_z,
+                    "transport_atom_i": survivor_i,
+                    "transport_atom_invest": atom_invest[survivor_atom_mask],
+                    "transport_atom_bp_head": survivor_bp,
+                    "entry_transport_atom_parent_h": entry_atom_parent_h[~entry_atom_default],
+                    "entry_transport_atom_weight": entry_atom_weight[~entry_atom_default],
+                    "entry_transport_atom_source_z": entry_atom_z[~entry_atom_default],
+                    "entry_transport_atom_i": entry_atom_i[~entry_atom_default],
+                    "default_boundary_task_position": task_position,
                 }
             )
         self._sync(device)
@@ -948,7 +1014,10 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
             sorted_path = path
             rank = path
         packed: Dict[str, torch.Tensor] = {}
-        for name, value in values.items():
+        # Consume one flat field at a time.  This bounds the overlap between
+        # the final padded representation and its flat construction sources.
+        while values:
+            name, value = values.popitem()
             output = torch.full(
                 (batch_size, capacity),
                 fill[name],
@@ -981,14 +1050,17 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         if detail["h"].shape[1] != 1:
             raise MarketClearingError("selected decision reconstruction requires H=1")
 
-        local_source_task = detail["transport_atom_source_task"]
-        active_flat_task = detail["default_boundary_task_position"]
+        local_source_task = detail.pop("transport_atom_source_task")
+        active_flat_task = detail.pop("default_boundary_task_position")
         flat_component = active_flat_task[local_source_task]
         incumbent_path = torch.div(flat_component, L, rounding_mode="floor")
         incumbent_component = flat_component % L
-        incumbent_state = detail["transport_atom_firm_state"]
-        incumbent_bp_head = detail["transport_atom_bp_head"].reshape(-1, 1)
-        if incumbent_state.shape[0]:
+        incumbent_bp_head = detail.pop("transport_atom_bp_head").reshape(-1)
+        incumbent_source_z = detail.pop("transport_atom_source_z")
+        incumbent_i = detail.pop("transport_atom_i")
+        incumbent_invest = detail.pop("transport_atom_invest")
+        incumbent_weight = detail.pop("transport_atom_weight")
+        if incumbent_bp_head.numel():
             if int(branch) == -1 and hasattr(sim, "_resolve_bp_action"):
                 component_id = state.get(
                     "component_id",
@@ -998,42 +1070,64 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                     "economic_node_id",
                     torch.arange(B, device=device, dtype=torch.long),
                 )[incumbent_path]
-                bp_action = sim._resolve_bp_action(
-                    sim=sim,
-                    firm_state=incumbent_state,
-                    model_output=None,
-                    bp_head=incumbent_bp_head,
-                    hatc_cal=selected_h[incumbent_path, None],
-                    lnk_cal=torch.log(
-                        detail["K_total"][:, 0].to(dtype).clamp_min(1.0e-30)
-                    )[incumbent_path, None],
-                    path_index=incumbent_path,
-                    firm_id=component_id,
-                    economic_node_id=node_id,
-                    t=int(t),
-                    branch=int(branch),
-                    decision_stage="boundary_transport_parent_policy",
-                    bp_execution_applicable=True,
-                ).reshape(-1)
+                bp_action = incumbent_bp_head.new_empty(incumbent_bp_head.shape)
+                lnk_cal = torch.log(
+                    detail["K_total"][:, 0].to(dtype).clamp_min(1.0e-30)
+                )
+                resolver_chunk = min(
+                    int(self.config.candidate_chunk_size), 65_536
+                )
+                for start in range(0, incumbent_bp_head.numel(), resolver_chunk):
+                    stop = min(start + resolver_chunk, incumbent_bp_head.numel())
+                    path_chunk = incumbent_path[start:stop]
+                    component_chunk = incumbent_component[start:stop]
+                    firm_state = self._states_for_coordinates(
+                        b=state["b"][path_chunk, component_chunk],
+                        z=incumbent_source_z[start:stop],
+                        eta=state["eta"][path_chunk, component_chunk],
+                        investment_cost=incumbent_i[start:stop],
+                        x=state["x"][path_chunk],
+                        h=selected_h[path_chunk],
+                        lnkf=state["lnkf"][path_chunk],
+                    )
+                    bp_action[start:stop].copy_(
+                        sim._resolve_bp_action(
+                            sim=sim,
+                            firm_state=firm_state,
+                            model_output=None,
+                            bp_head=incumbent_bp_head[start:stop, None],
+                            hatc_cal=selected_h[path_chunk, None],
+                            lnk_cal=lnk_cal[path_chunk, None],
+                            path_index=path_chunk,
+                            firm_id=component_id[start:stop],
+                            economic_node_id=node_id[start:stop],
+                            t=int(t),
+                            branch=int(branch),
+                            decision_stage="boundary_transport_parent_policy",
+                            bp_execution_applicable=True,
+                        ).reshape(-1)
+                    )
             else:
-                bp_action = incumbent_bp_head.reshape(-1)
+                bp_action = incumbent_bp_head
             incumbent_b_next = apply_refinancing_policy(
                 state["b"][incumbent_path, incumbent_component],
                 bp_action,
                 state["eta"][incumbent_path, incumbent_component],
             )
             incumbent_capital_next = state["K"][incumbent_path, incumbent_component] * torch.where(
-                detail["transport_atom_invest"],
-                torch.full_like(detail["transport_atom_i"], float(sim.g)),
-                torch.ones_like(detail["transport_atom_i"]),
+                incumbent_invest,
+                torch.full_like(incumbent_i, float(sim.g)),
+                torch.ones_like(incumbent_i),
             )
         else:
             incumbent_b_next = torch.empty(0, device=device, dtype=dtype)
             incumbent_capital_next = torch.empty(0, device=device, dtype=dtype)
 
-        entry_parent_h = detail["entry_transport_atom_parent_h"]
+        entry_parent_h = detail.pop("entry_transport_atom_parent_h")
         entry_path = torch.div(entry_parent_h, 1, rounding_mode="floor")
-        entry_state = detail["entry_transport_atom_firm_state"]
+        entry_weight = detail.pop("entry_transport_atom_weight")
+        entry_source_z = detail.pop("entry_transport_atom_source_z")
+        detail.pop("entry_transport_atom_i")
         entry_count = int(entry_path.numel())
         entry_b_next = torch.zeros(entry_count, device=device, dtype=dtype)
         if entry_count:
@@ -1049,21 +1143,21 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         atom_path = torch.cat((incumbent_path, entry_path))
         weight = torch.cat(
             (
-                detail["transport_atom_weight"],
-                detail["entry_transport_atom_weight"],
+                incumbent_weight,
+                entry_weight,
             )
         ).to(torch.float64)
         source_z = torch.cat(
             (
-                detail["transport_atom_source_z"],
-                detail["entry_transport_atom_source_z"],
+                incumbent_source_z,
+                entry_source_z,
             )
         )
         b_next = torch.cat((incumbent_b_next, entry_b_next))
         capital_next = torch.cat((incumbent_capital_next, entry_capital_next))
         investment_region = torch.cat(
             (
-                detail["transport_atom_invest"].to(torch.long),
+                incumbent_invest.to(torch.long),
                 torch.full((entry_count,), -1, device=device, dtype=torch.long),
             )
         )
@@ -1131,6 +1225,28 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
             "origin_kind": origin_kind,
             "origin_source_id": origin_source_id,
         }
+        # Flat construction tensors are now owned only by ``values``.  The
+        # destructive packer releases each one after its padded field exists.
+        del (
+            weight,
+            source_z,
+            b_next,
+            capital_next,
+            source_component,
+            investment_region,
+            economic_node,
+            cohort,
+            birth_time,
+            origin_kind,
+            origin_source_id,
+            incumbent_source_z,
+            incumbent_i,
+            incumbent_invest,
+            incumbent_weight,
+            incumbent_bp_head,
+            entry_weight,
+            entry_source_z,
+        )
         fill = {
             "transport_weight": 0.0,
             "source_z_current": 0.0,
@@ -1155,6 +1271,7 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         transport = PostDecisionTransportAtoms(
             atom_mask=packed.pop("atom_mask"), **packed
         ).validate()
+        self.record_gpu_memory("transport_packing", device)
         ledger = {
             "C_raw": detail["C_raw"][:, 0],
             "C_oper": detail["C_oper"][:, 0],
@@ -1165,7 +1282,7 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
             "Liquidation_total": detail["Liquidation_total"][:, 0],
             "I_maintenance_total": detail["I_maintenance_total"][:, 0],
         }
-        record = BoundaryAwareDecisionRecord(
+        record = BoundaryAwareDecisionRecord.from_owned_transport(
             predecision_fingerprint=predecision_fingerprint_from_state(state),
             candidate_h=selected_h,
             ledger=ledger,
@@ -1180,7 +1297,7 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
                 "root_selection": "existing_coarse_to_fine_selected_record",
                 "component_mean_hard_default_used": False,
             },
-        ).detached()
+        )
         state["_boundary_decision_record"] = record
         state["_selected_transport_atoms"] = record.transport_atoms
         state["hatc_cal"] = selected_h.detach().clone()
@@ -1233,6 +1350,7 @@ class BoundaryAwareMarketClearingController(MarketClearingController):
         state["economic_state_defined"] = torch.ones(
             B, device=device, dtype=torch.bool
         )
+        self.record_gpu_memory("commit", device)
 
     def validate_committed(
         self,

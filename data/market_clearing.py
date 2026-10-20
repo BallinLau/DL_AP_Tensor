@@ -160,6 +160,7 @@ class MarketClearingController:
         self._validated_decision_records: set[tuple[str, bytes]] = set()
         self.failure_records: list[dict[str, Any]] = []
         self.root_records: list[dict[str, Any]] = []
+        self.gpu_memory_stages: dict[str, dict[str, int]] = {}
 
     @property
     def _root_acceptance_tolerance(self) -> float:
@@ -178,6 +179,72 @@ class MarketClearingController:
     def _sync(device: torch.device) -> None:
         if device.type == "cuda":
             torch.cuda.synchronize(device)
+
+    def record_gpu_memory(self, stage: str, device: torch.device) -> None:
+        """Keep bounded per-stage CUDA lifetime diagnostics.
+
+        The controller may evaluate thousands of nodes, so this deliberately
+        stores aggregates rather than one Python record per node.  It is a
+        diagnostic only and never resets allocator statistics or changes the
+        economic operator.
+        """
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return
+        self._sync(device)
+        allocated = int(torch.cuda.memory_allocated(device))
+        reserved = int(torch.cuda.memory_reserved(device))
+        maximum = int(torch.cuda.max_memory_allocated(device))
+        current = self.gpu_memory_stages.get(stage)
+        if current is None:
+            self.gpu_memory_stages[stage] = {
+                "count": 1,
+                "first_allocated_bytes": allocated,
+                "last_allocated_bytes": allocated,
+                "min_allocated_bytes": allocated,
+                "max_allocated_bytes": allocated,
+                "max_reserved_bytes": reserved,
+                "max_memory_allocated_bytes": maximum,
+            }
+            return
+        current["count"] += 1
+        current["last_allocated_bytes"] = allocated
+        current["min_allocated_bytes"] = min(
+            current["min_allocated_bytes"], allocated
+        )
+        current["max_allocated_bytes"] = max(
+            current["max_allocated_bytes"], allocated
+        )
+        current["max_reserved_bytes"] = max(
+            current["max_reserved_bytes"], reserved
+        )
+        current["max_memory_allocated_bytes"] = max(
+            current["max_memory_allocated_bytes"], maximum
+        )
+
+    def _evaluate_policy_summary(
+        self,
+        sim: Any,
+        state: Dict[str, torch.Tensor],
+        candidates: EntryCandidates,
+        h: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return the policy fields used by bounded-improvement diagnostics.
+
+        The legacy controller has no lighter implementation, so it retains its
+        historical detailed evaluation.  Boundary-aware clearing overrides
+        this hook with a summary-only path that never constructs transport.
+        """
+        return self.evaluate(sim, state, candidates, h, detail=True)
+
+    def _evaluate_final_record(
+        self,
+        sim: Any,
+        state: Dict[str, torch.Tensor],
+        candidates: EntryCandidates,
+        h: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Evaluate the selected h with the fields needed for commit."""
+        return self.evaluate(sim, state, candidates, h, detail=True)
 
     @torch.inference_mode()
     def _entry_values(
@@ -266,6 +333,30 @@ class MarketClearingController:
                 outputs[name][start:stop].copy_(value)
             self.network_forward_calls += 1
         return outputs
+
+    @torch.inference_mode()
+    def _firm_bp(
+        self, model: torch.nn.Module, states: torch.Tensor
+    ) -> torch.Tensor:
+        """Evaluate the production policy while retaining only executed-bp input.
+
+        This intentionally calls the same full simulation forward used by
+        ``_firm_policy``.  It only changes tensor lifetime: the other policy
+        outputs are released after each chunk instead of being concatenated
+        over every transport atom.
+        """
+        output_bp = states.new_empty((states.shape[0],))
+        for start in range(0, states.shape[0], self.config.candidate_chunk_size):
+            stop = min(start + self.config.candidate_chunk_size, states.shape[0])
+            output = forward_policy_value_for_simulation(
+                model, states[start:stop]
+            )
+            value = output.bp.reshape(-1)
+            if value.numel() != stop - start:
+                raise RuntimeError("firm policy bp returned a non-scalar row output")
+            output_bp[start:stop].copy_(value)
+            self.network_forward_calls += 1
+        return output_bp
 
     @torch.inference_mode()
     def evaluate(
@@ -919,9 +1010,10 @@ class MarketClearingController:
         # Evaluation 1: FC1 baseline.  Detail is retained only for matched
         # policy-movement diagnostics; the accepted record is reconstructed
         # once at the final selected h below.
-        baseline = self.evaluate(
-            sim, state, candidates, h_fc1[:, None], detail=True
+        baseline = self._evaluate_policy_summary(
+            sim, state, candidates, h_fc1[:, None]
         )
+        self.record_gpu_memory("baseline", device)
         base_residual = baseline["G_normalized"][:, 0].abs()
         base_feasible = baseline["resource_feasible"][:, 0]
         base_c = baseline["C_raw"][:, 0]
@@ -1000,6 +1092,8 @@ class MarketClearingController:
             feasible_any |= local_feasible
             improved |= take
 
+        self.record_gpu_memory("candidate_search", device)
+
         if bool((~feasible_any).any()):
             bad = torch.nonzero(~feasible_any, as_tuple=False).reshape(-1)
             raise MarketClearingError(
@@ -1010,9 +1104,10 @@ class MarketClearingController:
         # Final evaluation is deliberately counted.  It creates the exact
         # immutable decision record used by commit/transport; no interpolated
         # candidate is ever written into Macro data.
-        final = self.evaluate(
-            sim, state, candidates, selected_h[:, None], detail=True
+        final = self._evaluate_final_record(
+            sim, state, candidates, selected_h[:, None]
         )
+        self.record_gpu_memory("final_detail", device)
         evaluations += 1
         if bool((evaluations > self.config.fast_max_evaluations).any()):
             raise RuntimeError("bounded improvement exceeded its G-evaluation budget")
@@ -1757,6 +1852,10 @@ class MarketClearingController:
             "policy_forward_seconds": float(self.policy_forward_seconds),
             "accounting_seconds": float(self.accounting_seconds),
             "root_search_seconds": float(self.root_search_seconds),
+            "gpu_memory_stages": {
+                name: dict(values)
+                for name, values in sorted(self.gpu_memory_stages.items())
+            },
             "failure_count": len(self.failure_records),
             "root_candidate_acceptance_tolerance": (
                 self._root_acceptance_tolerance

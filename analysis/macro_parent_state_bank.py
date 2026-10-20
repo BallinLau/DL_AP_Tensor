@@ -1912,6 +1912,27 @@ def _evaluate_boundary_candidate_batch(
             sim, state, empty_entry_candidates(state), t=0, branch=-1
         )
         controller.validate_committed(state, t=0, branch=-1)
+        parent_record = state["_boundary_decision_record"]
+        parent_transport = parent_record.transport_atoms
+        parent_transport_fingerprint = parent_transport.fingerprint()
+        torch.testing.assert_close(
+            parent_transport.total_mass(),
+            state["decision_transport_mass"].to(torch.float64),
+            atol=5.0e-6,
+            rtol=5.0e-6,
+        )
+        if bool(
+            (
+                parent_transport.source_time[parent_transport.atom_mask]
+                != 0
+            ).any()
+        ) or bool(
+            (
+                parent_transport.destination_time[parent_transport.atom_mask]
+                != 1
+            ).any()
+        ):
+            raise RuntimeError("parent transport timing parity failed")
         parent_rows = boundary_macro_rows(state, t=0, branch=-1, split=specs[0].split)
         entry = boundary_entry_candidates(sim, boundary_distribution_from_state(state))
         children: list[dict[str, torch.Tensor]] = []
@@ -1919,6 +1940,33 @@ def _evaluate_boundary_candidate_batch(
         for branch in range(2):
             stage = f"child_{branch}"
             child = boundary_child_state(sim, state, branch=branch)
+            if parent_transport.fingerprint() != parent_transport_fingerprint:
+                raise RuntimeError("child transition mutated parent transport storage")
+            child_mask = child["component_mask"].bool()
+            child_mass = torch.where(
+                child_mask,
+                child["component_mass"],
+                torch.zeros_like(child["component_mass"]),
+            )
+            torch.testing.assert_close(
+                child_mass.sum(dim=1).to(torch.float64),
+                parent_transport.total_mass(),
+                atol=5.0e-6,
+                rtol=5.0e-6,
+            )
+            torch.testing.assert_close(
+                (child_mass * child["K"]).sum(dim=1).to(torch.float64),
+                parent_transport.total_capital(),
+                atol=5.0e-6,
+                rtol=5.0e-6,
+            )
+            torch.testing.assert_close(
+                (child_mass * child["K"] * child["b"]).sum(dim=1).to(torch.float64),
+                parent_transport.aggregate_debt(),
+                atol=5.0e-6,
+                rtol=5.0e-6,
+            )
+            controller.record_gpu_memory("child_transition", device)
             child = controller.clear_state(
                 sim, child, entry, t=1, branch=branch
             )
@@ -1968,6 +2016,25 @@ def _evaluate_boundary_candidate_batch(
             else "APPROXIMATE_PILOT_REJECTED"
         )
 
+    if parent_transport.fingerprint() != parent_transport_fingerprint:
+        raise RuntimeError("selected transport fingerprint changed after child clearing")
+    parent_bp_trace = [
+        item
+        for item in sim.bp_actual_use_trace
+        if item.get("decision_stage") == "boundary_transport_parent_policy"
+    ]
+    bp_trace_required = bool(sim.bp_actual_use_trace_enabled)
+    bp_action_parity = (not bp_trace_required) or (
+        bool(parent_bp_trace)
+        and all(
+            item.get("executed_bp_source") == "grid"
+            for item in parent_bp_trace
+        )
+    )
+    if not bp_action_parity:
+        raise RuntimeError("parent BP grid action parity trace failed")
+    controller_summary = controller.summary()
+    memory_stages = controller_summary.get("gpu_memory_stages", {})
     records: list[dict[str, Any]] = []
     valid_rows: list[dict[str, Any]] = []
     manifest_rows = manifest.to_dict("records")
@@ -2007,6 +2074,12 @@ def _evaluate_boundary_candidate_batch(
             "root_residual_child_0": float(children[0]["market_root_residual_normalized"][local]),
             "root_residual_child_1": float(children[1]["market_root_residual_normalized"][local]),
             "only_b_replaced": bool(preservation["only_b_replaced"]),
+            "gpu_memory_stages": memory_stages,
+            "candidate_committed_ledger_parity": True,
+            "transport_fingerprint_parity": True,
+            "capital_debt_mass_accounting": True,
+            "parent_child_timing": True,
+            "bp_action_parity": bp_action_parity,
         }
         records.append(record)
         manifest_rows[local]["candidate_status"] = status
