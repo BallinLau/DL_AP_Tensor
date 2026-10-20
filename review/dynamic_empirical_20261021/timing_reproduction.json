@@ -1,0 +1,94 @@
+{
+  "status": "BLOCKED_PREVIOUS_DEFAULT_NOT_REMOVED_BEFORE_CHILD_DECISION",
+  "evidence_kind": "SYNTHETIC_CPU_PRODUCTION_TRANSITION_FORWARD_ONLY",
+  "source_node": "post-parent-decision before exit",
+  "parent_eta": [
+    [
+      1.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "parent_b": [
+    [
+      0.6000000238418579,
+      0.4000000059604645,
+      0.800000011920929
+    ]
+  ],
+  "parent_bp": [
+    [
+      0.20000000298023224,
+      0.8999999761581421,
+      0.30000001192092896
+    ]
+  ],
+  "branches": [
+    {
+      "branch": 0,
+      "parent_defaulted_ids": [
+        10
+      ],
+      "child_alive_ids": [
+        10,
+        11
+      ],
+      "previous_default_still_alive_ids": [
+        10
+      ],
+      "child_b": [
+        [
+          0.20000000298023224,
+          0.4000000059604645,
+          0.30000001192092896
+        ]
+      ],
+      "child_eta": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "exit_on_copy_alive_ids": [
+        11
+      ]
+    },
+    {
+      "branch": 1,
+      "parent_defaulted_ids": [
+        10
+      ],
+      "child_alive_ids": [
+        10,
+        11
+      ],
+      "previous_default_still_alive_ids": [
+        10
+      ],
+      "child_b": [
+        [
+          0.20000000298023224,
+          0.4000000059604645,
+          0.30000001192092896
+        ]
+      ],
+      "child_eta": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "exit_on_copy_alive_ids": [
+        11
+      ]
+    }
+  ],
+  "realized_b_eta_t_parity": true,
+  "default_exit_timing_pass": false,
+  "production_code_changed": false,
+  "optimizer_steps": 0,
+  "economic_equations_changed": false,
+  "training_performed": false
+}

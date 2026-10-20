@@ -1,0 +1,5 @@
+BLOCKED — NO EXECUTABLE TRAINING COMMAND ISSUED
+Dynamic mechanism and Approval v4 verifier are not implemented.
+Do not reuse old Approval v3 or pass --execute-approved for this design.
+Await explicit authorization for the Parent-default/Child pre-decision exit timing correction, then finish dynamic implementation and targeted tests before any new training approval.
+No sbatch command was executed in this task.

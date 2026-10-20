@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CONTINUATION_APPROVAL_V4_DYNAMIC_EMPIRICAL DESIGN ONLY",
+  "description": "Non-executable draft. No approval instance generated; runtime v4 verifier not implemented because timing gate failed.",
+  "type": "object",
+  "required": ["schema_name", "approved", "source_commit", "source_job_id", "source_terminal_outer", "source_checkpoint_sha256", "continuation_initial_checkpoint_sha256", "dynamic_algorithm_version", "dynamic_config", "initial_empirical_pool_sha256", "initial_train_bank_sha256", "fixed_validation_bank_sha256", "plan_fingerprint", "economic_operator_version", "start_outer", "end_outer", "train_parents", "validation_parents"],
+  "properties": {
+    "schema_name": {"const": "CONTINUATION_APPROVAL_V4_DYNAMIC_EMPIRICAL"},
+    "approved": {"type": "boolean"},
+    "source_commit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+    "source_job_id": {"const": 701387},
+    "source_terminal_outer": {"const": 3},
+    "source_checkpoint_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "continuation_initial_checkpoint_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "dynamic_algorithm_version": {"type": "string"},
+    "dynamic_config": {"type": "object", "required": ["beta_empirical", "recent_archive", "recent_count", "archive_count", "seed_rule", "source_contract"], "properties": {"beta_empirical": {"const": "50:50"}, "recent_archive": {"const": "70:30"}, "recent_count": {"const": 2867}, "archive_count": {"const": 1229}, "seed_rule": {"type": "string"}, "source_contract": {"const": "TRAIN_ONLY_REACHABLE_PRE_DECISION_REALIZED_B"}}},
+    "initial_empirical_pool_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "initial_train_bank_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "fixed_validation_bank_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "plan_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "economic_operator_version": {"const": "finite_direct_production_ledger_v1"},
+    "start_outer": {"const": 4}, "end_outer": {"const": 11},
+    "train_parents": {"const": 8192}, "validation_parents": {"const": 2048}
+  }
+}

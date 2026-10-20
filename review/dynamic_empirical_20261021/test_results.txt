@@ -1,0 +1,16 @@
+2026-10-21 Asia/Shanghai
+Base: 788fad7efef6c748f48193f30e357e812c4921b3
+Command: PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/private/tmp/fc1_mpl_cache /Users/ballinliu/anaconda3/bin/python -m pytest tests/test_dynamic_empirical_timing_blocker.py -q
+Result: 7 passed in 2.33s; no skip, no xfail.
+
+These tests prove a blocker, NOT a ready dynamic runner:
+1. Parent eta_t produces realized b, including eta_t=0 retaining old b.
+2. Both production children retain a previously defaulted parent firm.
+3. Existing exit on a COPY removes it, without changing b or the original child.
+4. Stable-identity CRN replay; previously dead firm stays dead.
+5. Actual adapter omits exit; Child capture follows Child process.
+6. Existing capture eligibility is post-accounting, not exit certification.
+7. No optimizer steps or false readiness claim in reproduction.
+
+User's full dynamic acceptance tests 1-22: NOT_COMPLETED (production timing blocker).
+No economic experiment, GPU benchmark, optimization, Slurm, or server access.
