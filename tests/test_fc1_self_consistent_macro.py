@@ -87,6 +87,13 @@ def test_direct_negative_account_retention_is_opt_in(monkeypatch):
     c=sim.MACRO_COLUMNS.index('C_raw'); h=sim.MACRO_COLUMNS.index('Hatc')
     assert (macro[:,c]<0).all()
     assert torch.isnan(macro[:,h]).all()
+    # Undefined nodes have no BP action; allow NaN only on those nodes.
+    sim.bp_action_override=lambda **kw: torch.full_like(kw['bp_head'],float('nan'))
+    _,macro=parallel._process_node_batched(sim,select_state(state,slice(None)),0,-1)
+    assert torch.isnan(macro[:,h]).all()
+    positive=select_state(state,slice(None)); positive['x'].fill_(5.); positive['i'].zero_()
+    with pytest.raises(FloatingPointError,match='non-finite'):
+        parallel._process_node_batched(sim,positive,0,-1)
 
 
 def test_simulation_cache_rejects_changed_fc1(tmp_path):

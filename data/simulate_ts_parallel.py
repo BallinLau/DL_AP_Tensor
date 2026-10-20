@@ -1658,7 +1658,11 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                 "resolved BP action returned shape "
                 f"{tuple(overridden.shape)}, expected {tuple(bp.shape)}"
             )
-        if not torch.isfinite(overridden).all():
+        undefined_diagnostic_bp = (
+            bool(getattr(sim, "diagnostic_retain_undefined_nodes", False))
+            & ~(torch.isfinite(Hatc[path_idx]) & torch.isfinite(LnK[path_idx]))
+        )
+        if bool((~torch.isfinite(overridden) & ~undefined_diagnostic_bp).any()):
             raise FloatingPointError("resolved BP action returned non-finite values")
         bp = overridden
         firm_rows[:, sim.FIRM_COLUMNS.index("bp")] = bp.to(firm_rows.dtype)
