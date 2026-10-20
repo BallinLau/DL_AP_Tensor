@@ -1247,7 +1247,11 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
         invalid = active_paths & ~raw_finite
         if raw_mode and consumption_floor <= 0.0:
             invalid = invalid | (active_paths & (C_raw_total <= 0.0))
-        if raw_mode and bool(invalid.any()):
+        # Conditional FC1 diagnostics may retain undefined rows as failures.
+        # This opt-in does not alter resource terms or construct log labels;
+        # the caller must exclude these nodes from economic continuation.
+        retain_undefined = bool(getattr(sim, "diagnostic_retain_undefined_nodes", False))
+        if raw_mode and bool(invalid.any()) and not retain_undefined:
             bad = torch.nonzero(invalid, as_tuple=False).reshape(-1).tolist()
             if (
                 getattr(sim, "entry_mode", "legacy") == "investment_compare"
