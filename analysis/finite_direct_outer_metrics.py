@@ -175,7 +175,8 @@ def _figures(root,training,economic,al):
     def axes(n,title):
         fig,axs=plt.subplots(1,n,figsize=(5*n,4),squeeze=False)
         fig.suptitle(title)
-        for ax in axs[0]: ax.set_xlabel('Outer'); ax.set_xticks([0,1,2,3]); ax.grid(alpha=.2)
+        ticks=sorted(set(training.outer.dropna()).union(economic.outer.dropna()))
+        for ax in axs[0]: ax.set_xlabel('Outer'); ax.set_xticks(ticks); ax.grid(alpha=.2)
         return fig,axs[0]
     def save(fig,axs,name):
         for ax in axs:

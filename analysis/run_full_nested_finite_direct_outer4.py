@@ -171,15 +171,17 @@ def finite_gradient_guard(model):
 
 
 class ProductionBackend:
-    def __init__(self,args,bank_data):
+    def __init__(self,args,bank_data,*,learning_snapshot=None):
         self.args=args; self.root=args.output; self.banks,self.schedules,self.signature=bank_data
-        models,episode,fc1,guard=setup(argparse.Namespace(device=args.device,checkpoint=args.initial_checkpoint))
+        models,episode,fc1,guard=setup(argparse.Namespace(device=args.device,checkpoint=args.initial_checkpoint),
+            **({} if learning_snapshot is None else {'initial_models':learning_snapshot['transaction']['models']}))
         self.models=models; self.episode=episode; self.fc1=fc1; self.fc2_guard=guard
-        cp=torch.load(args.initial_checkpoint,map_location='cpu',weights_only=False)
-        if cp.get('format')!='finite_direct_outer4_initial_weights_v1' or cp.get('training_performed') is not False:
-            raise RuntimeError('initial checkpoint is not the reviewed combined weight warm start')
-        if hashes(models)!=cp['source_manifest']['hashes']:
-            raise RuntimeError('initial combined component hash mismatch')
+        if learning_snapshot is None:
+            cp=torch.load(args.initial_checkpoint,map_location='cpu',weights_only=False)
+            if cp.get('format')!='finite_direct_outer4_initial_weights_v1' or cp.get('training_performed') is not False:
+                raise RuntimeError('initial checkpoint is not the reviewed combined weight warm start')
+            if hashes(models)!=cp['source_manifest']['hashes']:
+                raise RuntimeError('initial combined component hash mismatch')
         episode._fc1_firms=200; self.budget=Budget()
         hp=episode.hyperparams
         hp.bp_distill_max_optimizer_steps=1000; hp.bp_distill_epochs=1000

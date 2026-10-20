@@ -1,0 +1,30 @@
+PLANNED ONLY. Placeholders must be set after user approval; NOT EXECUTED.
+
+Fresh CROSS_RUN_CONTINUATION (new empty run):
+REPO_DIR=<THU_CLEAN_REVIEWED_CHECKOUT> REQUIRED_COMMIT=<REVIEWED_COMMIT> \
+RUN_ROOT=/home/fit/zhuyingz/WORK/LiuHao/cachedir/finite_direct_large_continuation_outer4_11_20261020_r1 \
+SAMPLING_DIR=<DEPLOYED_PREPARED>/continuation_sampling \
+INITIAL_CHECKPOINT=<DEPLOYED_PREPARED>/continuation_initial_checkpoint.pt \
+SOURCE_MANIFEST=<DEPLOYED_PREPARED>/continuation_source_manifest.json \
+APPROVAL_FILE=<FUTURE_USER_APPROVED_V3_FILE> RESUME=0 \
+/rmprog/slurm/v24.05.1/bin/sbatch <THU_CLEAN_REVIEWED_CHECKOUT>/slurm/run_finite_direct_large_continuation_outer4_11_a800.slurm
+
+INTRA_RUN_RESUME (same new run and identical binding):
+REPO_DIR=<THU_CLEAN_REVIEWED_CHECKOUT> REQUIRED_COMMIT=<REVIEWED_COMMIT> \
+RUN_ROOT=/home/fit/zhuyingz/WORK/LiuHao/cachedir/finite_direct_large_continuation_outer4_11_20261020_r1 \
+SAMPLING_DIR=<DEPLOYED_PREPARED>/continuation_sampling \
+INITIAL_CHECKPOINT=<DEPLOYED_PREPARED>/continuation_initial_checkpoint.pt \
+SOURCE_MANIFEST=<DEPLOYED_PREPARED>/continuation_source_manifest.json \
+APPROVAL_FILE=<FUTURE_USER_APPROVED_V3_FILE> RESUME=1 \
+/rmprog/slurm/v24.05.1/bin/sbatch <THU_CLEAN_REVIEWED_CHECKOUT>/slurm/run_finite_direct_large_continuation_outer4_11_a800.slurm
+
+Exact Python CLI (fresh; append --resume only for the new journal):
+python analysis/run_finite_direct_large_continuation.py \
+  --sampling-dir <DEPLOYED_PREPARED>/continuation_sampling \
+  --initial-checkpoint <DEPLOYED_PREPARED>/continuation_initial_checkpoint.pt \
+  --source-manifest <DEPLOYED_PREPARED>/continuation_source_manifest.json \
+  --output <NEW_RUN_ROOT> --device cuda:0 \
+  --parent-batch-size 128 --fit-parent-batch-size 128 --firm-batch-size 512 \
+  --execute-approved --approval <FUTURE_USER_APPROVED_V3_FILE>
+
+No approved=true file exists. Original v2 approval is invalid for this run.

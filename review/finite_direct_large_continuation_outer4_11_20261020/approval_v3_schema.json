@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "approved": {
+      "const": true,
+      "type": "boolean"
+    },
+    "continuation_initial_checkpoint_sha256": {
+      "type": "string"
+    },
+    "end_outer": {
+      "const": 11,
+      "type": "integer"
+    },
+    "initial_checkpoint_sha256": {
+      "type": "string"
+    },
+    "plan_fingerprint": {
+      "type": "string"
+    },
+    "sampling_signature_fingerprint": {
+      "type": "string"
+    },
+    "sampling_signature_sha256": {
+      "type": "string"
+    },
+    "schema_name": {
+      "const": "CONTINUATION_APPROVAL_V3",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 3,
+      "type": "integer"
+    },
+    "source_commit": {
+      "type": "string"
+    },
+    "source_job_id": {
+      "const": 701387,
+      "type": "integer"
+    },
+    "source_manifest_sha256": {
+      "type": "string"
+    },
+    "source_terminal_checkpoint_sha256": {
+      "type": "string"
+    },
+    "source_terminal_outer": {
+      "const": 3,
+      "type": "integer"
+    },
+    "source_terminal_stage": {
+      "const": "outer_003/outer_commit",
+      "type": "string"
+    },
+    "start_outer": {
+      "const": 4,
+      "type": "integer"
+    },
+    "train_parents": {
+      "const": 8192,
+      "type": "integer"
+    },
+    "validation_parents": {
+      "const": 2048,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "source_commit",
+    "plan_fingerprint",
+    "sampling_signature_fingerprint",
+    "sampling_signature_sha256",
+    "initial_checkpoint_sha256",
+    "continuation_initial_checkpoint_sha256",
+    "source_manifest_sha256",
+    "source_job_id",
+    "source_terminal_outer",
+    "source_terminal_stage",
+    "source_terminal_checkpoint_sha256",
+    "start_outer",
+    "end_outer",
+    "train_parents",
+    "validation_parents",
+    "schema_version",
+    "schema_name",
+    "approved"
+  ],
+  "title": "CONTINUATION_APPROVAL_V3 (schema only, not an approval)",
+  "type": "object"
+}

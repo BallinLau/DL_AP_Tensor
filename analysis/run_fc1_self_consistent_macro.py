@@ -83,7 +83,7 @@ def select_state(state, index, device=None):
                 else deepcopy(v)) for k, v in state.items()}
 
 
-def setup(args):
+def setup(args, *, initial_models=None):
     device = torch.device(args.device)
     Config.DEVICE = device
     hp = build_hyperparams()
@@ -97,7 +97,8 @@ def setup(args):
     hp.fc1_recursive_aux_training_enabled = False
     hp.fc1_rollout_diagnostic_enabled = False
     models = build_models(device)
-    cp = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    cp = (torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+          if initial_models is None else {'models': initial_models})
     for name in ('policy_value', 'sdf_fc1'):
         models[name].load_state_dict(cp['models'][name], strict=True)
     for model in models.values(): model.requires_grad_(False); model.eval()

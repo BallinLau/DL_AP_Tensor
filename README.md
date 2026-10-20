@@ -99,6 +99,18 @@ python main.py --mode simulate --resume best
 
 ## 子模块文档
 
+### Finite Direct Outer 4–11 continuation（审查阶段）
+
+Job 701387 的完整 Outer 3 状态续训入口为
+`analysis/run_finite_direct_large_continuation.py`，默认仅打印计划、不构建训练 backend。
+CPU 准备入口为 `analysis/prepare_finite_direct_continuation.py`。
+新逻辑规模为 8192/2048 Parent，Beta/Empirical 50:50，实际阶段编号 4–11。
+跨 run 导入完整优化器/AL/RNG；`--resume` 仅用于新 run 自身的事务恢复。
+必须在用户审查后单独批准 Approval v3，才可使用 `--execute-approved`。
+本分支不自动训练、提交 Slurm、批准或 push。
+完整契约、真实 CLI、源状态审计和验收见
+[continuation 审查报告](review/finite_direct_large_continuation_outer4_11_20261020/implementation_report.md)。
+
 - `config/README.md`
 - `data/README.md`
 - `models/README.md`

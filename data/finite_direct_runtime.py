@@ -44,10 +44,12 @@ def load_locked_sampling(root):
 
 
 def cache_provenance(models,bank,schedule,signature,*,outer,stage,economic):
-    return dict(model_hashes=hashes(models),economic_hash=stable_json_hash(economic),
+    result=dict(model_hashes=hashes(models),economic_hash=stable_json_hash(economic),
         operator=OPERATOR,sampling_signature=signature['fingerprint'],parent_bank_hash=bank['fingerprint'],
         crn_hash=stable_json_hash([r['child_shock_keys'] for r in schedule['parents']]),
         outer=outer,stage=stage,macro_inner=(int(stage[1:]) if stage.startswith('D') else None))
+    if 'run_identity' in signature: result['run_identity']=signature['run_identity']
+    return result
 
 
 def verify_cache(saved,expected):
