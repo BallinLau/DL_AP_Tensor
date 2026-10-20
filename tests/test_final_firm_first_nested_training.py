@@ -612,6 +612,37 @@ def test_resume_restores_original_immutable_configuration_and_rejects_conflict(
     assert resumed.initial_checkpoint == checkpoint_source
     assert _args_fingerprint(resumed) == _args_fingerprint(original)
 
+    reduced = parse_args([
+        "--resume",
+        str(run_root),
+        "--device",
+        "cpu",
+        "--resume-macro-parent-batch-size",
+        "16",
+        "--resume-boundary-candidate-h-microbatch-size",
+        "1",
+    ])
+    reduced, _, _ = _resume_with_recorded_config(
+        reduced,
+        [
+            "--resume",
+            str(run_root),
+            "--device",
+            "cpu",
+            "--resume-macro-parent-batch-size",
+            "16",
+            "--resume-boundary-candidate-h-microbatch-size",
+            "1",
+        ],
+    )
+    assert reduced.macro_parent_batch_size == original.macro_parent_batch_size
+    assert reduced.resume_macro_parent_batch_size == 16
+    assert reduced.boundary_candidate_h_microbatch_size == (
+        original.boundary_candidate_h_microbatch_size
+    )
+    assert reduced.resume_boundary_candidate_h_microbatch_size == 1
+    assert _args_fingerprint(reduced) == _args_fingerprint(original)
+
     conflicting = parse_args([
         "--resume", str(run_root), "--device", "cpu", "--seed", "7"
     ])

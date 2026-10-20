@@ -48,12 +48,25 @@ export PYTHONUNBUFFERED=1
 export MPLCONFIGDIR="$WORK_ROOT/.mplcache"
 export REQUIRED_COMMIT RUN_ROOT
 
-echo "${SLURM_JOB_ID:-}" > "$RUN_ROOT/slurm_job_id"
-printf '%s\n' "$OBSERVED_COMMIT" > "$RUN_ROOT/source_git_commit"
+if [[ ! -f "$RUN_ROOT/slurm_job_id" ]]; then
+  echo "${SLURM_JOB_ID:-}" > "$RUN_ROOT/slurm_job_id"
+fi
+echo "${SLURM_JOB_ID:-}" > "$RUN_ROOT/slurm_job_id_latest"
+printf '%s\n' "${SLURM_JOB_ID:-}" >> "$RUN_ROOT/slurm_job_ids"
+if [[ ! -f "$RUN_ROOT/source_git_commit" ]]; then
+  printf '%s\n' "$OBSERVED_COMMIT" > "$RUN_ROOT/source_git_commit"
+fi
+printf '%s\n' "$OBSERVED_COMMIT" > "$RUN_ROOT/source_git_commit_latest"
+printf '%s\n' "$OBSERVED_COMMIT" >> "$RUN_ROOT/source_git_commit_history"
 printf '%s\n' "$INITIAL_CHECKPOINT" > "$RUN_ROOT/initial_checkpoint_path"
 
-nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,memory.used,memory.total,power.draw \
-  --format=csv -l 30 > "$RUN_ROOT/logs/gpu_telemetry.csv" &
+if [[ -n "$RESUME_CHECKPOINT" ]]; then
+  nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,memory.used,memory.total,power.draw \
+    --format=csv -l 30 >> "$RUN_ROOT/logs/gpu_telemetry.csv" &
+else
+  nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,memory.used,memory.total,power.draw \
+    --format=csv -l 30 > "$RUN_ROOT/logs/gpu_telemetry.csv" &
+fi
 TELEMETRY_PID=$!
 cleanup() {
   kill "$TELEMETRY_PID" 2>/dev/null || true
@@ -125,17 +138,27 @@ payload = {
     "combined_b_mean_max": max(means),
 }
 root = Path(os.environ["RUN_ROOT"])
-(root / "metadata" / "embedded_preflight.json").write_text(
+target = root / "metadata" / "embedded_preflight.json"
+if target.exists():
+    target = root / "metadata" / (
+        f"embedded_preflight_resume_{os.environ.get('SLURM_JOB_ID', 'unknown')}.json"
+    )
+target.write_text(
     json.dumps(payload, indent=2, sort_keys=True) + "\n"
 )
 print(payload, flush=True)
 PY
 
 MODE_ARGS=(--cold-start --initial-checkpoint "$INITIAL_CHECKPOINT")
+PARENT_BATCH_ARGS=(--macro-parent-batch-size 16)
+H_BATCH_ARGS=(--boundary-candidate-h-microbatch-size 1)
 TEE_ARGS=()
 if [[ -n "$RESUME_CHECKPOINT" ]]; then
-  MODE_ARGS=(--resume "$RESUME_CHECKPOINT")
+  MODE_ARGS=(--resume "$RESUME_CHECKPOINT" --allow-code-mismatch)
+  PARENT_BATCH_ARGS=(--resume-macro-parent-batch-size 16)
+  H_BATCH_ARGS=(--resume-boundary-candidate-h-microbatch-size 1)
   TEE_ARGS=(-a)
+  printf '%s\n' "$RESUME_CHECKPOINT" >> "$RUN_ROOT/resume_checkpoint_history"
 fi
 
 python3 -u analysis/run_full_nested_equilibrium.py \
@@ -171,7 +194,7 @@ python3 -u analysis/run_full_nested_equilibrium.py \
   --macro-validation-max-candidate-budget 256 \
   --macro-minimum-partial-train 64 \
   --macro-minimum-partial-validation 16 \
-  --macro-parent-batch-size 16 \
+  "${PARENT_BATCH_ARGS[@]}" \
   --macro-candidate-distribution-design restricted_beta_full_outer_v1 \
   --max-initial-weighted-b-mean 0.30 \
   --initial-total-k-min 45 \
@@ -186,7 +209,7 @@ python3 -u analysis/run_full_nested_equilibrium.py \
   --sdf-min-parent-groups-per-batch 64 \
   --sdf-recursive-epochs 0 \
   --macro-clearing-solver-mode fc1_bounded_improvement_pilot \
-  --boundary-candidate-h-microbatch-size 1 \
+  "${H_BATCH_ARGS[@]}" \
   --aggregation-mode continuum_mass_consistent_v1 \
   --bp-actual-use-trace \
   --disable-fc2 \
@@ -195,6 +218,6 @@ python3 -u analysis/run_full_nested_equilibrium.py \
   2>&1 | tee "${TEE_ARGS[@]}" "$RUN_ROOT/logs/run.log"
 
 python3 -u analysis/market_cleared_reporting.py --run-root "$RUN_ROOT" \
-  2>&1 | tee "$RUN_ROOT/logs/report.log"
+  2>&1 | tee "${TEE_ARGS[@]}" "$RUN_ROOT/logs/report.log"
 
 echo "Formal four-Outer job finished: $(date)"

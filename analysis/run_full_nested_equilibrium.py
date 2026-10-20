@@ -221,7 +221,8 @@ def _load_child_bank(payload: Mapping[str, Any]) -> InnerFPChildBank:
 def _args_fingerprint(args: argparse.Namespace) -> str:
     ignored = {
         "cold_start", "resume", "allow_code_mismatch", "output_dir", "smoke",
-        "device",
+        "device", "resume_macro_parent_batch_size",
+        "resume_boundary_candidate_h_microbatch_size",
     }
     return stable_json_hash({key: value for key, value in vars(args).items() if key not in ignored})
 
@@ -232,6 +233,8 @@ _RESUME_RUNTIME_ONLY_ARGS = {
     "allow_code_mismatch",
     "output_dir",
     "device",
+    "resume_macro_parent_batch_size",
+    "resume_boundary_candidate_h_microbatch_size",
 }
 _PATH_ARGS = {"resume", "output_dir", "initial_checkpoint"}
 
@@ -1921,6 +1924,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--macro-minimum-partial-validation", type=int, default=256)
     parser.add_argument("--macro-parent-batch-size", type=int, default=256)
     parser.add_argument(
+        "--resume-macro-parent-batch-size",
+        type=int,
+        help=(
+            "resume-only engineering override that may reduce the recorded "
+            "parent batch without changing schedules, economics, or checkpoint identity"
+        ),
+    )
+    parser.add_argument(
+        "--resume-boundary-candidate-h-microbatch-size",
+        type=int,
+        help=(
+            "resume-only engineering override that may reduce the recorded "
+            "h-candidate microbatch without changing candidate values, "
+            "integration nodes, root decisions, or economics"
+        ),
+    )
+    parser.add_argument(
         "--macro-candidate-distribution-design",
         choices=MACRO_CANDIDATE_DISTRIBUTION_DESIGNS,
         default=RESTRICTED_BETA_FULL_OUTER_V1,
@@ -2090,6 +2110,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args, resume_root, resume_checkpoint = _resume_with_recorded_config(
         args, raw_argv
     )
+    if (
+        args.resume_macro_parent_batch_size is not None
+        and resume_checkpoint is None
+    ):
+        raise RuntimeError(
+            "--resume-macro-parent-batch-size is valid only with --resume"
+        )
+    if (
+        args.resume_boundary_candidate_h_microbatch_size is not None
+        and resume_checkpoint is None
+    ):
+        raise RuntimeError(
+            "--resume-boundary-candidate-h-microbatch-size is valid only with --resume"
+        )
     device = torch.device(args.device)
     if device.type == "cuda" and os.environ.get("CUDA_VISIBLE_DEVICES") not in {None, "0"}:
         raise RuntimeError("formal CUDA run requires CUDA_VISIBLE_DEVICES=0")
@@ -2209,8 +2243,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "checkpoint": str(resume_checkpoint), "timestamp": time.time(),
             "git_head": git_head, "hyperparameter_fingerprint": fingerprint,
             "allow_code_mismatch": bool(args.allow_code_mismatch),
+            "recorded_macro_parent_batch_size": int(
+                args.macro_parent_batch_size
+            ),
+            "runtime_macro_parent_batch_size": (
+                None
+                if args.resume_macro_parent_batch_size is None
+                else int(args.resume_macro_parent_batch_size)
+            ),
+            "recorded_boundary_candidate_h_microbatch_size": int(
+                args.boundary_candidate_h_microbatch_size
+            ),
+            "runtime_boundary_candidate_h_microbatch_size": (
+                None
+                if args.resume_boundary_candidate_h_microbatch_size is None
+                else int(args.resume_boundary_candidate_h_microbatch_size)
+            ),
         })
         atomic_write_json(resume_events_path, resume_events)
+
+    if args.resume_macro_parent_batch_size is not None:
+        runtime_parent_batch = int(args.resume_macro_parent_batch_size)
+        recorded_parent_batch = int(args.macro_parent_batch_size)
+        if runtime_parent_batch < 1 or runtime_parent_batch > recorded_parent_batch:
+            raise RuntimeError(
+                "resume Macro parent batch override must be in "
+                f"[1,{recorded_parent_batch}], got {runtime_parent_batch}"
+            )
+        # The checkpoint fingerprint above is intentionally validated against
+        # the original configuration.  Parent batching changes only execution
+        # partitioning; schedules, CRN, candidate identities, integration, and
+        # every economic equation remain recorded and unchanged.
+        args.macro_parent_batch_size = runtime_parent_batch
+
+    if args.resume_boundary_candidate_h_microbatch_size is not None:
+        runtime_h_batch = int(
+            args.resume_boundary_candidate_h_microbatch_size
+        )
+        recorded_h_batch = int(args.boundary_candidate_h_microbatch_size)
+        if runtime_h_batch < 1 or runtime_h_batch > recorded_h_batch:
+            raise RuntimeError(
+                "resume h-candidate microbatch override must be in "
+                f"[1,{recorded_h_batch}], got {runtime_h_batch}"
+            )
+        # This is an execution partition only.  The h candidates, policy
+        # boundaries, quadrature nodes, refinement, and accepted roots are
+        # unchanged and remain covered by scalar/vectorized parity tests.
+        args.boundary_candidate_h_microbatch_size = runtime_h_batch
 
     oom_events_path = run_root / "metadata" / "oom_events.json"
     oom_events = (
