@@ -140,7 +140,18 @@ def locate_all_policy_boundaries(
     all_width = torch.cat((crossing_width, torch.zeros_like(exact_coordinate)))
     all_residual = torch.cat((crossing_residual, torch.zeros_like(exact_coordinate)))
 
-    capacity = 2 * scan_points
+    # Allocate only the largest number of boundaries that was actually
+    # observed for any task.  The old conservative ``2 * scan_points`` width
+    # is harmless for tiny unit tests, but at production scale ``task_count``
+    # can be tens of millions.  Materialising several [task_count, 2*S]
+    # tensors then dominates GPU memory even when almost every task has zero
+    # or one boundary.  This is a representation-only change: all discovered
+    # crossings and exact zeros are still sorted and deduplicated below.
+    if all_task.numel():
+        boundary_count = torch.bincount(all_task, minlength=task_count)
+        capacity = int(boundary_count.max().item())
+    else:
+        capacity = 0
     boundary = torch.full(
         (task_count, capacity), float("inf"), device=scan_value.device, dtype=scan_value.dtype
     )

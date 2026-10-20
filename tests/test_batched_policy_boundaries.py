@@ -75,7 +75,27 @@ def test_nonfinite_segment_does_not_create_false_boundary():
 
     result = locate_all_policy_boundaries(scan, values, evaluator)
     assert result.boundary_mask.sum().item() == 0
+    assert result.boundary_coordinate.shape == (1, 0)
     assert result.nonfinite_count.item() == 1
+
+
+def test_boundary_storage_width_tracks_observed_count_not_scan_capacity():
+    task_count = 10_000
+    scan = torch.linspace(-1.0, 1.0, 65)[None, :].expand(task_count, -1)
+    offset = torch.linspace(-0.5, 0.5, task_count)[:, None]
+    values = scan - offset
+
+    def evaluator(task, x):
+        return x - offset[:, 0][task]
+
+    result = locate_all_policy_boundaries(
+        scan,
+        values,
+        evaluator,
+        refinement_rounds=4,
+    )
+    assert result.boundary_coordinate.shape == (task_count, 1)
+    assert result.boundary_mask.all()
 
 
 def test_exact_zero_is_retained_without_duplicate_crossings():
