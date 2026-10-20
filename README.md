@@ -106,10 +106,16 @@ Job 701387 的完整 Outer 3 状态续训入口为
 CPU 准备入口为 `analysis/prepare_finite_direct_continuation.py`。
 新逻辑规模为 8192/2048 Parent，Beta/Empirical 50:50，实际阶段编号 4–11。
 跨 run 导入完整优化器/AL/RNG；`--resume` 仅用于新 run 自身的事务恢复。
-必须在用户审查后单独批准 Approval v3，才可使用 `--execute-approved`。
+本版本修正 Parent default 在 Child 政策前退出，算子版本为
+`finite_direct_parent_exit_before_child_v2`。Train Empirical 逐 Outer 更新：
+post-SDF Train-only pre-decision realized-b source → 原子 Pool/下一轮 Bank；
+Recent/Archive 精确2867/1229，Validation 与 Beta 固定。Outer4 初始模板仍明确为历史t0。
+旧 Job701387 只作为完整学习状态初始化，不是新算子的收敛证据。
+必须在用户审查后单独批准 `CONTINUATION_APPROVAL_V4_DYNAMIC_EMPIRICAL`，才可使用
+`--execute-approved`；旧v3批准、旧缓存和旧run journal不能用于本版本。
 本分支不自动训练、提交 Slurm、批准或 push。
 完整契约、真实 CLI、源状态审计和验收见
-[continuation 审查报告](review/finite_direct_large_continuation_outer4_11_20261020/implementation_report.md)。
+[退出修正与动态 Empirical 审查报告](review/dynamic_empirical_exit_fix_20261021/dynamic_empirical_implementation_report.md)。
 
 - `config/README.md`
 - `data/README.md`

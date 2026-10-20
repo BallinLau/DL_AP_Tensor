@@ -7,7 +7,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=7-00:00:00
-# PREPARED ONLY. No approval is generated, no job is self-submitted/requeued.
+# PREPARED ONLY. Corrected exit v2 + dynamic Train Empirical requires Approval v4.
+# Old fixed-bank Approval v3 cannot authorize this code. No self-submission.
 set -euo pipefail
 source /apps/soft/anaconda3/bin/activate
 conda activate DL_HL
@@ -17,7 +18,7 @@ cd "${REPO_DIR:?Set immutable reviewed continuation checkout}"
 : "${SAMPLING_DIR:?Set reviewed NEW 8192/2048 bank}"
 : "${INITIAL_CHECKPOINT:?Set full continuation_initial_checkpoint.pt}"
 : "${SOURCE_MANIFEST:?Set certified continuation_source_manifest.json}"
-: "${APPROVAL_FILE:?Separate explicit CONTINUATION_APPROVAL_V3 required}"
+: "${APPROVAL_FILE:?Separate explicit CONTINUATION_APPROVAL_V4_DYNAMIC_EMPIRICAL required}"
 [[ "$(git rev-parse HEAD)" == "$REQUIRED_COMMIT" ]]
 [[ -z "$(git status --porcelain)" ]]
 export PYTHONUNBUFFERED=1 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8

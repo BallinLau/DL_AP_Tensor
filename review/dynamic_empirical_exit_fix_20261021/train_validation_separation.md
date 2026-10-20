@@ -1,0 +1,7 @@
+# Train / Validation
+
+capture_templates直接拒绝Validation；pool构造再次核查split与source outer/stage/model；归档拒绝未来来源。仅POST_SDF_TRAIN_EMPIRICAL_SOURCE供下一池。
+
+Validation初始文件SHA与schedule/CRN fingerprint在每次激活Bank时核对。它不随Train动态更新。动态source不读取POST_SDF_VALIDATION_RESIMULATION。
+
+train_distribution_history.csv明确标注CHANGING_TRAIN_NOT_FIXED_VALIDATION；正式宏观评估仍保留Train/Validation及BETA/EMPIRICAL/ALL分组。变化Train的改善不能全部归因于网络收敛。

@@ -1,0 +1,16 @@
+REVIEW ONLY — NOT EXECUTED
+
+1. 审查本提交后，在新的prepared目录调用 analysis/prepare_finite_direct_continuation.py。
+   工具生成initial_dynamic_pool.pt及新commit/source/operator清单，不生成approved文件。
+2. 用户另行批准后，基于 analysis.finite_direct_dynamic_approval.approval_binding()
+   生成内容绑定的Approval v4。旧v3无效；本轮没有批准实例。
+3. 未来入口参数（本轮未执行）：
+python analysis/run_finite_direct_large_continuation.py \
+  --sampling-dir <NEW_PREPARED>/continuation_sampling \
+  --initial-checkpoint <NEW_PREPARED>/continuation_initial_checkpoint.pt \
+  --source-manifest <NEW_PREPARED>/continuation_source_manifest.json \
+  --output <NEW_EMPTY_DYNAMIC_EXIT_V2_RUN> --device cuda:0 \
+  --parent-batch-size 128 --fit-parent-batch-size 128 --firm-batch-size 512 \
+  --execute-approved --approval <FUTURE_USER_APPROVED_V4_JSON>
+
+无--execute-approved时只输出plan。Slurm模板已更新v4提示，但本轮未提交/启动。

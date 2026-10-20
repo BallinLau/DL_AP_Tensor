@@ -14,11 +14,27 @@ from analysis.nested_equilibrium_utils import atomic_torch_save,atomic_write_jso
 from analysis.run_fc1_self_consistent_macro import simulator,process_node,select_state,hashes
 from analysis.economic_config import AnalysisEconomicConfig
 from analysis.convergence_transition import ConvergenceShockBank,MacroTransitionContext,build_child_exogenous_bundle
-from data.simulate_ts_parallel import _expand_branches_batched
+from data.simulate_ts_parallel import _expand_branches_batched, _apply_exit_batched, _apply_entry_batched
 from data.finite_direct_sampling import file_hash,state_hash,validate_template_splits,SamplingConfig,fixed_schedule
 from training.inner_fixed_point import InnerFPCollocationBank,InnerFPChildBank
 
-OPERATOR='finite_direct_production_ledger_v1'
+OPERATOR='finite_direct_parent_exit_before_child_v2'
+
+
+def expand_after_parent_exit(sim, parent, *, child_t=1):
+    """Preserve pre-transition reference/accounting history, commit old exits.
+
+    Production expansion records the ORIGINAL parent K/alive for entry scale
+    and capital bridge, and applies the original eta_t and bar_i transition.
+    Its copied bar_z still belongs to the parent. Apply the existing exit to
+    each child NOW, before entry or any child policy can overwrite bar_z.
+    No parent ledger/history is mutated and no survivor b/K formula changes.
+    """
+    children=_expand_branches_batched(sim,parent,child_t=child_t)
+    if sim.enable_exit:
+        for child in children:
+            _apply_exit_batched(child)
+    return children
 
 
 def load_locked_sampling(root):
@@ -49,6 +65,8 @@ def cache_provenance(models,bank,schedule,signature,*,outer,stage,economic):
         crn_hash=stable_json_hash([r['child_shock_keys'] for r in schedule['parents']]),
         outer=outer,stage=stage,macro_inner=(int(stage[1:]) if stage.startswith('D') else None))
     if 'run_identity' in signature: result['run_identity']=signature['run_identity']
+    result['empirical_pool_fingerprint']=bank.get('empirical_pool_fingerprint','INITIAL_T0')
+    result['train_bank_version']=bank.get('bank_version','INITIAL_LOCKED')
     return result
 
 
@@ -81,7 +99,7 @@ def capture_node(state,records,*,split,outer,time,branch,model_hashes):
 
 
 @torch.no_grad()
-def generate_dataset(models,episode,bank,schedule,signature,output,*,outer,stage,parent_batch_size=128,capture=True):
+def generate_dataset(models,episode,bank,schedule,signature,output,*,outer,stage,parent_batch_size=128,capture=True,predecision_templates=False):
     output=Path(output); output.mkdir(parents=True,exist_ok=True)
     economic=asdict(AnalysisEconomicConfig.from_current_config())
     economic['hyperparameters']=asdict(episode.hyperparams)
@@ -92,6 +110,7 @@ def generate_dataset(models,episode,bank,schedule,signature,output,*,outer,stage
         bp_source='grid',raw_consumption=True)
     provenance=cache_provenance(models,bank,schedule,signature,outer=outer,stage=stage,economic=economic)
     provenance['capture']=capture
+    provenance['predecision_templates']=predecision_templates
     p=output/'provenance.json'
     if p.exists(): verify_cache(json.loads(p.read_text()),provenance)
     else: atomic_write_json(p,provenance)
@@ -116,10 +135,22 @@ def generate_dataset(models,episode,bank,schedule,signature,output,*,outer,stage
                         split=split,economic_state_valid=False,failure_reason='PARENT_'+r['failure_reason']))
             if valid:
                 s=select_state(s,torch.tensor(valid,device=episode.device))
-                children=_expand_branches_batched(sim,s,child_t=1)
+                children=expand_after_parent_exit(sim,s,child_t=1)
                 for branch,child in enumerate(children):
-                    child,observations,_=process_node(sim,child,1,branch,entry=True)
-                    if capture: snaps.append(capture_node(child,observations,split=split,outer=outer,time=1,branch=branch,model_hashes=initial))
+                    # Entry exactly once, retaining the production reference
+                    # captured BEFORE old exits. Snapshot before current policy.
+                    child=_apply_entry_batched(sim,child,max(20,int(sim.group_size*.1)))
+                    if predecision_templates:
+                        from data.finite_direct_dynamic_empirical import capture_templates
+                        snaps.extend(capture_templates(child,split=split,outer=outer,branch=branch,model_hashes=initial))
+                    if bool(child['alive'].any()):
+                        child,observations,_=process_node(sim,child,1,branch,entry=False)
+                    else:
+                        observations=[dict(parent_candidate_id=int(pid),t=1,child_branch=branch,
+                            economic_state_valid=False,failure_reason='CHILD_EXTINCT')
+                            for pid in child['transition_path_id'].tolist()]
+                    if capture and bool(child['alive'].any()):
+                        snaps.append(capture_node(child,observations,split=split,outer=outer,time=1,branch=branch,model_hashes=initial))
                     for r in observations:
                         par=pmap[r['parent_candidate_id']]
                         r.update(split=split,x_t=par['x_t1'],Hatc_cal_t=par['Hatc_cal_t1'],LnK_cal_t=par['LnK_cal_t1'],

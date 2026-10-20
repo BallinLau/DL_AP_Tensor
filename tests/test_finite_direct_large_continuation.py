@@ -117,15 +117,16 @@ def test_actual_sampling_size_ratio_templates_and_no_leakage():
 def test_exact_eight_outer_stage_order_and_real_indices(tmp_path):
     backend=FakeBackend();journal=StageJournal(tmp_path,{'new':'run'},backend)
     drive(backend,journal)
-    assert backend.calls[0][:2]==(3,'baseline')
-    assert {o for o,k,i in backend.calls if k!='baseline'}==set(range(4,12))
+    assert backend.calls[0][:2]==(3,'dynamic_initialize')
+    assert backend.calls[1][:2]==(3,'baseline')
+    assert {o for o,k,i in backend.calls if k not in ('baseline','dynamic_initialize')}==set(range(4,12))
     assert not any(k=='reuse_firm' for o,k,i in backend.calls)
     for o in range(4,12):
         calls=[(k,i) for n,k,i in backend.calls if n==o]
         assert [i['version'] for k,i in calls if k=='data']==[0,1,2]
         assert [i['chunk'] for k,i in calls if k=='SDF']==[0,1]
         assert calls[1][0]=='firm_bank' and calls[-1][0]=='outer_commit'
-        assert [k for k,i in calls][-3:]==['post_sdf_validation','cross_block','outer_commit']
+        assert [k for k,i in calls][-5:]==['post_sdf_validation','empirical_source','EMPIRICAL_POOL_COMMIT','cross_block','outer_commit']
     before=len(backend.calls);drive(backend,journal);assert len(backend.calls)==before
 
 

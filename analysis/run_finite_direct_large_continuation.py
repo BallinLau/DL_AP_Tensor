@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Review-gated CROSS_RUN_CONTINUATION_FROM_COMMITTED_OUTER3.
 
-Default: plan-only. No backend or optimizer is constructed without approval v3.
+Default: plan-only. No backend or optimizer is constructed without dynamic v4.
 --resume means ONLY intra-run recovery of this new continuation run.
 """
 import argparse
@@ -22,7 +22,7 @@ from analysis.run_full_nested_finite_direct_outer4 import (ProductionBackend,Bud
     stage_id,restore_fresh,set_scope)
 from analysis.finite_direct_outer4_state import StageJournal
 from analysis.finite_direct_continuation_state import (RUN_ID,SOURCE_SHA,EXPECTED_HASHES,safe_load,
-    state_digest,component_hashes,new_backend_state,approval_binding,require_continuation_approval,verify_optimizer_restored,verify_economic_contract)
+    state_digest,component_hashes,new_backend_state,verify_optimizer_restored,verify_economic_contract)
 from analysis.finite_direct_continuation_probes import (make_macro_probe,evaluate_fixed,save_movement,write_probe_histories)
 from analysis.nested_equilibrium_utils import (atomic_write_json,atomic_torch_save,stable_json_hash,
     restore_training_transaction,capture_rng_state,restore_rng_state,atomic_write_bytes)
@@ -30,21 +30,30 @@ from data.finite_direct_runtime import load_locked_sampling,generate_dataset,fir
 from data.finite_direct_sampling import file_hash
 from analysis.finite_direct_outer_metrics import economic_metrics
 from analysis.run_fc1_self_consistent_macro import evaluate
+from analysis.finite_direct_dynamic_approval import approval_binding,require_approval as require_continuation_approval
+from data.finite_direct_dynamic_empirical import (CONFIG as DYNAMIC_CONFIG,initial_pool,next_pool,resample_train,save_bundle,load_bundle,source_summary)
+from data.finite_direct_runtime import OPERATOR
 from training.inner_fixed_point import InnerFPCollocationBank
 
 
 def stages():
+    yield 3,'dynamic_initialize',{}
     yield 3,'baseline',{}
     for outer,kind,indices in old_stages(replace(Budget(),equilibrium_outer_max=12)):
-        if outer>=4: yield outer,kind,indices
+        if outer>=4:
+            if kind=='cross_block':
+                yield outer,'empirical_source',{}
+                yield outer,'EMPIRICAL_POOL_COMMIT',{}
+            yield outer,kind,indices
 
 
 def training_plan():
-    return dict(experiment=RUN_ID,initialization='CROSS_RUN_CONTINUATION_FROM_COMMITTED_OUTER3',
+    return dict(experiment=RUN_ID+'_dynamic_exit_v2',initialization='CROSS_RUN_CONTINUATION_FROM_COMMITTED_OUTER3',
         intra_run_resume='NEW_STAGEJOURNAL_ONLY',start_outer=4,end_outer=11,outers_to_execute=8,
         budget=asdict(replace(Budget(),equilibrium_outer_max=8)),train_parents=8192,validation_parents=2048,
-        firms=200,children=2,beta_empirical_ratio='50:50',operator='finite_direct_production_ledger_v1',
-        empirical_semantics='RECORDED_INITIAL_PARENT_DISTRIBUTION',root_search=False,fc2=False,
+        firms=200,children=2,beta_empirical_ratio='50:50',operator=OPERATOR,
+        empirical_semantics='DYNAMIC_TRAIN_ONLY_REALIZED_PRE_DECISION_B',dynamic_sampling=DYNAMIC_CONFIG,
+        source_result_limit='OLD_OPERATOR_LEARNING_STATE_WARM_START_NOT_CONVERGENCE_EVIDENCE',root_search=False,fc2=False,
         execution=[dict(id=stage_id(o,k,i),outer=o,kind=k,indices=i) for o,k,i in stages()],
         baseline='OUTER3_ON_NEW_VALIDATION_BANK_BASELINE',physical_batch=dict(parent=128,fc1=128,firm=512),
         convergence_is_report_only=True,retention='KEEP_ALL_TRANSACTIONS_NO_AUTOMATIC_DELETION')
@@ -101,8 +110,84 @@ class ContinuationBackend(ProductionBackend):
             new_sdf_parent_index_range='0 .. legal_train_pairs + legal_validation_pairs - 1',
             bitwise_old_run_counterfactual=False)
         self.state['function_snapshots']={}
-        self.state['run_identity']=RUN_ID
+        self.state['run_identity']=training_plan()['experiment']
         self.state['new_code_commit']=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
+        self._initial_train=self.banks['train'];self._initial_schedule=self.schedules['train']
+        self._validation_identity=(file_hash(args.sampling_dir/'validation_initial_bank.pt'),
+            stable_json_hash(self.schedules['validation']))
+
+    def restore(self,snapshot):
+        super().restore(snapshot)
+        if 'active_dynamic_outer' in self.state:
+            self._activate_dynamic(self.state['active_dynamic_outer'])
+
+    def _activate_dynamic(self,outer):
+        record=self.state['dynamic_banks'][str(outer)]
+        _,bank,schedule=load_bundle(record)
+        if record['outer']!=outer: raise ValueError('wrong committed dynamic Outer')
+        self.banks['train']=bank;self.schedules['train']=schedule
+        self.state['active_dynamic_outer']=outer
+        if (file_hash(self.args.sampling_dir/'validation_initial_bank.pt'),stable_json_hash(self.schedules['validation']))!=self._validation_identity:
+            raise ValueError('fixed Validation changed')
+
+    def _dynamic_initialize(self):
+        path=self.args.sampling_dir/'initial_dynamic_pool.pt'
+        pool=safe_load(path)
+        expected=initial_pool(safe_load(self.args.sampling_dir/'empirical_template_bank.pt'))
+        if state_digest(pool)!=state_digest(expected): raise ValueError('unreviewed initial empirical pool')
+        bank,schedule,history=resample_train(self._initial_train,self._initial_schedule,pool,outer=4)
+        record=save_bundle(self.root/'dynamic/outer_004',pool,bank,schedule,history)
+        self.state['dynamic_banks']={'4':record};self._activate_dynamic(4)
+        return dict(initialization='LOCKED_JOB699894_T0',pool_sha=file_hash(path),optimizer_steps=0)
+
+    def _empirical_source(self,outer):
+        set_scope(self.models,'frozen');rng=capture_rng_state();start=time.monotonic()
+        before=component_hashes({k:m.state_dict() for k,m in self.models.items()})
+        try:
+            path=self.root/f'outer_{outer:03d}'/'POST_SDF_TRAIN_EMPIRICAL_SOURCE'
+            with torch.inference_mode():
+                _,_,manifest=generate_dataset(self.models,self.episode,self.banks['train'],self.schedules['train'],
+                    self.signature,path,outer=outer,stage=DYNAMIC_CONFIG['source'],
+                    parent_batch_size=self.args.parent_batch_size,capture=False,predecision_templates=True)
+        finally: restore_rng_state(rng)
+        if before!=component_hashes({k:m.state_dict() for k,m in self.models.items()}): raise ValueError('source changed model')
+        self.state.setdefault('dynamic_sources',{})[str(outer)]=dict(path=str(path),manifest_sha256=file_hash(path/'manifest.json'),model_hashes=before)
+        return dict(optimizer_steps=0,source_seconds=time.monotonic()-start,
+            source_stage=DYNAMIC_CONFIG['source'],predecision_template_count=manifest['captures'],
+            peak_gpu_memory_gib=torch.cuda.max_memory_allocated(self.episode.device)/2**30 if self.episode.device.type=='cuda' else 0)
+
+    def _pool_commit(self,outer):
+        start=time.monotonic();record=self.state['dynamic_sources'][str(outer)];path=Path(record['path'])
+        if file_hash(path/'manifest.json')!=record['manifest_sha256']: raise ValueError('source manifest changed')
+        manifest=json.loads((path/'manifest.json').read_text());captures=[]
+        for name,digest in manifest['shards'].items():
+            if Path(name).name!=name or file_hash(path/name)!=digest: raise ValueError('source shard changed')
+            captures.extend(safe_load(path/name)['captures'])
+        pool,_,_=load_bundle(self.state['dynamic_banks'][str(outer)])
+        result=next_pool(pool,captures,source_outer=outer,source_hashes=record['model_hashes'],source_manifest_sha=record['manifest_sha256'])
+        stats=dict(outer=outer,source_outer=outer,source_model_hashes=record['model_hashes'],
+            pool_update_seconds=time.monotonic()-start,recent_templates=len(result['recent']),archive_templates=len(result['archive']),
+            unique_source_parents=len({t['cluster_id'] for t in result['recent']}),
+            pool_fingerprint=result['fingerprint'],source_failures=len(result['failures']))
+        stats.update(source_summary(result['recent']))
+        if outer<11:
+            bank_start=time.monotonic()
+            bank,schedule,history=resample_train(self._initial_train,self._initial_schedule,result,outer=outer+1)
+            bundle=save_bundle(self.root/f'dynamic/outer_{outer+1:03d}',result,bank,schedule,history)
+            self.state['dynamic_banks'][str(outer+1)]=bundle
+            stats.update(bank_construction_seconds=time.monotonic()-bank_start,
+                artifact_bytes=sum(Path(bundle[k]['path']).stat().st_size for k in ('pool','bank','schedule')),
+                bank_fingerprint=bundle['bank_fingerprint'],
+                unique_sampled_source_parent_count=len({h['cluster_id'] for h in history}),
+                recent_parent_coverage=len({h['cluster_id'] for h in history if h['pool_source']=='RECENT'})/stats['unique_source_parents'],
+                template_reuse_fraction=1-len({h['template_id'] for h in history})/len(history),
+                conditional_fallback_fraction=sum(h['fallback_fraction'] for h in history)/len(history))
+        else:
+            # Persist final distributions, but never construct nonexistent Bank12.
+            atomic_write_json(self.root/'dynamic/final_empirical_pool_statistics.json',result)
+        stats.update(update_seconds=time.monotonic()-start,optimizer_steps=0)
+        self.state.setdefault('dynamic_history',{})[str(outer)]=stats
+        return stats
 
     def _fixed_bank(self):
         record=self.state['probe_bank']; path=Path(record['path'])
@@ -149,11 +234,18 @@ class ContinuationBackend(ProductionBackend):
 
     def _execute(self,outer,kind,i):
         start=time.monotonic()
-        if kind=='baseline': result=self._baseline()
+        if kind=='dynamic_initialize': result=self._dynamic_initialize()
+        elif kind=='empirical_source': result=self._empirical_source(outer)
+        elif kind=='EMPIRICAL_POOL_COMMIT': result=self._pool_commit(outer)
+        elif kind=='baseline': result=self._baseline()
         elif kind=='outer_commit':
             movement_rows=self._record_functions(outer)
             result=super()._execute(outer,kind,i); result['function_movement']=movement_rows
-        else: result=super()._execute(outer,kind,i)
+        else:
+            if kind=='outer_start': self._activate_dynamic(outer)
+            if outer>=4 and kind not in ('outer_start',) and self.state.get('active_dynamic_outer')!=outer:
+                raise ValueError('current Outer bank not activated')
+            result=super()._execute(outer,kind,i)
         result['stage_wallclock_seconds']=time.monotonic()-start
         return result
 
@@ -181,6 +273,8 @@ class ContinuationBackend(ProductionBackend):
     def write_histories(self,results,*,figures=False):
         super().write_histories(results,figures=figures)
         write_probe_histories(self.root,results,figures=figures)
+        from analysis.finite_direct_dynamic_diagnostics import write_dynamic_histories
+        write_dynamic_histories(self,figures=figures)
         training=pd.read_csv(self.root/'outer_training_history.csv')
         mask=training.get('probe_kind',pd.Series(index=training.index,dtype=object)).notna()
         training[mask].to_csv(self.root/'firm_residual_history.csv',index=False)
@@ -195,7 +289,8 @@ class ContinuationBackend(ProductionBackend):
                     epoch=r['indices']['epoch'],evaluation=phase,**r[phase]))
         pd.DataFrame(fit).to_csv(self.root/'fc1_fit_history.csv',index=False)
         common=dict(source_run='Job701387',source_commit=source_commit(),source_outer=3,
-            new_run=RUN_ID,new_commit=self.state['new_code_commit'],sampling_signature=self.signature['fingerprint'],
+            economic_operator=OPERATOR,historical_results_are_corrected_convergence_evidence=False,
+            new_run=training_plan()['experiment'],new_commit=self.state['new_code_commit'],sampling_signature=self.signature['fingerprint'],
             validation_crn_hash=stable_json_hash([r['child_shock_keys'] for r in self.schedules['validation']['parents']]))
         for filename in ('outer_training_history.csv','outer_macro_economic_history.csv','outer_sdf_al_history.csv',
             'firm_function_movement.csv','fc1_function_movement.csv','sdf_wealth_function_movement.csv',
@@ -259,9 +354,12 @@ def main(argv=None):
         print(json.dumps(dict(CURRENT_PHASE='WAITING_FOR_USER_REVIEW',FORMAL_TRAINING_STARTED=False,
             SLURM_JOB_SUBMITTED=False,plan=plan,plan_fingerprint=stable_json_hash(plan)),indent=2));return
     if args.approval is None: raise ValueError('explicit continuation approval required')
+    approved=json.loads(args.approval.read_text())
+    if approved.get('approved') is not True or approved.get('schema_version')!=4:
+        raise ValueError('explicit dynamic v4 approval required; old v3 forbidden')
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     expected=approval_binding(plan,commit,args.sampling_dir,args.initial_checkpoint,args.source_manifest)
-    require_continuation_approval(json.loads(args.approval.read_text()),expected)
+    require_continuation_approval(approved,expected)
     if subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip():
         raise ValueError('clean approved commit required')
     if torch.device(args.device).type!='cuda' or not torch.cuda.is_available() or torch.cuda.device_count()!=1:
@@ -284,7 +382,7 @@ def main(argv=None):
         if not pointer.exists(): raise ValueError('INTRA_RUN_RESUME requires this new run committed pointer')
     elif args.output.exists() and list(args.output.iterdir()): raise ValueError('fresh run must be empty')
     backend=ContinuationBackend(args,locked,initial,source)
-    contract=dict(source_commit=commit,plan=plan,approval_binding=expected,run_identity=RUN_ID,
+    contract=dict(source_commit=commit,plan=plan,approval_binding=expected,run_identity=plan['experiment'],
         sampling_signature=locked[2],economic=asdict(backend.economic),hyperparameters=asdict(backend.episode.hyperparams),
         runtime=dict(device=args.device,parent_batch=args.parent_batch_size,fit_batch=args.fit_parent_batch_size,firm_batch=args.firm_batch_size))
     journal=StageJournal(args.output/'transactions',contract,backend,resume=args.resume)

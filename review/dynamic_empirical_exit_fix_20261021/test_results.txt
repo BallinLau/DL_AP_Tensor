@@ -1,0 +1,40 @@
+Date: 2026-10-21 Asia/Shanghai
+Base: bcb2c5a23417321b71507c51f7e289f656bb1259
+CPU only; no optimization, GPU benchmark, server contact or Slurm submission.
+
+Command:
+PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/private/tmp/fc1_mpl_cache /Users/ballinliu/anaconda3/bin/python -m pytest tests/test_dynamic_empirical_exit_fix.py tests/test_dynamic_empirical_timing_blocker.py tests/test_finite_direct_large_continuation.py tests/test_finite_direct_outer4_runner.py tests/test_finite_direct_outer4_resume.py tests/test_finite_direct_macro_contract.py tests/test_finite_direct_macro_production_adapter.py tests/test_finite_direct_firm_bank.py tests/test_finite_direct_sampling.py tests/test_finite_direct_approval_metrics_patch.py tests/test_entry_investment_compare.py tests/test_entry_value_cost.py -q --junitxml=/private/tmp/dynamic_exit_review_tests.xml
+
+Final result: 182 passed, 1 warning in 31.61s. No skipped or xfailed tests.
+Warning: existing test fixture explicitly overrides BP source to HEAD despite disabled checkpoint provenance, and asserts that warning. Formal runner remains production Grid.
+
+Scope: real CPU production transition/ledger/Entry forwards, source capture, 4096 empirical count construction, fake-optimizer stage orchestration, actual pool commit and file/journal restore, old source learning-state restoration without stepping optimizers.
+No optimizer step/backward is added or executed by the new tests.
+GPU memory/time and corrected-operator economic convergence: NOT_TESTED.
+After the final diagnostic coverage fields were added, the new scoped suite was rerun: 28 passed in 13.11s.
+Final suite additionally checks cross-Outer archive lineage clustering.
+Actual CLI default plan-only check: WAITING_FOR_USER_REVIEW; training_started=false; slurm_submitted=false; operator=finite_direct_parent_exit_before_child_v2; Outer4-11. Nonexistent input/output paths were not accessed or created.
+
+Original 22-item request mapping:
+1. Outer4 t0 provenance: initial_pool + locked-bank identity test.
+2. Outer5 uses Outer4 templates: next_pool/resample test.
+3. Outer6 Recent uses Outer5: same test, distinct source_outer.
+4. Exact 50:50: bank ratio assertions; full4096 empirical fixture.
+5. Fixed Validation/CRN: real activation/resume test + original sampler tests.
+6. Leakage: parameterized rejection + capture validation guard.
+7. Realized b vs target: parent eta_t production tests.
+8. Previous defaults: actual parent policy/ledger and both production children.
+9. No child success selection: source includes pre-decision entrants even if currently defaulted later.
+10. Entry timing: real value_cost and investment_compare birth-node forwards.
+11. Conditional CDF: source template quartiles + original conditional sampler tests.
+12. Reproducibility: full4096 repeated resampling identical states/schedules/history.
+13. Sibling weighting: one cluster selected uniformly, not each branch independently.
+14. Exact70:30: 2867 Recent,1229 Archive.
+15. Pool/Bank SHA: immutable save/load and tamper rejection.
+16. Current Bank cache: old operator and changed pool rejected even if state hash matches.
+17. No mid-Outer switch: real_pool_commit keeps active Bank4 unchanged.
+18. No redraw after commit: StageJournal skip plus restored same Bank5 file record.
+19. Post-SDF Train-only/no optimizer: actual source method with forward fixture, inference mode/model/RNG checks.
+20. Invalid v4/oldv3: rejection tests and input-content mutation tests.
+21. Production order: actual stage list preserves Firm/FC1/D2/SDF order.
+22. Resume version: real commit/activation restores referenced Bank5, no old-version fallback.

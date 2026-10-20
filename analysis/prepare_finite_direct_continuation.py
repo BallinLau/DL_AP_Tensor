@@ -28,6 +28,8 @@ def prepare(args):
     args.output.mkdir(parents=True,exist_ok=True)
     sampling=args.output/'continuation_sampling'
     locked=prepare_sampling(sampling,args.template_bank,TEMPLATE_SHA)
+    from analysis.finite_direct_dynamic_approval import prepare_initial_pool
+    prepare_initial_pool(sampling)
     sig=locked[2]
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     initial=dict(format='finite_direct_cross_run_continuation_v1',source_job_id=701387,
@@ -42,6 +44,8 @@ def prepare(args):
     audit.update(learning_sha256=state_digest(learning),new_sampling_signature=sig['fingerprint'],
         continuation_initial_checkpoint_sha256=file_hash(path),new_training_budget=training_plan()['budget'],
         new_code_commit=commit,source_run_verified_on_thu=True,
+        historical_operator='finite_direct_production_ledger_v1',
+        new_operator=training_plan()['operator'],historical_convergence_evidence_for_new_operator=False,
         source_run='/home/fit/zhuyingz/WORK/LiuHao/cachedir/full_nested_finite_direct_outer4_20261020_160a4d1_r1',
         local_readonly_mirror=str(args.source_run.resolve()),training_performed=False)
     audit['source_component_hashes']=audit['model_hashes']

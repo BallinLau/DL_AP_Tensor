@@ -35,11 +35,12 @@ def test_stable_crn_replay_and_previous_dead_identity_stays_dead():
     assert all(12 not in r['child_alive_ids'] for r in a['branches'])
 
 
-def test_adapter_omits_exit_and_capture_follows_child_decision():
+def test_adapter_now_uses_corrected_transition_but_old_capture_remains_post_decision():
     tree=ast.parse(inspect.getsource(generate_dataset.__wrapped__))
     calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name)]
     assert not any(n.func.id=='_apply_exit_batched' for n in calls)
-    child_process=[n for n in calls if n.func.id=='process_node' and any(k.arg=='entry' and isinstance(k.value,ast.Constant) and k.value.value is True for k in n.keywords)]
+    assert any(n.func.id=='expand_after_parent_exit' for n in calls)
+    child_process=[n for n in calls if n.func.id=='process_node' and len(n.args)>3 and isinstance(n.args[2],ast.Constant) and n.args[2].value==1]
     child_capture=[n for n in calls if n.func.id=='capture_node' and any(k.arg=='time' and isinstance(k.value,ast.Constant) and k.value.value==1 for k in n.keywords)]
     assert len(child_process)==len(child_capture)==1
     assert child_process[0].lineno < child_capture[0].lineno
