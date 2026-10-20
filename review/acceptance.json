@@ -1,0 +1,19 @@
+{
+  "SAMPLING_IMPLEMENTED": true,
+  "SAMPLING_CONNECTED_TO_RUNNER": true,
+  "FIRM_BANK_CONNECTED": true,
+  "FC1_PRODUCTION_CONNECTED": true,
+  "SDF_PRODUCTION_CONNECTED": true,
+  "SDF_TRUE_ONLY_CONTRACT_TEST": "PASS",
+  "PARENT_TWO_CHILD_PAIR_TEST": "PASS",
+  "FOUR_OUTER_STAGE_ORDER_TEST": "PASS",
+  "RESUME_STAGE_TEST": "PASS",
+  "CACHE_PROVENANCE_TEST": "PASS",
+  "RUNNER_READY_FOR_USER_REVIEW": true,
+  "FORMAL_TRAINING_STARTED": false,
+  "SLURM_JOB_SUBMITTED": false,
+  "PRODUCTION_OPTIMIZER_STEPS_EXECUTED_THIS_TASK": 0,
+  "CURRENT_PHASE": "WAITING_FOR_USER_REVIEW",
+  "GPU_VALIDATED": false,
+  "LIMITATION": "Local forward/interface and fake-optimizer orchestration tests only; not formal training acceptance or convergence evidence."
+}

@@ -1,0 +1,30 @@
+Review only. No production optimizer step executed.
+
+Command (project Conda Python):
+PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/private/tmp/fc1_mpl_cache PYTHONPATH=. /Users/ballinliu/anaconda3/bin/python -m pytest -q -p no:cacheprovider tests/test_finite_direct_macro_production_adapter.py tests/test_finite_direct_outer4_runner.py tests/test_finite_direct_outer4_resume.py tests/test_finite_direct_firm_bank.py tests/test_finite_direct_sampling.py tests/test_finite_direct_macro_contract.py tests/test_finite_direct_review_preparation.py tests/test_fc1_self_consistent_macro.py
+
+49 targeted tests passed (see final handoff verification).
+
+Covered:
+- Exact 50:50 source allocation, CDF/conditional-CDF, lineage, sampling resume.
+- Actual production SDF TRUE_ONLY forward and AL pooled estimator; no optimizer.
+- Actual FC1 production single-child loss forward; no optimizer.
+- Tiny real production ledger/entry/branch adapter with synthetic policy fixture and existing CPU Grid reference option.
+- Stale Firm or FC1 hash rejected by cache provenance.
+- Missing sibling not a legal SDF pair.
+- Four-Outer driver ordering with fake backend; Outer0 no Firm optimization.
+- Interrupt FC1 epoch/SDF chunk/P block: optimizer/AL/data/RNG restored; committed blocks not repeated.
+- Actual SDF fresh-bank and pair-generator round trip.
+- Explicit committed-Firm hard refresh of actual simulation Grid target, without optimizer execution.
+- Real saved combined checkpoint backend CPU initialization/hash check, production optimizer step count=0, FC2 calls=0.
+
+Static checks:
+- Runner --help succeeds.
+- bash -n slurm/run_full_nested_finite_direct_outer4_a800.slurm succeeds.
+- git diff --check succeeds.
+
+First added CPU simulator integration test hit intentional production Grid CUDA guard.
+Correction limited to test: existing GridBPSimulationPolicy(require_cuda=False) CPU reference.
+Formal Grid source still requires CUDA, no BP head fallback added.
+
+Not run: A800, full production optimizer budgets, end-to-end four-Outer numerical convergence, entire test repository containing optimization tests.

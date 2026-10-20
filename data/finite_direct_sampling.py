@@ -18,7 +18,7 @@ from data.simulate_ts_parallel import _initialize_batched_state
 from analysis.nested_equilibrium_utils import atomic_torch_save,atomic_write_json,atomic_write_csv,stable_json_hash,tensor_hash
 
 VERSION='finite_direct_beta_empirical_50_v2'
-SOURCE_KIND='RECORDED_INITIAL_PARENT_BANK_PRE_DECISION'
+SOURCE_KIND='RECORDED_INITIAL_PARENT_DISTRIBUTION'
 
 
 def file_hash(path):

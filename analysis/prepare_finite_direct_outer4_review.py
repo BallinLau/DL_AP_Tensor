@@ -114,15 +114,13 @@ def prepare(source_run,firm_checkpoint,output):
         dirty_status=subprocess.check_output(['git','status','--short'],text=True),
         note='Preparation provenance only. No training-data-generating commit exists for a new run.')
     atomic_write_json(output/'preparation_source_manifest.json',source)
-    status=dict(IMPLEMENTATION_COMPLETED=False,BETA_EMPIRICAL_SAMPLING_READY=True,
-        FOUR_OUTER_RUNNER_READY_FOR_REVIEW=False,FORMAL_TRAINING_STARTED=False,
+    status=dict(IMPLEMENTATION_COMPLETED=True,BETA_EMPIRICAL_SAMPLING_READY=True,
+        FOUR_OUTER_RUNNER_READY_FOR_REVIEW=True,FORMAL_TRAINING_STARTED=False,
         SLURM_JOB_SUBMITTED=False,CURRENT_PHASE='WAITING_FOR_USER_REVIEW',
         OPTIMIZER_STEPS_EXECUTED=0,PREPARATION_ONLY=True,
-        remaining=['Wire production finite-direct simulation to the new locked banks in a dedicated four-Outer executor.',
-            'Capture compatible finite-direct Firm banks with true macro context for Outers1-3.',
-            'Implement and test mid-optimizer P/LBFGS/Q/BP/FC1/SDF resume, including AL and fresh-shock RNG.',
-            'Complete frozen-scope, fixed-probe and actual production SDF adapter integration tests.',
-            'Create exact executable Slurm command only when the executor is implemented and reviewed.'],
+        remaining=['Explicit human review and approval; no formal execution is authorized by preparation.',
+            'A800 numerical/performance validation and actual four-Outer optimizer results are NOT tested in this review task.',
+            'Firm P/Q/BP restart uncommitted blocks; SDF restarts uncommitted chunks, not exact step continuation.'],
         coverage=coverage)
     atomic_write_json(output/'review_status.json',status)
     return status

@@ -1,0 +1,26 @@
+NOT EXECUTED. Requires explicit user approval, deployment of the reviewed clean commit and reviewed artifacts.
+No approval file was created by this task.
+
+Environment (future THU, same production environment as existing scripts):
+source /apps/soft/anaconda3/bin/activate
+conda activate DL_HL
+cd "$REPO_DIR"
+
+Exact CLI (all flags exist):
+python analysis/run_full_nested_finite_direct_outer4.py --sampling-dir "$SAMPLING_DIR" --initial-checkpoint "$INITIAL_CHECKPOINT" --output "$RUN_ROOT" --device cuda:0 --parent-batch-size 128 --fit-parent-batch-size 128 --firm-batch-size 512 --execute-approved --approval "$APPROVAL_FILE"
+
+Exact resume CLI (same immutable source, config, artifacts and approved run):
+python analysis/run_full_nested_finite_direct_outer4.py --sampling-dir "$SAMPLING_DIR" --initial-checkpoint "$INITIAL_CHECKPOINT" --output "$RUN_ROOT" --device cuda:0 --parent-batch-size 128 --fit-parent-batch-size 128 --firm-batch-size 512 --execute-approved --approval "$APPROVAL_FILE" --resume
+
+Non-executing plan (safe, no approval/optimizer):
+python analysis/run_full_nested_finite_direct_outer4.py --sampling-dir "$SAMPLING_DIR" --initial-checkpoint "$INITIAL_CHECKPOINT" --output "$RUN_ROOT"
+
+Future script: slurm/run_full_nested_finite_direct_outer4_a800.slurm
+Required environment: REPO_DIR, REQUIRED_COMMIT, RUN_ROOT (NEW persistent directory), SAMPLING_DIR, INITIAL_CHECKPOINT, APPROVAL_FILE.
+RESUME=1 passes --resume; default cold new run.
+No sbatch or srun was executed. This file is a plan, not an auto-submission hook.
+
+Existing local reviewed artifacts for deployment:
+SAMPLING_DIR=/Users/ballinliu/Desktop/PHD/Project1/DL_AP_Tensor/cachedir/full_nested_finite_direct_outer4_20261020_review/v2/sampling
+INITIAL_CHECKPOINT=/Users/ballinliu/Desktop/PHD/Project1/DL_AP_Tensor/cachedir/full_nested_finite_direct_outer4_20261020_review/v2/initial_combined_checkpoint.pt
+These local paths must be deployed to THU and verified by hash, not blindly used on the server.
