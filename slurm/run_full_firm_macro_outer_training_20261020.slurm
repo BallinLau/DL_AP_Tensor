@@ -171,7 +171,7 @@ python3 -u analysis/run_full_nested_equilibrium.py \
   --macro-validation-max-candidate-budget 256 \
   --macro-minimum-partial-train 64 \
   --macro-minimum-partial-validation 16 \
-  --macro-parent-batch-size 32 \
+  --macro-parent-batch-size 16 \
   --macro-candidate-distribution-design restricted_beta_full_outer_v1 \
   --max-initial-weighted-b-mean 0.30 \
   --initial-total-k-min 45 \
