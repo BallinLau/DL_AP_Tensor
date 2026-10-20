@@ -1,5 +1,9 @@
 # Finite Direct 四轮 Runner 集成审查
 
+最新限定审查修复见 `approval_metrics_patch_report.md`：approval schema v2额外绑定输入artifacts，
+每轮最后SDF chunk后增加固定Validation-only post-SDF重模拟，并从现有账本生成跨Outer历史与图。
+下文49项是原bdb58fc集成基线测试，不代替新补丁的定向测试结果。
+
 ## 结论与授权
 
 基于 `2a456f000ab57e3a55c3956a7e2e0d430aa0254e` 补齐独立执行器。

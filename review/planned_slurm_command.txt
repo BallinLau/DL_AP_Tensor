@@ -1,5 +1,13 @@
 NOT EXECUTED. Requires explicit user approval, deployment of the reviewed clean commit and reviewed artifacts.
 No approval file was created by this task.
+Approval schema v2: review/approval_schema.json. Legacy source/plan-only approval is rejected.
+Required identity fields: schema_version=2, approved (explicit human authorization), source_commit,
+plan_fingerprint, sampling_signature_fingerprint, sampling_signature_sha256, initial_checkpoint_sha256.
+sampling_signature_fingerprint is the existing sampling_signature.json fingerprint field.
+sampling_signature_sha256 binds the actual signature file including its per-artifact manifest.
+initial_checkpoint_sha256 binds the initial combined checkpoint bytes.
+No absolute deployment path is an approval identity: byte-identical deployment is allowed.
+For review only, inspect hashes using shasum/sha256sum and inspect the signature JSON; do not create an approved=true file.
 
 Environment (future THU, same production environment as existing scripts):
 source /apps/soft/anaconda3/bin/activate
@@ -24,3 +32,6 @@ Existing local reviewed artifacts for deployment:
 SAMPLING_DIR=/Users/ballinliu/Desktop/PHD/Project1/DL_AP_Tensor/cachedir/full_nested_finite_direct_outer4_20261020_review/v2/sampling
 INITIAL_CHECKPOINT=/Users/ballinliu/Desktop/PHD/Project1/DL_AP_Tensor/cachedir/full_nested_finite_direct_outer4_20261020_review/v2/initial_combined_checkpoint.pt
 These local paths must be deployed to THU and verified by hash, not blindly used on the server.
+The current four-Outer plan additionally includes one POST_SDF_VALIDATION_RESIMULATION per Outer,
+after the last SDF chunk, using only the SAME fixed Validation bank/CRN with no optimizer/root.
+Training budgets and CLI flags are unchanged; plan_fingerprint must be obtained from the NEW reviewed code.

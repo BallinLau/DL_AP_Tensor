@@ -38,7 +38,7 @@ def test_cli_defaults_and_approval_boundary(tmp_path):
     assert require_approval(args,training_plan(),'commit') is False
     args.execute_approved=True
     with pytest.raises(RuntimeError,match='approval'): require_approval(args,training_plan(),'commit')
-    path=tmp_path/'approval.json'; path.write_text(json.dumps(dict(approved=True,source_commit='wrong')))
+    path=tmp_path/'approval.json'; path.write_text(json.dumps(dict(approved=False,source_commit='wrong')))
     args.approval=path
     with pytest.raises(RuntimeError,match='exact'): require_approval(args,training_plan(),'commit')
 

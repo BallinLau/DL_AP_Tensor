@@ -73,7 +73,7 @@ def stage_plan():
     for outer in range(4):
         stages=['reuse_verified_firm'] if outer==0 else ['finite_firm_bank','P0_PI','Q','BP_distillation']
         stages+=['macro_D0','FC1_0','macro_D1_refresh','FC1_1','macro_D2_refresh',
-                 'SDF_TRUE_ONLY_chunk0','SDF_TRUE_ONLY_chunk1','cross_block','outer_checkpoint']
+                 'SDF_TRUE_ONLY_chunk0','SDF_TRUE_ONLY_chunk1','POST_SDF_VALIDATION_RESIMULATION','cross_block','outer_checkpoint']
         rows.extend(dict(outer=outer,stage=s,completed=False) for s in stages)
     return rows
 

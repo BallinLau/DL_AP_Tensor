@@ -18,6 +18,9 @@ cd "${REPO_DIR:?Set immutable reviewed checkout}"
 : "${SAMPLING_DIR:?Set locked reviewed sampling directory}"
 : "${INITIAL_CHECKPOINT:?Set verified combined checkpoint}"
 : "${APPROVAL_FILE:?Separate explicit user approval required}"
+# Schema v2 also binds sampling_signature fingerprint + file SHA and the
+# initial combined checkpoint SHA. The Python gate verifies actual contents;
+# changing SAMPLING_DIR/INITIAL_CHECKPOINT cannot bypass approval by path alone.
 [[ "$(git rev-parse HEAD)" == "$REQUIRED_COMMIT" ]]
 [[ -z "$(git status --porcelain)" ]]
 export PYTHONUNBUFFERED=1

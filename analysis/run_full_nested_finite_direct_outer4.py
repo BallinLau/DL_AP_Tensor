@@ -23,7 +23,8 @@ import torch
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 from analysis.nested_equilibrium_utils import (atomic_torch_save,atomic_write_json,module_hash,
-    stable_json_hash,capture_training_transaction,restore_training_transaction,seed_all,require_finite_module)
+    stable_json_hash,capture_training_transaction,restore_training_transaction,seed_all,require_finite_module,
+    capture_rng_state,restore_rng_state)
 from analysis.finite_direct_outer4_state import StageJournal
 from data.finite_direct_runtime import (OPERATOR,load_locked_sampling,generate_dataset,
     firm_bank_from_captures,conditional_child_bank,check_firm_lineage,verify_cache)
@@ -37,6 +38,7 @@ from analysis.test_frozen_policy_root_solve import P_PREFIXES,Q_PREFIXES
 from training.episode import SDFTrainingPhase
 from training.sdf_shock_bank import SDFShockBank,_make_generator
 from training.inner_fixed_point import InnerFPCollocationBank,InnerFPChildBank
+from analysis.finite_direct_outer_metrics import economic_metrics,write_histories
 
 
 @dataclass(frozen=True)
@@ -72,6 +74,7 @@ def stages(budget=Budget()):
             for epoch in range(1,budget.fc1_max_epochs+1): yield outer,'FC1',dict(macro=macro,epoch=epoch)
             yield outer,'data',dict(version=macro+1)
         for chunk in range(budget.sdf_chunks): yield outer,'SDF',dict(chunk=chunk)
+        yield outer,'post_sdf_validation',{}
         yield outer,'cross_block',{}
         yield outer,'outer_commit',{}
 
@@ -94,8 +97,19 @@ def require_approval(args,plan,commit):
     if not args.execute_approved: return False
     if args.approval is None: raise RuntimeError('explicit user approval file required')
     approval=json.loads(args.approval.read_text())
-    expected=dict(approved=True,source_commit=commit,plan_fingerprint=stable_json_hash(plan))
-    if any(approval.get(k)!=v for k,v in expected.items()): raise RuntimeError('approval does not match exact source/plan')
+    head=dict(schema_version=2,source_commit=commit,plan_fingerprint=stable_json_hash(plan))
+    if approval.get('approved') is not True or any(approval.get(k)!=v for k,v in head.items()):
+        raise RuntimeError('approval does not match exact source/plan/input artifacts')
+    signature_path=args.sampling_dir/'sampling_signature.json'
+    signature=json.loads(signature_path.read_text())
+    expected=dict(**head,
+        sampling_signature_fingerprint=signature['fingerprint'],
+        sampling_signature_sha256=file_hash(signature_path),
+        initial_checkpoint_sha256=file_hash(args.initial_checkpoint))
+    # The signature file SHA also binds its per-artifact hash manifest: changing
+    # the bank hashes while retaining a configuration fingerprint cannot pass.
+    if approval.get('approved') is not True or any(approval.get(k)!=v for k,v in expected.items()):
+        raise RuntimeError('approval does not match exact source/plan/input artifacts')
     if subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip():
         raise RuntimeError('formal execution requires clean source checkout')
     return True
@@ -301,6 +315,8 @@ class ProductionBackend:
                 self.state['data'][f'{outer}/D{version}/{split}']=dict(path=str(path),manifest_sha256=file_hash(path/'manifest.json'))
                 result[split]=coverage(frame,len(self.banks[split]['state']['x']))
                 result[split].update(evaluate(self.models['sdf_fc1'],frame,self.episode.device))
+                result.setdefault('economic_metrics',[]).extend(economic_metrics(
+                    frame,self.schedules[split],outer=outer,stage=f'D{version}'))
                 if not len(rows.fc1): raise RuntimeError('NO_LEGAL_FC1_LABELS')
             # Build fixed evaluation bank from initial models/CRN even in Outer0.
             if 'probe_bank' not in self.state:
@@ -316,6 +332,7 @@ class ProductionBackend:
             return result
         if kind=='FC1': return self._fc1_epoch(outer,i)
         if kind=='SDF': return self._sdf_chunk(outer,i['chunk'])
+        if kind=='post_sdf_validation': return self._post_sdf_validation(outer)
         if kind=='cross_block': return self._cross(outer)
         if kind=='outer_commit':
             self.state['outer_metrics'][str(outer)]['committed_hashes']=hashes(self.models)
@@ -323,6 +340,30 @@ class ProductionBackend:
             return dict(checkpoint=str(path),sha256=file_hash(path),completed=True,
                 convergence='NOT_ASSERTED_FROM_TRAINING_LOSS')
         raise ValueError(kind)
+
+    @torch.no_grad()
+    def _post_sdf_validation(self,outer):
+        stage='POST_SDF_VALIDATION_RESIMULATION'; split='validation'
+        # Never read self._data(outer,2,...): D2 predates the SDF optimizer.
+        # Dedicated stage/path plus all current network hashes prevent reuse.
+        path=self.root/f'outer_{outer:03d}'/stage/split
+        before=hashes(self.models)
+        modes={m:m.training for model in self.models.values() for m in model.modules()}
+        rng=capture_rng_state()
+        try:
+            for model in self.models.values(): model.eval()
+            frame,_,manifest=generate_dataset(self.models,self.episode,self.banks[split],self.schedules[split],
+                self.signature,path,outer=outer,stage=stage,parent_batch_size=self.args.parent_batch_size,capture=False)
+        finally:
+            for module,mode in modes.items(): module.training=mode
+            restore_rng_state(rng)
+        if hashes(self.models)!=before: raise RuntimeError('post-SDF evaluation mutated model')
+        return dict(evaluation=stage,split=split,path=str(path),manifest_sha256=file_hash(path/'manifest.json'),
+            crn_hash=manifest['provenance']['crn_hash'],
+            economic_metrics=economic_metrics(frame,self.schedules[split],outer=outer,stage=stage))
+
+    def write_histories(self,results,*,figures=False):
+        write_histories(self.root,results,figures=figures)
 
     def _bp(self,banks,child_payloads,output):
         # Use actual production BP cache/distillation; minimal parent adapter
@@ -402,8 +443,10 @@ class ProductionBackend:
         if e.sdf_fc1_step_count<=start: raise RuntimeError('SDF chunk executed no optimizer steps')
         # Production forward-only validation. No strict-convergence early stop.
         metrics=rows[-1]['validation']
-        atomic_write_json(self.root/f'outer_{outer:03d}'/f'sdf_chunk{chunk}_history.json',rows)
+        history_path=self.root/f'outer_{outer:03d}'/f'sdf_chunk{chunk}_history.json'
+        atomic_write_json(history_path,rows)
         return dict(optimizer_steps=e.sdf_fc1_step_count-start,epochs=50,validation=metrics,
+                    al_history_path=str(history_path),al_history_sha256=file_hash(history_path),
                     al=e._get_sdf_al_state(),fresh_bank_identity=stable_json_hash(fresh_state(e)))
 
     def _cross(self,outer,label='post_macro'):
@@ -420,7 +463,7 @@ class ProductionBackend:
         qproblem,regimes=build_q_survival_problem(episode=self.episode,initial_model=model,frozen_p_model=model,
             parents=parents,children=children,batch_size=self.args.firm_batch_size,m_mode='current_sdf_child',include_all_regimes=True)
         qmetrics=evaluate_q_problem(model,self.episode,qproblem)
-        result=dict(P=pmetrics,Q=qmetrics,regimes=regimes,fixed_parent_hash=bank.fingerprint,
+        result=dict(P=pmetrics,Q=qmetrics,regimes=regimes,probe_kind='FIXED_7D_PROBE',label=label,fixed_parent_hash=bank.fingerprint,
                     current_macro=module_hash(self.models['sdf_fc1']))
         atomic_write_json(self.root/f'outer_{outer:03d}'/f'cross_block_{label}.json',result)
         return result
@@ -429,6 +472,8 @@ class ProductionBackend:
 def drive(backend,journal,budget=Budget()):
     for outer,kind,indices in stages(budget):
         journal.run(stage_id(outer,kind,indices),lambda o=outer,k=kind,i=indices:backend.execute(o,k,i))
+        if hasattr(backend,'write_histories') and kind in ('data','SDF','post_sdf_validation','cross_block','outer_commit'):
+            backend.write_histories(journal.results,figures=kind in ('post_sdf_validation','outer_commit'))
 
 
 def parse_args(argv=None):

@@ -1,5 +1,16 @@
 Review only. No production optimizer step executed.
 
+LATEST LIMITED PATCH (base bdb58fc):
+PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/private/tmp/fc1_mpl_cache PYTHONPATH=. /Users/ballinliu/anaconda3/bin/python -m pytest -q -p no:cacheprovider tests/test_finite_direct_approval_metrics_patch.py tests/test_finite_direct_outer4_runner.py tests/test_finite_direct_outer4_resume.py tests/test_finite_direct_review_preparation.py::test_plan_preserves_four_outers_and_no_outer0_firm_retrain
+Result: 26 passed in 4.48s.
+Approval content substitution/path relocation, no production entry on invalid approval, grouped CPU ledger statistics,
+failed defined accounts preserved, explicit NOT_AVAILABLE, post-SDF cache/no-optimizer/mode/RNG isolation,
+CSV/figures/idempotence and original StageJournal resume covered.
+No approved=true file generated: valid-approval fixture is in memory only.
+No GPU benchmark, production optimization, Slurm, or independent numerical experiment.
+
+The following 49-test entry is the prior bdb58fc integration baseline, not a claim that it was rerun for this limited patch.
+
 Command (project Conda Python):
 PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/private/tmp/fc1_mpl_cache PYTHONPATH=. /Users/ballinliu/anaconda3/bin/python -m pytest -q -p no:cacheprovider tests/test_finite_direct_macro_production_adapter.py tests/test_finite_direct_outer4_runner.py tests/test_finite_direct_outer4_resume.py tests/test_finite_direct_firm_bank.py tests/test_finite_direct_sampling.py tests/test_finite_direct_macro_contract.py tests/test_finite_direct_review_preparation.py tests/test_fc1_self_consistent_macro.py
 

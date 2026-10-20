@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Finite Direct execution approval schema v2 - NOT an approval artifact",
+  "type": "object",
+  "required": ["schema_version", "approved", "source_commit", "plan_fingerprint", "sampling_signature_fingerprint", "sampling_signature_sha256", "initial_checkpoint_sha256"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "approved": {"type": "boolean", "const": true},
+    "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "plan_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sampling_signature_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sampling_signature_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "initial_checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
