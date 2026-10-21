@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CONTINUATION_APPROVAL_V5_HSTAR_H50 (schema only, NOT an approval)",
+  "type": "object",
+  "required": [
+    "approved",
+    "schema_name",
+    "schema_version",
+    "source_commit",
+    "plan_fingerprint",
+    "sampling_signature_fingerprint",
+    "source_checkpoint_sha256",
+    "input_artifact_sha256",
+    "root_fingerprint",
+    "horizon",
+    "operator"
+  ],
+  "properties": {
+    "approved": {
+      "type": "boolean"
+    },
+    "schema_name": {
+      "const": "CONTINUATION_APPROVAL_V5_HSTAR_H50"
+    },
+    "schema_version": {
+      "const": 5
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "plan_fingerprint": {
+      "type": "string"
+    },
+    "sampling_signature_fingerprint": {
+      "type": "string"
+    },
+    "source_checkpoint_sha256": {
+      "type": "string"
+    },
+    "input_artifact_sha256": {
+      "type": "object",
+      "required": [
+        "sampling_signature.json",
+        "train_initial_bank.pt",
+        "validation_initial_bank.pt"
+      ]
+    },
+    "root_fingerprint": {
+      "type": "string"
+    },
+    "horizon": {
+      "const": 50
+    },
+    "operator": {
+      "const": "INITIAL_HSTAR_H50_BROAD_MACRO_V1"
+    }
+  },
+  "description": "No approved=true instance was created. Runtime compares every expected binding to actual files and source."
+}

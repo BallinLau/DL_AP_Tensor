@@ -1,0 +1,91 @@
+{
+  "version": "INITIAL_HSTAR_H50_BROAD_MACRO_V1",
+  "horizon": 50,
+  "primary_branch": 0,
+  "children": 2,
+  "start_outer": 12,
+  "end_outer": 15,
+  "train_parents": 8192,
+  "validation_parents": 2048,
+  "firms": 200,
+  "initial_root": {
+    "solver_mode": "strict_global",
+    "coarse_points": 10,
+    "refinement_points": 20,
+    "max_refinement_rounds": 4,
+    "support_lower": -8.0,
+    "support_upper": 2.0,
+    "support_padding": 2.0,
+    "residual_tolerance": 1e-05,
+    "width_tolerance": 1e-05,
+    "candidate_chunk_size": 262144,
+    "fast_alphas": [
+      1.0,
+      0.5,
+      0.25,
+      0.125
+    ],
+    "fast_local_correction_rounds": 2,
+    "fast_max_evaluations": 8,
+    "fast_improvement_noise_tolerance": 1e-10
+  },
+  "root_only_t0": true,
+  "finite_operator": "finite_direct_parent_exit_before_child_v2",
+  "budget": {
+    "equilibrium_outer_max": 4,
+    "firm_inner_max": 3,
+    "p_policy_outer_max": 3,
+    "p_adam_steps": 200,
+    "p_lbfgs_max_iter": 100,
+    "q_picard_outer_max": 3,
+    "q_fit_steps": 300,
+    "policy_distill_max_steps": 1000,
+    "macro_inner_max": 2,
+    "fc1_min_epochs": 25,
+    "fc1_max_epochs": 40,
+    "fc1_patience": 10,
+    "sdf_chunks": 2,
+    "sdf_epochs_per_chunk": 50
+  },
+  "firm_rows": {
+    "train": 8192,
+    "validation": 2048
+  },
+  "calculated_fraction": 0.5,
+  "macro_pair_budget": {
+    "train": 8192,
+    "validation": 2048
+  },
+  "sdf_pair_budget": {
+    "train": 8192,
+    "validation": 2048
+  },
+  "optimizer_budget": "UNCHANGED; BOUNDED_LOCKED_SUBSET_PER_DATA_STAGE",
+  "firm_sampling": "LINEAGE_TIME_MACRO_STRATIFIED",
+  "time_strata": [
+    [
+      0,
+      9
+    ],
+    [
+      10,
+      29
+    ],
+    [
+      30,
+      49
+    ]
+  ],
+  "beta_empirical": "50:50",
+  "recent_archive": "70:30",
+  "empirical_parent_counts": [
+    2867,
+    1229
+  ],
+  "validation": "FIXED_INITIAL_BANK_AND_CRN; HSTAR_RECALIBRATED_IF_MODEL_CHANGES",
+  "training_distribution_is_not_population": true,
+  "fc2": false,
+  "plan_fingerprint": "4961f9a63a5491730718ce2e4c419798384c60e2d651138a90e212a28c2c766f",
+  "stage_sequence_fingerprint": "c9f314f5886dc1de778cc75669df8fd7e636f4c492ec4861488ed78f78da7b59",
+  "stage_count": 449
+}

@@ -1,0 +1,9 @@
+# 仅计划。未执行。需要用户下一次批准、V5内容绑定、干净源码及持久磁盘核验。
+# 不能复用旧v4文件。不得在本轮生成approved=true。
+REPO_DIR=<new-reviewed-commit-clean-checkout>
+RUN_ROOT=/home/fit/zhuyingz/WORK/LiuHao/cachedir/initial_hstar_h50_broad_macro_20261021
+SAMPLING_DIR=<reviewed-8192-2048-sampling>
+INITIAL_CHECKPOINT=/home/fit/zhuyingz/WORK/LiuHao/cachedir/finite_direct_dynamic_outer4_11_v2_97a0181_r1/outer_011/outer_complete.pt
+USER_APPROVAL_JSON=<future-user-approved-v5-json>
+# 用户批准且补齐部署核验后才可运行：
+# sbatch --export=ALL,REPO_DIR=...,RUN_ROOT=...,SAMPLING_DIR=...,INITIAL_CHECKPOINT=...,USER_APPROVAL_JSON=... slurm/run_initial_hstar_h50_broad_macro_a800.slurm

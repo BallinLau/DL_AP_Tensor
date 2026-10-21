@@ -1,0 +1,9 @@
+CPU定向测试：111 passed, 6 skipped（8.56秒；最终重复结果另见交付复核）。
+测试包含：V5默认不执行/拒旧schema/artifact内容绑定，t0-only根接口，时间分层，真实Macro child/M重建，多期pair索引，BP-only promotion别名安全，动态pool比例及Beta不变，50步单主干与缓存重用。
+原生产Default/Exit、Parent/two-child、Macro contracts、classification、Journal resume回归同时运行。
+6个既有测试因缺少本地历史review artifact跳过，不得记为PASS，详见最终pytest -rs结果。
+真实冻结检查：4个真实Validation Parents、Outer11模型，optimizer_steps=0，模型hash不变，FC2调用0。
+GPU、正式训练、Slurm：未运行。
+bash -n 与 git diff --check：PASS。
+跳过项：Job701387 audit fixture；prepared continuation artifacts；原8192/2048构造fixture；historical forward-only fixture；历史metrics fixture；certified input bindings。跳过不算通过。
+额外真实CPU Bellman forward：8行（4 calculated / 4 on-policy），重建children/M，P0/PI动态RHS对production target最大差约5.96e-8，通过原1e-5 parity阈值；optimizer step=0。

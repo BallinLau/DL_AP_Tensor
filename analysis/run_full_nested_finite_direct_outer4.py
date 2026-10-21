@@ -196,7 +196,8 @@ class ProductionBackend:
             policy_distill_max_epochs=1000,policy_distill_max_steps=1000)
         self.economic=AnalysisEconomicConfig.from_current_config()
         self.counter={'ROOT_SEARCH_CALLS':0,'FAST_CLEARING_CALLS':0}
-        install_guards(self.counter)
+        if not getattr(args,'initial_hstar_h50_adapter',False):
+            install_guards(self.counter)
 
     def snapshot(self):
         return dict(transaction=capture_training_transaction(models=self.models,
