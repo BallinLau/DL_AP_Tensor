@@ -23,6 +23,8 @@
 
 历史summary记录batch2048、3inner、8192/2048 donor rows、标准成本版本、所有P/Q/BP阶段完成，Macro hashes与Outer11一致。旧r1在CSV导出发生重复stage字段错误；r2显式导入已提交前缀，不能把97秒r2耗时当成全部训练耗时。
 
+后续补充artifact核验：最终checkpoint的整个sdf_fc1 state_dict、sdf_fc1/FC1 optimizer state、AL state与Outer11 digest均相同；Firm digest不同。历史采样8192行有1211个独立firm-time donor，不能称8192个独立微观源。
+
 ## 不可照搬的部分
 
 旧H50 overlay无条件把全部Firm Bank改为Uniform，并改默认batch2048。新合同要求显式启用，默认关闭；Hybrid配比显式给定，剩余ON_POLICY/CALCULATED保持50:50并输出实际整数配比。旧独立runner的优化流程应复用，不另造不同公式trainer。

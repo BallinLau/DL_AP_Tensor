@@ -1,0 +1,17 @@
+CPU non-optimizing regression command:
+MPLCONFIGDIR=/private/tmp/mpl-hstar /Users/ballinliu/anaconda3/bin/python -m pytest tests/test_h50_coverage_round2.py tests/test_h50_joint_coverage.py tests/test_initial_hstar_h50.py tests/test_h50_continuation_review.py tests/test_dynamic_empirical_exit_fix.py tests/test_finite_direct_outer4_resume.py tests/test_finite_direct_outer4_runner.py -q
+
+Final regression result: 132 passed in 17.40s (previous repeat: 16.89s).
+Earlier scoped round-two result: 92 passed; expanded original Exit/Entry/Journal suite: 130, then 131, then 132 as tests were added. No lowered numeric tolerances.
+
+bash -n slurm/run_initial_hstar_h50_broad_macro_a800.slurm: PASS
+git diff --check: PASS
+Standalone ORIGINAL/UNIFORM plan-only commands and default H50 plan-only: exit 0, no optimizer/model execution.
+
+Actual frozen matched evaluator: complete, 1944 matched states, 4 economic Parents per model, 50 transitions; 0 optimizer/backward, FC2=0.
+Actual next-Outer frozen Bank: complete, 8 candidates, 4 selected, 50 transitions; Validation unchanged, models unchanged.
+
+Preserved diagnostic development errors (not economic failures):
+1. compute_value_target(bp_pred=...) TypeError: use production full compute for regret, value target parity 0.
+2. missing macro columns in invalid terminal suffix: NaN schema only, no finite label imputation.
+3. Inference tensors do not track version counter: model setup switched to no_grad, Entry's weight-version guard preserved.

@@ -45,6 +45,9 @@ def firm_coverage_config(args=None):
 def plan(coverage=None,firm_coverage=None):
     # Epoch sample budgets are proposed for explicit approval, not hidden 50x
     # optimizer expansion. All available time bins are eligible in sampling.
+    firm_coverage=firm_coverage or FirmMacroCoverageConfig()
+    effective_firm_rows=(dict(train=firm_coverage.firm_macro_sampling_budget,validation=min(2048,firm_coverage.firm_macro_sampling_budget))
+        if firm_coverage.firm_macro_coverage_enabled else dict(train=8192,validation=2048))
     execution=[dict(outer=12,kind='baseline',indices={})]
     for o,k,i in stages(replace(Budget(),equilibrium_outer_max=5)):
         if o<1:continue
@@ -53,11 +56,12 @@ def plan(coverage=None,firm_coverage=None):
     return dict(version=VERSION,continuation_contract=CONTRACT,horizon=50,primary_branch=0,children=2,
         initial_train_rule='CERTIFIED_OUTER11_BASE; NEW_IMMUTABLE_JOINT_COVERAGE_TRAIN_BANK',
         joint_coverage=asdict(coverage or JointCoverageConfig()),
-        firm_macro_coverage=asdict(firm_coverage or FirmMacroCoverageConfig()),
+        firm_macro_coverage=asdict(firm_coverage),
+        effective_firm_batch_size=firm_coverage.firm_macro_batch_size if firm_coverage.firm_macro_coverage_enabled else 512,
         start_outer=12,end_outer=15,train_parents=8192,validation_parents=2048,firms=200,
         initial_root=asdict(MarketClearingConfig()),root_only_t0=True,
         finite_operator='finite_direct_parent_exit_before_child_v2',
-        budget=asdict(Budget()),firm_rows=dict(train=8192,validation=2048),
+        budget=asdict(Budget()),firm_rows=effective_firm_rows,
         calculated_fraction=.5,macro_pair_budget=dict(train=8192,validation=2048),
         sdf_pair_budget=dict(train=8192,validation=2048),
         optimizer_budget='UNCHANGED; BOUNDED_LOCKED_SUBSET_PER_DATA_STAGE',

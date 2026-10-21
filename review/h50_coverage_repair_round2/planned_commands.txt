@@ -1,0 +1,8 @@
+PLAN-ONLY examples; no training or Slurm submission authorized:
+
+python analysis/run_uniform_macro_frozen_firm.py --output REVIEW_PLAN_B --distribution-mode ORIGINAL --firm-macro-config review/h50_coverage_repair_round2/standalone_uniform_config.json
+python analysis/run_uniform_macro_frozen_firm.py --output REVIEW_PLAN_C --distribution-mode UNIFORM --firm-macro-config review/h50_coverage_repair_round2/standalone_uniform_config.json
+python analysis/run_initial_hstar_h50_broad_macro.py --output REVIEW_DEFAULT_H50_PLAN
+
+Do not add --execute or --execute-approved during this task.
+hybrid_requires_user_fraction.json deliberately fails validation until the user chooses an explicit numeric fraction. It is NOT a runnable formal default and NOT an approval artifact.

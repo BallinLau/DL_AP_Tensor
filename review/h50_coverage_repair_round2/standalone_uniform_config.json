@@ -1,0 +1,11 @@
+{
+  "firm_macro_coverage_enabled": true,
+  "firm_macro_coverage_mode": "STANDALONE",
+  "firm_macro_h_bounds": [-6, 2],
+  "firm_macro_ell_bounds": [-2, 5],
+  "firm_macro_sampling_seed": 20261022,
+  "firm_macro_batch_size": 2048,
+  "firm_macro_inner_cycles": 3,
+  "firm_macro_coverage_fraction": 1.0,
+  "firm_macro_sampling_budget": 8192
+}

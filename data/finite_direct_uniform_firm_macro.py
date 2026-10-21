@@ -83,6 +83,7 @@ def bounded_donor_bank(bank,rows,*,seed):
         if torch.is_tensor(v) and v.ndim and len(v)==n:meta[key]=v[ids].clone()
         elif isinstance(v,list) and len(v)==n:meta[key]=[v[j] for j in ids.tolist()]
     meta['donor_selection_indices']=ids
+    meta['unique_source_firm_time_count']=micro_donor_count(meta)
     return InnerFPCollocationBank(bank.parent_states[ids].clone(),bank.source_kind[ids].clone(),seed,bank.split,meta)
 
 
@@ -105,6 +106,13 @@ def configured_macro_bank(bank,cfg,*,seed):
     order=torch.cat([v for v in pools])
     # Sort by within-stratum rank first, then reproducibly randomized stratum.
     ranks=torch.cat([torch.arange(len(v)) for v in pools]);order=order[torch.argsort(ranks,stable=True)]
+    leaders=[]
+    for eta in (0,1):
+        matches=order[p[order,2]==eta]
+        if len(matches):leaders.append(matches[0])
+    if nuni and nuni<len(leaders):raise ValueError('Uniform budget cannot cover both available eta strata')
+    if leaders:
+        leaders=torch.stack(leaders);order=torch.cat([leaders,order[~torch.isin(order,leaders)]])
     uniform_ids=order[:nuni];remaining_mask=torch.ones(n,dtype=torch.bool);remaining_mask[uniform_ids]=False
     residual=n-nuni;ncal=residual//2;non=residual-ncal
     kinds=bank.metadata['source_kind']
@@ -129,14 +137,15 @@ def configured_macro_bank(bank,cfg,*,seed):
         source_composition=dict(FIRM_ON_POLICY=non,FIRM_CALCULATED_MACRO_COLLOCATION=ncal,FIRM_UNIFORM_MACRO_COLLOCATION=nuni),
         synthetic_rows_are_calculated_labels=False,population_distribution=False)
     source_codes=bank.source_kind[ids].clone();source_codes[mask]=2
-    meta['actual_unique_micro_donors']=len(torch.unique(ids))
+    meta['unique_selected_bank_indices']=len(torch.unique(ids))
+    meta['actual_unique_micro_donors']=micro_donor_count(meta)
     return InnerFPCollocationBank(states,source_codes,seed,bank.split,meta)
 
 
 def firm_coverage_summary(bank):
     p=bank.parent_states
     labels=[k if k.startswith('FIRM_') else 'FIRM_'+k for k in bank.metadata.get('source_kind',[])]
-    return dict(rows=len(p),sources=dict(Counter(labels)),
+    return dict(rows=len(p),sources=dict(Counter(labels)),actual_unique_micro_donors=micro_donor_count(bank.metadata),
         eta_counts={str(v):int((p[:,2]==v).sum()) for v in (0,1)},
         b_hist=torch.histc(p[:,0],bins=5,min=0,max=1).tolist(),
         z_quantiles=torch.quantile(p[:,1],torch.tensor([0.,.1,.5,.9,1.])).tolist(),
@@ -145,3 +154,9 @@ def firm_coverage_summary(bank):
         synthetic_proposed=int(bank.metadata.get('synthetic_macro_mask',torch.zeros(len(p))).sum()),
         finite_parent_count=int(torch.isfinite(p).all(1).sum()),rejected_states=0,
         target_finite_states='CHECK_AT_FRESH_TARGET_EVALUATION_NOT_ASSUMED',off_support='REPORTED_NOT_CLIPPED')
+
+
+def micro_donor_count(meta):
+    fields=('path','source_time','source_branch','firm_id')
+    if not all(k in meta for k in fields):return None
+    return len(torch.unique(torch.stack([meta[k].long() for k in fields],1),dim=0))

@@ -119,11 +119,12 @@ def boundary_figures(frames,out,scatter):
         for i,eta in enumerate((0,1)):
             for j,name in enumerate(('BEFORE','AFTER_UNIFORM')):
                 f=frames[name];g=f[(f.macro_case==case)&(f.eta==eta)];v=g.pivot(index='z',columns='b',values='Phat')
-                ax=axes[i,j];ax.pcolormesh(v.columns,v.index,(v.to_numpy()<0),vmin=0,vmax=1,cmap='coolwarm',shading='auto')
+                hard=g.pivot(index='z',columns='b',values='hard_default').to_numpy(dtype=float)
+                ax=axes[i,j];ax.pcolormesh(v.columns,v.index,hard,vmin=0,vmax=1,cmap='coolwarm',shading='auto')
                 if v.to_numpy().min()<0<v.to_numpy().max():ax.contour(v.columns,v.index,v.to_numpy(),levels=[0],colors='black')
                 if scatter is not None:ax.scatter(scatter[0],scatter[1],s=3,c='gold',alpha=.35)
-                ax.set(title=f'{name}; eta={eta}; h={g.h_f.iloc[0]:.3g}, ell={g.ell_f.iloc[0]:.3g}',xlabel='b',ylabel='z')
-        fig.suptitle('Black=current checkpoint boundary; identical real initial scatter; no previous-period boundary')
+                ax.set(title=f'{name}; eta={eta}; h={g.h_f.iloc[0]:.3g}, ell={g.ell_f.iloc[0]:.3g}',xlabel='b',ylabel='z',xlim=(0,1),ylim=(-2,2))
+        fig.suptitle('Red=hard default; blue=survival; gold=same real initial scatter\nBlack=current checkpoint boundary; no previous-period boundary')
         fig.tight_layout();fig.savefig(out/f'four_way_boundary_macro{case}.png',dpi=130);plt.close(fig)
     fig,axes=plt.subplots(1,2,figsize=(10,4))
     for ax,eta in zip(axes,(0,1)):

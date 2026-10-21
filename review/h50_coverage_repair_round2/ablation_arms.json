@@ -1,0 +1,13 @@
+{
+  "status": "CONFIGURATION_ONLY_NO_TRAINING_AUTHORIZATION",
+  "initial_checkpoint_sha256": "9ad7610a1851d06d80c8b2d08052a01532923f7a2808e3a006f5538b404aa94d",
+  "same_micro_donor_bank_sha256": "70bb0d702a34eb29fb163d010b1c26e97c7dafc4a8fc83ab819922f83a79b50f",
+  "frozen_components": ["FC1_C", "FC1_K", "SDF", "Wealth"],
+  "same_seed": 20261022,
+  "same_batch_size_B_C": 2048,
+  "same_optimizer_initialization_B_C": "SOURCE_PERSISTENT_STATE_PLUS_IDENTICAL_PRODUCTION_STAGE_LOCAL_P_Q",
+  "same_lr_schedule_B_C": "EXISTING_PRODUCTION_NO_OVERRIDE",
+  "A": {"distribution": "ORIGINAL", "additional_inner": 0, "optimizer_steps": 0, "evaluation_only": true},
+  "B": {"distribution": "ORIGINAL", "additional_inner": 3, "runner": "analysis/run_uniform_macro_frozen_firm.py", "cli_mode": "--distribution-mode ORIGINAL", "checkpoint_available": false},
+  "C": {"distribution": "UNIFORM", "additional_inner": 3, "runner": "analysis/run_uniform_macro_frozen_firm.py", "cli_mode": "--distribution-mode UNIFORM", "existing_checkpoint_sha256": "d26b9004210eef0be224c79d1f1faef6e59692e48ceba45050e616865ef2d325"}
+}

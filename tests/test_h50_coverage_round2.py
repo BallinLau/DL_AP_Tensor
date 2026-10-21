@@ -48,6 +48,7 @@ def test_explicit_hybrid_composition_and_default_off():
     c=FirmMacroCoverageConfig(firm_macro_coverage_enabled=True,firm_macro_coverage_fraction=.25)
     u=configured_macro_bank(d,c,seed=8)
     assert u.metadata['source_composition']=={'FIRM_ON_POLICY':48,'FIRM_CALCULATED_MACRO_COLLOCATION':48,'FIRM_UNIFORM_MACRO_COLLOCATION':32}
+    assert set(u.parent_states[u.metadata['synthetic_macro_mask'],2].tolist())=={0,1}
     assert u.fingerprint==configured_macro_bank(d,c,seed=8).fingerprint
 
 
@@ -167,3 +168,20 @@ def test_shared_bounded_micro_donors_and_source_event_conservation(tmp_path):
     root=tmp_path/'store';root.mkdir();f=source_event_table(diagnostic_fixture(root),tmp_path/'out')
     row=f[f.t==1].iloc[0]
     assert row.valid_child_rows==3 and row.complete_sdf_pairs==1 and row.main_spine_alive_paths==1
+
+
+def test_micro_donor_identity_not_bank_index_count():
+    d=donor();d.metadata.update(path=torch.zeros(128,dtype=torch.long),firm_id=torch.arange(128)%8,
+        source_time=torch.zeros(128,dtype=torch.long),source_branch=torch.zeros(128,dtype=torch.long))
+    cfg=FirmMacroCoverageConfig(firm_macro_coverage_enabled=True,firm_macro_coverage_fraction=.25)
+    result=configured_macro_bank(d,cfg,seed=3)
+    assert result.metadata['actual_unique_micro_donors']==8
+    assert result.metadata['unique_selected_bank_indices']>8
+
+
+def test_plan_binds_effective_firm_budget_without_changing_default():
+    from analysis.run_initial_hstar_h50_broad_macro import plan
+    assert plan()['firm_rows']=={'train':8192,'validation':2048}
+    cfg=FirmMacroCoverageConfig(firm_macro_coverage_enabled=True,firm_macro_coverage_fraction=.25,firm_macro_sampling_budget=4096)
+    assert plan(firm_coverage=cfg)['firm_rows']=={'train':4096,'validation':2048}
+    assert plan(firm_coverage=cfg)['effective_firm_batch_size']==2048
