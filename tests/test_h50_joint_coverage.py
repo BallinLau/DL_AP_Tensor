@@ -207,3 +207,12 @@ def test_comparison_rejects_changed_validation_crn(tmp_path):
     atomic_write_json(q/'stage_provenance.json',meta)
     pd.read_csv(p/'diagnostics/path_survival_by_time.csv').to_csv(q/'path_survival_by_time.csv',index=False)
     with pytest.raises(ValueError,match='UNFAIR'):compare_validation_stages({'D0':p/'diagnostics','D1':q},tmp_path/'compare')
+
+
+def test_comparison_reports_endpoint_quantiles_without_fake_future_stages(tmp_path):
+    p=tmp_path/'v';p.mkdir();write_dashboard(diagnostic_fixture(p),p/'diagnostics')
+    out=tmp_path/'compare';compare_validation_stages({'D0':p/'diagnostics'},out)
+    rows=pd.read_csv(out/'comparison_d0_d1_d2.csv')
+    assert rows.loc[rows.stage=='D0','last_valid_t_p50'].iloc[0]==.5
+    assert rows.loc[rows.stage.isin(['D1','D2']),'status'].eq('NO_ACTUAL_STAGE_DATA').all()
+    assert (out/'macro_coverage_before_after_fc1.png').exists()

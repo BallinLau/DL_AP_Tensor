@@ -1,0 +1,29 @@
+{
+  "base_commit": "c725c69bffecfde0673f8c77423abc340d172234",
+  "data_generation_commit": "f48b2e2a7af02435ded2a43b47e0f30005cd7500",
+  "branch": "exp/h50-joint-macro-coverage-20261021",
+  "targeted_cpu_tests": {"status": "PASS", "passed": 77},
+  "bash_syntax": "PASS",
+  "diff_check": "PASS",
+  "frozen_probe": {
+    "status": "COMPLETE", "candidates": 32, "strict_root_pass": 32,
+    "economic_valid_selected": 29, "underfilled": 3,
+    "valid_fc1_child_rows": 197, "complete_sdf_pairs": 95,
+    "continuable_paths_at_t50": 1, "models_unchanged": true,
+    "generation_tracked_dirty": false, "peak_cpu_rss_gib": 3.405792236328125
+  },
+  "optimizer_steps": 0,
+  "fc2_calls": 0,
+  "economic_calibration_changed": false,
+  "root_algorithm_changed": false,
+  "training_objectives_changed": false,
+  "population_sampling_claimed": false,
+  "late_coverage_sufficiency": "NOT_ESTABLISHED",
+  "gpu_performance": "NOT_TESTED",
+  "trained_convergence": "NOT_TESTED",
+  "approval_created": false,
+  "formal_training_started": false,
+  "slurm_job_submitted": false,
+  "pushed": false,
+  "current_phase": "WAITING_FOR_USER_REVIEW"
+}

@@ -204,6 +204,11 @@ def compare_validation_stages(stage_directories,output):
         if name not in loaded:records.append(dict(stage=name,status='NO_ACTUAL_STAGE_DATA'));continue
         p,s=loaded[name];row=dict(stage=name,status='ACTUAL_FROZEN_STAGE',total_initial_paths=p['scheduled_initial_paths'])
         for t in (1,5,10,20,30,50):row[f'survived_t{t}']=int(s.loc[s.t==t,'main_spine_alive_paths'].iloc[0])
+        endpoint_path=Path(stage_directories[name])/'path_endpoints.csv'
+        ends=pd.read_csv(endpoint_path) if endpoint_path.exists() else pd.DataFrame()
+        values=ends.last_valid_t.dropna().to_numpy() if 'last_valid_t' in ends else np.array([])
+        for q in (10,50,90):row[f'last_valid_t_p{q}']=float(np.percentile(values,q)) if len(values) else np.nan
+        row['right_censored_paths']=int(ends.right_censored.sum()) if 'right_censored' in ends else None
         row['attribution']='SYSTEM_CHANGE_NOT_FC1_ONLY' if p['firm_checkpoint_hash']!=reference['firm_checkpoint_hash'] or p['sdf_checkpoint_hash']!=reference['sdf_checkpoint_hash'] else 'MATCHED_FIRM_SDF; CHECK_FC1_HASH'
         records.append(row)
     pd.DataFrame(records).to_csv(output/'comparison_d0_d1_d2.csv',index=False)
