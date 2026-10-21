@@ -19,8 +19,10 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 from analysis.run_initial_hstar_h50_broad_macro import (
     H50Backend,approval_binding,require_approval,plan,coverage_config,firm_coverage_config)
+from analysis.run_full_nested_finite_direct_outer4 import ProductionBackend
+from analysis.finite_direct_continuation_state import verify_optimizer_restored,state_digest
 from analysis.h50_source_certification import certify,verify_fixed_validation
-from analysis.nested_equilibrium_utils import atomic_write_json
+from analysis.nested_equilibrium_utils import atomic_write_json,restore_training_transaction
 from analysis.run_fc1_self_consistent_macro import hashes
 from data.finite_direct_runtime import load_locked_sampling
 from data.finite_direct_joint_coverage import JointCoverageConfig
@@ -56,11 +58,22 @@ def main():
     verify_fixed_validation(a.sampling_dir)
     # Actual production restore, no simulation or optimization. This verifies
     # persistent optimizer/scheduler/AL and Fresh Pair restoration, not weights only.
-    backend=H50Backend(a,load_locked_sampling(a.sampling_dir),learning)
+    # CUDA Philox generator bytes are not a CPU MT19937 generator state.
+    # Do not call restore_fresh on CPU, convert bytes, or seed a replacement.
+    # The unchanged H50Backend restores the exact saved bytes on CUDA at launch.
+    a.initial_hstar_h50_adapter=True
+    backend=ProductionBackend(a,load_locked_sampling(a.sampling_dir),learning_snapshot=learning)
+    optimizers={**backend.episode.optimizers,'fc1_conditional':backend.fc1}
+    restore_training_transaction(learning['transaction'],models=backend.models,
+        optimizers=optimizers,episode=backend.episode)
+    optimizer_audit={name:verify_optimizer_restored(learning['transaction']['optimizers'][name],opt)
+        for name,opt in optimizers.items()}
     assert all(x['verified'] for x in audits.values())
     before=hashes(backend.models)
     audit=dict(source_commit=commit,certification=audits,
-        restored_optimizer_audit=backend.state['restored_optimizer_audit'],
+        restored_optimizer_audit=optimizer_audit,
+        fresh_pair_state_sha256=state_digest(learning['fresh']['pair_rng']),
+        fresh_pair_restore='ORIGINAL_CUDA_BYTES_PRESERVED; ACTUAL_RESTORE_AT_CUDA_START',
         restored_model_hashes=before,training_performed=False,optimizer_steps=0,
         fixed_validation_verified=True,phase='CPU_PREPARATION_PASS')
     atomic_write_json(deploy/'preflight.json',audit)
