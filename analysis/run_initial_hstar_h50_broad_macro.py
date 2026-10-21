@@ -25,6 +25,7 @@ from data.finite_direct_sampling import file_hash
 from data.market_clearing import MarketClearingConfig
 from analysis.h50_source_certification import CONTRACT, certify, save_bank_reference, load_bank_reference, verify_fixed_validation
 from data.finite_direct_joint_coverage import JointCoverageConfig,build_joint_bank
+from data.finite_direct_uniform_firm_macro import FirmMacroCoverageConfig,configured_macro_bank,firm_coverage_summary
 
 SCHEMA='CONTINUATION_APPROVAL_V5_HSTAR_H50'
 
@@ -35,7 +36,13 @@ def coverage_config(args=None):
     cfg.validate();return cfg
 
 
-def plan(coverage=None):
+def firm_coverage_config(args=None):
+    path=getattr(args,'firm_macro_config',None)
+    cfg=FirmMacroCoverageConfig(**json.loads(path.read_text())) if path else FirmMacroCoverageConfig()
+    cfg.validate();return cfg
+
+
+def plan(coverage=None,firm_coverage=None):
     # Epoch sample budgets are proposed for explicit approval, not hidden 50x
     # optimizer expansion. All available time bins are eligible in sampling.
     execution=[dict(outer=12,kind='baseline',indices={})]
@@ -46,6 +53,7 @@ def plan(coverage=None):
     return dict(version=VERSION,continuation_contract=CONTRACT,horizon=50,primary_branch=0,children=2,
         initial_train_rule='CERTIFIED_OUTER11_BASE; NEW_IMMUTABLE_JOINT_COVERAGE_TRAIN_BANK',
         joint_coverage=asdict(coverage or JointCoverageConfig()),
+        firm_macro_coverage=asdict(firm_coverage or FirmMacroCoverageConfig()),
         start_outer=12,end_outer=15,train_parents=8192,validation_parents=2048,firms=200,
         initial_root=asdict(MarketClearingConfig()),root_only_t0=True,
         finite_operator='finite_direct_parent_exit_before_child_v2',
@@ -64,7 +72,8 @@ def approval_binding(args,commit):
     sampling=args.sampling_dir
     required=['sampling_signature.json','train_initial_bank.pt','validation_initial_bank.pt']
     return dict(schema_name=SCHEMA,schema_version=5,source_commit=commit,
-        plan_fingerprint=stable_json_hash(plan(coverage_config(args))),
+        plan_fingerprint=stable_json_hash(plan(coverage_config(args),firm_coverage_config(args))),
+        firm_macro_coverage_fingerprint=stable_json_hash(asdict(firm_coverage_config(args))),
         joint_coverage_fingerprint=stable_json_hash(asdict(coverage_config(args))),
         sampling_signature_fingerprint=json.loads((sampling/'sampling_signature.json').read_text())['fingerprint'],
         source_checkpoint_sha256=file_hash(args.initial_checkpoint),
@@ -128,7 +137,21 @@ class H50Backend(ProductionBackend):
         self._source_bank_ref=save_bank_reference(self.root,bank,schedule,outer=11,pool_version=pool['fingerprint'])
         self._active_bank_ref=save_bank_reference(self.root,bank,schedule,outer=12,pool_version=pool['fingerprint'])
         self.coverage_cfg=coverage_config(args)
+        self.firm_coverage_cfg=firm_coverage_config(args)
         for name,audit in audits.items():atomic_write_json(self.root/'metadata'/f'{name}.json',audit)
+        if self.firm_coverage_cfg.firm_macro_coverage_enabled:
+            if self.firm_coverage_cfg.firm_macro_coverage_mode!='HYBRID':raise ValueError('STANDALONE uses reviewed Firm-only runner, not Outer')
+            args.firm_batch_size=self.firm_coverage_cfg.firm_macro_batch_size
+
+    def _conditional(self,bank,seed):
+        from data.finite_direct_runtime import conditional_child_bank
+        return conditional_child_bank(self.models['sdf_fc1'],bank,seed=seed,n_child_shocks=2,
+            economic=self.economic,device=self.episode.device,chunk_size=self.args.firm_batch_size,
+            m_min=self.episode.hyperparams.pv_m_clamp_min,m_max=self.episode.hyperparams.pv_m_clamp_max)
+
+    def _firm_coverage_bank(self,bank,outer):
+        cfg=self.firm_coverage_cfg
+        return configured_macro_bank(bank,cfg,seed=cfg.firm_macro_sampling_seed+outer*100003+(100000 if bank.split=='validation' else 0))
 
     def _store(self,outer,stage,split,capture=True,templates=False):
         set_scope(self.models,'frozen')
@@ -151,12 +174,8 @@ class H50Backend(ProductionBackend):
         from analysis.economic_config import AnalysisEconomicConfig
         from data.finite_direct_sampling import state_hash
         def templates():
-            for source in reversed(self.state['pool_sources']):
-                path=Path(source['path'])
-                if source['outer']>=outer or file_hash(path/'manifest.json')!=source['manifest_sha256']:raise ValueError('uncommitted/future empirical source')
-                for shard in ShardStore(path).chunks():
-                    for item in shard['templates']:
-                        if 'dynamic_template' in item:yield item['dynamic_template']
+            from data.finite_direct_long_horizon_empirical import committed_templates
+            yield from committed_templates(self.state['pool_sources'],outer=outer)
             yield from self.archive_templates
         bank,schedule,stats=build_joint_bank(self.initial_train,templates(),outer=outer,
             target=plan()['train_parents'],cfg=self.coverage_cfg,output=self.root/f'outer_{outer:03d}'/'coverage_bank',
@@ -216,6 +235,7 @@ class H50Backend(ProductionBackend):
             store=self._store(outer,'firm_source','validation')
             bank=broad_firm_bank(store,split='validation',max_rows=2048,seed=20361021,
                 calculated_fraction=plan()['calculated_fraction'])
+            bank=self._firm_coverage_bank(bank,outer)
             children=self._conditional(bank,bank.seed+1)
             path=self.root/'immutable_artifacts/fixed_firm_probe.pt'
             atomic_torch_save(path,dict(banks={'validation':bank.payload()},
@@ -238,9 +258,12 @@ class H50Backend(ProductionBackend):
             set_scope(self.models,'frozen');banks={};children={}
             for split in ('train','validation'):
                 store=self._store(outer,'firm_source',split)
-                banks[split]=broad_firm_bank(store,split=split,max_rows=plan()['firm_rows'][split],
+                budget=(self.firm_coverage_cfg.firm_macro_sampling_budget if split=='train' else min(2048,self.firm_coverage_cfg.firm_macro_sampling_budget)) if self.firm_coverage_cfg.firm_macro_coverage_enabled else plan()['firm_rows'][split]
+                banks[split]=broad_firm_bank(store,split=split,max_rows=budget,
                     seed=20261021+(0 if split=='train' else 100000),
                     calculated_fraction=plan()['calculated_fraction'])
+                banks[split]=self._firm_coverage_bank(banks[split],outer)
+                atomic_write_json(directory/f'firm_source_composition_{split}.json',firm_coverage_summary(banks[split]))
                 # Never reuse stored RHS or old forecast-state targets.
                 children[split]=self._conditional(banks[split],banks[split].seed+1)
             check_firm_lineage(banks['train'],banks['validation'])
@@ -331,6 +354,7 @@ def main(argv=None):
     p.add_argument('--source-latest-pointer',type=Path)
     p.add_argument('--source-artifact-dir',type=Path)
     p.add_argument('--coverage-config',type=Path)
+    p.add_argument('--firm-macro-config',type=Path)
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--approval',type=Path)
     p.add_argument('--execute-approved',action='store_true')
@@ -343,7 +367,7 @@ def main(argv=None):
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     if not require_approval(args,commit):
         args.output.mkdir(parents=True,exist_ok=True)
-        atomic_write_json(args.output/'training_plan.json',plan(coverage_config(args)))
+        atomic_write_json(args.output/'training_plan.json',plan(coverage_config(args),firm_coverage_config(args)))
         return 0
     if args.sampling_dir is None or args.initial_checkpoint is None:
         raise ValueError('approved artifact paths required')

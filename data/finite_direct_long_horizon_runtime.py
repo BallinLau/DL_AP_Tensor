@@ -60,6 +60,20 @@ def continuable_nodes(state,records):
     return good
 
 
+def certify_template_accounting(values,observed):
+    """Join predecision realized distributions to SAME node ledger evidence."""
+    by_id={r['parent_candidate_id']:r for r in observed}
+    for value in values:
+        t=value.get('dynamic_template')
+        if t is not None:
+            record=by_id[t['source_path']]
+            t['post_decision_accounting_valid']=bool(record['economic_state_valid'])
+            t['accounting_evidence']=dict(parent_id=record['parent_candidate_id'],
+                time=t['source_time'],branch=t['source_branch'],
+                C_raw=record.get('C_raw_t1'),K_cal=record.get('K_cal_t1'),
+                rule='SAME_NODE_PRODUCTION_LEDGER_NOT_FUTURE_SURVIVAL')
+
+
 @torch.no_grad()
 def promote_child(sim, state, time):
     """Execute only the now-applicable parent financing action, no ledger redo.
@@ -231,11 +245,7 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
                                 for j,pid in enumerate(child['transition_path_id'].tolist())]
                         valid=continuable_nodes(child,observed)
                         node_diagnostics(child,observed,entry_attempted=True)
-                        observed_by_id={r['parent_candidate_id']:r for r in observed}
-                        for value in values:
-                            t=value.get('dynamic_template')
-                            if t is not None:
-                                t['post_decision_accounting_valid']=bool(observed_by_id[t['source_path']]['economic_state_valid'])
+                        certify_template_accounting(values,observed)
                         if diagnostic_observer is not None:
                             diagnostic_observer('POST_DECISION',sim,child,observed,time+1,branch)
                         if capture and branch==1 and time+1<horizon and bool(child['alive'].any()):

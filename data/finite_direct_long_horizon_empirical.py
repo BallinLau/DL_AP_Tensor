@@ -13,6 +13,20 @@ from data.finite_direct_long_horizon_runtime import ShardStore
 from data.finite_direct_sampling import file_hash,capital_groups,state_hash
 
 
+def committed_templates(sources,*,outer):
+    """Only next-Outer activation of SHA-bound POST_SDF Train sources."""
+    for source in reversed(sources):
+        path=Path(source['path'])
+        if source['outer']>=outer:raise ValueError('future/uncommitted Outer empirical activation')
+        if file_hash(path/'manifest.json')!=source['manifest_sha256']:raise ValueError('empirical manifest changed')
+        store=ShardStore(path);p=store.manifest['provenance']
+        if p['split']!='train' or p['stage']!='POST_SDF_TRAIN_EMPIRICAL_SOURCE' or p['outer']!=source['outer']:raise ValueError('wrong empirical source stage/split/outer')
+        for shard in store.chunks():
+            for item in shard.get('templates',[]):
+                if item['split']!='train':raise ValueError('Validation template leakage')
+                if 'dynamic_template' in item:yield item['dynamic_template']
+
+
 def resample_from_sources(initial_bank,schedule,sources,*,outer,initial_archive):
     if not sources:raise ValueError('no committed H50 empirical source')
     indices=[]

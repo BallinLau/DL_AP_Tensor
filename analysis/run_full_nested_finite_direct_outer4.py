@@ -27,7 +27,7 @@ from analysis.nested_equilibrium_utils import (atomic_torch_save,atomic_write_js
     capture_rng_state,restore_rng_state)
 from analysis.finite_direct_outer4_state import StageJournal
 from data.finite_direct_runtime import (OPERATOR,load_locked_sampling,generate_dataset,
-    firm_bank_from_captures,conditional_child_bank,check_firm_lineage,verify_cache)
+    firm_bank_from_captures,conditional_child_bank,check_firm_lineage,verify_cache,firm_bp_parent_rows)
 from data.finite_direct_macro_contract import select_training_rows,production_sdf_tensors
 from data.finite_direct_sampling import file_hash
 from analysis.economic_config import AnalysisEconomicConfig
@@ -372,7 +372,7 @@ class ProductionBackend:
         # Use actual production BP cache/distillation; minimal parent adapter
         # preserves 7D network inputs while exposing raw M to Episode.
         def batches(split):
-            parent=torch.cat([banks[split].parent_states,banks[split].metadata['true_macro_context']],dim=1)
+            parent=firm_bp_parent_rows(banks[split])
             child=child_payloads[split]['children']; b=self.args.firm_batch_size
             return [dict(parent=parent[j:j+b].to(self.episode.device),
                 children=[x.to(self.episode.device) for x in child[j:j+b].unbind(1)]) for j in range(0,len(parent),b)]

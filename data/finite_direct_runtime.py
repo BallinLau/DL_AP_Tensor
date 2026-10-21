@@ -192,6 +192,24 @@ def check_firm_lineage(train,validation):
     if set(train.metadata['path'].tolist())&set(validation.metadata['path'].tolist()): raise RuntimeError('Firm lineage leakage')
 
 
+def firm_transition_context(bank):
+    """Reviewed Uniform adapter: one context for children, M and BP teacher."""
+    kind=bank.metadata.get('macro_context_kind','same_node_true_macro')
+    if kind in ('SYNTHETIC_CURRENT_MACRO_PERCEIVED_FC1_TRANSITION','MIXED_FIRM_COLLOCATION_V1'):
+        context=bank.metadata['transition_macro_context']
+        mask=bank.metadata.get('synthetic_macro_mask',torch.ones(len(context),dtype=torch.bool))
+        if not torch.equal(context[mask],bank.parent_states[mask,5:7]):raise ValueError('synthetic context mismatch')
+        if (~mask).any() and not torch.equal(context[~mask],bank.metadata['true_macro_context'][~mask]):raise ValueError('observed context mismatch')
+    elif kind=='same_node_true_macro':context=bank.metadata['true_macro_context']
+    else:raise ValueError('unknown Firm macro context')
+    if context.shape!=(len(bank.parent_states),2) or not torch.isfinite(context).all():raise ValueError('invalid Firm context')
+    return context
+
+
+def firm_bp_parent_rows(bank):
+    return torch.cat([bank.parent_states,firm_transition_context(bank)],dim=1)
+
+
 @torch.no_grad()
 def conditional_child_bank(model,bank,*,seed,n_child_shocks,economic,device,chunk_size=512,m_min=.7,m_max=1.3):
     """Use SAME observed 7D row + SAME-node true macro context; exact eta later.
@@ -201,11 +219,12 @@ def conditional_child_bank(model,bank,*,seed,n_child_shocks,economic,device,chun
     We reuse their actual exogenous transition primitive with explicit context.
     """
     before=module_hash(model); n=len(bank.parent_states)
+    contexts=firm_transition_context(bank)
     shock=ConvergenceShockBank.create(n,n_child_shocks,seed=seed)
     out=[]; raw=[]
     for start in range(0,n,chunk_size):
         stop=min(start+chunk_size,n); p=bank.parent_states[start:stop].to(device)
-        context=bank.metadata['true_macro_context'][start:stop].to(device)
+        context=contexts[start:stop].to(device)
         sub=shock.gather(torch.arange(start,stop))
         b=build_child_exogenous_bundle(model,p,MacroTransitionContext(context[:,0:1],context[:,1:2]),sub,economic_config=economic)
         child=torch.stack([p[:,0,None].expand(-1,n_child_shocks),b.z_next[...,0],
@@ -215,4 +234,4 @@ def conditional_child_bank(model,bank,*,seed,n_child_shocks,economic,device,chun
     if module_hash(model)!=before: raise RuntimeError('Macro changed during conditional children')
     return InnerFPChildBank(torch.cat(out),shock.eps_x,shock.eps_z,shock.u_eta,shock.u_i,seed,
         dict(sdf_fc1_hash=before,parent_fingerprint=bank.fingerprint,raw_m=torch.cat(raw),
-             common_m_clamp=[m_min,m_max],context='same_node_true_macro',eta='integrated_exactly_in_operator'))
+             common_m_clamp=[m_min,m_max],context=bank.metadata.get('macro_context_kind','same_node_true_macro'),eta='integrated_exactly_in_operator'))
