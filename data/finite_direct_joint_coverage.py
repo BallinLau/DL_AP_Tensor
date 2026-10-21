@@ -7,7 +7,7 @@ from collections import Counter,defaultdict
 import csv
 import json
 import time
-from dataclasses import dataclass,asdict
+from dataclasses import dataclass,asdict,replace
 from pathlib import Path
 import hashlib
 import math
@@ -21,7 +21,7 @@ from data.simulate_ts_parallel import _keyed_uniform,_keyed_normal
 from data.finite_direct_initial_hstar import calibrate_initial,InitialCalibrationBlocked
 from analysis.finite_direct_continuation_state import safe_load
 
-VERSION='H50_BETA_JOINT_COVERAGE_V1'
+VERSION='H50_BETA_JOINT_COVERAGE_V2_DIRECTIONAL_REFILL'
 
 
 @dataclass(frozen=True)
@@ -65,8 +65,17 @@ class JointCoverageConfig:
 def joint_bin(h,ell,cfg):
     if not math.isfinite(h) or not math.isfinite(ell):return None
     he,ke=cfg.edges()
-    if not he[0]<=h<=he[-1] or not ke[0]<=ell<=ke[-1]:return (-1,-1)
-    return min(int(np.searchsorted(he,h,side='right')-1),len(he)-2),min(int(np.searchsorted(ke,ell,side='right')-1),len(ke)-2)
+    def axis(v,e):
+        if v<e[0]:return -1
+        if v>e[-1]:return len(e)-1
+        return min(int(np.searchsorted(e,v,side='right')-1),len(e)-2)
+    return axis(h,he),axis(ell,ke)
+
+
+def bin_direction(cell,cfg):
+    if cell is None:return 'INVALID'
+    h,k=cell
+    return ('H_LOW' if h<0 else 'H_HIGH' if h>=cfg.n_h_bins else 'H_IN')+'/'+('ELL_LOW' if k<0 else 'ELL_HIGH' if k>=cfg.n_ell_bins else 'ELL_IN')
 
 
 def source_allocation(total,empirical_eligible,beta_eligible):
@@ -151,22 +160,34 @@ class JointReservoir:
     No tensors retained here. Scarce-bin newcomers replace the largest bin's
     most represented family; seeded priorities resolve ties reproducibly.
     """
-    def __init__(self,capacity,cfg):self.capacity=capacity;self.cfg=cfg;self.buckets=defaultdict(list);self.count=0
+    def __init__(self,capacity,cfg):
+        self.capacity=capacity;self.cfg=cfg;self.buckets=defaultdict(list);self.count=0
+        self.occupancy_by_bin=Counter();self.occupancy_by_bin_family=Counter()
+        self.families_by_bin={}
+        self.eligible_count_by_bin=Counter();self.cap_limited_rejections=0
     def add(self,record):
         bin_=tuple(record['coverage_bin']);family=record['coverage_family'];key=(bin_,family)
         r=dict(record,priority=int(hashlib.sha256(f'{self.cfg.seed}:{record["parent_id"]}'.encode()).hexdigest()[:16],16))
-        bins=Counter({b:sum(len(v) for (bb,f),v in self.buckets.items() if bb==b) for b,f in self.buckets})
+        bins=self.occupancy_by_bin;self.eligible_count_by_bin[bin_]+=1
         if bins[bin_]>=self.cfg.bin_cap or self.count>=self.capacity:
             victim_bin=bin_ if bins[bin_]>=self.cfg.bin_cap else max(bins,key=lambda b:(bins[b],b))
-            if victim_bin!=bin_ and bins[bin_]>=bins[victim_bin]:return
-            candidates=[k for k in self.buckets if k[0]==victim_bin and self.buckets[k]]
+            if victim_bin!=bin_ and bins[bin_]>=bins[victim_bin]:return False
+            # Empirical tests may supply other family names; register only the
+            # bounded occupied family index, never rescan every bucket.
+            candidates=[(victim_bin,f) for f in self.families_by_bin.get(victim_bin,()) if self.occupancy_by_bin_family[victim_bin,f]>0]
             victim=max(candidates,key=lambda k:(len(self.buckets[k]),k[1]))
             if victim_bin==bin_ and len(self.buckets[key])>=len(self.buckets[victim]):
                 victim=key
                 worst=min(self.buckets[victim],key=lambda x:x['priority'])
-                if r['priority']<=worst['priority']:return
+                if r['priority']<=worst['priority']:
+                    self.cap_limited_rejections+=bins[bin_]>=self.cfg.bin_cap
+                    return False
             worst=min(self.buckets[victim],key=lambda x:x['priority']);self.buckets[victim].remove(worst);self.count-=1
+            self.occupancy_by_bin[victim_bin]-=1;self.occupancy_by_bin_family[victim]-=1
         self.buckets[key].append(r);self.count+=1
+        self.occupancy_by_bin[bin_]+=1;self.occupancy_by_bin_family[key]+=1
+        self.families_by_bin.setdefault(bin_,set()).add(family)
+        return True
     def selected(self,n):
         pools={k:sorted(v,key=lambda x:x['priority'],reverse=True) for k,v in self.buckets.items() if v}
         result=[]
@@ -276,11 +297,12 @@ def build_joint_bank(reference,templates,*,outer,target,cfg,output,simulator_fac
     goal=min(target//2,cfg.max_candidates);nr=min(len(recent),int(goal*cfg.recent_fraction));na=min(len(archive),goal-nr)
     nr=min(len(recent),goal-na)
     eligible=recent[:nr]+archive[:na]
-    empirical=[];beta=JointReservoir(target,cfg);counters=Counter();timers=Counter()
+    empirical=[];beta=JointReservoir(target,cfg)
+    refill=JointReservoir(2*target,replace(cfg,bin_cap=2*target));counters=Counter();timers=Counter()
     started=time.monotonic();audit_path=output/'candidate_acceptance.csv'
     columns=['parent_id','source_type','coverage_family','source_lineage','source_outer','source_snapshot_time',
         'K_scale','K_total_requested','K_total_realized','h_belief_proposed','ell_proposed','h_cal','ell_cal',
-        'root_status','root_residual','hstar_pass','ledger_valid','economic_valid','coverage_bin',
+        'root_status','root_residual','hstar_pass','ledger_valid','economic_valid','coverage_bin','overflow_direction',
         'b_mean','b_std','b_p10','b_p50','b_p90','b_p99','high_b_share','corr_b_z','corr_b_K','rejection_reason']
     with audit_path.open('w',newline='') as stream:
         writer=csv.DictWriter(stream,fieldnames=columns);writer.writeheader()
@@ -316,16 +338,27 @@ def build_joint_bank(reference,templates,*,outer,target,cfg,output,simulator_fac
                     row=dict(p,h_belief_proposed=float(state['hatcf'][j]),ell_proposed=float(state['lnkf'][j]),
                         h_cal=h,ell_cal=ell,hstar_pass=bool(value),ledger_valid=ledger,economic_valid=valid,
                         root_status='ROOT_FOUND' if value else 'STRICT_HSTAR_FAILED',root_residual=a.get('normalized_residual'),
-                        coverage_bin=bins,rejection_reason='' if valid else ('ROOT_FAILED' if not value else 'CURRENT_NODE_ECONOMIC_INVALID'))
+                        coverage_bin=bins,overflow_direction=bin_direction(bins,cfg),rejection_reason='' if valid else ('ROOT_FAILED' if not value else 'CURRENT_NODE_ECONOMIC_INVALID'))
                     writer.writerow({k:json.dumps(row.get(k)) if isinstance(row.get(k),(dict,list,tuple)) else row.get(k) for k in columns})
                     counters['proposed']+=1;counters['hstar_pass']+=bool(value);counters['ledger_valid']+=ledger;counters['economic_valid']+=valid
                     if valid:
                         ref=dict(p,h_cal=h,ell_cal=ell,coverage_bin=bins,artifact=str(file),artifact_sha256=shard_sha,row=j)
                         if source=='DYNAMIC_EMPIRICAL':empirical.append(ref)
-                        else:beta.add(ref)
+                        else:beta.add(ref);refill.add(ref)
                 offset+=count
-    allocation=source_allocation(target,len(empirical),beta.count)
-    selected=empirical[:allocation['empirical']]+beta.selected(allocation['beta'])
+    allocation=source_allocation(target,len(empirical),refill.count)
+    stage1=beta.selected(allocation['beta']);chosen={r['parent_id'] for r in stage1}
+    extras=[r for r in refill.selected(2*target) if r['parent_id'] not in chosen]
+    occupancy=Counter(tuple(r['coverage_bin']) for r in stage1);refilled=[]
+    # Stage2 only references already certified distinct candidates; never draw
+    # a repeated Parent or increase the candidate/economic budget.
+    groups=defaultdict(list)
+    for r in extras:groups[tuple(r['coverage_bin'])].append(r)
+    while groups and len(stage1)+len(refilled)<allocation['beta']:
+        cell=min(groups,key=lambda b:(occupancy[b],b))
+        r=groups[cell].pop(0);r=dict(r,selection_stage='CAPACITY_REFILL');refilled.append(r);occupancy[cell]+=1
+        if not groups[cell]:del groups[cell]
+    selected=empirical[:allocation['empirical']]+stage1+refilled
     if not selected:raise ValueError('NO_ROOT_CERTIFIED_ECONOMIC_COVERAGE_PARENTS; see candidate_acceptance.csv')
     # Materialize only the FINAL bounded Bank, never all candidate tensors.
     first=safe_load(selected[0]['artifact'])['state'];M=len(selected);B=len(first['x'])
@@ -349,11 +382,22 @@ def build_joint_bank(reference,templates,*,outer,target,cfg,output,simulator_fac
         selected_families=dict(Counter(r['coverage_family'] for r in parents)),
         unique_macro_bins=len({tuple(r['coverage_bin']) for r in parents}),
         unique_initial_parents=len({r['parent_id'] for r in parents}),
-        occupied_bin_ratio=len({tuple(r['coverage_bin']) for r in parents if tuple(r['coverage_bin'])!=(-1,-1)})/(cfg.n_h_bins*cfg.n_ell_bins),
+        occupied_bin_ratio=len({tuple(r['coverage_bin']) for r in parents if bin_direction(tuple(r['coverage_bin']),cfg)=='H_IN/ELL_IN'})/(cfg.n_h_bins*cfg.n_ell_bins),
         timers=dict(timers),total_seconds=time.monotonic()-started,
         proposed_h_cal='NOT_DEFINED_UNTIL_STRICT_ROOT',h_bounds=cfg.h_bounds,ell_bounds=cfg.ell_bounds,
         h_edges=cfg.edges()[0].tolist(),ell_edges=cfg.edges()[1].tolist(),
         selection_is_population_sample=False,gpu_performance='NOT_TESTED')
+    beta_legal=sum(beta.eligible_count_by_bin.values());beta_goal=target-allocation['empirical']
+    capped_capacity=sum(min(n,cfg.bin_cap) for n in beta.eligible_count_by_bin.values())
+    stats['capacity_audit']=dict(occupied_bins=len(beta.eligible_count_by_bin),
+        eligible_count_by_bin={str(k):v for k,v in beta.eligible_count_by_bin.items()},
+        retained_count_by_bin={str(k):v for k,v in occupancy.items()},
+        cap_limited_rejections=beta.cap_limited_rejections,
+        economic_invalid_rejections=counters['hstar_pass']-counters['economic_valid'],root_failed_rejections=counters['proposed']-counters['hstar_pass'],
+        reachable_capacity_under_current_caps=capped_capacity,target_bank_size=target,actual_bank_size=len(selected),
+        stage1_bank_size=len(empirical[:allocation['empirical']])+len(stage1),capacity_refill_count=len(refilled),
+        capacity_shortfall=max(0,min(beta_goal,beta_legal)-min(beta_goal,capped_capacity)),
+        economic_shortfall=max(0,target-len(empirical)-beta_legal),candidate_budget_exhausted=counters['proposed']>=cfg.max_candidates)
     # Bounded scalar-only diagnostics, never retained simulation tensors.
     import pandas as pd
     audit=pd.read_csv(audit_path);phase_rows=[];grid_rows=[]

@@ -8,7 +8,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from analysis.nested_equilibrium_utils import atomic_write_json,stable_json_hash
-from data.finite_direct_joint_coverage import JointCoverageConfig,joint_bin
+from data.finite_direct_joint_coverage import JointCoverageConfig,joint_bin,bin_direction
 
 
 def _defined(r):
@@ -27,7 +27,7 @@ def error_metrics(values):
 
 def write_dashboard(store,output,cfg=None):
     output=Path(output);output.mkdir(parents=True,exist_ok=True);cfg=cfg or JointCoverageConfig()
-    identity=stable_json_hash(dict(provenance=store.manifest['provenance'],shards=store.manifest['shards'],config=vars(cfg)))
+    identity=stable_json_hash(dict(diagnostics_version='ROUND2_EFFECTIVE_V1',provenance=store.manifest['provenance'],shards=store.manifest['shards'],config=vars(cfg)))
     done=output/'dashboard_manifest.json'
     if done.exists() and json.loads(done.read_text())['identity']==identity:return pd.read_csv(output/'path_survival_by_time.csv')
     started=time.monotonic();N=store.manifest['scheduled_initial_parents'];prov=store.manifest['provenance']
@@ -126,7 +126,7 @@ def write_dashboard(store,output,cfg=None):
         error_rows.append(metrics)
     error_frame=pd.DataFrame(error_rows);error_frame.to_csv(output/'macro_forecast_error_by_time.csv',index=False)
     pd.DataFrame(links).to_csv(output/'forecast_error_next_default.csv',index=False)
-    pd.DataFrame([dict(phase=phase,sampling_source=source_,family=family,h_bin=h,ell_bin=k,count=n)
+    pd.DataFrame([dict(phase=phase,sampling_source=source_,family=family,h_bin=h,ell_bin=k,count=n,overflow_direction=bin_direction((h,k),cfg))
         for (phase,source_,family,h,k),n in bins.items()]).to_csv(output/'coverage_2d_bins.csv',index=False)
     composition=[dict(layer='INITIAL_PARENTS',sampling_source=label,count=sum(v[0]==label for v in source.values())) for label in ('BETA','EMPIRICAL')]
     composition.extend(dict(layer=layer,sampling_source=label,count=n) for (layer,label),n in coverage_sources.items())
@@ -151,6 +151,8 @@ def write_dashboard(store,output,cfg=None):
         collection_seconds=time.monotonic()-started,training_performed=False)
     atomic_write_json(output/'stage_provenance.json',metadata)
     draw_figures(output,survival,error_frame,bins,composition,family_counts,cfg)
+    from analysis.h50_effective_coverage import collect_effective_coverage
+    collect_effective_coverage(store,output,cfg)
     atomic_write_json(done,dict(identity=identity,metadata=metadata))
     return survival
 
@@ -161,7 +163,7 @@ def draw_figures(output,survival,errors,bins,composition,families,cfg):
     def panel(ax,phase,source=None):
         hist=np.zeros((cfg.n_h_bins,cfg.n_ell_bins))
         for (p,s,f,h,k),n in bins.items():
-            if p==phase and (source is None or s==source) and h>=0 and k>=0:hist[h,k]+=n
+            if p==phase and (source is None or s==source) and 0<=h<cfg.n_h_bins and 0<=k<cfg.n_ell_bins:hist[h,k]+=n
         ax.pcolormesh(he,ke,np.log1p(hist.T),shading='auto');ax.set(xlabel='h_cal',ylabel='ell_cal',xlim=cfg.h_bounds,ylim=cfg.ell_bounds)
         if not hist.sum():ax.text(.5,.5,'NO VALID DATA',transform=ax.transAxes,ha='center')
     fig,axes=plt.subplots(1,3,figsize=(13,4))

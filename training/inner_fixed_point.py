@@ -586,6 +586,7 @@ def evaluate_inner_operator_snapshot(
     batches: List[Dict[str, torch.Tensor]],
     *,
     model: Optional[nn.Module] = None,
+    include_bp_regret: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Fresh-evaluate outputs and Bellman targets on one fixed bank."""
     model = model or episode.models["policy_value"]
@@ -614,10 +615,12 @@ def evaluate_inner_operator_snapshot(
                 children, raw_m, used_m
             )
             p0_result = teacher.compute_value_target(
-                parent, children_exp, used_exp, branch="p0", child_weights=weights
+                parent, children_exp, used_exp, branch="p0", child_weights=weights,
+                **({"bp_pred": model.forward_policy(parent)[0]} if include_bp_regret else {})
             )
             pi_result = teacher.compute_value_target(
-                parent, children_exp, used_exp, branch="pi", child_weights=weights
+                parent, children_exp, used_exp, branch="pi", child_weights=weights,
+                **({"bp_pred": model.forward_policy(parent)[1]} if include_bp_regret else {})
             )
             p0_value, pi_value = model._value_outputs(parent)
             value_scale = model.equity_value_scale(parent).detach().clamp_min(1e-8)
@@ -707,6 +710,9 @@ def evaluate_inner_operator_snapshot(
             pieces["q_regime"].append(regime.detach().cpu())
             b0_star.append(p0_result["bp_star"].detach().cpu())
             bi_star.append(pi_result["bp_star"].detach().cpu())
+            if include_bp_regret:
+                pieces.setdefault('bp0_regret',[]).append(p0_result['regret'].detach().cpu())
+                pieces.setdefault('bpi_regret',[]).append(pi_result['regret'].detach().cpu())
     snapshot = {name: torch.cat(values) for name, values in pieces.items()}
     snapshot["q_recursion_gain"] = (
         torch.cat(recursion_gain) if recursion_gain else torch.empty(0)

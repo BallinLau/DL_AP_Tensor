@@ -92,7 +92,7 @@ def test_joint_bins_reservoir_caps_and_determinism():
     cfg=replace(JointCoverageConfig(),bin_cap=3)
     assert joint_bin(-2.2,2.3,cfg)==(0,0)
     assert joint_bin(.4,6.,cfg)==(7,7)
-    assert joint_bin(-99.,3.,cfg)==(-1,-1)
+    assert joint_bin(-99.,3.,cfg)==(-1,1)  # H_LOW / ELL_IN, not the old collapsed overflow
     a=JointReservoir(5,cfg);b=JointReservoir(5,cfg)
     for j in range(30):
         r=dict(parent_id=j,coverage_bin=(j%2,0),coverage_family=str(j%3))
