@@ -34,12 +34,12 @@ def matched_payloads(before,after):
     return a,b
 
 
-def static_grid():
+def static_grid(extra_contexts=()):
     # Fixed macro cases; the same i/x and eta slices are used for A and B.
-    macros=[(-1.,4.19),(-6.,-2.),(-6.,5.),(2.,-2.),(2.,5.),(-1.879,-2.156),(-.9,1.),(-.5,0.)]
+    macros=[(float(Config.XBAR),h,k) for h,k in [(-1.,4.19),(-6.,-2.),(-6.,5.),(2.,-2.),(2.,5.),(-1.879,-2.156),(-.9,1.),(-.5,0.)]]+list(extra_contexts)
     mesh=torch.cartesian_prod(torch.linspace(0,1,9),torch.linspace(-2,2,9),torch.tensor([0.,1.]),torch.arange(len(macros)).float())
     s=torch.empty(len(mesh),7);s[:,:3]=mesh[:,:3];s[:,3]=.25;s[:,4]=float(Config.XBAR)
-    s[:,5:7]=torch.tensor(macros)[mesh[:,3].long()]
+    s[:,4:7]=torch.tensor(macros)[mesh[:,3].long()]
     b=InnerFPCollocationBank(s,torch.full((len(s),),2),2026102142,'validation',dict(
         macro_context_kind='SYNTHETIC_CURRENT_MACRO_PERCEIVED_FC1_TRANSITION',transition_macro_context=s[:,5:7].clone(),
         source_kind=['FIRM_UNIFORM_MACRO_COLLOCATION']*len(s),macro_case=mesh[:,3].long(),population_distribution=False))
@@ -52,11 +52,30 @@ def evaluate_static(models,e,bank,out):
         m_min=e.hyperparams.pv_m_clamp_min,m_max=e.hyperparams.pv_m_clamp_max)
     parent=firm_bp_parent_rows(bank);batches=[dict(parent=parent[j:j+128],children=list(child.children[j:j+128].unbind(1))) for j in range(0,len(parent),128)]
     metrics,policies,snapshot=evaluate_inner_operator_snapshot(e,batches,include_bp_regret=True)
+    _,_,reference_snapshot=evaluate_inner_operator_snapshot(e,batches[:1],include_bp_regret=False)
+    target_parity={k:float((snapshot[k][:len(reference_snapshot[k])]-reference_snapshot[k]).abs().max()) for k in ('p0_target','pi_target','q_target')}
+    for k,error in target_parity.items():
+        scale=max(1.,float(reference_snapshot[k].abs().max()))
+        if error>2e-6*scale:raise ValueError('DIAGNOSTIC_GRID_TARGET_PARITY_FAILED')
     model=models['policy_value'];output=model(bank.parent_states)
     frame=pd.DataFrame(bank.parent_states.numpy(),columns=['b','z','eta','i','x','h_f','ell_f'])
     frame['macro_case']=bank.metadata['macro_case'].numpy()
     for name in ('P0','PI','Phat','Q','bp0','bpI','bar_i','bar_z'):frame[name]=getattr(output,name).reshape(-1).detach().numpy()
     frame['hard_default']=frame.bar_z>=.5
+    frame['hard_investment_at_fixed_i']=frame.PI>=frame.P0
+    # Cost-region diagnostic, not a new threshold/decision rule. Resolve all
+    # observed PI-P0 sign changes on the ORIGINAL production i grid.
+    igrid=torch.linspace(0.,model.i_threshold,max(2,model.i_grid_size))
+    costs=bank.parent_states[:,None,:].expand(-1,len(igrid),-1).clone();costs[:,:,3]=igrid[None,:]
+    flat=costs.reshape(-1,7);parts=[]
+    for start in range(0,len(flat),2048):
+        p0,pi=model._value_outputs(flat[start:start+2048]);parts.append((pi-p0).reshape(-1))
+    diff=torch.cat(parts).reshape(len(bank.parent_states),-1);active=diff>=0
+    crossings=active[:,:-1]!=active[:,1:];rid,jid=torch.nonzero(crossings,as_tuple=True)
+    pd.DataFrame(dict(state_index=rid.numpy(),i_left=igrid[jid].numpy(),i_right=igrid[jid+1].numpy(),
+        difference_left=diff[rid,jid].numpy(),difference_right=diff[rid,jid+1].numpy())).to_csv(out/'investment_threshold_brackets.csv',index=False)
+    frame['investment_cost_grid_crossings']=crossings.sum(1).numpy()
+    frame['investment_cost_grid_positive_share']=active.float().mean(1).numpy()
     for k,v in snapshot.items():
         if len(v)==len(frame):frame[k]=v.reshape(-1).numpy()
     for k,v in policies.items():frame[k]=v.reshape(-1).numpy()
@@ -86,6 +105,7 @@ def evaluate_static(models,e,bank,out):
     pd.DataFrame(boundary).to_csv(out/'boundary_quality.csv',index=False)
     raw=child.metadata['raw_m'];used=child.children[:,:,7]
     atomic_write_json(out/'static_contract.json',dict(parent_fingerprint=bank.fingerprint,child_fingerprint=child.fingerprint,
+        diagnostic_vs_original_value_target_max_abs_error=target_parity,
         macro_unchanged=macro_before==state_digest(models['sdf_fc1'].state_dict()),targets_finite={k:bool(torch.isfinite(snapshot[k]).all()) for k in ('p0_target','pi_target','q_target')},
         raw_m_quantiles=torch.quantile(raw.flatten(),torch.tensor([0.,.5,.9,.99,1.])).tolist(),
         pv_clipping_fraction=float(((raw.flatten()<e.hyperparams.pv_m_clamp_min)|(raw.flatten()>e.hyperparams.pv_m_clamp_max)).float().mean()),
@@ -118,6 +138,8 @@ def boundary_figures(frames,out,scatter):
 def main():
     p=argparse.ArgumentParser();p.add_argument('--before',type=Path,required=True);p.add_argument('--after',type=Path,required=True)
     p.add_argument('--bank',type=Path,required=True);p.add_argument('--schedule',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--macro-support-csv',type=Path);p.add_argument('--macro-support-manifest',type=Path)
+    p.add_argument('--abnormal-store',type=Path)
     p.add_argument('--parents',type=int,default=4);a=p.parse_args()
     if not 1<=a.parents<=32:p.error('bounded frozen Parents only')
     a.output.mkdir(parents=True,exist_ok=False);torch.set_num_threads(4);started=time.monotonic()
@@ -131,7 +153,20 @@ def main():
     bank=safe_load(a.bank);schedule=safe_load(a.schedule)
     bank=dict(bank,state=select_state(bank['state'],slice(0,a.parents),'cpu'));bank['fingerprint']=state_hash(bank['state'])
     schedule=dict(schedule,parents=schedule['parents'][:a.parents]);schedule['fingerprint']=stable_json_hash(schedule['parents']);bank['schedule_fingerprint']=schedule['fingerprint']
-    initial=state_hash(bank['state']);grid=static_grid();frames={};summaries={}
+    extra=[];examples=[]
+    if a.abnormal_store is not None:
+        from data.finite_direct_long_horizon_runtime import ShardStore
+        selected={}
+        for f in ShardStore(a.abnormal_store).rows():
+            if not {'K_cal_t1','Hatc_cal_t1','LnK_cal_t1','x_t1'}<=set(f):continue
+            f=f[f.economic_state_valid & f.t.isin([1,2,3,4])]
+            for t,g in f.groupby('t'):
+                r=g.sort_values(['K_cal_t1','parent_candidate_id','child_branch']).iloc[0].to_dict()
+                if int(t) not in selected or r['K_cal_t1']<selected[int(t)]['K_cal_t1']:selected[int(t)]=r
+        for t in sorted(selected):
+            r=selected[t];extra.append((r['x_t1'],r['Hatc_cal_t1'],r['LnK_cal_t1']));examples.append(r)
+    atomic_write_json(a.output/'abnormal_macro_examples.json',dict(source_store_manifest_sha256=file_hash(a.abnormal_store/'manifest.json') if a.abnormal_store else None,examples=examples))
+    initial=state_hash(bank['state']);grid=static_grid(extra);frames={};summaries={}
     scatter=(bank['state']['b'][0].numpy(),bank['state']['z'][0].numpy())
     # Models must retain parameter version counters for production Entry's
     # immutable-weight guard. no_grad disables graphs without inference params.
@@ -149,7 +184,7 @@ def main():
                 source=dict(path=str(store.root),outer=12,manifest_sha256=file_hash(store.root/'manifest.json'))
                 templates=list(committed_templates([source],outer=13));eligible,reasons=eligible_templates(templates,outer=13,cfg=JointCoverageConfig(),committed=True)
                 atomic_write_json(out/'empirical_roundtrip.json',dict(status='FROZEN_POOL_CONTRACT_NOT_ACTUAL_TRAINED_OUTER',raw=len(templates),eligible=len(eligible),unique_lineages=len({t['cluster_id'] for t in eligible}),rejections=reasons))
-                summaries[name]=dict(status='COMPLETE',initial_micro_hash=initial,root_file=str(store.root/'initial_root_calibration.csv'),
+                summaries[name]=dict(status='COMPLETE',initial_micro_hash=initial,root_file=str(store.root/'initial_hstar_audit.csv'),
                     survival={str(t):int(survival.loc[survival.t==t,'main_spine_alive_paths'].iloc[0]) for t in (1,5,10,20,30,50)})
             except Exception as exc:
                 from data.finite_direct_initial_hstar import InitialCalibrationBlocked
@@ -157,6 +192,20 @@ def main():
                 summaries[name]=dict(status='STRICT_INITIAL_ROOT_BLOCKED',error=str(exc),audit=exc.audit)
             if original!=hashes(models) or state_hash(bank['state'])!=initial or guard['calls']:raise ValueError('frozen invariant violation')
         boundary_figures(frames,a.output,scatter)
+        if a.macro_support_csv is not None:
+            if a.macro_support_manifest is None:raise ValueError('support CSV requires content-bound manifest')
+            m=json.loads(a.macro_support_manifest.read_text())
+            if file_hash(a.macro_support_csv)!=m['observations_sha256']:raise ValueError('support data SHA mismatch')
+            from data.finite_direct_macro_contract import select_training_rows
+            training=select_training_rows(pd.read_csv(a.macro_support_csv)).fc1
+            support=training[['Hatc_cal_t','LnK_cal_t']].to_numpy();lo=support.min(0);hi=support.max(0)
+            states=grid.parent_states[:,5:7].numpy();distance=np.maximum(lo-states,0)+np.maximum(states-hi,0)
+            pd.DataFrame(dict(state_index=np.arange(len(states)),h_f=states[:,0],ell_f=states[:,1],
+                h_distance_outside_D2_envelope=distance[:,0],ell_distance_outside_D2_envelope=distance[:,1],
+                outside_observed_envelope=(distance>0).any(1))).to_csv(a.output/'macro_support_distance.csv',index=False)
+            atomic_write_json(a.output/'macro_support_provenance.json',dict(csv_sha256=file_hash(a.macro_support_csv),manifest_sha256=file_hash(a.macro_support_manifest),
+                legal_rows=len(training),h_ell_min=lo.tolist(),h_ell_max=hi.tolist(),
+                interpretation='DISTANCE_TO_OBSERVED_AXIS_ENVELOPE_NOT_PROOF_OF_JOINT_SUPPORT_OR_SDF_RELIABILITY'))
     atomic_write_json(a.output/'summary.json',dict(status='COMPLETE',cases=summaries,source_hashes=dict(BEFORE=ha,AFTER_UNIFORM=hb),
         source_sha256=dict(before=file_hash(a.before),after=file_hash(a.after)),matched_macro=True,matched_input_grid=grid.fingerprint,
         independent_strict_root_per_model=True,training_performed=False,optimizer_steps=0,fc2_calls=0,

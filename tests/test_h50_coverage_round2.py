@@ -109,6 +109,17 @@ def test_empirical_next_outer_sha_stage_and_same_node_evidence(tmp_path):
     with pytest.raises(ValueError,match='activation'):list(committed_templates([source],outer=12))
     loaded=list(committed_templates([source],outer=13));eligible,_=eligible_templates(loaded,outer=13,cfg=JointCoverageConfig(),committed=True)
     assert len(eligible)==1 and eligible[0]['source_time']==3 and eligible[0]['accounting_evidence']['parent_id']==10
+    from analysis.finite_direct_outer4_state import StageJournal
+    class Backend:
+        def __init__(self):self.sources=[]
+        def snapshot(self):return {'pool_sources':deepcopy(self.sources)}
+        def restore(self,state):self.sources=deepcopy(state['pool_sources'])
+    first=Backend();journal=StageJournal(tmp_path/'journal',{'scope':'CPU_POOL_ROUNDTRIP'},first)
+    def commit():first.sources.append(source);return {'optimizer_steps':0}
+    journal.run('outer_012/EMPIRICAL_POOL_COMMIT',commit)
+    resumed=Backend();again=StageJournal(tmp_path/'journal',{'scope':'CPU_POOL_ROUNDTRIP'},resumed,resume=True)
+    again.run('outer_012/EMPIRICAL_POOL_COMMIT',lambda:pytest.fail('committed source repeated'))
+    assert list(committed_templates(resumed.sources,outer=13))==loaded
 
 
 def test_ess_counts_lineages_not_child_independence():
