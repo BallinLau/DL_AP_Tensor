@@ -169,6 +169,8 @@ class JointReservoir:
         bin_=tuple(record['coverage_bin']);family=record['coverage_family'];key=(bin_,family)
         r=dict(record,priority=int(hashlib.sha256(f'{self.cfg.seed}:{record["parent_id"]}'.encode()).hexdigest()[:16],16))
         bins=self.occupancy_by_bin;self.eligible_count_by_bin[bin_]+=1
+        cap_hit=bins[bin_]>=self.cfg.bin_cap
+        if cap_hit:self.cap_limited_rejections+=1  # rejected newcomer OR displaced eligible incumbent
         if bins[bin_]>=self.cfg.bin_cap or self.count>=self.capacity:
             victim_bin=bin_ if bins[bin_]>=self.cfg.bin_cap else max(bins,key=lambda b:(bins[b],b))
             if victim_bin!=bin_ and bins[bin_]>=bins[victim_bin]:return False
@@ -180,7 +182,6 @@ class JointReservoir:
                 victim=key
                 worst=min(self.buckets[victim],key=lambda x:x['priority'])
                 if r['priority']<=worst['priority']:
-                    self.cap_limited_rejections+=bins[bin_]>=self.cfg.bin_cap
                     return False
             worst=min(self.buckets[victim],key=lambda x:x['priority']);self.buckets[victim].remove(worst);self.count-=1
             self.occupancy_by_bin[victim_bin]-=1;self.occupancy_by_bin_family[victim]-=1

@@ -72,6 +72,20 @@ class FirmMacroCoverageConfig:
             if len(b)!=2 or not torch.isfinite(torch.tensor(b)).all() or b[0]>=b[1]:raise ValueError('invalid macro bounds')
 
 
+def bounded_donor_bank(bank,rows,*,seed):
+    """Shared B/C donor selection, no invented micro states or target reuse."""
+    n=len(bank.parent_states)
+    if rows<1 or rows>n:raise ValueError('insufficient real donor capacity for declared sampling budget')
+    if rows==n:return bank
+    ids=torch.randperm(n,generator=torch.Generator().manual_seed(seed))[:rows]
+    meta=deepcopy(bank.metadata)
+    for key,v in list(meta.items()):
+        if torch.is_tensor(v) and v.ndim and len(v)==n:meta[key]=v[ids].clone()
+        elif isinstance(v,list) and len(v)==n:meta[key]=[v[j] for j in ids.tolist()]
+    meta['donor_selection_indices']=ids
+    return InnerFPCollocationBank(bank.parent_states[ids].clone(),bank.source_kind[ids].clone(),seed,bank.split,meta)
+
+
 def configured_macro_bank(bank,cfg,*,seed):
     """Retain residual ON_POLICY/CALCULATED 50:50; Uniform is explicit only.
 

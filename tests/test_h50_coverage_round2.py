@@ -69,6 +69,7 @@ def test_incremental_occupancy_and_fourteen_bin_capacity():
     cfg=JointCoverageConfig();r=JointReservoir(8192,cfg)
     for j in range(8192):r.add(dict(parent_id=j,coverage_bin=(j%14//8,j%14%8),coverage_family=cfg.families[j%7]))
     assert r.count==14*256 and sum(r.eligible_count_by_bin.values())==8192
+    assert r.cap_limited_rejections==8192-14*256
     assert sum(r.occupancy_by_bin.values())==r.count==sum(r.occupancy_by_bin_family.values())
     for (cell,family),values in r.buckets.items():assert r.occupancy_by_bin_family[cell,family]==len(values)
 
@@ -154,3 +155,15 @@ def test_regret_interface_and_control_budget_identical(monkeypatch):
     a=r.plan();monkeypatch.setattr(r,'DISTRIBUTION_MODE','ORIGINAL');b=r.plan()
     for key in ('firm_batch_size','firm_inner_max','p_adam_steps','p_lbfgs_max_iter','q_fit_steps','rng_seed','optimizer_semantics'):assert a[key]==b[key]
     assert a['effective_uniform_fraction']==1 and b['effective_uniform_fraction']==0
+
+
+def test_shared_bounded_micro_donors_and_source_event_conservation(tmp_path):
+    from data.finite_direct_uniform_firm_macro import bounded_donor_bank
+    from analysis.h50_source_events import source_event_table
+    from test_h50_joint_coverage import diagnostic_fixture
+    d=donor();a=bounded_donor_bank(d,32,seed=44);b=bounded_donor_bank(d,32,seed=44)
+    assert a.fingerprint==b.fingerprint and len(a.parent_states)==32
+    with pytest.raises(ValueError,match='capacity'):bounded_donor_bank(d,129,seed=44)
+    root=tmp_path/'store';root.mkdir();f=source_event_table(diagnostic_fixture(root),tmp_path/'out')
+    row=f[f.t==1].iloc[0]
+    assert row.valid_child_rows==3 and row.complete_sdf_pairs==1 and row.main_spine_alive_paths==1

@@ -20,7 +20,7 @@ from analysis.run_full_nested_finite_direct_outer4 import ProductionBackend,rest
 from analysis.run_fc1_self_consistent_macro import hashes
 from copy import deepcopy
 from data.finite_direct_runtime import conditional_child_bank,check_firm_lineage
-from data.finite_direct_uniform_firm_macro import uniform_macro_bank,sampling_spec,FirmMacroCoverageConfig
+from data.finite_direct_uniform_firm_macro import uniform_macro_bank,sampling_spec,FirmMacroCoverageConfig,bounded_donor_bank
 from dataclasses import asdict
 from data.finite_direct_sampling import file_hash
 from training.inner_fixed_point import InnerFPCollocationBank
@@ -128,6 +128,7 @@ def run(args):
     for split,offset in [('train',0),('validation',100000)]:
         p=source['banks'][split]
         donor=InnerFPCollocationBank(**{k:v for k,v in p.items() if k!='fingerprint'})
+        donor=bounded_donor_bank(donor,plan()[f'{split}_rows'],seed=FIRM_CFG.firm_macro_sampling_seed+offset+11)
         banks[split]=(uniform_macro_bank(donor,seed=FIRM_CFG.firm_macro_sampling_seed+offset,
             hatcf_bounds=FIRM_CFG.firm_macro_h_bounds,lnkf_bounds=FIRM_CFG.firm_macro_ell_bounds) if DISTRIBUTION_MODE=='UNIFORM' else donor)
         if len(banks[split].parent_states)!=plan()[f'{split}_rows']:

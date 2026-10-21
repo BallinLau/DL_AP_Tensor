@@ -155,6 +155,8 @@ def write_dashboard(store,output,cfg=None):
     draw_figures(output,survival,error_frame,bins,composition,family_counts,cfg)
     from analysis.h50_effective_coverage import collect_effective_coverage
     collect_effective_coverage(store,output,cfg)
+    from analysis.h50_source_events import source_event_table
+    source_event_table(store,output)
     atomic_write_json(done,dict(identity=identity,metadata=metadata))
     return survival
 
