@@ -15,6 +15,16 @@ SOURCE_SHA = '9ad7610a1851d06d80c8b2d08052a01532923f7a2808e3a006f5538b404aa94d'
 SOURCE_STAGE = 'outer_011/outer_commit'
 OPERATOR = 'finite_direct_parent_exit_before_child_v2'
 CONTRACT = 'H50_CERTIFIED_OUTER11_AND_IMMUTABLE_BANK_V2'
+FIXED_VALIDATION_SHA = 'b7be82344320aecf75bf7c57a1580e28b2cd8282f1426bc1363fe5a8dceddab8'
+FIXED_VALIDATION_SCHEDULE_SHA = '686a684ed35164050d1cba1dcd93eec7119b3b021445db86fed4031c3944b4b9'
+
+
+def verify_fixed_validation(sampling_dir):
+    for name, expected in (
+        ('validation_initial_bank.pt', FIXED_VALIDATION_SHA),
+        ('validation_parent_sampling_schedule.json', FIXED_VALIDATION_SCHEDULE_SHA)):
+        if file_hash(Path(sampling_dir)/name) != expected:
+            raise ValueError('certified fixed Validation changed: '+name)
 
 
 def certify(checkpoint, journal_checkpoint, pointer, *, source_job, artifact_dir=None):

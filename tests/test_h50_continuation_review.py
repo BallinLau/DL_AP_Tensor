@@ -113,3 +113,15 @@ def test_frozen_cpu_does_not_reinterpret_cuda_pair_rng(monkeypatch):
     assert seen[0]['pair_rng'] is None and source['pair_rng'].numel()==16
     assert audit['source_cuda_rng_preserved_not_converted']
     assert not audit['sdf_pair_rng_used_in_frozen_rollout']
+
+
+def test_production_fixed_validation_matches_certified_source(monkeypatch,tmp_path):
+    import analysis.h50_source_certification as m
+    expected={'validation_initial_bank.pt':m.FIXED_VALIDATION_SHA,
+        'validation_parent_sampling_schedule.json':m.FIXED_VALIDATION_SCHEDULE_SHA}
+    monkeypatch.setattr(m,'file_hash',lambda p:expected[p.name])
+    m.verify_fixed_validation(tmp_path)
+    for key in list(expected):
+        original=expected[key];expected[key]='changed'
+        with pytest.raises(ValueError,match='Validation changed'):m.verify_fixed_validation(tmp_path)
+        expected[key]=original

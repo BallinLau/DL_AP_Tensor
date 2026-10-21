@@ -23,7 +23,7 @@ from data.finite_direct_long_horizon_sampling import broad_firm_bank,sample_macr
 from data.finite_direct_runtime import load_locked_sampling,check_firm_lineage
 from data.finite_direct_sampling import file_hash
 from data.market_clearing import MarketClearingConfig
-from analysis.h50_source_certification import CONTRACT, certify, save_bank_reference, load_bank_reference
+from analysis.h50_source_certification import CONTRACT, certify, save_bank_reference, load_bank_reference, verify_fixed_validation
 
 SCHEMA='CONTINUATION_APPROVAL_V5_HSTAR_H50'
 
@@ -105,6 +105,7 @@ class H50Backend(ProductionBackend):
         self.state['pool_sources']=[]
         _,bank,schedule,pool,audits=certify(args.initial_checkpoint,args.source_journal_checkpoint,
             args.source_latest_pointer,source_job=702636,artifact_dir=args.source_artifact_dir)
+        verify_fixed_validation(args.sampling_dir)
         if set(bank['state']['transition_path_id'].tolist()) & set(self.banks['validation']['state']['transition_path_id'].tolist()):
             raise ValueError('source dynamic Train/Validation lineage overlap')
         self.banks['train']=bank;self.schedules['train']=schedule
