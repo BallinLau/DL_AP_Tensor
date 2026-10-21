@@ -127,7 +127,7 @@ def propose_beta_batch(reference_bank,*,start,count,outer,cfg):
         s['x'][j]=float(Config.XBAR)+float(Config.SIGMA_X)/math.sqrt(1-float(Config.RHO_X)**2)*zx
         total=float(s['K'][j].sum())*scale
         s['K'][j]*=scale
-        specs.append(dict(parent_id=int(pid[j]),split='train',sampling_source='BETA',source_type='BETA_COVERAGE',
+        specs.append(dict(parent_id=int(pid[j]),split='train',sampling_source='BETA',source_type='BETA_JOINT_ECONOMIC_COVERAGE',
             source_outer=outer,source_lineage=int(pid[j]),source_snapshot_time=0,
             source_pool_fingerprint=stable_json_hash(dict(generator=VERSION,config=asdict(cfg))),coverage_family=family,
             sampling_weight=1.,reuse_count=1,base_source_parent=int(base['transition_path_id'][indices[j]]),

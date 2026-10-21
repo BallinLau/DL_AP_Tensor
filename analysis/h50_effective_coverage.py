@@ -32,14 +32,14 @@ def collect_effective_coverage(store,output,cfg):
             if cell is None:raise ValueError('invalid macro label admitted into coverage')
             direction=bin_direction(cell,cfg);directions[direction]+=1
             source=r.get('sampling_source','UNKNOWN');family=r.get('b_distribution_family','UNKNOWN')
-            keys=[('ALL','ALL'),('TIME',str(t)),('MACRO_BIN',str(cell)),('FAMILY',family),('TIME_STRATUM',band),('SOURCE',source)]
+            keys=[('ALL','ALL'),('TIME',str(t)),('MACRO_BIN',str(cell)),('FAMILY',family),('TIME_STRATUM',band),('SOURCE',source),('TIME_SOURCE',f'{t}:{source}')]
             for key in keys:
                 groups[key][pid]+=1;cells[key].add(cell);sources[key][source]+=1
             last[pid]=max(last.get(pid,0),t)
         for _,g in selected.sdf_pairs.groupby(['split','parent_candidate_id','t']):
             r=g.iloc[0];pt=int(r.t)-1;band='EARLY_0_9' if pt<10 else 'MIDDLE_10_29' if pt<30 else 'LATE_30_49'
             for key in [('ALL','ALL'),('TIME',str(int(r.t))),('MACRO_BIN',str(joint_bin(r.Hatc_cal_t,r.LnK_cal_t,cfg))),
-                        ('FAMILY',r.get('b_distribution_family','UNKNOWN')),('TIME_STRATUM',band),('SOURCE',r.get('sampling_source','UNKNOWN'))]:pair_counts[key]+=1
+                        ('FAMILY',r.get('b_distribution_family','UNKNOWN')),('TIME_STRATUM',band),('SOURCE',r.get('sampling_source','UNKNOWN')),('TIME_SOURCE',f'{int(r.t)}:{r.get("sampling_source","UNKNOWN")}')]:pair_counts[key]+=1
     for band in ('EARLY_0_9','MIDDLE_10_29','LATE_30_49'):groups['TIME_STRATUM',band]
     rows=[]
     for key,weights in groups.items():
@@ -47,7 +47,8 @@ def collect_effective_coverage(store,output,cfg):
         sc=np.array(list(sources[key].values()),float);sc=sc/sc.sum() if sc.sum() else sc
         stats['source_entropy']=float(-(sc*np.log(sc)).sum()) if len(sc) else None
         end=[last[p] for p in weights]
-        rows.append(dict(group=key[0],stratum=key[1],**stats,complete_sdf_pairs=pair_counts[key],
+        prov=getattr(store,'manifest',{}).get('provenance',{})
+        rows.append(dict(outer=prov.get('outer'),stage=prov.get('stage'),split=prov.get('split'),group=key[0],stratum=key[1],**stats,complete_sdf_pairs=pair_counts[key],
             joint_macro_occupied_bins=len(cells[key]),last_valid_t_mean=float(np.mean(end)) if end else None,
             last_valid_t_median=float(np.median(end)) if end else None))
     output=Path(output);output.mkdir(parents=True,exist_ok=True)

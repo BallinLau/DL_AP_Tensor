@@ -1,6 +1,7 @@
 """Wide Firm collocation, NOT a simulated aggregate population distribution."""
 from copy import deepcopy
 from dataclasses import dataclass,asdict
+from collections import Counter
 import torch
 from training.inner_fixed_point import InnerFPCollocationBank
 
@@ -120,7 +121,8 @@ def configured_macro_bank(bank,cfg,*,seed):
 
 def firm_coverage_summary(bank):
     p=bank.parent_states
-    return dict(rows=len(p),sources=bank.metadata.get('source_composition',{}),
+    labels=[k if k.startswith('FIRM_') else 'FIRM_'+k for k in bank.metadata.get('source_kind',[])]
+    return dict(rows=len(p),sources=dict(Counter(labels)),
         eta_counts={str(v):int((p[:,2]==v).sum()) for v in (0,1)},
         b_hist=torch.histc(p[:,0],bins=5,min=0,max=1).tolist(),
         z_quantiles=torch.quantile(p[:,1],torch.tensor([0.,.1,.5,.9,1.])).tolist(),

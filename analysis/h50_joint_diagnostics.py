@@ -139,6 +139,8 @@ def write_dashboard(store,output,cfg=None):
             terminated_t=terminal.get(pid),right_censored=bool(main.get((pid,50),{}).get('continuation_allowed',False))))
     pd.DataFrame(last).to_csv(output/'path_endpoints.csv',index=False)
     metadata=dict(outer=outer,stage_name=stage,split=split,scheduled_initial_paths=N,
+        model_version=prov.get('diagnostic_metadata',{}).get('model_version','STAGE_MODEL_HASH_BOUND'),
+        checkpoint_sha256=prov.get('diagnostic_metadata',{}).get('checkpoint_sha256','NOT_AVAILABLE_UNCOMMITTED_STAGE_MODEL'),
         firm_checkpoint_hash=prov['model_hashes']['firm'],fc1_checkpoint_hash={k:prov['model_hashes'][k] for k in ('fc1_c','fc1_k')},
         sdf_checkpoint_hash=prov['model_hashes']['sdf'],wealth_checkpoint_hash=prov['model_hashes']['wealth'],
         initial_bank_sha=prov.get('diagnostic_metadata',{}).get('initial_bank_sha',prov['parent_bank_hash']),

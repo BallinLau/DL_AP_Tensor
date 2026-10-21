@@ -133,7 +133,9 @@ def main():
     schedule=dict(schedule,parents=schedule['parents'][:a.parents]);schedule['fingerprint']=stable_json_hash(schedule['parents']);bank['schedule_fingerprint']=schedule['fingerprint']
     initial=state_hash(bank['state']);grid=static_grid();frames={};summaries={}
     scatter=(bank['state']['b'][0].numpy(),bank['state']['z'][0].numpy())
-    with torch.inference_mode():
+    # Models must retain parameter version counters for production Entry's
+    # immutable-weight guard. no_grad disables graphs without inference params.
+    with torch.no_grad():
         for name,cp in [('BEFORE',before),('AFTER_UNIFORM',after)]:
             out=a.output/name;out.mkdir();models,e,_,guard=setup(SimpleNamespace(device='cpu'),initial_models=cp['transaction']['models']);e._fc1_firms=200;e.refresh_firm_target()
             for m in models.values():m.eval();m.requires_grad_(False)
