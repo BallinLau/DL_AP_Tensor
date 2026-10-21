@@ -22,6 +22,29 @@ from data.simulate_ts_parallel import _apply_entry_batched
 from data.simulation_forward import forward_policy_value_for_simulation
 
 
+def node_diagnostics(state,records,*,entry_attempted):
+    """Reductions only; no additional policy forward or economic mutation."""
+    alive=state['alive'].bool();mass=state.get('firm_mass',torch.ones_like(state['K']))
+    default=alive & (state['bar_z']>=.5)
+    values=torch.stack([alive.sum(1),default.sum(1),(alive & ~default).sum(1),
+        (state['K']*mass*alive).sum(1),(state['K']*mass*(alive & ~default)).sum(1)],1).cpu().tolist()
+    byid={r['parent_candidate_id']:r for r in records}
+    event_names=('event_potential_count','event_accepted_count','event_K_entry_gross','event_reference_K','event_reference_N')
+    events={name:state[name].cpu().tolist() for name in event_names if name in state}
+    for j,pid in enumerate(state['transition_path_id'].cpu().tolist()):
+        r=byid[pid];n,d,s,k,kpost=values[j]
+        defined=all(math.isfinite(r.get(f,float('nan'))) for f in ('C_raw_t1','K_cal_t1','Hatc_cal_t1','LnK_cal_t1')) and r.get('C_raw_t1',0)>0 and r.get('K_cal_t1',0)>0
+        r.update(predecision_alive_firms=int(n),hard_default_count=int(d),post_exit_alive_firms=int(s),
+            K_pre_exit=k,K_post_exit=kpost,entry_attempted=entry_attempted,
+            entry_candidate_count=events.get('event_potential_count',[None]*len(records))[j] if entry_attempted else None,
+            entry_accepted_count=events.get('event_accepted_count',[None]*len(records))[j] if entry_attempted else None,
+            K_entry_gross=events.get('event_K_entry_gross',[None]*len(records))[j] if entry_attempted else None,
+            entry_reference_K=events.get('event_reference_K',[None]*len(records))[j] if entry_attempted else None,
+            entry_reference_N=events.get('event_reference_N',[None]*len(records))[j] if entry_attempted else None,
+            macro_defined=defined,continuation_allowed=defined)
+    return records
+
+
 def continuable_nodes(state,records):
     """Continuation differs from training eligibility, without changing either
     exit or entry. A defined ledger with zero post-policy survivors can still
@@ -87,7 +110,7 @@ class ShardStore:
 @torch.inference_mode()
 def generate_long_horizon_dataset(models, episode, bank, schedule, signature, output, *,
         outer, stage, horizon=50, parent_batch_size=128, root_config=None,
-        capture=True, predecision_templates=False, diagnostic_observer=None):
+        capture=True, predecision_templates=False, diagnostic_observer=None,diagnostic_metadata=None):
     if horizon != 50:
         raise ValueError('H50 data contract requires exactly 50 transitions')
     if parent_batch_size < 1:
@@ -103,6 +126,8 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
         source_commit=SOURCE_COMMIT,runtime_source_sha256=file_hash(__file__),
         root_config=asdict(root_config), physical_parent_batch=parent_batch_size,
         capture=capture, predecision_templates=predecision_templates)
+    provenance['diagnostics_version']='H50_JOINT_COVERAGE_DIAGNOSTICS_V1'
+    provenance['diagnostic_metadata']=diagnostic_metadata or {}
     provenance=json.loads(json.dumps(provenance))
     identity_path = output/'provenance.json'
     if identity_path.exists() and json.loads(identity_path.read_text()) != provenance:
@@ -110,6 +135,7 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
     atomic_write_json(identity_path, provenance)
     before = hashes(models); manifest = {}; root_audits = [];initial_caches={}
     n = len(bank['state']['x']); all_ids = bank['state']['transition_path_id'].tolist()
+    source_specs={r['parent_id']:r for r in schedule['parents']}
     for start in range(0, n, parent_batch_size):
         stop = min(n, start+parent_batch_size)
         sim = simulator(models, episode, stop-start, schedule['seed'])
@@ -127,6 +153,7 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
             atomic_write_json(output/f'initial_failure_{start:06d}.json',dict(error=str(exc),audit=exc.audit))
             raise
         root_audits.extend(audit)
+        node_diagnostics(state,parents,entry_attempted=False)
         if diagnostic_observer is not None:
             diagnostic_observer('INITIAL_PROCESSED',sim,state,parents,0,-1)
         if root_cache.exists():initial_caches[root_cache.name]=file_hash(root_cache)
@@ -157,6 +184,7 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
             else:
                 rows, captures, templates = [], [], []
                 parent_records=parents
+                attempted_parent_ids=[]
                 next_state = None; next_parents = []; next_good = []
                 if state is not None and good:
                     if time and capture:
@@ -166,6 +194,7 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
                         captures.append(capture_node(state, parents, split=schedule['split'],
                             outer=outer, time=0, branch=-1, model_hashes=before))
                     state = select_state(state, torch.tensor(good, device=episode.device))
+                    attempted_parent_ids=state['transition_path_id'].cpu().tolist()
                     if time:
                         state = promote_child(sim, state, time)
                         if diagnostic_observer is not None:
@@ -178,6 +207,7 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
                         child = _apply_entry_batched(sim, child, max(20,int(sim.group_size*.1)))
                         if diagnostic_observer is not None:
                             diagnostic_observer('POST_ENTRY_PRE_DECISION',sim,child,[],time+1,branch)
+                        values=[]
                         if predecision_templates and schedule['split']=='train':
                             from data.finite_direct_dynamic_empirical import capture_templates
                             values = capture_templates(child, split='train', outer=outer,
@@ -200,6 +230,12 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
                                 Hatc_cal_t1=float('nan'),LnK_cal_t1=float('nan'))
                                 for j,pid in enumerate(child['transition_path_id'].tolist())]
                         valid=continuable_nodes(child,observed)
+                        node_diagnostics(child,observed,entry_attempted=True)
+                        observed_by_id={r['parent_candidate_id']:r for r in observed}
+                        for value in values:
+                            t=value.get('dynamic_template')
+                            if t is not None:
+                                t['post_decision_accounting_valid']=bool(observed_by_id[t['source_path']]['economic_state_valid'])
                         if diagnostic_observer is not None:
                             diagnostic_observer('POST_DECISION',sim,child,observed,time+1,branch)
                         if capture and branch==1 and time+1<horizon and bool(child['alive'].any()):
@@ -214,6 +250,8 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
                                 LnK_cal_t=parent['LnK_cal_t1'], Hatcf_t=parent['Hatcf_t1'],
                                 LnKF_t=parent['LnKF_t1'])
                             row['node_economic_state_valid']=original_row['economic_state_valid']
+                            row['node_failure_reason']=original_row['failure_reason']
+                            row['prediction_input_kind']='TRUE_PARENT_CALCULATED'
                             if not parent['economic_state_valid']:
                                 row['economic_state_valid']=False
                                 row['failure_reason']='PARENT_'+parent['failure_reason']
@@ -236,7 +274,17 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
                                 economic_state_valid=False,
                                 node_attempted=False,
                                 failure_reason='ANCESTOR_UNDEFINED_OR_EXTINCT'))
+                for row in rows:
+                    spec=source_specs[row['parent_candidate_id']]
+                    row.update(sampling_source=spec.get('sampling_source','UNKNOWN'),
+                        source_type=spec.get('source_type','LEGACY_'+spec.get('sampling_source','UNKNOWN')),
+                        b_distribution_family=spec.get('coverage_family','LEGACY_'+spec.get('sampling_source','UNKNOWN')),
+                        source_lineage=spec.get('source_lineage',row['parent_candidate_id']),
+                        source_outer=spec.get('source_outer',-1),source_snapshot_time=spec.get('source_snapshot_time',0),
+                        source_pool_fingerprint=spec.get('source_pool_fingerprint','LEGACY_INITIAL'),
+                        sampling_weight=spec.get('sampling_weight',1.),reuse_count=spec.get('reuse_count',1))
                 saved=dict(provenance=provenance, rows=rows, captures=captures,parent_records=parent_records,
+                    attempted_parent_ids=attempted_parent_ids,
                     templates=templates, next_state=None if next_state is None else
                     select_state(next_state,slice(None),torch.device('cpu')),
                     next_parents=next_parents,next_good=next_good)

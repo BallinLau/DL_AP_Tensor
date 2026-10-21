@@ -24,11 +24,18 @@ from data.finite_direct_runtime import load_locked_sampling,check_firm_lineage
 from data.finite_direct_sampling import file_hash
 from data.market_clearing import MarketClearingConfig
 from analysis.h50_source_certification import CONTRACT, certify, save_bank_reference, load_bank_reference, verify_fixed_validation
+from data.finite_direct_joint_coverage import JointCoverageConfig,build_joint_bank
 
 SCHEMA='CONTINUATION_APPROVAL_V5_HSTAR_H50'
 
 
-def plan():
+def coverage_config(args=None):
+    path=getattr(args,'coverage_config',None)
+    cfg=JointCoverageConfig(**json.loads(path.read_text())) if path else JointCoverageConfig()
+    cfg.validate();return cfg
+
+
+def plan(coverage=None):
     # Epoch sample budgets are proposed for explicit approval, not hidden 50x
     # optimizer expansion. All available time bins are eligible in sampling.
     execution=[dict(outer=12,kind='baseline',indices={})]
@@ -37,7 +44,8 @@ def plan():
         if k=='cross_block':execution.append(dict(outer=o+11,kind='EMPIRICAL_POOL_COMMIT',indices={}))
         execution.append(dict(outer=o+11,kind=k,indices=i))
     return dict(version=VERSION,continuation_contract=CONTRACT,horizon=50,primary_branch=0,children=2,
-        initial_train_rule='REUSE_CERTIFIED_OUTER11_BANK_NOT_INDEPENDENT_RESAMPLE',
+        initial_train_rule='CERTIFIED_OUTER11_BASE; NEW_IMMUTABLE_JOINT_COVERAGE_TRAIN_BANK',
+        joint_coverage=asdict(coverage or JointCoverageConfig()),
         start_outer=12,end_outer=15,train_parents=8192,validation_parents=2048,firms=200,
         initial_root=asdict(MarketClearingConfig()),root_only_t0=True,
         finite_operator='finite_direct_parent_exit_before_child_v2',
@@ -46,7 +54,7 @@ def plan():
         sdf_pair_budget=dict(train=8192,validation=2048),
         optimizer_budget='UNCHANGED; BOUNDED_LOCKED_SUBSET_PER_DATA_STAGE',
         firm_sampling='LINEAGE_TIME_MACRO_STRATIFIED',time_strata=[[0,9],[10,29],[30,49]],
-        beta_empirical='50:50',recent_archive='70:30',empirical_parent_counts=[2867,1229],
+        beta_empirical='TARGET_50:50; CERTIFIED_EMPIRICAL_SHORTFALL_FILLED_BY_ROOT_VALID_BETA',recent_archive='70:30_WHEN_AVAILABLE',
         validation='FIXED_INITIAL_BANK_AND_CRN; HSTAR_RECALIBRATED_IF_MODEL_CHANGES',
         training_distribution_is_not_population=True,fc2=False,
         stages=execution)
@@ -56,7 +64,8 @@ def approval_binding(args,commit):
     sampling=args.sampling_dir
     required=['sampling_signature.json','train_initial_bank.pt','validation_initial_bank.pt']
     return dict(schema_name=SCHEMA,schema_version=5,source_commit=commit,
-        plan_fingerprint=stable_json_hash(plan()),
+        plan_fingerprint=stable_json_hash(plan(coverage_config(args))),
+        joint_coverage_fingerprint=stable_json_hash(asdict(coverage_config(args))),
         sampling_signature_fingerprint=json.loads((sampling/'sampling_signature.json').read_text())['fingerprint'],
         source_checkpoint_sha256=file_hash(args.initial_checkpoint),
         committed_source_journal_sha256=file_hash(args.source_journal_checkpoint),
@@ -118,6 +127,7 @@ class H50Backend(ProductionBackend):
             {**self.episode.optimizers,'fc1_conditional':self.fc1}.items()}
         self._source_bank_ref=save_bank_reference(self.root,bank,schedule,outer=11,pool_version=pool['fingerprint'])
         self._active_bank_ref=save_bank_reference(self.root,bank,schedule,outer=12,pool_version=pool['fingerprint'])
+        self.coverage_cfg=coverage_config(args)
         for name,audit in audits.items():atomic_write_json(self.root/'metadata'/f'{name}.json',audit)
 
     def _store(self,outer,stage,split,capture=True,templates=False):
@@ -125,30 +135,63 @@ class H50Backend(ProductionBackend):
         if module_hash(self.episode._target_policy_value())!=module_hash(self.models['policy_value']):
             raise ValueError('stale Firm Grid target')
         path=self.root/f'outer_{outer:03d}'/stage/split
-        return generate_long_horizon_dataset(self.models,self.episode,self.banks[split],
+        store=generate_long_horizon_dataset(self.models,self.episode,self.banks[split],
             self.schedules[split],self.signature,path,outer=outer,stage=stage,
             parent_batch_size=self.args.parent_batch_size,capture=capture,
-            predecision_templates=templates)
+            predecision_templates=templates,diagnostic_metadata=dict(
+                initial_bank_sha=(self._active_bank_ref['sha256'] if split=='train' else file_hash(self.args.sampling_dir/'validation_initial_bank.pt')),
+                coverage_config=asdict(self.coverage_cfg)))
+        from analysis.h50_joint_diagnostics import write_dashboard,compare_validation_stages
+        write_dashboard(store,path/'diagnostics',self.coverage_cfg)
+        if split=='validation':compare_validation_stages({name:self.root/f'outer_{outer:03d}'/name/'validation/diagnostics' for name in ('D0','D1','D2')},self.root/f'outer_{outer:03d}'/'diagnostics')
+        return store
+
+    def _joint_train_bank(self,outer):
+        from analysis.run_fc1_self_consistent_macro import simulator
+        from analysis.economic_config import AnalysisEconomicConfig
+        from data.finite_direct_sampling import state_hash
+        def templates():
+            for source in reversed(self.state['pool_sources']):
+                path=Path(source['path'])
+                if source['outer']>=outer or file_hash(path/'manifest.json')!=source['manifest_sha256']:raise ValueError('uncommitted/future empirical source')
+                for shard in ShardStore(path).chunks():
+                    for item in shard['templates']:
+                        if 'dynamic_template' in item:yield item['dynamic_template']
+            yield from self.archive_templates
+        bank,schedule,stats=build_joint_bank(self.initial_train,templates(),outer=outer,
+            target=plan()['train_parents'],cfg=self.coverage_cfg,output=self.root/f'outer_{outer:03d}'/'coverage_bank',
+            simulator_factory=lambda n:simulator(self.models,self.episode,n,self.coverage_cfg.seed),
+            economic=dict(config=asdict(AnalysisEconomicConfig.from_current_config()),hyperparameters=asdict(self.episode.hyperparams)),
+            committed=True,pool_fingerprint=stable_json_hash(dict(
+                source_sha256=self._source_bank_ref['sha256'],
+                pools=[dict(outer=p['outer'],manifest_sha256=p['manifest_sha256']) for p in self.state['pool_sources']])) )
+        self.banks['train']=bank;self.schedules['train']=schedule
+        self.state.setdefault('coverage_banks',{})[str(outer)]=stats
+        return stats
 
     def _generate(self,outer,stage,*,capture=True):
         result={}
         for split in ('train','validation'):
             store=self._store(outer,stage,split,capture)
             frame,index=sample_macro_rows(store,pair_budget=plan()['macro_pair_budget'][split],
-                seed=20261021+(0 if split=='train' else 100000))
+                seed=20261021+(0 if split=='train' else 100000),
+                source_by_id={r['parent_id']:r for r in self.schedules[split]['parents']} if split=='train' else None,
+                coverage_config=self.coverage_cfg)
             frame.to_csv(store.root/'observations.csv',index=False)
             atomic_write_json(store.root/'sample_index.json',index)
             manifest=dict(store.manifest,observations_sha256=file_hash(store.root/'observations.csv'),
                           sampled_rows=len(frame),sampling=index)
             if stage=='D2':
                 sdf_rows,sdf_index=sample_macro_rows(store,pair_budget=plan()['sdf_pair_budget'][split],
-                    seed=20261022+(0 if split=='train' else 100000),complete_pairs_only=True)
+                    seed=20261022+(0 if split=='train' else 100000),complete_pairs_only=True,
+                    source_by_id={r['parent_id']:r for r in self.schedules[split]['parents']} if split=='train' else None,
+                    coverage_config=self.coverage_cfg)
                 sdf_rows.to_csv(store.root/'sdf_observations.csv',index=False)
                 atomic_write_json(store.root/'sdf_sample_index.json',sdf_index)
                 manifest.update(sdf_observations_sha256=file_hash(store.root/'sdf_observations.csv'),sdf_sampling=sdf_index)
             atomic_write_json(store.root/'manifest.json',manifest)
-            from analysis.h50_diagnostics import write_diagnostics
-            write_diagnostics(store,store.root/'figures')
+            # _store already collected the canonical diagnostics once. Do not
+            # reread every H50 shard merely to create a second figures folder.
             result[split]=(frame,[],manifest,store.root)
         return result
 
@@ -169,7 +212,7 @@ class H50Backend(ProductionBackend):
     def _execute(self,outer,kind,i):
         directory=self.root/f'outer_{outer:03d}';directory.mkdir(parents=True,exist_ok=True)
         if kind=='baseline':
-            from analysis.h50_diagnostics import streaming_economic_metrics,write_diagnostics
+            from analysis.h50_diagnostics import streaming_economic_metrics
             store=self._store(outer,'firm_source','validation')
             bank=broad_firm_bank(store,split='validation',max_rows=2048,seed=20361021,
                 calculated_fraction=plan()['calculated_fraction'])
@@ -178,7 +221,6 @@ class H50Backend(ProductionBackend):
             atomic_torch_save(path,dict(banks={'validation':bank.payload()},
                 children={'validation':children.payload()}))
             self.state['probe_bank']=dict(path=str(path),sha256=file_hash(path))
-            write_diagnostics(store,store.root/'figures')
             return dict(optimizer_steps=0,evaluation='NEW_H50_OPERATOR_BASELINE_BEFORE_FIRST_FIRM_UPDATE',
                 economic_metrics=streaming_economic_metrics(store,self.schedules['validation'],outer=outer,stage='BASELINE'),
                 fixed_probe_residual=self._cross(outer,label='initial_baseline'))
@@ -186,15 +228,12 @@ class H50Backend(ProductionBackend):
             if outer>12:
                 expected=self.state['outer_metrics'][str(outer-1)]['committed_hashes']
                 if hashes(self.models)!=expected:raise ValueError('previous committed model mismatch')
-                from data.finite_direct_long_horizon_empirical import resample_from_sources
-                bank=resample_from_sources(self.initial_train,self.initial_schedule,
-                    self.state['pool_sources'],outer=outer,initial_archive=self.archive_templates)
-                self.banks['train']=bank
+            coverage_stats=self._joint_train_bank(outer) if self.coverage_cfg.enabled else None
             self.state['h50_active_outer']=outer
             self._active_bank_ref=save_bank_reference(self.root,self.banks['train'],self.schedules['train'],
                 outer=outer,pool_version=self.banks['train']['empirical_pool_fingerprint'])
             self.state['outer_metrics'][str(outer)]={'initial_hashes':hashes(self.models)}
-            return dict(version=VERSION,source_outer=11,optimizer_steps=0)
+            return dict(version=VERSION,source_outer=11,optimizer_steps=0,joint_coverage=coverage_stats)
         if kind=='firm_bank':
             set_scope(self.models,'frozen');banks={};children={}
             for split in ('train','validation'):
@@ -232,8 +271,6 @@ class H50Backend(ProductionBackend):
         if kind=='post_sdf_validation':
             # Dedicated current-model provenance; never old D2.
             store=self._store(outer,'POST_SDF_VALIDATION_RESIMULATION','validation',capture=False)
-            from analysis.h50_diagnostics import write_diagnostics
-            write_diagnostics(store,store.root/'figures')
             from analysis.h50_diagnostics import streaming_economic_metrics
             return dict(optimizer_steps=0,manifest=str(store.root/'manifest.json'),
                         evaluation='POST_SDF_VALIDATION_RESIMULATION',
@@ -293,6 +330,7 @@ def main(argv=None):
     p.add_argument('--source-journal-checkpoint',type=Path)
     p.add_argument('--source-latest-pointer',type=Path)
     p.add_argument('--source-artifact-dir',type=Path)
+    p.add_argument('--coverage-config',type=Path)
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--approval',type=Path)
     p.add_argument('--execute-approved',action='store_true')
@@ -305,7 +343,7 @@ def main(argv=None):
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     if not require_approval(args,commit):
         args.output.mkdir(parents=True,exist_ok=True)
-        atomic_write_json(args.output/'training_plan.json',plan())
+        atomic_write_json(args.output/'training_plan.json',plan(coverage_config(args)))
         return 0
     if args.sampling_dir is None or args.initial_checkpoint is None:
         raise ValueError('approved artifact paths required')

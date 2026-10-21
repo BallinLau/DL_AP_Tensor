@@ -193,7 +193,7 @@ def test_fifty_transitions_one_spine_no_duplicate_node_commit(monkeypatch,tmp_pa
     monkeypatch.setattr(r,'simulator',lambda *a:sim)
     monkeypatch.setattr(r,'hashes',lambda *a:{'fixture':'SYNTHETIC_NOT_FEASIBILITY'})
     monkeypatch.setattr(r,'cache_provenance',lambda *a,**k:{'crn_hash':'fixture'})
-    state=dict(x=torch.zeros(2),b=torch.zeros(2,2),K=torch.ones(2,2),alive=torch.ones(2,2,dtype=torch.bool),
+    state=dict(x=torch.zeros(2),b=torch.zeros(2,2),bar_z=torch.zeros(2,2),K=torch.ones(2,2),alive=torch.ones(2,2,dtype=torch.bool),
         transition_path_id=torch.tensor([10,20]),hatc_cal=torch.zeros(2),lnk_cal=torch.zeros(2))
     def observations(s,t,b):
         return [dict(parent_candidate_id=int(pid),t=t,child_branch=b,x_t1=0.,Hatcf_t1=0.,LnKF_t1=math.log(2),
@@ -212,7 +212,7 @@ def test_fifty_transitions_one_spine_no_duplicate_node_commit(monkeypatch,tmp_pa
     def promote(sim,s,t):promoted.append(t);return s
     monkeypatch.setattr(r,'promote_child',promote)
     e=SimpleNamespace(device=torch.device('cpu'),hyperparams=build_hyperparams())
-    bank=dict(state=state,fingerprint='fixture');schedule=dict(seed=1,split='train')
+    bank=dict(state=state,fingerprint='fixture');schedule=dict(seed=1,split='train',parents=[dict(parent_id=p,sampling_source='BETA') for p in (10,20)])
     store=r.generate_long_horizon_dataset({},e,bank,schedule,{},tmp_path,
         outer=12,stage='CPU_SYNTHETIC_INTERFACE_ONLY',parent_batch_size=2,capture=False)
     rows=pd.concat(list(store.rows()))

@@ -39,7 +39,7 @@ def bounded_quotas(available, budget):
     return quotas
 
 
-def sample_macro_rows(store, *, pair_budget, seed, complete_pairs_only=False):
+def sample_macro_rows(store, *, pair_budget, seed, complete_pairs_only=False,source_by_id=None,coverage_config=None):
     """Bounded paired reservoir: equal lineage, then time/state strata.
 
     Keep complete pairs together when both are eligible. Single legal FC1
@@ -48,7 +48,13 @@ def sample_macro_rows(store, *, pair_budget, seed, complete_pairs_only=False):
     the resulting reweighting is explicit optimization sampling, not population.
     """
     import heapq
+    from data.finite_direct_joint_coverage import source_allocation,joint_bin
     rng=np.random.default_rng(seed); counts=defaultdict(int); coverage=[]
+    def origin(pid):
+        spec=source_by_id[int(pid)] if source_by_id is not None else {}
+        return 'EMPIRICAL' if spec.get('sampling_source')=='EMPIRICAL' else 'BETA'
+    def cell(h,k):return joint_bin(h,k,coverage_config) if coverage_config is not None else macro_bin(h,k)
+    def family(pid):return source_by_id[int(pid)].get('coverage_family','LEGACY') if source_by_id is not None else 'LEGACY'
     def eligible(frame):
         for name in ('x_t','x_t1','Hatc_cal_t','LnK_cal_t','Hatc_cal_t1','LnK_cal_t1','C_raw_t1','K_cal_t1'):
             if name not in frame:frame[name]=np.nan
@@ -58,22 +64,37 @@ def sample_macro_rows(store, *, pair_budget, seed, complete_pairs_only=False):
         coverage.append(dict(attempted=len(frame),fc1=len(selected.fc1),sdf_children=len(selected.sdf_pairs)))
         sampling=selected.sdf_pairs if complete_pairs_only else selected.fc1
         for (split,pid,t),g in sampling.groupby(['split','parent_candidate_id','t']):
-            first=g.iloc[0]; key=(int(pid),time_bin(int(t)-1),*macro_bin(first.Hatc_cal_t,first.LnK_cal_t))
+            first=g.iloc[0]; key=(int(pid),time_bin(int(t)-1),*cell(first.Hatc_cal_t,first.LnK_cal_t))
             counts[key]+=1
     bands=sorted({k[1] for k in counts});keys_per_lineage=defaultdict(int)
     for pid,band,h,k in counts:keys_per_lineage[pid,band]+=1
     if not bands:raise ValueError('NO_COMPLETE_LONG_HORIZON_SDF_PAIRS' if complete_pairs_only else 'NO_LEGAL_LONG_HORIZON_MACRO_ROWS')
     available={band:sum(count for key,count in counts.items() if key[1]==band) for band in (0,1,2)}
     quotas=bounded_quotas(available,pair_budget)
-    heaps={band:[] for band in bands}
+    source_available=defaultdict(int);bucket_available=defaultdict(int)
+    for (pid,band,h,k),count in counts.items():
+        source_available[origin(pid)]+=count;bucket_available[origin(pid),band]+=count
+    allocation=source_allocation(pair_budget,source_available['EMPIRICAL'],source_available['BETA']) if source_by_id is not None else None
+    if allocation is not None:
+        quotas={}
+        for label,key in [('EMPIRICAL','empirical'),('BETA','beta')]:
+            local=bounded_quotas({band:bucket_available[label,band] for band in (0,1,2)},allocation[key])
+            quotas.update({(label,band):n for band,n in local.items()})
+        heaps={k:[] for k,n in quotas.items() if n}
+    else:heaps={band:[] for band in bands}
+    rarity=defaultdict(int)
+    for (pid,band,h,k),count in counts.items():rarity[origin(pid),band,h,k,family(pid)]+=count
     for frame in store.rows():
         selected=eligible(frame);sampling=selected.sdf_pairs if complete_pairs_only else selected.fc1
         for (split,pid,t),g in sampling.groupby(['split','parent_candidate_id','t']):
             first=g.iloc[0];band=time_bin(int(t)-1)
-            key=(int(pid),band,*macro_bin(first.Hatc_cal_t,first.LnK_cal_t))
-            priority=float(rng.random())**(counts[key]*keys_per_lineage[pid,band])
+            key=(int(pid),band,*cell(first.Hatc_cal_t,first.LnK_cal_t))
+            factor=rarity[origin(pid),band,*key[2:],family(pid)] if source_by_id is not None else counts[key]
+            priority=float(rng.random())**(factor*keys_per_lineage[pid,band])
             entry=(priority,float(rng.random()),g.to_dict('records'))
-            heap=heaps[band];quota=quotas[band]
+            bucket=(origin(pid),band) if allocation is not None else band
+            if not quotas[bucket]:continue
+            heap=heaps[bucket];quota=quotas[bucket]
             if len(heap)<quota: heapq.heappush(heap,entry)
             elif quota and entry[:2]>heap[0][:2]: heapq.heapreplace(heap,entry)
     rows=[r for heap in heaps.values() for _,_,records in heap for r in records]
@@ -82,7 +103,9 @@ def sample_macro_rows(store, *, pair_budget, seed, complete_pairs_only=False):
     return result,dict(pair_budget=pair_budget,seed=seed,source_coverage=coverage,
         index_sha256=stable_json_hash(result[['split','parent_candidate_id','t','child_branch']].to_dict('records')),
         rule='EQUAL_NONEMPTY_TIME_BAND_THEN_WEIGHTED_LINEAGE_MACRO_RESERVOIR',
-        time_band_quotas=quotas,available_parent_times_by_band=available,
+        time_band_quotas={str(k):v for k,v in quotas.items()},available_parent_times_by_band=available,
+        source_allocation=allocation,source_available_parent_times=dict(source_available),
+        source_counts_selected=dict(result.groupby('sampling_source').size()) if 'sampling_source' in result else None,
         requested_parent_time_budget=pair_budget,actual_parent_times=sum(len(h) for h in heaps.values()),
         unused_quota=pair_budget-sum(len(h) for h in heaps.values()),
         actual_unique_child_rows=len(result),distinct_initial_parents=int(result.parent_candidate_id.nunique()),

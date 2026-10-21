@@ -71,6 +71,11 @@ def streaming_economic_metrics(store,schedule,*,outer,stage):
 
 
 def write_diagnostics(store, output):
+    if store.manifest.get('provenance',{}).get('diagnostics_version')=='H50_JOINT_COVERAGE_DIAGNOSTICS_V1':
+        from analysis.h50_joint_diagnostics import write_dashboard
+        from data.finite_direct_joint_coverage import JointCoverageConfig
+        cfg=store.manifest['provenance'].get('diagnostic_metadata',{}).get('coverage_config',{})
+        return write_dashboard(store,output,JointCoverageConfig(**cfg))
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     edges=[np.linspace(-15,8,93),np.linspace(-12,5,69)]
     names=['fc1_h_lnk_coverage_heatmap','fc1_long_horizon_actual_states',
