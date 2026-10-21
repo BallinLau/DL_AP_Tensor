@@ -62,7 +62,7 @@ def evaluate_static(models,e,bank,out):
     frame['macro_case']=bank.metadata['macro_case'].numpy()
     for name in ('P0','PI','Phat','Q','bp0','bpI','bar_i','bar_z'):frame[name]=getattr(output,name).reshape(-1).detach().numpy()
     frame['hard_default']=frame.bar_z>=.5
-    frame['hard_investment_at_fixed_i']=frame.PI>=frame.P0
+    frame['conditional_investment_value_region_at_fixed_i']=frame.PI>=frame.P0
     # Cost-region diagnostic, not a new threshold/decision rule. Resolve all
     # observed PI-P0 sign changes on the ORIGINAL production i grid.
     igrid=torch.linspace(0.,model.i_threshold,max(2,model.i_grid_size))

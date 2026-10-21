@@ -31,6 +31,8 @@ P/Q改善，但BP regret恶化；不是全面收敛。default面积eta0：0.8302
 
 四组Before/After×eta0/1每个背景均同轴、同色、同真实初始scatter。黑色=current checkpoint boundary，未画previous-period boundary。另有Before黑线/After红线直接叠加。保存方向反转、多交叉、离散总变差、Value尺度，以及原i-grid上全部PI−P0变号bracket；未假装得到唯一精确i-star。
 
+生成版本b0d8d73的CSV列hard_investment_at_fixed_i实际表示PI≥P0的条件value region，不是加上生存/违约后的执行投资；最终评价器已改为conditional_investment_value_region_at_fixed_i。原始CSV不重写，证据包附语义说明。i-grid positive share也不等于soft bar_i资源权重。
+
 ## Off-support风险
 
 认证下载的Outer11 D2训练记录16384行中，合法FC1行14067；其Parent h/ell轴包络约[-1.415235,-0.752838]×[3.806767,4.442607]。最终网格91.6667%在该观测轴包络之外；这只是与一批真实训练输入的距离，不证明包络内均有joint support，也不是整个SDF可信域。
