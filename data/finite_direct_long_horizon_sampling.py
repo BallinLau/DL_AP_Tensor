@@ -25,6 +25,20 @@ def macro_bin(h, k):
     return math.floor(h), math.floor(k)
 
 
+def bounded_quotas(available, budget):
+    """Redistribute unused quota only to distinct available observations."""
+    if budget<0:raise ValueError('negative sampling budget')
+    quotas={band:0 for band in (0,1,2)}
+    remaining=min(budget,sum(available.values()))
+    while remaining:
+        active=[band for band in quotas if quotas[band]<available.get(band,0)]
+        portion=max(1,remaining//len(active))
+        for band in active:
+            add=min(portion,available[band]-quotas[band],remaining)
+            quotas[band]+=add;remaining-=add
+    return quotas
+
+
 def sample_macro_rows(store, *, pair_budget, seed, complete_pairs_only=False):
     """Bounded paired reservoir: equal lineage, then time/state strata.
 
@@ -49,7 +63,8 @@ def sample_macro_rows(store, *, pair_budget, seed, complete_pairs_only=False):
     bands=sorted({k[1] for k in counts});keys_per_lineage=defaultdict(int)
     for pid,band,h,k in counts:keys_per_lineage[pid,band]+=1
     if not bands:raise ValueError('NO_COMPLETE_LONG_HORIZON_SDF_PAIRS' if complete_pairs_only else 'NO_LEGAL_LONG_HORIZON_MACRO_ROWS')
-    quotas={band:pair_budget//len(bands)+(j<pair_budget%len(bands)) for j,band in enumerate(bands)}
+    available={band:sum(count for key,count in counts.items() if key[1]==band) for band in (0,1,2)}
+    quotas=bounded_quotas(available,pair_budget)
     heaps={band:[] for band in bands}
     for frame in store.rows():
         selected=eligible(frame);sampling=selected.sdf_pairs if complete_pairs_only else selected.fc1
@@ -67,7 +82,12 @@ def sample_macro_rows(store, *, pair_budget, seed, complete_pairs_only=False):
     return result,dict(pair_budget=pair_budget,seed=seed,source_coverage=coverage,
         index_sha256=stable_json_hash(result[['split','parent_candidate_id','t','child_branch']].to_dict('records')),
         rule='EQUAL_NONEMPTY_TIME_BAND_THEN_WEIGHTED_LINEAGE_MACRO_RESERVOIR',
-        time_band_quotas=quotas,complete_pairs_only=complete_pairs_only,population_weights=False)
+        time_band_quotas=quotas,available_parent_times_by_band=available,
+        requested_parent_time_budget=pair_budget,actual_parent_times=sum(len(h) for h in heaps.values()),
+        unused_quota=pair_budget-sum(len(h) for h in heaps.values()),
+        actual_unique_child_rows=len(result),distinct_initial_parents=int(result.parent_candidate_id.nunique()),
+        macro_bin_count=len({k[2:] for k in counts}),
+        complete_pairs_only=complete_pairs_only,population_weights=False)
 
 
 def broad_firm_bank(store, *, split, max_rows, seed, calculated_fraction=.5):
@@ -107,6 +127,7 @@ def broad_firm_bank(store, *, split, max_rows, seed, calculated_fraction=.5):
     states=torch.empty(max_rows,7);contexts=torch.empty(max_rows,2)
     paths=torch.empty(max_rows,dtype=torch.long);times=torch.empty_like(paths)
     firms=torch.empty_like(paths); provenance=[None]*max_rows
+    branches=torch.empty_like(paths)
     for shard_index,capture in enumerate(store.captures()):
         for out,pid,offset,kind in wanted.get(shard_index,[]):
             ids=torch.nonzero(capture['eligible'].bool() & (capture['path']==pid)).flatten()
@@ -115,9 +136,15 @@ def broad_firm_bank(store, *, split, max_rows, seed, calculated_fraction=.5):
             if kind=='CALCULATED_MACRO_COLLOCATION': state[5:7]=context
             states[out]=state; contexts[out]=context; paths[out]=capture['path'][row]
             firms[out]=capture['firm_id'][row]; times[out]=capture['source_time'];provenance[out]=kind
+            branches[out]=capture.get('source_branch',-1)
     return InnerFPCollocationBank(states,torch.zeros(max_rows,dtype=torch.long),seed,split,
-        dict(path=paths,firm_id=firms,source_time=times,true_macro_context=contexts,
+        dict(path=paths,firm_id=firms,source_time=times,source_branch=branches,true_macro_context=contexts,
             source_kind=provenance,operator=VERSION,
             target_contract='REBUILD_CONDITIONAL_CHILD_BANK_AND_BELLMAN_RHS; NO_CACHED_LABELS',
             calculated_fraction=calculated_fraction,
+            requested_rows=max_rows,actual_draws=max_rows,
+            unique_source_firm_time_count=len(set(zip(paths.tolist(),times.tolist(),branches.tolist(),firms.tolist()))),
+            replacement_draws_are_not_new_independent_states=True,
+            available_firm_capture_rows=sum(n for values in groups.values() for _,_,n in values),
+            available_time_bands=sorted({key[1] for key in groups}),
             sampler='EQUAL_NONEMPTY_TIME_BAND_THEN_LINEAGE_THEN_MACRO_STRATUM_THEN_CAPTURE_THEN_FIRM'))

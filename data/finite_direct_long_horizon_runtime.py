@@ -87,7 +87,7 @@ class ShardStore:
 @torch.inference_mode()
 def generate_long_horizon_dataset(models, episode, bank, schedule, signature, output, *,
         outer, stage, horizon=50, parent_batch_size=128, root_config=None,
-        capture=True, predecision_templates=False):
+        capture=True, predecision_templates=False, diagnostic_observer=None):
     if horizon != 50:
         raise ValueError('H50 data contract requires exactly 50 transitions')
     if parent_batch_size < 1:
@@ -127,6 +127,8 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
             atomic_write_json(output/f'initial_failure_{start:06d}.json',dict(error=str(exc),audit=exc.audit))
             raise
         root_audits.extend(audit)
+        if diagnostic_observer is not None:
+            diagnostic_observer('INITIAL_PROCESSED',sim,state,parents,0,-1)
         if root_cache.exists():initial_caches[root_cache.name]=file_hash(root_cache)
         for time in range(horizon):
             target = output/f'batch_{start:06d}_time_{time:03d}.pt'
@@ -166,10 +168,16 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
                     state = select_state(state, torch.tensor(good, device=episode.device))
                     if time:
                         state = promote_child(sim, state, time)
+                        if diagnostic_observer is not None:
+                            diagnostic_observer('NEXT_PARENT_BP_STAGE',sim,state,parents,time,0)
                     pmap = {r['parent_candidate_id']:r for r in parents}
                     children = expand_after_parent_exit(sim, state, child_t=time+1)
                     for branch, child in enumerate(children):
+                        if diagnostic_observer is not None:
+                            diagnostic_observer('POST_EXIT',sim,child,[],time+1,branch)
                         child = _apply_entry_batched(sim, child, max(20,int(sim.group_size*.1)))
+                        if diagnostic_observer is not None:
+                            diagnostic_observer('POST_ENTRY_PRE_DECISION',sim,child,[],time+1,branch)
                         if predecision_templates and schedule['split']=='train':
                             from data.finite_direct_dynamic_empirical import capture_templates
                             values = capture_templates(child, split='train', outer=outer,
@@ -192,6 +200,8 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
                                 Hatc_cal_t1=float('nan'),LnK_cal_t1=float('nan'))
                                 for j,pid in enumerate(child['transition_path_id'].tolist())]
                         valid=continuable_nodes(child,observed)
+                        if diagnostic_observer is not None:
+                            diagnostic_observer('POST_DECISION',sim,child,observed,time+1,branch)
                         if capture and branch==1 and time+1<horizon and bool(child['alive'].any()):
                             captures.append(capture_node(child,observed,split=schedule['split'],
                                 outer=outer,time=time+1,branch=branch,model_hashes=before))

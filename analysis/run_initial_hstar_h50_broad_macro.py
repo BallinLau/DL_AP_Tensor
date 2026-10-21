@@ -10,7 +10,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 import pandas as pd
 import torch
-from analysis.finite_direct_continuation_state import safe_load
+from analysis.finite_direct_continuation_state import safe_load,verify_optimizer_restored
 from analysis.finite_direct_outer4_state import StageJournal
 from analysis.nested_equilibrium_utils import (stable_json_hash,atomic_write_json,atomic_torch_save,
     restore_training_transaction,module_hash)
@@ -23,6 +23,7 @@ from data.finite_direct_long_horizon_sampling import broad_firm_bank,sample_macr
 from data.finite_direct_runtime import load_locked_sampling,check_firm_lineage
 from data.finite_direct_sampling import file_hash
 from data.market_clearing import MarketClearingConfig
+from analysis.h50_source_certification import CONTRACT, certify, save_bank_reference, load_bank_reference
 
 SCHEMA='CONTINUATION_APPROVAL_V5_HSTAR_H50'
 
@@ -35,7 +36,8 @@ def plan():
         if o<1:continue
         if k=='cross_block':execution.append(dict(outer=o+11,kind='EMPIRICAL_POOL_COMMIT',indices={}))
         execution.append(dict(outer=o+11,kind=k,indices=i))
-    return dict(version=VERSION,horizon=50,primary_branch=0,children=2,
+    return dict(version=VERSION,continuation_contract=CONTRACT,horizon=50,primary_branch=0,children=2,
+        initial_train_rule='REUSE_CERTIFIED_OUTER11_BANK_NOT_INDEPENDENT_RESAMPLE',
         start_outer=12,end_outer=15,train_parents=8192,validation_parents=2048,firms=200,
         initial_root=asdict(MarketClearingConfig()),root_only_t0=True,
         finite_operator='finite_direct_parent_exit_before_child_v2',
@@ -57,6 +59,12 @@ def approval_binding(args,commit):
         plan_fingerprint=stable_json_hash(plan()),
         sampling_signature_fingerprint=json.loads((sampling/'sampling_signature.json').read_text())['fingerprint'],
         source_checkpoint_sha256=file_hash(args.initial_checkpoint),
+        committed_source_journal_sha256=file_hash(args.source_journal_checkpoint),
+        committed_source_pointer_sha256=file_hash(args.source_latest_pointer),
+        source_job=702636,continuation_contract=CONTRACT,
+        dynamic_source_artifact_sha256={k:v['sha256'] for k,v in
+            safe_load(args.initial_checkpoint)['state']['dynamic_banks']['11'].items()
+            if k in ('pool','bank','schedule')},
         input_artifact_sha256={n:file_hash(sampling/n) for n in required},
         root_fingerprint=stable_json_hash(plan()['initial_root']),
         horizon=50,operator=VERSION)
@@ -68,6 +76,8 @@ def require_approval(args,commit):
     supplied=json.loads(args.approval.read_text())
     if supplied.get('schema_version')!=5 or supplied.get('schema_name')!=SCHEMA:
         raise ValueError('V5 content-bound approval mismatch; v4 forbidden')
+    if any(getattr(args,k,None) is None for k in ('sampling_dir','initial_checkpoint','source_journal_checkpoint','source_latest_pointer')):
+        raise ValueError('V5 certified source artifact paths required')
     expected=approval_binding(args,commit)
     if supplied.get('approved') is not True or any(supplied.get(k)!=v for k,v in expected.items()):
         raise ValueError('V5 content-bound approval mismatch; v4 forbidden')
@@ -93,9 +103,21 @@ class H50Backend(ProductionBackend):
         self.episode.refresh_firm_target()
         self.state['initialization']='FULL_OUTER11_LEARNING_STATE_NEW_H50_DATA_CONTRACT'
         self.state['pool_sources']=[]
-        self.initial_train=self.banks['train']
-        self.initial_schedule=self.schedules['train']
-        self.archive_templates=[t for t in safe_load(args.sampling_dir/'empirical_template_bank.pt')['templates'] if t['split']=='train']
+        _,bank,schedule,pool,audits=certify(args.initial_checkpoint,args.source_journal_checkpoint,
+            args.source_latest_pointer,source_job=702636,artifact_dir=args.source_artifact_dir)
+        if set(bank['state']['transition_path_id'].tolist()) & set(self.banks['validation']['state']['transition_path_id'].tolist()):
+            raise ValueError('source dynamic Train/Validation lineage overlap')
+        self.banks['train']=bank;self.schedules['train']=schedule
+        self.initial_train=bank;self.initial_schedule=schedule
+        self.archive_templates=pool['archive']+pool['recent']
+        self.state['h50_active_outer']=12
+        self.state['source_certification']=audits
+        self.state['restored_optimizer_audit']={name:verify_optimizer_restored(
+            learning['transaction']['optimizers'][name],opt) for name,opt in
+            {**self.episode.optimizers,'fc1_conditional':self.fc1}.items()}
+        self._source_bank_ref=save_bank_reference(self.root,bank,schedule,outer=11,pool_version=pool['fingerprint'])
+        self._active_bank_ref=save_bank_reference(self.root,bank,schedule,outer=12,pool_version=pool['fingerprint'])
+        for name,audit in audits.items():atomic_write_json(self.root/'metadata'/f'{name}.json',audit)
 
     def _store(self,outer,stage,split,capture=True,templates=False):
         set_scope(self.models,'frozen')
@@ -167,6 +189,9 @@ class H50Backend(ProductionBackend):
                 bank=resample_from_sources(self.initial_train,self.initial_schedule,
                     self.state['pool_sources'],outer=outer,initial_archive=self.archive_templates)
                 self.banks['train']=bank
+            self.state['h50_active_outer']=outer
+            self._active_bank_ref=save_bank_reference(self.root,self.banks['train'],self.schedules['train'],
+                outer=outer,pool_version=self.banks['train']['empirical_pool_fingerprint'])
             self.state['outer_metrics'][str(outer)]={'initial_hashes':hashes(self.models)}
             return dict(version=VERSION,source_outer=11,optimizer_steps=0)
         if kind=='firm_bank':
@@ -223,12 +248,19 @@ class H50Backend(ProductionBackend):
 
     def snapshot(self):
         result=super().snapshot()
-        result['h50_train_bank']=self.banks['train']
+        result['h50_train_bank_reference']=self._active_bank_ref
+        result['h50_source_bank_reference']=self._source_bank_ref
         return result
 
     def restore(self,snapshot):
         super().restore(snapshot)
-        self.banks['train']=snapshot['h50_train_bank']
+        if 'h50_train_bank_reference' not in snapshot:
+            raise ValueError('old inline H50 snapshot requires explicit migration, not silent resume')
+        ref=snapshot['h50_train_bank_reference']
+        if ref['outer']!=self.state['h50_active_outer']:raise ValueError('active Outer/Bank mismatch')
+        self.banks['train'],self.schedules['train']=load_bank_reference(ref)
+        self.initial_train,self.initial_schedule=load_bank_reference(snapshot['h50_source_bank_reference'])
+        self._active_bank_ref=ref;self._source_bank_ref=snapshot['h50_source_bank_reference']
         for record in self.state['data'].values():
             path=Path(record['path'])
             if file_hash(path/'manifest.json')!=record['manifest_sha256']:
@@ -257,6 +289,9 @@ def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--sampling-dir',type=Path)
     p.add_argument('--initial-checkpoint',type=Path)
+    p.add_argument('--source-journal-checkpoint',type=Path)
+    p.add_argument('--source-latest-pointer',type=Path)
+    p.add_argument('--source-artifact-dir',type=Path)
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--approval',type=Path)
     p.add_argument('--execute-approved',action='store_true')

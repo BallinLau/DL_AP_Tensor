@@ -11,10 +11,15 @@ set -euo pipefail
 : "${RUN_ROOT:?new persistent output directory required}"
 : "${SAMPLING_DIR:?reviewed input bank directory required}"
 : "${INITIAL_CHECKPOINT:?approved committed Outer11 learning state required}"
+: "${SOURCE_JOURNAL_CHECKPOINT:?Job702636 final committed transaction required}"
+: "${SOURCE_LATEST_POINTER:?Job702636 final pointer required}"
+: "${SOURCE_ARTIFACT_DIR:?certified Outer11 pool bank schedule mirror required}"
 : "${USER_APPROVAL_JSON:?explicit content-bound V5 approval required}"
 cd "$REPO_DIR"
 python analysis/run_initial_hstar_h50_broad_macro.py \
   --sampling-dir "$SAMPLING_DIR" --initial-checkpoint "$INITIAL_CHECKPOINT" \
+  --source-journal-checkpoint "$SOURCE_JOURNAL_CHECKPOINT" \
+  --source-latest-pointer "$SOURCE_LATEST_POINTER" --source-artifact-dir "$SOURCE_ARTIFACT_DIR" \
   --output "$RUN_ROOT" --device cuda:0 --parent-batch-size 128 \
   --fit-parent-batch-size 128 --firm-batch-size 512 \
   --execute-approved --approval "$USER_APPROVAL_JSON"

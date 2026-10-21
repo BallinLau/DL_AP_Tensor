@@ -50,12 +50,16 @@ def test_missing_explicit_approval_rejected():
 
 
 @pytest.mark.parametrize('artifact',['checkpoint','train_initial_bank.pt','validation_initial_bank.pt','sampling_signature.json'])
-def test_approval_binds_actual_content(artifact,tmp_path):
+def test_approval_binds_actual_content(artifact,tmp_path,monkeypatch):
     # Arbitrary test bytes, never an approved=true file.
     for name in ('checkpoint','train_initial_bank.pt','validation_initial_bank.pt','sampling_signature.json'):
         (tmp_path/name).write_bytes(b'test fixture')
     (tmp_path/'sampling_signature.json').write_text(json.dumps({'fingerprint':'fixture'}))
-    a=SimpleNamespace(sampling_dir=tmp_path,initial_checkpoint=tmp_path/'checkpoint')
+    import analysis.run_initial_hstar_h50_broad_macro as runner
+    monkeypatch.setattr(runner,'safe_load',lambda path:dict(state=dict(dynamic_banks={'11':{
+        k:dict(sha256=k) for k in ('pool','bank','schedule')}})))
+    a=SimpleNamespace(sampling_dir=tmp_path,initial_checkpoint=tmp_path/'checkpoint',
+        source_journal_checkpoint=tmp_path/'checkpoint',source_latest_pointer=tmp_path/'checkpoint')
     first=approval_binding(a,'c');(tmp_path/artifact).write_bytes(b'different fixture')
     if artifact=='sampling_signature.json':(tmp_path/artifact).write_text(json.dumps({'fingerprint':'different'}))
     assert approval_binding(a,'c')!=first
@@ -272,11 +276,15 @@ def test_post_sdf_uses_new_validation_store_not_d2(monkeypatch,tmp_path):
     assert result['optimizer_steps']==0
 
 
-def test_new_approval_rejects_changed_checkpoint_content(tmp_path):
+def test_new_approval_rejects_changed_checkpoint_content(tmp_path,monkeypatch):
     for name in ('checkpoint','train_initial_bank.pt','validation_initial_bank.pt'):
         (tmp_path/name).write_bytes(b'fixture')
     (tmp_path/'sampling_signature.json').write_text(json.dumps({'fingerprint':'fixture'}))
-    args=SimpleNamespace(sampling_dir=tmp_path,initial_checkpoint=tmp_path/'checkpoint',execute_approved=True)
+    import analysis.run_initial_hstar_h50_broad_macro as runner
+    monkeypatch.setattr(runner,'safe_load',lambda path:dict(state=dict(dynamic_banks={'11':{
+        k:dict(sha256=k) for k in ('pool','bank','schedule')}})))
+    args=SimpleNamespace(sampling_dir=tmp_path,initial_checkpoint=tmp_path/'checkpoint',execute_approved=True,
+        source_journal_checkpoint=tmp_path/'checkpoint',source_latest_pointer=tmp_path/'checkpoint')
     expected=approval_binding(args,'commit')
     # Pure in-memory fixture; never create a real approved=true artifact.
     args.approval=SimpleNamespace(read_text=lambda:json.dumps(dict(expected,approved=True)))

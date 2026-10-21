@@ -10,12 +10,22 @@
     "plan_fingerprint",
     "sampling_signature_fingerprint",
     "source_checkpoint_sha256",
+    "committed_source_journal_sha256",
+    "committed_source_pointer_sha256",
+    "source_job",
+    "continuation_contract",
+    "dynamic_source_artifact_sha256",
     "input_artifact_sha256",
     "root_fingerprint",
     "horizon",
     "operator"
   ],
   "properties": {
+    "source_job": {"const": 702636},
+    "continuation_contract": {"const": "H50_CERTIFIED_OUTER11_AND_IMMUTABLE_BANK_V2"},
+    "committed_source_journal_sha256": {"type": "string"},
+    "committed_source_pointer_sha256": {"type": "string"},
+    "dynamic_source_artifact_sha256": {"type": "object", "required": ["pool", "bank", "schedule"]},
     "approved": {
       "type": "boolean"
     },
