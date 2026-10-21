@@ -125,3 +125,21 @@ def test_matched_evaluator_requires_same_macro_and_distinct_firm_input_grid():
     with pytest.raises(ValueError,match='UNMATCHED'):matched_payloads(a,b)
     g=static_grid();p=g.parent_states
     assert torch.equal(p[p[:,2]==0][:,[0,1,3,4,5,6]],p[p[:,2]==1][:,[0,1,3,4,5,6]])
+
+
+def test_invalid_terminal_suffix_is_counted_without_fake_labels(tmp_path):
+    from analysis.h50_effective_coverage import collect_effective_coverage
+    class Store:
+        def rows(self):yield pd.DataFrame([dict(split='train',parent_candidate_id=1,t=10,child_branch=b,economic_state_valid=False) for b in (0,1)])
+    f=collect_effective_coverage(Store(),tmp_path,JointCoverageConfig())
+    assert f.raw_rows.sum()==0 and f.complete_sdf_pairs.sum()==0
+
+
+def test_regret_interface_and_control_budget_identical(monkeypatch):
+    import inspect
+    from training.bp_grid_teacher import BPGridTeacher
+    assert 'bp_pred' in inspect.signature(BPGridTeacher.compute).parameters
+    import analysis.run_uniform_macro_frozen_firm as r
+    a=r.plan();monkeypatch.setattr(r,'DISTRIBUTION_MODE','ORIGINAL');b=r.plan()
+    for key in ('firm_batch_size','firm_inner_max','p_adam_steps','p_lbfgs_max_iter','q_fit_steps','rng_seed','optimizer_semantics'):assert a[key]==b[key]
+    assert a['effective_uniform_fraction']==1 and b['effective_uniform_fraction']==0

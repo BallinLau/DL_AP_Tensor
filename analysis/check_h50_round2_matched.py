@@ -62,6 +62,8 @@ def evaluate_static(models,e,bank,out):
     for k,v in policies.items():frame[k]=v.reshape(-1).numpy()
     for v in ('p0','pi','q'):frame[v+'_residual']=frame[v+'_value']-frame[v+'_target']
     frame['bp0_MAE']=(frame.bp0-frame.b0_star).abs();frame['bpi_MAE']=(frame.bpI-frame.bi_star).abs()
+    frame['bp_execution_applicable']=frame.eta==1
+    frame.loc[frame.eta==0,['bp0_MAE','bpi_MAE','bp0_regret','bpi_regret']]=np.nan
     frame.to_csv(out/'static_matched_states.csv',index=False)
     frame['h_bin']=pd.cut(frame.h_f,[-float('inf'),-2,0,2,float('inf')],labels=False)
     frame['ell_bin']=pd.cut(frame.ell_f,[-float('inf'),0,2,5,float('inf')],labels=False)

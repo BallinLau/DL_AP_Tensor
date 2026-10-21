@@ -20,6 +20,10 @@ def lineage_statistics(weights,sources=()):
 def collect_effective_coverage(store,output,cfg):
     groups=defaultdict(Counter);pair_counts=Counter();cells=defaultdict(set);sources=defaultdict(Counter);last={};directions=Counter()
     for frame in store.rows():
+        # Terminal suffix audit rows intentionally omit undefined quantities.
+        # NaN is only a schema completion for INVALID rows, never imputation.
+        for name in ('x_t','x_t1','Hatc_cal_t','LnK_cal_t','Hatc_cal_t1','LnK_cal_t1','C_raw_t1','K_cal_t1'):
+            if name not in frame:frame[name]=np.nan
         selected=select_training_rows(frame)
         for r in selected.fc1.to_dict('records'):
             pid=int(r['parent_candidate_id']);t=int(r['t']);pt=t-1

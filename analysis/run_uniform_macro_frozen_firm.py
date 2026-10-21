@@ -26,6 +26,7 @@ from data.finite_direct_sampling import file_hash
 from training.inner_fixed_point import InnerFPCollocationBank
 
 FIRM_CFG=FirmMacroCoverageConfig(firm_macro_coverage_enabled=True,firm_macro_coverage_mode='STANDALONE',firm_macro_coverage_fraction=1.)
+DISTRIBUTION_MODE='UNIFORM'
 
 def plan():
     result=dict(experiment='uniform_macro_frozen_firm_20261021',scope='FIRM_ONLY',
@@ -36,6 +37,8 @@ def plan():
         source='JOB702636_OUTER11_MODEL_AND_MICRO_DONORS',
         rng_seed=20261022,resume='RESTART_UNCOMMITTED_FIRM_BLOCK',
         optimizer_semantics='PRODUCTION_BLOCK_LOCAL_P_Q_OPTIMIZERS; SOURCE_PERSISTENT_BP_STATE_RESTORED')
+    result['distribution_mode']=DISTRIBUTION_MODE
+    result['effective_uniform_fraction']=1. if DISTRIBUTION_MODE=='UNIFORM' else 0.
     return result
 
 
@@ -125,8 +128,8 @@ def run(args):
     for split,offset in [('train',0),('validation',100000)]:
         p=source['banks'][split]
         donor=InnerFPCollocationBank(**{k:v for k,v in p.items() if k!='fingerprint'})
-        banks[split]=uniform_macro_bank(donor,seed=FIRM_CFG.firm_macro_sampling_seed+offset,
-            hatcf_bounds=FIRM_CFG.firm_macro_h_bounds,lnkf_bounds=FIRM_CFG.firm_macro_ell_bounds)
+        banks[split]=(uniform_macro_bank(donor,seed=FIRM_CFG.firm_macro_sampling_seed+offset,
+            hatcf_bounds=FIRM_CFG.firm_macro_h_bounds,lnkf_bounds=FIRM_CFG.firm_macro_ell_bounds) if DISTRIBUTION_MODE=='UNIFORM' else donor)
         if len(banks[split].parent_states)!=plan()[f'{split}_rows']:
             raise ValueError('unexpected source donor budget')
         children[split]=backend._conditional(banks[split],20261023+offset)
@@ -194,7 +197,7 @@ def run(args):
 
 
 def main(argv=None):
-    global FIRM_CFG
+    global FIRM_CFG,DISTRIBUTION_MODE
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--initial-checkpoint',type=Path)
@@ -206,7 +209,9 @@ def main(argv=None):
     p.add_argument('--resume-from-run',type=Path)
     p.add_argument('--device',default='cuda:0')
     p.add_argument('--firm-macro-config',type=Path)
+    p.add_argument('--distribution-mode',choices=['ORIGINAL','UNIFORM'],default='UNIFORM')
     args=p.parse_args(argv)
+    DISTRIBUTION_MODE=args.distribution_mode
     if args.firm_macro_config is not None:FIRM_CFG=FirmMacroCoverageConfig(**json.loads(args.firm_macro_config.read_text()))
     FIRM_CFG.validate()
     if not FIRM_CFG.firm_macro_coverage_enabled or FIRM_CFG.firm_macro_coverage_mode!='STANDALONE':p.error('Firm-only runner requires explicit STANDALONE coverage')

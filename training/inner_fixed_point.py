@@ -614,11 +614,12 @@ def evaluate_inner_operator_snapshot(
             children_exp, _, used_exp, weights = episode._expand_policy_expectation_children(
                 children, raw_m, used_m
             )
-            p0_result = teacher.compute_value_target(
+            target_fn = teacher.compute if include_bp_regret else teacher.compute_value_target
+            p0_result = target_fn(
                 parent, children_exp, used_exp, branch="p0", child_weights=weights,
                 **({"bp_pred": model.forward_policy(parent)[0]} if include_bp_regret else {})
             )
-            pi_result = teacher.compute_value_target(
+            pi_result = target_fn(
                 parent, children_exp, used_exp, branch="pi", child_weights=weights,
                 **({"bp_pred": model.forward_policy(parent)[1]} if include_bp_regret else {})
             )
