@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
@@ -30,6 +31,29 @@ from data.finite_direct_uniform_firm_macro import FirmMacroCoverageConfig,config
 SCHEMA='CONTINUATION_APPROVAL_V5_HSTAR_H50'
 
 
+def distinct_balanced_donors(bank):
+    """Do not label repeated capture draws independent; keep bounded real rows.
+
+    No new micro or macro state is fabricated. Underfilled observed samples
+    retain balanced ON_POLICY/CALCULATED support before explicit Hybrid split.
+    """
+    from copy import deepcopy
+    from training.inner_fixed_point import InnerFPCollocationBank
+    meta=bank.metadata;n=len(bank.parent_states);seen=set();groups=[[],[]]
+    for j,key in enumerate(zip(*(meta[k].tolist() for k in ('path','source_time','source_branch','firm_id')))):
+        if key in seen:continue
+        seen.add(key);groups[int('CALCULATED' in meta['source_kind'][j])].append(j)
+    count=min(map(len,groups));ids=torch.tensor(groups[0][:count]+groups[1][:count],dtype=torch.long)
+    if not len(ids):raise ValueError('NO_DISTINCT_BALANCED_FIRM_DONORS')
+    result=deepcopy(meta)
+    for k,v in list(result.items()):
+        if torch.is_tensor(v) and v.ndim and len(v)==n:result[k]=v[ids].clone()
+        elif isinstance(v,list) and len(v)==n:result[k]=[v[j] for j in ids.tolist()]
+    result.update(requested_rows=n,actual_distinct_donor_rows=len(ids),donor_shortfall=n-len(ids),
+        unique_source_firm_time_count=len(ids),actual_draws=len(ids))
+    return InnerFPCollocationBank(bank.parent_states[ids].clone(),bank.source_kind[ids].clone(),bank.seed,bank.split,result)
+
+
 def coverage_config(args=None):
     path=getattr(args,'coverage_config',None)
     cfg=JointCoverageConfig(**json.loads(path.read_text())) if path else JointCoverageConfig()
@@ -42,14 +66,15 @@ def firm_coverage_config(args=None):
     cfg.validate();return cfg
 
 
-def plan(coverage=None,firm_coverage=None):
+def plan(coverage=None,firm_coverage=None,*,end_outer=15,skip_bp_head=False):
     # Epoch sample budgets are proposed for explicit approval, not hidden 50x
     # optimizer expansion. All available time bins are eligible in sampling.
     firm_coverage=firm_coverage or FirmMacroCoverageConfig()
     effective_firm_rows=(dict(train=firm_coverage.firm_macro_sampling_budget,validation=min(2048,firm_coverage.firm_macro_sampling_budget))
         if firm_coverage.firm_macro_coverage_enabled else dict(train=8192,validation=2048))
     execution=[dict(outer=12,kind='baseline',indices={})]
-    for o,k,i in stages(replace(Budget(),equilibrium_outer_max=5)):
+    if not 12<=end_outer<=20:raise ValueError('H50 end Outer must be 12..20')
+    for o,k,i in stages(replace(Budget(),equilibrium_outer_max=end_outer-10)):
         if o<1:continue
         if k=='cross_block':execution.append(dict(outer=o+11,kind='EMPIRICAL_POOL_COMMIT',indices={}))
         execution.append(dict(outer=o+11,kind=k,indices=i))
@@ -58,7 +83,10 @@ def plan(coverage=None,firm_coverage=None):
         joint_coverage=asdict(coverage or JointCoverageConfig()),
         firm_macro_coverage=asdict(firm_coverage),
         effective_firm_batch_size=firm_coverage.firm_macro_batch_size if firm_coverage.firm_macro_coverage_enabled else 512,
-        start_outer=12,end_outer=15,train_parents=8192,validation_parents=2048,firms=200,
+        start_outer=12,end_outer=end_outer,train_parents=8192,validation_parents=2048,firms=200,
+        bp_head_training_skipped_by_user=skip_bp_head,simulation_bp_action_source='grid',
+        firm_donor_sampling='DISTINCT_FIRM_TIME_BRANCH_BALANCED_OBSERVED_SUBSET',
+        sdf_no_pairs='SKIP_WITHOUT_OPTIMIZER_OR_AL_MUTATION',
         initial_root=asdict(MarketClearingConfig()),root_only_t0=True,
         finite_operator='finite_direct_parent_exit_before_child_v2',
         budget=asdict(Budget()),firm_rows=effective_firm_rows,
@@ -76,7 +104,10 @@ def approval_binding(args,commit):
     sampling=args.sampling_dir
     required=['sampling_signature.json','train_initial_bank.pt','validation_initial_bank.pt']
     return dict(schema_name=SCHEMA,schema_version=5,source_commit=commit,
-        plan_fingerprint=stable_json_hash(plan(coverage_config(args),firm_coverage_config(args))),
+        plan_fingerprint=stable_json_hash(plan(coverage_config(args),firm_coverage_config(args),
+            end_outer=getattr(args,'end_outer',15),skip_bp_head=getattr(args,'skip_bp_head',False))),
+        runtime_partition=dict(parent_batch_size=getattr(args,'parent_batch_size',128),
+            fit_parent_batch_size=getattr(args,'fit_parent_batch_size',128),firm_batch_size=getattr(args,'firm_batch_size',512)),
         firm_macro_coverage_fingerprint=stable_json_hash(asdict(firm_coverage_config(args))),
         joint_coverage_fingerprint=stable_json_hash(asdict(coverage_config(args))),
         sampling_signature_fingerprint=json.loads((sampling/'sampling_signature.json').read_text())['fingerprint'],
@@ -155,6 +186,8 @@ class H50Backend(ProductionBackend):
 
     def _firm_coverage_bank(self,bank,outer):
         cfg=self.firm_coverage_cfg
+        if getattr(self.args,'skip_bp_head',False):
+            bank=distinct_balanced_donors(bank)
         return configured_macro_bank(bank,cfg,seed=cfg.firm_macro_sampling_seed+outer*100003+(100000 if bank.split=='validation' else 0))
 
     def _store(self,outer,stage,split,capture=True,templates=False):
@@ -207,6 +240,7 @@ class H50Backend(ProductionBackend):
             if stage=='D2':
                 sdf_rows,sdf_index=sample_macro_rows(store,pair_budget=plan()['sdf_pair_budget'][split],
                     seed=20261022+(0 if split=='train' else 100000),complete_pairs_only=True,
+                    allow_empty_pairs=True,
                     source_by_id={r['parent_id']:r for r in self.schedules[split]['parents']} if split=='train' else None,
                     coverage_config=self.coverage_cfg)
                 sdf_rows.to_csv(store.root/'sdf_observations.csv',index=False)
@@ -229,11 +263,25 @@ class H50Backend(ProductionBackend):
 
     def _sdf_chunk(self,outer,chunk):
         self._sdf_sampling=True
-        try:return super()._sdf_chunk(outer,chunk)
+        try:
+            frame=self._data(outer,2,'train')
+            if frame.empty:
+                return dict(status='SDF_SKIPPED_NO_VALID_PAIRS',optimizer_steps=0,epochs=0,
+                    al_updated=False,learning_state_preserved=True)
+            return super()._sdf_chunk(outer,chunk,allow_empty_validation=True)
         finally:self._sdf_sampling=False
 
     def _execute(self,outer,kind,i):
         directory=self.root/f'outer_{outer:03d}';directory.mkdir(parents=True,exist_ok=True)
+        if kind=='BP' and getattr(self.args,'skip_bp_head',False):
+            before=module_hash(self.models['policy_value'])
+            if self.episode.hyperparams.simulation_bp_action_source!='grid':
+                raise ValueError('Grid simulation mandatory; no BP head fallback')
+            result=dict(BP_HEAD_TRAINING_SKIPPED_BY_USER=True,BP_HEAD_OPTIMIZER_STEPS=0,
+                SIMULATION_BP_ACTION_SOURCE='GRID',optimizer_steps=0,optimizer_executed=False,
+                model_hash_before=before,model_hash_after=module_hash(self.models['policy_value']))
+            if result['model_hash_after']!=before:raise ValueError('skipped BP mutated Firm')
+            return result
         if kind=='baseline':
             from analysis.h50_diagnostics import streaming_economic_metrics
             store=self._store(outer,'firm_source','validation')
@@ -359,6 +407,8 @@ def main(argv=None):
     p.add_argument('--source-artifact-dir',type=Path)
     p.add_argument('--coverage-config',type=Path)
     p.add_argument('--firm-macro-config',type=Path)
+    p.add_argument('--end-outer',type=int,default=15)
+    p.add_argument('--skip-bp-head',action='store_true')
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--approval',type=Path)
     p.add_argument('--execute-approved',action='store_true')
@@ -371,7 +421,7 @@ def main(argv=None):
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     if not require_approval(args,commit):
         args.output.mkdir(parents=True,exist_ok=True)
-        atomic_write_json(args.output/'training_plan.json',plan(coverage_config(args),firm_coverage_config(args)))
+        atomic_write_json(args.output/'training_plan.json',plan(coverage_config(args),firm_coverage_config(args),end_outer=args.end_outer,skip_bp_head=args.skip_bp_head))
         return 0
     if args.sampling_dir is None or args.initial_checkpoint is None:
         raise ValueError('approved artifact paths required')
@@ -382,12 +432,27 @@ def main(argv=None):
     backend=H50Backend(args,locked,learning)
     contract=approval_binding(args,commit)
     journal=StageJournal(args.output/'transactions',contract,backend,resume=args.resume)
-    execution=plan()['stages']
+    atomic_write_json(args.output/'metadata'/'approval_v5.json',json.loads(args.approval.read_text()))
+    execution=plan(coverage_config(args),firm_coverage_config(args),end_outer=args.end_outer,skip_bp_head=args.skip_bp_head)['stages']
     for stage in execution:
         o,k,i=stage['outer'],stage['kind'],stage['indices']
-        journal.run(stage_id(o,k,i),lambda o=o,k=k,i=i:backend.execute(o,k,i))
+        started=time.monotonic()
+        print(json.dumps(dict(event='STAGE_BEGIN',outer=o,stage=k,indices=i)),flush=True)
+        result=journal.run(stage_id(o,k,i),lambda o=o,k=k,i=i:backend.execute(o,k,i))
+        atomic_write_json(args.output/'progress.json',dict(outer=o,stage=k,indices=i,
+            status='COMMITTED',elapsed_seconds=time.monotonic()-started,
+            optimizer_steps=result.get('optimizer_steps','NOT_AVAILABLE_SEE_OPTIMIZER_HISTORY'),
+            model_hashes=result.get('hashes_after'),latest_pointer=str(journal.pointer)))
+        print(json.dumps(dict(event='STAGE_COMMITTED',outer=o,stage=k,indices=i)),flush=True)
         if k in ('data','SDF','cross_block','outer_commit'):
             backend.write_histories(journal.results,figures=k=='outer_commit')
+    completed=[o for o in range(12,args.end_outer+1) if stage_id(o,'outer_commit',{}) in journal.completed]
+    atomic_write_json(args.output/'final_summary.json',dict(completed_outers=completed,
+        TRAINING_COMPLETED=completed==list(range(12,args.end_outer+1)),
+        ECONOMIC_EQUILIBRIUM_CONVERGED='NOT_ASSERTED',source_commit=commit,
+        BP_HEAD_TRAINING_SKIPPED_BY_USER=args.skip_bp_head,
+        SDF_skipped_stages=[k for k,v in journal.results.items() if v.get('status')=='SDF_SKIPPED_NO_VALID_PAIRS'],
+        checkpoints=[str(args.output/f'outer_{o:03d}'/'outer_complete.pt') for o in completed]))
     return 0
 
 

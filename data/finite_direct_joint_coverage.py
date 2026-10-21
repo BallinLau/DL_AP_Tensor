@@ -347,6 +347,15 @@ def build_joint_bank(reference,templates,*,outer,target,cfg,output,simulator_fac
                         if source=='DYNAMIC_EMPIRICAL':empirical.append(ref)
                         else:beta.add(ref);refill.add(ref)
                 offset+=count
+                elapsed=time.monotonic()-started
+                progress=dict(event='JOINT_CANDIDATE_PROGRESS',outer=outer,source=source,
+                    proposed=counters['proposed'],economic_valid=counters['economic_valid'],
+                    max_candidates=cfg.max_candidates,elapsed_seconds=elapsed,
+                    candidates_per_second=counters['proposed']/max(elapsed,1e-9),
+                    estimated_remaining_seconds=(cfg.max_candidates-counters['proposed'])*elapsed/max(counters['proposed'],1),
+                    adaptive_early_stop=False)
+                atomic_write_json(output/'progress.json',progress)
+                print(json.dumps(progress),flush=True);stream.flush()
     allocation=source_allocation(target,len(empirical),refill.count)
     stage1=beta.selected(allocation['beta']);chosen={r['parent_id'] for r in stage1}
     extras=[r for r in refill.selected(2*target) if r['parent_id'] not in chosen]

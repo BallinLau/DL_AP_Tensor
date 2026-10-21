@@ -420,11 +420,12 @@ class ProductionBackend:
             selection='LAST_EPOCH_MATCHED_OPTIMIZER; BEST_DEV_DIAGNOSTIC_ONLY',
             validation=evaluate(self.models['sdf_fc1'],self._data(outer,i['macro'],'validation'),self.episode.device))
 
-    def _sdf_chunk(self,outer,chunk):
+    def _sdf_chunk(self,outer,chunk,*,allow_empty_validation=False):
         set_scope(self.models,'sdf'); e=self.episode; e.add_FC1loss=False
         e.set_sdf_training_phase(SDFTrainingPhase.SDF_TRUE_ONLY)
         train,lineage=sdf_batches(self._data(outer,2,'train'),self.args.fit_parent_batch_size,e.device)
-        val,_=sdf_batches(self._data(outer,2,'validation'),self.args.fit_parent_batch_size,e.device,offset=len(lineage))
+        validation_frame=self._data(outer,2,'validation')
+        val=[] if allow_empty_validation and validation_frame.empty else sdf_batches(validation_frame,self.args.fit_parent_batch_size,e.device,offset=len(lineage))[0]
         e._require_sdf_al_outer_loop(SDFTrainingPhase.SDF_TRUE_ONLY)
         e._validate_sdf_al_semantics(SDFTrainingPhase.SDF_TRUE_ONLY)
         if chunk==0: e._configure_sdf_lr_for_phase()
@@ -439,7 +440,8 @@ class ProductionBackend:
                 dual=False
                 if (epoch+1)%int(e.hyperparams.sdf_al_primal_epochs_per_dual_update)==0:
                     e._update_sdf_al_duals(constraints); dual=True
-                validation=e._evaluate_sdf_fc1_batches(val,prefix=f'outer{outer}_sdf{chunk}_epoch{epoch}',max_batches=None)
+                validation=(e._evaluate_sdf_fc1_batches(val,prefix=f'outer{outer}_sdf{chunk}_epoch{epoch}',max_batches=None)
+                    if val else dict(status='NOT_AVAILABLE_NO_VALID_VALIDATION_PAIRS'))
                 self.state['sdf_epoch']+=1
                 rows.append(dict(epoch=epoch,constraints=constraints,al=e._get_sdf_al_state(),dual_update=dual,
                                  validation=validation))

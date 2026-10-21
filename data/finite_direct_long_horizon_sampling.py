@@ -39,7 +39,7 @@ def bounded_quotas(available, budget):
     return quotas
 
 
-def sample_macro_rows(store, *, pair_budget, seed, complete_pairs_only=False,source_by_id=None,coverage_config=None):
+def sample_macro_rows(store, *, pair_budget, seed, complete_pairs_only=False,source_by_id=None,coverage_config=None,allow_empty_pairs=False):
     """Bounded paired reservoir: equal lineage, then time/state strata.
 
     Keep complete pairs together when both are eligible. Single legal FC1
@@ -68,7 +68,12 @@ def sample_macro_rows(store, *, pair_budget, seed, complete_pairs_only=False,sou
             counts[key]+=1
     bands=sorted({k[1] for k in counts});keys_per_lineage=defaultdict(int)
     for pid,band,h,k in counts:keys_per_lineage[pid,band]+=1
-    if not bands:raise ValueError('NO_COMPLETE_LONG_HORIZON_SDF_PAIRS' if complete_pairs_only else 'NO_LEGAL_LONG_HORIZON_MACRO_ROWS')
+    if not bands:
+        if complete_pairs_only and allow_empty_pairs:
+            return pd.DataFrame(columns=['split','parent_candidate_id','t','child_branch']),dict(
+                status='SDF_SKIPPED_NO_VALID_PAIRS',pair_budget=pair_budget,actual_parent_times=0,
+                actual_unique_child_rows=0,complete_pairs_only=True)
+        raise ValueError('NO_COMPLETE_LONG_HORIZON_SDF_PAIRS' if complete_pairs_only else 'NO_LEGAL_LONG_HORIZON_MACRO_ROWS')
     available={band:sum(count for key,count in counts.items() if key[1]==band) for band in (0,1,2)}
     quotas=bounded_quotas(available,pair_budget)
     source_available=defaultdict(int);bucket_available=defaultdict(int)
