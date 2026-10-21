@@ -1,0 +1,11 @@
+{
+  "immutable_bank_and_schedule_bytes": 150097309,
+  "learning_state_source_bytes": 12821336,
+  "measurement": "ACTUAL_SERIALIZATION_OF_SAME_SOURCE_LEARNING_PLUS_BANK_VS_REFERENCE; NOT_FUTURE_FULL_H50_CHECKPOINT_BENCHMARK",
+  "new_reference_snapshot_bytes": 12822117,
+  "old_inline_snapshot_bytes": 160239905,
+  "optimizer_steps": 0,
+  "per_snapshot_bytes_saved": 147417788,
+  "proposed_stage_count": 449,
+  "remaining_large_state": "models/optimizer/AL/RNG/fresh bank and inherited backend history"
+}

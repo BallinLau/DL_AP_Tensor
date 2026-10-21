@@ -1,0 +1,26 @@
+{
+  "cpu_seconds": 110.98230000003241,
+  "fc2_calls": 0,
+  "generation_commit": "576e8045da0580b62f950555471bff5c751db383",
+  "horizon": 50,
+  "model_hashes": {
+    "fc2": "b4c05e3d874465240299b54c8d13d8fd90a3eb584758188d06f06d73b4d9d084",
+    "policy_value": "22edee01a2baff4f8b70bc5826f656647bfb597551c2c99bd2a0680d2f8fbaba",
+    "sdf_fc1": "91ab7ff4f2689c77388c0e2ae7e04273a48ca6103d40c173b2fd35715b0db258"
+  },
+  "models_unchanged": true,
+  "optimizer_steps": 0,
+  "parents": 64,
+  "source_files": {
+    "analysis/h50_source_certification.py": "19b2c4200ab9b865438ab821ad20f5650c8bf355859b9ea43f27b403a49f6943",
+    "analysis/run_fc1_self_consistent_macro.py": "2fc9cc75ea375c2d3d4c37690922add638e8925a26a173d25fdedea8ea1b99c9",
+    "analysis/run_h50_frozen_extinction_review.py": "8e9f7d99d020d07d594c49d77fab1eed79406204cb3353bef1b336382cd5ad1f",
+    "data/finite_direct_initial_hstar.py": "046478c3a5e4f955bf4a85e6957161df7e24f0cce53c35f37b6509c0b74162a2",
+    "data/finite_direct_long_horizon_runtime.py": "90d4701bc36e94f376a6ac327dd123611437086bf400d7f11944771561d6fc28",
+    "data/finite_direct_long_horizon_sampling.py": "0e1899ecbac884d893bc31c780ce701332a95ee5f24076151f76e37f32cdec76",
+    "data/finite_direct_runtime.py": "65657ced8d924d8aff5f307a2d7182a25932b845b80ce7a06333b0a60c96523b",
+    "data/simulate_ts_parallel.py": "7aae483f3d347204047f833812c594a1e2380f6cf583f54e8b3205537a89d4fe",
+    "models/policy_value.py": "ddbed0feba874ec9c4991e87ef5ed7fe992cf68d494b62c2237c4aaac57e488e"
+  },
+  "tracked_dirty": false
+}

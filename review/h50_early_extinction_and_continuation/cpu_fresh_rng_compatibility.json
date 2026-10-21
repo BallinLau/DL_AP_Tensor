@@ -1,0 +1,8 @@
+{
+  "applied_to_cpu_generator": false,
+  "exact_cuda_training_rng_resume_claimed": false,
+  "sdf_pair_rng_used_in_frozen_rollout": false,
+  "source_cuda_rng_preserved_not_converted": true,
+  "source_pair_rng_bytes": 16,
+  "source_pair_rng_hash": "27e1345396882c4b5e511c80022674e76c64539c67a777dbf8ef82871bf378c6"
+}

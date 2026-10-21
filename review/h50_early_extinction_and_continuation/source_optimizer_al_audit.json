@@ -1,0 +1,30 @@
+{
+  "al_state": {
+    "lambda_mean_high": 7132943.90625,
+    "lambda_mean_low": 0.0,
+    "lambda_var_high": 974912578560.0,
+    "rho": 2.0
+  },
+  "fresh_hash": "9302c6de56169f2265b904c491f532cfb920c55c78ae9fcd2bbaac676fbf9885",
+  "optimizer_state_counts": {
+    "fc1_conditional": 16,
+    "fc2": 0,
+    "policy_value": 0,
+    "sdf_fc1": 8
+  },
+  "optimizer_state_hashes": {
+    "fc1_conditional": "f3672132066d5db21efd08c5b30d4f73e7dc8e5429bbc7c12079728ca70ccb94",
+    "fc2": "f105d25940a97d54397c2a4d4b92a36eb34a7e00e14621b1512805ab43c7e1b3",
+    "policy_value": "d80514addc94efde26c10d7935ac42e5cc40dbe24d01f7483e781318fb4f1e50",
+    "sdf_fc1": "ec9b0d7a6fcf7e2ca0b7093b61396946c3257ec2c9dc071854c6463ad94308aa"
+  },
+  "optimizer_steps_performed": 0,
+  "rng_hashes": {
+    "cuda": "3702965b2f3ef04d78a94313da69d24fc64b16db5d3536ff99fec7cb4b840b94",
+    "numpy": "f6ec7a1aa4f26e5ba884ae9a4e831fd3289e60c27d6df3caf7e648a382dd2671",
+    "python": "10a9d4db1f1b0b2edaa067876f4a3c44c6ab6a4f7ede42308768991d980f5331",
+    "torch": "763d08414dced70f632e4004d4a20fa7e25f1f382c0b152df4c7ed722228628f"
+  },
+  "scheduler_hash": "6876d13142d8afd57244678f780aeef4f6b01681ba6558d46ba99883ad0e1d7c",
+  "verified": true
+}

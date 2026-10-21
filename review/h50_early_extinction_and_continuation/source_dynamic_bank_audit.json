@@ -1,0 +1,13 @@
+{
+  "bank_sha256": "c1bca9220b563729819219105416fafb1599afea75ab442c7297e73379536e81",
+  "bank_state_hash": "89a51a4b59c26331b601620b8242f7e6fb4dfdb35b9a3f7a957d421a3568f922",
+  "bank_version": "outer_011",
+  "independent_new_sample": false,
+  "initial_bank_construction_rule": "REUSE_CERTIFIED_OUTER11_BANK_NOT_INDEPENDENT_RESAMPLE",
+  "new_bank_state_hash": "89a51a4b59c26331b601620b8242f7e6fb4dfdb35b9a3f7a957d421a3568f922",
+  "pool_sha256": "df17c7326bdd8baff9e3284f6e959432734c7a3e237062d65b1b73043aea1312",
+  "schedule_sha256": "3214e19f79e12d211f629b40f7c769b45e6ce19b286e69b0b5f63bc3fe8cad5a",
+  "source_bank_outer": 11,
+  "source_pool_fingerprint": "6cb8f3727def6b63ed3ffa37d90d7ace8c2baf78899b9db411186be26daa5f93",
+  "verified": true
+}

@@ -1,0 +1,17 @@
+PLAN ONLY. NOT EXECUTED. NO APPROVAL CREATED.
+
+Future reviewed environment must bind:
+REPO_DIR=<new reviewed clean commit checkout>
+RUN_ROOT=<new persistent H50 directory>
+SAMPLING_DIR=<locked source sampling directory>
+INITIAL_CHECKPOINT=<certified Job702636 outer_011/outer_complete.pt>
+SOURCE_JOURNAL_CHECKPOINT=<source transactions/checkpoint_00907.pt>
+SOURCE_LATEST_POINTER=<source transactions/latest.json>
+SOURCE_ARTIFACT_DIR=<certified Outer11 pool/bank/schedule directory or SHA-identical mirror>
+USER_APPROVAL_JSON=<future user-authorized V5 instance binding all actual content>
+
+Template: slurm/run_initial_hstar_h50_broad_macro_a800.slurm
+No sbatch/srun was executed in this task. Current evidence recommends NOT starting formal H50.
+
+Safe plan-only command:
+python analysis/run_initial_hstar_h50_broad_macro.py --output <new_plan_directory>

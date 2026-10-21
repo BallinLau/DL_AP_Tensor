@@ -1,0 +1,36 @@
+{
+  "A800_COST": "NOT_MEASURED",
+  "attempted_failure_counts": {
+    "PARENT_ZERO_SURVIVING_MASS": 128,
+    "VALID": 145,
+    "ZERO_SURVIVING_MASS": 129
+  },
+  "complete_sdf_pair_count": 68,
+  "entry_status_counts": {
+    "ALL_REJECTED": 311,
+    "NO_CANDIDATES": 82,
+    "POSITIVE_ENTRY": 9
+  },
+  "horizon": 50,
+  "initial_default_range": [
+    57,
+    183
+  ],
+  "initial_hard_default_fraction": 0.72390625,
+  "initial_hard_default_mean": 144.78125,
+  "max_valid_economic_time": 5,
+  "middle_late_coverage": "NOT_ACHIEVED",
+  "optimizer_steps": 0,
+  "ready_for_formal_training": false,
+  "real_parent_count": 64,
+  "root_failed_count": 0,
+  "root_found_count": 64,
+  "timeline_thresholds": {
+    "capital_decline_fraction": 0.25,
+    "hard_default_fraction": 0.5,
+    "interpretation": "EXPLORATORY_TIMELINE_THRESHOLDS_NOT_ROOT_OR_TRAINING_GATES",
+    "macro_error_absolute": 0.6931471805599453
+  },
+  "training_performed": false,
+  "valid_child_count": 145
+}

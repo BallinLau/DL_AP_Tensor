@@ -1,0 +1,44 @@
+{
+  "fc1_conditional": {
+    "added_runtime_metadata": [
+      [
+        "decoupled_weight_decay"
+      ]
+    ],
+    "momentum_and_groups": "PASS",
+    "source_state_hash": "f3672132066d5db21efd08c5b30d4f73e7dc8e5429bbc7c12079728ca70ccb94"
+  },
+  "fc2": {
+    "added_runtime_metadata": [
+      [
+        "decoupled_weight_decay"
+      ]
+    ],
+    "momentum_and_groups": "PASS",
+    "source_state_hash": "f105d25940a97d54397c2a4d4b92a36eb34a7e00e14621b1512805ab43c7e1b3"
+  },
+  "policy_value": {
+    "added_runtime_metadata": [
+      [
+        "decoupled_weight_decay"
+      ]
+    ],
+    "momentum_and_groups": "PASS",
+    "source_state_hash": "d80514addc94efde26c10d7935ac42e5cc40dbe24d01f7483e781318fb4f1e50"
+  },
+  "sdf_fc1": {
+    "added_runtime_metadata": [
+      [
+        "decoupled_weight_decay"
+      ],
+      [
+        "decoupled_weight_decay"
+      ],
+      [
+        "decoupled_weight_decay"
+      ]
+    ],
+    "momentum_and_groups": "PASS",
+    "source_state_hash": "ec9b0d7a6fcf7e2ca0b7093b61396946c3257ec2c9dc071854c6463ad94308aa"
+  }
+}

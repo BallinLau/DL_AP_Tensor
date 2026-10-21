@@ -1,0 +1,41 @@
+{
+  "contract": "REBUILT_CHILD_MACRO_M_AND_ORIGINAL_PRODUCTION_RHS",
+  "kinds": [
+    "ON_POLICY",
+    "CALCULATED_MACRO_COLLOCATION",
+    "CALCULATED_MACRO_COLLOCATION",
+    "CALCULATED_MACRO_COLLOCATION",
+    "ON_POLICY",
+    "CALCULATED_MACRO_COLLOCATION",
+    "ON_POLICY",
+    "ON_POLICY"
+  ],
+  "parity": [
+    {
+      "branch": "p0",
+      "max_abs_error": 2.9802322387695312e-08,
+      "mean_abs_error": 4.190951585769653e-09,
+      "p90_abs_error": 1.1548399925231929e-08,
+      "passed": true,
+      "tolerance": 1e-05
+    },
+    {
+      "branch": "pi",
+      "max_abs_error": 7.450580596923828e-09,
+      "mean_abs_error": 9.313225746154785e-10,
+      "p90_abs_error": 2.235174179077147e-09,
+      "passed": true,
+      "tolerance": 1e-05
+    }
+  ],
+  "source_times": [
+    1,
+    0,
+    0,
+    1,
+    0,
+    3,
+    0,
+    0
+  ]
+}

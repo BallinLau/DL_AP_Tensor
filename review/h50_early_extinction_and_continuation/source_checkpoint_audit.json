@@ -1,0 +1,20 @@
+{
+  "checkpoint_sha256": "9ad7610a1851d06d80c8b2d08052a01532923f7a2808e3a006f5538b404aa94d",
+  "complete_learning_state_equal": true,
+  "completed_outers": [
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11
+  ],
+  "journal_sha256": "a9156eb0a120f144d1d6c3063e98ac17730b4e3b87821c0e0dd57f4311763cf2",
+  "operator": "finite_direct_parent_exit_before_child_v2",
+  "source_commit": "97a018118e917fc5bc5d6b7ed3dd662890560595",
+  "source_job": 702636,
+  "source_stage": "outer_011/outer_commit",
+  "verified": true
+}

@@ -1,0 +1,27 @@
+Data-generating source commit: 576e8045da0580b62f950555471bff5c751db383
+CPU only; no optimizer.step, loss.backward, Slurm or GPU benchmark.
+
+Targeted suite:
+python -m pytest tests/test_h50_continuation_review.py tests/test_initial_hstar_h50.py tests/test_finite_direct_outer4_resume.py tests/test_finite_direct_large_continuation.py tests/test_finite_direct_macro_contract.py tests/test_finite_direct_macro_production_adapter.py tests/test_dynamic_empirical_exit_fix.py tests/test_market_clearing_classification.py -q -rs
+141 passed, 6 skipped in 23.33s (includes final fixed Validation Bank/schedule guard)
+
+6 skips are existing missing Job701387 historical fixtures:
+- separately certified audit fixture
+- prepared reviewed continuation artifacts
+- actual 8192/2048 constructed banks
+- source forward-only fixture
+- historical metrics fixture
+- certified input bindings
+Skipped != PASS. Actual Job702636 source/optimizer/Bank audits and frozen CPU evidence were executed separately.
+
+New coverage: exact committed source rejection, wrong Job/stage/commit/operator/export/SHA, persistent fields; source Bank SHA and Outer mismatch; reference snapshot has no inline Bank; StageJournal committed action not repeated; empty strata/unused quota; complete same-parent-time pairs; zero hard survivors with defined ledger still continuable; CPU cannot reinterpret CUDA pair RNG.
+Inherited tests cover actual production Parent Default->Child Exit, both children, financing/capital/entry timing, Root t0-only/default plan-only/approval artifact binding and current-target children/M wiring.
+
+Real frozen probe: 64 stratified Parents, source checkpoint unchanged, root 64/64, 145 legal Child rows, 68 complete pairs, last legal Child t5; FC2 calls0, optimizer_steps0; model hashes unchanged.
+Real calculated/on-policy Bellman target check: 8 rows, 4+4, source times0/1/3; P0 max_abs2.9802322387695312e-8, PI max_abs7.450580596923828e-9; tolerance1e-5; PASS. Not a convergence test.
+
+bash -n slurm/run_initial_hstar_h50_broad_macro_a800.slurm: PASS
+git diff --check: PASS
+No training readiness claim from unit tests.
+Final implementation commit: a0e74d64ee465a9dea170b8181528b50b8e8ae89
+Data-generating commit remains 576e8045da0580b62f950555471bff5c751db383; no economic implementation changed in the final validation identity guard.
