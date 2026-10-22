@@ -13,6 +13,7 @@ python analysis/run_h10_h100_longrun_macro.py --output /NEW_RUN
 Formal deployment uses `slurm/run_h10_h100_longrun_macro_a800.slurm` only after integration smoke, source review and V6 content approval. Export the required variables listed in that script. Planned submission (NOT an executed job ID):
 
 ```sh
+mkdir -p "$RUN_ROOT/logs"
 sbatch --output="$RUN_ROOT/logs/slurm.%j.out" \
   --error="$RUN_ROOT/logs/slurm.%j.err" \
   slurm/run_h10_h100_longrun_macro_a800.slurm

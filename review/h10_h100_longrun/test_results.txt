@@ -1,0 +1,32 @@
+Tested economic source: b291c645e0b821f2256ce9a5ee30f08e264cdb24
+CPU targeted command:
+MPLCONFIGDIR=/private/tmp/mpl-hstar /Users/ballinliu/anaconda3/bin/python -m pytest tests/test_h10_h100_replay.py tests/test_h50_coverage_round2.py tests/test_h50_joint_coverage.py tests/test_initial_hstar_h50.py tests/test_dynamic_empirical_exit_fix.py tests/test_finite_direct_outer4_resume.py tests/test_finite_direct_outer4_runner.py -q
+Result: 129 passed in 18.47s
+Shell syntax: both H10/H100 Slurm scripts PASS
+git diff --check: PASS
+Plan-only CLI: exit 0; no backend constructed/optimizer called
+
+GPU integration smoke 713307, source 1f46cbca6e9b168b3a90040408b2060e0e61dea7:
+sacct COMPLETED, ExitCode 0:0
+summary.status PASS
+P 2 optimizer blocks, Q 2 optimizer blocks, FC1 8 optimizer steps, SDF 12 optimizer steps
+Two tiny cycles, 16 initial parents/split, 4 H100 paths/outer
+
+Final-source GPU integration smoke 713318, source b291c645e0b821f2256ce9a5ee30f08e264cdb24:
+sacct COMPLETED, ExitCode 0:0
+summary.status PASS
+P 2 optimizer blocks, Q 2 optimizer blocks, FC1 8 optimizer steps, SDF 12 optimizer steps
+Two tiny cycles; cycle execution elapsed 72.613124 seconds, excluding startup certification
+H100 optimizer_steps=0; empty post20 pools reported, no fake data
+
+CPU THU source preparation:
+PREPARED_PENDING_APPROVAL
+source certification PASS; actual input SHAs bound in approval_required.json
+approved=false; formal_training_started=false; slurm_submitted=false
+
+Formal four-Outer training: NOT STARTED
+GPU resume verification 713328: COMPLETED 0:0
+Journal latest.json SHA before/after:
+e7091afb068f3adf288519e7a558a73c3272b645da88435429148402b800000a
+No new StageJournal commit or optimizer execution on completed-stage resume.
+This file does not assert economic convergence or 200-path full-budget completion.

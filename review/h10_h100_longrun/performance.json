@@ -1,0 +1,29 @@
+{
+  "cpu_shared_eligibility_benchmark": {
+    "rows": 20480,
+    "original_seconds": 1.9967661669943482,
+    "vectorized_seconds": 0.015658250078558922,
+    "speedup": 127.52166793711835,
+    "fc1_index_parity": "PASS",
+    "sdf_index_parity": "PASS",
+    "scope": "CPU eligibility only, not end-to-end training"
+  },
+  "real_checkpoint_frozen_replay": {
+    "paths": 4,
+    "h10_scheduled_child_rows": 80,
+    "h100_scheduled_child_rows": 400,
+    "h100_written_time_shards": 7,
+    "dense_scheduled_time_shards": 100,
+    "h100_batch_terminal_parent_time": 6,
+    "scheduled_terminal_suffix_parent_times": 372,
+    "total_seconds": 8.505282709025778,
+    "post20_eligible": 0,
+    "training_performed": false,
+    "scope": "Four-path pre-commit diagnostic snapshot, not 200-path production performance"
+  },
+  "planned_D0_D1_D2_child_denominator": 307200,
+  "previous_H50_child_denominator": 3072000,
+  "planned_record_reduction": 0.9,
+  "end_to_end_runtime_reduction_claimed": false,
+  "full_budget_gpu_memory_benchmark": "NOT_PERFORMED"
+}
