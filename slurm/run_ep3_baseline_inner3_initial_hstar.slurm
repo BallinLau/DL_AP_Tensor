@@ -22,6 +22,11 @@
 # NEW_H10_H100=false
 # NEW_DYNAMIC_EMPIRICAL=false
 # NEW_REFERENCE_MACRO=false
+# SIMULATION_BP_ACTION_SOURCE=grid
+# BP_HEAD_TRAINING_ENABLED=false
+# BP_HEAD_OPTIMIZER_STEPS=0
+# SIMULATION_BP_GRID_N_CHILD_SHOCKS=2
+# SIMULATION_BP_GRID_SHOCK_SEED=314159
 #
 # Everything except the two added features is inherited from the committed
 # ep3 Fresh100 chain script, so no ep3 parameter can silently drift here.
@@ -54,12 +59,19 @@ export INITIAL_HSTAR_RESIDUAL_TOLERANCE="${INITIAL_HSTAR_RESIDUAL_TOLERANCE:-1e-
 export INITIAL_HSTAR_PARITY_TOLERANCE="${INITIAL_HSTAR_PARITY_TOLERANCE:-1e-5}"
 export INITIAL_HSTAR_MAX_ITERATIONS="${INITIAL_HSTAR_MAX_ITERATIONS:-40}"
 
+# Feature C: simulation leverage comes from the Grid BP policy; the retained
+# BP head is never trained and only produces read-only diagnostics.
+export SIMULATION_BP_ACTION_SOURCE="${SIMULATION_BP_ACTION_SOURCE:-grid}"
+export PV_BP_HEAD_TRAINING_ENABLED="${PV_BP_HEAD_TRAINING_ENABLED:-0}"
+export SIMULATION_BP_GRID_N_CHILD_SHOCKS="${SIMULATION_BP_GRID_N_CHILD_SHOCKS:-2}"
+export SIMULATION_BP_GRID_SHOCK_SEED="${SIMULATION_BP_GRID_SHOCK_SEED:-314159}"
+
 if [[ ! -f "$INITIAL_CHECKPOINT" ]]; then
   echo "ERROR: ep3 source checkpoint not found: $INITIAL_CHECKPOINT"
   exit 1
 fi
 
-echo "=== ep3 baseline + inner3 + initial h-star ==="
+echo "=== ep3 baseline + inner3 + initial h-star + grid BP ==="
 echo "BASE_SOURCE_COMMIT=004a2ad"
 echo "REPO_DIR=$REPO_DIR"
 echo "REQUIRED_COMMIT=$REQUIRED_COMMIT"
@@ -71,5 +83,11 @@ echo "N_EPISODES=$N_EPISODES"
 echo "FIRM_INNER_CYCLES=$FIRM_INNER_CYCLES"
 echo "INITIAL_HSTAR_ENABLED=$INITIAL_HSTAR_ENABLED"
 echo "RESUME_CLASSIFICATION=$RESUME_CLASSIFICATION"
+echo "SIMULATION_BP_ACTION_SOURCE=$SIMULATION_BP_ACTION_SOURCE"
+echo "PV_BP_HEAD_TRAINING_ENABLED=$PV_BP_HEAD_TRAINING_ENABLED"
+echo "SIMULATION_BP_GRID_N_CHILD_SHOCKS=$SIMULATION_BP_GRID_N_CHILD_SHOCKS"
+echo "SIMULATION_BP_GRID_SHOCK_SEED=$SIMULATION_BP_GRID_SHOCK_SEED"
+echo "GRID_BP_CONFIGURED=true"
+echo "GRID_BP_ACTUALLY_USED_IN_ECONOMIC_TRANSITIONS=checked_runtime_via_evidence"
 
 exec bash "$REPO_DIR/slurm/run_normalized_sdf_aio_bp_logit_scaled_value_eta25_bp500_investment_compare_fresh100.slurm"

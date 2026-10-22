@@ -112,6 +112,11 @@ class GridBPSimulationPolicy:
         self.refinancing_active_rows = 0
         self.coarse_candidate_evaluations = 0
         self.fine_candidate_evaluations = 0
+        self.child_head_fallback_calls = 0
+        self._gap_rows = 0
+        self._gap_abs_sum = 0.0
+        self._gap_signed_sum = 0.0
+        self._gap_abs_max = 0.0
 
     def _shock_bank_for_rows(self, n_rows: int) -> ConvergenceShockBank:
         def expand(value: torch.Tensor) -> torch.Tensor:
@@ -221,6 +226,16 @@ class GridBPSimulationPolicy:
             mixed["bp_star"],
             output.survival_prob,
         )
+        # Read-only grid-vs-head diagnostic: the head prediction of the same
+        # frozen target model is never consumed by the economic transition.
+        action_detached = action.detach()
+        head_detached = output.bp.detach()
+        gap = action_detached - head_detached
+        n_rows_now = int(firm_state.shape[0])
+        self._gap_rows += n_rows_now
+        self._gap_abs_sum += float(gap.abs().sum())
+        self._gap_signed_sum += float(gap.sum())
+        self._gap_abs_max = max(self._gap_abs_max, float(gap.abs().max()))
         active = int((firm_state[:, 2] > 0.5).sum().item())
         self.calls += 1
         self.parent_rows += int(firm_state.shape[0])
@@ -244,7 +259,16 @@ class GridBPSimulationPolicy:
 
     @torch.inference_mode()
     def __call__(self, **context: Any) -> torch.Tensor:
+        # Formal leverage decisions are resolved exclusively at parent nodes
+        # (branch == -1).  Child branches are parallel bookkeeping rows: their
+        # leverage is re-resolved by the NEXT parent node before it is ever
+        # consumed, because the economic transition in data/simulate_ts_parallel.
+        # py (_expand_branches_batched) reads state["bp"], which the parent node
+        # overwrites with this grid resolution at every period.  Child rows
+        # therefore only produce a read-only BP head diagnostic and never enter
+        # an economic transition.
         if int(context["branch"]) != -1:
+            self.child_head_fallback_calls += 1
             return context["bp_head"]
         return self.evaluate_actions(
             firm_state=context["firm_state"],
@@ -273,5 +297,21 @@ class GridBPSimulationPolicy:
             ),
             "coarse_eval_count": int(self.coarse_candidate_evaluations),
             "fine_eval_count": int(self.fine_candidate_evaluations),
+            "child_branch_bp_head_fallback_calls": int(
+                self.child_head_fallback_calls
+            ),
+            "bp_grid_vs_head_abs_gap_mean": (
+                self._gap_abs_sum / max(self._gap_rows, 1)
+                if self._gap_rows
+                else None
+            ),
+            "bp_grid_vs_head_abs_gap_max": (
+                self._gap_abs_max if self._gap_rows else None
+            ),
+            "bp_grid_vs_head_signed_gap_mean": (
+                self._gap_signed_sum / max(self._gap_rows, 1)
+                if self._gap_rows
+                else None
+            ),
             **self.teacher.forward_stats(),
         }

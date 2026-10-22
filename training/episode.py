@@ -9609,6 +9609,7 @@ class Episode:
             "status": "diagnostic_only_training_disabled",
             "bp_head_training_enabled": False,
             "optimizer_steps": 0,
+            "bp_head_optimizer_steps": 0,
             "bp_optimizer_steps": 0,
             "successful_optimizer_steps": 0,
             "attempted_optimizer_steps": 0,
@@ -16856,6 +16857,30 @@ class Episode:
             ),
             "diagnostics": deepcopy(
                 getattr(self, "_firm_inner_cycle_diagnostics", None)
+            ),
+        }
+        transition_evidence = deepcopy(
+            getattr(self, "_last_simulation_meta", {}).get(
+                "simulation_bp_transition_evidence", {}
+            )
+        )
+        module_summaries["simulation_bp"] = {
+            "grid_bp_configured": bool(
+                str(
+                    getattr(
+                        self.hyperparams, "simulation_bp_action_source", "head"
+                    )
+                )
+                .strip()
+                .lower()
+                == "grid"
+            ),
+            "grid_bp_actually_used_in_economic_transitions": bool(
+                transition_evidence.get("bp_actual_is_grid", False)
+            ),
+            **transition_evidence,
+            "bp_grid": deepcopy(
+                getattr(self, "_last_simulation_meta", {}).get("bp_grid", {})
             ),
         }
 

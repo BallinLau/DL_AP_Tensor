@@ -595,6 +595,7 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
         "enabled": True,
         "scope": "t0_initial_only",
         "root_solver": "batched_bisection_production_node_operator",
+        "root_policy_source": str(getattr(sim, "bp_action_source", "head")),
         "n_paths": int(n_paths),
         "success_count": int(converged.sum()),
         "fail_count": int((~converged).sum()),
@@ -660,6 +661,23 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
         int(sim.n_paths), dtype=torch.bool, device=device
     )
     completed_parent_steps = 0
+
+    # Evidence trail for the formal BP source guarantee. The refinancing in
+    # ``_expand_branches_batched`` must consume a bp that the parent node just
+    # resolved; ``_last_parent_bp_grid_resolved`` makes that contract
+    # executable instead of a comment.
+    sim._bp_transition_evidence = {
+        "economic_refinancing_bp_source": str(
+            getattr(sim, "bp_action_source", "head")
+        ),
+        "bp_actual_is_grid": bool(
+            str(getattr(sim, "bp_action_source", "head")).lower() == "grid"
+        ),
+        "parent_grid_resolutions": 0,
+        "child_branch_bp_head_fallbacks": 0,
+        "grid_refinancing_expansions": 0,
+    }
+    sim._last_parent_bp_grid_resolved = False
 
     for t in tqdm(range(sim.horizon), desc="Simulating steps (tensor)"):
         state_bank_capture = getattr(sim, "state_bank_capture", None)
@@ -768,6 +786,9 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
             "n_extinct_paths": len(extinct_paths),
             "path_stop_times": path_stop_times,
             "initial_hstar": initial_hstar_diagnostics,
+            "simulation_bp_transition_evidence": getattr(
+                sim, "_bp_transition_evidence", None
+            ),
         },
     )
 
@@ -1579,6 +1600,23 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
             raise FloatingPointError("resolved BP action returned non-finite values")
         bp = overridden
         firm_rows[:, sim.FIRM_COLUMNS.index("bp")] = bp.to(firm_rows.dtype)
+        evidence = getattr(sim, "_bp_transition_evidence", None)
+        if evidence is not None:
+            if int(branch_k) == -1:
+                evidence["parent_grid_resolutions"] = (
+                    int(evidence.get("parent_grid_resolutions", 0)) + 1
+                )
+                if str(getattr(sim, "bp_action_source", "head")).lower() == "grid":
+                    # Marks the bp that _expand_branches_batched will consume
+                    # for this period's refinancing as grid-resolved.
+                    sim._last_parent_bp_grid_resolved = True
+            else:
+                # Child branches carry a read-only BP head diagnostic; the
+                # parent resolution above is the only value that enters the
+                # economic transition.
+                evidence["child_branch_bp_head_fallbacks"] = (
+                    int(evidence.get("child_branch_bp_head_fallbacks", 0)) + 1
+                )
 
     potential_count = state.get("event_potential_count", torch.zeros(n_paths, device=device))
     accepted_count = state.get("event_accepted_count", torch.zeros(n_paths, device=device))
@@ -1733,6 +1771,21 @@ def _expand_branches_batched(
     branches: List[Dict[str, torch.Tensor]] = []
     b_prev = state["b"]
     bp_prev = state.get("bp", b_prev)
+    evidence = getattr(sim, "_bp_transition_evidence", None)
+    if evidence is not None:
+        evidence["grid_refinancing_expansions"] = (
+            int(evidence.get("grid_refinancing_expansions", 0)) + 1
+        )
+        if evidence.get("bp_actual_is_grid", False):
+            # Hard guarantee: in grid mode the bp consumed by refinancing must
+            # have been grid-resolved by the parent node this period. It can
+            # never be stale (previous child) or head-derived.
+            if not bool(getattr(sim, "_last_parent_bp_grid_resolved", False)):
+                raise RuntimeError(
+                    "grid simulation consumed a refinancing bp that was not "
+                    "grid-resolved by the parent node in this period"
+                )
+            sim._last_parent_bp_grid_resolved = False
     entry_reference = compute_entry_reference(
         state["K"],
         state["alive"],
