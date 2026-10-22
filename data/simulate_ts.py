@@ -125,6 +125,10 @@ class SimulateTS:
         entry_hatc_failure_scan_points: int = 81,
         entry_hatc_failure_scan_half_width: float = 2.0,
         entry_hatc_failure_episode_id: int = -1,
+        initial_hstar_enabled: bool = False,
+        initial_hstar_residual_tolerance: float = 1e-5,
+        initial_hstar_parity_tolerance: float = 1e-5,
+        initial_hstar_max_iterations: int = 40,
         initial_state: Optional[Dict[str, torch.Tensor]] = None,
         state_bank_capture=None,
     ):
@@ -247,8 +251,28 @@ class SimulateTS:
         self.entry_hatc_failure_episode_id = int(
             entry_hatc_failure_episode_id
         )
+        self.initial_hstar_enabled = bool(initial_hstar_enabled)
+        self.initial_hstar_residual_tolerance = float(
+            initial_hstar_residual_tolerance
+        )
+        self.initial_hstar_parity_tolerance = float(
+            initial_hstar_parity_tolerance
+        )
+        self.initial_hstar_max_iterations = int(initial_hstar_max_iterations)
+        if self.initial_hstar_residual_tolerance <= 0.0:
+            raise ValueError("initial_hstar_residual_tolerance must be positive")
+        if self.initial_hstar_parity_tolerance <= 0.0:
+            raise ValueError("initial_hstar_parity_tolerance must be positive")
+        if self.initial_hstar_max_iterations < 1:
+            raise ValueError("initial_hstar_max_iterations must be at least 1")
+        self._initial_hstar_diagnostics = None
         self.initial_state = initial_state
         self.state_bank_capture = state_bank_capture
+        if self.initial_hstar_enabled and initial_state is not None:
+            raise ValueError(
+                "initial_hstar calibration is defined only for a fresh t=0 "
+                "initialization; initial_state rollouts cannot recalibrate"
+            )
         if self.initial_state is not None:
             if "b" not in self.initial_state or self.initial_state["b"].ndim != 2:
                 raise ValueError("initial_state must contain two-dimensional 'b'")

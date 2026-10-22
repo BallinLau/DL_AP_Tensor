@@ -473,6 +473,146 @@ def _ensure_entry_state_fields(state: Dict[str, torch.Tensor]) -> None:
         )
 
 
+@torch.no_grad()
+def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dict:
+    """Solve the initial (t=0) macro clearing condition path-by-path.
+
+    ``G_t0(h) = exp(h) * K_ledger(h) - C_raw(h)`` is evaluated with the
+    unmodified production node operator on a private clone of the initial
+    state, so the authoritative ledger, the simulation state, and every RNG
+    stream remain untouched.  Because the production macro export is
+    ``Hatc_cal = log(C_raw / K_ledger)``, the root condition is equivalent to
+    ``Hatc_cal(h) - h = 0``.  Only t=0 is calibrated; later periods keep the
+    original FC1 forecast.
+    """
+    from .state_bank import clone_state
+
+    device = sim.device
+    n_paths = int(sim.n_paths)
+    alive = state["alive"].to(torch.bool)
+    K = state["K"].to(torch.float32)
+    capital = (K * alive.to(K.dtype)).sum(dim=1)
+    finite_capital = torch.isfinite(capital) & (capital > 0.0)
+    if not bool(finite_capital.all()):
+        bad = torch.nonzero(~finite_capital, as_tuple=False).reshape(-1).tolist()
+        raise RuntimeError(
+            "initial h-star calibration requires positive finite firm capital; "
+            f"paths={bad[:20]} (n={len(bad)})"
+        )
+    state["lnkf"] = torch.log(capital).to(state["lnkf"].dtype)
+    initial_belief = state["hatcf"].to(torch.float32).clone()
+
+    tolerance = float(sim.initial_hstar_residual_tolerance)
+    dtype = state["hatcf"].dtype
+
+    rng_cpu = torch.get_rng_state()
+    rng_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    def evaluate(h: torch.Tensor):
+        # Root-candidate evaluation may exercise the entry operator, which
+        # draws from the global RNG. Preserve and restore every stream so the
+        # accepted simulation continues from its original CRN.
+        torch.set_rng_state(rng_cpu)
+        if rng_cuda is not None:
+            torch.cuda.set_rng_state_all(rng_cuda)
+        trial = clone_state(state, device=device)
+        trial["hatcf"] = h.to(dtype)
+        try:
+            _process_node_batched(sim, trial, 0, -1)
+        except EntryEconomicInfeasibilityError as exc:
+            raise RuntimeError(
+                "initial h-star candidate belief is economically infeasible on "
+                f"the production t=0 operator at h={h.tolist()[:20]}: {exc}"
+            ) from exc
+        except EntryAccountingError as exc:
+            raise RuntimeError(
+                "initial h-star candidate belief violates the production "
+                f"resource account at h={h.tolist()[:20]}: {exc}"
+            ) from exc
+        finally:
+            torch.set_rng_state(rng_cpu)
+            if rng_cuda is not None:
+                torch.cuda.set_rng_state_all(rng_cuda)
+        return trial["hatc_cal"].to(torch.float32) - h, trial
+
+    lo = initial_belief.clone()
+    hi = initial_belief.clone()
+    f_lo, _ = evaluate(lo)
+    f_hi = f_lo.clone()
+    bracket = (f_lo * f_hi) <= 0.0
+    expansions = 0
+    # The initial belief is the FC1 forecast, so the realized t=0 clearing rate
+    # is expected nearby. Widen symmetrically in small steps; candidates the
+    # production operator rejects are reported instead of being clipped.
+    for step in range(1, 9):
+        active = ~bracket
+        if not bool(active.any()):
+            break
+        width = 0.5 * float(step)
+        lo = torch.where(active, initial_belief - width, lo)
+        hi = torch.where(active, initial_belief + width, hi)
+        f_lo, _ = evaluate(lo)
+        f_hi, _ = evaluate(hi)
+        bracket = (f_lo * f_hi) <= 0.0
+        expansions = step
+    bracket = bracket & torch.isfinite(f_lo) & torch.isfinite(f_hi)
+    failed = ~bracket
+    if bool(failed.any()):
+        bad = torch.nonzero(failed, as_tuple=False).reshape(-1).tolist()
+        raise RuntimeError(
+            "initial h-star root is not bracketed on the production t=0 "
+            f"operator within +/-4 of the initial belief; "
+            f"paths={bad[:20]} (n={len(bad)}), "
+            f"f_low={f_lo[bad[:5]].tolist()}, f_high={f_hi[bad[:5]].tolist()}"
+        )
+
+    mid = (lo + hi) * 0.5
+    f_mid = torch.full_like(mid, float("nan"))
+    iterations = 0
+    for iterations in range(1, max(1, int(sim.initial_hstar_max_iterations)) + 1):
+        f_mid, _ = evaluate(mid)
+        if bool((f_mid.abs() <= tolerance).all()):
+            break
+        same_as_low = f_mid * f_lo > 0.0
+        lo = torch.where(same_as_low, mid, lo)
+        hi = torch.where(~same_as_low, mid, hi)
+        f_lo = torch.where(same_as_low, f_mid, f_lo)
+        f_hi = torch.where(~same_as_low, f_mid, f_hi)
+        mid = (lo + hi) * 0.5
+    residuals = f_mid.abs()
+    converged = torch.isfinite(residuals) & (residuals <= tolerance)
+    if not bool(converged.all()):
+        bad = torch.nonzero(~converged, as_tuple=False).reshape(-1).tolist()
+        raise RuntimeError(
+            "initial h-star root did not converge to the required tolerance; "
+            f"paths={bad[:20]} (n={len(bad)}), "
+            f"residual_max={float(residuals[bad].max()) if bad else 0.0}, "
+            f"tolerance={tolerance}"
+        )
+
+    state["hatcf"] = mid.to(state["hatcf"].dtype)
+    diagnostics = {
+        "enabled": True,
+        "scope": "t0_initial_only",
+        "root_solver": "batched_bisection_production_node_operator",
+        "n_paths": int(n_paths),
+        "success_count": int(converged.sum()),
+        "fail_count": int((~converged).sum()),
+        "residual_tolerance": tolerance,
+        "max_iterations": int(sim.initial_hstar_max_iterations),
+        "iterations_used": int(iterations),
+        "bracket_expansions": int(expansions),
+        "initial_belief_mean": float(initial_belief.mean()),
+        "selected_hstar_mean": float(mid.mean()),
+        "selected_hstar_p50": float(mid.median()),
+        "residual_abs_mean": float(residuals.mean()),
+        "residual_abs_p90": float(torch.quantile(residuals, 0.9)),
+        "residual_abs_max": float(residuals.max()),
+        "initial_capital_mean": float(capital.mean()),
+    }
+    return diagnostics
+
+
 def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
     """
     Simulate all paths in parallel on device.
@@ -500,6 +640,16 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
         max_firms = int(state["b"].shape[1])
     sim._max_firms_observed = max(int(sim._max_firms_observed), int(max_firms))
 
+    initial_hstar_diagnostics = None
+    if bool(getattr(sim, "initial_hstar_enabled", False)):
+        if initial_state is not None:
+            raise RuntimeError(
+                "initial h-star calibration must not run on a State Bank "
+                "initial_state rollout"
+            )
+        initial_hstar_diagnostics = _calibrate_initial_hstar_batched(sim, state)
+        sim._initial_hstar_diagnostics = dict(initial_hstar_diagnostics)
+
     firm_rows: List[torch.Tensor] = []
     macro_rows: List[torch.Tensor] = []
     stopped_early = False
@@ -521,6 +671,41 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
         firm_rows.append(parent_firm)
         macro_rows.append(parent_macro)
         completed_parent_steps += 1
+
+        if t == 0 and initial_hstar_diagnostics is not None:
+            hatc_residual = (
+                state["hatc_cal"].to(torch.float32)
+                - state["hatcf"].to(torch.float32)
+            ).abs()
+            lnk_residual = (
+                state["lnk_cal"].to(torch.float32)
+                - state["lnkf"].to(torch.float32)
+            ).abs()
+            parity_tolerance = float(sim.initial_hstar_parity_tolerance)
+            strict_tolerance = float(sim.initial_hstar_residual_tolerance)
+            hatc_ok = hatc_residual <= strict_tolerance
+            lnk_ok = lnk_residual <= parity_tolerance
+            if not bool((hatc_ok & lnk_ok).all()):
+                bad = torch.nonzero(
+                    ~(hatc_ok & lnk_ok), as_tuple=False
+                ).reshape(-1).tolist()
+                raise RuntimeError(
+                    "t=0 h-star belief does not reproduce the production "
+                    f"ledger; paths={bad[:20]} (n={len(bad)}), "
+                    f"hatc_residual_max={float(hatc_residual[bad].max())}, "
+                    f"strict_tolerance={strict_tolerance}, "
+                    f"lnk_residual_max={float(lnk_residual[bad].max())}, "
+                    f"parity_tolerance={parity_tolerance}"
+                )
+            initial_hstar_diagnostics.update({
+                "production_hatc_residual_max": float(hatc_residual.max()),
+                "production_lnk_residual_max": float(lnk_residual.max()),
+                "production_ledger_parity_passed": True,
+                "production_strict_tolerance": strict_tolerance,
+                "production_parity_tolerance": parity_tolerance,
+                "t0_calibrated_path_count": int((hatc_ok & lnk_ok).sum()),
+            })
+            sim._initial_hstar_diagnostics = dict(initial_hstar_diagnostics)
 
         branch_states = _expand_branches_batched(sim, state, child_t=t + 1)
         _annotate_parent_next_leverage_rows(
@@ -582,6 +767,7 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
             "extinct_paths": extinct_paths,
             "n_extinct_paths": len(extinct_paths),
             "path_stop_times": path_stop_times,
+            "initial_hstar": initial_hstar_diagnostics,
         },
     )
 

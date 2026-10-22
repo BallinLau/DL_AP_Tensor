@@ -157,6 +157,15 @@ class HyperParams:
     pv_max_consecutive_degraded_episodes: int = 3
     pv_training_flow: str = "joint"
     pv_eval_epochs: Optional[int] = None
+    # Staged P/Q Gauss-Seidel cycles executed while FC1/SDF stay frozen.
+    # 1 reproduces the original ep3 staged flow exactly.
+    firm_inner_cycles: int = 1
+    # Initial-only (t=0) macro calibration.  Periods t>=1 keep the original
+    # FC1 forecast path; no further market clearing is performed.
+    initial_hstar_enabled: bool = False
+    initial_hstar_residual_tolerance: float = 1e-5
+    initial_hstar_parity_tolerance: float = 1e-5
+    initial_hstar_max_iterations: int = 40
     bp_distill_epochs: int = 20
     bp_distill_patience: int = 3
     bp_distill_min_delta: float = 1e-4

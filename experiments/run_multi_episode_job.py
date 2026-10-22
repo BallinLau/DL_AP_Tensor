@@ -666,6 +666,44 @@ def parse_args() -> argparse.Namespace:
         help="Treat a missing QS Bellman optimizer step as a Q-stage failure",
     )
     parser.add_argument("--bp-distill-epochs", type=int, default=None, help="BP distillation epochs for staged policy/value flow")
+    parser.add_argument(
+        "--firm-inner-cycles",
+        type=int,
+        default=None,
+        help="Staged P/Q Gauss-Seidel cycles per Episode with FC1/SDF frozen; 1 is the ep3 baseline",
+    )
+    parser.add_argument(
+        "--initial-hstar-enabled",
+        dest="initial_hstar_enabled",
+        action="store_true",
+        default=None,
+        help="Calibrate the t=0 macro belief with the production clearing root; later periods keep FC1 forecasts",
+    )
+    parser.add_argument(
+        "--no-initial-hstar",
+        dest="initial_hstar_enabled",
+        action="store_false",
+        default=None,
+        help="Disable t=0 h-star calibration (ep3 baseline behavior)",
+    )
+    parser.add_argument(
+        "--initial-hstar-residual-tolerance",
+        type=float,
+        default=None,
+        help="Required absolute clearing residual for the t=0 h-star root",
+    )
+    parser.add_argument(
+        "--initial-hstar-parity-tolerance",
+        type=float,
+        default=None,
+        help="Required ledger parity tolerance between the root candidate and the production t=0 node",
+    )
+    parser.add_argument(
+        "--initial-hstar-max-iterations",
+        type=int,
+        default=None,
+        help="Maximum bisection iterations for the t=0 h-star root",
+    )
     parser.add_argument("--bp-distill-patience", type=int, default=None, help="BP distillation early-stop patience")
     parser.add_argument("--bp-distill-min-delta", type=float, default=None, help="BP distillation validation min delta")
     parser.add_argument(
@@ -1382,6 +1420,22 @@ def configure_hyperparams(args: argparse.Namespace):
     )
     if args.bp_distill_epochs is not None:
         hyperparams.bp_distill_epochs = args.bp_distill_epochs
+    if args.firm_inner_cycles is not None:
+        hyperparams.firm_inner_cycles = args.firm_inner_cycles
+    if args.initial_hstar_enabled is not None:
+        hyperparams.initial_hstar_enabled = bool(args.initial_hstar_enabled)
+    if args.initial_hstar_residual_tolerance is not None:
+        hyperparams.initial_hstar_residual_tolerance = (
+            args.initial_hstar_residual_tolerance
+        )
+    if args.initial_hstar_parity_tolerance is not None:
+        hyperparams.initial_hstar_parity_tolerance = (
+            args.initial_hstar_parity_tolerance
+        )
+    if args.initial_hstar_max_iterations is not None:
+        hyperparams.initial_hstar_max_iterations = (
+            args.initial_hstar_max_iterations
+        )
     if args.bp_distill_patience is not None:
         hyperparams.bp_distill_patience = args.bp_distill_patience
     if args.bp_distill_min_delta is not None:
@@ -1474,6 +1528,22 @@ def configure_hyperparams(args: argparse.Namespace):
             raise ValueError("PV mixture currently requires --pv-training-flow staged.")
     if args.firm_target_update is not None:
         hyperparams.firm_target_update = args.firm_target_update
+    if int(getattr(hyperparams, "firm_inner_cycles", 1)) < 1:
+        raise ValueError("firm_inner_cycles must be at least 1.")
+    if int(getattr(hyperparams, "firm_inner_cycles", 1)) > 1 and (
+        str(getattr(hyperparams, "pv_training_flow", "joint")).lower() != "staged"
+    ):
+        raise ValueError("firm_inner_cycles>1 requires --pv-training-flow staged.")
+    if bool(getattr(hyperparams, "initial_hstar_enabled", False)):
+        if bool(getattr(hyperparams, "state_bank_enabled", False)):
+            raise ValueError(
+                "initial_hstar_enabled requires a fresh t=0 initialization and "
+                "cannot run with state_bank_enabled."
+            )
+        if float(getattr(hyperparams, "initial_hstar_residual_tolerance", 1e-5)) <= 0.0:
+            raise ValueError("initial_hstar_residual_tolerance must be positive.")
+        if float(getattr(hyperparams, "initial_hstar_parity_tolerance", 1e-5)) <= 0.0:
+            raise ValueError("initial_hstar_parity_tolerance must be positive.")
     hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"
     hyperparams.pv_fixed_sdf = args.ablation_mode == "fixed_sdf"
     hyperparams.pv_fixed_policy = args.ablation_mode == "fixed_policy"
@@ -2259,6 +2329,17 @@ def main():
                     "simulation_bp_grid_shock_seed": hyperparams.simulation_bp_grid_shock_seed,
                     "pv_training_flow": hyperparams.pv_training_flow,
                     "pv_eval_epochs": hyperparams.pv_eval_epochs,
+                    "firm_inner_cycles": hyperparams.firm_inner_cycles,
+                    "initial_hstar_enabled": hyperparams.initial_hstar_enabled,
+                    "initial_hstar_residual_tolerance": (
+                        hyperparams.initial_hstar_residual_tolerance
+                    ),
+                    "initial_hstar_parity_tolerance": (
+                        hyperparams.initial_hstar_parity_tolerance
+                    ),
+                    "initial_hstar_max_iterations": (
+                        hyperparams.initial_hstar_max_iterations
+                    ),
                     "bp_distill_epochs": hyperparams.bp_distill_epochs,
                     "bp_distill_patience": hyperparams.bp_distill_patience,
                     "bp_distill_max_optimizer_steps": hyperparams.bp_distill_max_optimizer_steps,

@@ -310,6 +310,7 @@ class Episode:
         self._last_policy_value_stage_summary: Optional[Dict[str, float]] = None
         self._last_policy_value_gate_context: Dict[str, float] = {}
         self._last_simulation_meta: Dict[str, Any] = {}
+        self._firm_inner_cycle_diagnostics: Optional[List[Dict[str, Any]]] = None
         self._policy_value_stage_target_model: Optional[nn.Module] = None
         self._target_grid_loss_component_mode = "joint"
         self._last_partial_module_summaries: Dict[str, Any] = {}
@@ -869,6 +870,31 @@ class Episode:
         return numeric_metrics, metadata
 
     @staticmethod
+    def _state_dict_delta_norm(
+        before: Dict[str, torch.Tensor],
+        after: Dict[str, torch.Tensor],
+    ) -> Dict[str, float]:
+        """L2 drift between two state snapshots, absolute and relative."""
+        sq_delta = 0.0
+        sq_before = 0.0
+        for name in sorted(after.keys()):
+            if name not in before:
+                continue
+            current = after[name].detach().cpu().to(torch.float64)
+            previous = before[name].detach().cpu().to(torch.float64)
+            if current.shape != previous.shape:
+                continue
+            sq_delta += float(torch.sum((current - previous) ** 2))
+            sq_before += float(torch.sum(previous ** 2))
+        delta = math.sqrt(max(sq_delta, 0.0))
+        base = math.sqrt(max(sq_before, 0.0))
+        return {
+            "l2_delta": delta,
+            "l2_before": base,
+            "relative": (delta / base) if base > 0.0 else float("inf"),
+        }
+
+    @staticmethod
     def _state_dict_hash(module: nn.Module) -> str:
         digest = hashlib.sha256()
         for name, tensor in sorted(module.state_dict().items()):
@@ -1162,6 +1188,18 @@ class Episode:
             getattr(self.hyperparams, "entry_hatc_failure_scan_half_width", 2.0)
         )
         sim_kwargs["entry_hatc_failure_episode_id"] = int(self.episode_id)
+        sim_kwargs["initial_hstar_enabled"] = bool(
+            getattr(self.hyperparams, "initial_hstar_enabled", False)
+        )
+        sim_kwargs["initial_hstar_residual_tolerance"] = float(
+            getattr(self.hyperparams, "initial_hstar_residual_tolerance", 1e-5)
+        )
+        sim_kwargs["initial_hstar_parity_tolerance"] = float(
+            getattr(self.hyperparams, "initial_hstar_parity_tolerance", 1e-5)
+        )
+        sim_kwargs["initial_hstar_max_iterations"] = int(
+            getattr(self.hyperparams, "initial_hstar_max_iterations", 40)
+        )
         source = self._simulation_bp_action_source()
         # The formal source is controlled only by HyperParams. This prevents a
         # stale caller-provided kwarg from silently switching a replay back to
@@ -11690,99 +11728,234 @@ class Episode:
             q_pricing_teacher = deepcopy(q_teacher_source).to(self.device)
             q_pricing_teacher.eval()
             q_pricing_teacher.requires_grad_(False)
-            pq_summary = self._run_policy_value_evaluation_stage(
-                p_train_batches,
-                p_validation_batches,
-                episode_teacher,
-                eval_epochs,
-                q_target_model=q_pricing_teacher,
-            )
-            pq_summary.update(p_eta_balance_summary)
-            if pq_summary.get("status") != "accepted":
-                _restore_full_staged_start()
-                self._last_policy_value_stage_summary = {
-                    "policy_value_training_flow": "staged",
-                    "policy_value_stage_status": "failed_pq",
-                    "q_bootstrap_stage": q_bootstrap_summary,
-                    "policy_value_evaluation_stage": pq_summary,
-                }
-                return {
-                    "final_losses": {},
-                    "metadata": self._last_policy_value_stage_summary,
-                    "convergence": {
-                        "enabled": False,
-                        "skip_reason": "staged_training_failed",
-                    },
-                    "target_grid_validation_batches": len(validation_batches),
-                }
-            if bool(
-                getattr(
-                    self.hyperparams,
-                    "save_intermediate_stage_checkpoints",
-                    False,
-                )
-            ):
-                self._intermediate_stage_states["post_p"] = self._state_dict_to_cpu(
-                    self.models["policy_value"]
-                )
-            self._stage_component_hashes["post_p"] = (
-                self._policy_value_component_hashes()
-            )
-
-            # Freeze the P solution once for the entire Q stage. The Q continuation
-            # target is maintained separately inside _run_q_regime_training, so Q
-            # target refreshes can never move this Phat classifier.
-            frozen_p_snapshot = deepcopy(self.models["policy_value"]).to(self.device)
-            frozen_p_snapshot.eval()
-            frozen_p_snapshot.requires_grad_(False)
-            q_summary = self._run_q_regime_training(
-                pv_train_batches,
-                frozen_p_snapshot,
-                validation_batches=validation_batches,
-            )
             q_soft_accept_statuses = {
                 "accepted",
                 "accepted_improved",
                 "accepted_reverted",
             }
-            if q_summary.get("status") not in q_soft_accept_statuses:
-                # Only numerical, structural, or missing-required-sample failures
-                # roll the full staged update back. Validation no-improvement has
-                # already restored Q only and must preserve the accepted P update.
-                _restore_full_staged_start()
-                metadata = {
-                    "policy_value_training_flow": "staged",
-                    "policy_value_stage_status": "failed_q",
-                    "q_bootstrap_stage": q_bootstrap_summary,
-                    "policy_value_evaluation_stage": pq_summary,
-                    "q_regime_training_stage": q_summary,
-                    "q_stage_required_gate_passed": False,
-                    "q_stage_rejection_reason": q_summary.get("q_stage_rejection_reason"),
-                    "bp_distillation_stage": {"status": "skipped_q_stage_rejected"},
-                }
-                self._last_policy_value_stage_summary = metadata
-                return {
-                    "final_losses": {},
-                    "metadata": metadata,
-                    "convergence": {
-                        "enabled": False,
-                        "skip_reason": "staged_training_failed",
-                    },
-                    "target_grid_validation_batches": len(validation_batches),
-                }
-            if bool(
-                getattr(
-                    self.hyperparams,
-                    "save_intermediate_stage_checkpoints",
-                    False,
-                )
-            ):
-                self._intermediate_stage_states["post_q_final"] = (
-                    self._state_dict_to_cpu(self.models["policy_value"])
-                )
-            self._stage_component_hashes["post_q_final"] = (
-                self._policy_value_component_hashes()
+            inner_cycles = int(
+                getattr(self.hyperparams, "firm_inner_cycles", 1)
             )
+            if inner_cycles < 1:
+                raise ValueError("firm_inner_cycles must be at least 1")
+            inner_cycle_diagnostics: List[Dict[str, Any]] = []
+            inner_eval_batches = (
+                validation_batches
+                if validation_batches
+                else pv_train_batches
+            )[:4]
+            cycle_teacher = episode_teacher
+            for cycle_index in range(1, inner_cycles + 1):
+                cycle_sdf_hash_before = (
+                    self._state_dict_hash(self.models["sdf_fc1"])
+                    if "sdf_fc1" in self.models
+                    else None
+                )
+                cycle_start_state = self._state_dict_to_cpu(
+                    self.models["policy_value"]
+                )
+                pq_summary = self._run_policy_value_evaluation_stage(
+                    p_train_batches,
+                    p_validation_batches,
+                    cycle_teacher,
+                    eval_epochs,
+                    q_target_model=q_pricing_teacher,
+                )
+                pq_summary.update(p_eta_balance_summary)
+                if pq_summary.get("status") != "accepted":
+                    _restore_full_staged_start()
+                    self._last_policy_value_stage_summary = {
+                        "policy_value_training_flow": "staged",
+                        "policy_value_stage_status": "failed_pq",
+                        "firm_inner_cycles": inner_cycles,
+                        "inner_cycle_index": cycle_index,
+                        "q_bootstrap_stage": q_bootstrap_summary,
+                        "policy_value_evaluation_stage": pq_summary,
+                        "inner_cycle_diagnostics": inner_cycle_diagnostics,
+                    }
+                    return {
+                        "final_losses": {},
+                        "metadata": self._last_policy_value_stage_summary,
+                        "convergence": {
+                            "enabled": False,
+                            "skip_reason": "staged_training_failed",
+                        },
+                        "target_grid_validation_batches": len(validation_batches),
+                    }
+                if bool(
+                    getattr(
+                        self.hyperparams,
+                        "save_intermediate_stage_checkpoints",
+                        False,
+                    )
+                ):
+                    self._intermediate_stage_states[
+                        "post_p"
+                        if inner_cycles == 1
+                        else f"post_p_cycle{cycle_index}"
+                    ] = self._state_dict_to_cpu(self.models["policy_value"])
+                self._stage_component_hashes[
+                    "post_p"
+                    if inner_cycles == 1
+                    else f"post_p_cycle{cycle_index}"
+                ] = self._policy_value_component_hashes()
+
+                # Freeze the P solution once for the entire Q stage. The Q
+                # continuation target is maintained separately inside
+                # _run_q_regime_training, so Q target refreshes can never move
+                # this Phat classifier.
+                frozen_p_snapshot = deepcopy(self.models["policy_value"]).to(
+                    self.device
+                )
+                frozen_p_snapshot.eval()
+                frozen_p_snapshot.requires_grad_(False)
+                q_summary = self._run_q_regime_training(
+                    pv_train_batches,
+                    frozen_p_snapshot,
+                    validation_batches=validation_batches,
+                )
+                if q_summary.get("status") not in q_soft_accept_statuses:
+                    # Only numerical, structural, or missing-required-sample
+                    # failures roll the full staged update back. Validation
+                    # no-improvement has already restored Q only and must
+                    # preserve the accepted P update.
+                    _restore_full_staged_start()
+                    metadata = {
+                        "policy_value_training_flow": "staged",
+                        "policy_value_stage_status": "failed_q",
+                        "firm_inner_cycles": inner_cycles,
+                        "inner_cycle_index": cycle_index,
+                        "q_bootstrap_stage": q_bootstrap_summary,
+                        "policy_value_evaluation_stage": pq_summary,
+                        "q_regime_training_stage": q_summary,
+                        "q_stage_required_gate_passed": False,
+                        "q_stage_rejection_reason": q_summary.get(
+                            "q_stage_rejection_reason"
+                        ),
+                        "bp_distillation_stage": {
+                            "status": "skipped_q_stage_rejected"
+                        },
+                        "inner_cycle_diagnostics": inner_cycle_diagnostics,
+                    }
+                    self._last_policy_value_stage_summary = metadata
+                    return {
+                        "final_losses": {},
+                        "metadata": metadata,
+                        "convergence": {
+                            "enabled": False,
+                            "skip_reason": "staged_training_failed",
+                        },
+                        "target_grid_validation_batches": len(validation_batches),
+                    }
+                if bool(
+                    getattr(
+                        self.hyperparams,
+                        "save_intermediate_stage_checkpoints",
+                        False,
+                    )
+                ):
+                    self._intermediate_stage_states[
+                        "post_q_final"
+                        if inner_cycles == 1
+                        else f"post_q_cycle{cycle_index}"
+                    ] = self._state_dict_to_cpu(self.models["policy_value"])
+                self._stage_component_hashes[
+                    "post_q_final"
+                    if inner_cycles == 1
+                    else f"post_q_cycle{cycle_index}"
+                ] = self._policy_value_component_hashes()
+
+                cycle_rng_state = self._capture_rng_state()
+                try:
+                    cycle_convergence = self.evaluate_bellman_convergence(
+                        inner_eval_batches,
+                        validation_batches=inner_eval_batches,
+                    )
+                finally:
+                    self._restore_rng_state(cycle_rng_state)
+                cycle_end_state = self._state_dict_to_cpu(
+                    self.models["policy_value"]
+                )
+                cycle_sdf_hash_after = (
+                    self._state_dict_hash(self.models["sdf_fc1"])
+                    if "sdf_fc1" in self.models
+                    else None
+                )
+                if cycle_sdf_hash_after != cycle_sdf_hash_before:
+                    raise RuntimeError(
+                        "Firm inner cycle modified the frozen FC1/SDF model: "
+                        f"cycle={cycle_index}, "
+                        f"before={cycle_sdf_hash_before}, "
+                        f"after={cycle_sdf_hash_after}"
+                    )
+                equations = cycle_convergence.get("equations", {})
+                cycle_record: Dict[str, Any] = {
+                    "cycle": cycle_index,
+                    "p_teacher_source": (
+                        "episode_start_teacher"
+                        if cycle_index == 1
+                        else "previous_cycle_online_snapshot"
+                    ),
+                    "q_target_source": (
+                        "bootstrap_snapshot"
+                        if cycle_index == 1
+                        else "previous_cycle_q_snapshot"
+                    ),
+                    "firm_target_snapshot_hash": (
+                        self._state_dict_hash(self.firm_target)
+                        if self.firm_target is not None
+                        else None
+                    ),
+                    "p_stage_status": pq_summary.get("status"),
+                    "q_stage_status": q_summary.get("status"),
+                    "sdf_fc1_hash": cycle_sdf_hash_before,
+                    "function_drift": self._state_dict_delta_norm(
+                        cycle_start_state, cycle_end_state
+                    ),
+                }
+                for eq_name, key_prefix in (
+                    ("p0", "P0"),
+                    ("pi", "PI"),
+                    ("q", "Q"),
+                ):
+                    conditional = equations.get(eq_name, {}).get(
+                        "conditional_train_m", {}
+                    )
+                    cycle_record[f"Inner{cycle_index}_{key_prefix}_residual"] = {
+                        "mean": conditional.get("mean"),
+                        "p90": conditional.get("p90"),
+                        "passed": conditional.get("passed"),
+                        "n_parent": conditional.get("n_parent"),
+                    }
+                inner_cycle_diagnostics.append(cycle_record)
+                logger.info(
+                    "Firm inner cycle %d/%d | p_status=%s, q_status=%s, "
+                    "p0_mean=%s, pi_mean=%s, q_mean=%s, drift_rel=%s",
+                    cycle_index,
+                    inner_cycles,
+                    pq_summary.get("status"),
+                    q_summary.get("status"),
+                    cycle_record["Inner%d_P0_residual"]["mean"],
+                    cycle_record["Inner%d_PI_residual"]["mean"],
+                    cycle_record["Inner%d_Q_residual"]["mean"],
+                    cycle_record["function_drift"]["relative"],
+                )
+                if cycle_index < inner_cycles:
+                    # Gauss-Seidel refresh: the next cycle's P uses the Q that
+                    # was just updated, and the equity teacher becomes the
+                    # updated online snapshot. No optimizer step touches
+                    # FC1/SDF during the whole inner loop.
+                    q_pricing_teacher = deepcopy(
+                        self.models["policy_value"]
+                    ).to(self.device)
+                    q_pricing_teacher.eval()
+                    q_pricing_teacher.requires_grad_(False)
+                    cycle_teacher = deepcopy(self.models["policy_value"]).to(
+                        self.device
+                    )
+                    cycle_teacher.eval()
+                    cycle_teacher.requires_grad_(False)
+            self._firm_inner_cycle_diagnostics = inner_cycle_diagnostics
 
             bp_teacher = deepcopy(self.models["policy_value"]).to(self.device)
             bp_teacher.eval()
@@ -11926,6 +12099,8 @@ class Episode:
                 ),
                 "q_stage_rejection_reason": q_summary.get("q_stage_rejection_reason"),
                 "bp_distillation_stage": bp_summary,
+                "firm_inner_cycles": inner_cycles,
+                "inner_cycle_diagnostics": inner_cycle_diagnostics,
                 "stage_component_hashes": deepcopy(self._stage_component_hashes),
                 "firm_target_stage_update": {
                     "firm_target_update_mode": firm_mode,
@@ -16670,6 +16845,17 @@ class Episode:
             "bp_head_diagnostics_enabled": True,
             "latest_simulation": deepcopy(
                 getattr(self, "_last_simulation_meta", {})
+            ),
+        }
+        module_summaries["initial_hstar"] = deepcopy(
+            getattr(self, "_last_simulation_meta", {}).get("initial_hstar")
+        )
+        module_summaries["firm_inner_cycles"] = {
+            "requested_cycles": int(
+                getattr(self.hyperparams, "firm_inner_cycles", 1)
+            ),
+            "diagnostics": deepcopy(
+                getattr(self, "_firm_inner_cycle_diagnostics", None)
             ),
         }
 
