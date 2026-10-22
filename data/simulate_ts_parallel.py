@@ -1940,6 +1940,7 @@ def _expand_branches_batched(
     state: Dict[str, torch.Tensor],
     *,
     child_t: int = 1,
+    branch_indices=None,
 ) -> List[Dict[str, torch.Tensor]]:
     _ensure_entry_state_fields(state)
     device = sim.device
@@ -1967,7 +1968,12 @@ def _expand_branches_batched(
             entry_capital_ratio=float(getattr(sim, "entry_capital_ratio", 0.10)),
             entry_size_ratio=float(getattr(sim, "entry_size_ratio", 1.0)),
         )
-    for branch_index in range(sim.branch_num):
+    # Optional subset preserves the original branch_num identity namespace.
+    # In particular, Child0-only replay must not change Entry CRN node IDs.
+    indices = range(sim.branch_num) if branch_indices is None else tuple(branch_indices)
+    if any(not 0 <= b < sim.branch_num for b in indices) or len(set(indices)) != len(indices):
+        raise ValueError('invalid production branch subset')
+    for branch_index in indices:
         if getattr(sim, "transition_rng_mode", "legacy_position") == "stable_firm_identity":
             (
                 x_next, z_next, eta_next, i_next,

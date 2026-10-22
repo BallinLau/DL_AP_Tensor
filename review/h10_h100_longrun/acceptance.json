@@ -1,0 +1,23 @@
+{
+  "experiment": "h10_h100_longrun_macro_replay_20261022",
+  "base_commit": "1e05ecde9f6981c54f89deeadde1a55bc5c48296",
+  "old_h50_job": 711731,
+  "old_h50_unmodified": true,
+  "economic_operator": "finite_direct_parent_exit_before_child_v2",
+  "economic_equations_changed": false,
+  "initial_checkpoint_sha256": "9ad7610a1851d06d80c8b2d08052a01532923f7a2808e3a006f5538b404aa94d",
+  "initial_checkpoint_sha_verified_on_thu": true,
+  "cpu_test_last_completed": "125 passed",
+  "frozen_real_checkpoint_replay": "PASS; FOUR_PATHS; NOT_OPTIMIZER_PIPELINE_SMOKE",
+  "frozen_replay_post20": "EMPTY_LONGRUN_POOL; COVERAGE_ONLY_FALLBACK",
+  "full_optimizer_pipeline_smoke": "PENDING_GPU_EXECUTION",
+  "formal_approval_schema": "CONTINUATION_APPROVAL_V6_H10_H100",
+  "formal_approval_created": false,
+  "formal_training_started": false,
+  "formal_slurm_submitted": false,
+  "ready_for_formal_submission": false,
+  "remaining_gates": ["GPU pipeline smoke", "source and full-budget review", "new content-bound V6 approval"],
+  "h50_v5_approval_reused": false,
+  "four_formal_outers_completed": 0,
+  "equilibrium_convergence": "NOT_TESTED"
+}

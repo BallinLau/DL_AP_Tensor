@@ -118,7 +118,7 @@ def sample_macro_rows(store, *, pair_budget, seed, complete_pairs_only=False,sou
         complete_pairs_only=complete_pairs_only,population_weights=False)
 
 
-def broad_firm_bank(store, *, split, max_rows, seed, calculated_fraction=.5):
+def broad_firm_bank(store, *, split, max_rows, seed, calculated_fraction=.5,time_boundaries=(10,30)):
     """Two-pass bounded index sampling; all time strata are eligible.
 
     Equal lineage -> equal nonempty time/macro bin -> equal eligible firm.
@@ -135,7 +135,8 @@ def broad_firm_bank(store, *, split, max_rows, seed, calculated_fraction=.5):
             ids=torch.nonzero(valid & (paths==pid)).flatten()
             if not len(ids): continue
             h,k=context[ids[0]].tolist()
-            key=(int(pid),time_bin(capture['source_time']),*macro_bin(h,k))
+            band=int(capture['source_time']>=time_boundaries[0])+int(capture['source_time']>=time_boundaries[1])
+            key=(int(pid),band,*macro_bin(h,k))
             groups[key].append((shard_index,int(pid),len(ids)))
     if not groups: raise ValueError('NO_LEGAL_BROAD_FIRM_STATES')
     lineages=defaultdict(list)

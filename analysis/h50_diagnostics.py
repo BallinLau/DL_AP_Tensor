@@ -44,16 +44,18 @@ def streaming_economic_metrics(store,schedule,*,outer,stage):
                 a['counts'][name]+=len(y)
     rows=[]
     for group,a in accum.items():
-        count=sum(group=='ALL' or label==group for label in source.values());den=count*50
+        horizon=store.manifest.get('provenance',{}).get('horizon',50)
+        branches=store.manifest.get('provenance',{}).get('branches',2)
+        count=sum(group=='ALL' or label==group for label in source.values());den=count*horizon
         row={name:float('nan') for name in METRICS}
         row.update(outer=outer,stage=stage,split=schedule['split'],sampling_source=group,
             crn_hash=stable_json_hash([r['child_shock_keys'] for r in schedule['parents']]),
-            scheduled_parent_count=count,scheduled_parent_time_count=den,scheduled_child_count=2*den,
+            scheduled_parent_count=count,scheduled_parent_time_count=den,scheduled_child_count=branches*den,
             attempted_child_count=a['attempts'],valid_child_count=a['valid'],complete_sdf_pair_count=a['pairs'],
             attempted_parent_time_count=a['parent_attempts'],valid_parent_time_count=a['parent_valid'],
-            Valid_child_fraction=a['valid']/(2*den) if den else np.nan,
+            Valid_child_fraction=a['valid']/(branches*den) if den else np.nan,
             Complete_SDF_pair_fraction=a['pairs']/den if den else np.nan,
-            metric_scope='ALL_SCHEDULED_H50_ROWS; INVALID_SUFFIXES_RETAINED',
+            metric_scope=f'ALL_SCHEDULED_H{horizon}_ROWS; SCHEDULED_DENOMINATOR_INCLUDES_TERMINAL_SUFFIX',
             empirical_semantics='TRAIN_DYNAMIC_PRE_DECISION_REALIZED_B; FIXED_INITIAL_VALIDATION')
         g=np.concatenate(a['g']) if a['g'] else np.array([])
         if len(g):row.update(G_mean=float(g.mean()),G_median=float(np.median(g)),G_p90=float(np.quantile(g,.9)),G_p99=float(np.quantile(g,.99)))

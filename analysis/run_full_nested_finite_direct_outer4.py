@@ -431,7 +431,7 @@ class ProductionBackend:
         if chunk==0: e._configure_sdf_lr_for_phase()
         rows=[]; start=e.sdf_fc1_step_count
         with finite_gradient_guard(self.models['sdf_fc1']):
-            for local in range(50):
+            for local in range(self.budget.sdf_epochs_per_chunk):
                 epoch=self.state['sdf_epoch']; e._run_batches_epoch_offset=epoch
                 e._prepare_sdf_shock_bank_for_epoch(train+val,epoch,['sdf_fc1'])
                 e._run_batches(train,n_epochs=1,log_interval=100,train_modules=['sdf_fc1'],
@@ -450,7 +450,7 @@ class ProductionBackend:
         metrics=rows[-1]['validation']
         history_path=self.root/f'outer_{outer:03d}'/f'sdf_chunk{chunk}_history.json'
         atomic_write_json(history_path,rows)
-        return dict(optimizer_steps=e.sdf_fc1_step_count-start,epochs=50,validation=metrics,
+        return dict(optimizer_steps=e.sdf_fc1_step_count-start,epochs=self.budget.sdf_epochs_per_chunk,validation=metrics,
                     al_history_path=str(history_path),al_history_sha256=file_hash(history_path),
                     al=e._get_sdf_al_state(),fresh_bank_identity=stable_json_hash(fresh_state(e)))
 

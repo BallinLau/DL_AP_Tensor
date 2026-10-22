@@ -1,0 +1,21 @@
+{
+  "observed_date": "2026-10-22",
+  "job_id": 711731,
+  "observed_status": "RUNNING",
+  "node": "g53",
+  "source_commit": "1e05ecde9f6981c54f89deeadde1a55bc5c48296",
+  "source_worktree": "/WORK/PUBLIC/zhuyingz_work/LiuHao/h50_formal_source_1e05ecd",
+  "source_worktree_status": "CLEAN",
+  "output_directory": "/home/fit/zhuyingz/WORK/LiuHao/cachedir/h50_joint_coverage_train_outer12_20_20261021_r2",
+  "source_checkpoint": "/home/fit/zhuyingz/WORK/LiuHao/cachedir/finite_direct_dynamic_outer4_11_v2_97a0181_r1/outer_011/outer_complete.pt",
+  "checkpoint_sha256": "9ad7610a1851d06d80c8b2d08052a01532923f7a2808e3a006f5538b404aa94d",
+  "observed_outer": 13,
+  "observed_stage": "firm_bank",
+  "slurm_preempt_mode": "OFF",
+  "partition": "a01",
+  "unmodified": true,
+  "new_experiment": "h10_h100_longrun_macro_replay_20261022",
+  "new_worktree": "/private/tmp/DL_AP_Tensor_h10_h100_20261022",
+  "new_output_relative": "cachedir/h10_h100_longrun_macro_replay_20261022",
+  "observation_limits": "Status is a read-only snapshot, not a continuous monitor. Checkpoint SHA is the certified input identity; deployment must independently verify it."
+}

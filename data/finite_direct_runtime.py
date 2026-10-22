@@ -21,7 +21,7 @@ from training.inner_fixed_point import InnerFPCollocationBank,InnerFPChildBank
 OPERATOR='finite_direct_parent_exit_before_child_v2'
 
 
-def expand_after_parent_exit(sim, parent, *, child_t=1):
+def expand_after_parent_exit(sim, parent, *, child_t=1, branch_indices=None):
     """Preserve pre-transition reference/accounting history, commit old exits.
 
     Production expansion records the ORIGINAL parent K/alive for entry scale
@@ -30,7 +30,8 @@ def expand_after_parent_exit(sim, parent, *, child_t=1):
     each child NOW, before entry or any child policy can overwrite bar_z.
     No parent ledger/history is mutated and no survivor b/K formula changes.
     """
-    children=_expand_branches_batched(sim,parent,child_t=child_t)
+    kwargs={} if branch_indices is None else dict(branch_indices=branch_indices)
+    children=_expand_branches_batched(sim,parent,child_t=child_t,**kwargs)
     if sim.enable_exit:
         for child in children:
             _apply_exit_batched(child)
