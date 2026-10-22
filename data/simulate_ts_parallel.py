@@ -1276,6 +1276,10 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
         audit_record["resource_feasible_at_root"] = bool(
             final_record["feasible"]
         )
+    # 审计文件在逐 Root 字段补全后重写，保证残差/floor flag 落盘。
+    if audit_dir and audit_path is not None:
+        with open(audit_path, "w", encoding="utf-8") as handle:
+            json.dump(audit, handle, indent=2)
 
     residual_raw = selected_raw_g[strict_ok]
     residual_norm = selected_norm[strict_ok]
