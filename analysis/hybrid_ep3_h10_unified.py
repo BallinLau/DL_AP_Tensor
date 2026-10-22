@@ -96,7 +96,7 @@ def hybrid_stage_plan() -> list[dict[str, Any]]:
 
     output: list[dict[str, Any]] = []
     for outer, kind, indices in stages(hybrid_budget()):
-        if outer == 0 and kind in {"reuse_firm", "outer_start"}:
+        if outer == 0 and kind == "reuse_firm":
             continue
         if outer == 0 and kind == "data" and indices.get("version") == 0:
             kind = "unified_firm_data"
