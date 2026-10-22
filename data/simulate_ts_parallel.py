@@ -610,6 +610,10 @@ def _polish_initial_hstar_root(
     """
     device = h_rows.device
     n_rows = int(rows.numel())
+    # 抛光收敛目标取声明容差的 1/4：hatc_cal/hatcf 以 fp32 导出，log 与存储
+    # 舍入约 2e-7；留出余量保证最终 gate 值不因舍入噪声越过 1e-5（gate 与
+    # 声明容差本身不变，这是收紧内部精度）。
+    polish_target = float(strict_tolerance) * 0.25
     h = h_rows.clone()
     records: List[Optional[Dict[str, torch.Tensor]]] = [None] * n_rows
     failures: Dict[int, str] = {}
@@ -645,7 +649,7 @@ def _polish_initial_hstar_root(
                 finite_positive
                 and _candidate_residual_accepted(g_norm, root_tolerance)
                 and _candidate_residual_accepted(
-                    hatc_expected - float(h[index]), strict_tolerance
+                    hatc_expected - float(h[index]), polish_target
                 )
             )
             if ok:
