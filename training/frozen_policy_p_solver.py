@@ -710,6 +710,40 @@ def _params_finite(params: Sequence[torch.nn.Parameter]) -> bool:
     return True
 
 
+class LBFGSNonFiniteClosureError(RuntimeError):
+    """L-BFGS closure hit nonfinite loss/gradient/parameters.
+
+    Raised from inside the closure and caught outside ``optimizer.step()`` so
+    a nonfinite value is never fed to the Strong-Wolfe line search and the
+    failure is never silently absorbed.
+    """
+
+
+def full_problem_loss(
+    model: torch.nn.Module,
+    train: Sequence[FrozenPolicyBatch],
+) -> torch.Tensor:
+    """Parent-count weighted full-problem objective for the L-BFGS closure.
+
+    ``root_loss`` already averages over the parents of one batch, so batch
+    equal weighting would make the objective depend on the minibatch
+    partition.  Weight each batch by ``n_j / N`` so every parent carries the
+    same weight:
+
+        L = sum_j (n_j / N) * L_j
+    """
+    if not train:
+        raise ValueError("full_problem_loss requires at least one batch")
+    total_parents = sum(int(batch.parent.shape[0]) for batch in train)
+    if total_parents <= 0:
+        raise ValueError("full_problem_loss requires positive parent counts")
+    total = torch.zeros((), device=train[0].parent.device)
+    for batch in train:
+        weight = float(batch.parent.shape[0]) / float(total_parents)
+        total = total + root_loss(model, batch) * weight
+    return total
+
+
 def _grads_finite(params: Sequence[torch.nn.Parameter]) -> bool:
     for param in params:
         if param.grad is not None and not bool(torch.isfinite(param.grad).all()):
@@ -828,7 +862,9 @@ def run_lbfgs_chunked(
         "LBFGS_ACTUAL_ITERATIONS": 0,
         "LBFGS_CLOSURE_CALLS": 0,
         "LBFGS_NONFINITE_CLOSURES": 0,
+        "LBFGS_NONFINITE_CLOSURE_ABORT": 0,
     }
+    total_parents = sum(int(batch.parent.shape[0]) for batch in train)
     completed_budget = 0
     stop_reason = "optimizer_limit"
     while completed_budget < max_iter:
@@ -850,19 +886,53 @@ def run_lbfgs_chunked(
             nonlocal block_calls, block_nonfinite
             optimizer.zero_grad(set_to_none=True)
             loss = torch.zeros((), device=train[0].parent.device)
+            # Parent-count weighting: each parent carries weight 1/N regardless
+            # of the minibatch partition (root_loss averages within a batch).
             for batch in train:
-                batch_loss = root_loss(model, batch) / len(train)
+                weight = float(batch.parent.shape[0]) / float(total_parents)
+                batch_loss = root_loss(model, batch) * weight
                 batch_loss.backward()
                 loss = loss + batch_loss.detach()
             block_calls += 1
             counters["LBFGS_CLOSURE_CALLS"] += 1
-            if not torch.isfinite(loss) or not _grads_finite(params):
+            # 非有限 Loss/梯度/参数必须立即中止求解：绝不清空梯度后继续把
+            # NaN/Inf 返回给 Strong Wolfe Line Search。
+            if (
+                not torch.isfinite(loss)
+                or not _grads_finite(params)
+                or not _params_finite(params)
+            ):
                 block_nonfinite += 1
                 counters["LBFGS_NONFINITE_CLOSURES"] += 1
                 optimizer.zero_grad(set_to_none=True)
+                raise LBFGSNonFiniteClosureError(
+                    "L-BFGS closure produced nonfinite loss/gradient/parameters"
+                )
             return loss
 
-        optimizer.step(closure)
+        try:
+            optimizer.step(closure)
+        except LBFGSNonFiniteClosureError:
+            # 保守回退：停止本 Chunk 与剩余 L-BFGS，恢复最近的有限 Best
+            # State 并验证恢复，再重新评价 Validation。
+            counters["LBFGS_NONFINITE_CLOSURE_ABORT"] += 1
+            if train[0].parent.is_cuda:
+                torch.cuda.synchronize(train[0].parent.device)
+            _restore_state(model, best_state)
+            final = evaluate_problem(model, validation)
+            history.append(
+                {
+                    "phase": "lbfgs_nonfinite_closure_abort",
+                    "block_budget": block_budget,
+                    "block_closure_calls": block_calls,
+                    "block_nonfinite_closures": block_nonfinite,
+                    "restored_best_state": True,
+                    "val_normalized_mae": final["normalized_mae"],
+                    "val_all_finite": bool(final["all_finite"]),
+                }
+            )
+            stop_reason = "lbfgs_nonfinite_closure"
+            break
         if train[0].parent.is_cuda:
             torch.cuda.synchronize(train[0].parent.device)
         elapsed = time.perf_counter() - started
@@ -875,6 +945,23 @@ def run_lbfgs_chunked(
                 break
         counters["LBFGS_ACTUAL_ITERATIONS"] += int(actual_iter)
         completed_budget += block_budget
+        # 防御性双保险：即使 closure 未触发异常，本 Chunk 内出现过任何非有限
+        # closure 也必须按失败处理，不能仅依赖最终 val["all_finite"]。
+        if block_nonfinite > 0:
+            counters["LBFGS_NONFINITE_CLOSURE_ABORT"] += 1
+            _restore_state(model, best_state)
+            final = evaluate_problem(model, validation)
+            history.append(
+                {
+                    "phase": "lbfgs_nonfinite_closure_abort",
+                    "block_nonfinite_closures": block_nonfinite,
+                    "restored_best_state": True,
+                    "val_normalized_mae": final["normalized_mae"],
+                    "val_all_finite": bool(final["all_finite"]),
+                }
+            )
+            stop_reason = "lbfgs_nonfinite_closure"
+            break
         val = evaluate_problem(model, validation)
         history.append(
             {
@@ -1093,7 +1180,13 @@ def run_p_policy_iteration(
         if rng_cuda is not None:
             torch.cuda.set_rng_state_all(rng_cuda)
 
-    def _reject(status: str, failure_kind: str, detail: Any) -> Dict[str, Any]:
+    def _reject(
+        status: str,
+        failure_kind: str,
+        detail: Any,
+        *,
+        initial_legal: bool = True,
+    ) -> Dict[str, Any]:
         """Roll back to the iteration-start state and report a non-accept."""
         _restore_state(model, start_state)
         _restore_rng()
@@ -1121,9 +1214,13 @@ def run_p_policy_iteration(
             },
             "rollback": {
                 "restored_iteration_start_state": True,
+                # 初始状态本身非法时不得声称"恢复合法模型"；上层必须阻断
+                # 本次 Firm Stage，而不是把非法起点当作可回退目标。
+                "initial_state_was_legal": bool(initial_legal),
                 "model_hash_verified": True,
                 "p_root_hash_verified": True,
                 "rng_restored": True,
+                "block_firm_stage": not bool(initial_legal),
             },
         }
 
@@ -1134,6 +1231,39 @@ def run_p_policy_iteration(
             "validation_parity": val_parity,
         }
         return _reject("rejected_numerical", "parity_failed", detail)
+
+    # --- Initial Validation 硬有限 Gate（Prompt §2）：Parity 之后、任何
+    # Optimizer Step 之前。初始状态非法时禁止 Adam/L-BFGS、禁止
+    # accepted_reverted、禁止继续 Q。
+    initial_all_finite = bool(initial.get("all_finite"))
+    initial_n_total = int(initial.get("n_total", 0))
+    initial_nonfinite = int(initial.get("nonfinite_count", 0))
+    initial_loss_finite = math.isfinite(float(initial.get("normalized_mae", float("nan"))))
+    params_finite = _params_finite(params)
+    if not (
+        initial_all_finite
+        and initial_n_total > 0
+        and initial_nonfinite == 0
+        and initial_loss_finite
+        and params_finite
+    ):
+        return _reject(
+            "rejected_numerical",
+            "initial_validation_nonfinite",
+            {
+                "initial_validation": {
+                    "all_finite": initial_all_finite,
+                    "n_total": initial_n_total,
+                    "nonfinite_count": initial_nonfinite,
+                    "normalized_mae": initial.get("normalized_mae"),
+                    "p0_norm_mae": initial.get("p0_norm_mae"),
+                    "pi_norm_mae": initial.get("pi_norm_mae"),
+                },
+                "root_loss_finite": initial_loss_finite,
+                "p_root_params_finite": params_finite,
+            },
+            initial_legal=False,
+        )
 
     # Fresh-greedy 基线（同一固定 Validation/CRN），用于如实记录 Frozen
     # Residual 改善而 Fresh Greedy 恶化的情况。
@@ -1180,6 +1310,22 @@ def run_p_policy_iteration(
             chunk_iterations=lbfgs_chunk_iterations,
             history_size=lbfgs_history_size,
             target_residual=target_residual,
+        )
+    # --- L-BFGS Nonfinite Closure 保守拒绝（Prompt §1.2）：即使 Adam 曾取得
+    # 合法改善，本次求解也不得报告为 accepted_improved，必须恢复完整的
+    # Iteration Start，不向下一次 P Iteration 或 Q 传递。
+    if (
+        stop_reason == "lbfgs_nonfinite_closure"
+        or int(lbfgs_counters.get("LBFGS_NONFINITE_CLOSURE_ABORT", 0)) > 0
+    ):
+        return _reject(
+            "rejected_numerical",
+            "lbfgs_nonfinite_closure",
+            {
+                "lbfgs_counters": dict(lbfgs_counters),
+                "adam_steps_before_abort": int(adam_steps_done),
+                "lbfgs_history_tail": lbfgs_history[-3:],
+            },
         )
     _restore_state(model, best_state)
     final = evaluate_problem(model, validation_problem)
@@ -1279,9 +1425,12 @@ def run_p_policy_iteration(
             "restored_iteration_start_state": False,
             "kept_best_validation_state": True,
             "rng_restored": False,
+            "initial_state_was_legal": True,
         }
     else:
         # 候选未改善：恢复上一合法模型（迭代起点），不得计为成功 P 更新。
+        # accepted_reverted 仅在初始状态合法（Initial Gate 已通过）、训练无
+        # 未处理数值异常、且已严格恢复并校验哈希时成立。
         _restore_state(model, start_state)
         _restore_rng()
         if _module_state_hash(model) != start_model_hash:
@@ -1293,6 +1442,7 @@ def run_p_policy_iteration(
             "restored_iteration_start_state": True,
             "kept_best_validation_state": False,
             "rng_restored": True,
+            "initial_state_was_legal": True,
             "model_hash_verified": True,
             "p_root_hash_verified": True,
         }

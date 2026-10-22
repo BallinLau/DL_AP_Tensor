@@ -483,6 +483,109 @@ def _candidate_residual_accepted(g_norm: float, tol: float) -> bool:
     return math.isfinite(g_norm) and abs(g_norm) <= float(tol)
 
 
+def _initial_macro_floor_decomposition(
+    *,
+    hatcf0: torch.Tensor,
+    lnkf0: torch.Tensor,
+    hatc_cal0: torch.Tensor,
+    lnk_cal0: torch.Tensor,
+    c_raw: torch.Tensor,
+    k_ledger: torch.Tensor,
+    floor: float,
+    floor_flag: torch.Tensor,
+    raw_clearing_ok: torch.Tensor,
+    ledger_parity_ok: torch.Tensor,
+    strict_tolerance: float,
+    parity_tolerance: float,
+) -> Dict[str, torch.Tensor]:
+    """Decompose the initial macro gap into floor effect + unexplained residual.
+
+    ``raw_*_expected`` 复用生产 no-floor 分支的精确表达式（含 ``+1e-8``
+    数值约定）；``floored_*_expected`` 复用生产 floor 分支的精确 clamp 规则。
+    只有当 Floor 的理论影响能完整解释观察到的 Hatc/LnK Gap、且剩余
+    Unexplained Gap 在既有容差内时，才归类 ``FLOOR_EXPLAINED_MISMATCH``；
+    否则 ``UNEXPLAINED_MISMATCH``。不放宽任何 tolerance。
+    """
+    c = c_raw.to(torch.float32)
+    k = k_ledger.to(torch.float32)
+    # 生产 no-floor raw 分支表达式（simulate_ts_parallel raw_mode，floor<=0）。
+    k_raw_shift = k + 1e-8
+    raw_hatc_expected = torch.log(c / k_raw_shift)
+    raw_lnk_expected = torch.log(k_raw_shift)
+    if floor > 0.0:
+        # 生产 floor 分支表达式（raw_mode，floor>0）。
+        c_eff = c.clamp_min(floor)
+        k_eff = k.clamp_min(floor)
+        floored_hatc_expected = torch.log(c_eff / k_eff)
+        floored_lnk_expected = torch.log(k_eff)
+    else:
+        floored_hatc_expected = raw_hatc_expected
+        floored_lnk_expected = raw_lnk_expected
+
+    observed_hatc_gap = hatcf0.to(torch.float32) - hatc_cal0.to(torch.float32)
+    observed_lnk_gap = lnkf0.to(torch.float32) - lnk_cal0.to(torch.float32)
+    floor_hatc_effect = raw_hatc_expected - floored_hatc_expected
+    floor_lnk_effect = raw_lnk_expected - floored_lnk_expected
+    unexplained_hatc_gap = observed_hatc_gap - floor_hatc_effect
+    unexplained_lnk_gap = observed_lnk_gap - floor_lnk_effect
+
+    finite_positive = (
+        torch.isfinite(c)
+        & torch.isfinite(k)
+        & (c > 0.0)
+        & (k > 0.0)
+        & torch.isfinite(observed_hatc_gap)
+        & torch.isfinite(observed_lnk_gap)
+        & torch.isfinite(floor_hatc_effect)
+        & torch.isfinite(floor_lnk_effect)
+    )
+    macro_match_ok = (
+        (observed_hatc_gap.abs() <= strict_tolerance)
+        & (observed_lnk_gap.abs() <= parity_tolerance)
+        & finite_positive
+    )
+    floor_effect_explains = (
+        finite_positive
+        & (unexplained_hatc_gap.abs() <= strict_tolerance)
+        & (unexplained_lnk_gap.abs() <= parity_tolerance)
+    )
+    floor_explained = (
+        (~macro_match_ok)
+        & floor_flag.to(torch.bool)
+        & raw_clearing_ok
+        & ledger_parity_ok
+        & floor_effect_explains
+    )
+    unexplained_mismatch = (~macro_match_ok) & (~floor_explained)
+    classification = torch.where(
+        macro_match_ok,
+        torch.zeros_like(unexplained_mismatch, dtype=torch.int64),
+        torch.where(
+            floor_explained,
+            torch.ones_like(unexplained_mismatch, dtype=torch.int64),
+            torch.full_like(unexplained_mismatch, 2, dtype=torch.int64),
+        ),
+    )
+    return {
+        "raw_hatc_expected": raw_hatc_expected,
+        "raw_lnk_expected": raw_lnk_expected,
+        "floored_hatc_expected": floored_hatc_expected,
+        "floored_lnk_expected": floored_lnk_expected,
+        "observed_hatc_gap": observed_hatc_gap,
+        "observed_lnk_gap": observed_lnk_gap,
+        "floor_hatc_effect": floor_hatc_effect,
+        "floor_lnk_effect": floor_lnk_effect,
+        "unexplained_hatc_gap": unexplained_hatc_gap,
+        "unexplained_lnk_gap": unexplained_lnk_gap,
+        "finite_positive": finite_positive,
+        "macro_match_ok": macro_match_ok,
+        "floor_effect_explains": floor_effect_explains,
+        "floor_explained": floor_explained,
+        "unexplained_mismatch": unexplained_mismatch,
+        "classification": classification,
+    }
+
+
 def _initial_hstar_gather_state(state: Dict[str, torch.Tensor], rows, device):
     """Gather ``rows`` (path indices) out of a batched state for re-evaluation."""
     from .state_bank import clone_state
@@ -1542,26 +1645,32 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
             lnkf0 = state["lnkf"].to(torch.float32)
             hatc_cal0 = state["hatc_cal"].to(torch.float32)
             lnk_cal0 = state["lnk_cal"].to(torch.float32)
-            hatc_gap = (hatcf0 - hatc_cal0).abs()
-            lnk_gap = (lnkf0 - lnk_cal0).abs()
-            macro_match_ok = (hatc_gap <= strict_tolerance) & (
-                lnk_gap <= parity_tolerance
-            )
             floor_flag = state.get(
                 "accounting_consumption_floor_applied",
                 torch.zeros(n_paths, dtype=torch.bool, device=device),
             ).to(torch.bool)
-            floor_explained = (~macro_match_ok) & floor_flag & raw_clearing_ok
-            unexplained_mismatch = (~macro_match_ok) & (~floor_explained)
-            classification = torch.where(
-                macro_match_ok,
-                torch.zeros(n_paths, dtype=torch.int64, device=device),
-                torch.where(
-                    floor_explained,
-                    torch.ones(n_paths, dtype=torch.int64, device=device),
-                    torch.full((n_paths,), 2, dtype=torch.int64, device=device),
-                ),
+            # Floor 归因必须由理论效应解释：重新构造 raw/floored 宏观变换，
+            # 只有 Floor 的理论影响完整解释观察 gap 时才允许 FLOOR_EXPLAINED。
+            decomposition = _initial_macro_floor_decomposition(
+                hatcf0=hatcf0,
+                lnkf0=lnkf0,
+                hatc_cal0=hatc_cal0,
+                lnk_cal0=lnk_cal0,
+                c_raw=c_raw_prod,
+                k_ledger=k_prod,
+                floor=float(getattr(sim, "consumption_floor", 0.0)),
+                floor_flag=floor_flag,
+                raw_clearing_ok=raw_clearing_ok,
+                ledger_parity_ok=ledger_parity_ok,
+                strict_tolerance=strict_tolerance,
+                parity_tolerance=parity_tolerance,
             )
+            hatc_gap = decomposition["observed_hatc_gap"].abs()
+            lnk_gap = decomposition["observed_lnk_gap"].abs()
+            macro_match_ok = decomposition["macro_match_ok"]
+            floor_explained = decomposition["floor_explained"]
+            unexplained_mismatch = decomposition["unexplained_mismatch"]
+            classification = decomposition["classification"]
             classification_labels = {
                 0: "MATCH",
                 1: "FLOOR_EXPLAINED_MISMATCH",
@@ -1576,11 +1685,11 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
                     for name, mask in field_detail.items()
                     if not bool(mask[bad].all())
                 ]
-                if not bool(raw_clearing_ok[bad].all()):
+                if bool((~raw_clearing_ok)[bad].any()):
                     failing_fields.append("raw_clearing_G")
-                if not bool(lnk_ok[bad].all()):
+                if bool((~lnk_ok)[bad].any()):
                     failing_fields.append("lnk_cal")
-                if not bool(unexplained_mismatch[bad].all()):
+                if bool(unexplained_mismatch[bad].any()):
                     failing_fields.append("initial_macro_unexplained_mismatch")
                 raise RuntimeError(
                     "t=0 h-star production gate failed; "
@@ -1604,10 +1713,37 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
                     "lnk_cal0": float(lnk_cal0[path]),
                     "hatc_gap": float(hatc_gap[path]),
                     "lnk_gap": float(lnk_gap[path]),
+                    "raw_hatc_expected": float(
+                        decomposition["raw_hatc_expected"][path]
+                    ),
+                    "raw_lnk_expected": float(
+                        decomposition["raw_lnk_expected"][path]
+                    ),
+                    "floored_hatc_expected": float(
+                        decomposition["floored_hatc_expected"][path]
+                    ),
+                    "floored_lnk_expected": float(
+                        decomposition["floored_lnk_expected"][path]
+                    ),
+                    "floor_hatc_effect": float(
+                        decomposition["floor_hatc_effect"][path]
+                    ),
+                    "floor_lnk_effect": float(
+                        decomposition["floor_lnk_effect"][path]
+                    ),
+                    "unexplained_hatc_gap": float(
+                        decomposition["unexplained_hatc_gap"][path]
+                    ),
+                    "unexplained_lnk_gap": float(
+                        decomposition["unexplained_lnk_gap"][path]
+                    ),
                     "floor_applied": bool(floor_flag[path]),
                     "raw_clearing_passed": bool(raw_clearing_ok[path]),
                     "production_ledger_parity_passed": bool(ledger_parity_ok[path]),
                     "initial_macro_match_passed": bool(macro_match_ok[path]),
+                    "floor_effect_explains": bool(
+                        decomposition["floor_effect_explains"][path]
+                    ),
                     "initial_macro_classification": classification_labels[
                         int(classification[path])
                     ],
@@ -1620,6 +1756,18 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
                 "initial_macro_unexplained_count": int(unexplained_mismatch.sum()),
                 "initial_hatc_gap_max": float(hatc_gap.max()),
                 "initial_lnk_gap_max": float(lnk_gap.max()),
+                "unexplained_hatc_gap_max": float(
+                    decomposition["unexplained_hatc_gap"].abs().max()
+                ),
+                "unexplained_lnk_gap_max": float(
+                    decomposition["unexplained_lnk_gap"].abs().max()
+                ),
+                "floor_hatc_effect_max": float(
+                    decomposition["floor_hatc_effect"].abs().max()
+                ),
+                "floor_lnk_effect_max": float(
+                    decomposition["floor_lnk_effect"].abs().max()
+                ),
                 "floor_applied_root_count": int(floor_flag.sum()),
                 "strict_tolerance": strict_tolerance,
                 "parity_tolerance": parity_tolerance,

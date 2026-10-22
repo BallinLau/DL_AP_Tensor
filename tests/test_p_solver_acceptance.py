@@ -315,14 +315,19 @@ def test_C5_nonfinite_validation_rows_reject_best_state(monkeypatch):
     batch = _batch(episode.device)
     start_hash = episode._state_dict_hash(model)
     real_evaluate = solver.evaluate_problem
+    calls = {"n": 0}
 
-    def _evaluate_nonfinite(model_, problem):
+    def _evaluate_nonfinite_after_initial(model_, problem):
+        calls["n"] += 1
         result = dict(real_evaluate(model_, problem))
-        result["all_finite"] = False
-        result["nonfinite_count"] = int(result.get("n_total", 1))
+        if calls["n"] >= 2:
+            # 首次（Initial Gate）保持合法；此后注入非有限行，覆盖
+            # best-state 验收路径。
+            result["all_finite"] = False
+            result["nonfinite_count"] = int(result.get("n_total", 1))
         return result
 
-    monkeypatch.setattr(solver, "evaluate_problem", _evaluate_nonfinite)
+    monkeypatch.setattr(solver, "evaluate_problem", _evaluate_nonfinite_after_initial)
     summary = episode._run_frozen_policy_p_stage(
         [batch], [batch], model, inner_index=1
     )
