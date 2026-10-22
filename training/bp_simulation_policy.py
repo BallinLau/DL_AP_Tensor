@@ -64,6 +64,7 @@ class GridBPSimulationPolicy:
         n_child_shocks: int,
         shock_seed: int,
         require_cuda: bool = True,
+        defer_diagnostic_sync: bool = False,
     ) -> None:
         if sdf_fc1_model is None:
             raise ValueError("grid simulation BP requires sdf_fc1_model")
@@ -112,6 +113,10 @@ class GridBPSimulationPolicy:
         self.refinancing_active_rows = 0
         self.coarse_candidate_evaluations = 0
         self.fine_candidate_evaluations = 0
+        # Opt-in hot-path experiment: collect one device scalar, materialize
+        # only at an explicit instrumentation boundary. Not an economic mask.
+        self.defer_diagnostic_sync = bool(defer_diagnostic_sync)
+        self._pending_active_rows = torch.zeros((), device=device, dtype=torch.long)
 
     def _shock_bank_for_rows(self, n_rows: int) -> ConvergenceShockBank:
         def expand(value: torch.Tensor) -> torch.Tensor:
@@ -221,7 +226,12 @@ class GridBPSimulationPolicy:
             mixed["bp_star"],
             output.survival_prob,
         )
-        active = int((firm_state[:, 2] > 0.5).sum().item())
+        active_tensor = (firm_state[:, 2] > 0.5).sum()
+        if self.defer_diagnostic_sync:
+            self._pending_active_rows.add_(active_tensor)
+            active = 0
+        else:
+            active = int(active_tensor.item())
         self.calls += 1
         self.parent_rows += int(firm_state.shape[0])
         self.refinancing_active_rows += active
@@ -264,6 +274,13 @@ class GridBPSimulationPolicy:
             raise RuntimeError("grid simulation mutated the SDF/FC1 model")
 
     def instrumentation(self) -> Dict[str, Any]:
+        if self.defer_diagnostic_sync:
+            active = int(self._pending_active_rows.item())
+            self._pending_active_rows.zero_()
+            self.refinancing_active_rows += active
+            self.coarse_candidate_evaluations += 2 * active * int(self.teacher.coarse_size)
+            if self.teacher.refine:
+                self.fine_candidate_evaluations += 2 * active * int(self.teacher.fine_size)
         return {
             "simulation_bp_source": "grid",
             "device": str(self.device),

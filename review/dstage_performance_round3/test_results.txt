@@ -1,0 +1,15 @@
+Environment: local Mac CPU, /Users/ballinliu/anaconda3/bin/python
+Command:
+MPLCONFIGDIR=/private/tmp/mpl-hstar /Users/ballinliu/anaconda3/bin/python -m pytest -q -rs tests/test_bp_grid_teacher.py tests/test_dstage_round3.py tests/test_dstage_performance.py tests/test_bp_head_vs_grid_simulation.py tests/test_h10_h100_replay.py tests/test_market_clearing_classification.py
+
+................................s...........................             [100%]
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_bp_head_vs_grid_simulation.py:363: CUDA is unavailable
+59 passed, 1 skipped in 4.25s
+
+python -m py_compile analysis/benchmark_dstage_performance.py analysis/dstage_benchmark_support.py training/bp_simulation_policy.py: PASS
+git diff --check: PASS
+
+CPU plan-only subprocess verified: no model/checkpoint/bank read and no generation.
+GPU benchmark: NOT_TESTED (BLOCKED_TRANSFER_PERMISSION).
+No formal training, Slurm submission, optimizer step, push, or remote deployment.

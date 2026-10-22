@@ -1,0 +1,10 @@
+{
+  "status": "NOT_TESTED",
+  "blocker": "BLOCKED_TRANSFER_PERMISSION",
+  "gpu_job_submitted": false,
+  "BP_GRID_HOTSPOT_CONFIRMED": "NOT_TESTED",
+  "stage_gpu_seconds": null,
+  "stage_cpu_seconds": null,
+  "sync_counts": null,
+  "profiler_figures": "NOT_PRODUCED_NO_MEASUREMENT"
+}

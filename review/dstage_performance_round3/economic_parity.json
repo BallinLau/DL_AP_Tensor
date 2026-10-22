@@ -1,0 +1,14 @@
+{
+  "ECONOMIC_PARITY": "NOT_TESTED",
+  "CPU_TARGETED_TESTS": "PASS",
+  "tests_passed": 59,
+  "tests_skipped": 1,
+  "deferred_stats_actions_rng_counts": "CPU_BITWISE_EQUAL",
+  "trained_checkpoint_full_path_pair_parity": "NOT_TESTED",
+  "Train_Validation_leakage": "NOT_TESTED_FULL_DATA",
+  "optimizer_steps_in_tests": 0,
+  "GPU_optimizer_steps": 0,
+  "formal_models_modified": false,
+  "SAFE_FOR_FUTURE_TRAINING": false,
+  "ROOT_ONLY_CACHE_ENABLED": false
+}

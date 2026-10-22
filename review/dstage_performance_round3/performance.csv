@@ -1,0 +1,11 @@
+variant,status,wall_time_seconds,speedup_vs_original,speedup_vs_round2,valid_parent_times_per_second,GPU_peak_VRAM,CPU_peak_RSS,BP_grid_forward_calls,BP_candidate_evaluations,shard_IO_bytes,SHA_bytes,GPU_CPU_sync_counts
+BASELINE_PRODUCTION,NOT_TESTED,,,,,,,,,,,
+ROUND2_BASELINE,NOT_TESTED,,,,,,,,,,,
+NO_TIMING_SYNC_ONLY,NOT_TESTED,,,,,,,,,,,
+LIGHTWEIGHT_ROOT_ONLY,NOT_TESTED,,,,,,,,,,,
+BP_GRID_LOCAL_ONLY,NOT_TESTED,,,,,,,,,,,
+DYNAMIC_TRANSITION_LOCAL,NOT_IMPLEMENTED,,,,,,,,,,,
+BATCH64_ONLY,NOT_TESTED,,,,,,,,,,,
+BATCH128_ONLY,NOT_TESTED,,,,,,,,,,,
+SHARD_DIGEST_REUSE_ONLY,NOT_TESTED,,,,,,,,,,,
+COMBINED_OPTIMIZATION,BLOCKED_PENDING_FULL_PATH_PARITY,,,,,,,,,,,
