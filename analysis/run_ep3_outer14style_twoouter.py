@@ -238,7 +238,7 @@ def main(argv=None):
         return 0
 
     locked = load_locked_sampling(args.sampling_dir)
-    if locked[2]['config']['train_parents'] != 4096 or locked[2]['config']['validation_parents'] != 1024 or locked[2]['config']['firms'] != 200:
+    if locked[2]['config']['train_parents'] != 8192 or locked[2]['config']['validation_parents'] != 2048 or locked[2]['config']['firms'] != 200:
         raise RuntimeError('formal logical data budget changed')
 
     backend = EP3Backend(args, locked)
