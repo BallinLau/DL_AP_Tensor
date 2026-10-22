@@ -60,6 +60,7 @@ from .sdf_shock_bank import (
     shocks_to_x_children,
 )
 from .bp_grid_teacher import BPGridTeacher
+from . import frozen_policy_p_solver
 from .bp_simulation_policy import GridBPSimulationPolicy
 from .bp_policy_loss import (
     compute_target_grid_policy_logit_distillation_loss,
@@ -11600,6 +11601,176 @@ class Episode:
             "q_survival_coverage": _coverage("survival"),
         }
 
+    def _run_p_stage_for_inner(
+        self,
+        train_batches: List[Dict[str, torch.Tensor]],
+        validation_batches: List[Dict[str, torch.Tensor]],
+        teacher: nn.Module,
+        n_epochs: int,
+        *,
+        q_target_model: Optional[nn.Module] = None,
+        inner_index: int,
+        inner_cycles: int,
+    ) -> Dict[str, Any]:
+        """Dispatch the per-Inner P stage to the configured P solver.
+
+        ``frozen_policy_dynamic_residual``（Hybrid 正式模式）：本 Inner 内先连续执行
+        ``p_policy_iterations_per_inner`` 次 P Policy Iteration，再进入 Q 分区域
+        训练，绝不插入 P→Q 交替。
+        """
+        mode = self._p_solver_mode()
+        if mode == "frozen_policy_dynamic_residual":
+            return self._run_frozen_policy_p_stage(
+                train_batches,
+                validation_batches,
+                q_target_model if q_target_model is not None else teacher,
+                inner_index=inner_index,
+            )
+        # 旧 Fixed Target Cache 兼容路径（firm_inner_cycles=1 回归）。
+        return self._run_policy_value_evaluation_stage(
+            train_batches,
+            validation_batches,
+            teacher,
+            n_epochs,
+            q_target_model=q_target_model,
+        )
+
+    def _p_solver_mode(self) -> str:
+        mode = str(
+            getattr(self.hyperparams, "p_solver", "fixed_target_cache")
+        ).strip().lower()
+        if mode not in {"fixed_target_cache", "frozen_policy_dynamic_residual"}:
+            raise ValueError(
+                "p_solver must be 'fixed_target_cache' or "
+                f"'frozen_policy_dynamic_residual', got {mode!r}"
+            )
+        return mode
+
+    def _run_frozen_policy_p_stage(
+        self,
+        train_batches: List[Dict[str, torch.Tensor]],
+        validation_batches: List[Dict[str, torch.Tensor]],
+        q_model: nn.Module,
+        *,
+        inner_index: int,
+    ) -> Dict[str, Any]:
+        """Hybrid P stage: frozen-policy dynamic Bellman residual policy iterations.
+
+        每次 Policy Iteration：刷新 Greedy Grid-BP 策略 → 冻结策略/掩码/Q/FC1/SDF →
+        Adam + L-BFGS 求解 Dynamic Bellman Residual（Parent P 与 Child P 同时参与
+        梯度）→ 保存 Validation 最优状态。Q/BP/FC1/SDF 参数全程不变。
+        """
+        if not train_batches:
+            return {
+                "status": "skipped_no_training_batches",
+                "p_solver": "frozen_policy_dynamic_residual",
+                "p_policy_iterations": [],
+                "optimizer_steps": 0,
+                "accepted_epochs": 0,
+            }
+        iterations = int(
+            getattr(self.hyperparams, "p_policy_iterations_per_inner", 3)
+        )
+        if iterations < 1:
+            raise ValueError("p_policy_iterations_per_inner must be at least 1")
+        model = self.models["policy_value"]
+        bp_params = self._policy_value_stage_params("bp")
+        bp_snapshot = self._snapshot_params(bp_params)
+        records: List[Dict[str, Any]] = []
+        total_optimizer_steps = 0
+        total_lbfgs_calls = 0
+        try:
+            for iteration_index in range(1, iterations + 1):
+                summary = frozen_policy_p_solver.run_p_policy_iteration(
+                    self,
+                    model,
+                    train_batches=train_batches,
+                    validation_batches=validation_batches,
+                    q_model=q_model,
+                    inner_index=int(inner_index),
+                    iteration_index=int(iteration_index),
+                    adam_steps=int(
+                        getattr(self.hyperparams, "p_root_adam_steps", 200)
+                    ),
+                    adam_lr=float(getattr(self.hyperparams, "p_root_adam_lr", 1e-4)),
+                    adam_clip=float(getattr(self.hyperparams, "p_root_adam_clip", 10.0)),
+                    eval_every=int(
+                        getattr(self.hyperparams, "p_root_eval_every", 10)
+                    ),
+                    lbfgs_max_iter=int(
+                        getattr(self.hyperparams, "p_root_lbfgs_max_iter", 100)
+                    ),
+                    lbfgs_chunk_iterations=int(
+                        getattr(self.hyperparams, "p_root_lbfgs_chunk_iterations", 20)
+                    ),
+                    lbfgs_history_size=int(
+                        getattr(self.hyperparams, "p_root_lbfgs_history_size", 50)
+                    ),
+                    target_residual=(
+                        float(self.hyperparams.p_root_target_residual)
+                        if getattr(self.hyperparams, "p_root_target_residual", None)
+                        is not None
+                        else None
+                    ),
+                )
+                records.append(summary)
+                total_optimizer_steps += int(summary["optimizer_steps"])
+                total_lbfgs_calls += int(summary["lbfgs_closure_calls"])
+                logger.info(
+                    "Frozen-policy P iteration inner=%d iter=%d | "
+                    "frozen_p0_mae=%.5f frozen_pi_mae=%.5f fresh_p0_mae=%.5f "
+                    "fresh_pi_mae=%.5f adam_steps=%d lbfgs_calls=%d stop=%s",
+                    int(inner_index),
+                    int(iteration_index),
+                    summary["frozen_policy_p0_residual"]["mae"],
+                    summary["frozen_policy_pi_residual"]["mae"],
+                    summary["fresh_greedy_residual"].get(
+                        "fresh_greedy_p0_norm_mae", float("nan")
+                    ),
+                    summary["fresh_greedy_residual"].get(
+                        "fresh_greedy_pi_norm_mae", float("nan")
+                    ),
+                    int(summary["optimizer_steps"]),
+                    int(summary["lbfgs_closure_calls"]),
+                    summary["stop_reason"],
+                )
+        except Exception as exc:
+            logger.exception("frozen-policy P stage failed")
+            return {
+                "status": "failed_p_policy_iteration",
+                "p_solver": "frozen_policy_dynamic_residual",
+                "p_policy_iterations": records,
+                "optimizer_steps": total_optimizer_steps,
+                "accepted_epochs": len(records),
+                "failure": f"{type(exc).__name__}: {exc}",
+            }
+        if self._param_max_change_from_snapshot(bp_params, bp_snapshot) != 0.0:
+            raise RuntimeError("frozen-policy P stage changed BP policy parameters")
+        return {
+            "status": "accepted",
+            "p_solver": "frozen_policy_dynamic_residual",
+            "p_policy_iterations": records,
+            "p_policy_iteration_count": len(records),
+            "p_policy_iterations_requested": iterations,
+            "optimizer_steps": total_optimizer_steps,
+            "lbfgs_closure_calls": total_lbfgs_calls,
+            "accepted_epochs": len(records),
+            "rejected_epochs": 0,
+            "best_epoch": records[-1]["iteration_index"] if records else None,
+            "target_update_count": 0,
+            "final_frozen_policy_residual": (
+                {
+                    "p0": records[-1]["frozen_policy_p0_residual"],
+                    "pi": records[-1]["frozen_policy_pi_residual"],
+                }
+                if records
+                else {}
+            ),
+            "final_fresh_greedy_residual": (
+                records[-1]["fresh_greedy_residual"] if records else {}
+            ),
+        }
+
     def _run_policy_value_staged(
         self,
         pv_train_batches: List[Dict[str, torch.Tensor]],
@@ -11780,12 +11951,14 @@ class Episode:
                 cycle_start_state = self._state_dict_to_cpu(
                     self.models["policy_value"]
                 )
-                pq_summary = self._run_policy_value_evaluation_stage(
+                pq_summary = self._run_p_stage_for_inner(
                     p_train_batches,
                     p_validation_batches,
                     cycle_teacher,
                     eval_epochs,
                     q_target_model=q_pricing_teacher,
+                    inner_index=cycle_index,
+                    inner_cycles=inner_cycles,
                 )
                 pq_summary.update(p_eta_balance_summary)
                 if pq_summary.get("status") != "accepted":
@@ -11936,6 +12109,10 @@ class Episode:
                     "q_stage_status": q_summary.get("status"),
                     "p_optimizer_steps": pq_summary.get("optimizer_steps"),
                     "p_accepted_epochs": pq_summary.get("accepted_epochs"),
+                    "p_policy_iteration_count": pq_summary.get(
+                        "p_policy_iteration_count"
+                    ),
+                    "p_policy_iterations": pq_summary.get("p_policy_iterations"),
                     "q_optimizer_steps": q_summary.get("optimizer_steps"),
                     "sdf_fc1_hash": cycle_sdf_hash_before,
                     "sdf_fc1_hash_after": cycle_sdf_hash_after,

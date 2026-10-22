@@ -673,6 +673,37 @@ def parse_args() -> argparse.Namespace:
         help="Staged P/Q Gauss-Seidel cycles per Episode with FC1/SDF frozen; 1 is the ep3 baseline",
     )
     parser.add_argument(
+        "--p-solver",
+        type=str,
+        default=None,
+        choices=["fixed_target_cache", "frozen_policy_dynamic_residual"],
+        help=(
+            "P stage solver: legacy fixed-target-cache Huber regression or the "
+            "Hybrid frozen-policy dynamic Bellman residual policy iteration"
+        ),
+    )
+    parser.add_argument(
+        "--p-policy-iterations-per-inner",
+        type=int,
+        default=None,
+        help="P policy iterations executed before the EP3 Q staged block of each Firm Inner",
+    )
+    parser.add_argument("--p-root-adam-steps", type=int, default=None, help="Adam steps per P policy iteration")
+    parser.add_argument("--p-root-adam-lr", type=float, default=None, help="Adam LR per P policy iteration")
+    parser.add_argument("--p-root-adam-clip", type=float, default=None, help="Adam grad-clip norm per P policy iteration")
+    parser.add_argument("--p-root-eval-every", type=int, default=None, help="Validation interval in Adam steps")
+    parser.add_argument("--p-root-lbfgs-max-iter", type=int, default=None, help="L-BFGS optimizer budget per P policy iteration")
+    parser.add_argument("--p-root-lbfgs-chunk-iterations", type=int, default=None, help="L-BFGS chunk size in optimizer iterations")
+    parser.add_argument("--p-root-lbfgs-history-size", type=int, default=None, help="L-BFGS history size")
+    parser.add_argument("--p-root-target-residual", type=float, default=None, help="Optional early-stop normalized residual target")
+    parser.add_argument(
+        "--q-solver",
+        type=str,
+        default=None,
+        choices=["ep3_regime_staged"],
+        help="Q stage solver; only the EP3 regime-staged Q training is permitted",
+    )
+    parser.add_argument(
         "--initial-hstar-enabled",
         dest="initial_hstar_enabled",
         action="store_true",
@@ -1470,6 +1501,28 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.bp_distill_epochs = args.bp_distill_epochs
     if args.firm_inner_cycles is not None:
         hyperparams.firm_inner_cycles = args.firm_inner_cycles
+    if args.p_solver is not None:
+        hyperparams.p_solver = args.p_solver
+    if args.p_policy_iterations_per_inner is not None:
+        hyperparams.p_policy_iterations_per_inner = args.p_policy_iterations_per_inner
+    if args.p_root_adam_steps is not None:
+        hyperparams.p_root_adam_steps = args.p_root_adam_steps
+    if args.p_root_adam_lr is not None:
+        hyperparams.p_root_adam_lr = args.p_root_adam_lr
+    if args.p_root_adam_clip is not None:
+        hyperparams.p_root_adam_clip = args.p_root_adam_clip
+    if args.p_root_eval_every is not None:
+        hyperparams.p_root_eval_every = args.p_root_eval_every
+    if args.p_root_lbfgs_max_iter is not None:
+        hyperparams.p_root_lbfgs_max_iter = args.p_root_lbfgs_max_iter
+    if args.p_root_lbfgs_chunk_iterations is not None:
+        hyperparams.p_root_lbfgs_chunk_iterations = args.p_root_lbfgs_chunk_iterations
+    if args.p_root_lbfgs_history_size is not None:
+        hyperparams.p_root_lbfgs_history_size = args.p_root_lbfgs_history_size
+    if args.p_root_target_residual is not None:
+        hyperparams.p_root_target_residual = args.p_root_target_residual
+    if args.q_solver is not None:
+        hyperparams.q_solver = args.q_solver
     if args.initial_hstar_enabled is not None:
         hyperparams.initial_hstar_enabled = bool(args.initial_hstar_enabled)
     if args.initial_hstar_residual_tolerance is not None:
@@ -1604,6 +1657,45 @@ def configure_hyperparams(args: argparse.Namespace):
         str(getattr(hyperparams, "pv_training_flow", "joint")).lower() != "staged"
     ):
         raise ValueError("firm_inner_cycles>1 requires --pv-training-flow staged.")
+    if str(getattr(hyperparams, "q_solver", "ep3_regime_staged")).lower() != (
+        "ep3_regime_staged"
+    ):
+        raise ValueError(
+            "q_solver must remain 'ep3_regime_staged'; the EP3 Q0/QD/QS/Polish "
+            "regime-staged training is the only permitted Q solver."
+        )
+    p_solver_mode = str(getattr(hyperparams, "p_solver", "fixed_target_cache")).lower()
+    if p_solver_mode not in {"fixed_target_cache", "frozen_policy_dynamic_residual"}:
+        raise ValueError(
+            "p_solver must be 'fixed_target_cache' or "
+            f"'frozen_policy_dynamic_residual', got {p_solver_mode!r}"
+        )
+    if p_solver_mode == "frozen_policy_dynamic_residual":
+        if str(getattr(hyperparams, "pv_training_flow", "joint")).lower() != "staged":
+            raise ValueError(
+                "p_solver=frozen_policy_dynamic_residual requires --pv-training-flow staged."
+            )
+        if int(getattr(hyperparams, "p_policy_iterations_per_inner", 3)) < 1:
+            raise ValueError("p_policy_iterations_per_inner must be at least 1.")
+        for name, minimum in (
+            ("p_root_adam_steps", 1),
+            ("p_root_adam_lr", 0.0),
+            ("p_root_adam_clip", 0.0),
+            ("p_root_eval_every", 1),
+            ("p_root_lbfgs_max_iter", 0),
+            ("p_root_lbfgs_chunk_iterations", 1),
+            ("p_root_lbfgs_history_size", 1),
+        ):
+            value = float(getattr(hyperparams, name))
+            lower_bound = float(minimum)
+            if name == "p_root_lbfgs_max_iter":
+                if value < lower_bound:
+                    raise ValueError(f"{name} is out of range: {value!r}")
+            elif value <= lower_bound:
+                raise ValueError(f"{name} is out of range: {value!r}")
+        target_residual = getattr(hyperparams, "p_root_target_residual", None)
+        if target_residual is not None and float(target_residual) <= 0.0:
+            raise ValueError("p_root_target_residual must be positive when set.")
     if bool(getattr(hyperparams, "initial_hstar_enabled", False)):
         if bool(getattr(hyperparams, "state_bank_enabled", False)):
             raise ValueError(
@@ -2400,6 +2492,21 @@ def main():
                     "pv_training_flow": hyperparams.pv_training_flow,
                     "pv_eval_epochs": hyperparams.pv_eval_epochs,
                     "firm_inner_cycles": hyperparams.firm_inner_cycles,
+                    "p_solver": hyperparams.p_solver,
+                    "p_policy_iterations_per_inner": (
+                        hyperparams.p_policy_iterations_per_inner
+                    ),
+                    "p_root_adam_steps": hyperparams.p_root_adam_steps,
+                    "p_root_adam_lr": hyperparams.p_root_adam_lr,
+                    "p_root_adam_clip": hyperparams.p_root_adam_clip,
+                    "p_root_eval_every": hyperparams.p_root_eval_every,
+                    "p_root_lbfgs_max_iter": hyperparams.p_root_lbfgs_max_iter,
+                    "p_root_lbfgs_chunk_iterations": (
+                        hyperparams.p_root_lbfgs_chunk_iterations
+                    ),
+                    "p_root_lbfgs_history_size": hyperparams.p_root_lbfgs_history_size,
+                    "p_root_target_residual": hyperparams.p_root_target_residual,
+                    "q_solver": hyperparams.q_solver,
                     "initial_hstar_enabled": hyperparams.initial_hstar_enabled,
                     "initial_hstar_residual_tolerance": (
                         hyperparams.initial_hstar_residual_tolerance

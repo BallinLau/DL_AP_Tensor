@@ -174,6 +174,24 @@ class HyperParams:
     initial_hstar_width_tolerance: float = 1e-5
     initial_hstar_audit_output_dir: Optional[str] = None
     initial_hstar_audit_episode_id: int = -1
+    # Hybrid Firm P solver. ``fixed_target_cache`` keeps the legacy EP3 P stage
+    # (frozen Teacher value target + Huber regression); the formal Hybrid
+    # configuration uses ``frozen_policy_dynamic_residual``: each Firm Inner
+    # runs ``p_policy_iterations_per_inner`` frozen-policy Bellman-residual
+    # policy iterations before the EP3 Q staged block.
+    p_solver: str = "fixed_target_cache"
+    p_policy_iterations_per_inner: int = 3
+    p_root_adam_steps: int = 200
+    p_root_adam_lr: float = 1e-4
+    p_root_adam_clip: float = 10.0
+    p_root_eval_every: int = 10
+    p_root_lbfgs_max_iter: int = 100
+    p_root_lbfgs_chunk_iterations: int = 20
+    p_root_lbfgs_history_size: int = 50
+    p_root_target_residual: Optional[float] = None
+    # Q stage solver. Only the EP3 regime-staged Q training (Q0/QD/QS/Polish)
+    # is permitted; this flag exists for provenance and hard validation.
+    q_solver: str = "ep3_regime_staged"
     bp_distill_epochs: int = 20
     bp_distill_patience: int = 3
     bp_distill_min_delta: float = 1e-4
