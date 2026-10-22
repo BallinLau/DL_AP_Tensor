@@ -241,7 +241,7 @@ def main(argv=None):
     if locked[2]['config']['train_parents'] != 8192 or locked[2]['config']['validation_parents'] != 2048 or locked[2]['config']['firms'] != 200:
         raise RuntimeError('formal logical data budget changed')
 
-    backend = EP3Backend(args, locked)
+    backend = EP3Backend(args, locked, args.initial_checkpoint)
     contract = approval_binding(args, commit)
     journal = StageJournal(args.output / 'transactions', contract, backend, resume=args.resume)
     atomic_write_json(args.output / 'metadata' / 'approval_v1.json', json.loads(args.approval.read_text()))
