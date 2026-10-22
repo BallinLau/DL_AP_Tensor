@@ -722,6 +722,8 @@ class LBFGSNonFiniteClosureError(RuntimeError):
 def full_problem_loss(
     model: torch.nn.Module,
     train: Sequence[FrozenPolicyBatch],
+    *,
+    total_parents: Optional[int] = None,
 ) -> torch.Tensor:
     """Parent-count weighted full-problem objective for the L-BFGS closure.
 
@@ -731,10 +733,15 @@ def full_problem_loss(
     same weight:
 
         L = sum_j (n_j / N) * L_j
+
+    ``total_parents`` lets callers compute the same objective over a *group*
+    of batches with the GLOBAL parent count ``N`` (for fused closure passes);
+    the resulting group losses sum to the exact full-problem loss.
     """
     if not train:
         raise ValueError("full_problem_loss requires at least one batch")
-    total_parents = sum(int(batch.parent.shape[0]) for batch in train)
+    if total_parents is None:
+        total_parents = sum(int(batch.parent.shape[0]) for batch in train)
     if total_parents <= 0:
         raise ValueError("full_problem_loss requires positive parent counts")
     total = torch.zeros((), device=train[0].parent.device)
@@ -742,6 +749,12 @@ def full_problem_loss(
         weight = float(batch.parent.shape[0]) / float(total_parents)
         total = total + root_loss(model, batch) * weight
     return total
+
+
+# L-BFGS closure: fuse this many parents into one graph per backward pass.
+# Pure execution detail (fewer kernel launches on the tiny MLP); the weighted
+# objective is exactly sum_j (n_j/N) L_j regardless of grouping.
+CLOSURE_FUSE_PARENTS = 131072
 
 
 def _grads_finite(params: Sequence[torch.nn.Parameter]) -> bool:
@@ -865,6 +878,19 @@ def run_lbfgs_chunked(
         "LBFGS_NONFINITE_CLOSURE_ABORT": 0,
     }
     total_parents = sum(int(batch.parent.shape[0]) for batch in train)
+    # 执行层融合：每个 backward 覆盖约 CLOSURE_FUSE_PARENTS 个 parent 的
+    # 组合图（等权公式完全不变），减少小 MLP 的 kernel launch 开销。
+    fused_groups: List[List[FrozenPolicyBatch]] = []
+    group: List[FrozenPolicyBatch] = []
+    group_parents = 0
+    for batch in train:
+        group.append(batch)
+        group_parents += int(batch.parent.shape[0])
+        if group_parents >= CLOSURE_FUSE_PARENTS:
+            fused_groups.append(group)
+            group, group_parents = [], 0
+    if group:
+        fused_groups.append(group)
     completed_budget = 0
     stop_reason = "optimizer_limit"
     while completed_budget < max_iter:
@@ -888,11 +914,13 @@ def run_lbfgs_chunked(
             loss = torch.zeros((), device=train[0].parent.device)
             # Parent-count weighting: each parent carries weight 1/N regardless
             # of the minibatch partition (root_loss averages within a batch).
-            for batch in train:
-                weight = float(batch.parent.shape[0]) / float(total_parents)
-                batch_loss = root_loss(model, batch) * weight
-                batch_loss.backward()
-                loss = loss + batch_loss.detach()
+            # 分组仅是执行层融合，权重仍用全局 N。
+            for group_batches in fused_groups:
+                group_loss = full_problem_loss(
+                    model, group_batches, total_parents=total_parents
+                )
+                group_loss.backward()
+                loss = loss + group_loss.detach()
             block_calls += 1
             counters["LBFGS_CLOSURE_CALLS"] += 1
             # 非有限 Loss/梯度/参数必须立即中止求解：绝不清空梯度后继续把

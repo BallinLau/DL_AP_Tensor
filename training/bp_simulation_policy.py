@@ -8,7 +8,7 @@ evaluation and argmax to :class:`training.bp_grid_teacher.BPGridTeacher`.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -110,6 +110,10 @@ class GridBPSimulationPolicy:
         self.calls = 0
         self.parent_rows = 0
         self.refinancing_active_rows = 0
+        # 惰性 GPU 诊断累加器：evaluate_actions 每节点调用一次，任何
+        # .item()/float() 都会造成 CPU-GPU 同步；所有诊断量改为张量累加，
+        # instrumentation() 边界一次性物化。
+        self._diag_gpu: Optional[Dict[str, torch.Tensor]] = None
         self.coarse_candidate_evaluations = 0
         self.fine_candidate_evaluations = 0
         self.child_head_fallback_calls = 0
@@ -231,18 +235,28 @@ class GridBPSimulationPolicy:
         action_detached = action.detach()
         head_detached = output.bp.detach()
         gap = action_detached - head_detached
+        # 惰性 GPU 累加（见 __init__ 注释）：此处不做任何 GPU→CPU 同步。
+        active_rows = (firm_state[:, 2] > 0.5).sum().detach()
+        gap_abs_sum = gap.abs().sum().detach()
+        gap_signed_sum = gap.sum().detach()
+        gap_abs_max = gap.abs().max().detach()
+        acc = self._diag_gpu
+        if acc is None:
+            self._diag_gpu = {
+                "active": active_rows,
+                "gap_abs_sum": gap_abs_sum,
+                "gap_signed_sum": gap_signed_sum,
+                "gap_abs_max": gap_abs_max,
+            }
+        else:
+            acc["active"] = acc["active"] + active_rows
+            acc["gap_abs_sum"] = acc["gap_abs_sum"] + gap_abs_sum
+            acc["gap_signed_sum"] = acc["gap_signed_sum"] + gap_signed_sum
+            acc["gap_abs_max"] = torch.maximum(acc["gap_abs_max"], gap_abs_max)
         n_rows_now = int(firm_state.shape[0])
         self._gap_rows += n_rows_now
-        self._gap_abs_sum += float(gap.abs().sum())
-        self._gap_signed_sum += float(gap.sum())
-        self._gap_abs_max = max(self._gap_abs_max, float(gap.abs().max()))
-        active = int((firm_state[:, 2] > 0.5).sum().item())
         self.calls += 1
-        self.parent_rows += int(firm_state.shape[0])
-        self.refinancing_active_rows += active
-        self.coarse_candidate_evaluations += 2 * active * int(self.teacher.coarse_size)
-        if self.teacher.refine:
-            self.fine_candidate_evaluations += 2 * active * int(self.teacher.fine_size)
+        self.parent_rows += n_rows_now
         return {
             "bp": action.detach(),
             "bp0_star": p0["bp_star"].detach(),
@@ -282,7 +296,23 @@ class GridBPSimulationPolicy:
         if _module_state_hash(self.sdf_fc1_model) != self._sdf_hash:
             raise RuntimeError("grid simulation mutated the SDF/FC1 model")
 
+    def _materialize_diagnostics(self) -> None:
+        acc = self._diag_gpu
+        if acc is None:
+            return
+        active = int(acc["active"].item())
+        self.refinancing_active_rows += active
+        self._gap_abs_sum += float(acc["gap_abs_sum"].item())
+        self._gap_signed_sum += float(acc["gap_signed_sum"].item())
+        self._gap_abs_max = max(self._gap_abs_max, float(acc["gap_abs_max"].item()))
+        self.coarse_candidate_evaluations += 2 * active * int(self.teacher.coarse_size)
+        if self.teacher.refine:
+            self.fine_candidate_evaluations += 2 * active * int(self.teacher.fine_size)
+        self._diag_gpu = None
+
     def instrumentation(self) -> Dict[str, Any]:
+        # 唯一允许 GPU→CPU 汇总的诊断边界（每次模拟结束时调用一次）。
+        self._materialize_diagnostics()
         return {
             "simulation_bp_source": "grid",
             "device": str(self.device),
