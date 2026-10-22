@@ -167,6 +167,7 @@ class _Sim(SimpleNamespace):
         self.initial_hstar_support_lower = -8.0
         self.initial_hstar_support_upper = 2.0
         self.initial_hstar_width_tolerance = 1e-5
+        self.initial_hstar_max_iterations = 40
         self.initial_hstar_audit_output_dir = str(tmp_path)
         self.initial_hstar_audit_episode_id = 4
         self.beliefs = beliefs

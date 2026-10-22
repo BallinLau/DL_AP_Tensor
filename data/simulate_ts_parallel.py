@@ -586,6 +586,78 @@ def _initial_macro_floor_decomposition(
     }
 
 
+@torch.no_grad()
+def _polish_initial_hstar_root(
+    sim,
+    base_state: Dict[str, torch.Tensor],
+    rows,
+    h_rows: torch.Tensor,
+    *,
+    rng_cpu,
+    rng_cuda,
+    strict_tolerance: float,
+    root_tolerance: float,
+    max_iterations: int,
+):
+    """Bounded fixed-point polish of accepted roots in BOTH residual units.
+
+    ``G(h)=0`` 的精确解是 ``h = log(C_raw/(K+1e-8))``（复用生产 no-floor
+    表达式）。候选验证只认证 ``|G_norm|<=tol``；当 K/C>1 时同样的 G_norm
+    残差在 hatc 单位被放大到 ``(K/C)*tol``，会超出初始宏观一致性的同值
+    gate。此处在同一声明容差下要求两种单位都满足，用有界定点抛光
+    （每步一次生产算子评价、批量化）把根收敛到声明精度——这是收紧验收，
+    不放宽任何容差、不改变 root support 或候选集合。
+    """
+    device = h_rows.device
+    n_rows = int(rows.numel())
+    h = h_rows.clone()
+    records: List[Optional[Dict[str, torch.Tensor]]] = [None] * n_rows
+    failures: Dict[int, str] = {}
+    done = torch.zeros(n_rows, dtype=torch.bool, device=device)
+    iterations_used = 0
+    for iteration in range(1, max(1, int(max_iterations)) + 1):
+        iterations_used = iteration
+        records, failures, _trial = _initial_hstar_evaluate_rows(
+            sim,
+            base_state,
+            rows,
+            h,
+            rng_cpu=rng_cpu,
+            rng_cuda=rng_cuda,
+            return_state=True,
+        )
+        step_to = h.clone()
+        for index in range(n_rows):
+            record = records[index]
+            if record is None:
+                done[index] = False
+                continue
+            c = float(record["C_raw"])
+            k = float(record["K"])
+            g_norm = float(record["G_norm"])
+            finite_positive = (
+                math.isfinite(c) and math.isfinite(k) and c > 0.0 and k > 0.0
+            )
+            hatc_expected = (
+                math.log(c / (k + 1e-8)) if finite_positive else float("nan")
+            )
+            ok = (
+                finite_positive
+                and _candidate_residual_accepted(g_norm, root_tolerance)
+                and _candidate_residual_accepted(
+                    hatc_expected - float(h[index]), strict_tolerance
+                )
+            )
+            if ok:
+                done[index] = True
+            elif finite_positive:
+                step_to[index] = hatc_expected
+        if bool(done.all()):
+            break
+        h = torch.where(done, h, step_to)
+    return h, records, failures, done, iterations_used
+
+
 def _initial_hstar_gather_state(state: Dict[str, torch.Tensor], rows, device):
     """Gather ``rows`` (path indices) out of a batched state for re-evaluation."""
     from .state_bank import clone_state
@@ -1268,16 +1340,64 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
             selected_c[path] = verified_records[choice]["C_raw"]
             selected_k[path] = verified_records[choice]["K"]
 
-    strict_ok = torch.isfinite(selected_h) & (
-        selected_norm.abs() <= tolerance
-    ) & torch.isfinite(selected_norm) & torch.isfinite(selected_raw_g)
+    # --- 根抛光：同一声明容差必须在 G_norm 与 hatc 两种单位上都满足。K/C>1
+    # 时 G_norm 残差在 hatc 单位被放大，不做抛光会误触发初始宏观一致性
+    # gate；抛光是定点迭代到声明精度（收紧），不放宽任何容差。
+    polish_rows = torch.nonzero(
+        torch.isfinite(selected_h), as_tuple=False
+    ).reshape(-1)
+    polish_converged = torch.zeros(n_paths, dtype=torch.bool, device=device)
+    polish_iterations = 0
+    if polish_rows.numel():
+        h_polished, polish_records, polish_failures, done_mask, polish_iterations = (
+            _polish_initial_hstar_root(
+                sim,
+                state,
+                polish_rows,
+                selected_h[polish_rows].to(dtype),
+                rng_cpu=rng_cpu,
+                rng_cuda=rng_cuda,
+                strict_tolerance=tolerance,
+                root_tolerance=tolerance,
+                max_iterations=max(1, int(sim.initial_hstar_max_iterations)),
+            )
+        )
+        selected_h[polish_rows] = h_polished.to(dtype)
+        for offset, path in enumerate(polish_rows.tolist()):
+            polish_converged[path] = bool(done_mask[offset])
+            record = polish_records[offset]
+            if record is None:
+                continue
+            h64 = float(h_polished[offset])
+            c64 = float(record["C_raw"])
+            k64 = float(record["K"])
+            g64 = math.exp(h64) * k64 - c64
+            scale64 = max(1.0, abs(c64), abs(k64))
+            selected_raw_g[path] = g64
+            selected_norm[path] = g64 / scale64
+            selected_c[path] = record["C_raw"]
+            selected_k[path] = record["K"]
+            root_records[path]["polished_root"] = h64
+            root_records[path]["selected_root"] = h64
+            root_records[path]["polish_converged"] = bool(done_mask[offset])
+            root_records[path]["polish_iterations"] = int(polish_iterations)
+
+    strict_ok = (
+        torch.isfinite(selected_h)
+        & (selected_norm.abs() <= tolerance)
+        & torch.isfinite(selected_norm)
+        & torch.isfinite(selected_raw_g)
+        & polish_converged
+    )
     has_candidate = torch.isfinite(selected_h)
     no_root = ~strict_ok
     for path in range(n_paths):
         if strict_ok[path]:
             root_records[path]["terminal_status"] = "ROOT_FOUND"
             continue
-        if has_candidate[path]:
+        if has_candidate[path] and not bool(polish_converged[path]):
+            reason = "POLISH_DID_NOT_CONVERGE"
+        elif has_candidate[path]:
             reason = "FP64_REPLAY_RESIDUAL_TOLERANCE_FAILED"
         elif root_records[path]["valid_root_count"] == 0 and root_records[path][
             "candidate_rejection_reasons"
@@ -1443,6 +1563,9 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
         "multi_root_path_count": multi_root_paths,
         "discontinuity_path_count": discontinuity_paths,
         "floor_applied_root_count": floor_applied_count,
+        "root_polish_iterations": int(polish_iterations),
+        "root_polish_converged_count": int(polish_converged.sum()),
+        "root_polish_required_count": int(polish_rows.numel()),
         "initial_capital_mean": float(capital.mean()),
         "selected_C_raw_mean": float(selected_c[strict_ok].mean()),
         "selected_K_ledger_mean": float(selected_k[strict_ok].mean()),
@@ -1678,30 +1801,6 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
             }
 
             hard_fail = (~raw_clearing_ok) | (~ledger_parity_ok) | unexplained_mismatch
-            if bool(hard_fail.any()):
-                bad = torch.nonzero(hard_fail, as_tuple=False).reshape(-1).tolist()
-                failing_fields = [
-                    name
-                    for name, mask in field_detail.items()
-                    if not bool(mask[bad].all())
-                ]
-                if bool((~raw_clearing_ok)[bad].any()):
-                    failing_fields.append("raw_clearing_G")
-                if bool((~lnk_ok)[bad].any()):
-                    failing_fields.append("lnk_cal")
-                if bool(unexplained_mismatch[bad].any()):
-                    failing_fields.append("initial_macro_unexplained_mismatch")
-                raise RuntimeError(
-                    "t=0 h-star production gate failed; "
-                    f"paths={bad[:20]} (n={len(bad)}), "
-                    f"failing_fields={failing_fields[:10]}, "
-                    f"raw_G_norm_max={float(g_norm_prod[bad].abs().max())}, "
-                    f"lnk_residual_max={float(lnk_residual[bad].max())}, "
-                    f"hatc_gap_max={float(hatc_gap[bad].max())}, "
-                    f"lnk_gap_max={float(lnk_gap[bad].max())}, "
-                    f"strict_tolerance={strict_tolerance}, "
-                    f"parity_tolerance={parity_tolerance}"
-                )
 
             per_path_t0 = []
             for path in range(n_paths):
@@ -1822,6 +1921,33 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
                             target.update(record)
                     with open(audit_path, "w", encoding="utf-8") as handle:
                         json.dump(audit_payload, handle, indent=2)
+            # 审计已在真实 t=0 账本之后完整落盘；现在才执行硬失败，保证失败
+            # 也可审计（逐 path 分类、gap 与 floor 分解齐全）。
+            if bool(hard_fail.any()):
+                bad = torch.nonzero(hard_fail, as_tuple=False).reshape(-1).tolist()
+                failing_fields = [
+                    name
+                    for name, mask in field_detail.items()
+                    if not bool(mask[bad].all())
+                ]
+                if bool((~raw_clearing_ok)[bad].any()):
+                    failing_fields.append("raw_clearing_G")
+                if bool((~lnk_ok)[bad].any()):
+                    failing_fields.append("lnk_cal")
+                if bool(unexplained_mismatch[bad].any()):
+                    failing_fields.append("initial_macro_unexplained_mismatch")
+                raise RuntimeError(
+                    "t=0 h-star production gate failed; "
+                    f"paths={bad[:20]} (n={len(bad)}), "
+                    f"failing_fields={failing_fields[:10]}, "
+                    f"raw_G_norm_max={float(g_norm_prod[bad].abs().max())}, "
+                    f"lnk_residual_max={float(lnk_residual[bad].max())}, "
+                    f"hatc_gap_max={float(hatc_gap[bad].max())}, "
+                    f"lnk_gap_max={float(lnk_gap[bad].max())}, "
+                    f"unexplained_hatc_max={float(decomposition['unexplained_hatc_gap'][bad].abs().max())}, "
+                    f"strict_tolerance={strict_tolerance}, "
+                    f"parity_tolerance={parity_tolerance}"
+                )
             sim._initial_hstar_diagnostics = dict(initial_hstar_diagnostics)
             sim._initial_hstar_verified_state = None
 
