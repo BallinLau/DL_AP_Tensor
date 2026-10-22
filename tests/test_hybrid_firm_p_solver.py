@@ -276,14 +276,22 @@ def test_three_real_p_policy_iterations_keep_q_frozen(monkeypatch):
         [batch], [batch], episode.models["policy_value"], inner_index=1
     )
 
-    assert summary["status"] == "accepted"
+    assert summary["status"] in {
+        "accepted",
+        "accepted_with_reverts",
+        "accepted_reverted",
+    }, summary.get("failure")
     assert summary["p_solver"] == "frozen_policy_dynamic_residual"
     records = summary["p_policy_iterations"]
     assert len(records) == 3
     assert summary["p_policy_iteration_count"] == 3
     for record in records:
         # 真实 Optimizer Steps 非零；策略快照在单次 Evaluation 内冻结。
-        assert int(record["optimizer_steps"]) > 0
+        assert int(record["effective_optimizer_steps"]) > 0
+        assert record["status"] in {
+            "accepted_improved",
+            "accepted_reverted",
+        }, record.get("failure_kind")
         assert record["parity"]["train"]["parity_passed"] is True
         assert record["parity"]["validation"]["parity_passed"] is True
         # Greedy 重求与函数漂移被记录。
@@ -300,11 +308,13 @@ def test_q_regime_phases_run_after_p_with_latest_snapshot(monkeypatch):
     episode = _episode()
     batch = _batch(episode.device)
     phases = []
+    epochs_seen = []
     frozen_p_hashes = []
 
     def _record_phase(*, phase, batches, frozen_p_model, q_target_model, epochs,
                       validation_bank):
         phases.append(phase)
+        epochs_seen.append(int(epochs))
         frozen_p_hashes.append(episode._state_dict_hash(frozen_p_model))
         return {
             "phase": phase,
@@ -327,6 +337,8 @@ def test_q_regime_phases_run_after_p_with_latest_snapshot(monkeypatch):
     # Q 使用最新 P Snapshot：QD/QS 区域分类所用冻结 P 与 P 阶段结束后的
     # 在线 P 完全一致（不是上一 Inner 的过期 P）。
     assert phases == ["zero", "default", "survival", "polish"]
+    # Test G: Q0/QD/QS/Polish 的 Epoch 不变（5/10/20/5）。
+    assert epochs_seen == [5, 10, 20, 5]
     online_hash = episode._state_dict_hash(episode.models["policy_value"])
     assert all(h == online_hash for h in frozen_p_hashes)
     # 不调用任何 b291 Q Picard Solver：Q 阶段记录全部来自 EP3 分区域训练。

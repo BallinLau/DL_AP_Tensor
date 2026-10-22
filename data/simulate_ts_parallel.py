@@ -3,8 +3,9 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -473,6 +474,15 @@ def _ensure_entry_state_fields(state: Dict[str, torch.Tensor]) -> None:
         )
 
 
+def _candidate_residual_accepted(g_norm: float, tol: float) -> bool:
+    """Root-candidate residual acceptance: absolute value + finite only.
+
+    带符号比较会让绝对值很大的负残差（G_norm ≪ 0）错误通过，因此验收
+    统一使用 ``abs(G_norm) <= tol`` 且排除 NaN/Inf。
+    """
+    return math.isfinite(g_norm) and abs(g_norm) <= float(tol)
+
+
 def _initial_hstar_gather_state(state: Dict[str, torch.Tensor], rows, device):
     """Gather ``rows`` (path indices) out of a batched state for re-evaluation."""
     from .state_bank import clone_state
@@ -804,7 +814,9 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
     candidate_prequalified: List[torch.Tensor] = []
 
     exact = torch.nonzero(
-        coarse["feasible"] & (coarse["G_norm"].abs() <= inner_tolerance),
+        coarse["feasible"]
+        & torch.isfinite(coarse["G_norm"])
+        & (coarse["G_norm"].abs() <= inner_tolerance),
         as_tuple=False,
     )
     if exact.numel():
@@ -875,7 +887,7 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
         )
         with torch.no_grad():
                 feasible_residual = torch.where(
-                    refined["feasible"],
+                    refined["feasible"] & torch.isfinite(refined["G_norm"]),
                     refined["G_norm"].abs(),
                     torch.full_like(refined["G_norm"], float("inf")),
                 )
@@ -1078,8 +1090,12 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
                     verified_failures.get(position, "CANDIDATE_EVALUATION_FAILED")
                 )
                 continue
-            ok = bool(record["feasible"]) and (
-                float(record["G_norm"]) <= float(replay_tolerance[position])
+            g_norm = float(record["G_norm"])
+            tol = float(replay_tolerance[position])
+            # 残差验收必须取绝对值并排除 NaN/Inf：带符号比较会让绝对值很大的
+            # 负残差（G_norm ≪ 0）错误通过。
+            ok = bool(record["feasible"]) and _candidate_residual_accepted(
+                g_norm, tol
             )
             if not ok:
                 if not bool(record["finite"]):
@@ -1513,9 +1529,48 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
                 state["lnkf"].to(torch.float32)
                 - verified["lnkf"].to(torch.float32)
             ).abs()
-            all_ok = raw_clearing_ok & lnk_ok & field_ok
-            if not bool(all_ok.all()):
-                bad = torch.nonzero(~all_ok, as_tuple=False).reshape(-1).tolist()
+            # Candidate/production ledger parity includes the belief fields.
+            ledger_parity_ok = field_ok & lnk_ok
+
+            # --- Initial macro consistency, evaluated independently of raw
+            # clearing and ledger parity.  With a consumption floor the macro
+            # export lifts K and C together (C_effective != C_raw), so
+            # ``Hatcf0 != Hatc_cal0`` can be legitimate: it must be recorded
+            # and classified, never reported as MATCH and never used to
+            # redefine the raw root through the floored C_effective.
+            hatcf0 = state["hatcf"].to(torch.float32)
+            lnkf0 = state["lnkf"].to(torch.float32)
+            hatc_cal0 = state["hatc_cal"].to(torch.float32)
+            lnk_cal0 = state["lnk_cal"].to(torch.float32)
+            hatc_gap = (hatcf0 - hatc_cal0).abs()
+            lnk_gap = (lnkf0 - lnk_cal0).abs()
+            macro_match_ok = (hatc_gap <= strict_tolerance) & (
+                lnk_gap <= parity_tolerance
+            )
+            floor_flag = state.get(
+                "accounting_consumption_floor_applied",
+                torch.zeros(n_paths, dtype=torch.bool, device=device),
+            ).to(torch.bool)
+            floor_explained = (~macro_match_ok) & floor_flag & raw_clearing_ok
+            unexplained_mismatch = (~macro_match_ok) & (~floor_explained)
+            classification = torch.where(
+                macro_match_ok,
+                torch.zeros(n_paths, dtype=torch.int64, device=device),
+                torch.where(
+                    floor_explained,
+                    torch.ones(n_paths, dtype=torch.int64, device=device),
+                    torch.full((n_paths,), 2, dtype=torch.int64, device=device),
+                ),
+            )
+            classification_labels = {
+                0: "MATCH",
+                1: "FLOOR_EXPLAINED_MISMATCH",
+                2: "UNEXPLAINED_MISMATCH",
+            }
+
+            hard_fail = (~raw_clearing_ok) | (~ledger_parity_ok) | unexplained_mismatch
+            if bool(hard_fail.any()):
+                bad = torch.nonzero(hard_fail, as_tuple=False).reshape(-1).tolist()
                 failing_fields = [
                     name
                     for name, mask in field_detail.items()
@@ -1525,25 +1580,100 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
                     failing_fields.append("raw_clearing_G")
                 if not bool(lnk_ok[bad].all()):
                     failing_fields.append("lnk_cal")
+                if not bool(unexplained_mismatch[bad].all()):
+                    failing_fields.append("initial_macro_unexplained_mismatch")
                 raise RuntimeError(
-                    "t=0 h-star candidate does not reproduce the formal "
-                    f"production ledger/decisions; paths={bad[:20]} "
-                    f"(n={len(bad)}), failing_fields={failing_fields[:10]}, "
+                    "t=0 h-star production gate failed; "
+                    f"paths={bad[:20]} (n={len(bad)}), "
+                    f"failing_fields={failing_fields[:10]}, "
                     f"raw_G_norm_max={float(g_norm_prod[bad].abs().max())}, "
                     f"lnk_residual_max={float(lnk_residual[bad].max())}, "
+                    f"hatc_gap_max={float(hatc_gap[bad].max())}, "
+                    f"lnk_gap_max={float(lnk_gap[bad].max())}, "
                     f"strict_tolerance={strict_tolerance}, "
                     f"parity_tolerance={parity_tolerance}"
                 )
+
+            per_path_t0 = []
+            for path in range(n_paths):
+                per_path_t0.append({
+                    "path": path,
+                    "hatcf0": float(hatcf0[path]),
+                    "hatc_cal0": float(hatc_cal0[path]),
+                    "lnkf0": float(lnkf0[path]),
+                    "lnk_cal0": float(lnk_cal0[path]),
+                    "hatc_gap": float(hatc_gap[path]),
+                    "lnk_gap": float(lnk_gap[path]),
+                    "floor_applied": bool(floor_flag[path]),
+                    "raw_clearing_passed": bool(raw_clearing_ok[path]),
+                    "production_ledger_parity_passed": bool(ledger_parity_ok[path]),
+                    "initial_macro_match_passed": bool(macro_match_ok[path]),
+                    "initial_macro_classification": classification_labels[
+                        int(classification[path])
+                    ],
+                })
+            t0_validation = {
+                "raw_clearing_passed": bool(raw_clearing_ok.all()),
+                "production_ledger_parity_passed": bool(ledger_parity_ok.all()),
+                "initial_macro_match_passed": bool(macro_match_ok.all()),
+                "initial_macro_floor_explained_count": int(floor_explained.sum()),
+                "initial_macro_unexplained_count": int(unexplained_mismatch.sum()),
+                "initial_hatc_gap_max": float(hatc_gap.max()),
+                "initial_lnk_gap_max": float(lnk_gap.max()),
+                "floor_applied_root_count": int(floor_flag.sum()),
+                "strict_tolerance": strict_tolerance,
+                "parity_tolerance": parity_tolerance,
+                "per_path": per_path_t0,
+            }
             initial_hstar_diagnostics.update({
-                "production_raw_clearing_passed": True,
+                "production_raw_clearing_passed": t0_validation["raw_clearing_passed"],
+                "raw_clearing_passed": t0_validation["raw_clearing_passed"],
                 "production_raw_G_norm_max": float(g_norm_prod.abs().max()),
-                "production_ledger_parity_passed": True,
+                "production_ledger_parity_passed": t0_validation[
+                    "production_ledger_parity_passed"
+                ],
                 "production_firm_decision_parity_passed": True,
+                "initial_macro_match_passed": t0_validation[
+                    "initial_macro_match_passed"
+                ],
+                "initial_macro_floor_explained_count": t0_validation[
+                    "initial_macro_floor_explained_count"
+                ],
+                "initial_macro_unexplained_count": t0_validation[
+                    "initial_macro_unexplained_count"
+                ],
+                "initial_hatc_gap_max": t0_validation["initial_hatc_gap_max"],
+                "initial_lnk_gap_max": t0_validation["initial_lnk_gap_max"],
+                "floor_applied_root_count": t0_validation["floor_applied_root_count"],
                 "production_lnk_residual_max": float(lnk_residual.max()),
                 "production_strict_tolerance": strict_tolerance,
                 "production_parity_tolerance": parity_tolerance,
-                "t0_calibrated_path_count": int(all_ok.sum()),
+                "t0_calibrated_path_count": int(
+                    (raw_clearing_ok & ledger_parity_ok).sum()
+                ),
+                "t0_production_validation": t0_validation,
             })
+            # The persistent audit is enriched after the formal t=0 production
+            # execution with the real ledger values and the three-way status.
+            audit_path = initial_hstar_diagnostics.get("audit_path")
+            if audit_path:
+                try:
+                    with open(audit_path, "r", encoding="utf-8") as handle:
+                        audit_payload = json.load(handle)
+                except (OSError, ValueError):
+                    audit_payload = None
+                if isinstance(audit_payload, dict):
+                    audit_payload["t0_production_validation"] = t0_validation
+                    by_path = {
+                        int(record.get("path", -1)): record
+                        for record in audit_payload.get("results", [])
+                    }
+                    for record in per_path_t0:
+                        target = by_path.get(int(record["path"]))
+                        if isinstance(target, dict):
+                            target.update(record)
+                    with open(audit_path, "w", encoding="utf-8") as handle:
+                        json.dump(audit_payload, handle, indent=2)
             sim._initial_hstar_diagnostics = dict(initial_hstar_diagnostics)
             sim._initial_hstar_verified_state = None
 

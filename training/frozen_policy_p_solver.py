@@ -94,6 +94,8 @@ class FrozenBranchBatch:
     production_continuation_mean: torch.Tensor  # [B,1]
     expanded_child_states: torch.Tensor  # [I*B*J,7] detached i-grid states
     i_grid_size: int
+    parity_max_abs_error: float = 0.0
+    parity_error_rows: Tuple[int, ...] = ()
 
     @property
     def n_rows(self) -> int:
@@ -209,19 +211,28 @@ def residual_tensors(
     batch: FrozenPolicyBatch,
 ) -> Dict[str, torch.Tensor]:
     p0_online, pi_online = model._value_outputs(batch.parent)
-    rhs0 = dynamic_rhs(model, batch.p0)
-    rhsi = dynamic_rhs(model, batch.pi)
+    equity0 = frozen_child_equity(model, batch.p0)
+    equityi = frozen_child_equity(model, batch.pi)
+    cont0 = (batch.p0.child_weights * batch.p0.m_used * equity0).sum(dim=1, keepdim=True)
+    conti = (batch.pi.child_weights * batch.pi.m_used * equityi).sum(dim=1, keepdim=True)
+    rhs0 = batch.p0.cashflow + batch.p0.continuation_factor * cont0
+    rhsi = batch.pi.cashflow + batch.pi.continuation_factor * conti
     r0 = p0_online - rhs0
     ri = pi_online - rhsi
+    r0n = r0 / batch.scale.clamp_min(1e-12)
+    rin = ri / batch.scale.clamp_min(1e-12)
     return {
         "p0": r0,
         "pi": ri,
-        "p0_normalized": r0 / batch.scale.clamp_min(1e-12),
-        "pi_normalized": ri / batch.scale.clamp_min(1e-12),
+        "p0_normalized": r0n,
+        "pi_normalized": rin,
         "p0_output": p0_online,
         "pi_output": pi_online,
         "p0_rhs": rhs0,
         "pi_rhs": rhsi,
+        "p0_continuation": cont0,
+        "pi_continuation": conti,
+        "row_loss": r0n.square() + rin.square(),
     }
 
 
@@ -233,10 +244,25 @@ def root_loss(model: torch.nn.Module, batch: FrozenPolicyBatch) -> torch.Tensor:
     )
 
 
+# 正式接受判定必须覆盖的逐行张量：残差、归一化残差、Parent P 输出、
+# Child Continuation 与逐行 Loss。
+FINITE_CHECK_KEYS = (
+    "p0",
+    "pi",
+    "p0_normalized",
+    "pi_normalized",
+    "p0_output",
+    "pi_output",
+    "p0_continuation",
+    "pi_continuation",
+    "row_loss",
+)
+
+
 def evaluate_problem(
     model: torch.nn.Module,
     problem: Sequence[FrozenPolicyBatch],
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     def _stats(value: torch.Tensor, prefix: str) -> Dict[str, float]:
         flat = value.detach().reshape(-1)
         finite = flat[torch.isfinite(flat)]
@@ -259,7 +285,7 @@ def evaluate_problem(
         for batch in problem:
             values = residual_tensors(model, batch)
             for key, value in values.items():
-                accum.setdefault(key, []).append(value.detach().cpu())
+                accum.setdefault(key, []).append(value.detach().reshape(-1).cpu())
     if not accum:
         return {
             "p0_norm_mae": float("nan"),
@@ -267,10 +293,22 @@ def evaluate_problem(
             "normalized_mae": float("nan"),
             "normalized_rmse": float("nan"),
             "finite": False,
+            "n_total": 0,
+            "n_finite": 0,
+            "nonfinite_count": 0,
+            "nonfinite_ratio": 0.0,
+            "all_finite": False,
         }
+    # 逐行 finite 判定覆盖全部正式验收张量；finite-only 统计仅作诊断。
+    row_finite: Optional[torch.Tensor] = None
+    for key in FINITE_CHECK_KEYS:
+        flat = torch.isfinite(torch.cat(accum[key]))
+        row_finite = flat if row_finite is None else (row_finite & flat)
+    n_total = int(row_finite.numel())
+    n_finite = int(row_finite.sum())
     p0n = torch.cat(accum["p0_normalized"])
     pin = torch.cat(accum["pi_normalized"])
-    result: Dict[str, float] = {}
+    result: Dict[str, Any] = {}
     result.update(_stats(torch.cat(accum["p0"]), "p0"))
     result.update(_stats(torch.cat(accum["pi"]), "pi"))
     result.update(_stats(p0n, "p0_norm"))
@@ -283,10 +321,14 @@ def evaluate_problem(
             ),
             "p0_output_mean": float(torch.cat(accum["p0_output"]).mean()),
             "pi_output_mean": float(torch.cat(accum["pi_output"]).mean()),
-            "finite": bool(
-                torch.isfinite(torch.cat(accum["p0"])).all()
-                and torch.isfinite(torch.cat(accum["pi"])).all()
+            "finite": bool(n_finite == n_total),
+            "n_total": n_total,
+            "n_finite": n_finite,
+            "nonfinite_count": n_total - n_finite,
+            "nonfinite_ratio": (
+                float((n_total - n_finite) / n_total) if n_total else 0.0
             ),
+            "all_finite": bool(n_finite == n_total) and n_total > 0,
         }
     )
     return result
@@ -469,6 +511,14 @@ def build_frozen_branch(
         parity_ok = bool(
             torch.allclose(rhs_snapshot, value_star, atol=PARITY_ATOL, rtol=PARITY_RTOL)
         )
+        row_error = (rhs_snapshot - value_star).abs().reshape(-1)
+        row_tol = PARITY_ATOL + PARITY_RTOL * value_star.abs().reshape(-1)
+        parity_error_rows = tuple(
+            int(index)
+            for index in torch.nonzero(
+                ~(row_error <= row_tol), as_tuple=False
+            ).reshape(-1).tolist()
+        )
 
         scale = (
             model.equity_value_scale(parent_state).detach().clamp_min(1e-8)
@@ -500,6 +550,8 @@ def build_frozen_branch(
             production_continuation_mean=continuation_mean,
             expanded_child_states=expanded_child_states,
             i_grid_size=int(max(int(model.i_grid_size), 2)),
+            parity_max_abs_error=parity_error,
+            parity_error_rows=parity_error_rows,
         ),
         parity_error,
         parity_ok,
@@ -584,6 +636,7 @@ def build_problem(
     problem: List[FrozenPolicyBatch] = []
     parity_errors: List[float] = []
     parity_flags: List[bool] = []
+    parity_failures: List[Dict[str, Any]] = []
     was_training = model.training
     model.eval()
     try:
@@ -599,6 +652,16 @@ def build_problem(
             problem.append(frozen)
             parity_errors.append(frozen.parity_max_abs_error)
             parity_flags.append(frozen.parity_passed)
+            if not frozen.parity_passed:
+                for branch_name, branch in (("p0", frozen.p0), ("pi", frozen.pi)):
+                    if branch.parity_error_rows or branch.parity_max_abs_error > 0.0:
+                        parity_failures.append({
+                            "batch_id": int(batch_id),
+                            "branch": branch_name,
+                            "parity_max_abs_error": float(branch.parity_max_abs_error),
+                            "failing_parent_rows": list(branch.parity_error_rows)[:20],
+                            "failing_row_count": len(branch.parity_error_rows),
+                        })
     finally:
         model.train(was_training)
     max_error = max(parity_errors) if parity_errors else 0.0
@@ -607,6 +670,7 @@ def build_problem(
         "parity_max_abs_error": float(max_error),
         "parity_tolerance": PARITY_ATOL,
         "parity_passed": bool(all(parity_flags)) if parity_flags else False,
+        "parity_failures": parity_failures,
     }
 
 
@@ -638,6 +702,21 @@ def _restore_state(model: torch.nn.Module, state: Dict[str, torch.Tensor]) -> No
     model.load_state_dict(state)
 
 
+def _params_finite(params: Sequence[torch.nn.Parameter]) -> bool:
+    for param in params:
+        if param.grad is not None or param.requires_grad:
+            if not bool(torch.isfinite(param.detach()).all()):
+                return False
+    return True
+
+
+def _grads_finite(params: Sequence[torch.nn.Parameter]) -> bool:
+    for param in params:
+        if param.grad is not None and not bool(torch.isfinite(param.grad).all()):
+            return False
+    return True
+
+
 def run_adam(
     *,
     model: torch.nn.Module,
@@ -648,23 +727,53 @@ def run_adam(
     lr: float,
     clip: float,
     eval_every: int,
-) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor], Dict[str, float], int]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor], Dict[str, float], int, str]:
+    """Adam block with full numerical protection.
+
+    Returns ``(history, best_state, best, completed_steps, status)`` where
+    ``status`` is ``ok`` or the explicit numerical failure kind.  A state is
+    only eligible as Best when the fixed Validation is entirely finite.
+    """
     optimizer = torch.optim.Adam(params, lr=lr, weight_decay=0.0)
     history: List[Dict[str, Any]] = []
     best = evaluate_problem(model, validation)
     best_state = _clone_state(model)
     completed_steps = 0
+    status = "ok"
     for step in range(1, steps + 1):
         batch = train[(step - 1) % len(train)]
         optimizer.zero_grad(set_to_none=True)
         loss = root_loss(model, batch)
         if not torch.isfinite(loss):
-            history.append({"phase": "adam", "step": step, "loss": float("nan"), "nonfinite": 1})
+            status = "nonfinite_loss"
+            history.append(
+                {"phase": "adam", "step": step, "loss": float("nan"), "failure": status}
+            )
             break
         loss.backward()
         raw_grad = _grad_norm(params)
+        if not math.isfinite(raw_grad) or not _grads_finite(params):
+            status = "nonfinite_gradient"
+            history.append(
+                {
+                    "phase": "adam",
+                    "step": step,
+                    "loss": float(loss.detach()),
+                    "raw_grad_norm": raw_grad,
+                    "failure": status,
+                }
+            )
+            # 非有限梯度绝不执行 optimizer.step()，也不保存为 Best。
+            optimizer.zero_grad(set_to_none=True)
+            break
         torch.nn.utils.clip_grad_norm_(params, clip)
         optimizer.step()
+        if not _params_finite(params):
+            status = "nonfinite_parameters"
+            history.append(
+                {"phase": "adam", "step": step, "failure": status}
+            )
+            break
         completed_steps = step
         if step == 1 or step % eval_every == 0 or step == steps:
             val = evaluate_problem(model, validation)
@@ -678,11 +787,16 @@ def run_adam(
                     "val_normalized_mae": val["normalized_mae"],
                     "val_p0_norm_mae": val["p0_norm_mae"],
                     "val_pi_norm_mae": val["pi_norm_mae"],
+                    "val_all_finite": bool(val["all_finite"]),
                 }
             )
-            if val["normalized_mae"] < best["normalized_mae"]:
+            if (
+                val["all_finite"]
+                and math.isfinite(val["normalized_mae"])
+                and val["normalized_mae"] < best["normalized_mae"]
+            ):
                 best, best_state = val, _clone_state(model)
-    return history, best_state, best, completed_steps
+    return history, best_state, best, completed_steps, status
 
 
 def run_lbfgs_chunked(
@@ -695,13 +809,26 @@ def run_lbfgs_chunked(
     chunk_iterations: int,
     history_size: int,
     target_residual: Optional[float] = None,
-) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor], Dict[str, float], str, int]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor], Dict[str, float], str, Dict[str, int]]:
+    """L-BFGS in bounded chunks with closure-level numerical protection.
+
+    Returns ``(history, best_state, best, stop_reason, counters)`` where
+    ``counters`` distinguishes the iteration budget from actual iterations
+    and closure calls.  A nonfinite closure or nonfinite chunk result restores
+    the last finite Best state and stops; the validation is re-evaluated on
+    the restored state before returning.
+    """
     if chunk_iterations <= 0:
         raise ValueError("chunk_iterations must be positive")
     best = evaluate_problem(model, validation)
     best_state = _clone_state(model)
     history: List[Dict[str, Any]] = []
-    total_calls = 0
+    counters = {
+        "LBFGS_ITERATION_BUDGET": int(max_iter),
+        "LBFGS_ACTUAL_ITERATIONS": 0,
+        "LBFGS_CLOSURE_CALLS": 0,
+        "LBFGS_NONFINITE_CLOSURES": 0,
+    }
     completed_budget = 0
     stop_reason = "optimizer_limit"
     while completed_budget < max_iter:
@@ -716,10 +843,11 @@ def run_lbfgs_chunked(
             tolerance_change=1e-12,
         )
         block_calls = 0
+        block_nonfinite = 0
         started = time.perf_counter()
 
         def closure() -> torch.Tensor:
-            nonlocal block_calls, total_calls
+            nonlocal block_calls, block_nonfinite
             optimizer.zero_grad(set_to_none=True)
             loss = torch.zeros((), device=train[0].parent.device)
             for batch in train:
@@ -727,13 +855,25 @@ def run_lbfgs_chunked(
                 batch_loss.backward()
                 loss = loss + batch_loss.detach()
             block_calls += 1
-            total_calls += 1
+            counters["LBFGS_CLOSURE_CALLS"] += 1
+            if not torch.isfinite(loss) or not _grads_finite(params):
+                block_nonfinite += 1
+                counters["LBFGS_NONFINITE_CLOSURES"] += 1
+                optimizer.zero_grad(set_to_none=True)
             return loss
 
         optimizer.step(closure)
         if train[0].parent.is_cuda:
             torch.cuda.synchronize(train[0].parent.device)
         elapsed = time.perf_counter() - started
+        # torch LBFGS 维护每个 block 的真实迭代计数；closure calls ≠ iterations。
+        actual_iter = 0
+        for param in params:
+            state_entry = optimizer.state.get(param, {})
+            if isinstance(state_entry, dict) and "n_iter" in state_entry:
+                actual_iter = max(actual_iter, int(state_entry["n_iter"]))
+                break
+        counters["LBFGS_ACTUAL_ITERATIONS"] += int(actual_iter)
         completed_budget += block_budget
         val = evaluate_problem(model, validation)
         history.append(
@@ -742,24 +882,45 @@ def run_lbfgs_chunked(
                 "optimizer_budget": completed_budget,
                 "block_budget": block_budget,
                 "block_closure_calls": block_calls,
-                "total_closure_calls": total_calls,
+                "block_nonfinite_closures": block_nonfinite,
+                "block_actual_iterations": int(actual_iter),
                 "seconds": elapsed,
                 "raw_grad_norm": _grad_norm(params),
                 "parameter_norm": _param_norm(params),
                 "val_normalized_mae": val["normalized_mae"],
                 "val_p0_norm_mae": val["p0_norm_mae"],
                 "val_pi_norm_mae": val["pi_norm_mae"],
+                "val_all_finite": bool(val["all_finite"]),
             }
         )
-        if val["normalized_mae"] < best["normalized_mae"]:
+        if (
+            val["all_finite"]
+            and math.isfinite(val["normalized_mae"])
+            and val["normalized_mae"] < best["normalized_mae"]
+        ):
             best, best_state = val, _clone_state(model)
-        if not bool(val["finite"]):
-            stop_reason = "nonfinite_validation"
+        if not bool(val["all_finite"]) or not _params_finite(params):
+            # 非有限 chunk 结果绝不污染 Best State：恢复最近一次有限
+            # Best 并重新评价后退出。
+            stop_reason = "nonfinite_chunk_restored"
+            _restore_state(model, best_state)
+            final = evaluate_problem(model, validation)
+            history.append(
+                {
+                    "phase": "lbfgs_restore",
+                    "restored_best_state": True,
+                    "val_normalized_mae": final["normalized_mae"],
+                    "val_all_finite": bool(final["all_finite"]),
+                }
+            )
+            if final["all_finite"] and math.isfinite(final["normalized_mae"]):
+                if final["normalized_mae"] < best["normalized_mae"]:
+                    best = final
             break
         if target_residual is not None and val["normalized_mae"] <= target_residual:
             stop_reason = "target_residual_reached"
             break
-    return history, best_state, best, stop_reason, total_calls
+    return history, best_state, best, stop_reason, counters
 
 
 # ---------------------------------------------------------------------------
@@ -826,14 +987,22 @@ def fresh_greedy_residual(
     finally:
         model.train(was_training)
     if not r0:
-        return {"fresh_greedy_p0_norm_mae": float("nan"), "fresh_greedy_pi_norm_mae": float("nan")}
+        return {
+            "fresh_greedy_p0_norm_mae": float("nan"),
+            "fresh_greedy_pi_norm_mae": float("nan"),
+            "all_finite": False,
+        }
     r0_flat = torch.cat(r0).reshape(-1)
     ri_flat = torch.cat(ri).reshape(-1)
+    all_finite = bool(
+        torch.isfinite(r0_flat).all() and torch.isfinite(ri_flat).all()
+    )
     return {
         "fresh_greedy_p0_norm_mae": float(r0_flat.abs().mean()),
         "fresh_greedy_pi_norm_mae": float(ri_flat.abs().mean()),
         "fresh_greedy_p0_norm_p90": _quantile(r0_flat.abs(), 0.9),
         "fresh_greedy_pi_norm_p90": _quantile(ri_flat.abs(), 0.9),
+        "all_finite": all_finite,
     }
 
 
@@ -912,8 +1081,71 @@ def run_p_policy_iteration(
     initial = evaluate_problem(model, validation_problem)
     with torch.no_grad():
         start_p0, start_pi = model._value_outputs(validation_problem[0].parent)
+    start_model_hash = _module_state_hash(model)
+    start_p_hash = episode._params_content_hash(params)
+    rng_cpu = torch.get_rng_state()
+    rng_cuda = (
+        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    )
 
-    adam_history, adam_state, adam_best, adam_steps_done = run_adam(
+    def _restore_rng() -> None:
+        torch.set_rng_state(rng_cpu)
+        if rng_cuda is not None:
+            torch.cuda.set_rng_state_all(rng_cuda)
+
+    def _reject(status: str, failure_kind: str, detail: Any) -> Dict[str, Any]:
+        """Roll back to the iteration-start state and report a non-accept."""
+        _restore_state(model, start_state)
+        _restore_rng()
+        if _module_state_hash(model) != start_model_hash:
+            raise RuntimeError("P rollback failed to restore the model hash")
+        if episode._params_content_hash(params) != start_p_hash:
+            raise RuntimeError("P rollback failed to restore the P-only hash")
+        return {
+            "inner_index": int(inner_index),
+            "iteration_index": int(iteration_index),
+            "status": status,
+            "failure_kind": failure_kind,
+            "failure_detail": detail,
+            "optimizer_steps": 0,
+            "adam_steps": 0,
+            "lbfgs_closure_calls": 0,
+            "lbfgs_iteration_budget": int(lbfgs_max_iter),
+            "lbfgs_actual_iterations": 0,
+            "stop_reason": failure_kind,
+            "module_hashes": {
+                "q_params": episode._params_content_hash(q_params),
+                "sdf_fc1": sdf_hash_before,
+                "model": start_model_hash,
+                "p_root": start_p_hash,
+            },
+            "rollback": {
+                "restored_iteration_start_state": True,
+                "model_hash_verified": True,
+                "p_root_hash_verified": True,
+                "rng_restored": True,
+            },
+        }
+
+    # --- Parity 是硬性前置条件：任一失败不执行 P Optimizer、不标记 Accepted。
+    if not (train_parity.get("parity_passed") and val_parity.get("parity_passed")):
+        detail = {
+            "train_parity": train_parity,
+            "validation_parity": val_parity,
+        }
+        return _reject("rejected_numerical", "parity_failed", detail)
+
+    # Fresh-greedy 基线（同一固定 Validation/CRN），用于如实记录 Frozen
+    # Residual 改善而 Fresh Greedy 恶化的情况。
+    fresh_initial = fresh_greedy_residual(
+        episode, model, teacher, validation_batches or train_batches, q_model=q_model
+    )
+    if not fresh_initial.get("all_finite", False):
+        return _reject(
+            "rejected_numerical", "fresh_greedy_nonfinite_initial", fresh_initial
+        )
+
+    adam_history, adam_state, adam_best, adam_steps_done, adam_status = run_adam(
         model=model,
         params=params,
         train=train_problem,
@@ -923,14 +1155,23 @@ def run_p_policy_iteration(
         clip=adam_clip,
         eval_every=eval_every,
     )
+    if adam_status != "ok":
+        return _reject("rejected_numerical", f"adam_{adam_status}", {
+            "adam_history_tail": adam_history[-3:],
+        })
     _restore_state(model, adam_state)
     if target_residual is not None and adam_best["normalized_mae"] <= target_residual:
         lbfgs_history: List[Dict[str, Any]] = []
         best_state, best = adam_state, adam_best
         stop_reason = "target_residual_reached_after_adam"
-        lbfgs_calls = 0
+        lbfgs_counters = {
+            "LBFGS_ITERATION_BUDGET": int(lbfgs_max_iter),
+            "LBFGS_ACTUAL_ITERATIONS": 0,
+            "LBFGS_CLOSURE_CALLS": 0,
+            "LBFGS_NONFINITE_CLOSURES": 0,
+        }
     else:
-        lbfgs_history, best_state, best, stop_reason, lbfgs_calls = run_lbfgs_chunked(
+        lbfgs_history, best_state, best, stop_reason, lbfgs_counters = run_lbfgs_chunked(
             model=model,
             params=params,
             train=train_problem,
@@ -942,11 +1183,35 @@ def run_p_policy_iteration(
         )
     _restore_state(model, best_state)
     final = evaluate_problem(model, validation_problem)
+    if not final.get("all_finite", False):
+        return _reject(
+            "rejected_numerical",
+            "best_state_nonfinite_validation",
+            {"final_validation": final},
+        )
 
-    # 冻结策略残差 + 重新 Greedy 残差（独立固定 Validation）。
+    # 有效优化步骤：Adam 成功步 + L-BFGS 真实迭代（closure calls 不算）。
+    effective_steps = int(adam_steps_done) + int(
+        lbfgs_counters.get("LBFGS_ACTUAL_ITERATIONS", 0)
+    )
+    if effective_steps <= 0:
+        return _reject(
+            "rejected_no_effective_update",
+            "no_effective_optimizer_step",
+            {
+                "adam_steps": int(adam_steps_done),
+                "lbfgs_counters": dict(lbfgs_counters),
+            },
+        )
+
+    # 冻结策略残差 + 重新 Greedy 残差（独立固定 Validation/CRN）。
     fresh = fresh_greedy_residual(
         episode, model, teacher, validation_batches or train_batches, q_model=q_model
     )
+    if not fresh.get("all_finite", False):
+        return _reject(
+            "rejected_numerical", "fresh_greedy_nonfinite_final", fresh
+        )
 
     # Greedy BP drift: frozen iteration policy vs fresh greedy at the accepted
     # state, on every train batch.
@@ -981,6 +1246,57 @@ def run_p_policy_iteration(
     if sdf_hash_after != sdf_hash_before:
         raise RuntimeError("P policy iteration mutated the frozen SDF/FC1 model")
 
+    # --- 接受判定（复用既有 best-checkpoint 语义：无既有退化门槛，不引入
+    # 新的经济收敛阈值）。accepted_improved = 合法候选在固定 Validation 上
+    # 取得有效改善；否则恢复迭代起点模型并标记 accepted_reverted。
+    initial_mae = (
+        float(initial["normalized_mae"]) if initial.get("all_finite") else float("nan")
+    )
+    final_mae = float(final["normalized_mae"])
+    frozen_improved = (
+        math.isfinite(initial_mae)
+        and math.isfinite(final_mae)
+        and final_mae < initial_mae
+    )
+    fresh_initial_combined = 0.5 * (
+        float(fresh_initial.get("fresh_greedy_p0_norm_mae", float("nan")))
+        + float(fresh_initial.get("fresh_greedy_pi_norm_mae", float("nan")))
+    )
+    fresh_final_combined = 0.5 * (
+        float(fresh.get("fresh_greedy_p0_norm_mae", float("nan")))
+        + float(fresh.get("fresh_greedy_pi_norm_mae", float("nan")))
+    )
+    fresh_worsened = (
+        math.isfinite(fresh_initial_combined)
+        and math.isfinite(fresh_final_combined)
+        and fresh_final_combined > fresh_initial_combined
+    )
+    fresh_regression_observed = bool(frozen_improved and fresh_worsened)
+
+    if frozen_improved:
+        status = "accepted_improved"
+        rollback = {
+            "restored_iteration_start_state": False,
+            "kept_best_validation_state": True,
+            "rng_restored": False,
+        }
+    else:
+        # 候选未改善：恢复上一合法模型（迭代起点），不得计为成功 P 更新。
+        _restore_state(model, start_state)
+        _restore_rng()
+        if _module_state_hash(model) != start_model_hash:
+            raise RuntimeError("P revert failed to restore the model hash")
+        if episode._params_content_hash(params) != start_p_hash:
+            raise RuntimeError("P revert failed to restore the P-only hash")
+        status = "accepted_reverted"
+        rollback = {
+            "restored_iteration_start_state": True,
+            "kept_best_validation_state": False,
+            "rng_restored": True,
+            "model_hash_verified": True,
+            "p_root_hash_verified": True,
+        }
+
     elapsed = time.perf_counter() - started
     peak_memory = None
     if device.type == "cuda":
@@ -990,10 +1306,18 @@ def run_p_policy_iteration(
     summary: Dict[str, Any] = {
         "inner_index": int(inner_index),
         "iteration_index": int(iteration_index),
-        "status": "accepted",
+        "status": status,
+        "effective_optimizer_steps": int(effective_steps),
         "optimizer_steps": int(adam_steps_done),
         "adam_steps": int(adam_steps_done),
-        "lbfgs_closure_calls": int(lbfgs_calls),
+        "lbfgs_closure_calls": int(lbfgs_counters.get("LBFGS_CLOSURE_CALLS", 0)),
+        "lbfgs_iteration_budget": int(lbfgs_counters.get("LBFGS_ITERATION_BUDGET", 0)),
+        "lbfgs_actual_iterations": int(
+            lbfgs_counters.get("LBFGS_ACTUAL_ITERATIONS", 0)
+        ),
+        "lbfgs_nonfinite_closures": int(
+            lbfgs_counters.get("LBFGS_NONFINITE_CLOSURES", 0)
+        ),
         "lbfgs_optimizer_budget": int(lbfgs_max_iter),
         "stop_reason": stop_reason,
         "frozen_policy_p0_residual": {
@@ -1009,9 +1333,23 @@ def run_p_policy_iteration(
         "initial_frozen_policy_residual": {
             "p0_mae": initial["p0_norm_mae"],
             "pi_mae": initial["pi_norm_mae"],
-            "normalized_mae": initial["normalized_mae"],
+            "normalized_mae": initial_mae,
+        },
+        "validation_finiteness": {
+            "initial_all_finite": bool(initial.get("all_finite")),
+            "final_all_finite": bool(final.get("all_finite")),
+            "final_nonfinite_count": int(final.get("nonfinite_count", 0)),
+            "final_n_total": int(final.get("n_total", 0)),
         },
         "fresh_greedy_residual": fresh,
+        "fresh_greedy_initial": fresh_initial,
+        "frozen_residual_improved": bool(frozen_improved),
+        "fresh_greedy_worsened": bool(fresh_worsened),
+        "fresh_greedy_regression_observed": fresh_regression_observed,
+        # Frozen 改善但 Fresh Greedy 恶化时不得宣称完整 Bellman 不动点改善。
+        "full_bellman_fixed_point_improvement": bool(
+            frozen_improved and not fresh_worsened
+        ),
         "function_drift": {
             "p0_output_mean_abs": drift_p0,
             "pi_output_mean_abs": drift_pi,
@@ -1033,7 +1371,10 @@ def run_p_policy_iteration(
         "module_hashes": {
             "q_params": q_hash_after,
             "sdf_fc1": sdf_hash_after,
+            "model": _module_state_hash(model),
+            "p_root": episode._params_content_hash(params),
         },
+        "rollback": rollback,
         "p_scope_modules": ["value_encoder", "v0_head", "vi_head"],
         "elapsed_seconds": float(elapsed),
         "peak_gpu_memory_bytes": peak_memory,

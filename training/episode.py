@@ -11674,11 +11674,35 @@ class Episode:
         if iterations < 1:
             raise ValueError("p_policy_iterations_per_inner must be at least 1")
         model = self.models["policy_value"]
+        # --- Current-Q snapshot（Prompt §3）：每个 Firm Inner 开始时读取当前
+        # 已接受的 Online Q，冻结 Snapshot 并做哈希一致性校验；本 Inner 的 3
+        # 次 P Policy Iteration 共享该 Snapshot，绝不使用旧 Firm Target 的 Q。
+        frozen_q = deepcopy(model).to(self.device)
+        frozen_q.eval()
+        frozen_q.requires_grad_(False)
+        q_hash_online = self._params_content_hash(
+            self._policy_value_stage_params("q")
+        )
+        snapshot_q_params = self._unique_params(
+            [
+                getattr(frozen_q, "q_encoder", None),
+                getattr(frozen_q, "q_head", None),
+            ]
+        )
+        q_hash_snapshot = self._params_content_hash(snapshot_q_params)
+        if q_hash_snapshot != q_hash_online:
+            raise RuntimeError(
+                "current-Q snapshot hash mismatch: snapshot="
+                f"{q_hash_snapshot} online={q_hash_online}"
+            )
         bp_params = self._policy_value_stage_params("bp")
         bp_snapshot = self._snapshot_params(bp_params)
         records: List[Dict[str, Any]] = []
         total_optimizer_steps = 0
         total_lbfgs_calls = 0
+        successful_iterations = 0
+        reverted_iterations: List[int] = []
+        rejected_iterations: List[Dict[str, Any]] = []
         try:
             for iteration_index in range(1, iterations + 1):
                 summary = frozen_policy_p_solver.run_p_policy_iteration(
@@ -11686,7 +11710,7 @@ class Episode:
                     model,
                     train_batches=train_batches,
                     validation_batches=validation_batches,
-                    q_model=q_model,
+                    q_model=frozen_q,
                     inner_index=int(inner_index),
                     iteration_index=int(iteration_index),
                     adam_steps=int(
@@ -11714,30 +11738,53 @@ class Episode:
                     ),
                 )
                 records.append(summary)
-                total_optimizer_steps += int(summary["optimizer_steps"])
-                total_lbfgs_calls += int(summary["lbfgs_closure_calls"])
+                total_optimizer_steps += int(summary.get("optimizer_steps", 0))
+                total_lbfgs_calls += int(summary.get("lbfgs_closure_calls", 0))
+                iteration_status = str(summary.get("status"))
+                if iteration_status == "accepted_improved":
+                    successful_iterations += 1
+                elif iteration_status == "accepted_reverted":
+                    reverted_iterations.append(int(iteration_index))
+                elif iteration_status.startswith("rejected"):
+                    rejected_iterations.append(
+                        {
+                            "iteration_index": int(iteration_index),
+                            "status": iteration_status,
+                            "failure_kind": summary.get("failure_kind"),
+                        }
+                    )
+                    # 拒绝的迭代已回滚到合法状态；为数值安全，本 Inner 的剩余
+                    # 迭代不再继续，避免在异常数值区域反复求解。
+                    break
                 logger.info(
-                    "Frozen-policy P iteration inner=%d iter=%d | "
-                    "frozen_p0_mae=%.5f frozen_pi_mae=%.5f fresh_p0_mae=%.5f "
-                    "fresh_pi_mae=%.5f adam_steps=%d lbfgs_calls=%d stop=%s",
+                    "Frozen-policy P iteration inner=%d iter=%d | status=%s "
+                    "frozen_p0_mae=%.5f frozen_pi_mae=%.5f "
+                    "fresh_p0_mae=%.5f fresh_pi_mae=%.5f adam_steps=%d "
+                    "lbfgs_iters=%d/%d stop=%s",
                     int(inner_index),
                     int(iteration_index),
-                    summary["frozen_policy_p0_residual"]["mae"],
-                    summary["frozen_policy_pi_residual"]["mae"],
-                    summary["fresh_greedy_residual"].get(
+                    iteration_status,
+                    summary.get("frozen_policy_p0_residual", {}).get(
+                        "mae", float("nan")
+                    ),
+                    summary.get("frozen_policy_pi_residual", {}).get(
+                        "mae", float("nan")
+                    ),
+                    summary.get("fresh_greedy_residual", {}).get(
                         "fresh_greedy_p0_norm_mae", float("nan")
                     ),
-                    summary["fresh_greedy_residual"].get(
+                    summary.get("fresh_greedy_residual", {}).get(
                         "fresh_greedy_pi_norm_mae", float("nan")
                     ),
-                    int(summary["optimizer_steps"]),
-                    int(summary["lbfgs_closure_calls"]),
-                    summary["stop_reason"],
+                    int(summary.get("adam_steps", 0)),
+                    int(summary.get("lbfgs_actual_iterations", 0)),
+                    int(summary.get("lbfgs_iteration_budget", 0)),
+                    summary.get("stop_reason"),
                 )
         except Exception as exc:
             logger.exception("frozen-policy P stage failed")
             return {
-                "status": "failed_p_policy_iteration",
+                "status": "rejected_numerical",
                 "p_solver": "frozen_policy_dynamic_residual",
                 "p_policy_iterations": records,
                 "optimizer_steps": total_optimizer_steps,
@@ -11746,28 +11793,45 @@ class Episode:
             }
         if self._param_max_change_from_snapshot(bp_params, bp_snapshot) != 0.0:
             raise RuntimeError("frozen-policy P stage changed BP policy parameters")
+
+        # --- 阶段状态语义（Prompt 2.6）：失败/回退绝不改写为 accepted。
+        if rejected_iterations:
+            stage_status = str(rejected_iterations[0]["status"])
+        elif successful_iterations == 0 and reverted_iterations:
+            stage_status = "accepted_reverted"
+        elif reverted_iterations:
+            stage_status = "accepted_with_reverts"
+        elif successful_iterations == 0:
+            stage_status = "rejected_no_effective_update"
+        else:
+            stage_status = "accepted"
         return {
-            "status": "accepted",
+            "status": stage_status,
             "p_solver": "frozen_policy_dynamic_residual",
             "p_policy_iterations": records,
             "p_policy_iteration_count": len(records),
             "p_policy_iterations_requested": iterations,
+            "successful_p_policy_iterations": successful_iterations,
+            "accepted_reverted_iterations": reverted_iterations,
+            "rejected_iterations": rejected_iterations,
+            "current_q_snapshot_hash": q_hash_snapshot,
+            "current_q_online_hash": q_hash_online,
             "optimizer_steps": total_optimizer_steps,
             "lbfgs_closure_calls": total_lbfgs_calls,
-            "accepted_epochs": len(records),
-            "rejected_epochs": 0,
+            "accepted_epochs": successful_iterations,
+            "rejected_epochs": len(rejected_iterations),
             "best_epoch": records[-1]["iteration_index"] if records else None,
             "target_update_count": 0,
             "final_frozen_policy_residual": (
                 {
-                    "p0": records[-1]["frozen_policy_p0_residual"],
-                    "pi": records[-1]["frozen_policy_pi_residual"],
+                    "p0": records[-1].get("frozen_policy_p0_residual"),
+                    "pi": records[-1].get("frozen_policy_pi_residual"),
                 }
                 if records
                 else {}
             ),
             "final_fresh_greedy_residual": (
-                records[-1]["fresh_greedy_residual"] if records else {}
+                records[-1].get("fresh_greedy_residual") if records else {}
             ),
         }
 
@@ -11961,7 +12025,15 @@ class Episode:
                     inner_cycles=inner_cycles,
                 )
                 pq_summary.update(p_eta_balance_summary)
-                if pq_summary.get("status") != "accepted":
+                # Hybrid P stage 的合法完成状态包含回退（模型已恢复到合法
+                # 状态）；rejected_* 一律中止整个 staged 阶段，绝不改写为
+                # accepted。
+                pq_ok_statuses = {
+                    "accepted",
+                    "accepted_with_reverts",
+                    "accepted_reverted",
+                }
+                if pq_summary.get("status") not in pq_ok_statuses:
                     _restore_full_staged_start()
                     self._last_policy_value_stage_summary = {
                         "policy_value_training_flow": "staged",
@@ -12242,7 +12314,7 @@ class Episode:
                 self._policy_value_component_hashes()
             )
             stages_successful = (
-                pq_summary.get("status") == "accepted"
+                pq_summary.get("status") in pq_ok_statuses
                 and q_summary.get("status") in q_soft_accept_statuses
                 and bp_summary.get("status") in {
                     "accepted",

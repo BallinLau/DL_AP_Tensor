@@ -263,3 +263,97 @@ def test_strict_global_no_root_persists_per_path_audit(tmp_path, patch_evaluator
     assert statuses[3] == "NO_ROOT_NO_SIGN_CHANGE_IN_SUPPORT"
     failed = [record for record in audit["results"] if record["path"] in (1, 3)]
     assert all(record["failure_reason"] for record in failed)
+
+
+# --- Test A: Root Negative Residual（Prompt H1-H5） --------------------------
+
+def test_H1_large_negative_residual_rejected():
+    # H1: G_norm=-0.2, tolerance=1e-5 必须拒绝（带符号比较会错误通过）。
+    assert stp._candidate_residual_accepted(-0.2, 1e-5) is False
+
+
+def test_H2_large_positive_residual_rejected():
+    # H2: G_norm=+0.2 必须拒绝。
+    assert stp._candidate_residual_accepted(0.2, 1e-5) is False
+
+
+def test_H3_small_negative_residual_accepted():
+    # H3: G_norm=-5e-6, tolerance=1e-5 可以接受。
+    assert stp._candidate_residual_accepted(-5e-6, 1e-5) is True
+    # NaN/Inf 一律拒绝。
+    assert stp._candidate_residual_accepted(float("nan"), 1e-5) is False
+    assert stp._candidate_residual_accepted(float("inf"), 1e-5) is False
+    assert stp._candidate_residual_accepted(float("-inf"), 1e-5) is False
+
+
+def test_H4_near_belief_large_negative_candidate_cannot_shadow_valid_root(
+    tmp_path, patch_evaluators, monkeypatch
+):
+    """候选 A（大负残差、近 belief）必须被拒绝，B（严格容差、远）必须被选中。"""
+    import sys as _sys_mod
+
+    monkeypatch.setitem(
+        _sys_mod.modules[__name__].PATH_ECONOMICS,
+        0,
+        {
+            "regions": [
+                (-0.8, 0.35, 1, 0),      # 真根 B: 2*exp(h)=0.35 -> h=-1.743
+                (0.5, -196.7, 2, 0),     # h<0.5 侧 G 很大为正
+                (float("inf"), 20.0, 3, 2),  # h>=0.5 侧 G 为负 -> 跳变伪候选 A
+            ],
+            "floor": False,
+        },
+    )
+    sim = _sim(tmp_path, 1, [0.3])
+    state = _state(sim)
+    diagnostics = stp._calibrate_initial_hstar_batched(sim, state)
+
+    assert diagnostics["success_count"] == 1
+    audit = json.loads(
+        (Path(tmp_path) / "initial_hstar_audit_4.json").read_text(encoding="utf-8")
+    )
+    record = audit["results"][0]
+    assert record["terminal_status"] == "ROOT_FOUND"
+    # B 不能被 A 遮蔽：唯一合法根是 B。
+    assert record["root_count"] == 1
+    assert record["selected_root"] == pytest.approx(-1.7430, abs=1e-2)
+    assert record["selected_root"] < -1.0
+    # A（跳变伪候选）被明确拒绝并记录原因。
+    assert any(
+        "RESIDUAL" in reason or "INFEASIBLE" in reason or "NONFINITE" in reason
+        for reason in record["candidate_rejection_reasons"]
+    )
+    assert float(state["hatcf"][0]) == pytest.approx(-1.7430, abs=1e-2)
+
+
+def test_H5_jump_sign_change_without_valid_root_is_not_root_found(
+    tmp_path, patch_evaluators, monkeypatch
+):
+    """正负端点符号变化仅来自跳跃不连续时，不得宣称 ROOT_FOUND。"""
+    import sys as _sys_mod
+
+    monkeypatch.setitem(
+        _sys_mod.modules[__name__].PATH_ECONOMICS,
+        0,
+        {
+            "regions": [
+                (0.5, -196.7, 2, 0),
+                (float("inf"), 20.0, 3, 2),
+            ],
+            "floor": False,
+        },
+    )
+    sim = _sim(tmp_path, 1, [0.3])
+    state = _state(sim)
+    with pytest.raises(RuntimeError, match="no valid clearing root"):
+        stp._calibrate_initial_hstar_batched(sim, state)
+    audit = json.loads(
+        (Path(tmp_path) / "initial_hstar_audit_4.json").read_text(encoding="utf-8")
+    )
+    record = audit["results"][0]
+    assert not record["terminal_status"].startswith("ROOT_FOUND")
+    assert record["terminal_status"].startswith("NO_ROOT")
+    # 带符号 bug 会让跳变伪候选通过验证并走到 FP64_REPLAY 失败分支；
+    # 修复后必须在候选验证阶段就被拒绝（ALL_CANDIDATES_REJECTED）。
+    assert record["failure_reason"] == "ALL_CANDIDATES_REJECTED"
+    assert record["valid_root_count"] == 0

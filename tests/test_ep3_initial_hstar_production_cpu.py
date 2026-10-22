@@ -160,6 +160,15 @@ def test_root_found_with_candidate_production_parity(tmp_path):
     assert diagnostics["production_raw_clearing_passed"] is True
     assert diagnostics["production_ledger_parity_passed"] is True
     assert diagnostics["production_firm_decision_parity_passed"] is True
+    t0 = diagnostics["t0_production_validation"]
+    assert t0["raw_clearing_passed"] is True
+    assert t0["production_ledger_parity_passed"] is True
+    if t0["floor_applied_root_count"] == 0:
+        # 无 Floor 时初始 Forecast 与 Calculated Macro 必须一致。
+        assert t0["initial_macro_match_passed"] is True
+        assert t0["initial_hatc_gap_max"] <= float(
+            diagnostics["production_strict_tolerance"]
+        )
     audit_file = Path(tmp_path) / "initial_hstar_audit_4.json"
     assert audit_file.is_file()
     audit = json.loads(audit_file.read_text(encoding="utf-8"))
@@ -185,8 +194,32 @@ def test_floor_flag_recorded_and_raw_clearing_unaffected(tmp_path):
     )
     record = audit["results"][0]
     assert record["terminal_status"] == "ROOT_FOUND"
-    # 大 floor 使 exported hatc_cal 使用 clamp 后的 C，但 raw 出清与审计仍成立。
-    assert diagnostics["floor_applied_root_count"] == 1
+    # Test F 三分语义：raw clearing 与账本 parity 合法，但 Floor 造成的
+    # Hatcf0 != Hatc_cal0 绝不能报告成 Initial Macro Match PASS。
+    t0 = diagnostics["t0_production_validation"]
+    assert t0["raw_clearing_passed"] is True
+    assert t0["production_ledger_parity_passed"] is True
+    assert t0["initial_macro_match_passed"] is False
+    assert t0["initial_macro_floor_explained_count"] == 1
+    assert t0["initial_macro_unexplained_count"] == 0
+    assert t0["initial_hatc_gap_max"] > float(
+        diagnostics["production_strict_tolerance"]
+    )
+    assert t0["floor_applied_root_count"] == 1
+    # 逐 Path 审计：Floor Flag、Hatcf0、Hatc_cal0、差值与合法性分类。
+    per_path = t0["per_path"][0]
+    assert per_path["floor_applied"] is True
+    assert per_path["initial_macro_classification"] == "FLOOR_EXPLAINED_MISMATCH"
+    assert abs(per_path["hatcf0"] - per_path["hatc_cal0"]) == per_path["hatc_gap"]
+    assert per_path["raw_clearing_passed"] is True
+    assert per_path["production_ledger_parity_passed"] is True
+    assert per_path["initial_macro_match_passed"] is False
+    # Audit 文件在正式 t0 Production 之后被真实账本重写。
+    assert "t0_production_validation" in audit
+    audit_path_record = audit["results"][0]
+    assert audit_path_record["initial_macro_classification"] == (
+        "FLOOR_EXPLAINED_MISMATCH"
+    )
 
 
 def test_no_root_raises_and_persists_audit(tmp_path):
