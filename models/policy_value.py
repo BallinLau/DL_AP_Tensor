@@ -578,15 +578,28 @@ class PolicyValueModel(nn.Module):
 
         V0_list = []
         VI_list = []
-        for i_val in simulated_i:
-            modified = firm_state.clone()
-            modified[:, SIMMODEL.I] = i_val.expand(batch_size)
-            V0_i, VI_i = self._value_outputs(modified)
-            V0_list.append(V0_i)
-            VI_list.append(VI_i)
+        # 批量 i-grid：保持旧语义（每个 i 只替换第 I 列、其余状态原样克隆），
+        # 但一次前向覆盖多行，消除逐 i 的 kernel launch；输出与逐 i 循环逐
+        # 元素一致（test_cal_phats_batched_parity 回归）。按行数分块限制峰值。
+        i_values = torch.as_tensor(
+            simulated_i, device=device, dtype=firm_state.dtype
+        ).reshape(-1)
+        n_i = int(i_values.numel())
+        state_dim = firm_state.size(-1)
+        max_rows = 262144
+        group = max(1, int(max_rows // max(batch_size, 1)))
+        for start in range(0, n_i, group):
+            chunk_i = i_values[start:start + group]
+            n_chunk = int(chunk_i.numel())
+            expanded = firm_state.unsqueeze(0).expand(n_chunk, batch_size, state_dim).clone()
+            expanded[:, :, SIMMODEL.I] = chunk_i.view(n_chunk, 1).expand(n_chunk, batch_size)
+            flat = expanded.reshape(n_chunk * batch_size, state_dim)
+            V0_flat, VI_flat = self._value_outputs(flat)
+            V0_list.append(V0_flat.reshape(n_chunk, batch_size, -1))
+            VI_list.append(VI_flat.reshape(n_chunk, batch_size, -1))
 
-        V0_stack = torch.stack(V0_list, dim=0)  # (n_i, batch, 1)
-        VI_stack = torch.stack(VI_list, dim=0)  # (n_i, batch, 1)
+        V0_stack = torch.cat(V0_list, dim=0)  # (n_i, batch, 1)
+        VI_stack = torch.cat(VI_list, dim=0)  # (n_i, batch, 1)
         max_vals = torch.max(V0_stack, VI_stack)
         Phat = max_vals.mean(dim=0)  # (batch, 1)
 

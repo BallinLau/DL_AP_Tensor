@@ -100,9 +100,19 @@ def test_cal_phats_uses_instance_i_grid_not_global_config(monkeypatch):
 
     model.cal_phats(states)
 
-    assert len(seen_i) == 3
-    grid = torch.stack([x[0] for x in seen_i]).reshape(-1)
-    assert torch.allclose(grid, torch.tensor([0.0, 0.15, 0.3]))
+    # cal_phats evaluates the i-grid in batched chunks; the number of
+    # _value_outputs calls is an implementation detail.  What must hold is
+    # that exactly the instance grid (3 points) is applied to every state row.
+    assert seen_i, "cal_phats must evaluate _value_outputs on the i-grid"
+    observed = torch.cat([chunk.reshape(-1) for chunk in seen_i]).sort().values
+    expected = (
+        torch.tensor([0.0, 0.15, 0.3])
+        .repeat_interleave(states.shape[0])
+        .sort()
+        .values
+    )
+    assert observed.shape == expected.shape
+    assert torch.allclose(observed, expected)
 
 
 def test_bellman_residual_scale_preserves_zero_and_normalizes():
