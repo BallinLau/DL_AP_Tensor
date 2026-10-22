@@ -126,6 +126,16 @@ class ShardStore:
         for shard in self.chunks():
             yield from shard['captures']
 
+    def diagnostic_chunks(self):
+        """Scalar ledgers only: no micro .pt deserialization for metrics."""
+        for name,digest in sorted(self.manifest['diagnostic_sidecars'].items()):
+            path=self.root/name
+            if Path(name).name!=name or file_hash(path)!=digest:raise ValueError('diagnostic metadata corruption')
+            meta=json.loads(path.read_text());csv=self.root/meta['rows_file']
+            if csv.name not in self.manifest['sidecars'] or file_hash(csv)!=self.manifest['sidecars'][csv.name]:
+                raise ValueError('diagnostic row corruption')
+            yield dict(rows=pd.read_csv(csv).to_dict('records'),parent_records=meta['parent_records'])
+
 
 def calibrate_exploration(sim,initial,*,cache,outer,economic,crn,provenance):
     """Original strict roots, path-local failure; never replace failed paths."""
@@ -185,8 +195,8 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
     if identity_path.exists() and json.loads(identity_path.read_text()) != provenance:
         raise ValueError('long-horizon model/CRN/horizon/root provenance mismatch')
     atomic_write_json(identity_path, provenance)
-    before = hashes(models); manifest = {}; sidecars={}; root_audits = [];initial_caches={}
-    terminations=[]
+    before = hashes(models); manifest = {}; sidecars={};diagnostic_sidecars={};root_audits = [];initial_caches={}
+    terminations=[];initial_records=[]
     n = len(bank['state']['x']); all_ids = bank['state']['transition_path_id'].tolist()
     source_specs={r['parent_id']:r for r in schedule['parents']}
     for start in range(0, n, parent_batch_size):
@@ -219,6 +229,7 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
             raise
         root_audits.extend(audit)
         if parents:node_diagnostics(state,parents,entry_attempted=False)
+        initial_records.extend(parents)
         if diagnostic_observer is not None:
             diagnostic_observer('INITIAL_PROCESSED',sim,state,parents,0,-1)
         if root_cache.exists():initial_caches[root_cache.name]=file_hash(root_cache)
@@ -364,6 +375,9 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
                 if frame.empty:frame=pd.DataFrame(columns=['split','parent_candidate_id','t','child_branch','economic_state_valid'])
                 temporary=sidecar.with_suffix('.csv.tmp');frame.to_csv(temporary,index=False);temporary.replace(sidecar)
             sidecars[sidecar.name]=file_hash(sidecar)
+            nodes=target.with_suffix('.nodes.json')
+            if not nodes.exists():atomic_write_json(nodes,dict(rows_file=sidecar.name,parent_records=saved['parent_records']))
+            diagnostic_sidecars[nodes.name]=file_hash(nodes)
             if sparse_terminal and (state is None or not good):
                 terminations.append(dict(batch_start=start,last_attempted_parent_time=time,
                     scheduled_suffix_parent_times=(stop-start)*(horizon-time-1),
@@ -372,10 +386,16 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
     if hashes(models)!=before:
         raise RuntimeError('long-horizon simulation mutated frozen models')
     pd.DataFrame(root_audits).to_csv(output/'initial_hstar_audit.csv',index=False)
-    result=dict(provenance=provenance,shards=manifest,sidecars=sidecars,
+    initial_frame=pd.DataFrame(initial_records)
+    if initial_frame.empty:initial_frame=pd.DataFrame(columns=['parent_candidate_id','economic_state_valid'])
+    initial_frame.to_csv(output/'initial_observations.csv',index=False)
+    result=dict(provenance=provenance,shards=manifest,sidecars=sidecars,diagnostic_sidecars=diagnostic_sidecars,
         terminal_suffixes=terminations,scheduled_initial_parents=n,
+        initial_observations_sha256=file_hash(output/'initial_observations.csv'),
         initial_cache_sha256=initial_caches,
         scheduled_parent_times=n*horizon,scheduled_child_rows=branches*n*horizon,
-        real_root_feasibility='PASS' if initial_mode=='ROOT_CONSISTENT' else 'NOT_CLAIMED',training_performed=False)
+        real_root_feasibility=('PASS' if all(a.get('root_found',False) for a in root_audits) else
+            'ROOT_FAILURES_RECORDED_NO_REPLACEMENT') if initial_mode=='ROOT_CONSISTENT' else 'NOT_CLAIMED',
+        training_performed=False)
     atomic_write_json(output/'manifest.json',result)
     return ShardStore(output)

@@ -95,7 +95,7 @@ def beta_values(family,n,rng,cfg):
     return np.where(high,rng.beta(*cfg.beta_parameters[2],n),rng.beta(*cfg.beta_parameters[0],n))
 
 
-def propose_beta_batch(reference_bank,*,start,count,outer,cfg):
+def propose_beta_batch(reference_bank,*,start,count,outer,cfg,design_points=None):
     """Vectorized exogenous draws with original calibrated stationary laws.
 
     Use the existing immutable initial Bank layout and relative capital weights.
@@ -119,7 +119,7 @@ def propose_beta_batch(reference_bank,*,start,count,outer,cfg):
     specs=[];bs=[]
     for j,index in enumerate(ids.tolist()):
         rng=np.random.default_rng(cfg.seed+outer*100003+index*193)
-        family=cfg.families[index%len(cfg.families)]
+        family=cfg.families[index%len(cfg.families)] if design_points is None else cfg.families[min(len(cfg.families)-1,int(float(design_points[j,3])*len(cfg.families)))]
         bs.append(beta_values(family,N,rng,cfg))
         scale=cfg.k_scales[(index//len(cfg.families)+index)%len(cfg.k_scales)]
         q=cfg.x_quantiles[int(rng.integers(len(cfg.x_quantiles)))]
@@ -132,7 +132,8 @@ def propose_beta_batch(reference_bank,*,start,count,outer,cfg):
             source_pool_fingerprint=stable_json_hash(dict(generator=VERSION,config=asdict(cfg))),coverage_family=family,
             sampling_weight=1.,reuse_count=1,base_source_parent=int(base['transition_path_id'][indices[j]]),
             K_scale=scale,K_family='BOUNDED_LOG_TIERS',K_total_requested=total,
-            x_quantile=q,rank_mode=cfg.rank_modes[int(rng.integers(len(cfg.rank_modes)))],
+            x_quantile=q,rank_mode=(cfg.rank_modes[int(rng.integers(len(cfg.rank_modes)))] if design_points is None else
+                cfg.rank_modes[min(len(cfg.rank_modes)-1,int(float(design_points[j,4])*len(cfg.rank_modes)))]),
             child_shock_keys=[dict(path_id=int(pid[j]),economic_time=1,branch_id=b,
                 transition_seed=cfg.seed+11,entry_seed=cfg.seed+29) for b in (0,1)]))
     b=torch.tensor(np.array(bs),dtype=torch.float32)

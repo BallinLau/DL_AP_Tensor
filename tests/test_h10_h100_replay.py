@@ -50,6 +50,11 @@ def test_h50_v5_approval_is_rejected_before_loading():
     with pytest.raises(ValueError,match='H50 V5 forbidden'):require_approval(a,'fixture')
 
 
+def test_h100_branch_does_not_shadow_earlier_stage_hash_helpers():
+    from analysis.run_h10_h100_longrun_macro import H50Backend
+    assert 'module_hash' not in H50Backend._execute.__code__.co_varnames
+
+
 def test_mixture_shortfall_and_no_duplicates():
     coverage=rows(100,t=1);replay=rows(10,start=1000)
     f,a=select_mixture(coverage,replay,edges=fit_edges([coverage,replay]),target=40)
@@ -144,3 +149,31 @@ def test_runtime_configured_horizon_sparse_resume_and_columnar(monkeypatch,tmp_p
     r.generate_long_horizon_dataset({},e,bank,schedule,{},tmp_path,
         outer=12,stage='SYNTHETIC_INTERFACE_ONLY',horizon=horizon,branches=branches,capture=False)
     assert len(calls)==3
+    if horizon==10:
+        dense=r.generate_long_horizon_dataset({},e,bank,schedule,{},tmp_path/'dense',
+            outer=12,stage='SYNTHETIC_INTERFACE_ONLY',horizon=10,branches=2,capture=False,sparse_terminal=False)
+        dense_rows=pd.concat(list(dense.rows()),ignore_index=True)
+        a=raw.loc[raw.economic_state_valid].reset_index(drop=True)
+        b=dense_rows.loc[dense_rows.economic_state_valid].reset_index(drop=True)
+        for name in ('parent_candidate_id','t','child_branch','C_raw_t1','K_cal_t1','Hatc_cal_t1','LnK_cal_t1'):
+            np.testing.assert_allclose(a[name],b[name],rtol=0,atol=0)
+        assert len(dense.manifest['shards'])==10
+
+
+def test_h100_design_real_capital_and_disjoint_stratified_origins():
+    from test_entry_value_cost import _value_cost_sim
+    from data.simulate_ts_parallel import _initialize_batched_state
+    from data.finite_direct_h100_initial import design_initial
+    sim,_=_value_cost_sim();sim.group_size=200;state=_initialize_batched_state(sim,200)
+    reference=dict(state=state)
+    a,sa,ma=design_initial(reference,outer=12,mode='ROOT_CONSISTENT')
+    b,sb,mb=design_initial(reference,outer=12,mode='OFF_EQUILIBRIUM_INITIAL_BELIEF')
+    assert len(a['state']['x'])==len(b['state']['x'])==100
+    assert not set(ma['initial_ids'])&set(mb['initial_ids'])
+    torch.testing.assert_close(b['state']['K'].sum(1).log(),b['state']['lnkf'])
+    assert ((b['state']['hatcf']>=-6)&(b['state']['hatcf']<=2)).all()
+    assert len({s['coverage_family'] for s in sb['parents']})==7
+    assert len({s['rank_mode'] for s in sb['parents']})==5
+    assert ma['root_required'] and not mb['root_required']
+    again,_,_=design_initial(reference,outer=12,mode='OFF_EQUILIBRIUM_INITIAL_BELIEF')
+    assert again['fingerprint']==b['fingerprint']

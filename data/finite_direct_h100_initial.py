@@ -13,9 +13,9 @@ def design_initial(reference,*,outer,mode,seed=20261022,count=100):
     if mode not in ('ROOT_CONSISTENT','OFF_EQUILIBRIUM_INITIAL_BELIEF'):raise ValueError('invalid initial mode')
     offset=0 if mode=='ROOT_CONSISTENT' else 100
     cfg=replace(JointCoverageConfig(),seed=seed)
-    s,specs=propose_beta_batch(reference,start=offset,count=count,outer=outer,cfg=cfg)
-    if s['K'].shape[1]!=200:raise ValueError('H100 requires 200 firms')
     points=torch.quasirandom.SobolEngine(5,scramble=True,seed=seed+outer+offset).draw(count).double()
+    s,specs=propose_beta_batch(reference,start=offset,count=count,outer=outer,cfg=cfg,design_points=points)
+    if s['K'].shape[1]!=200:raise ValueError('H100 requires 200 firms')
     # No changed stationary marginal. Sobol coordinates select stationary x
     # quantiles, original seven b families/rank modes, and real capital scale.
     q=points[:,2].clamp(1e-9,1-1e-9)

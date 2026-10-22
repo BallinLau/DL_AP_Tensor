@@ -36,6 +36,13 @@ def broad_firm_bank(*args,**kwargs):
     return _broad_firm_bank(*args,**kwargs,time_boundaries=(3,7))
 
 
+def economic_metrics(store,schedule,*,outer,stage):
+    from types import SimpleNamespace
+    from analysis.h50_diagnostics import streaming_economic_metrics
+    return streaming_economic_metrics(SimpleNamespace(chunks=store.diagnostic_chunks,manifest=store.manifest),
+        schedule,outer=outer,stage=stage)
+
+
 def distinct_balanced_donors(bank):
     """Do not label repeated capture draws independent; keep bounded real rows.
 
@@ -230,6 +237,8 @@ class H50Backend(ProductionBackend):
             predecision_templates=templates,diagnostic_metadata=dict(
                 initial_bank_sha=(self._active_bank_ref['sha256'] if split=='train' else file_hash(self.args.sampling_dir/'validation_initial_bank.pt')),
                 coverage_config=asdict(self.coverage_cfg)))
+        from analysis.h10_h100_diagnostics import time_report
+        time_report(store).to_csv(path/'time_diagnostics.csv',index=False)
         # Heavy H50-specific plots/time bins are deliberately not on the
         # training critical path. Raw sidecars retain complete actual events.
         return store
@@ -321,11 +330,26 @@ class H50Backend(ProductionBackend):
             path=self.root/f'outer_{outer:03d}'/f'FC1_{i["macro"]}_mixture.csv'
             mixed.to_csv(path,index=False)
             atomic_write_json(path.with_suffix('.json'),dict(audit=audit,edges=edges,semantics='HISTORICAL_POLICY_MACRO_REPLAY_PLUS_CURRENT_COVERAGE'))
+            from analysis.h10_h100_diagnostics import coverage_report
+            atomic_write_json(path.with_name(path.stem+'_coverage.json'),
+                coverage_report(mixed,validation,coverage,replay,edges))
             self.state['longrun_fc1_samples'][key]=dict(path=str(path),sha256=file_hash(path))
         # Existing production FC1 implementation calls self._data; scope the
         # input adapter, never replace its loss/optimizer or validation.
         self._fc1_replay_key=key
-        try:return super()._fc1_epoch(outer,i)
+        try:
+            result=super()._fc1_epoch(outer,i)
+            if i['epoch'] in (1,40) or self.state['fc1_progress'][key]['stopped']:
+                from analysis.h10_h100_diagnostics import by_bin_errors
+                from analysis.run_fc1_self_consistent_macro import xy,predictions
+                frames=[]
+                for split in ('train','validation'):
+                    X,_,f=xy(self._data(outer,i['macro'],split),self.episode.device)
+                    frames.append(by_bin_errors(f,predictions(self.models['sdf_fc1'],X).cpu().numpy(),
+                        self.state['fc1_locked_edges'],split))
+                pd.concat(frames,ignore_index=True).to_csv(self.root/f'outer_{outer:03d}'/
+                    f'FC1_{i["macro"]}_epoch{i["epoch"]}_bin_errors.csv',index=False)
+            return result
         finally:self._fc1_replay_key=None
 
     def _sdf_chunk(self,outer,chunk):
@@ -361,7 +385,7 @@ class H50Backend(ProductionBackend):
                 children={'validation':children.payload()}))
             self.state['probe_bank']=dict(path=str(path),sha256=file_hash(path))
             return dict(optimizer_steps=0,evaluation='NEW_H50_OPERATOR_BASELINE_BEFORE_FIRST_FIRM_UPDATE',
-                economic_metrics=streaming_economic_metrics(store,self.schedules['validation'],outer=outer,stage='BASELINE'),
+                economic_metrics=economic_metrics(store,self.schedules['validation'],outer=outer,stage='BASELINE'),
                 fixed_probe_residual=self._cross(outer,label='initial_baseline'))
         if kind=='outer_start':
             if outer>12:
@@ -406,7 +430,7 @@ class H50Backend(ProductionBackend):
                 result[split]=dict(optimizer_subset_rows=len(frame),evaluation_scope='BOUNDED_TIME_STRATIFIED_SUBSET',
                     metrics=evaluate(self.models['sdf_fc1'],frame,self.episode.device),
                     scheduled_parent_times=manifest['scheduled_parent_times'])
-                result['economic_metrics'].extend(streaming_economic_metrics(ShardStore(path),self.schedules[split],
+                result['economic_metrics'].extend(economic_metrics(ShardStore(path),self.schedules[split],
                     outer=outer,stage=f'D{version}'))
             if version==0:result['pre_macro_firm_residual']=self._cross(outer,label='pre_macro')
             return result
@@ -416,7 +440,7 @@ class H50Backend(ProductionBackend):
             from analysis.h50_diagnostics import streaming_economic_metrics
             return dict(optimizer_steps=0,manifest=str(store.root/'manifest.json'),
                         evaluation='POST_SDF_VALIDATION_RESIMULATION',
-                        economic_metrics=streaming_economic_metrics(store,self.schedules['validation'],
+                        economic_metrics=economic_metrics(store,self.schedules['validation'],
                             outer=outer,stage='POST_SDF_VALIDATION_RESIMULATION'))
         if kind=='EMPIRICAL_POOL_COMMIT':
             store=self._store(outer,'POST_SDF_TRAIN_EMPIRICAL_SOURCE','train',capture=False,templates=True)
@@ -429,6 +453,8 @@ class H50Backend(ProductionBackend):
             checkpoint=directory/'outer_complete.pt'
             if not checkpoint.exists():raise ValueError('H100 requires committed Outer model')
             set_scope(self.models,'frozen');before=hashes(self.models)
+            if before!=self.state['outer_metrics'][str(outer)]['committed_hashes']:
+                raise ValueError('H100 must freeze the just-committed complete Outer')
             stores=[];design=[]
             for mode in ('ROOT_CONSISTENT','OFF_EQUILIBRIUM_INITIAL_BELIEF'):
                 bank,schedule,meta=design_initial(self.initial_train,outer=outer,mode=mode)
@@ -447,8 +473,9 @@ class H50Backend(ProductionBackend):
                     directory/'longrun'/mode,outer=outer,stage='POST_OUTER_H100',horizon=100,branches=1,
                     capture=False,initial_mode=mode,parent_batch_size=self.args.parent_batch_size)
                 stores.append(store)
+                from analysis.h10_h100_diagnostics import time_report
+                time_report(store).to_csv(store.root/'time_diagnostics.csv',index=False)
             if hashes(self.models)!=before:raise ValueError('H100 mutated model')
-            from analysis.nested_equilibrium_utils import module_hash
             model_hashes=dict(firm=before['firm'],fc1=module_hash(self.models['sdf_fc1'].fc1_model),sdf=before['sdf'])
             path=directory/'longrun_pool'
             result=commit_pool(stores,path,source_outer=outer,model_hashes=model_hashes,
