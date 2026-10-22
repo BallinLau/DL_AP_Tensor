@@ -134,7 +134,8 @@ def cells(frame,edges):
     return np.stack(output,axis=1)
 
 
-def select_mixture(coverage,replay,*,edges,seed=20261022,target=4096,lineage_cap_fraction=.05):
+def select_mixture(coverage,replay,*,edges,seed=20261022,target=4096,lineage_cap_fraction=.05,
+                   on_policy_fraction=.5):
     coverage=legal(coverage);replay=legal(replay) if len(replay) else replay.copy()
     if len(replay) and ((replay.t-1<20).any() or (replay.child_branch!=0).any()):
         raise ValueError('invalid historical single-spine replay')
@@ -156,7 +157,9 @@ def select_mixture(coverage,replay,*,edges,seed=20261022,target=4096,lineage_cap
         descriptors=descriptors.sort_values(['_rank','_random'])
         groups[name]=[g for g in descriptors.to_dict('records')]
         sources[name]=f
-    long_target=min(target//2,len(groups['LONGRUN']))
+    if not 0<=float(on_policy_fraction)<=1:raise ValueError('on_policy_fraction must be in [0,1]')
+    if target<1:raise ValueError('target must be positive')
+    long_target=min(int(round(target*float(on_policy_fraction))),len(groups['LONGRUN']))
     requests={'LONGRUN':long_target,'COVERAGE':target-long_target}
     for name in ('LONGRUN','COVERAGE'):
         counts={};bin_counts={};selected=[];limit=max(1,int(np.ceil(target*lineage_cap_fraction)))
