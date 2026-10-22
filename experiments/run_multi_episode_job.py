@@ -704,6 +704,54 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum bisection iterations for the t=0 h-star root",
     )
+    parser.add_argument(
+        "--initial-hstar-coarse-points",
+        type=int,
+        default=None,
+        help="STRICT_GLOBAL coarse support scan points",
+    )
+    parser.add_argument(
+        "--initial-hstar-refinement-points",
+        type=int,
+        default=None,
+        help="STRICT_GLOBAL refinement grid points per round",
+    )
+    parser.add_argument(
+        "--initial-hstar-max-refinement-rounds",
+        type=int,
+        default=None,
+        help="STRICT_GLOBAL refinement round budget",
+    )
+    parser.add_argument(
+        "--initial-hstar-support-lower",
+        type=float,
+        default=None,
+        help="STRICT_GLOBAL declared support lower bound",
+    )
+    parser.add_argument(
+        "--initial-hstar-support-upper",
+        type=float,
+        default=None,
+        help="STRICT_GLOBAL declared support upper bound",
+    )
+    parser.add_argument(
+        "--initial-hstar-width-tolerance",
+        type=float,
+        default=None,
+        help="STRICT_GLOBAL terminal bracket width",
+    )
+    parser.add_argument(
+        "--initial-hstar-audit-output-dir",
+        type=str,
+        default=None,
+        help="Optional per-path h-star audit JSON output directory",
+    )
+    parser.add_argument(
+        "--initial-hstar-audit-episode-id",
+        type=int,
+        default=None,
+        help="Episode id stamped into the h-star audit filename",
+    )
     parser.add_argument("--bp-distill-patience", type=int, default=None, help="BP distillation early-stop patience")
     parser.add_argument("--bp-distill-min-delta", type=float, default=None, help="BP distillation validation min delta")
     parser.add_argument(
@@ -1436,6 +1484,28 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.initial_hstar_max_iterations = (
             args.initial_hstar_max_iterations
         )
+    if args.initial_hstar_coarse_points is not None:
+        hyperparams.initial_hstar_coarse_points = args.initial_hstar_coarse_points
+    if args.initial_hstar_refinement_points is not None:
+        hyperparams.initial_hstar_refinement_points = (
+            args.initial_hstar_refinement_points
+        )
+    if args.initial_hstar_max_refinement_rounds is not None:
+        hyperparams.initial_hstar_max_refinement_rounds = (
+            args.initial_hstar_max_refinement_rounds
+        )
+    if args.initial_hstar_support_lower is not None:
+        hyperparams.initial_hstar_support_lower = args.initial_hstar_support_lower
+    if args.initial_hstar_support_upper is not None:
+        hyperparams.initial_hstar_support_upper = args.initial_hstar_support_upper
+    if args.initial_hstar_width_tolerance is not None:
+        hyperparams.initial_hstar_width_tolerance = args.initial_hstar_width_tolerance
+    if args.initial_hstar_audit_output_dir is not None:
+        hyperparams.initial_hstar_audit_output_dir = (
+            args.initial_hstar_audit_output_dir
+        )
+    if args.initial_hstar_audit_episode_id is not None:
+        hyperparams.initial_hstar_audit_episode_id = args.initial_hstar_audit_episode_id
     if args.bp_distill_patience is not None:
         hyperparams.bp_distill_patience = args.bp_distill_patience
     if args.bp_distill_min_delta is not None:
@@ -2339,6 +2409,24 @@ def main():
                     ),
                     "initial_hstar_max_iterations": (
                         hyperparams.initial_hstar_max_iterations
+                    ),
+                    "initial_hstar_coarse_points": (
+                        hyperparams.initial_hstar_coarse_points
+                    ),
+                    "initial_hstar_refinement_points": (
+                        hyperparams.initial_hstar_refinement_points
+                    ),
+                    "initial_hstar_max_refinement_rounds": (
+                        hyperparams.initial_hstar_max_refinement_rounds
+                    ),
+                    "initial_hstar_support_lower": (
+                        hyperparams.initial_hstar_support_lower
+                    ),
+                    "initial_hstar_support_upper": (
+                        hyperparams.initial_hstar_support_upper
+                    ),
+                    "initial_hstar_width_tolerance": (
+                        hyperparams.initial_hstar_width_tolerance
                     ),
                     "bp_distill_epochs": hyperparams.bp_distill_epochs,
                     "bp_distill_patience": hyperparams.bp_distill_patience,

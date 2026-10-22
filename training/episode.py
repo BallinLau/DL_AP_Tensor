@@ -1200,6 +1200,28 @@ class Episode:
         sim_kwargs["initial_hstar_max_iterations"] = int(
             getattr(self.hyperparams, "initial_hstar_max_iterations", 40)
         )
+        sim_kwargs["initial_hstar_coarse_points"] = int(
+            getattr(self.hyperparams, "initial_hstar_coarse_points", 10)
+        )
+        sim_kwargs["initial_hstar_refinement_points"] = int(
+            getattr(self.hyperparams, "initial_hstar_refinement_points", 20)
+        )
+        sim_kwargs["initial_hstar_max_refinement_rounds"] = int(
+            getattr(self.hyperparams, "initial_hstar_max_refinement_rounds", 4)
+        )
+        sim_kwargs["initial_hstar_support_lower"] = float(
+            getattr(self.hyperparams, "initial_hstar_support_lower", -8.0)
+        )
+        sim_kwargs["initial_hstar_support_upper"] = float(
+            getattr(self.hyperparams, "initial_hstar_support_upper", 2.0)
+        )
+        sim_kwargs["initial_hstar_width_tolerance"] = float(
+            getattr(self.hyperparams, "initial_hstar_width_tolerance", 1e-5)
+        )
+        sim_kwargs["initial_hstar_audit_output_dir"] = getattr(
+            self.hyperparams, "initial_hstar_audit_output_dir", None
+        )
+        sim_kwargs["initial_hstar_audit_episode_id"] = int(self.episode_id)
         source = self._simulation_bp_action_source()
         # The formal source is controlled only by HyperParams. This prevents a
         # stale caller-provided kwarg from silently switching a replay back to
@@ -11691,6 +11713,9 @@ class Episode:
             if self.firm_target is not None
             else None
         )
+        # 每个 Firm 阶段开始时清空本阶段诊断，避免把上一阶段（或上一
+        # Episode）的内层循环记录误报为本阶段产物。
+        self._firm_inner_cycle_diagnostics = None
         try:
             self._intermediate_stage_states = {}
             self._stage_component_hashes = {
@@ -11909,7 +11934,11 @@ class Episode:
                     ),
                     "p_stage_status": pq_summary.get("status"),
                     "q_stage_status": q_summary.get("status"),
+                    "p_optimizer_steps": pq_summary.get("optimizer_steps"),
+                    "p_accepted_epochs": pq_summary.get("accepted_epochs"),
+                    "q_optimizer_steps": q_summary.get("optimizer_steps"),
                     "sdf_fc1_hash": cycle_sdf_hash_before,
+                    "sdf_fc1_hash_after": cycle_sdf_hash_after,
                     "function_drift": self._state_dict_delta_norm(
                         cycle_start_state, cycle_end_state
                     ),
@@ -11931,15 +11960,18 @@ class Episode:
                 inner_cycle_diagnostics.append(cycle_record)
                 logger.info(
                     "Firm inner cycle %d/%d | p_status=%s, q_status=%s, "
-                    "p0_mean=%s, pi_mean=%s, q_mean=%s, drift_rel=%s",
+                    "p0_mean=%s, pi_mean=%s, q_mean=%s, drift_rel=%s, "
+                    "p_steps=%s, q_steps=%s",
                     cycle_index,
                     inner_cycles,
                     pq_summary.get("status"),
                     q_summary.get("status"),
-                    cycle_record["Inner%d_P0_residual"]["mean"],
-                    cycle_record["Inner%d_PI_residual"]["mean"],
-                    cycle_record["Inner%d_Q_residual"]["mean"],
+                    cycle_record[f"Inner{cycle_index}_P0_residual"]["mean"],
+                    cycle_record[f"Inner{cycle_index}_PI_residual"]["mean"],
+                    cycle_record[f"Inner{cycle_index}_Q_residual"]["mean"],
                     cycle_record["function_drift"]["relative"],
+                    cycle_record["p_optimizer_steps"],
+                    cycle_record["q_optimizer_steps"],
                 )
                 if cycle_index < inner_cycles:
                     # Gauss-Seidel refresh: the next cycle's P uses the Q that

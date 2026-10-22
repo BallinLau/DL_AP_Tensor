@@ -473,25 +473,275 @@ def _ensure_entry_state_fields(state: Dict[str, torch.Tensor]) -> None:
         )
 
 
-@torch.no_grad()
-def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dict:
-    """Solve the initial (t=0) macro clearing condition path-by-path.
+def _initial_hstar_gather_state(state: Dict[str, torch.Tensor], rows, device):
+    """Gather ``rows`` (path indices) out of a batched state for re-evaluation."""
+    from .state_bank import clone_state
 
-    ``G_t0(h) = exp(h) * K_ledger(h) - C_raw(h)`` is evaluated with the
-    unmodified production node operator on a private clone of the initial
-    state, so the authoritative ledger, the simulation state, and every RNG
-    stream remain untouched.  Because the production macro export is
-    ``Hatc_cal = log(C_raw / K_ledger)``, the root condition is equivalent to
-    ``Hatc_cal(h) - h = 0``.  Only t=0 is calibrated; later periods keep the
-    original FC1 forecast.
+    n_full = int(state["b"].shape[0])
+    gathered = {}
+    for name, value in state.items():
+        if (
+            torch.is_tensor(value)
+            and value.ndim > 0
+            and int(value.shape[0]) == n_full
+        ):
+            gathered[name] = value.index_select(0, rows)
+        else:
+            gathered[name] = value
+    return clone_state(gathered, device=device)
+
+
+@torch.no_grad()
+def _initial_hstar_evaluate_rows(
+    sim,
+    base_state: Dict[str, torch.Tensor],
+    rows,
+    h_rows: torch.Tensor,
+    *,
+    rng_cpu,
+    rng_cuda,
+    max_gather_depth: int = 8,
+    _depth: int = 0,
+    return_state: bool = False,
+):
+    """Evaluate the production t=0 node operator on gathered paths at h.
+
+    Returns ``(records, failures, ok_trial_or_none)`` aligned with ``rows``;
+    ``records[i]`` is None for paths the production operator rejects at this
+    candidate.  The base state and every RNG stream are restored, so candidate
+    evaluation can never consume production transition/entry randomness.
+
+    Clearing uses the RAW ledger: ``G(h) = exp(h) * accounting_K_total -
+    accounting_C_raw`` where ``accounting_C_raw`` is pre-consumption-floor.
     """
     from .state_bank import clone_state
 
     device = sim.device
+    n_local = int(rows.numel())
+    records: List[Optional[Dict[str, torch.Tensor]]] = [None] * n_local
+    failures: Dict[int, str] = {}
+
+    def _restore_rng() -> None:
+        torch.set_rng_state(rng_cpu)
+        if rng_cuda is not None:
+            torch.cuda.set_rng_state_all(rng_cuda)
+
+    _restore_rng()
+    trial = None
+    try:
+        trial = _initial_hstar_gather_state(base_state, rows, device)
+        trial["hatcf"] = h_rows.to(trial["hatcf"].dtype).reshape(-1)
+        _process_node_batched(sim, trial, 0, -1)
+    except (EntryEconomicInfeasibilityError, EntryAccountingError) as exc:
+        _restore_rng()
+        bad = getattr(exc, "bad_paths", None)
+        if not bad:
+            bad_local = set(range(n_local))
+        else:
+            bad_local = {
+                int(index) for index in bad if 0 <= int(index) < n_local
+            }
+        reason = f"{type(exc).__name__}:{str(exc)[:160]}"
+        for index in set(range(n_local)) & bad_local:
+            failures[index] = reason
+        ok_local = [index for index in range(n_local) if index not in bad_local]
+        if ok_local and _depth >= max_gather_depth:
+            for index in ok_local:
+                failures[index] = "MAX_GATHER_DEPTH"
+            ok_local = []
+        if ok_local:
+            ok_rows = rows[
+                torch.tensor(ok_local, device=device, dtype=torch.long)
+            ]
+            ok_h = h_rows[
+                torch.tensor(ok_local, device=device, dtype=torch.long)
+            ]
+            sub_records, sub_failures, sub_trial = _initial_hstar_evaluate_rows(
+                sim,
+                base_state,
+                ok_rows,
+                ok_h,
+                rng_cpu=rng_cpu,
+                rng_cuda=rng_cuda,
+                max_gather_depth=max_gather_depth,
+                _depth=_depth + 1,
+                return_state=return_state,
+            )
+            for offset in range(len(ok_local)):
+                records[ok_local[offset]] = sub_records[offset]
+                if sub_failures.get(offset) is not None:
+                    failures[ok_local[offset]] = sub_failures[offset]
+            if len(sub_failures) == 0 and return_state and sub_trial is not None:
+                trial = sub_trial
+        return records, failures, trial
+    finally:
+        _restore_rng()
+
+    if "accounting_K_total" not in trial or "accounting_C_raw" not in trial:
+        raise RuntimeError(
+            "initial h-star STRICT_GLOBAL requires the economic_node_ledger "
+            "accounting fields on the production t=0 operator"
+        )
+    alive = trial["alive"].to(torch.bool)
+    h_f32 = h_rows.to(torch.float32)
+    k = trial["accounting_K_total"].to(torch.float32)
+    c_raw = trial["accounting_C_raw"].to(torch.float32)
+    c_eff = trial.get("accounting_C_effective", c_raw).to(torch.float32)
+    floor_flag = trial.get(
+        "accounting_consumption_floor_applied",
+        torch.zeros_like(k, dtype=torch.bool),
+    ).to(torch.bool)
+    accounting_valid = trial.get(
+        "accounting_valid", torch.ones_like(k, dtype=torch.bool)
+    ).to(torch.bool)
+    resource_feasible = trial.get(
+        "accounting_resource_feasible",
+        torch.ones_like(k, dtype=torch.bool),
+    ).to(torch.bool)
+    resource_residual = trial.get(
+        "accounting_resource_residual", torch.full_like(k, float("nan"))
+    )
+    bar_i = trial.get("bar_i", torch.zeros_like(trial["b"])).to(torch.bool)
+    bar_z = trial.get("bar_z", torch.zeros_like(trial["b"])).to(torch.bool)
+    g = torch.exp(h_f32) * k - c_raw
+    scale = torch.maximum(
+        torch.ones_like(g), torch.maximum(c_raw.abs(), k.abs())
+    )
+    finite = (
+        torch.isfinite(g)
+        & torch.isfinite(c_raw)
+        & torch.isfinite(k)
+    )
+    feasible = (
+        finite
+        & accounting_valid
+        & resource_feasible
+        & (c_raw > 0.0)
+        & (k > 0.0)
+    )
+    n_firms = trial.get(
+        "accounting_n_firms", alive.to(torch.float32).sum(dim=1)
+    ).to(torch.float32)
+    entry_accepted = trial.get(
+        "event_accepted_count", torch.zeros_like(k)
+    ).to(torch.float32)
+    for index in range(n_local):
+        records[index] = {
+            "h": h_f32[index],
+            "G": g[index],
+            "G_norm": (g / scale)[index],
+            "C_raw": c_raw[index],
+            "C_eff": c_eff[index],
+            "K": k[index],
+            "floor_applied": floor_flag[index],
+            "finite": finite[index],
+            "feasible": feasible[index],
+            "accounting_valid": accounting_valid[index],
+            "resource_feasible": resource_feasible[index],
+            "resource_residual": resource_residual[index],
+            "n_firms": n_firms[index],
+            "inv_count": ((bar_i & alive).sum(dim=1))[index],
+            "def_count": ((bar_z & alive).sum(dim=1))[index],
+            "entry_accepted": entry_accepted[index],
+        }
+    return records, failures, trial
+
+
+def _initial_hstar_grid_evaluate(
+    sim,
+    base_state: Dict[str, torch.Tensor],
+    rows,
+    h_grid: torch.Tensor,
+    *,
+    rng_cpu,
+    rng_cuda,
+):
+    """Evaluate a ``[n_rows, H]`` per-row belief grid with the production t=0 operator.
+
+    Column ``j`` is one fully vectorized production node call using the
+    per-row beliefs ``h_grid[:, j]``: constant columns for the global coarse
+    scan, one ladder row per path for quotient refinement.  Returns a dict of
+    ``[n_rows, H]`` tensors plus per-column failure notes.
+    """
+    device = sim.device
+    n_rows, n_cols = int(h_grid.shape[0]), int(h_grid.shape[1])
+    columns = {name: [] for name in (
+        "G", "G_norm", "C_raw", "C_eff", "K", "feasible", "finite",
+        "floor_applied", "inv_count", "def_count", "entry_accepted",
+        "n_firms",
+    )}
+    numeric_names = {
+        "G", "G_norm", "C_raw", "C_eff", "K", "entry_accepted", "n_firms",
+    }
+    bool_names = {"feasible", "finite", "floor_applied"}
+    long_names = {"inv_count", "def_count"}
+    column_failures: List[Dict[int, str]] = []
+    for column in range(n_cols):
+        h_vec = h_grid[:, column].to(base_state["hatcf"].dtype)
+        records, failures, _ = _initial_hstar_evaluate_rows(
+            sim,
+            base_state,
+            rows,
+            h_vec,
+            rng_cpu=rng_cpu,
+            rng_cuda=rng_cuda,
+        )
+        packed = {
+            name: torch.full(
+                (n_rows,),
+                False if name in bool_names else (
+                    float("nan") if name in numeric_names else 0
+                ),
+                device=device,
+                dtype=(
+                    torch.bool
+                    if name in bool_names
+                    else (
+                        torch.long
+                        if name in long_names
+                        else torch.float32
+                    )
+                ),
+            )
+            for name in columns
+        }
+        for row_index, record in enumerate(records):
+            if record is None:
+                continue
+            for name in columns:
+                packed[name][row_index] = record[name]
+        for name in columns:
+            columns[name].append(packed[name])
+        column_failures.append(failures)
+    return {
+        name: torch.stack(columns[name], dim=1)
+        for name in columns
+    }, column_failures
+
+
+@torch.no_grad()
+def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dict:
+    """STRICT_GLOBAL initial (t=0) macro clearing on the production operator.
+
+    Only the root-search mathematics follows the verified b291c64
+    STRICT_GLOBAL controller (declared support scan, quotient refinement,
+    multi-root deduplication, closest-belief selection, float64 replay gate).
+    Every economic evaluation is the unmodified EP3 production t=0 node
+    operator, and the clearing condition is computed on the raw pre-floor
+    ledger instead of the exported ``hatc_cal``:
+
+        ``G(h) = exp(h) * accounting_K_total - accounting_C_raw``
+
+    Per-path failures (no root, non-finite candidate, economically infeasible
+    candidate, unresolved discontinuity, residual replay failure) are written
+    to a persistent audit file when ``initial_hstar_audit_output_dir`` is set;
+    the calibration then raises instead of fabricating a parent.
+    """
+    device = sim.device
     n_paths = int(sim.n_paths)
     alive = state["alive"].to(torch.bool)
-    K = state["K"].to(torch.float32)
-    capital = (K * alive.to(K.dtype)).sum(dim=1)
+    k_initial = state["K"].to(torch.float32)
+    capital = (k_initial * alive.to(k_initial.dtype)).sum(dim=1)
     finite_capital = torch.isfinite(capital) & (capital > 0.0)
     if not bool(finite_capital.all()):
         bad = torch.nonzero(~finite_capital, as_tuple=False).reshape(-1).tolist()
@@ -503,113 +753,556 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
     initial_belief = state["hatcf"].to(torch.float32).clone()
 
     tolerance = float(sim.initial_hstar_residual_tolerance)
+    inner_tolerance = tolerance * 0.5
     dtype = state["hatcf"].dtype
+    coarse_points = int(sim.initial_hstar_coarse_points)
+    refinement_points = int(sim.initial_hstar_refinement_points)
+    max_rounds = int(sim.initial_hstar_max_refinement_rounds)
+    support_lower = float(sim.initial_hstar_support_lower)
+    support_upper = float(sim.initial_hstar_support_upper)
+    width_tolerance = float(sim.initial_hstar_width_tolerance)
 
     rng_cpu = torch.get_rng_state()
     rng_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    full_rows = torch.arange(n_paths, device=device)
 
-    def evaluate(h: torch.Tensor):
-        # Root-candidate evaluation may exercise the entry operator, which
-        # draws from the global RNG. Preserve and restore every stream so the
-        # accepted simulation continues from its original CRN.
-        torch.set_rng_state(rng_cpu)
-        if rng_cuda is not None:
-            torch.cuda.set_rng_state_all(rng_cuda)
-        trial = clone_state(state, device=device)
-        trial["hatcf"] = h.to(dtype)
-        try:
-            _process_node_batched(sim, trial, 0, -1)
-        except EntryEconomicInfeasibilityError as exc:
-            raise RuntimeError(
-                "initial h-star candidate belief is economically infeasible on "
-                f"the production t=0 operator at h={h.tolist()[:20]}: {exc}"
-            ) from exc
-        except EntryAccountingError as exc:
-            raise RuntimeError(
-                "initial h-star candidate belief violates the production "
-                f"resource account at h={h.tolist()[:20]}: {exc}"
-            ) from exc
-        finally:
-            torch.set_rng_state(rng_cpu)
-            if rng_cuda is not None:
-                torch.cuda.set_rng_state_all(rng_cuda)
-        return trial["hatc_cal"].to(torch.float32) - h, trial
+    def _as_float(name: str, value) -> float:
+        return float(value) if value is not None else float("nan")
 
-    lo = initial_belief.clone()
-    hi = initial_belief.clone()
-    f_lo, _ = evaluate(lo)
-    f_hi = f_lo.clone()
-    bracket = (f_lo * f_hi) <= 0.0
-    expansions = 0
-    # The initial belief is the FC1 forecast, so the realized t=0 clearing rate
-    # is expected nearby. Widen symmetrically in small steps; candidates the
-    # production operator rejects are reported instead of being clipped.
-    for step in range(1, 9):
-        active = ~bracket
-        if not bool(active.any()):
-            break
-        width = 0.5 * float(step)
-        lo = torch.where(active, initial_belief - width, lo)
-        hi = torch.where(active, initial_belief + width, hi)
-        f_lo, _ = evaluate(lo)
-        f_hi, _ = evaluate(hi)
-        bracket = (f_lo * f_hi) <= 0.0
-        expansions = step
-    bracket = bracket & torch.isfinite(f_lo) & torch.isfinite(f_hi)
-    failed = ~bracket
-    if bool(failed.any()):
-        bad = torch.nonzero(failed, as_tuple=False).reshape(-1).tolist()
-        raise RuntimeError(
-            "initial h-star root is not bracketed on the production t=0 "
-            f"operator within +/-4 of the initial belief; "
-            f"paths={bad[:20]} (n={len(bad)}), "
-            f"f_low={f_lo[bad[:5]].tolist()}, f_high={f_hi[bad[:5]].tolist()}"
+    alpha_coarse = torch.linspace(
+        0.0, 1.0, coarse_points, device=device, dtype=initial_belief.dtype
+    )
+    grid = (
+        support_lower + (support_upper - support_lower) * alpha_coarse
+    )
+    h_grid = grid[None, :].expand(n_paths, -1)
+    coarse, _coarse_failures = _initial_hstar_grid_evaluate(
+        sim, state, full_rows, h_grid, rng_cpu=rng_cpu, rng_cuda=rng_cuda
+    )
+    evaluations = torch.full(
+        (n_paths,), coarse_points, device=device, dtype=torch.long
+    )
+    _coarse_failure_count = torch.zeros(
+        n_paths, device=device, dtype=torch.long
+    )
+    for column, failures in enumerate(_coarse_failures):
+        if not failures:
+            continue
+        rows_index = torch.tensor(
+            sorted(failures.keys()), device=device, dtype=torch.long
+        )
+        _coarse_failure_count.scatter_add_(
+            0,
+            rows_index,
+            torch.ones_like(rows_index),
         )
 
-    mid = (lo + hi) * 0.5
-    f_mid = torch.full_like(mid, float("nan"))
-    iterations = 0
-    for iterations in range(1, max(1, int(sim.initial_hstar_max_iterations)) + 1):
-        f_mid, _ = evaluate(mid)
-        if bool((f_mid.abs() <= tolerance).all()):
-            break
-        same_as_low = f_mid * f_lo > 0.0
-        lo = torch.where(same_as_low, mid, lo)
-        hi = torch.where(~same_as_low, mid, hi)
-        f_lo = torch.where(same_as_low, f_mid, f_lo)
-        f_hi = torch.where(~same_as_low, f_mid, f_hi)
-        mid = (lo + hi) * 0.5
-    residuals = f_mid.abs()
-    converged = torch.isfinite(residuals) & (residuals <= tolerance)
-    if not bool(converged.all()):
-        bad = torch.nonzero(~converged, as_tuple=False).reshape(-1).tolist()
-        raise RuntimeError(
-            "initial h-star root did not converge to the required tolerance; "
-            f"paths={bad[:20]} (n={len(bad)}), "
-            f"residual_max={float(residuals[bad].max()) if bad else 0.0}, "
-            f"tolerance={tolerance}"
+    candidate_parent: List[torch.Tensor] = []
+    candidate_h: List[torch.Tensor] = []
+    candidate_round: List[torch.Tensor] = []
+    candidate_jump: List[torch.Tensor] = []
+    candidate_prequalified: List[torch.Tensor] = []
+
+    exact = torch.nonzero(
+        coarse["feasible"] & (coarse["G_norm"].abs() <= inner_tolerance),
+        as_tuple=False,
+    )
+    if exact.numel():
+        candidate_parent.append(exact[:, 0])
+        candidate_h.append(h_grid[exact[:, 0], exact[:, 1]])
+        candidate_round.append(
+            torch.zeros(len(exact), device=device, dtype=torch.long)
+        )
+        candidate_jump.append(
+            torch.zeros(len(exact), device=device, dtype=torch.bool)
+        )
+        candidate_prequalified.append(
+            torch.ones(len(exact), device=device, dtype=torch.bool)
         )
 
-    state["hatcf"] = mid.to(state["hatcf"].dtype)
+    valid_sign = coarse["feasible"] | (
+        coarse["finite"] & (coarse["K"] > 0.0)
+    )
+    sign_flip = (
+        valid_sign[:, :-1]
+        & valid_sign[:, 1:]
+        & (
+            torch.signbit(coarse["G"][:, :-1])
+            != torch.signbit(coarse["G"][:, 1:])
+        )
+    )
+    crossings = torch.nonzero(sign_flip, as_tuple=False)
+    active_parent = crossings[:, 0] if crossings.numel() else torch.empty(
+        0, device=device, dtype=torch.long
+    )
+    active_left = (
+        h_grid[crossings[:, 0], crossings[:, 1]]
+        if crossings.numel()
+        else torch.empty(0, device=device, dtype=dtype)
+    )
+    active_right = (
+        h_grid[crossings[:, 0], crossings[:, 1] + 1]
+        if crossings.numel()
+        else torch.empty(0, device=device, dtype=dtype)
+    )
+    unresolved_discontinuity = torch.zeros(
+        n_paths, device=device, dtype=torch.bool
+    )
+    discontinuity_bracket_count = torch.zeros(
+        n_paths, device=device, dtype=torch.long
+    )
+    unresolved_bracket_count = torch.zeros(
+        n_paths, device=device, dtype=torch.long
+    )
+    alpha_refine = torch.linspace(
+        0.0, 1.0, refinement_points, device=device, dtype=dtype
+    )
+    for round_index in range(1, max_rounds + 1):
+        if active_parent.numel() == 0:
+            break
+        refine_grid = (
+            active_left[:, None]
+            + (active_right - active_left)[:, None] * alpha_refine[None, :]
+        )
+        refined, _refined_failures = _initial_hstar_grid_evaluate(
+            sim, state, active_parent, refine_grid,
+            rng_cpu=rng_cpu, rng_cuda=rng_cuda,
+        )
+        evaluations.scatter_add_(
+            0,
+            active_parent,
+            torch.full_like(active_parent, refinement_points),
+        )
+        with torch.no_grad():
+                feasible_residual = torch.where(
+                    refined["feasible"],
+                    refined["G_norm"].abs(),
+                    torch.full_like(refined["G_norm"], float("inf")),
+                )
+                best_residual, best_column = feasible_residual.min(dim=1)
+                small = best_residual <= inner_tolerance
+                if bool(small.any()):
+                    rows_small = torch.nonzero(small, as_tuple=False).reshape(-1)
+                    candidate_parent.append(active_parent[rows_small])
+                    candidate_h.append(
+                        refine_grid[rows_small, best_column[rows_small]]
+                    )
+                    candidate_round.append(
+                        torch.full(
+                            (len(rows_small),),
+                            round_index,
+                            device=device,
+                            dtype=torch.long,
+                        )
+                    )
+                    candidate_jump.append(
+                        torch.zeros(
+                            len(rows_small), device=device, dtype=torch.bool
+                        )
+                    )
+                    candidate_prequalified.append(
+                        torch.ones(
+                            len(rows_small), device=device, dtype=torch.bool
+                        )
+                    )
+                refined_valid = refined["feasible"] | (
+                    refined["finite"] & (refined["K"] > 0.0)
+                )
+                sub_flip = (
+                    refined_valid[:, :-1]
+                    & refined_valid[:, 1:]
+                    & (
+                        torch.signbit(refined["G"][:, :-1])
+                        != torch.signbit(refined["G"][:, 1:])
+                    )
+                )
+                sub = torch.nonzero(sub_flip, as_tuple=False)
+                if sub.numel():
+                    sub = sub[~small[sub[:, 0]]]
+                if sub.numel() == 0:
+                    unresolved_rows = active_parent[~small]
+                    unresolved_discontinuity[unresolved_rows] = True
+                    unresolved_bracket_count.scatter_add_(
+                        0,
+                        unresolved_rows,
+                        torch.ones_like(unresolved_rows),
+                    )
+                    active_parent = torch.empty(
+                        0, device=device, dtype=torch.long
+                    )
+                    break
+                represented = (
+                    torch.bincount(sub[:, 0], minlength=len(active_parent)) > 0
+                )
+                missing = (~small) & (~represented)
+                missing_rows = active_parent[missing]
+                unresolved_discontinuity[missing_rows] = True
+                unresolved_bracket_count.scatter_add_(
+                    0,
+                    missing_rows,
+                    torch.ones_like(missing_rows),
+                )
+                row = sub[:, 0]
+                col = sub[:, 1]
+                new_parent = active_parent[row]
+                new_left = refine_grid[row, col]
+                new_right = refine_grid[row, col + 1]
+                terminal = (
+                    (new_right - new_left <= width_tolerance)
+                    | (round_index == max_rounds)
+                )
+                if bool(terminal.any()):
+                    terminal_row = row[terminal]
+                    terminal_col = col[terminal]
+                    g0 = refined["G"][terminal_row, terminal_col]
+                    g1 = refined["G"][terminal_row, terminal_col + 1]
+                    x0 = new_left[terminal]
+                    x1 = new_right[terminal]
+                    proposed = x0 - g0 * (x1 - x0) / (g1 - g0)
+                    jump = (
+                        (refined["inv_count"][terminal_row, terminal_col]
+                         != refined["inv_count"][terminal_row, terminal_col + 1])
+                        | (refined["def_count"][terminal_row, terminal_col]
+                           != refined["def_count"][terminal_row, terminal_col + 1])
+                        | (
+                            refined["entry_accepted"][terminal_row, terminal_col]
+                            != refined["entry_accepted"][
+                                terminal_row, terminal_col + 1
+                            ]
+                        )
+                    )
+                    jump_rows = new_parent[terminal][jump]
+                    discontinuity_bracket_count.scatter_add_(
+                        0,
+                        jump_rows,
+                        torch.ones_like(jump_rows),
+                    )
+                    candidate_parent.append(new_parent[terminal])
+                    candidate_h.append(proposed)
+                    candidate_round.append(
+                        torch.full(
+                            (int(terminal.sum()),),
+                            round_index,
+                            device=device,
+                            dtype=torch.long,
+                        )
+                    )
+                    candidate_jump.append(jump)
+                    candidate_prequalified.append(
+                        torch.zeros(
+                            int(terminal.sum()),
+                            device=device,
+                            dtype=torch.bool,
+                        )
+                    )
+                keep = ~terminal
+                active_parent = new_parent[keep]
+                active_left = new_left[keep]
+                active_right = new_right[keep]
+
+    # --- Candidate verification: one production-operator batch over all
+    # proposed roots, then per-path dedup/selection in float64. ---
+    root_records: List[Dict] = [
+        {
+            "path": path,
+            "h_belief": _as_float("belief", initial_belief[path]),
+            "all_valid_roots": [],
+            "selected_root": None,
+            "root_count": 0,
+            "valid_root_count": 0,
+            "discontinuity_bracket_count": int(
+                discontinuity_bracket_count[path]
+            ),
+            "unresolved_bracket_count": int(unresolved_bracket_count[path]),
+            "coarse_evaluation_failure_count": int(_coarse_failure_count[path]),
+            "candidate_rejection_reasons": [],
+            "terminal_status": "NO_ROOT",
+            "failure_reason": None,
+        }
+        for path in range(n_paths)
+    ]
+    selected_h = torch.full(
+        (n_paths,), float("nan"), device=device, dtype=dtype
+    )
+    selected_norm = torch.full(
+        (n_paths,), float("nan"), device=device, dtype=torch.float32
+    )
+    selected_raw_g = torch.full(
+        (n_paths,), float("nan"), device=device, dtype=torch.float32
+    )
+    selected_c = torch.full(
+        (n_paths,), float("nan"), device=device, dtype=torch.float32
+    )
+    selected_k = torch.full(
+        (n_paths,), float("nan"), device=device, dtype=torch.float32
+    )
+    if candidate_parent:
+        parents = torch.cat(candidate_parent)
+        values = torch.cat(candidate_h)
+        rounds = torch.cat(candidate_round)
+        jumps = torch.cat(candidate_jump)
+        prequalified = torch.cat(candidate_prequalified)
+        verified_records, verified_failures, _ = _initial_hstar_evaluate_rows(
+            sim,
+            state,
+            parents,
+            values.to(dtype).reshape(-1),
+            rng_cpu=rng_cpu,
+            rng_cuda=rng_cuda,
+        )
+        evaluations.scatter_add_(0, parents, torch.ones_like(parents))
+        replay_tolerance = torch.where(
+            prequalified,
+            torch.full(
+                (len(parents),), tolerance, device=device, dtype=torch.float32
+            ),
+            torch.full(
+                (len(parents),),
+                inner_tolerance,
+                device=device,
+                dtype=torch.float32,
+            ),
+        )
+        valid_candidate = torch.zeros(
+            len(parents), device=device, dtype=torch.bool
+        )
+        for position, record in enumerate(verified_records):
+            if record is None:
+                root_records[int(parents[position])][
+                    "candidate_rejection_reasons"
+                ].append(
+                    verified_failures.get(position, "CANDIDATE_EVALUATION_FAILED")
+                )
+                continue
+            ok = bool(record["feasible"]) and (
+                float(record["G_norm"]) <= float(replay_tolerance[position])
+            )
+            if not ok:
+                if not bool(record["finite"]):
+                    reason = "NONFINITE_CANDIDATE"
+                elif not bool(record["feasible"]):
+                    reason = "ECONOMICALLY_INFEASIBLE_CANDIDATE"
+                else:
+                    reason = "RESIDUAL_TOLERANCE_FAILED"
+                root_records[int(parents[position])][
+                    "candidate_rejection_reasons"
+                ].append(reason)
+                if bool(jumps[position]) and bool(record["finite"]):
+                    which = int(parents[position])
+                    unresolved_discontinuity[which] = True
+                    unresolved_bracket_count[which] += 1
+                continue
+            valid_candidate[position] = True
+        for path in range(n_paths):
+            positions = torch.nonzero(
+                valid_candidate & (parents == path), as_tuple=False
+            ).reshape(-1)
+            if positions.numel() == 0:
+                continue
+            ordered = positions[torch.argsort(values[positions])]
+            keep = [int(ordered[0])]
+            for position in ordered[1:]:
+                position_int = int(position)
+                same_h = abs(
+                    float(values[position_int] - values[keep[-1]])
+                ) <= (10.0 * width_tolerance)
+                previous = keep[-1]
+                same_policy_region = all(
+                    int(verified_records[position_int][name])
+                    == int(verified_records[previous][name])
+                    for name in ("inv_count", "def_count", "entry_accepted")
+                    if verified_records[position_int] is not None
+                    and verified_records[previous] is not None
+                )
+                if not (same_h and same_policy_region):
+                    keep.append(position_int)
+            keep_positions = torch.tensor(
+                keep, device=device, dtype=torch.long
+            )
+            root_records[path]["root_count"] = len(keep)
+            root_records[path]["valid_root_count"] = len(keep)
+            root_records[path]["all_valid_roots"] = [
+                float(values[position]) for position in keep
+            ]
+            distance = (
+                values[keep_positions] - initial_belief[path]
+            ).abs()
+            chosen = keep_positions[torch.argmin(distance)]
+            choice = int(chosen)
+            root_records[path]["selected_root"] = float(values[choice])
+            # float64 replay gate on the raw ledger.
+            h64 = values[choice].to(torch.float64)
+            c64 = verified_records[choice]["C_raw"].to(torch.float64)
+            k64 = verified_records[choice]["K"].to(torch.float64)
+            g64 = torch.exp(h64) * k64 - c64
+            scale64 = torch.maximum(
+                torch.ones_like(g64), torch.maximum(c64.abs(), k64.abs())
+            )
+            norm64 = (g64 / scale64).to(torch.float32)
+            selected_h[path] = values[choice].to(dtype)
+            selected_raw_g[path] = g64.to(torch.float32)
+            selected_norm[path] = norm64.to(torch.float32)
+            selected_c[path] = verified_records[choice]["C_raw"]
+            selected_k[path] = verified_records[choice]["K"]
+
+    strict_ok = torch.isfinite(selected_h) & (
+        selected_norm.abs() <= tolerance
+    ) & torch.isfinite(selected_norm) & torch.isfinite(selected_raw_g)
+    has_candidate = torch.isfinite(selected_h)
+    no_root = ~strict_ok
+    for path in range(n_paths):
+        if strict_ok[path]:
+            root_records[path]["terminal_status"] = "ROOT_FOUND"
+            continue
+        if has_candidate[path]:
+            reason = "FP64_REPLAY_RESIDUAL_TOLERANCE_FAILED"
+        elif root_records[path]["valid_root_count"] == 0 and root_records[path][
+            "candidate_rejection_reasons"
+        ]:
+            reason = "ALL_CANDIDATES_REJECTED"
+        elif bool(unresolved_discontinuity[path]):
+            reason = "DISCONTINUITY_UNRESOLVED"
+        elif int(_coarse_failure_count[path]) > 0:
+            reason = "COARSE_SUPPORT_EVALUATION_FAILURES"
+        else:
+            reason = "NO_SIGN_CHANGE_IN_SUPPORT"
+        root_records[path]["failure_reason"] = reason
+        root_records[path]["terminal_status"] = (
+            "NO_ROOT_" + reason
+        )
+
+    audit = {
+        "version": "EP3_INITIAL_HSTAR_STRICT_GLOBAL_V1",
+        "n_paths": n_paths,
+        "config": {
+            "residual_tolerance": tolerance,
+            "inner_acceptance_tolerance": inner_tolerance,
+            "coarse_points": coarse_points,
+            "refinement_points": refinement_points,
+            "max_refinement_rounds": max_rounds,
+            "support_lower": support_lower,
+            "support_upper": support_upper,
+            "width_tolerance": width_tolerance,
+        },
+        "results": root_records,
+    }
+    audit_dir = getattr(sim, "initial_hstar_audit_output_dir", None)
+    audit_path = None
+    if audit_dir:
+        audit_path = Path(audit_dir) / (
+            "initial_hstar_audit_"
+            f"{int(getattr(sim, 'initial_hstar_audit_episode_id', -1))}.json"
+        )
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(audit_path, "w", encoding="utf-8") as handle:
+            json.dump(audit, handle, indent=2)
+    if bool(no_root.any()):
+        bad = torch.nonzero(no_root, as_tuple=False).reshape(-1).tolist()
+        reasons = {}
+        for path in bad:
+            audit_record = root_records[path]
+            reasons[path] = {
+                "failure_reason": audit_record["failure_reason"],
+                "rejection_reasons": audit_record[
+                    "candidate_rejection_reasons"
+                ][-3:],
+                "discontinuity_brackets": audit_record[
+                    "discontinuity_bracket_count"
+                ],
+                "unresolved_brackets": audit_record[
+                    "unresolved_bracket_count"
+                ],
+                "coarse_eval_failures": audit_record[
+                    "coarse_evaluation_failure_count"
+                ],
+            }
+        raise RuntimeError(
+            "initial h-star STRICT_GLOBAL found no valid clearing root for "
+            f"{len(bad)}/{n_paths} paths (per-path reasons preserved in the "
+            f"audit {audit_path}); first={reasons.get(bad[0])}, "
+            f"paths={bad[:20]}"
+        )
+
+    # Final decision-record reconstruction at the selected root: this exact
+    # production t=0 evaluation is the candidate reference for the independent
+    # production parity gate in simulate_tensor_parallel.
+    final_records, final_failures, final_trial = _initial_hstar_evaluate_rows(
+        sim,
+        state,
+        full_rows,
+        selected_h.to(dtype).reshape(-1),
+        rng_cpu=rng_cpu,
+        rng_cuda=rng_cuda,
+        return_state=True,
+    )
+    if final_failures or any(record is None for record in final_records):
+        failed_paths = sorted(
+            {
+                int(index)
+                for index, reason in final_failures.items()
+                if reason
+            }
+            | {
+                int(index)
+                for index, record in enumerate(final_records)
+                if record is None
+            }
+        )
+        raise RuntimeError(
+            "initial h-star final decision reconstruction failed on paths "
+            f"{failed_paths[:20]} (n={len(failed_paths)})"
+        )
+    state["hatcf"] = selected_h.to(state["hatcf"].dtype)
+    sim._initial_hstar_verified_state = final_trial
+    sim._initial_hstar_selected_h = selected_h.to(state["hatcf"].dtype)
+
+    residual_raw = selected_raw_g[strict_ok]
+    residual_norm = selected_norm[strict_ok]
+    multi_root_paths = sum(
+        1 for record in root_records if record["root_count"] > 1
+    )
+    discontinuity_paths = sum(
+        1
+        for record in root_records
+        if record["discontinuity_bracket_count"] > 0
+    )
+    floor_applied_count = 0
+    for index, record in enumerate(final_records):
+        if record is not None and bool(record["floor_applied"]):
+            floor_applied_count += 1
     diagnostics = {
         "enabled": True,
         "scope": "t0_initial_only",
-        "root_solver": "batched_bisection_production_node_operator",
+        "root_solver": "strict_global_batched_production_node_operator",
         "root_policy_source": str(getattr(sim, "bp_action_source", "head")),
         "n_paths": int(n_paths),
-        "success_count": int(converged.sum()),
-        "fail_count": int((~converged).sum()),
+        "success_count": int(strict_ok.sum()),
+        "fail_count": int(no_root.sum()),
         "residual_tolerance": tolerance,
-        "max_iterations": int(sim.initial_hstar_max_iterations),
-        "iterations_used": int(iterations),
-        "bracket_expansions": int(expansions),
+        "inner_acceptance_tolerance": inner_tolerance,
+        "coarse_points": coarse_points,
+        "refinement_points": refinement_points,
+        "max_refinement_rounds": max_rounds,
+        "support_lower": support_lower,
+        "support_upper": support_upper,
+        "width_tolerance": width_tolerance,
+        "audit_path": str(audit_path) if audit_path else None,
         "initial_belief_mean": float(initial_belief.mean()),
-        "selected_hstar_mean": float(mid.mean()),
-        "selected_hstar_p50": float(mid.median()),
-        "residual_abs_mean": float(residuals.mean()),
-        "residual_abs_p90": float(torch.quantile(residuals, 0.9)),
-        "residual_abs_max": float(residuals.max()),
+        "selected_hstar_mean": float(selected_h[strict_ok].mean()),
+        "selected_hstar_p50": float(selected_h[strict_ok].median()),
+        "raw_residual_mean": float(residual_raw.mean()),
+        "raw_residual_p90": float(torch.quantile(residual_raw, 0.9)),
+        "raw_residual_abs_max": float(residual_raw.abs().max()),
+        "normalized_residual_mean": float(residual_norm.mean()),
+        "normalized_residual_p90": float(torch.quantile(residual_norm, 0.9)),
+        "normalized_residual_abs_max": float(residual_norm.abs().max()),
+        "multi_root_path_count": multi_root_paths,
+        "discontinuity_path_count": discontinuity_paths,
+        "floor_applied_root_count": floor_applied_count,
         "initial_capital_mean": float(capital.mean()),
+        "selected_C_raw_mean": float(selected_c[strict_ok].mean()),
+        "selected_K_ledger_mean": float(selected_k[strict_ok].mean()),
+        "per_path_audit": root_records,
     }
     return diagnostics
 
@@ -691,39 +1384,143 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
         completed_parent_steps += 1
 
         if t == 0 and initial_hstar_diagnostics is not None:
-            hatc_residual = (
-                state["hatc_cal"].to(torch.float32)
-                - state["hatcf"].to(torch.float32)
-            ).abs()
+            # Independent candidate-vs-production parity: the accepted root's
+            # candidate evaluation (sim._initial_hstar_verified_state) must
+            # reproduce the formal t=0 execution on the RAW ledger and on firm
+            # decisions, not just the exported Hatc_cal belief.
+            verified = getattr(sim, "_initial_hstar_verified_state", None)
+            parity_tolerance = float(sim.initial_hstar_parity_tolerance)
+            strict_tolerance = float(sim.initial_hstar_residual_tolerance)
+            n_paths = int(sim.n_paths)
+            if verified is None:
+                raise RuntimeError(
+                    "initial h-star verification state missing for the "
+                    "production parity gate"
+                )
+            # Raw clearing verified on the production ledger itself.
+            k_prod = state["accounting_K_total"].to(torch.float32)
+            c_raw_prod = state["accounting_C_raw"].to(torch.float32)
+            g_prod = torch.exp(state["hatcf"].to(torch.float32)) * k_prod - c_raw_prod
+            scale_prod = torch.maximum(
+                torch.ones_like(g_prod),
+                torch.maximum(c_raw_prod.abs(), k_prod.abs()),
+            )
+            g_norm_prod = (g_prod / scale_prod).to(torch.float32)
+            raw_clearing_ok = torch.isfinite(g_norm_prod) & (
+                g_norm_prod.abs() <= strict_tolerance
+            )
+
+            def _rel_close(a, b):
+                return (
+                    a.to(torch.float32) - b.to(torch.float32)
+                ).abs() <= parity_tolerance * torch.maximum(
+                    torch.ones_like(a), a.to(torch.float32).abs()
+                )
+
+            field_ok = torch.ones(
+                n_paths, dtype=torch.bool, device=device
+            )
+            field_detail = {}
+            for name in (
+                "accounting_C_raw",
+                "accounting_K_total",
+                "accounting_C_effective",
+                "accounting_C_oper",
+                "accounting_I_oper",
+                "accounting_I_entry",
+                "accounting_resource_residual",
+            ):
+                if name not in state or name not in verified:
+                    raise RuntimeError(
+                        f"production parity requires state field {name}"
+                    )
+                ok = _rel_close(state[name], verified[name])
+                field_detail[name] = ok
+                field_ok = field_ok & ok
+            for name in (
+                "accounting_n_firms",
+                "accounting_consumption_floor_applied",
+                "accounting_resource_feasible",
+                "accounting_valid",
+            ):
+                if name not in state or name not in verified:
+                    raise RuntimeError(
+                        f"production parity requires state field {name}"
+                    )
+                ok = (
+                    state[name].to(torch.bool)
+                    == verified[name].to(torch.bool)
+                    if name != "accounting_n_firms"
+                    else (
+                        state[name].to(torch.float32)
+                        - verified[name].to(torch.float32)
+                    ).abs()
+                    <= 1e-6
+                )
+                field_detail[name] = ok
+                field_ok = field_ok & ok
+            # Firm decision parity: hard investment/default choice and entry
+            # acceptance must be identical at every alive firm.
+            alive_mask = state["alive"].to(torch.bool)
+            for key in ("bar_i", "bar_z", "bp"):
+                if key not in state or key not in verified:
+                    raise RuntimeError(
+                        f"production parity requires state field {key}"
+                    )
+                equal = (
+                    state[key].to(torch.float32)
+                    == verified[key].to(torch.float32)
+                ) | ~alive_mask
+                field_detail[f"decisions_{key}"] = equal.all(dim=1)
+                field_ok = field_ok & field_detail[f"decisions_{key}"]
+            entry_ok = (
+                state.get(
+                    "event_accepted_count", torch.zeros(n_paths, device=device)
+                ).to(torch.float32)
+                == verified.get(
+                    "event_accepted_count", torch.zeros(n_paths, device=device)
+                ).to(torch.float32)
+            )
+            field_detail["entry_accepted_count"] = entry_ok
+            field_ok = field_ok & entry_ok
+            lnk_ok = _rel_close(state["lnk_cal"], state["lnkf"])
             lnk_residual = (
                 state["lnk_cal"].to(torch.float32)
                 - state["lnkf"].to(torch.float32)
             ).abs()
-            parity_tolerance = float(sim.initial_hstar_parity_tolerance)
-            strict_tolerance = float(sim.initial_hstar_residual_tolerance)
-            hatc_ok = hatc_residual <= strict_tolerance
-            lnk_ok = lnk_residual <= parity_tolerance
-            if not bool((hatc_ok & lnk_ok).all()):
-                bad = torch.nonzero(
-                    ~(hatc_ok & lnk_ok), as_tuple=False
-                ).reshape(-1).tolist()
+            all_ok = raw_clearing_ok & lnk_ok & field_ok
+            if not bool(all_ok.all()):
+                bad = torch.nonzero(~all_ok, as_tuple=False).reshape(-1).tolist()
+                failing_fields = [
+                    name
+                    for name, mask in field_detail.items()
+                    if not bool(mask[bad].all())
+                ]
+                if not bool(raw_clearing_ok[bad].all()):
+                    failing_fields.append("raw_clearing_G")
+                if not bool(lnk_ok[bad].all()):
+                    failing_fields.append("lnk_cal")
                 raise RuntimeError(
-                    "t=0 h-star belief does not reproduce the production "
-                    f"ledger; paths={bad[:20]} (n={len(bad)}), "
-                    f"hatc_residual_max={float(hatc_residual[bad].max())}, "
-                    f"strict_tolerance={strict_tolerance}, "
+                    "t=0 h-star candidate does not reproduce the formal "
+                    f"production ledger/decisions; paths={bad[:20]} "
+                    f"(n={len(bad)}), failing_fields={failing_fields[:10]}, "
+                    f"raw_G_norm_max={float(g_norm_prod[bad].abs().max())}, "
                     f"lnk_residual_max={float(lnk_residual[bad].max())}, "
+                    f"strict_tolerance={strict_tolerance}, "
                     f"parity_tolerance={parity_tolerance}"
                 )
             initial_hstar_diagnostics.update({
-                "production_hatc_residual_max": float(hatc_residual.max()),
-                "production_lnk_residual_max": float(lnk_residual.max()),
+                "production_raw_clearing_passed": True,
+                "production_raw_G_norm_max": float(g_norm_prod.abs().max()),
                 "production_ledger_parity_passed": True,
+                "production_firm_decision_parity_passed": True,
+                "production_lnk_residual_max": float(lnk_residual.max()),
                 "production_strict_tolerance": strict_tolerance,
                 "production_parity_tolerance": parity_tolerance,
-                "t0_calibrated_path_count": int((hatc_ok & lnk_ok).sum()),
+                "t0_calibrated_path_count": int(all_ok.sum()),
             })
             sim._initial_hstar_diagnostics = dict(initial_hstar_diagnostics)
+            sim._initial_hstar_verified_state = None
 
         branch_states = _expand_branches_batched(sim, state, child_t=t + 1)
         _annotate_parent_next_leverage_rows(
@@ -1194,10 +1991,14 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                                     "the original accounting error: "
                                     f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
                                 )
-                raise EntryAccountingError(
+                error = EntryAccountingError(
                     "independent node resource reconstruction failed; "
                     f"t={t}, branch={branch_k}, paths={bad[:20]}"
                 )
+                # 结构化逐 Path 失败信息：STRICT_GLOBAL 求根需要知道本批
+                # 具体哪些 path 在该候选 h 上会计无效，而不是整批作废。
+                error.bad_paths = [int(index) for index in bad]
+                raise error
         else:
             # Use the authoritative first-pass ledger directly. These aliases
             # preserve the output schema but are not an independent validation.
@@ -1286,7 +2087,7 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                                 "replacing the original error: "
                                 f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
                             )
-            raise EntryEconomicInfeasibilityError(
+            error = EntryEconomicInfeasibilityError(
                 "raw node resource account is infeasible or non-finite (C_raw<=0); "
                 f"t={t}, branch={branch_k}, paths={bad[:20]}, "
                 f"C_oper={[float(C_oper_total[index]) for index in bad[:20]]}, "
@@ -1295,6 +2096,8 @@ def _process_node_batched(sim, state: Dict[str, torch.Tensor], t: int, branch_k:
                 f"accepted_count={[float(state.get('event_accepted_count', torch.zeros(n_paths, device=device))[index]) for index in bad[:20]]}, "
                 "no positive floor was applied"
             )
+            error.bad_paths = [int(index) for index in bad]
+            raise error
         sim._pending_entry_candidates = None
         if raw_mode and consumption_floor > 0.0:
             C_total = C_raw_total.clamp_min(consumption_floor)

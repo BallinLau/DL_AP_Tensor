@@ -129,6 +129,14 @@ class SimulateTS:
         initial_hstar_residual_tolerance: float = 1e-5,
         initial_hstar_parity_tolerance: float = 1e-5,
         initial_hstar_max_iterations: int = 40,
+        initial_hstar_coarse_points: int = 10,
+        initial_hstar_refinement_points: int = 20,
+        initial_hstar_max_refinement_rounds: int = 4,
+        initial_hstar_support_lower: float = -8.0,
+        initial_hstar_support_upper: float = 2.0,
+        initial_hstar_width_tolerance: float = 1e-5,
+        initial_hstar_audit_output_dir: Optional[str] = None,
+        initial_hstar_audit_episode_id: int = -1,
         initial_state: Optional[Dict[str, torch.Tensor]] = None,
         state_bank_capture=None,
     ):
@@ -259,12 +267,32 @@ class SimulateTS:
             initial_hstar_parity_tolerance
         )
         self.initial_hstar_max_iterations = int(initial_hstar_max_iterations)
+        self.initial_hstar_coarse_points = int(initial_hstar_coarse_points)
+        self.initial_hstar_refinement_points = int(initial_hstar_refinement_points)
+        self.initial_hstar_max_refinement_rounds = int(
+            initial_hstar_max_refinement_rounds
+        )
+        self.initial_hstar_support_lower = float(initial_hstar_support_lower)
+        self.initial_hstar_support_upper = float(initial_hstar_support_upper)
+        self.initial_hstar_width_tolerance = float(initial_hstar_width_tolerance)
+        self.initial_hstar_audit_output_dir = initial_hstar_audit_output_dir
+        self.initial_hstar_audit_episode_id = int(initial_hstar_audit_episode_id)
         if self.initial_hstar_residual_tolerance <= 0.0:
             raise ValueError("initial_hstar_residual_tolerance must be positive")
         if self.initial_hstar_parity_tolerance <= 0.0:
             raise ValueError("initial_hstar_parity_tolerance must be positive")
         if self.initial_hstar_max_iterations < 1:
             raise ValueError("initial_hstar_max_iterations must be at least 1")
+        if self.initial_hstar_coarse_points < 3:
+            raise ValueError("initial_hstar_coarse_points must be at least 3")
+        if self.initial_hstar_refinement_points < 3:
+            raise ValueError("initial_hstar_refinement_points must be at least 3")
+        if self.initial_hstar_max_refinement_rounds < 1:
+            raise ValueError("initial_hstar_max_refinement_rounds must be positive")
+        if not self.initial_hstar_support_lower < self.initial_hstar_support_upper:
+            raise ValueError("initial h-star support must have positive width")
+        if self.initial_hstar_width_tolerance <= 0.0:
+            raise ValueError("initial_hstar_width_tolerance must be positive")
         self._initial_hstar_diagnostics = None
         self.initial_state = initial_state
         self.state_bank_capture = state_bank_capture

@@ -166,6 +166,14 @@ class HyperParams:
     initial_hstar_residual_tolerance: float = 1e-5
     initial_hstar_parity_tolerance: float = 1e-5
     initial_hstar_max_iterations: int = 40
+    initial_hstar_coarse_points: int = 10
+    initial_hstar_refinement_points: int = 20
+    initial_hstar_max_refinement_rounds: int = 4
+    initial_hstar_support_lower: float = -8.0
+    initial_hstar_support_upper: float = 2.0
+    initial_hstar_width_tolerance: float = 1e-5
+    initial_hstar_audit_output_dir: Optional[str] = None
+    initial_hstar_audit_episode_id: int = -1
     bp_distill_epochs: int = 20
     bp_distill_patience: int = 3
     bp_distill_min_delta: float = 1e-4
