@@ -81,6 +81,8 @@ class MarketClearingConfig:
     residual_tolerance: float = 1.0e-5
     width_tolerance: float = 1.0e-5
     candidate_chunk_size: int = 262_144
+    lightweight_hard_candidates: bool = False
+    profile_root_timing: bool = False
     fast_alphas: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125)
     fast_local_correction_rounds: int = 2
     fast_max_evaluations: int = 8
@@ -335,6 +337,31 @@ class MarketClearingController:
         return outputs
 
     @torch.inference_mode()
+    def _hard_candidate_values(self, model, states):
+        """Value-only inference; never used for selected-record construction.
+
+        Restrict the fast path to the audited concrete production model. An
+        unknown/subclass simulation override must retain its original forward.
+        Hard candidate accounting consumes P0/PI/Phat only, not Q or BP.
+        """
+        from models.policy_value import PolicyValueModel
+        if type(model) is not PolicyValueModel:
+            return self._firm_policy(model, states)
+        outputs = {}
+        for start in range(0, len(states), self.config.candidate_chunk_size):
+            chunk = states[start:start + self.config.candidate_chunk_size]
+            values = model.forward_value_components(chunk)
+            equity = model.forward_equity(chunk)
+            row = dict(P0=values['V0_physical'], PI=values['VI_physical'],
+                       Phat=equity['Phat'])
+            for name, value in row.items():
+                if name not in outputs:
+                    outputs[name] = value.new_empty((len(states),))
+                outputs[name][start:start + len(chunk)].copy_(value.reshape(-1))
+            self.network_forward_calls += 1
+        return outputs
+
+    @torch.inference_mode()
     def _firm_bp(
         self, model: torch.nn.Module, states: torch.Tensor
     ) -> torch.Tensor:
@@ -482,12 +509,20 @@ class MarketClearingController:
             ),
             dim=-1,
         )
-        policy = self._firm_policy(model, policy_state.reshape(B * H * total_slots, 7))
+        candidate_forward = (
+            self._hard_candidate_values
+            if self.config.lightweight_hard_candidates and not detail
+            and bool(getattr(sim, "hard_realized_aggregation", False))
+            else self._firm_policy
+        )
+        policy = candidate_forward(model, policy_state.reshape(B * H * total_slots, 7))
         policy = {
             name: value.reshape(B, H, total_slots) for name, value in policy.items()
         }
-        self._sync(device)
-        self.policy_forward_seconds += time.perf_counter() - policy_started
+        if self.config.profile_root_timing:
+            self._sync(device)
+        if device.type != "cuda" or self.config.profile_root_timing:
+            self.policy_forward_seconds += time.perf_counter() - policy_started
 
         accounting_started = time.perf_counter()
         if bool(getattr(sim, "hard_realized_aggregation", False)):
@@ -596,8 +631,10 @@ class MarketClearingController:
                     "firm_state": policy_state,
                 }
             )
-        self._sync(device)
-        self.accounting_seconds += time.perf_counter() - accounting_started
+        if self.config.profile_root_timing:
+            self._sync(device)
+        if device.type != "cuda" or self.config.profile_root_timing:
+            self.accounting_seconds += time.perf_counter() - accounting_started
         return result
 
     @staticmethod

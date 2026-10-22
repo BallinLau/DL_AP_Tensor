@@ -167,7 +167,7 @@ def calibrate_exploration(sim,initial,*,cache,outer,economic,crn,provenance):
 def generate_long_horizon_dataset(models, episode, bank, schedule, signature, output, *,
         outer, stage, horizon=10, branches=2, parent_batch_size=128, root_config=None,
         capture=True, predecision_templates=False, diagnostic_observer=None,diagnostic_metadata=None,
-        initial_mode='ROOT_CONSISTENT', sparse_terminal=True):
+        initial_mode='ROOT_CONSISTENT', sparse_terminal=True, reuse_shard_digest=True):
     if (horizon,branches) not in ((10,2),(50,2),(100,1)):
         raise ValueError('supported replay contracts: H10/2, H50/2, H100/1')
     if initial_mode not in ('ROOT_CONSISTENT','OFF_EQUILIBRIUM_INITIAL_BELIEF'):
@@ -254,7 +254,8 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
                     # than overwrite; recovery is explicit and preserves it.
                     raise ValueError('unpublished long-horizon shard requires review')
                 expected = json.loads(digest.read_text())
-                if file_hash(target) != expected['sha256']:
+                shard_sha256 = file_hash(target)
+                if shard_sha256 != expected['sha256']:
                     raise ValueError('long-horizon committed shard corruption')
                 saved = safe_load(target)
                 if saved['provenance'] != provenance:
@@ -370,9 +371,12 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
                     select_state(next_state,slice(None),torch.device('cpu')),
                     next_parents=next_parents,next_good=next_good)
                 atomic_torch_save(target,saved)
-                atomic_write_json(digest,dict(sha256=file_hash(target)))
+                # The published shard is immutable. Reuse this verified digest
+                # for the manifest rather than rereading the full tensor file.
+                shard_sha256 = file_hash(target)
+                atomic_write_json(digest,dict(sha256=shard_sha256))
                 state,parents,good=next_state,next_parents,next_good
-            manifest[target.name]=file_hash(target)
+            manifest[target.name]=shard_sha256 if reuse_shard_digest else file_hash(target)
             sidecar=target.with_suffix('.csv')
             if not sidecar.exists():
                 frame=pd.DataFrame(saved['rows'])
