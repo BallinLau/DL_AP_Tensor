@@ -43,7 +43,10 @@ from utils.firm_transition import normalize_child_weights
 from .bp_grid_teacher import (
     BPGridTeacher,
     _expand_grid_children,
+    _slice_child_axis,
+    _stack_children,
     _target_q_claim,
+    resolve_grid_chunk_plan,
 )
 
 
@@ -313,6 +316,60 @@ def _frozen_equity_components(
     return selector, survival, equity_snapshot.detach()
 
 
+def _evaluate_grid_chunked(
+    teacher: BPGridTeacher,
+    parent_state: torch.Tensor,
+    children: Sequence[torch.Tensor],
+    m_list: torch.Tensor,
+    bp_grid: torch.Tensor,
+    *,
+    branch: str,
+    child_weights: Optional[torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Call ``teacher._evaluate_grid`` under its parent chunk hard cap.
+
+    ``_evaluate_grid`` refuses batches above the resolved expanded-state cap;
+    real training batches are larger, so slice parents exactly like
+    ``_compute_value_target_grid_batch`` does.
+    """
+    n_parent = int(parent_state.shape[0])
+    n_children = int(_stack_children(children).shape[1])
+    plan = resolve_grid_chunk_plan(
+        n_parent=n_parent,
+        n_grid=int(bp_grid.shape[1]),
+        n_children=n_children,
+        configured_parent_chunk=n_parent,
+        configured_candidate_chunk=teacher.candidate_chunk_size,
+        max_expanded_states=teacher.max_expanded_states,
+    )
+    chunk = max(1, int(plan.parent_chunk_effective))
+    if chunk >= n_parent:
+        return teacher._evaluate_grid(
+            parent_state, children, m_list, bp_grid,
+            branch=branch, child_weights=child_weights,
+        )
+    outputs = []
+    for start in range(0, n_parent, chunk):
+        stop = min(start + chunk, n_parent)
+        weight_chunk = (
+            child_weights
+            if child_weights is not None and child_weights.ndim == 1
+            else child_weights[start:stop] if child_weights is not None else None
+        )
+        outputs.append(
+            teacher._evaluate_grid(
+                parent_state[start:stop],
+                _slice_child_axis(children, start, stop),
+                _slice_child_axis(m_list, start, stop),
+                bp_grid[start:stop],
+                branch=branch,
+                child_weights=weight_chunk,
+            )
+        )
+    keys = ("cashflow_grid_mean", "continuation_grid_mean", "value_grid")
+    return {key: torch.cat([out[key] for out in outputs], dim=0) for key in keys}
+
+
 def build_frozen_branch(
     *,
     teacher: BPGridTeacher,
@@ -351,7 +408,8 @@ def build_frozen_branch(
         )
         bp_star = production["bp_star"].detach()
         value_star = production["value_star"].detach()
-        fixed_eval = teacher._evaluate_grid(
+        fixed_eval = _evaluate_grid_chunked(
+            teacher,
             parent_state,
             children,
             m_used,
