@@ -1067,6 +1067,31 @@ def test_pool_feature_stats_reuses_hyperparams_quantile_cap():
     assert stats["simulate_child0_M_n_used_for_quantiles"] == 2.0
     assert stats["simulate_child_all_M_n_total"] == 12.0
     assert stats["simulate_child_all_M_n_used_for_quantiles"] == 2.0
+    # i 列分位数必须遵守同一 cap（等距下采样后估计）。
+    expected_i = torch.quantile(
+        pool.parent[:, 3][::3], torch.tensor([0.1, 0.5, 0.9])
+    )
+    assert stats["simulate_i_p10"] == pytest.approx(float(expected_i[0]))
+    assert stats["simulate_i_p50"] == pytest.approx(float(expected_i[1]))
+    assert stats["simulate_i_p90"] == pytest.approx(float(expected_i[2]))
+
+
+def test_pool_feature_stats_caps_oversized_i_column_quantiles():
+    # 回归：simulate pool 超过 2^24 行时（entry 复利增长后实际发生过），
+    # i 列分位数必须走限流下采样，否则 torch.quantile 抛
+    # "quantile() input tensor is too large" 直接打断训练。
+    episode = _episode()
+    episode.hyperparams = replace(
+        episode.hyperparams, bellman_conv_max_samples=1_000_000
+    )
+    pool = _pool_for_feature_stats(n_parents=2**24 + 1, n_children=0, n_cols=4)
+
+    stats = episode._pool_feature_stats("simulate", pool)
+
+    assert stats["simulate_parent_groups"] == float(2**24 + 1)
+    assert np.isfinite(stats["simulate_i_p10"])
+    assert np.isfinite(stats["simulate_i_p50"])
+    assert np.isfinite(stats["simulate_i_p90"])
 
 
 def test_bellman_convergence_primary_uses_conditional_not_legacy_abs():

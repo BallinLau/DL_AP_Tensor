@@ -2235,7 +2235,14 @@ class Episode:
         if data.shape[1] > 2:
             stats[f"{prefix}_eta_share"] = float(data[:, 2].mean().item())
         if data.shape[1] > 3:
-            i_quantiles = torch.quantile(data[:, 3], torch.tensor([0.1, 0.5, 0.9]))
+            # 分位数同样受 torch.quantile 的 2^24 元素硬限制（simulate pool 可
+            # 超过该规模），按同一 cap 等距下采样；切片确定性且不消耗 RNG。
+            i_values = data[:, 3]
+            i_sample = i_values
+            if cap > 0 and i_sample.numel() > cap:
+                i_step = -(-int(i_sample.numel()) // cap)
+                i_sample = i_sample[::i_step]
+            i_quantiles = torch.quantile(i_sample, torch.tensor([0.1, 0.5, 0.9]))
             stats.update({
                 f"{prefix}_i_p10": float(i_quantiles[0].item()),
                 f"{prefix}_i_p50": float(i_quantiles[1].item()),
