@@ -2656,18 +2656,18 @@ def test_staged_bp_failure_rolls_back_full_online_model_and_target():
 def test_staged_bp_failure_skips_convergence_after_restore():
     episode = _episode()
     batch = _batch(episode.device)
-    called = {"convergence": False}
+    calls = {"n": 0}
 
     episode._run_bp_distillation_stage = lambda *args, **kwargs: {
         "status": "failed_no_valid_checkpoint",
         "optimizer_steps": 1,
     }
 
-    def _fail_if_called(*args, **kwargs):
-        called["convergence"] = True
-        raise AssertionError("convergence should be skipped after staged failure")
+    def _count_convergence(*args, **kwargs):
+        calls["n"] += 1
+        return {"passed": True, "equations": {}}
 
-    episode.evaluate_bellman_convergence = _fail_if_called
+    episode.evaluate_bellman_convergence = _count_convergence
 
     result = episode._run_policy_value_staged(
         pv_train_batches=[batch],
@@ -2678,7 +2678,9 @@ def test_staged_bp_failure_skips_convergence_after_restore():
     assert result["metadata"]["policy_value_stage_status"] == "failed_bp"
     assert result["convergence"]["enabled"] is False
     assert result["convergence"]["skip_reason"] == "staged_training_failed"
-    assert called["convergence"] is False
+    # Feature A 的内层循环每轮诊断评估恰好一次（cycles=1）；BP 阶段失败后
+    # 最终 convergence 评估必须被跳过，不得再触发额外调用。
+    assert calls["n"] == 1
 
 
 def test_staged_exception_restores_full_runtime_state():

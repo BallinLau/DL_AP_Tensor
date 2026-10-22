@@ -88,7 +88,15 @@ def _fake_grid(sim, base_state, rows, h_grid, *, rng_cpu=None, rng_cuda=None):
         packed = {
             name: torch.full(
                 (n_rows,),
-                float("nan") if name not in {"feasible", "finite", "floor_applied"} else False,
+                (
+                    0
+                    if name in {"inv_count", "def_count"}
+                    else (
+                        False
+                        if name in {"feasible", "finite", "floor_applied"}
+                        else float("nan")
+                    )
+                ),
                 dtype=(
                     torch.bool
                     if name in {"feasible", "finite", "floor_applied"}

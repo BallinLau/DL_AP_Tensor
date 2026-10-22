@@ -337,7 +337,8 @@ def test_A_cold_start_bootstrap_runs_before_p_stage(monkeypatch):
     order = []
     _patch_staged_stages(episode, monkeypatch, order)
     result = episode._run_policy_value_staged([_batch()], [], 1)
-    assert order[:4] == ["bootstrap", "p_stage", "q_regime", "bp"]
+    # Feature A 在 BP 蒸馏前插入一次内层循环 Bellman 诊断（cycles=1）。
+    assert order[:5] == ["bootstrap", "p_stage", "q_regime", "convergence", "bp"]
     assert result["metadata"]["policy_value_stage_status"] == "accepted"
     assert result["metadata"]["q_bootstrap_stage"]["status"] == "accepted"
 

@@ -23,6 +23,7 @@ from torch import nn
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
+from data.entry import INVESTMENT_COMPARE_SPEC_VERSION  # noqa: E402
 from data.simulate_ts import SimulateTS  # noqa: E402
 
 
@@ -122,6 +123,7 @@ def _sim(*, policy, config, n_paths=1, group_size=2, horizon=1, tmp_path,
         enable_exit=True,
         device=torch.device("cpu"),
         entry_mode="investment_compare",
+        entry_spec_version=INVESTMENT_COMPARE_SPEC_VERSION,
         entry_capital_ratio=0.0,
         entry_size_ratio=1.0,
         entry_cost_max=config.I_THRESHOLD,
