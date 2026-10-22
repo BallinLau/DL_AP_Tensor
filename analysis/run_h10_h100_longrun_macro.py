@@ -92,7 +92,8 @@ def plan(coverage=None,firm_coverage=None,*,end_outer=15,skip_bp_head=False):
         if k=='cross_block':execution.append(dict(outer=o+11,kind='EMPIRICAL_POOL_COMMIT',indices={}))
         execution.append(dict(outer=o+11,kind=k,indices=i))
         if k=='outer_commit':execution.append(dict(outer=o+11,kind='LONGRUN_MACRO_POOL_COMMIT',indices={}))
-    return dict(version='H10_H100_LONGRUN_V1',continuation_contract=CONTRACT,horizon=10,primary_branch=0,children=2,
+    return dict(version='H10_H100_LONGRUN_V1',experiment_id='h10_h100_longrun_macro_replay_20261022',
+        continuation_contract=CONTRACT,horizon=10,primary_branch=0,children=2,
         longrun=dict(paths=200,firms=200,horizon=100,branches=1,burnin=20,
             root_consistent=100,wide_belief=100,initial_design='SCRAMBLED_SOBOL',
             semantics='HISTORICAL_POLICY_MACRO_REPLAY',no_optimizer=True),
@@ -467,7 +468,9 @@ class H50Backend(ProductionBackend):
                     schedule=dict(schedule,parents=schedule['parents'][:count])
                     schedule['fingerprint']=stable_json_hash(schedule['parents'])
                     bank['schedule_fingerprint']=schedule['fingerprint']
-                    meta=dict(meta,count=count,SMOKE_ONLY=True)
+                    meta=dict(meta,count=count,SMOKE_ONLY=True,
+                        initial_ids=bank['state']['transition_path_id'].tolist(),
+                        state_fingerprint=bank['fingerprint'],schedule_fingerprint=schedule['fingerprint'])
                 design.append(meta)
                 store=generate_long_horizon_dataset(self.models,self.episode,bank,schedule,self.signature,
                     directory/'longrun'/mode,outer=outer,stage='POST_OUTER_H100',horizon=100,branches=1,
@@ -476,7 +479,7 @@ class H50Backend(ProductionBackend):
                 from analysis.h10_h100_diagnostics import time_report
                 time_report(store).to_csv(store.root/'time_diagnostics.csv',index=False)
             if hashes(self.models)!=before:raise ValueError('H100 mutated model')
-            model_hashes=dict(firm=before['firm'],fc1=module_hash(self.models['sdf_fc1'].fc1_model),sdf=before['sdf'])
+            model_hashes=dict(firm=before['firm'],fc1=module_hash(self.models['sdf_fc1'].fc1_model),sdf=before['sdf'],wealth=before['wealth'])
             path=directory/'longrun_pool'
             result=commit_pool(stores,path,source_outer=outer,model_hashes=model_hashes,
                 initial_design=design,outer_checkpoint_sha=file_hash(checkpoint))

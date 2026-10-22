@@ -183,7 +183,11 @@ def generate_long_horizon_dataset(models, episode, bank, schedule, signature, ou
     root_config = root_config or MarketClearingConfig()
     provenance = cache_provenance(models, bank, schedule, signature,
                                   outer=outer, stage=stage, economic=economic)
+    if 'run_identity' in provenance:provenance['input_sampling_run_identity']=provenance.pop('run_identity')
+    provenance['experiment_id']='h10_h100_longrun_macro_replay_20261022'
     provenance.update(version='H10_H100_REPLAY_RUNTIME_V1', horizon=horizon, branches=branches,
+        schedule_seed=schedule['seed'],actual_transition_seed=schedule['seed']+11,
+        actual_entry_seed=schedule['seed']+29,
         initial_mode=initial_mode,sparse_terminal=sparse_terminal,primary_branch=0,split=schedule['split'],
         source_commit=SOURCE_COMMIT,runtime_source_sha256=file_hash(__file__),
         root_config=asdict(root_config), physical_parent_batch=parent_batch_size,

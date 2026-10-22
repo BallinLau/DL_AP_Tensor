@@ -24,6 +24,9 @@ cd "$REPO_DIR"
 [[ -z "$(git status --porcelain)" ]]
 export PYTHONUNBUFFERED=1 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+nvidia-smi --query-gpu=timestamp,name,memory.used,memory.total,utilization.gpu --format=csv -l 30 > "$RUN_ROOT/logs/gpu_telemetry.${SLURM_JOB_ID}.csv" &
+telemetry_pid=$!
+trap 'kill "$telemetry_pid" 2>/dev/null || true' EXIT
 extra=()
 if [[ "${RESUME:-0}" == 1 ]]; then extra+=(--resume); fi
 python analysis/run_h10_h100_longrun_macro.py \

@@ -26,10 +26,13 @@ def design_initial(reference,*,outer,mode,seed=20261022,count=100):
     s['K']=(weights*target_ell.exp()[:,None]).float();s['K_birth']=s['K'].clone()
     s['lnkf']=s['K'].sum(1).log()
     if mode=='OFF_EQUILIBRIUM_INITIAL_BELIEF':s['hatcf']=(-6+8*points[:,0]).float()
+    actual_seed=seed+outer*100003+offset
     for j,p in enumerate(specs):
         p.update(initial_mode=mode,K_total_requested=float(target_ell[j].exp()),
             K_total_realized=float(s['K'][j].sum()),sobol=points[j].tolist())
-    schedule=dict(split='train',seed=seed+outer*100003+offset,parents=specs)
+        for shock in p['child_shock_keys']:
+            shock.update(transition_seed=actual_seed+11,entry_seed=actual_seed+29)
+    schedule=dict(split='train',seed=actual_seed,parents=specs)
     schedule['fingerprint']=stable_json_hash(schedule)
     bank=dict(state=s,fingerprint=state_hash(s),schedule_fingerprint=schedule['fingerprint'])
     metadata=dict(mode=mode,count=count,seed=seed,outer=outer,design='SCRAMBLED_SOBOL',

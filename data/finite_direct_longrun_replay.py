@@ -91,6 +91,7 @@ def commit_pool(stores,output,*,source_outer,model_hashes,initial_design,outer_c
     f['valid_label']=True
     for name in ('firm','fc1','sdf'):
         f['source_'+name+'_hash']=model_hashes[name]
+    if 'wealth' in model_hashes:f['source_wealth_hash']=model_hashes['wealth']
     data=output/'macro_rows.csv';temporary=output/'macro_rows.csv.tmp'
     f.to_csv(temporary,index=False);temporary.replace(data)
     result=dict(identity=identity,rows_file=data.name,rows_sha256=file_hash(data),
@@ -126,8 +127,11 @@ def fit_edges(train_frames,reference=((-6,2),(-2,5)),bins=8):
 
 def cells(frame,edges):
     # Separate directional low/high coordinates, never collapse overflow.
-    return np.stack([np.searchsorted(e,frame[c].to_numpy(),side='right')-1
-        for e,c in zip(edges,('Hatc_cal_t','LnK_cal_t'))],axis=1)
+    output=[]
+    for e,c in zip(edges,('Hatc_cal_t','LnK_cal_t')):
+        values=frame[c].to_numpy();indices=np.searchsorted(e,values,side='right')-1
+        output.append(np.where(values==e[-1],len(e)-2,indices))
+    return np.stack(output,axis=1)
 
 
 def select_mixture(coverage,replay,*,edges,seed=20261022,target=4096,lineage_cap_fraction=.05):
@@ -155,12 +159,17 @@ def select_mixture(coverage,replay,*,edges,seed=20261022,target=4096,lineage_cap
     long_target=min(target//2,len(groups['LONGRUN']))
     requests={'LONGRUN':long_target,'COVERAGE':target-long_target}
     for name in ('LONGRUN','COVERAGE'):
-        counts={};selected=[];limit=max(1,int(np.ceil(target*lineage_cap_fraction)))
+        counts={};bin_counts={};selected=[];limit=max(1,int(np.ceil(target*lineage_cap_fraction)))
+        occupied=len({(r['_hbin'],r['_kbin']) for r in groups[name]})
+        bin_limit=max(1,int(np.ceil(max(target*.125,requests[name]/max(1,occupied)))))
         for row in groups[name]:
             lineage=row['original_lineage']
             if counts.get(lineage,0)>=limit:continue
+            cell=(row['_hbin'],row['_kbin'])
+            if bin_counts.get(cell,0)>=bin_limit:continue
             selected.append((row['parent_candidate_id'],row['t']))
             counts[lineage]=counts.get(lineage,0)+1
+            bin_counts[cell]=bin_counts.get(cell,0)+1
             if len(selected)>=requests[name]:break
         if requests[name]==0:selected=[]
         f=sources[name]
@@ -168,7 +177,8 @@ def select_mixture(coverage,replay,*,edges,seed=20261022,target=4096,lineage_cap
             idx=pd.MultiIndex.from_tuples(selected,names=['parent_candidate_id','t'])
             piece=f.set_index(['parent_candidate_id','t']).loc[idx].reset_index()
             chosen.append(piece)
-        audit[name]=dict(requested=requests[name],eligible=len(groups[name]),selected=len(selected),underfilled=requests[name]-len(selected))
+        audit[name]=dict(requested=requests[name],eligible=len(groups[name]),selected=len(selected),
+            underfilled=requests[name]-len(selected),per_lineage_cap=limit,per_bin_cap=bin_limit)
         if name=='LONGRUN':requests['COVERAGE']=target-len(selected)
     result=pd.concat(chosen,ignore_index=True) if chosen else coverage.iloc[:0].copy()
     if len(result):

@@ -77,6 +77,26 @@ def test_lineage_limit_underfill_truthful():
     assert len(f)==2 and a['COVERAGE']['underfilled']==38
 
 
+def test_bin_endpoints_and_directional_overflow():
+    from data.finite_direct_longrun_replay import cells
+    f=pd.DataFrame(dict(Hatc_cal_t=[-7,-6,2,3],LnK_cal_t=[-2,-3,5,6]))
+    assert cells(f,[[-6,0,2],[-2,0,5]]).tolist()==[[-1,0],[0,-1],[1,1],[2,2]]
+
+
+def test_diagnostic_coverage_and_bin_error_units():
+    from analysis.h10_h100_diagnostics import coverage_report,by_bin_errors
+    c=rows(20,t=1);r=rows(20,start=100,t=21);edges=fit_edges([c,r])
+    mixed,_=select_mixture(c,r,edges=edges,target=20)
+    validation=c.copy();validation['split']='validation';validation.parent_candidate_id+=10000
+    report=coverage_report(mixed,validation,c,r,edges)
+    assert report['train_valid_rows']==len(mixed)
+    assert report['validation_unique_initial_lineages']==20
+    assert report['longrun_share']+report['coverage_share']==1
+    predicted=validation[['Hatc_cal_t1','LnK_cal_t1']].to_numpy()
+    errors=by_bin_errors(validation,predicted,edges,'validation')
+    assert errors.rows.sum()==20 and errors.h_MAE.max()==0 and errors.ell_RMSE.max()==0
+
+
 def test_committed_pool_burnin_and_corruption(tmp_path):
     from types import SimpleNamespace
     p=tmp_path/'source';p.mkdir();(p/'manifest.json').write_text('{}')
@@ -174,6 +194,8 @@ def test_h100_design_real_capital_and_disjoint_stratified_origins():
     assert ((b['state']['hatcf']>=-6)&(b['state']['hatcf']<=2)).all()
     assert len({s['coverage_family'] for s in sb['parents']})==7
     assert len({s['rank_mode'] for s in sb['parents']})==5
+    assert all(k['transition_seed']==sb['seed']+11 and k['entry_seed']==sb['seed']+29
+        for p in sb['parents'] for k in p['child_shock_keys'])
     assert ma['root_required'] and not mb['root_required']
     again,_,_=design_initial(reference,outer=12,mode='OFF_EQUILIBRIUM_INITIAL_BELIEF')
     assert again['fingerprint']==b['fingerprint']

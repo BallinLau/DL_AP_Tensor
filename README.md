@@ -125,3 +125,11 @@ Recent/Archive 精确2867/1229，Validation 与 Beta 固定。Outer4 初始模�
 - `losses/README.md`
 - `training/README.md`
 - `utils/README.md`
+
+## Independent H10 + H100 historical macro replay
+
+The 2026-10-22 experiment uses a separate checkout and V6 approval; it never
+switches or modifies the running H50 job. See [runtime, data contracts, smoke
+and formal launch gates](review/h10_h100_longrun/README.md) and the
+[verified implementation status](review/h10_h100_longrun/implementation_report.md).
+Default CLI behavior is plan-only. A running bounded smoke is not formal training.
