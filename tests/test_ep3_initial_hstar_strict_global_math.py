@@ -24,13 +24,16 @@ import data.simulate_ts_parallel as stp  # noqa: E402
 
 
 # 每条 path 的分段 C_raw(h)：regions 按上界升序 (bound, c, inv, def)，K=2.0。
+# path0 的分段边界保证每个粗网格单元只含一个变号事件，根与决策跳变都能被
+# coarse-to-fine 细化发现。
 PATH_ECONOMICS = {
-    # 双根（-1.6094 与 -0.5108）+ h=-1 决策跳变，均在粗网格可见区间。
+    # 双根（-1.6094 与 ln(1.5)=0.4055）+ h=-1.0 决策跳变；每个粗网格单元
+    # 只含一个变号事件（root/jump/root 分别落在三个相邻单元）。
     0: {
         "regions": [
             (-1.0, 0.4, 1, 0),
-            (0.5, 1.2, 2, 0),
-            (float("inf"), 3.0, 3, 1),
+            (0.0, 100.0, 2, 1),
+            (float("inf"), 3.0, 3, 2),
         ],
         "floor": False,
     },
@@ -218,7 +221,7 @@ def test_strict_global_multi_root_selection(tmp_path, patch_evaluators, monkeypa
     roots = by_path[0]["all_valid_roots"]
     assert len(roots) == 2
     assert min(roots) == pytest.approx(-1.6094, abs=1e-4)
-    assert max(roots) == pytest.approx(-0.5108, abs=1e-4)
+    assert max(roots) == pytest.approx(0.4055, abs=1e-4)
     assert by_path[0]["selected_root"] == pytest.approx(min(roots))
     assert by_path[1]["terminal_status"] == "ROOT_FOUND"
     # 正式状态写入所选根。

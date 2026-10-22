@@ -1018,6 +1018,10 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
             "candidate_rejection_reasons": [],
             "terminal_status": "NO_ROOT",
             "failure_reason": None,
+            "normalized_residual": None,
+            "raw_residual": None,
+            "floor_applied_at_root": None,
+            "resource_feasible_at_root": None,
         }
         for path in range(n_paths)
     ]
@@ -1255,6 +1259,23 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
     state["hatcf"] = selected_h.to(state["hatcf"].dtype)
     sim._initial_hstar_verified_state = final_trial
     sim._initial_hstar_selected_h = selected_h.to(state["hatcf"].dtype)
+
+    # 逐 Root 审计：raw/normalized residual、floor flag 与合法性随审计落盘。
+    for path in range(n_paths):
+        audit_record = root_records[path]
+        if audit_record["terminal_status"] != "ROOT_FOUND":
+            continue
+        final_record = final_records[path]
+        audit_record["normalized_residual"] = float(selected_norm[path])
+        audit_record["raw_residual"] = float(selected_raw_g[path])
+        audit_record["C_raw_at_root"] = float(selected_c[path])
+        audit_record["K_ledger_at_root"] = float(selected_k[path])
+        audit_record["floor_applied_at_root"] = bool(
+            final_record["floor_applied"]
+        )
+        audit_record["resource_feasible_at_root"] = bool(
+            final_record["feasible"]
+        )
 
     residual_raw = selected_raw_g[strict_ok]
     residual_norm = selected_norm[strict_ok]
