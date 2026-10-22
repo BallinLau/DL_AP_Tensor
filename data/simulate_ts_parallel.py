@@ -1483,10 +1483,10 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
             )
             field_detail["entry_accepted_count"] = entry_ok
             field_ok = field_ok & entry_ok
-            lnk_ok = _rel_close(state["lnk_cal"], state["lnkf"])
+            lnk_ok = _rel_close(state["lnkf"], verified["lnkf"])
             lnk_residual = (
-                state["lnk_cal"].to(torch.float32)
-                - state["lnkf"].to(torch.float32)
+                state["lnkf"].to(torch.float32)
+                - verified["lnkf"].to(torch.float32)
             ).abs()
             all_ok = raw_clearing_ok & lnk_ok & field_ok
             if not bool(all_ok.all()):

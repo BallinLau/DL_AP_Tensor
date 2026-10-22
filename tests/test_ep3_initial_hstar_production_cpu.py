@@ -152,7 +152,7 @@ def test_root_found_with_candidate_production_parity(tmp_path):
         config=_PositiveDeltaConfig,
         tmp_path=tmp_path,
     )
-    output = simulator.simulate()
+    output = simulator.simulate_tensor()
     diagnostics = output.meta["initial_hstar"]
     assert diagnostics["success_count"] == 1
     assert diagnostics["production_raw_clearing_passed"] is True
@@ -175,7 +175,7 @@ def test_floor_flag_recorded_and_raw_clearing_unaffected(tmp_path):
         tmp_path=tmp_path,
         floor=1e6,
     )
-    output = simulator.simulate()
+    output = simulator.simulate_tensor()
     diagnostics = output.meta["initial_hstar"]
     assert diagnostics["success_count"] == 1
     audit = json.loads(
@@ -211,7 +211,7 @@ def test_hard_default_switch_finds_root_and_records_jump(tmp_path):
         config=_PositiveDeltaConfig,
         tmp_path=tmp_path,
     )
-    output = simulator.simulate()
+    output = simulator.simulate_tensor()
     diagnostics = output.meta["initial_hstar"]
     assert diagnostics["success_count"] == 1
     audit = json.loads(
@@ -236,7 +236,7 @@ def test_calibration_preserves_production_transition_crn(tmp_path):
             tmp_path=tmp_path,
             initial_hstar=with_calibration,
         )
-        return simulator.simulate()
+        return simulator.simulate_tensor()
 
     calibrated = run(True)
     baseline = run(False)

@@ -23,29 +23,48 @@ sys.path.append(str(ROOT))
 import data.simulate_ts_parallel as stp  # noqa: E402
 
 
-# 每条 path 的分段 C_raw(h)：h<0 与 h>=0 两段，K 固定 2.0。
+# 每条 path 的分段 C_raw(h)：regions 按上界升序 (bound, c, inv, def)，K=2.0。
 PATH_ECONOMICS = {
-    0: {"c_neg": 0.4, "c_pos": 4.0, "floor": False},   # 双根 + h=0 跳变
-    1: {"c_neg": 100.0, "c_pos": 100.0, "floor": False},  # 支撑区间内无变号
-    2: {"c_neg": 0.8, "c_pos": 0.8, "floor": True},    # 单根 + floor
-    3: {"c_neg": -1.0, "c_pos": -1.0, "floor": False},  # 处处经济不可行
+    # 双根（-1.6094 与 -0.5108）+ h=-1 决策跳变，均在粗网格可见区间。
+    0: {
+        "regions": [
+            (-1.0, 0.4, 1, 0),
+            (0.5, 1.2, 2, 0),
+            (float("inf"), 3.0, 3, 1),
+        ],
+        "floor": False,
+    },
+    # 支撑区间内无变号。
+    1: {"regions": [(float("inf"), 100.0, 1, 0)], "floor": False},
+    # 单根 + floor。
+    2: {"regions": [(float("inf"), 0.8, 1, 0)], "floor": True},
+    # 处处经济不可行。
+    3: {"regions": [(float("inf"), -1.0, 1, 0)], "floor": False},
 }
 
 
 def _c_raw(path: int, h: float) -> float:
-    spec = PATH_ECONOMICS[path]
-    return spec["c_neg"] if h < 0.0 else spec["c_pos"]
+    return _region_at(path, h)[0]
+
+
+def _region_at(path: int, h: float):
+    """(c, inv, default) 分段经济：region 按上界升序，h<bound 命中该段。"""
+    regions = PATH_ECONOMICS[path]["regions"]
+    for bound, c, inv, default in regions:
+        if h < bound:
+            return c, inv, default
+    last = regions[-1]
+    return last[1], last[2], last[3]
 
 
 def _record(h: float, path: int) -> dict:
-    c = _c_raw(path, h)
+    c, inv, default = _region_at(path, h)
     k = 2.0
     g = torch.exp(torch.tensor(h, dtype=torch.float64)) * k - c
     scale = max(1.0, abs(c), abs(k))
     finite = torch.isfinite(torch.tensor(h)) and torch.isfinite(torch.tensor(c))
     feasible = finite and c > 0.0 and k > 0.0
     floor_flag = bool(PATH_ECONOMICS[path]["floor"])
-    h_region = h < 0.0
     return {
         "h": torch.tensor(h, dtype=torch.float32),
         "G": torch.tensor(float(g), dtype=torch.float32),
@@ -60,19 +79,25 @@ def _record(h: float, path: int) -> dict:
         "resource_feasible": torch.tensor(feasible, dtype=torch.bool),
         "resource_residual": torch.tensor(0.0, dtype=torch.float32),
         "n_firms": torch.tensor(1.0, dtype=torch.float32),
-        "inv_count": torch.tensor(1 if h_region else 2, dtype=torch.long),
-        "def_count": torch.tensor(0 if h_region else 1, dtype=torch.long),
+        "inv_count": torch.tensor(inv, dtype=torch.long),
+        "def_count": torch.tensor(default, dtype=torch.long),
         "entry_accepted": torch.tensor(0.0, dtype=torch.float32),
     }
+
+
+def _economic_path(sim, path: int) -> int:
+    return int(getattr(sim, "path_economics_map", {}).get(path, path))
 
 
 def _fake_rows(sim, base_state, rows, h_rows, *, rng_cpu=None, rng_cuda=None,
                return_state=False, **kwargs):
     records = []
     failures = {}
+    del base_state, rng_cpu, rng_cuda
     for index in range(int(rows.numel())):
         path = int(rows[index])
-        records.append(_record(float(h_rows[index]), path))
+        economic = _economic_path(sim, path)
+        records.append(_record(float(h_rows[index]), economic))
     return records, failures, {} if return_state else None
 
 
@@ -111,7 +136,8 @@ def _fake_grid(sim, base_state, rows, h_grid, *, rng_cpu=None, rng_cuda=None):
         }
         for row in range(n_rows):
             path = int(rows[row])
-            record = _record(float(h_grid[row, column]), path)
+            economic = _economic_path(sim, path)
+            record = _record(float(h_grid[row, column]), economic)
             for name in names:
                 packed[name][row] = record[name]
         for name in names:
@@ -125,7 +151,7 @@ def _sim(tmp_path, n_paths, beliefs) -> "_Sim":
 
 
 class _Sim(SimpleNamespace):
-    def __init__(self, tmp_path, n_paths, beliefs):
+    def __init__(self, tmp_path, n_paths, beliefs, path_economics_map=None):
         super().__init__()
         self.device = torch.device("cpu")
         self.n_paths = n_paths
@@ -141,6 +167,7 @@ class _Sim(SimpleNamespace):
         self.initial_hstar_audit_output_dir = str(tmp_path)
         self.initial_hstar_audit_episode_id = 4
         self.beliefs = beliefs
+        self.path_economics_map = path_economics_map or {}
 
 
 def _state(sim) -> dict:
@@ -167,15 +194,18 @@ def test_strict_global_multi_root_selection(tmp_path, patch_evaluators, monkeypa
     monkeypatch.setitem(
         _sys_mod.modules[__name__].PATH_ECONOMICS,
         1,
-        {"c_neg": 0.8, "c_pos": 0.8, "floor": False},
+        {"regions": [(float("inf"), 0.8, 1, 0)], "floor": False},
     )
     sim = _sim(tmp_path, 2, [-2.0, 0.0])
     state = _state(sim)
     diagnostics = stp._calibrate_initial_hstar_batched(sim, state)
 
     assert diagnostics["success_count"] == 2
-    assert diagnostics["root_solver"] == "strict_global_batched_production_node_operator"
-    # path0 两个有效根 + 一个跳变区间；选择离 belief(-2) 更近的低根。
+    assert (
+        diagnostics["root_solver"]
+        == "strict_global_batched_production_node_operator"
+    )
+    # path0 两个有效根 + 一个决策跳变区间；选择离 belief(-2) 更近的低根。
     assert diagnostics["multi_root_path_count"] == 1
     assert diagnostics["discontinuity_path_count"] >= 1
     assert diagnostics["floor_applied_root_count"] == 0
@@ -188,6 +218,7 @@ def test_strict_global_multi_root_selection(tmp_path, patch_evaluators, monkeypa
     roots = by_path[0]["all_valid_roots"]
     assert len(roots) == 2
     assert min(roots) == pytest.approx(-1.6094, abs=1e-4)
+    assert max(roots) == pytest.approx(-0.5108, abs=1e-4)
     assert by_path[0]["selected_root"] == pytest.approx(min(roots))
     assert by_path[1]["terminal_status"] == "ROOT_FOUND"
     # 正式状态写入所选根。
@@ -197,9 +228,9 @@ def test_strict_global_multi_root_selection(tmp_path, patch_evaluators, monkeypa
 
 
 def test_strict_global_floor_recorded_at_root(tmp_path, patch_evaluators):
-    # 单条 path（经济 2）带 consumption-floor；raw 出清根必须正常找到，
-    # floor flag 只记录在审计里，不阻塞 root。
-    sim = _sim(tmp_path, 1, [0.0])
+    # 单条 path 映射到经济 2（单根 + consumption-floor）；raw 出清根必须
+    # 正常找到，floor flag 只记录在审计里，不阻塞 root。
+    sim = _Sim(tmp_path, 1, [0.0], path_economics_map={0: 2})
     state = _state(sim)
     diagnostics = stp._calibrate_initial_hstar_batched(sim, state)
     assert diagnostics["success_count"] == 1
