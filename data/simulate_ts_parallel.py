@@ -1959,14 +1959,21 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
         _annotate_parent_next_leverage_rows(
             sim, parent_firm, state, branch_states[sim.main_branch]
         )
+        # Finished export rows move to host memory immediately: keeping every
+        # step's rows on the GPU makes late-simulation pools OOM before the
+        # final assembly ever runs.
+        parent_firm = parent_firm.cpu()
+        parent_macro = parent_macro.cpu()
+        firm_rows[-1] = parent_firm
+        macro_rows[-1] = parent_macro
         for branch_k, branch_state in enumerate(branch_states):
             if sim.enable_entry:
                 branch_state = _apply_entry_batched(sim, branch_state, n_potential)
                 branch_states[branch_k] = branch_state
 
             branch_firm, branch_macro = _process_node_batched(sim, branch_state, t + 1, branch_k=branch_k)
-            firm_rows.append(branch_firm)
-            macro_rows.append(branch_macro)
+            firm_rows.append(branch_firm.cpu())
+            macro_rows.append(branch_macro.cpu())
 
         state = branch_states[sim.main_branch]
         if sim.enable_exit:
