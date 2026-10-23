@@ -226,20 +226,20 @@ def test_C3_lbfgs_nonfinite_closure_does_not_pollute_best(monkeypatch):
     batch = _batch(episode.device)
     start_hash = episode._state_dict_hash(model)
     episode.hyperparams.p_root_adam_steps = 0
-    real_evaluate = solver.evaluate_problem
+    real_evaluate = solver.evaluate_problem_rows
     calls = {"n": 0}
 
     def _evaluate_after_first(model_, problem):
         calls["n"] += 1
-        result = real_evaluate(model_, problem)
+        result, rows = real_evaluate(model_, problem)
         if calls["n"] >= 2:
             # 第二次起（L-BFGS chunk 验证）注入非有限结果。
             result = dict(result)
             result["all_finite"] = False
             result["nonfinite_count"] = 1
-        return result
+        return result, rows
 
-    monkeypatch.setattr(solver, "evaluate_problem", _evaluate_after_first)
+    monkeypatch.setattr(solver, "evaluate_problem_rows", _evaluate_after_first)
     summary = episode._run_frozen_policy_p_stage(
         [batch], [batch], model, inner_index=1
     )
@@ -293,7 +293,7 @@ def test_C4_nonfinite_fresh_greedy_rejected(monkeypatch):
     start_hash = episode._state_dict_hash(model)
     monkeypatch.setattr(
         solver,
-        "fresh_greedy_residual",
+        "_fresh_stats_from_rows",
         lambda *args, **kwargs: {
             "fresh_greedy_p0_norm_mae": float("nan"),
             "fresh_greedy_pi_norm_mae": float("nan"),
@@ -314,20 +314,21 @@ def test_C5_nonfinite_validation_rows_reject_best_state(monkeypatch):
     model = episode.models["policy_value"]
     batch = _batch(episode.device)
     start_hash = episode._state_dict_hash(model)
-    real_evaluate = solver.evaluate_problem
+    real_evaluate = solver.evaluate_problem_rows
     calls = {"n": 0}
 
     def _evaluate_nonfinite_after_initial(model_, problem):
         calls["n"] += 1
-        result = dict(real_evaluate(model_, problem))
+        result, rows = real_evaluate(model_, problem)
         if calls["n"] >= 2:
             # 首次（Initial Gate）保持合法；此后注入非有限行，覆盖
             # best-state 验收路径。
+            result = dict(result)
             result["all_finite"] = False
             result["nonfinite_count"] = int(result.get("n_total", 1))
-        return result
+        return result, rows
 
-    monkeypatch.setattr(solver, "evaluate_problem", _evaluate_nonfinite_after_initial)
+    monkeypatch.setattr(solver, "evaluate_problem_rows", _evaluate_nonfinite_after_initial)
     summary = episode._run_frozen_policy_p_stage(
         [batch], [batch], model, inner_index=1
     )

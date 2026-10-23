@@ -11618,7 +11618,7 @@ class Episode:
         q_target_model: Optional[nn.Module] = None,
         inner_index: int,
         inner_cycles: int,
-        natural_validation_batches: Optional[List[Dict[str, torch.Tensor]]] = None,
+        natural_diag_request: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Dispatch the per-Inner P stage to the configured P solver.
 
@@ -11633,7 +11633,7 @@ class Episode:
                 validation_batches,
                 q_target_model if q_target_model is not None else teacher,
                 inner_index=inner_index,
-                natural_validation_batches=natural_validation_batches,
+                natural_diag_request=natural_diag_request,
             )
         # 旧 Fixed Target Cache 兼容路径（firm_inner_cycles=1 回归）。
         return self._run_policy_value_evaluation_stage(
@@ -11662,7 +11662,7 @@ class Episode:
         q_model: nn.Module,
         *,
         inner_index: int,
-        natural_validation_batches: Optional[List[Dict[str, torch.Tensor]]] = None,
+        natural_diag_request: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Hybrid P stage: frozen-policy dynamic Bellman residual policy iterations.
 
@@ -11713,8 +11713,25 @@ class Episode:
         successful_iterations = 0
         reverted_iterations: List[int] = []
         rejected_iterations: List[Dict[str, Any]] = []
+        # Natural Validation 请求（Prompt §1/§2）：request=None（直接调用/旧
+        # 路径）视为无独立口径；independent 模式受频率控制（默认每个 Firm
+        # Inner 只在最后一次 P Policy Iteration 执行一次），reuse 模式零成本
+        # 每次都报。
+        request = natural_diag_request or {}
+        request_mode = str(request.get("mode", "not_evaluable"))
+        request_frequency = str(request.get("frequency", "firm_inner_end")).lower()
         try:
             for iteration_index in range(1, iterations + 1):
+                if request_mode == "independent":
+                    run_diag_now = request_frequency == "per_p_iteration" or (
+                        request_frequency == "firm_inner_end"
+                        and iteration_index == iterations
+                    )
+                    diag_mode = "independent" if run_diag_now else "skipped"
+                    diag_batches = request.get("batches") if run_diag_now else None
+                else:
+                    diag_mode = request_mode
+                    diag_batches = None
                 summary = frozen_policy_p_solver.run_p_policy_iteration(
                     self,
                     model,
@@ -11746,7 +11763,12 @@ class Episode:
                         is not None
                         else None
                     ),
-                    natural_validation_batches=natural_validation_batches,
+                    natural_validation_batches=diag_batches,
+                    natural_diag_mode=diag_mode,
+                    natural_diag_config=request.get("config"),
+                    natural_calibers_identical=bool(
+                        request.get("calibers_identical", False)
+                    ),
                 )
                 records.append(summary)
                 total_optimizer_steps += int(summary.get("optimizer_steps", 0))
@@ -11908,9 +11930,61 @@ class Episode:
                 "eta1_count_after": validation_counts["eta1_count"],
                 "eta1_share_after": validation_counts["eta1_share"],
             }
+        # --- Natural Validation 诊断请求（Prompt §1.2）：
+        # A：η Balance 关闭 → 主 Validation 即 Natural 口径，直接复用诊断；
+        # B：η Balance 开启且 Validation 被平衡 → 对 Original Validation 的
+        #    固定预算子集做独立诊断（唯一需要第二种口径的情形）；
+        # C：η Balance 开启但 Validation 未平衡 → 主 Validation 已是 Natural，
+        #    复用诊断并标记两种口径一致；
+        # 无 Validation batch → not_evaluable，绝不退化为对整个训练池诊断。
+        balance_enabled = bool(
+            getattr(self.hyperparams, "pv_current_eta_balance_enabled", False)
+        )
+        diag_enabled = bool(
+            getattr(self.hyperparams, "p_eta_natural_diag_enabled", True)
+        )
+        diag_frequency = str(
+            getattr(self.hyperparams, "p_eta_natural_diag_frequency", "firm_inner_end")
+        ).lower()
+        if not validation_batches:
+            natural_diag_request: Dict[str, Any] = {
+                "mode": "not_evaluable",
+                "batches": None,
+                "calibers_identical": False,
+                "frequency": diag_frequency,
+            }
+        elif (not balance_enabled) or (not balance_validation):
+            natural_diag_request = {
+                "mode": "reuse_validation",
+                "batches": None,
+                "calibers_identical": bool(balance_enabled and not balance_validation),
+                "frequency": diag_frequency,
+            }
+        else:
+            natural_diag_request = {
+                "mode": (
+                    "independent"
+                    if diag_enabled and diag_frequency != "off"
+                    else "not_evaluable"
+                ),
+                "batches": validation_batches,
+                "calibers_identical": False,
+                "frequency": diag_frequency,
+                "config": {
+                    "max_parents": int(
+                        getattr(self.hyperparams, "p_eta_natural_diag_max_parents", 4096)
+                    ),
+                    "chunk_size": int(
+                        getattr(self.hyperparams, "p_eta_natural_diag_chunk_size", 512)
+                    ),
+                    "seed": int(
+                        getattr(self.hyperparams, "p_eta_natural_diag_seed", 97531)
+                    ),
+                },
+            }
         original_counts = self._current_eta_counts_from_batches(pv_train_batches)
         natural_validation_counts = self._current_eta_counts_from_batches(
-            validation_batches if validation_batches else pv_train_batches
+            validation_batches
         )
         p_eta_balance_summary = {
             "p_eta_balance_enabled": bool(
@@ -12047,9 +12121,7 @@ class Episode:
                     q_target_model=q_pricing_teacher,
                     inner_index=cycle_index,
                     inner_cycles=inner_cycles,
-                    natural_validation_batches=(
-                        validation_batches if validation_batches else pv_train_batches
-                    ),
+                    natural_diag_request=natural_diag_request,
                 )
                 pq_summary.update(p_eta_balance_summary)
                 logger.info(
@@ -12510,18 +12582,20 @@ class Episode:
             + int(self.episode_id) * 100003
             + stream_offset * 1000003
         )
-        # 原批次完整性快照：反事实重分配只允许写 P 专用副本。
-        original_parent_snapshots: List[torch.Tensor] = []
+        # 原批次完整性校验（轻量摘要）：反事实重分配只允许写 P 专用副本；
+        # 不再保留整批 Parent 快照张量，改为 GPU 端列和摘要在结束时单次比对，
+        # 计数也全部张量化累计、末尾单次同步（Prompt §2.5）。
+        original_digests: List[torch.Tensor] = []
         original_children_refs: List[Any] = []
         balanced: List[Dict[str, torch.Tensor]] = []
-        reassigned_count = 0
-        source_stats: Dict[str, Dict[str, int]] = {}
+        reassigned_deltas: List[torch.Tensor] = []
+        source_stats: Dict[str, Dict[str, List[torch.Tensor]]] = {}
         for batch in batches:
             parent = batch.get("parent")
             if not torch.is_tensor(parent) or parent.ndim < 2 or parent.shape[1] < 3:
                 balanced.append(batch)
                 continue
-            original_parent_snapshots.append(parent.detach().clone())
+            original_digests.append(parent.detach().to(torch.float64).sum(dim=0))
             original_children_refs.append(batch.get("children"))
             n_rows = int(parent.shape[0])
             n_eta1 = int(round(n_rows * target_share))
@@ -12533,27 +12607,31 @@ class Episode:
             cloned_parent[:, 2] = eta_cpu.to(parent.device)
             cloned["parent"] = cloned_parent
             balanced.append(cloned)
-            eta_before_rows = parent[:, 2].detach().cpu()
-            eta_after_rows = cloned_parent[:, 2].detach().cpu()
-            reassigned_count += int((eta_after_rows != eta_before_rows).sum().item())
+            eta_before_rows = parent[:, 2].detach()
+            eta_after_rows = cloned_parent[:, 2].detach()
+            reassigned_deltas.append(
+                (eta_after_rows != eta_before_rows).to(torch.long).sum().reshape(1)
+            )
             source_ids = batch.get("source_id")
             if torch.is_tensor(source_ids) and source_ids.numel() == n_rows:
-                source_cpu = source_ids.detach().reshape(-1).cpu()
-                for src in torch.unique(source_cpu).tolist():
-                    mask = source_cpu == src
+                source_flat = source_ids.detach().reshape(-1)
+                for src in torch.unique(source_flat).tolist():
+                    mask = source_flat == src
                     stats = source_stats.setdefault(
                         str(int(src)),
-                        {"n_parents": 0, "eta1_before": 0, "eta1_after": 0},
+                        {"n_parents": [], "eta1_before": [], "eta1_after": []},
                     )
-                    stats["n_parents"] += int(mask.sum().item())
-                    stats["eta1_before"] += int(
-                        (eta_before_rows[mask] > 0.5).sum().item()
+                    stats["n_parents"].append(
+                        mask.to(torch.long).sum().reshape(1)
                     )
-                    stats["eta1_after"] += int(
-                        (eta_after_rows[mask] > 0.5).sum().item()
+                    stats["eta1_before"].append(
+                        ((eta_before_rows > 0.5) & mask).to(torch.long).sum().reshape(1)
+                    )
+                    stats["eta1_after"].append(
+                        ((eta_after_rows > 0.5) & mask).to(torch.long).sum().reshape(1)
                     )
         originals_preserved = True
-        for batch, snapshot, children_ref in zip(
+        for batch, digest, children_ref in zip(
             [
                 b
                 for b in batches
@@ -12561,31 +12639,35 @@ class Episode:
                 and b["parent"].ndim >= 2
                 and b["parent"].shape[1] >= 3
             ],
-            original_parent_snapshots,
+            original_digests,
             original_children_refs,
         ):
-            if not torch.equal(batch["parent"], snapshot):
+            current = batch["parent"].detach().to(torch.float64).sum(dim=0)
+            if not torch.equal(current.cpu(), digest.cpu()):
                 originals_preserved = False
             if batch.get("children") is not children_ref:
                 originals_preserved = False
-        source_eta_shares = {
-            src: {
-                "n_parents": stats["n_parents"],
-                "eta1_count_before": stats["eta1_before"],
-                "eta1_count_after": stats["eta1_after"],
+        reassigned_count = (
+            int(torch.cat(reassigned_deltas).sum().item())
+            if reassigned_deltas
+            else 0
+        )
+        source_eta_shares = {}
+        for src, stats_tensors in source_stats.items():
+            n_parents = int(torch.cat(stats_tensors["n_parents"]).sum().item())
+            eta1_before = int(torch.cat(stats_tensors["eta1_before"]).sum().item())
+            eta1_after = int(torch.cat(stats_tensors["eta1_after"]).sum().item())
+            source_eta_shares[src] = {
+                "n_parents": n_parents,
+                "eta1_count_before": eta1_before,
+                "eta1_count_after": eta1_after,
                 "eta1_share_before": (
-                    stats["eta1_before"] / stats["n_parents"]
-                    if stats["n_parents"]
-                    else float("nan")
+                    eta1_before / n_parents if n_parents else float("nan")
                 ),
                 "eta1_share_after": (
-                    stats["eta1_after"] / stats["n_parents"]
-                    if stats["n_parents"]
-                    else float("nan")
+                    eta1_after / n_parents if n_parents else float("nan")
                 ),
             }
-            for src, stats in source_stats.items()
-        }
         after = self._current_eta_counts_from_batches(balanced)
         return balanced, {
             "enabled": True,

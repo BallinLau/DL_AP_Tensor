@@ -31,6 +31,7 @@ production Bellman value ``value_star`` reported by the grid teacher.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import time
 from dataclasses import dataclass
@@ -48,6 +49,9 @@ from .bp_grid_teacher import (
     _target_q_claim,
     resolve_grid_chunk_plan,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 PARITY_RTOL = 1e-5
@@ -115,6 +119,9 @@ class FrozenPolicyBatch:
     pi: FrozenBranchBatch
     parity_max_abs_error: float
     parity_passed: bool
+    # 每个 Parent 行的来源标记（0=Simulated / 1=Coverage / -1=未知），仅用于
+    # 诊断分组，绝不参与任何经济计算或验收判定。
+    source_id: Optional[torch.Tensor] = None
 
     @property
     def parent(self) -> torch.Tensor:
@@ -290,10 +297,16 @@ def _eta_stratified_stats(
     return out
 
 
-def evaluate_problem(
+def evaluate_problem_rows(
     model: torch.nn.Module,
     problem: Sequence[FrozenPolicyBatch],
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
+    """``evaluate_problem`` + 逐 Parent 行的残差/η/source 行数据（CPU）。
+
+    行数据仅供诊断分组（Balanced / Original Mixture / Simulated-only）复用，
+    不进入任何正式摘要，也绝不参与 Acceptance 判定。统计输出与
+    ``evaluate_problem`` 完全一致。
+    """
     def _stats(value: torch.Tensor, prefix: str) -> Dict[str, float]:
         flat = value.detach().reshape(-1)
         finite = flat[torch.isfinite(flat)]
@@ -313,6 +326,7 @@ def evaluate_problem(
 
     accum: Dict[str, List[torch.Tensor]] = {}
     eta_rows: List[torch.Tensor] = []
+    source_rows: List[torch.Tensor] = []
     with torch.no_grad():
         for batch in problem:
             values = residual_tensors(model, batch)
@@ -321,6 +335,25 @@ def evaluate_problem(
             eta_rows.append(
                 batch.parent[:, 2].detach().reshape(-1).to(torch.float32).cpu()
             )
+            if batch.source_id is not None:
+                source_rows.append(
+                    batch.source_id.detach().reshape(-1).to(torch.long).cpu()
+                )
+            else:
+                source_rows.append(
+                    torch.full(
+                        (int(batch.parent.shape[0]),), -1, dtype=torch.long
+                    )
+                )
+    rows: Dict[str, torch.Tensor] = {
+        "p0_norm": torch.empty(0),
+        "pi_norm": torch.empty(0),
+        "p0": torch.empty(0),
+        "pi": torch.empty(0),
+        "eta": torch.empty(0),
+        "source": torch.empty(0, dtype=torch.long),
+        "row_finite": torch.empty(0, dtype=torch.bool),
+    }
     if not accum:
         result: Dict[str, Any] = {
             "p0_norm_mae": float("nan"),
@@ -337,7 +370,7 @@ def evaluate_problem(
         empty = torch.empty(0)
         for prefix in ("p0", "pi", "p0_norm", "pi_norm"):
             result.update(_eta_stratified_stats(empty, empty, prefix))
-        return result
+        return result, rows
     # 逐行 finite 判定覆盖全部正式验收张量；finite-only 统计仅作诊断。
     row_finite: Optional[torch.Tensor] = None
     for key in FINITE_CHECK_KEYS:
@@ -378,7 +411,27 @@ def evaluate_problem(
         result.update(_eta_stratified_stats(torch.cat(accum["pi"]), eta_all, "pi"))
         result.update(_eta_stratified_stats(p0n, eta_all, "p0_norm"))
         result.update(_eta_stratified_stats(pin, eta_all, "pi_norm"))
-    return result
+    rows = {
+        "p0_norm": p0n,
+        "pi_norm": pin,
+        "p0": torch.cat(accum["p0"]),
+        "pi": torch.cat(accum["pi"]),
+        "eta": eta_all,
+        "source": (
+            torch.cat(source_rows)
+            if source_rows
+            else torch.empty(0, dtype=torch.long)
+        ),
+        "row_finite": row_finite,
+    }
+    return result, rows
+
+
+def evaluate_problem(
+    model: torch.nn.Module,
+    problem: Sequence[FrozenPolicyBatch],
+) -> Dict[str, Any]:
+    return evaluate_problem_rows(model, problem)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -663,12 +716,20 @@ def build_frozen_policy_batch(
         branch="pi",
         normalize_by_value_scale=normalize_by_value_scale,
     )
+    source_ids = batch.get("source_id")
+    if torch.is_tensor(source_ids) and source_ids.numel() == parent_state.shape[0]:
+        source_ids = source_ids.detach().reshape(-1).to(torch.long)
+    else:
+        source_ids = torch.full(
+            (parent_state.shape[0],), -1, dtype=torch.long, device=parent_state.device
+        )
     return FrozenPolicyBatch(
         batch_id=int(batch_id),
         p0=p0_branch,
         pi=pi_branch,
         parity_max_abs_error=max(err0, erri),
         parity_passed=bool(ok0 and oki),
+        source_id=source_ids,
     )
 
 
@@ -1090,22 +1151,24 @@ def run_lbfgs_chunked(
 # ---------------------------------------------------------------------------
 
 
-def fresh_greedy_residual(
+def _fresh_greedy_rows(
     episode: Any,
     model: torch.nn.Module,
     teacher: BPGridTeacher,
     batches: Sequence[Dict[str, torch.Tensor]],
     *,
     q_model: Optional[torch.nn.Module] = None,
-) -> Dict[str, float]:
-    """Recompute the greedy policy at the current P and report its residual.
+) -> Dict[str, torch.Tensor]:
+    """逐 Parent 行的 Fresh-Greedy 归一化残差（CPU）+ η/source/finite 掩码。
 
-    ``value_star`` is the production RHS under the fresh greedy policy, so
-    ``P - value_star`` is the fresh-greedy Bellman residual.
+    与 ``fresh_greedy_residual`` 同一套数学；行数据供 Natural Validation
+    诊断分组（Simulated-only 等）复用，不进入正式摘要。
     """
     q_model = q_model if q_model is not None else model
-    r0, ri, bp0_change, bpi_change = [], [], [], []
+    r0: List[torch.Tensor] = []
+    ri: List[torch.Tensor] = []
     eta_sinks: List[torch.Tensor] = []
+    source_sinks: List[torch.Tensor] = []
     normalize = bool(
         getattr(episode.hyperparams, "pv_bellman_normalize_by_value_scale", False)
     )
@@ -1146,13 +1209,51 @@ def fresh_greedy_residual(
                         branch=branch,
                         child_weights=child_weights,
                     )
-                    sink.append(((online - target["value_star"]) / scale).detach().cpu())
+                    sink.append(
+                        ((online - target["value_star"]) / scale)
+                        .detach()
+                        .reshape(-1)
+                        .cpu()
+                    )
+                n_rows = int(parent_state.shape[0])
                 eta_sinks.append(
                     parent_state[:, 2].detach().reshape(-1).to(torch.float32).cpu()
                 )
+                source_ids = batch.get("source_id")
+                if torch.is_tensor(source_ids) and source_ids.numel() == n_rows:
+                    source_sinks.append(
+                        source_ids.detach().reshape(-1).to(torch.long).cpu()
+                    )
+                else:
+                    source_sinks.append(torch.full((n_rows,), -1, dtype=torch.long))
     finally:
         model.train(was_training)
-    if not r0:
+    r0_flat = torch.cat(r0) if r0 else torch.empty(0)
+    ri_flat = torch.cat(ri) if ri else torch.empty(0)
+    return {
+        "fg_p0_norm": r0_flat,
+        "fg_pi_norm": ri_flat,
+        "eta": (
+            torch.cat(eta_sinks).reshape(-1) if eta_sinks else torch.empty(0)
+        ),
+        "source": (
+            torch.cat(source_sinks).reshape(-1)
+            if source_sinks
+            else torch.empty(0, dtype=torch.long)
+        ),
+        "row_finite": (
+            torch.isfinite(r0_flat) & torch.isfinite(ri_flat)
+            if r0_flat.numel()
+            else torch.empty(0, dtype=torch.bool)
+        ),
+    }
+
+
+def _fresh_stats_from_rows(rows: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    r0_flat = rows["fg_p0_norm"]
+    ri_flat = rows["fg_pi_norm"]
+    eta_flat = rows["eta"]
+    if r0_flat.numel() == 0:
         result: Dict[str, Any] = {
             "fresh_greedy_p0_norm_mae": float("nan"),
             "fresh_greedy_pi_norm_mae": float("nan"),
@@ -1162,9 +1263,6 @@ def fresh_greedy_residual(
         result.update(_eta_stratified_stats(empty, empty, "fresh_greedy_p0_norm"))
         result.update(_eta_stratified_stats(empty, empty, "fresh_greedy_pi_norm"))
         return result
-    r0_flat = torch.cat(r0).reshape(-1)
-    ri_flat = torch.cat(ri).reshape(-1)
-    eta_flat = torch.cat(eta_sinks).reshape(-1) if eta_sinks else torch.empty(0)
     all_finite = bool(
         torch.isfinite(r0_flat).all() and torch.isfinite(ri_flat).all()
     )
@@ -1184,6 +1282,823 @@ def fresh_greedy_residual(
             _eta_stratified_stats(ri_flat, eta_flat, "fresh_greedy_pi_norm")
         )
     return result
+
+
+def fresh_greedy_residual(
+    episode: Any,
+    model: torch.nn.Module,
+    teacher: BPGridTeacher,
+    batches: Sequence[Dict[str, torch.Tensor]],
+    *,
+    q_model: Optional[torch.nn.Module] = None,
+) -> Dict[str, float]:
+    """Recompute the greedy policy at the current P and report its residual.
+
+    ``value_star`` is the production RHS under the fresh greedy policy, so
+    ``P - value_star`` is the fresh-greedy Bellman residual.
+    """
+    return _fresh_stats_from_rows(
+        _fresh_greedy_rows(episode, model, teacher, batches, q_model=q_model)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Natural Validation diagnostic（纯诊断，绝不参与 P Acceptance）
+# ---------------------------------------------------------------------------
+#
+# 三种 Validation 分布（Prompt §4）：
+#   * Balanced Validation      — P-only η Balance 后的主 Validation（正式口径）；
+#   * Original Mixture         — 未 η 重分配的原始 80/20 混合分布；
+#   * Simulated-only           — Original Mixture 中 source_id=0 的子集。
+# 诊断只从 Original Validation 里取有上限的固定 Parent 子集（固定 Seed、
+# Parent/Child 完整配对、不重采样 η、不消耗全局 RNG），分块构建/评估并在
+# 优化期间把问题存放在 CPU，绝不把完整诊断问题常驻 GPU。
+
+NOT_EVALUABLE = "not_evaluable"
+
+
+def _tree_to_device(obj: Any, device: torch.device) -> Any:
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    if isinstance(obj, (list, tuple)):
+        seq = [_tree_to_device(item, device) for item in obj]
+        return tuple(seq) if isinstance(obj, tuple) else seq
+    if isinstance(obj, dict):
+        return {key: _tree_to_device(value, device) for key, value in obj.items()}
+    return obj
+
+
+def _frozen_batch_to(
+    batch: FrozenPolicyBatch, device: torch.device
+) -> FrozenPolicyBatch:
+    kwargs = {
+        name: _tree_to_device(getattr(batch, name), device)
+        for name in batch.__dataclass_fields__
+    }
+    return FrozenPolicyBatch(**kwargs)
+
+
+def _batch_dict_to_device(
+    batch: Dict[str, Any], device: torch.device
+) -> Dict[str, Any]:
+    return {key: _tree_to_device(value, device) for key, value in batch.items()}
+
+
+def _batch_dict_to_cpu(batch: Dict[str, Any]) -> Dict[str, Any]:
+    return _batch_dict_to_device(batch, torch.device("cpu"))
+
+
+def _select_diagnostic_batches(
+    batches: Sequence[Dict[str, Any]],
+    *,
+    max_parents: int,
+    seed: int,
+    episode_id: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """从 Original Validation 里选固定的有上限 Parent 行子集（CPU、可复现）。
+
+    * 固定 Seed 的 CPU ``torch.Generator``，不消耗全局 RNG；
+    * Parent 与全部 Child 行整体配对切片；
+    * 不重采样 η，不改变任何行的内容；
+    * Parent/Child 行数不匹配的 batch 整体丢弃并如实计数，绝不凭空补样本。
+    """
+    pairable: List[Tuple[int, Dict[str, Any], int]] = []
+    requested_parents = 0
+    dropped_unpairable_batches = 0
+    for batch in batches:
+        parent = batch.get("parent")
+        if not torch.is_tensor(parent) or parent.ndim < 2 or parent.shape[0] == 0:
+            continue
+        n_rows = int(parent.shape[0])
+        children = batch.get("children")
+        if not children and batch.get("child0") is not None:
+            children = [batch.get("child0"), batch.get("child1")]
+        children = children or []
+        if not children or any(
+            (not torch.is_tensor(child)) or int(child.shape[0]) != n_rows
+            for child in children
+        ):
+            dropped_unpairable_batches += 1
+            continue
+        requested_parents += n_rows
+        pairable.append((n_rows, batch, len(pairable)))
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed) + int(episode_id) * 100003)
+    budget = max(1, int(max_parents))
+    if requested_parents <= budget:
+        chosen = {
+            index: torch.arange(n_rows, dtype=torch.long)
+            for n_rows, _batch, index in pairable
+        }
+    else:
+        flat = torch.randperm(requested_parents, generator=generator)[:budget]
+        chosen_lists: Dict[int, List[int]] = {}
+        offset = 0
+        for n_rows, _batch, index in pairable:
+            local = flat[(flat >= offset) & (flat < offset + n_rows)] - offset
+            if int(local.numel()) > 0:
+                chosen_lists[index] = local.sort().values.tolist()
+            offset += n_rows
+        chosen = {
+            index: torch.tensor(rows, dtype=torch.long)
+            for index, rows in chosen_lists.items()
+        }
+
+    subset: List[Dict[str, Any]] = []
+    source_counts = {"source0": 0, "source1": 0, "unknown": 0}
+    selected_parents = 0
+    for n_rows, batch, index in pairable:
+        rows = chosen.get(index)
+        if rows is None:
+            continue
+        rows = rows.to(dtype=torch.long)
+        sliced: Dict[str, Any] = {}
+        for key, value in batch.items():
+            if torch.is_tensor(value) and value.ndim >= 1 and int(value.shape[0]) == n_rows:
+                sliced[key] = value.detach().index_select(0, rows.to(value.device)).cpu()
+            elif (
+                isinstance(value, (list, tuple))
+                and value
+                and all(
+                    torch.is_tensor(item) and int(item.shape[0]) == n_rows
+                    for item in value
+                )
+            ):
+                sliced[key] = [
+                    item.detach().index_select(0, rows.to(item.device)).cpu()
+                    for item in value
+                ]
+            else:
+                sliced[key] = value
+        subset.append(sliced)
+        selected_parents += int(rows.numel())
+        source_ids = batch.get("source_id")
+        if torch.is_tensor(source_ids) and int(source_ids.numel()) == n_rows:
+            picked = source_ids.detach().reshape(-1).index_select(
+                0, rows.to(source_ids.device)
+            )
+            source_counts["source0"] += int((picked == 0).sum())
+            source_counts["source1"] += int((picked == 1).sum())
+            source_counts["unknown"] += int(
+                (picked != 0).sum() - (picked == 1).sum()
+            )
+        else:
+            source_counts["unknown"] += int(rows.numel())
+
+    sampling = {
+        "sampling_method": "uniform_parent_row_subset_without_replacement",
+        "stratified": False,
+        "eta_rebalanced": False,
+        "preserves_global_rng": True,
+        "requested_parents": int(requested_parents),
+        "selected_parents": int(selected_parents),
+        "sampling_ratio": (
+            float(selected_parents / requested_parents)
+            if requested_parents
+            else 0.0
+        ),
+        "max_parents": int(budget),
+        "seed": int(seed),
+        "episode_id": int(episode_id),
+        "source_counts": dict(source_counts),
+        "dropped_unpairable_batches": int(dropped_unpairable_batches),
+    }
+    return subset, sampling
+
+
+def _chunk_batch_dicts(
+    batches: Sequence[Dict[str, Any]], chunk_size: int
+) -> List[List[Dict[str, Any]]]:
+    """把子集 batch 按 Parent 行数切成 ≤ chunk_size 的构建/评估块。"""
+    limit = max(1, int(chunk_size))
+    chunks: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    current_rows = 0
+    for batch in batches:
+        n_rows = int(batch["parent"].shape[0])
+        if current and current_rows + n_rows > limit:
+            chunks.append(current)
+            current = []
+            current_rows = 0
+        if n_rows <= limit:
+            current.append(batch)
+            current_rows += n_rows
+            continue
+        # 单个 batch 超过 chunk 上限时按行再切。
+        for start in range(0, n_rows, limit):
+            stop = min(start + limit, n_rows)
+            sub: Dict[str, Any] = {}
+            for key, value in batch.items():
+                if torch.is_tensor(value) and int(value.shape[0]) == n_rows:
+                    sub[key] = value[start:stop]
+                elif (
+                    isinstance(value, (list, tuple))
+                    and value
+                    and all(
+                        torch.is_tensor(item) and int(item.shape[0]) == n_rows
+                        for item in value
+                    )
+                ):
+                    sub[key] = [item[start:stop] for item in value]
+                else:
+                    sub[key] = value
+            if current:
+                chunks.append(current)
+                current = []
+                current_rows = 0
+            chunks.append([sub])
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _eval_frozen_rows_chunked(
+    model: torch.nn.Module,
+    problem_cpu: Sequence[FrozenPolicyBatch],
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """逐 chunk（逐 batch）把 CPU 上的冻结问题搬回 GPU 求残差并立即释放。"""
+    p0_rows: List[torch.Tensor] = []
+    pi_rows: List[torch.Tensor] = []
+    p0n_rows: List[torch.Tensor] = []
+    pin_rows: List[torch.Tensor] = []
+    eta_rows: List[torch.Tensor] = []
+    source_rows: List[torch.Tensor] = []
+    finite_rows: List[torch.Tensor] = []
+    with torch.no_grad():
+        for frozen_cpu in problem_cpu:
+            frozen = _frozen_batch_to(frozen_cpu, device)
+            values = residual_tensors(model, frozen)
+            row_finite: Optional[torch.Tensor] = None
+            for key in FINITE_CHECK_KEYS:
+                flat = torch.isfinite(values[key].reshape(-1))
+                row_finite = flat if row_finite is None else (row_finite & flat)
+            n_rows = int(frozen.parent.shape[0])
+            p0_rows.append(values["p0"].reshape(-1).detach().cpu())
+            pi_rows.append(values["pi"].reshape(-1).detach().cpu())
+            p0n_rows.append(values["p0_normalized"].reshape(-1).detach().cpu())
+            pin_rows.append(values["pi_normalized"].reshape(-1).detach().cpu())
+            eta_rows.append(
+                frozen.parent[:, 2].detach().reshape(-1).to(torch.float32).cpu()
+            )
+            if frozen.source_id is not None:
+                source_rows.append(
+                    frozen.source_id.detach().reshape(-1).to(torch.long).cpu()
+                )
+            else:
+                source_rows.append(torch.full((n_rows,), -1, dtype=torch.long))
+            finite_rows.append(row_finite.detach().cpu())
+            del frozen, values
+    return {
+        "p0": torch.cat(p0_rows) if p0_rows else torch.empty(0),
+        "pi": torch.cat(pi_rows) if pi_rows else torch.empty(0),
+        "p0_norm": torch.cat(p0n_rows) if p0n_rows else torch.empty(0),
+        "pi_norm": torch.cat(pin_rows) if pin_rows else torch.empty(0),
+        "eta": torch.cat(eta_rows) if eta_rows else torch.empty(0),
+        "source": (
+            torch.cat(source_rows) if source_rows else torch.empty(0, dtype=torch.long)
+        ),
+        "row_finite": (
+            torch.cat(finite_rows) if finite_rows else torch.empty(0, dtype=torch.bool)
+        ),
+    }
+
+
+def _fresh_greedy_rows_chunked(
+    episode: Any,
+    model: torch.nn.Module,
+    teacher: BPGridTeacher,
+    subset_cpu: Sequence[Dict[str, Any]],
+    device: torch.device,
+    chunk_size: int,
+    *,
+    q_model: Optional[torch.nn.Module] = None,
+) -> Dict[str, torch.Tensor]:
+    """对 CPU 上的固定诊断子集分块执行 Fresh-Greedy 残差（同一子集可复用）。"""
+    chunks = _chunk_batch_dicts(subset_cpu, chunk_size)
+    r0: List[torch.Tensor] = []
+    ri: List[torch.Tensor] = []
+    eta: List[torch.Tensor] = []
+    source: List[torch.Tensor] = []
+    finite: List[torch.Tensor] = []
+    for chunk in chunks:
+        rows = _fresh_greedy_rows(
+            episode,
+            model,
+            teacher,
+            [_batch_dict_to_device(batch, device) for batch in chunk],
+            q_model=q_model,
+        )
+        r0.append(rows["fg_p0_norm"])
+        ri.append(rows["fg_pi_norm"])
+        eta.append(rows["eta"])
+        source.append(rows["source"])
+        finite.append(rows["row_finite"])
+    return {
+        "fg_p0_norm": torch.cat(r0) if r0 else torch.empty(0),
+        "fg_pi_norm": torch.cat(ri) if ri else torch.empty(0),
+        "eta": torch.cat(eta) if eta else torch.empty(0),
+        "source": torch.cat(source) if source else torch.empty(0, dtype=torch.long),
+        "row_finite": torch.cat(finite) if finite else torch.empty(0, dtype=torch.bool),
+    }
+
+
+def _frozen_stats_from_rows(rows: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    """与 ``evaluate_problem`` 同形状的统计（由行数据纯 CPU 聚合）。"""
+    if rows["p0_norm"].numel() == 0:
+        result: Dict[str, Any] = {
+            "p0_norm_mae": float("nan"),
+            "pi_norm_mae": float("nan"),
+            "normalized_mae": float("nan"),
+            "normalized_rmse": float("nan"),
+            "finite": False,
+            "n_total": 0,
+            "n_finite": 0,
+            "nonfinite_count": 0,
+            "nonfinite_ratio": 0.0,
+            "all_finite": False,
+        }
+        empty = torch.empty(0)
+        for prefix in ("p0", "pi", "p0_norm", "pi_norm"):
+            result.update(_eta_stratified_stats(empty, empty, prefix))
+        return result
+
+    def _stats(value: torch.Tensor, prefix: str) -> Dict[str, float]:
+        flat = value.detach().reshape(-1)
+        finite = flat[torch.isfinite(flat)]
+        if finite.numel() == 0:
+            return {
+                f"{prefix}_mae": float("nan"),
+                f"{prefix}_rmse": float("nan"),
+                f"{prefix}_p90": float("nan"),
+                f"{prefix}_max": float("nan"),
+            }
+        return {
+            f"{prefix}_mae": float(finite.abs().mean()),
+            f"{prefix}_rmse": float(finite.square().mean().sqrt()),
+            f"{prefix}_p90": _quantile(finite.abs(), 0.9),
+            f"{prefix}_max": float(finite.abs().max()),
+        }
+
+    p0n = rows["p0_norm"]
+    pin = rows["pi_norm"]
+    row_finite = rows["row_finite"]
+    n_total = int(row_finite.numel())
+    n_finite = int(row_finite.sum())
+    result = {}
+    result.update(_stats(rows["p0"], "p0"))
+    result.update(_stats(rows["pi"], "pi"))
+    result.update(_stats(p0n, "p0_norm"))
+    result.update(_stats(pin, "pi_norm"))
+    result.update(
+        {
+            "normalized_mae": 0.5 * (result["p0_norm_mae"] + result["pi_norm_mae"]),
+            "normalized_rmse": math.sqrt(
+                0.5 * (result["p0_norm_rmse"] ** 2 + result["pi_norm_rmse"] ** 2)
+            ),
+            "finite": bool(n_finite == n_total),
+            "n_total": n_total,
+            "n_finite": n_finite,
+            "nonfinite_count": n_total - n_finite,
+            "nonfinite_ratio": (
+                float((n_total - n_finite) / n_total) if n_total else 0.0
+            ),
+            "all_finite": bool(n_finite == n_total) and n_total > 0,
+        }
+    )
+    eta_all = rows["eta"]
+    if eta_all.numel() == p0n.numel():
+        result.update(_eta_stratified_stats(rows["p0"], eta_all, "p0"))
+        result.update(_eta_stratified_stats(rows["pi"], eta_all, "pi"))
+        result.update(_eta_stratified_stats(p0n, eta_all, "p0_norm"))
+        result.update(_eta_stratified_stats(pin, eta_all, "pi_norm"))
+    return result
+
+
+def _mae_p90(values: torch.Tensor) -> Tuple[float, float]:
+    flat = values.detach().reshape(-1)
+    finite = flat[torch.isfinite(flat)]
+    if finite.numel() == 0:
+        return float("nan"), float("nan")
+    return float(finite.abs().mean()), _quantile(finite.abs(), 0.9)
+
+
+def _diag_view(
+    label: str,
+    mask: torch.Tensor,
+    frozen_init: Dict[str, torch.Tensor],
+    frozen_final: Dict[str, torch.Tensor],
+    fresh_init: Dict[str, torch.Tensor],
+    fresh_final: Dict[str, torch.Tensor],
+) -> Dict[str, Any]:
+    """一种 Validation 分布的完整视图（Prompt §4.4 字段）。"""
+    n_parents = int(mask.sum())
+    if n_parents == 0:
+        return {
+            "source": label,
+            "n_parents": 0,
+            "eta0_count": 0,
+            "eta1_count": 0,
+            "eta1_share": float("nan"),
+            "evaluable": False,
+            "status": NOT_EVALUABLE,
+            "reason": "empty_group",
+        }
+    eta = frozen_final["eta"][mask]
+    combined_finite = (
+        frozen_init["row_finite"][mask]
+        & frozen_final["row_finite"][mask]
+        & fresh_init["row_finite"][mask]
+        & fresh_final["row_finite"][mask]
+    )
+    n_nonfinite = int((~combined_finite).sum())
+    p0_frozen_mae, p0_frozen_p90 = _mae_p90(frozen_final["p0_norm"][mask])
+    pi_frozen_mae, pi_frozen_p90 = _mae_p90(frozen_final["pi_norm"][mask])
+    p0_fresh_mae, p0_fresh_p90 = _mae_p90(fresh_final["fg_p0_norm"][mask])
+    pi_fresh_mae, pi_fresh_p90 = _mae_p90(fresh_final["fg_pi_norm"][mask])
+    p0_frozen_i_mae, p0_frozen_i_p90 = _mae_p90(frozen_init["p0_norm"][mask])
+    pi_frozen_i_mae, pi_frozen_i_p90 = _mae_p90(frozen_init["pi_norm"][mask])
+    p0_fresh_i_mae, p0_fresh_i_p90 = _mae_p90(fresh_init["fg_p0_norm"][mask])
+    pi_fresh_i_mae, pi_fresh_i_p90 = _mae_p90(fresh_init["fg_pi_norm"][mask])
+    eta0_count = int((eta <= 0.5).sum())
+    eta1_count = int((eta > 0.5).sum())
+    return {
+        "source": label,
+        "n_parents": n_parents,
+        "eta0_count": eta0_count,
+        "eta1_count": eta1_count,
+        "eta1_share": float(eta1_count / n_parents),
+        "p0_frozen_mae": p0_frozen_mae,
+        "p0_frozen_p90": p0_frozen_p90,
+        "pi_frozen_mae": pi_frozen_mae,
+        "pi_frozen_p90": pi_frozen_p90,
+        "p0_fresh_greedy_mae": p0_fresh_mae,
+        "p0_fresh_greedy_p90": p0_fresh_p90,
+        "pi_fresh_greedy_mae": pi_fresh_mae,
+        "pi_fresh_greedy_p90": pi_fresh_p90,
+        "nonfinite_ratio": float(n_nonfinite / n_parents),
+        "evaluable": bool(n_nonfinite == 0),
+        "status": "completed",
+        "frozen_initial": {
+            "p0_mae": p0_frozen_i_mae,
+            "p0_p90": p0_frozen_i_p90,
+            "pi_mae": pi_frozen_i_mae,
+            "pi_p90": pi_frozen_i_p90,
+        },
+        "frozen_final": {
+            "p0_mae": p0_frozen_mae,
+            "p0_p90": p0_frozen_p90,
+            "pi_mae": pi_frozen_mae,
+            "pi_p90": pi_frozen_p90,
+        },
+        "fresh_greedy_initial": {
+            "p0_mae": p0_fresh_i_mae,
+            "p0_p90": p0_fresh_i_p90,
+            "pi_mae": pi_fresh_i_mae,
+            "pi_p90": pi_fresh_i_p90,
+        },
+        "fresh_greedy_final": {
+            "p0_mae": p0_fresh_mae,
+            "p0_p90": p0_fresh_p90,
+            "pi_mae": pi_fresh_mae,
+            "pi_p90": pi_fresh_p90,
+        },
+    }
+
+
+def _diag_improvement_flags(
+    frozen_init: Dict[str, torch.Tensor],
+    frozen_final: Dict[str, torch.Tensor],
+    fresh_init: Dict[str, torch.Tensor],
+    fresh_final: Dict[str, torch.Tensor],
+) -> Dict[str, Any]:
+    """Frozen / Fresh-Greedy 前后改善判断（三态；绝不把失败写成改善）。"""
+    n = int(frozen_final["p0_norm"].numel())
+    combined_finite = (
+        n > 0
+        and bool(frozen_init["row_finite"].all())
+        and bool(frozen_final["row_finite"].all())
+        and bool(fresh_init["row_finite"].all())
+        and bool(fresh_final["row_finite"].all())
+    )
+
+    def _combined_frozen(rows: Dict[str, torch.Tensor]) -> float:
+        p0, _ = _mae_p90(rows["p0_norm"])
+        pi, _ = _mae_p90(rows["pi_norm"])
+        return 0.5 * (p0 + pi)
+
+    def _combined_fresh(rows: Dict[str, torch.Tensor]) -> float:
+        p0, _ = _mae_p90(rows["fg_p0_norm"])
+        pi, _ = _mae_p90(rows["fg_pi_norm"])
+        return 0.5 * (p0 + pi)
+
+    if not combined_finite:
+        return {
+            "natural_frozen_improved": NOT_EVALUABLE,
+            "natural_frozen_worsened": NOT_EVALUABLE,
+            "natural_fresh_greedy_improved": NOT_EVALUABLE,
+            "natural_fresh_greedy_worsened": NOT_EVALUABLE,
+            "natural_full_bellman_improvement": NOT_EVALUABLE,
+        }
+    frozen_before = _combined_frozen(frozen_init)
+    frozen_after = _combined_frozen(frozen_final)
+    fresh_before = _combined_fresh(fresh_init)
+    fresh_after = _combined_fresh(fresh_final)
+    frozen_improved = bool(frozen_after < frozen_before)
+    frozen_worsened = bool(frozen_after > frozen_before)
+    fresh_improved = bool(fresh_after < fresh_before)
+    fresh_worsened = bool(fresh_after > fresh_before)
+    return {
+        "natural_frozen_improved": frozen_improved,
+        "natural_frozen_worsened": frozen_worsened,
+        "natural_fresh_greedy_improved": fresh_improved,
+        "natural_fresh_greedy_worsened": fresh_worsened,
+        "natural_full_bellman_improvement": bool(
+            frozen_improved and fresh_improved
+        ),
+    }
+
+
+def _assemble_natural_block(
+    *,
+    mode: str,
+    natural_validation_reused: bool,
+    calibers_identical: bool,
+    sampling: Dict[str, Any],
+    parity: Optional[Dict[str, Any]],
+    frozen_init: Dict[str, torch.Tensor],
+    frozen_final: Dict[str, torch.Tensor],
+    fresh_init: Dict[str, torch.Tensor],
+    fresh_final: Dict[str, torch.Tensor],
+    validation_rows: Optional[Dict[str, torch.Tensor]] = None,
+    frozen_initial_stats: Optional[Dict[str, Any]] = None,
+    frozen_final_stats: Optional[Dict[str, Any]] = None,
+    fresh_initial_stats: Optional[Dict[str, Any]] = None,
+    fresh_final_stats: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """组装 Natural Validation 块（复用与独立两种模式共用）。"""
+    frozen_initial_stats = frozen_initial_stats or _frozen_stats_from_rows(frozen_init)
+    frozen_final_stats = frozen_final_stats or _frozen_stats_from_rows(frozen_final)
+    fresh_initial_stats = fresh_initial_stats or _fresh_stats_from_rows(fresh_init)
+    fresh_final_stats = fresh_final_stats or _fresh_stats_from_rows(fresh_final)
+
+    n = int(frozen_final["p0_norm"].numel())
+    eta = frozen_final["eta"]
+    source = frozen_final["source"]
+    source_counts = {
+        "source0": int((source == 0).sum()) if n else 0,
+        "source1": int((source == 1).sum()) if n else 0,
+        "unknown": int((source != 0).sum() - (source == 1).sum()) if n else 0,
+    }
+    rows_finite = (
+        frozen_init["row_finite"]
+        & frozen_final["row_finite"]
+        & fresh_init["row_finite"]
+        & fresh_final["row_finite"]
+    )
+    n_finite_rows = int(rows_finite.sum()) if n else 0
+    if n == 0:
+        diagnostic_status = NOT_EVALUABLE
+        failure_kind = "empty_diagnostic_sample"
+        failure_detail = "no evaluable parent rows in the diagnostic subset"
+    elif n_finite_rows == 0:
+        diagnostic_status = NOT_EVALUABLE
+        failure_kind = "no_finite_rows"
+        failure_detail = "all diagnostic rows nonfinite"
+    else:
+        diagnostic_status = "completed"
+        failure_kind = None
+        failure_detail = None
+
+    all_mask = torch.ones(n, dtype=torch.bool)
+    sim_mask = source == 0
+    views: Dict[str, Any] = {}
+    if validation_rows is not None:
+        v_n = int(validation_rows["frozen_final"]["p0_norm"].numel())
+        v_mask = torch.ones(v_n, dtype=torch.bool)
+        v_label = (
+            "natural_parent_eta"
+            if (calibers_identical or natural_validation_reused)
+            else "balanced_parent_eta"
+        )
+        views["balanced_validation"] = _diag_view(
+            v_label,
+            v_mask,
+            validation_rows["frozen_init"],
+            validation_rows["frozen_final"],
+            validation_rows["fresh_init"],
+            validation_rows["fresh_final"],
+        )
+    views["original_mixture"] = _diag_view(
+        "natural_parent_eta_mixture",
+        all_mask,
+        frozen_init,
+        frozen_final,
+        fresh_init,
+        fresh_final,
+    )
+    if int(sim_mask.sum()) > 0:
+        views["simulated_only"] = _diag_view(
+            "simulated_only_source0",
+            sim_mask,
+            frozen_init,
+            frozen_final,
+            fresh_init,
+            fresh_final,
+        )
+    else:
+        views["simulated_only"] = {
+            "source": "simulated_only_source0",
+            "n_parents": 0,
+            "status": NOT_EVALUABLE,
+            "evaluable": False,
+            "reason": "no_simulated_parent_groups",
+        }
+
+    flags = _diag_improvement_flags(frozen_init, frozen_final, fresh_init, fresh_final)
+    total_initial = float(frozen_initial_stats.get("normalized_mae", float("nan")))
+    total_final = float(frozen_final_stats.get("normalized_mae", float("nan")))
+    if flags["natural_frozen_worsened"] == NOT_EVALUABLE:
+        regression_observed: Any = NOT_EVALUABLE
+    else:
+        regression_observed = bool(
+            flags["natural_frozen_worsened"] is True
+            or flags["natural_fresh_greedy_worsened"] is True
+        )
+    return {
+        "diagnostic_status": diagnostic_status,
+        "diagnostic_failure_kind": failure_kind,
+        "diagnostic_failure_detail": failure_detail,
+        "diagnostic_n_parents": int(n),
+        "diagnostic_source_counts": source_counts,
+        "diagnostic_finite_rows": n_finite_rows,
+        "natural_validation_reused": bool(natural_validation_reused),
+        "calibers_identical": bool(calibers_identical),
+        "caliber": "natural_parent_eta",
+        "p_eta_sampling_method": "natural_parent_eta",
+        "diagnostic_mode": mode,
+        "sampling": sampling,
+        "n_parents": int(n),
+        "eta0_count": int((eta <= 0.5).sum()) if n else 0,
+        "eta1_count": int((eta > 0.5).sum()) if n else 0,
+        "eta1_share": float((eta > 0.5).float().mean()) if n else 0.0,
+        "total_residual_initial": total_initial,
+        "total_residual_final": total_final,
+        "frozen_improved": flags["natural_frozen_improved"],
+        "natural_worsened": flags["natural_frozen_worsened"],
+        "natural_validation_regression_observed": regression_observed,
+        **flags,
+        "frozen_policy_initial": frozen_initial_stats,
+        "frozen_policy_final": frozen_final_stats,
+        "fresh_greedy_initial": fresh_initial_stats,
+        "fresh_greedy_final": fresh_final_stats,
+        "views": views,
+        "parity": parity,
+    }
+
+
+def natural_diag_prepare(
+    episode: Any,
+    model: torch.nn.Module,
+    teacher: BPGridTeacher,
+    batches: Sequence[Dict[str, Any]],
+    *,
+    q_model: Optional[torch.nn.Module] = None,
+    max_parents: int = 4096,
+    chunk_size: int = 512,
+    seed: int = 97531,
+) -> Dict[str, Any]:
+    """独立 Natural 诊断第一步：固定子集 + 冻结问题（CPU 驻留）+ 初始评估。
+
+    冻结问题在迭代起点构建一次，前后比较共用同一冻结政策问题（Prompt §5.2）。
+    """
+    device = next(model.parameters()).device
+    subset, sampling = _select_diagnostic_batches(
+        batches,
+        max_parents=max_parents,
+        seed=seed,
+        episode_id=int(getattr(episode, "episode_id", 0)),
+    )
+    if not subset:
+        return {
+            "status": NOT_EVALUABLE,
+            "failure_kind": "empty_diagnostic_subset",
+            "failure_detail": "diagnostic subset selection produced no parent rows",
+            "sampling": sampling,
+        }
+    chunks = _chunk_batch_dicts(subset, chunk_size)
+    problem_cpu: List[FrozenPolicyBatch] = []
+    parity_flags: List[bool] = []
+    parity_errors: List[float] = []
+    for chunk in chunks:
+        problem_chunk, parity = build_problem(
+            episode,
+            model,
+            teacher,
+            [_batch_dict_to_device(batch, device) for batch in chunk],
+            q_model=q_model,
+        )
+        parity_flags.append(bool(parity.get("parity_passed")))
+        parity_errors.append(float(parity.get("parity_max_abs_error", 0.0)))
+        problem_cpu.extend(
+            _frozen_batch_to(frozen, torch.device("cpu")) for frozen in problem_chunk
+        )
+    frozen_init = _eval_frozen_rows_chunked(model, problem_cpu, device)
+    fresh_init = _fresh_greedy_rows_chunked(
+        episode, model, teacher, subset, device, chunk_size, q_model=q_model
+    )
+    return {
+        "status": "ready",
+        "problem_cpu": problem_cpu,
+        "subset": subset,
+        "sampling": sampling,
+        "chunk_size": int(chunk_size),
+        "parity": {
+            "parity_passed": bool(all(parity_flags)) if parity_flags else False,
+            "parity_max_abs_error": max(parity_errors) if parity_errors else 0.0,
+        },
+        "frozen_init": frozen_init,
+        "fresh_init": fresh_init,
+    }
+
+
+def natural_diag_failure_block(
+    *,
+    status: str,
+    failure_kind: str,
+    failure_detail: Any,
+    mode: str = "independent",
+    sampling: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """诊断不可评估/失败时的诚实报告：绝不写成改善或无恶化。"""
+    return {
+        "diagnostic_status": status,
+        "diagnostic_failure_kind": failure_kind,
+        "diagnostic_failure_detail": failure_detail,
+        "diagnostic_n_parents": 0,
+        "diagnostic_source_counts": {"source0": 0, "source1": 0, "unknown": 0},
+        "natural_validation_reused": mode == "reuse_validation",
+        "caliber": "natural_parent_eta",
+        "p_eta_sampling_method": "natural_parent_eta",
+        "diagnostic_mode": mode,
+        "sampling": sampling or {},
+        "n_parents": 0,
+        "eta0_count": 0,
+        "eta1_count": 0,
+        "eta1_share": 0.0,
+        "natural_worsened": NOT_EVALUABLE,
+        "frozen_improved": NOT_EVALUABLE,
+        "natural_frozen_improved": NOT_EVALUABLE,
+        "natural_fresh_greedy_improved": NOT_EVALUABLE,
+        "natural_frozen_worsened": NOT_EVALUABLE,
+        "natural_fresh_greedy_worsened": NOT_EVALUABLE,
+        "natural_full_bellman_improvement": NOT_EVALUABLE,
+        "natural_validation_regression_observed": NOT_EVALUABLE,
+    }
+
+
+def natural_diag_finalize(
+    state: Dict[str, Any],
+    episode: Any,
+    model: torch.nn.Module,
+    teacher: BPGridTeacher,
+    *,
+    q_model: Optional[torch.nn.Module] = None,
+    validation_rows: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+) -> Dict[str, Any]:
+    """独立 Natural 诊断第二步：同一冻结问题终评 + Fresh-Greedy 终评。"""
+    if state.get("status") != "ready":
+        return natural_diag_failure_block(
+            status=state.get("diagnostic_status", NOT_EVALUABLE),
+            failure_kind=str(state.get("failure_kind", "prepare_failed")),
+            failure_detail=state.get("failure_detail"),
+            sampling=state.get("sampling", {}),
+        )
+    device = next(model.parameters()).device
+    chunk_size = int(state.get("chunk_size", 512))
+    frozen_final = _eval_frozen_rows_chunked(model, state["problem_cpu"], device)
+    fresh_final = _fresh_greedy_rows_chunked(
+        episode,
+        model,
+        teacher,
+        state["subset"],
+        device,
+        chunk_size,
+        q_model=q_model,
+    )
+    return _assemble_natural_block(
+        mode="independent",
+        natural_validation_reused=False,
+        calibers_identical=False,
+        sampling=state.get("sampling", {}),
+        parity=state.get("parity"),
+        frozen_init=state["frozen_init"],
+        frozen_final=frozen_final,
+        fresh_init=state["fresh_init"],
+        fresh_final=fresh_final,
+        validation_rows=validation_rows,
+    )
 
 
 def p_root_params(episode: Any, model: torch.nn.Module) -> List[torch.nn.Parameter]:
@@ -1228,6 +2143,9 @@ def run_p_policy_iteration(
     lbfgs_history_size: int,
     target_residual: Optional[float] = None,
     natural_validation_batches: Optional[Sequence[Dict[str, torch.Tensor]]] = None,
+    natural_diag_mode: Optional[str] = None,
+    natural_diag_config: Optional[Dict[str, Any]] = None,
+    natural_calibers_identical: bool = False,
 ) -> Dict[str, Any]:
     """One frozen-policy P iteration: greedy refresh -> residual solve -> best state."""
     device = next(model.parameters()).device
@@ -1259,17 +2177,31 @@ def run_p_policy_iteration(
     validation_problem, val_parity = build_problem(
         episode, model, teacher, validation_batches or train_batches, q_model=q_model
     )
-    # Natural Validation（未经 η 重分配的原始分布）双口径诊断：问题构建一次，
-    # 迭代起点/终点各评估一次。纯诊断，绝不参与 Acceptance / Revert 判定。
-    natural_problem = None
-    natural_parity = None
-    natural_initial = None
-    if natural_validation_batches:
-        natural_problem, natural_parity = build_problem(
-            episode, model, teacher, natural_validation_batches, q_model=q_model
+    # Natural Validation 诊断模式（Prompt §1）：
+    #   reuse_validation — 主 Validation 即 Natural 口径（η Balance 关闭，或
+    #                      Validation 未被 η 平衡），直接复用其诊断，零额外
+    #                      Grid Teacher 调用、零第二份问题构建；
+    #   independent     — 存在第二种口径（Balanced Validation），对 Original
+    #                      Validation 的固定预算子集做独立双时点诊断；
+    #   not_evaluable   — 无独立 Validation 口径。绝不退化为整个训练池诊断。
+    if natural_diag_mode is None:
+        natural_diag_mode = (
+            "independent" if natural_validation_batches else "reuse_validation"
         )
-        natural_initial = evaluate_problem(model, natural_problem)
-    initial = evaluate_problem(model, validation_problem)
+    if natural_diag_mode not in {
+        "independent",
+        "reuse_validation",
+        "not_evaluable",
+        "skipped",
+    }:
+        raise ValueError(f"Unknown natural_diag_mode: {natural_diag_mode!r}")
+    if natural_diag_mode == "independent" and not natural_validation_batches:
+        natural_diag_mode = "not_evaluable"
+    natural_diag_state: Optional[Dict[str, Any]] = None
+    natural_diag_failure: Optional[Dict[str, Any]] = None
+    initial, validation_rows_initial = evaluate_problem_rows(
+        model, validation_problem
+    )
     with torch.no_grad():
         start_p0, start_pi = model._value_outputs(validation_problem[0].parent)
     start_model_hash = _module_state_hash(model)
@@ -1371,13 +2303,56 @@ def run_p_policy_iteration(
 
     # Fresh-greedy 基线（同一固定 Validation/CRN），用于如实记录 Frozen
     # Residual 改善而 Fresh Greedy 恶化的情况。
-    fresh_initial = fresh_greedy_residual(
+    fresh_rows_initial = _fresh_greedy_rows(
         episode, model, teacher, validation_batches or train_batches, q_model=q_model
     )
+    fresh_initial = _fresh_stats_from_rows(fresh_rows_initial)
     if not fresh_initial.get("all_finite", False):
         return _reject(
             "rejected_numerical", "fresh_greedy_nonfinite_initial", fresh_initial
         )
+
+    # --- 独立 Natural 诊断的迭代起点快照（Prompt §2/§5）：固定预算子集 + 冻结
+    # 问题（CPU 驻留，优化期间不占 GPU）+ Frozen/Fresh-Greedy 初始评估。整个
+    # 诊断与正式求解完全隔离：任何可恢复的诊断异常只记录诊断状态，绝不改变
+    # 合法 P 更新的 Acceptance；CUDA 资源故障则记录并安全停止。
+    if natural_diag_mode == "independent":
+        rng_cpu_diag = torch.get_rng_state()
+        rng_cuda_diag = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        )
+        diag_config = natural_diag_config or {}
+        try:
+            natural_diag_state = natural_diag_prepare(
+                episode,
+                model,
+                teacher,
+                natural_validation_batches,
+                q_model=q_model,
+                max_parents=int(diag_config.get("max_parents", 4096)),
+                chunk_size=int(diag_config.get("chunk_size", 512)),
+                seed=int(diag_config.get("seed", 97531)),
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            logger.error("Natural diagnostic CUDA OOM; safe-stopping: %s", exc)
+            raise RuntimeError(
+                f"natural_diagnostic_cuda_oom: {exc}"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 诊断异常必须与训练隔离
+            natural_diag_failure = {
+                "diagnostic_status": "failed_diagnostic",
+                "diagnostic_failure_kind": type(exc).__name__,
+                "diagnostic_failure_detail": str(exc),
+            }
+            logger.warning(
+                "Natural diagnostic prepare failed (isolated): %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+        finally:
+            torch.set_rng_state(rng_cpu_diag)
+            if rng_cuda_diag is not None:
+                torch.cuda.set_rng_state_all(rng_cuda_diag)
 
     adam_history, adam_state, adam_best, adam_steps_done, adam_status = run_adam(
         model=model,
@@ -1432,7 +2407,7 @@ def run_p_policy_iteration(
             },
         )
     _restore_state(model, best_state)
-    final = evaluate_problem(model, validation_problem)
+    final, validation_rows_final = evaluate_problem_rows(model, validation_problem)
     if not final.get("all_finite", False):
         return _reject(
             "rejected_numerical",
@@ -1455,9 +2430,10 @@ def run_p_policy_iteration(
         )
 
     # 冻结策略残差 + 重新 Greedy 残差（独立固定 Validation/CRN）。
-    fresh = fresh_greedy_residual(
+    fresh_rows_final = _fresh_greedy_rows(
         episode, model, teacher, validation_batches or train_batches, q_model=q_model
     )
+    fresh = _fresh_stats_from_rows(fresh_rows_final)
     if not fresh.get("all_finite", False):
         return _reject(
             "rejected_numerical", "fresh_greedy_nonfinite_final", fresh
@@ -1558,62 +2534,111 @@ def run_p_policy_iteration(
         peak_memory = int(torch.cuda.max_memory_allocated(device))
 
     # Natural Validation 终评（模型已处于最终生效状态：accepted best 或
-    # accepted_reverted 的迭代起点）。RNG 显式保护，诊断不得扰动训练流。
-    natural_validation_block: Optional[Dict[str, Any]] = None
-    natural_regression_observed = False
-    if natural_problem is not None and natural_initial is not None:
-        rng_cpu_diag = torch.get_rng_state()
-        rng_cuda_diag = (
-            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        )
-        try:
-            natural_final = evaluate_problem(model, natural_problem)
-            natural_fresh = fresh_greedy_residual(
-                episode, model, teacher, natural_validation_batches, q_model=q_model
+    # accepted_reverted 的迭代起点）。纯诊断：RNG 显式保护，异常与训练完全
+    # 隔离，绝不参与 Acceptance / Revert 判定。
+    validation_rows_bundle = {
+        "frozen_init": validation_rows_initial,
+        "frozen_final": validation_rows_final,
+        "fresh_init": fresh_rows_initial,
+        "fresh_final": fresh_rows_final,
+    }
+    if natural_diag_mode == "independent":
+        if natural_diag_failure is not None:
+            natural_validation_block = natural_diag_failure_block(
+                status="failed_diagnostic",
+                failure_kind=str(
+                    natural_diag_failure.get("diagnostic_failure_kind")
+                ),
+                failure_detail=natural_diag_failure.get(
+                    "diagnostic_failure_detail"
+                ),
             )
-        finally:
-            torch.set_rng_state(rng_cpu_diag)
-            if rng_cuda_diag is not None:
-                torch.cuda.set_rng_state_all(rng_cuda_diag)
-        natural_initial_mae = float(
-            natural_initial.get("normalized_mae", float("nan"))
+        else:
+            rng_cpu_diag = torch.get_rng_state()
+            rng_cuda_diag = (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            )
+            try:
+                natural_validation_block = natural_diag_finalize(
+                    natural_diag_state,
+                    episode,
+                    model,
+                    teacher,
+                    q_model=q_model,
+                    validation_rows=validation_rows_bundle,
+                )
+            except torch.cuda.OutOfMemoryError as exc:
+                logger.error("Natural diagnostic CUDA OOM; safe-stopping: %s", exc)
+                raise RuntimeError(
+                    f"natural_diagnostic_cuda_oom: {exc}"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 - 诊断异常必须与训练隔离
+                logger.warning(
+                    "Natural diagnostic finalize failed (isolated): %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                natural_validation_block = natural_diag_failure_block(
+                    status="failed_diagnostic",
+                    failure_kind=type(exc).__name__,
+                    failure_detail=str(exc),
+                )
+            finally:
+                torch.set_rng_state(rng_cpu_diag)
+                if rng_cuda_diag is not None:
+                    torch.cuda.set_rng_state_all(rng_cuda_diag)
+        natural_diag_state = None  # 诊断问题不再需要，立即释放
+    elif natural_diag_mode == "reuse_validation":
+        # 情况 A/C（Prompt §1.2）：主 Validation 即 Natural 口径 — 直接复用
+        # 已算出的诊断，零重复 Grid Teacher、零第二份 Expanded Child States。
+        n_val_rows = int(validation_rows_final["p0_norm"].numel())
+        natural_validation_block = _assemble_natural_block(
+            mode="reuse_validation",
+            natural_validation_reused=True,
+            calibers_identical=bool(natural_calibers_identical),
+            sampling={
+                "sampling_method": "reused_main_validation_diagnostics",
+                "requested_parents": n_val_rows,
+                "selected_parents": n_val_rows,
+                "sampling_ratio": 1.0,
+                "eta_rebalanced": False,
+                "note": (
+                    "no second frozen problem constructed; diagnostics "
+                    "reused from the main validation evaluation"
+                ),
+            },
+            parity=val_parity,
+            frozen_init=validation_rows_initial,
+            frozen_final=validation_rows_final,
+            fresh_init=fresh_rows_initial,
+            fresh_final=fresh_rows_final,
+            frozen_initial_stats=initial,
+            frozen_final_stats=final,
+            fresh_initial_stats=fresh_initial,
+            fresh_final_stats=fresh,
+            validation_rows=validation_rows_bundle,
         )
-        natural_final_mae = float(
-            natural_final.get("normalized_mae", float("nan"))
-        )
-        natural_regression_observed = bool(
-            math.isfinite(natural_initial_mae)
-            and math.isfinite(natural_final_mae)
-            and natural_final_mae > natural_initial_mae
-        )
-        nat_eta_rows = [
-            batch["parent"][:, 2].detach().reshape(-1).to(torch.float32).cpu()
-            for batch in natural_validation_batches
-            if torch.is_tensor(batch.get("parent"))
-        ]
-        nat_eta = torch.cat(nat_eta_rows) if nat_eta_rows else torch.empty(0)
-        natural_validation_block = {
-            "p_eta_sampling_method": "counterfactual_parent_eta_balance",
-            "caliber": "natural_parent_eta",
-            "n_parents": int(nat_eta.numel()),
-            "eta0_count": int((nat_eta <= 0.0).sum()),
-            "eta1_count": int((nat_eta > 0.0).sum()),
-            "eta1_share": (
-                float((nat_eta > 0.0).float().mean()) if nat_eta.numel() else 0.0
+    else:
+        natural_validation_block = natural_diag_failure_block(
+            status=NOT_EVALUABLE,
+            failure_kind=(
+                "skipped_by_frequency"
+                if natural_diag_mode == "skipped"
+                else "no_natural_validation_batches"
             ),
-            "total_residual_initial": natural_initial_mae,
-            "total_residual_final": natural_final_mae,
-            "frozen_improved": bool(
-                math.isfinite(natural_initial_mae)
-                and math.isfinite(natural_final_mae)
-                and natural_final_mae < natural_initial_mae
+            failure_detail=(
+                "natural diagnostic deferred by frequency control"
+                if natural_diag_mode == "skipped"
+                else (
+                    "no independent validation caliber; falling back to the "
+                    "full train pool is forbidden"
+                )
             ),
-            "natural_worsened": natural_regression_observed,
-            "frozen_policy_initial": natural_initial,
-            "frozen_policy_final": natural_final,
-            "fresh_greedy_final": natural_fresh,
-            "parity": natural_parity,
-        }
+            mode=natural_diag_mode,
+        )
+    natural_regression_observed = natural_validation_block[
+        "natural_validation_regression_observed"
+    ]
 
     summary: Dict[str, Any] = {
         "inner_index": int(inner_index),

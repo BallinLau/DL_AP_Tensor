@@ -209,6 +209,17 @@ class HyperParams:
     pv_current_eta1_train_share: float = 0.50
     pv_current_eta_balance_validation: bool = True
     pv_current_eta_balance_seed: int = 97531
+    # Natural Validation Diagnostic（纯诊断，绝不参与 P Acceptance）。仅当
+    # 确实存在第二种 Validation 口径（eta balance 同时作用于 Train 与
+    # Validation）时独立计算；否则直接复用主 Validation 诊断。
+    p_eta_natural_diag_enabled: bool = True
+    p_eta_natural_diag_max_parents: int = 4096
+    p_eta_natural_diag_chunk_size: int = 512
+    # "firm_inner_end" = 每个 Firm Inner 只在最后一次 P Policy Iteration
+    # 执行一次诊断；"per_p_iteration" = 每次 P Policy Iteration 都执行；
+    # "off" = 关闭独立诊断。
+    p_eta_natural_diag_frequency: str = "firm_inner_end"
+    p_eta_natural_diag_seed: int = 97531
     pv_eval_grad_clip_norm: float = 10.0
     bp_distill_grad_clip_norm: float = 10.0
     pv_rollback_on_soft_spikes: bool = False

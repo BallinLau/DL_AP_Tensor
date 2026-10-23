@@ -469,6 +469,9 @@ def _enable_eta_balance(episode, share=0.50):
     hp.pv_eta_resample_enabled = False
     hp.pv_exact_eta_integration_enabled = True
     hp.bp_current_eta_resample_enabled = False
+    # 测试中每次 P Policy Iteration 都执行 Natural 诊断（默认生产口径为
+    # firm_inner_end，只在每个 Firm Inner 的最后一次 P 迭代执行一次）。
+    hp.p_eta_natural_diag_frequency = "per_p_iteration"
     return hp
 
 

@@ -834,6 +834,38 @@ def parse_args() -> argparse.Namespace:
         help="Deterministic CPU RNG seed for staged P-only eta balancing",
     )
     parser.add_argument(
+        "--p-eta-natural-diag-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable the independent Natural Validation diagnostic when a "
+        "second validation caliber exists (diagnostics only)",
+    )
+    parser.add_argument(
+        "--p-eta-natural-diag-max-parents",
+        type=int,
+        default=None,
+        help="Max parent-group budget for the Natural Validation diagnostic",
+    )
+    parser.add_argument(
+        "--p-eta-natural-diag-chunk-size",
+        type=int,
+        default=None,
+        help="Parent chunk size for chunked Natural Validation diagnostics",
+    )
+    parser.add_argument(
+        "--p-eta-natural-diag-frequency",
+        type=str.lower,
+        default=None,
+        choices=["firm_inner_end", "per_p_iteration", "off"],
+        help="Natural Validation diagnostic frequency",
+    )
+    parser.add_argument(
+        "--p-eta-natural-diag-seed",
+        type=int,
+        default=None,
+        help="Deterministic CPU RNG seed for Natural Validation subset selection",
+    )
+    parser.add_argument(
         "--pv-rollback-on-soft-spikes",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -1592,6 +1624,37 @@ def configure_hyperparams(args: argparse.Namespace):
     if args.pv_current_eta_balance_seed is not None:
         hyperparams.pv_current_eta_balance_seed = int(
             args.pv_current_eta_balance_seed
+        )
+    if args.p_eta_natural_diag_enabled is not None:
+        hyperparams.p_eta_natural_diag_enabled = bool(
+            args.p_eta_natural_diag_enabled
+        )
+    if args.p_eta_natural_diag_max_parents is not None:
+        hyperparams.p_eta_natural_diag_max_parents = int(
+            args.p_eta_natural_diag_max_parents
+        )
+    if args.p_eta_natural_diag_chunk_size is not None:
+        hyperparams.p_eta_natural_diag_chunk_size = int(
+            args.p_eta_natural_diag_chunk_size
+        )
+    if args.p_eta_natural_diag_frequency is not None:
+        hyperparams.p_eta_natural_diag_frequency = str(
+            args.p_eta_natural_diag_frequency
+        )
+    if args.p_eta_natural_diag_seed is not None:
+        hyperparams.p_eta_natural_diag_seed = int(args.p_eta_natural_diag_seed)
+    if int(getattr(hyperparams, "p_eta_natural_diag_max_parents", 4096)) < 1:
+        raise ValueError("p_eta_natural_diag_max_parents must be at least 1")
+    if int(getattr(hyperparams, "p_eta_natural_diag_chunk_size", 512)) < 1:
+        raise ValueError("p_eta_natural_diag_chunk_size must be at least 1")
+    if str(getattr(hyperparams, "p_eta_natural_diag_frequency", "firm_inner_end")) not in {
+        "firm_inner_end",
+        "per_p_iteration",
+        "off",
+    }:
+        raise ValueError(
+            "p_eta_natural_diag_frequency must be 'firm_inner_end', "
+            "'per_p_iteration' or 'off'"
         )
     if int(getattr(hyperparams, "bp_distill_max_optimizer_steps", 0)) < 0:
         raise ValueError("bp_distill_max_optimizer_steps must be non-negative")

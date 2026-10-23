@@ -21,7 +21,8 @@ def test_fresh100_wrapper_pins_the_ablation_contract():
         "investment_compare_fresh100_${STAMP}",
         'export N_EPISODES="${N_EPISODES:-4}"',
         "export SIMULATE_GROUP_SIZE=200",
-        "export SIMULATE_HORIZON=100",
+        # 默认仍固定 100；允许环境变量显式覆盖（d833661）。
+        'export SIMULATE_HORIZON="${SIMULATE_HORIZON:-100}"',
         "export POST0_MODE=modeb",
         "export STATE_BANK_ENABLED=0",
         "export STATE_BANK_SDF_PUBLICATION_GATE_ENABLED=0",
