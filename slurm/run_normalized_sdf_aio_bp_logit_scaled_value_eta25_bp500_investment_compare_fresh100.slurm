@@ -45,7 +45,7 @@ fi
 # Dedicated Fresh100 ablation. Every post-bootstrap episode starts from a new
 # broad cross-section and runs the ordinary Mode-B simulator for 100 periods.
 export SIMULATE_GROUP_SIZE=200
-export SIMULATE_HORIZON=100
+export SIMULATE_HORIZON="${SIMULATE_HORIZON:-100}"
 export POST0_MODE=modeb
 export STATE_BANK_ENABLED=0
 export STATE_BANK_SDF_PUBLICATION_GATE_ENABLED=0
