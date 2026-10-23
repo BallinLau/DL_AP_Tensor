@@ -10788,13 +10788,25 @@ class Episode:
             coverage_diagnostics: List[Dict[str, Any]] = []
             skipped = 0
             frozen_hash = self._state_dict_hash(frozen_p_model)
+            eta_input_counts: Tuple[int, int] = (0, 0)
+            eta_effective_counts: Tuple[int, int] = (0, 0)
             with torch.no_grad():
                 for batch in batches:
                     source_parent = batch["parent"]
                     state = source_parent[:, :7] if source_parent.shape[1] > 7 else source_parent
+                    n_in, eta1_in = self._eta_share_counts(state)
+                    eta_input_counts = (
+                        eta_input_counts[0] + n_in,
+                        eta_input_counts[1] + eta1_in,
+                    )
                     if phase == "zero":
                         check_state = state.clone()
                         check_state[:, 0:1] = 0.0
+                        n_eff, eta1_eff = self._eta_share_counts(state)
+                        eta_effective_counts = (
+                            eta_effective_counts[0] + n_eff,
+                            eta_effective_counts[1] + eta1_eff,
+                        )
                         q_value = model._q_effective_output(
                             check_state,
                             default_mask=torch.zeros_like(
@@ -10816,6 +10828,11 @@ class Episode:
                             & (phat <= 0.0)
                         ).reshape(-1)
                         check_state = state[realized_default]
+                        n_eff, eta1_eff = self._eta_share_counts(check_state)
+                        eta_effective_counts = (
+                            eta_effective_counts[0] + n_eff,
+                            eta_effective_counts[1] + eta1_eff,
+                        )
                         coverage_diagnostics.append({
                             "realized_parent_default_count": int(
                                 realized_default.sum().item()
@@ -10867,6 +10884,9 @@ class Episode:
                 "frozen_p_hash_after": frozen_hash,
                 "non_q_parameter_max_change": 0.0,
                 "coverage": self._aggregate_q_coverage_diagnostics(coverage_diagnostics),
+                "eta_diagnostics": self._q_phase_eta_diagnostics(
+                    eta_input_counts, eta_effective_counts
+                ),
                 "metrics": {**avg, **meta},
                 "epoch_history": [],
             }
@@ -10881,6 +10901,8 @@ class Episode:
         epoch_history: List[Dict[str, Any]] = []
         coverage_diagnostics: List[Dict[str, Any]] = []
         survival_parent_count = 0
+        eta_input_counts: Tuple[int, int] = (0, 0)
+        eta_effective_counts: Tuple[int, int] = (0, 0)
         optimizer_steps = 0
         skipped = 0
         rollback_reason: Optional[str] = None
@@ -10926,8 +10948,22 @@ class Episode:
                         optimizer.zero_grad(set_to_none=True)
                         source_parent = batch["parent"]
                         source_state = source_parent[:, :7] if source_parent.shape[1] > 7 else source_parent
+                        if epoch == 0:
+                            # 诊断（Prompt §8.2）：输入 η 分布与各阶段有效样本
+                            # η 分布分别累计；只在首个 epoch 计数，避免重复累计。
+                            n_in, eta1_in = self._eta_share_counts(source_state)
+                            eta_input_counts = (
+                                eta_input_counts[0] + n_in,
+                                eta_input_counts[1] + eta1_in,
+                            )
                         if phase == "zero":
                             loss = self._compute_q_zero_loss(source_state)
+                            if epoch == 0:
+                                n_eff, eta1_eff = self._eta_share_counts(source_state)
+                                eta_effective_counts = (
+                                    eta_effective_counts[0] + n_eff,
+                                    eta_effective_counts[1] + eta1_eff,
+                                )
                         elif phase == "default":
                             default_states, default_diag = self._build_q_default_coverage_states(
                                 source_state, frozen_p_model, return_diagnostics=True
@@ -10936,6 +10972,12 @@ class Episode:
                             if default_states.shape[0] == 0:
                                 skipped += 1
                                 continue
+                            if epoch == 0:
+                                n_eff, eta1_eff = self._eta_share_counts(default_states)
+                                eta_effective_counts = (
+                                    eta_effective_counts[0] + n_eff,
+                                    eta_effective_counts[1] + eta1_eff,
+                                )
                             loss = self._compute_q_default_loss(
                                 default_states,
                                 frozen_p_model=frozen_p_model,
@@ -10956,6 +10998,14 @@ class Episode:
                                 skipped += 1
                                 continue
                             survival_parent_count += int(survival_batch["parent"].shape[0])
+                            if epoch == 0:
+                                n_eff, eta1_eff = self._eta_share_counts(
+                                    survival_batch["parent"]
+                                )
+                                eta_effective_counts = (
+                                    eta_effective_counts[0] + n_eff,
+                                    eta_effective_counts[1] + eta1_eff,
+                                )
                             loss = self._compute_q_survival_bellman_loss(
                                 survival_batch,
                                 frozen_p_model=frozen_p_model,
@@ -10976,6 +11026,14 @@ class Episode:
                                 survival_parent_count += int(
                                     survival_batch["parent"].shape[0]
                                 )
+                                if epoch == 0:
+                                    n_eff, eta1_eff = self._eta_share_counts(
+                                        survival_batch["parent"]
+                                    )
+                                    eta_effective_counts = (
+                                        eta_effective_counts[0] + n_eff,
+                                        eta_effective_counts[1] + eta1_eff,
+                                    )
                                 loss = self._compute_q_survival_bellman_loss(
                                     survival_batch,
                                     frozen_p_model=frozen_p_model,
@@ -11006,6 +11064,22 @@ class Episode:
                                         q_target_model=q_target_model,
                                     ))
                                     polish_weights.append(float(getattr(self.hyperparams, "q_survival_sample_share", 0.5)))
+                                if epoch == 0:
+                                    # 非 hybrid Polish 为零/违约/存活三段混合，
+                                    # 有效样本 η 份额按实际进入 loss 的行累计。
+                                    polish_rows = [source_state[:zero_n]]
+                                    if default_states.shape[0] > 0:
+                                        polish_rows.append(default_states)
+                                    if survival_batch is not None:
+                                        polish_rows.append(survival_batch["parent"])
+                                    for polish_part in polish_rows:
+                                        n_eff, eta1_eff = self._eta_share_counts(
+                                            polish_part
+                                        )
+                                        eta_effective_counts = (
+                                            eta_effective_counts[0] + n_eff,
+                                            eta_effective_counts[1] + eta1_eff,
+                                        )
                                 if not polish_terms:
                                     skipped += 1
                                     continue
@@ -11147,6 +11221,9 @@ class Episode:
             "frozen_p_hash_after": frozen_p_hash_after,
             "non_q_parameter_max_change": non_q_change,
             "coverage": coverage,
+            "eta_diagnostics": self._q_phase_eta_diagnostics(
+                eta_input_counts, eta_effective_counts
+            ),
             "metrics": {**avg, **meta},
             "epoch_history": epoch_history,
             "validation_enabled": validation_enabled,
@@ -11161,6 +11238,46 @@ class Episode:
             "q_online_hash_before": q_online_hash_before,
             "q_online_hash_after": self._params_content_hash(q_params),
             "hybrid_learned_object": "claim_q" if hybrid else None,
+        }
+
+    @staticmethod
+    def _eta_share_counts(
+        rows: Optional[torch.Tensor],
+    ) -> Tuple[int, int]:
+        """(n_parents, eta1_count) of a parent/state row tensor (col 2 = eta_t)."""
+        if (
+            rows is None
+            or not torch.is_tensor(rows)
+            or rows.numel() == 0
+            or rows.ndim < 2
+            or rows.shape[1] < 3
+        ):
+            return 0, 0
+        n_rows = int(rows.shape[0])
+        eta1 = int((rows[:, 2] > 0.5).sum().item())
+        return n_rows, eta1
+
+    def _q_phase_eta_diagnostics(
+        self,
+        input_counts: Tuple[int, int],
+        effective_counts: Tuple[int, int],
+    ) -> Dict[str, Any]:
+        """Per-phase eta shares: raw input parents vs phase-effective samples.
+
+        Prompt §8.2：Q 输入原始 Batch 的 η 分布与 Survival/Default 筛选后有效
+        样本的 η 比例必须分别报告。纯诊断字段，不参与任何训练判定。
+        """
+        in_n, in_eta1 = int(input_counts[0]), int(input_counts[1])
+        eff_n, eff_eta1 = int(effective_counts[0]), int(effective_counts[1])
+        return {
+            "input_n_parents": in_n,
+            "input_eta1_count": in_eta1,
+            "input_eta0_count": in_n - in_eta1,
+            "input_eta1_share": (in_eta1 / in_n) if in_n else None,
+            "effective_n_parents": eff_n,
+            "effective_eta1_count": eff_eta1,
+            "effective_eta0_count": eff_n - eff_eta1,
+            "effective_eta1_share": (eff_eta1 / eff_n) if eff_n else None,
         }
 
     @staticmethod
@@ -12308,6 +12425,19 @@ class Episode:
                     ),
                     "p_policy_iterations": pq_summary.get("p_policy_iterations"),
                     "q_optimizer_steps": q_summary.get("optimizer_steps"),
+                    # 每个 Q Staged Block 的 Q0/QD/QS/Polish 真实状态、优化步数
+                    # 与输入/有效样本 η 分布（Prompt §8.2 证据，纯诊断）。
+                    "q_phases": [
+                        {
+                            "phase": phase_item.get("phase"),
+                            "status": phase_item.get("status"),
+                            "epochs": phase_item.get("epochs"),
+                            "optimizer_steps": phase_item.get("optimizer_steps"),
+                            "eta_diagnostics": phase_item.get("eta_diagnostics"),
+                        }
+                        for phase_item in (q_summary.get("phases") or [])
+                        if isinstance(phase_item, dict)
+                    ],
                     "sdf_fc1_hash": cycle_sdf_hash_before,
                     "sdf_fc1_hash_after": cycle_sdf_hash_after,
                     "function_drift": self._state_dict_delta_norm(
