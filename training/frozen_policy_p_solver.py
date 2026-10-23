@@ -259,6 +259,37 @@ FINITE_CHECK_KEYS = (
 )
 
 
+def _eta_stratified_stats(
+    values: torch.Tensor,
+    eta: torch.Tensor,
+    prefix: str,
+) -> Dict[str, float]:
+    """Per-current-eta strata stats (diagnostics only; never used for gating).
+
+    ``eta`` is the parent current-eta column aligned row-wise with ``values``.
+    Reports MAE / P90 / counts / nonfinite ratio for the eta=0 and eta=1 strata.
+    """
+    out: Dict[str, float] = {}
+    for label, mask in (("eta0", eta <= 0.0), ("eta1", eta > 0.0)):
+        n_total = int(mask.sum())
+        subset = values[mask]
+        finite = subset[torch.isfinite(subset)]
+        n_finite = int(finite.numel())
+        out[f"{prefix}_{label}_n_total"] = float(n_total)
+        out[f"{prefix}_{label}_n_finite"] = float(n_finite)
+        out[f"{prefix}_{label}_nonfinite_count"] = float(n_total - n_finite)
+        out[f"{prefix}_{label}_nonfinite_ratio"] = (
+            float((n_total - n_finite) / n_total) if n_total else 0.0
+        )
+        if n_finite == 0:
+            out[f"{prefix}_{label}_mae"] = float("nan")
+            out[f"{prefix}_{label}_p90"] = float("nan")
+        else:
+            out[f"{prefix}_{label}_mae"] = float(finite.abs().mean())
+            out[f"{prefix}_{label}_p90"] = _quantile(finite.abs(), 0.9)
+    return out
+
+
 def evaluate_problem(
     model: torch.nn.Module,
     problem: Sequence[FrozenPolicyBatch],
@@ -281,13 +312,17 @@ def evaluate_problem(
         }
 
     accum: Dict[str, List[torch.Tensor]] = {}
+    eta_rows: List[torch.Tensor] = []
     with torch.no_grad():
         for batch in problem:
             values = residual_tensors(model, batch)
             for key, value in values.items():
                 accum.setdefault(key, []).append(value.detach().reshape(-1).cpu())
+            eta_rows.append(
+                batch.parent[:, 2].detach().reshape(-1).to(torch.float32).cpu()
+            )
     if not accum:
-        return {
+        result: Dict[str, Any] = {
             "p0_norm_mae": float("nan"),
             "pi_norm_mae": float("nan"),
             "normalized_mae": float("nan"),
@@ -299,6 +334,10 @@ def evaluate_problem(
             "nonfinite_ratio": 0.0,
             "all_finite": False,
         }
+        empty = torch.empty(0)
+        for prefix in ("p0", "pi", "p0_norm", "pi_norm"):
+            result.update(_eta_stratified_stats(empty, empty, prefix))
+        return result
     # 逐行 finite 判定覆盖全部正式验收张量；finite-only 统计仅作诊断。
     row_finite: Optional[torch.Tensor] = None
     for key in FINITE_CHECK_KEYS:
@@ -331,6 +370,14 @@ def evaluate_problem(
             "all_finite": bool(n_finite == n_total) and n_total > 0,
         }
     )
+    # 分 η 口径（诊断专用，不参与任何验收判定）：P0/PI 的 Frozen-Policy
+    # 残差在 eta=0/eta=1 两个 Parent 状态层内独立统计。
+    eta_all = torch.cat(eta_rows) if eta_rows else torch.empty(0)
+    if eta_all.numel() == p0n.numel():
+        result.update(_eta_stratified_stats(torch.cat(accum["p0"]), eta_all, "p0"))
+        result.update(_eta_stratified_stats(torch.cat(accum["pi"]), eta_all, "pi"))
+        result.update(_eta_stratified_stats(p0n, eta_all, "p0_norm"))
+        result.update(_eta_stratified_stats(pin, eta_all, "pi_norm"))
     return result
 
 
@@ -1058,6 +1105,7 @@ def fresh_greedy_residual(
     """
     q_model = q_model if q_model is not None else model
     r0, ri, bp0_change, bpi_change = [], [], [], []
+    eta_sinks: List[torch.Tensor] = []
     normalize = bool(
         getattr(episode.hyperparams, "pv_bellman_normalize_by_value_scale", False)
     )
@@ -1099,26 +1147,43 @@ def fresh_greedy_residual(
                         child_weights=child_weights,
                     )
                     sink.append(((online - target["value_star"]) / scale).detach().cpu())
+                eta_sinks.append(
+                    parent_state[:, 2].detach().reshape(-1).to(torch.float32).cpu()
+                )
     finally:
         model.train(was_training)
     if not r0:
-        return {
+        result: Dict[str, Any] = {
             "fresh_greedy_p0_norm_mae": float("nan"),
             "fresh_greedy_pi_norm_mae": float("nan"),
             "all_finite": False,
         }
+        empty = torch.empty(0)
+        result.update(_eta_stratified_stats(empty, empty, "fresh_greedy_p0_norm"))
+        result.update(_eta_stratified_stats(empty, empty, "fresh_greedy_pi_norm"))
+        return result
     r0_flat = torch.cat(r0).reshape(-1)
     ri_flat = torch.cat(ri).reshape(-1)
+    eta_flat = torch.cat(eta_sinks).reshape(-1) if eta_sinks else torch.empty(0)
     all_finite = bool(
         torch.isfinite(r0_flat).all() and torch.isfinite(ri_flat).all()
     )
-    return {
+    result = {
         "fresh_greedy_p0_norm_mae": float(r0_flat.abs().mean()),
         "fresh_greedy_pi_norm_mae": float(ri_flat.abs().mean()),
         "fresh_greedy_p0_norm_p90": _quantile(r0_flat.abs(), 0.9),
         "fresh_greedy_pi_norm_p90": _quantile(ri_flat.abs(), 0.9),
         "all_finite": all_finite,
     }
+    # 分 η 口径（诊断专用）：Fresh-Greedy 残差在 eta=0/1 层内独立统计。
+    if eta_flat.numel() == r0_flat.numel():
+        result.update(
+            _eta_stratified_stats(r0_flat, eta_flat, "fresh_greedy_p0_norm")
+        )
+        result.update(
+            _eta_stratified_stats(ri_flat, eta_flat, "fresh_greedy_pi_norm")
+        )
+    return result
 
 
 def p_root_params(episode: Any, model: torch.nn.Module) -> List[torch.nn.Parameter]:
@@ -1162,6 +1227,7 @@ def run_p_policy_iteration(
     lbfgs_chunk_iterations: int,
     lbfgs_history_size: int,
     target_residual: Optional[float] = None,
+    natural_validation_batches: Optional[Sequence[Dict[str, torch.Tensor]]] = None,
 ) -> Dict[str, Any]:
     """One frozen-policy P iteration: greedy refresh -> residual solve -> best state."""
     device = next(model.parameters()).device
@@ -1193,6 +1259,16 @@ def run_p_policy_iteration(
     validation_problem, val_parity = build_problem(
         episode, model, teacher, validation_batches or train_batches, q_model=q_model
     )
+    # Natural Validation（未经 η 重分配的原始分布）双口径诊断：问题构建一次，
+    # 迭代起点/终点各评估一次。纯诊断，绝不参与 Acceptance / Revert 判定。
+    natural_problem = None
+    natural_parity = None
+    natural_initial = None
+    if natural_validation_batches:
+        natural_problem, natural_parity = build_problem(
+            episode, model, teacher, natural_validation_batches, q_model=q_model
+        )
+        natural_initial = evaluate_problem(model, natural_problem)
     initial = evaluate_problem(model, validation_problem)
     with torch.no_grad():
         start_p0, start_pi = model._value_outputs(validation_problem[0].parent)
@@ -1481,6 +1557,64 @@ def run_p_policy_iteration(
         torch.cuda.synchronize(device)
         peak_memory = int(torch.cuda.max_memory_allocated(device))
 
+    # Natural Validation 终评（模型已处于最终生效状态：accepted best 或
+    # accepted_reverted 的迭代起点）。RNG 显式保护，诊断不得扰动训练流。
+    natural_validation_block: Optional[Dict[str, Any]] = None
+    natural_regression_observed = False
+    if natural_problem is not None and natural_initial is not None:
+        rng_cpu_diag = torch.get_rng_state()
+        rng_cuda_diag = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        )
+        try:
+            natural_final = evaluate_problem(model, natural_problem)
+            natural_fresh = fresh_greedy_residual(
+                episode, model, teacher, natural_validation_batches, q_model=q_model
+            )
+        finally:
+            torch.set_rng_state(rng_cpu_diag)
+            if rng_cuda_diag is not None:
+                torch.cuda.set_rng_state_all(rng_cuda_diag)
+        natural_initial_mae = float(
+            natural_initial.get("normalized_mae", float("nan"))
+        )
+        natural_final_mae = float(
+            natural_final.get("normalized_mae", float("nan"))
+        )
+        natural_regression_observed = bool(
+            math.isfinite(natural_initial_mae)
+            and math.isfinite(natural_final_mae)
+            and natural_final_mae > natural_initial_mae
+        )
+        nat_eta_rows = [
+            batch["parent"][:, 2].detach().reshape(-1).to(torch.float32).cpu()
+            for batch in natural_validation_batches
+            if torch.is_tensor(batch.get("parent"))
+        ]
+        nat_eta = torch.cat(nat_eta_rows) if nat_eta_rows else torch.empty(0)
+        natural_validation_block = {
+            "p_eta_sampling_method": "counterfactual_parent_eta_balance",
+            "caliber": "natural_parent_eta",
+            "n_parents": int(nat_eta.numel()),
+            "eta0_count": int((nat_eta <= 0.0).sum()),
+            "eta1_count": int((nat_eta > 0.0).sum()),
+            "eta1_share": (
+                float((nat_eta > 0.0).float().mean()) if nat_eta.numel() else 0.0
+            ),
+            "total_residual_initial": natural_initial_mae,
+            "total_residual_final": natural_final_mae,
+            "frozen_improved": bool(
+                math.isfinite(natural_initial_mae)
+                and math.isfinite(natural_final_mae)
+                and natural_final_mae < natural_initial_mae
+            ),
+            "natural_worsened": natural_regression_observed,
+            "frozen_policy_initial": natural_initial,
+            "frozen_policy_final": natural_final,
+            "fresh_greedy_final": natural_fresh,
+            "parity": natural_parity,
+        }
+
     summary: Dict[str, Any] = {
         "inner_index": int(inner_index),
         "iteration_index": int(iteration_index),
@@ -1502,12 +1636,30 @@ def run_p_policy_iteration(
             "mae": final["p0_norm_mae"],
             "rmse": final["p0_norm_rmse"],
             "p90": final["p0_norm_p90"],
+            "eta0_mae": final.get("p0_norm_eta0_mae"),
+            "eta1_mae": final.get("p0_norm_eta1_mae"),
+            "eta0_p90": final.get("p0_norm_eta0_p90"),
+            "eta1_p90": final.get("p0_norm_eta1_p90"),
+            "eta0_n": final.get("p0_norm_eta0_n_total"),
+            "eta1_n": final.get("p0_norm_eta1_n_total"),
+            "eta0_nonfinite_ratio": final.get("p0_norm_eta0_nonfinite_ratio"),
+            "eta1_nonfinite_ratio": final.get("p0_norm_eta1_nonfinite_ratio"),
         },
         "frozen_policy_pi_residual": {
             "mae": final["pi_norm_mae"],
             "rmse": final["pi_norm_rmse"],
             "p90": final["pi_norm_p90"],
+            "eta0_mae": final.get("pi_norm_eta0_mae"),
+            "eta1_mae": final.get("pi_norm_eta1_mae"),
+            "eta0_p90": final.get("pi_norm_eta0_p90"),
+            "eta1_p90": final.get("pi_norm_eta1_p90"),
+            "eta0_n": final.get("pi_norm_eta0_n_total"),
+            "eta1_n": final.get("pi_norm_eta1_n_total"),
+            "eta0_nonfinite_ratio": final.get("pi_norm_eta0_nonfinite_ratio"),
+            "eta1_nonfinite_ratio": final.get("pi_norm_eta1_nonfinite_ratio"),
         },
+        "natural_validation": natural_validation_block,
+        "natural_validation_regression_observed": natural_regression_observed,
         "initial_frozen_policy_residual": {
             "p0_mae": initial["p0_norm_mae"],
             "pi_mae": initial["pi_norm_mae"],

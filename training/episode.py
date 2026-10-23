@@ -11618,6 +11618,7 @@ class Episode:
         q_target_model: Optional[nn.Module] = None,
         inner_index: int,
         inner_cycles: int,
+        natural_validation_batches: Optional[List[Dict[str, torch.Tensor]]] = None,
     ) -> Dict[str, Any]:
         """Dispatch the per-Inner P stage to the configured P solver.
 
@@ -11632,6 +11633,7 @@ class Episode:
                 validation_batches,
                 q_target_model if q_target_model is not None else teacher,
                 inner_index=inner_index,
+                natural_validation_batches=natural_validation_batches,
             )
         # 旧 Fixed Target Cache 兼容路径（firm_inner_cycles=1 回归）。
         return self._run_policy_value_evaluation_stage(
@@ -11660,6 +11662,7 @@ class Episode:
         q_model: nn.Module,
         *,
         inner_index: int,
+        natural_validation_batches: Optional[List[Dict[str, torch.Tensor]]] = None,
     ) -> Dict[str, Any]:
         """Hybrid P stage: frozen-policy dynamic Bellman residual policy iterations.
 
@@ -11743,6 +11746,7 @@ class Episode:
                         is not None
                         else None
                     ),
+                    natural_validation_batches=natural_validation_batches,
                 )
                 records.append(summary)
                 total_optimizer_steps += int(summary.get("optimizer_steps", 0))
@@ -11905,9 +11909,15 @@ class Episode:
                 "eta1_share_after": validation_counts["eta1_share"],
             }
         original_counts = self._current_eta_counts_from_batches(pv_train_batches)
+        natural_validation_counts = self._current_eta_counts_from_batches(
+            validation_batches if validation_batches else pv_train_batches
+        )
         p_eta_balance_summary = {
             "p_eta_balance_enabled": bool(
                 getattr(self.hyperparams, "pv_current_eta_balance_enabled", False)
+            ),
+            "p_eta_sampling_method": p_train_eta_summary.get(
+                "p_eta_sampling_method", "natural_parent_eta"
             ),
             "p_eta_target_share": float(
                 getattr(self.hyperparams, "pv_current_eta1_train_share", 0.50)
@@ -11915,6 +11925,13 @@ class Episode:
             "p_eta_balance_seed": int(
                 getattr(self.hyperparams, "pv_current_eta_balance_seed", 97531)
             ),
+            "p_train_eta_summary": p_train_eta_summary,
+            "p_validation_eta_summary": p_validation_eta_summary,
+            "natural_validation_eta1_share": natural_validation_counts["eta1_share"],
+            "natural_validation_eta0_count": natural_validation_counts["eta0_count"],
+            "natural_validation_eta1_count": natural_validation_counts["eta1_count"],
+            "q_train_eta1_share_before": original_counts["eta1_share"],
+            "q_train_eta1_share_after": original_counts["eta1_share"],
             "p_train_eta0_count_before": p_train_eta_summary["eta0_count"],
             "p_train_eta1_count_before": p_train_eta_summary["eta1_count"],
             "p_train_eta1_share_before": p_train_eta_summary["eta1_share"],
@@ -12030,8 +12047,33 @@ class Episode:
                     q_target_model=q_pricing_teacher,
                     inner_index=cycle_index,
                     inner_cycles=inner_cycles,
+                    natural_validation_batches=(
+                        validation_batches if validation_batches else pv_train_batches
+                    ),
                 )
                 pq_summary.update(p_eta_balance_summary)
+                logger.info(
+                    "Inner %d/%d P eta diagnostics | "
+                    "P_ETA_BALANCE_ENABLED=%s P_ETA_SAMPLING_METHOD=%s "
+                    "P_TRAIN_ETA1_SHARE_BEFORE=%.4f P_TRAIN_ETA1_SHARE_AFTER=%.4f "
+                    "P_VALIDATION_ETA1_SHARE_BEFORE=%.4f "
+                    "P_VALIDATION_ETA1_SHARE_AFTER=%.4f "
+                    "NATURAL_VALIDATION_ETA1_SHARE=%.4f "
+                    "Q_TRAIN_ETA1_SHARE_BEFORE=%.4f Q_TRAIN_ETA1_SHARE_AFTER=%.4f "
+                    "P_ETA_BALANCE_SEED=%d",
+                    cycle_index,
+                    inner_cycles,
+                    p_eta_balance_summary["p_eta_balance_enabled"],
+                    p_eta_balance_summary["p_eta_sampling_method"],
+                    p_eta_balance_summary["p_train_eta1_share_before"],
+                    p_eta_balance_summary["p_train_eta1_share_after"],
+                    p_eta_balance_summary["p_validation_eta1_share_before"],
+                    p_eta_balance_summary["p_validation_eta1_share_after"],
+                    p_eta_balance_summary["natural_validation_eta1_share"],
+                    p_eta_balance_summary["q_train_eta1_share_before"],
+                    p_eta_balance_summary["q_train_eta1_share_after"],
+                    p_eta_balance_summary["p_eta_balance_seed"],
+                )
                 # Hybrid P stage 的合法完成状态包含回退（模型已恢复到合法
                 # 状态）；rejected_* 一律中止整个 staged 阶段，绝不改写为
                 # accepted。
@@ -12169,6 +12211,7 @@ class Episode:
                 equations = cycle_convergence.get("equations", {})
                 cycle_record: Dict[str, Any] = {
                     "cycle": cycle_index,
+                    "p_eta_balance": p_eta_balance_summary,
                     "p_teacher_source": (
                         "episode_start_teacher"
                         if cycle_index == 1
@@ -12449,10 +12492,13 @@ class Episode:
             return batches, {
                 "enabled": enabled,
                 "stream": stream,
+                "p_eta_sampling_method": "natural_parent_eta",
                 **before,
                 "eta0_count_after": before["eta0_count"],
                 "eta1_count_after": before["eta1_count"],
                 "eta1_share_after": before["eta1_share"],
+                "reassigned_count": 0,
+                "original_parent_child_preserved": True,
             }
 
         stream_offset = {"train": 0, "validation": 1}.get(stream)
@@ -12464,12 +12510,19 @@ class Episode:
             + int(self.episode_id) * 100003
             + stream_offset * 1000003
         )
+        # 原批次完整性快照：反事实重分配只允许写 P 专用副本。
+        original_parent_snapshots: List[torch.Tensor] = []
+        original_children_refs: List[Any] = []
         balanced: List[Dict[str, torch.Tensor]] = []
+        reassigned_count = 0
+        source_stats: Dict[str, Dict[str, int]] = {}
         for batch in batches:
             parent = batch.get("parent")
             if not torch.is_tensor(parent) or parent.ndim < 2 or parent.shape[1] < 3:
                 balanced.append(batch)
                 continue
+            original_parent_snapshots.append(parent.detach().clone())
+            original_children_refs.append(batch.get("children"))
             n_rows = int(parent.shape[0])
             n_eta1 = int(round(n_rows * target_share))
             order = torch.randperm(n_rows, generator=generator)
@@ -12480,14 +12533,71 @@ class Episode:
             cloned_parent[:, 2] = eta_cpu.to(parent.device)
             cloned["parent"] = cloned_parent
             balanced.append(cloned)
+            eta_before_rows = parent[:, 2].detach().cpu()
+            eta_after_rows = cloned_parent[:, 2].detach().cpu()
+            reassigned_count += int((eta_after_rows != eta_before_rows).sum().item())
+            source_ids = batch.get("source_id")
+            if torch.is_tensor(source_ids) and source_ids.numel() == n_rows:
+                source_cpu = source_ids.detach().reshape(-1).cpu()
+                for src in torch.unique(source_cpu).tolist():
+                    mask = source_cpu == src
+                    stats = source_stats.setdefault(
+                        str(int(src)),
+                        {"n_parents": 0, "eta1_before": 0, "eta1_after": 0},
+                    )
+                    stats["n_parents"] += int(mask.sum().item())
+                    stats["eta1_before"] += int(
+                        (eta_before_rows[mask] > 0.5).sum().item()
+                    )
+                    stats["eta1_after"] += int(
+                        (eta_after_rows[mask] > 0.5).sum().item()
+                    )
+        originals_preserved = True
+        for batch, snapshot, children_ref in zip(
+            [
+                b
+                for b in batches
+                if torch.is_tensor(b.get("parent"))
+                and b["parent"].ndim >= 2
+                and b["parent"].shape[1] >= 3
+            ],
+            original_parent_snapshots,
+            original_children_refs,
+        ):
+            if not torch.equal(batch["parent"], snapshot):
+                originals_preserved = False
+            if batch.get("children") is not children_ref:
+                originals_preserved = False
+        source_eta_shares = {
+            src: {
+                "n_parents": stats["n_parents"],
+                "eta1_count_before": stats["eta1_before"],
+                "eta1_count_after": stats["eta1_after"],
+                "eta1_share_before": (
+                    stats["eta1_before"] / stats["n_parents"]
+                    if stats["n_parents"]
+                    else float("nan")
+                ),
+                "eta1_share_after": (
+                    stats["eta1_after"] / stats["n_parents"]
+                    if stats["n_parents"]
+                    else float("nan")
+                ),
+            }
+            for src, stats in source_stats.items()
+        }
         after = self._current_eta_counts_from_batches(balanced)
         return balanced, {
             "enabled": True,
             "stream": stream,
+            "p_eta_sampling_method": "counterfactual_parent_eta_balance",
             **before,
             "eta0_count_after": after["eta0_count"],
             "eta1_count_after": after["eta1_count"],
             "eta1_share_after": after["eta1_share"],
+            "reassigned_count": int(reassigned_count),
+            "source_eta_shares": source_eta_shares,
+            "original_parent_child_preserved": bool(originals_preserved),
         }
 
     def _run_batches(

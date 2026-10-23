@@ -2668,6 +2668,16 @@ def main():
             extra_metadata={
                 "episode_mode": episode_mode,
                 "warmstart": warmstart_provenance,
+                # P 专用 Collocation Augmentation 的采样方法标记：这是对
+                # Bellman 状态空间的反事实 Parent η 覆盖，不是对真实 η=1
+                # 企业的 oversampling，也不是对真实 η 分布的重新估计。
+                "p_eta_sampling_method": (
+                    "counterfactual_parent_eta_balance"
+                    if bool(
+                        getattr(hyperparams, "pv_current_eta_balance_enabled", False)
+                    )
+                    else "natural_parent_eta"
+                ),
             },
         )
         print(f"Checkpoint metadata written: {saved_paths}")

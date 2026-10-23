@@ -422,3 +422,378 @@ def test_inner3_keeps_fc1_sdf_frozen(monkeypatch):
         assert cycle["sdf_fc1_hash"] == sdf_hash_before
         assert cycle["sdf_fc1_hash_after"] == sdf_hash_before
     assert episode._state_dict_hash(episode.models["sdf_fc1"]) == sdf_hash_before
+
+
+# ===========================================================================
+# P-only Parent η Balance (50/50) — Counterfactual Parent η Balance
+# ===========================================================================
+
+
+def _skewed_batch(device, n_rows=20, eta1_rows=1, seed=0):
+    """Parent batch with an extremely skewed natural current-eta distribution."""
+    g = torch.Generator().manual_seed(seed)
+    parent_state = torch.zeros(n_rows, 7, device=device)
+    parent_state[:, 0] = torch.rand(n_rows, generator=g) * 0.5
+    parent_state[:, 1] = torch.randn(n_rows, generator=g) * 0.3
+    parent_state[:, 2] = 0.0
+    if eta1_rows > 0:
+        parent_state[:eta1_rows, 2] = 1.0
+    parent_state[:, 3] = torch.rand(n_rows, generator=g) * 0.4
+    parent_state[:, 4] = torch.randn(n_rows, generator=g) * 0.1
+    parent_state[:, 5] = -2.0 + torch.randn(n_rows, generator=g) * 0.2
+    parent_state[:, 6] = 4.0 + torch.randn(n_rows, generator=g) * 0.1
+    child0 = parent_state.clone()
+    child1 = parent_state.clone()
+    child0[:, 1:2] += 0.05
+    child1[:, 1:2] -= 0.03
+    child0[:, 2:3] = 1.0 - parent_state[:, 2:3]
+    child1[:, 2:3] = parent_state[:, 2:3]
+    m0 = torch.full((n_rows, 1), 0.98, device=device)
+    m1 = torch.full((n_rows, 1), 1.02, device=device)
+    return {
+        "parent": torch.cat([parent_state, torch.ones(n_rows, 1, device=device)], dim=1),
+        "children": [
+            torch.cat([child0, m0], dim=1),
+            torch.cat([child1, m1], dim=1),
+        ],
+        "source_id": torch.zeros(n_rows, dtype=torch.long, device=device),
+    }
+
+
+def _enable_eta_balance(episode, share=0.50):
+    hp = episode.hyperparams
+    hp.pv_current_eta_balance_enabled = True
+    hp.pv_current_eta1_train_share = share
+    hp.pv_current_eta_balance_validation = True
+    hp.pv_current_eta_balance_seed = 97531
+    hp.pv_eta_resample_enabled = False
+    hp.pv_exact_eta_integration_enabled = True
+    hp.bp_current_eta_resample_enabled = False
+    return hp
+
+
+# --- Test 1: P Parent η = 50/50 ----------------------------------------------
+
+def test_p_eta_balance_reaches_fifty_fifty_on_skewed_natural_sample():
+    episode = _episode()
+    _enable_eta_balance(episode)
+    train = _skewed_batch(episode.device, n_rows=20, eta1_rows=1, seed=1)
+    validation = _skewed_batch(episode.device, n_rows=10, eta1_rows=0, seed=2)
+    train["source_id"][:10] = 0
+    train["source_id"][10:] = 1
+    original_parent = train["parent"].clone()
+    original_children = [c.clone() for c in train["children"]]
+    rng_before = torch.random.get_rng_state().clone()
+
+    balanced_train, train_summary = episode._balance_p_current_eta_batches(
+        [train], stream="train"
+    )
+    balanced_val, val_summary = episode._balance_p_current_eta_batches(
+        [validation], stream="validation"
+    )
+
+    # RNG 不被意外消耗；重复调用完全确定。
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    repeat, _ = episode._balance_p_current_eta_batches([train], stream="train")
+    assert torch.equal(balanced_train[0]["parent"], repeat[0]["parent"])
+
+    # 比例约 50%（允许取整偏差），Parent/Child 数量对应。
+    for summary in (train_summary, val_summary):
+        assert abs(summary["eta1_share_after"] - 0.5) <= 0.01
+        assert summary["eta0_count_after"] + summary["eta1_count_after"] == (
+            summary["eta0_count"] + summary["eta1_count"]
+        )
+        assert summary["p_eta_sampling_method"] == "counterfactual_parent_eta_balance"
+        assert summary["original_parent_child_preserved"] is True
+    assert train_summary["eta1_share"] == 0.05  # 自然样本极偏
+    assert val_summary["eta1_share"] == 0.0
+    assert balanced_train[0]["parent"].shape[0] == 20
+    assert balanced_val[0]["parent"].shape[0] == 10
+    for child_b, child_o in zip(balanced_train[0]["children"], original_children):
+        assert child_b.shape == child_o.shape
+
+    # 不修改原始 Batch（仅 η 列在副本中重分配）。
+    assert torch.equal(train["parent"], original_parent)
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(train["children"], original_children)
+    )
+
+    # Train/Validation 没有泄漏：每个副本的行（除 η 列）与自己来源的 Batch 一致。
+    assert torch.equal(
+        balanced_train[0]["parent"][:, [0, 1, 3, 4, 5, 6, 7]],
+        original_parent[:, [0, 1, 3, 4, 5, 6, 7]],
+    )
+    assert torch.equal(
+        balanced_val[0]["parent"][:, [0, 1, 3, 4, 5, 6, 7]],
+        validation["parent"][:, [0, 1, 3, 4, 5, 6, 7]],
+    )
+    # Source 级 η 比例与反事实重分配计数被如实记录；全局 50% 不得掩盖某个
+    # Source 完全缺少 η=1 的情况（Source 级不做独立配平，只做透明报告）。
+    sources = train_summary["source_eta_shares"]
+    assert set(sources.keys()) == {"0", "1"}
+    for stats in sources.values():
+        assert stats["eta1_count_after"] >= 1
+        assert 0.0 < stats["eta1_share_after"] < 1.0
+    assert train_summary["reassigned_count"] > 0
+
+
+# --- Test 2: Bellman Operator Parity（Dynamic P Solver，η=0/1）---------------
+
+def test_dynamic_solver_eta_gate_parity_and_gradients_on_balanced_parents():
+    episode = _episode()
+    model = episode.models["policy_value"]
+    _set_head_bias(model, 2.0)
+    _enable_eta_balance(episode)
+    batch = _skewed_batch(episode.device, n_rows=12, eta1_rows=0, seed=3)
+    balanced, _ = episode._balance_p_current_eta_batches([batch], stream="train")
+    balanced_parent = balanced[0]["parent"][:, :7]
+    eta = balanced_parent[:, 2]
+    eta0 = eta <= 0.5
+    eta1 = eta > 0.5
+    assert bool(eta0.any()) and bool(eta1.any())
+
+    frozen = solver.build_frozen_policy_batch(
+        episode, model, _teacher(episode), balanced[0], batch_id=0
+    )
+    # Frozen Policy Bellman RHS 与生产 Teacher 一致（parity 硬校验）。
+    assert frozen.parity_passed, frozen.parity_max_abs_error
+
+    b_parent = balanced_parent[:, 0:1]
+    for branch in (frozen.p0, frozen.pi):
+        child_b = branch.child_states[:, :, 0]
+        # η=0：Grid BP 融资门控生效，下期债务保持 b_parent。
+        assert torch.allclose(
+            branch.bp_star[eta0], b_parent[eta0], atol=1e-6, rtol=0.0
+        )
+        assert torch.allclose(
+            child_b[eta0],
+            b_parent[eta0].expand_as(child_b[eta0]),
+            atol=1e-6,
+            rtol=0.0,
+        )
+        # η=1：下期债务使用最优 Grid BP。
+        assert torch.allclose(
+            child_b[eta1],
+            branch.bp_star[eta1].expand_as(child_b[eta1]),
+            atol=1e-6,
+            rtol=0.0,
+        )
+
+    # Dynamic Residual 的 Parent 与 Child P 梯度均有效（同一 P scope）。
+    p_params = solver.p_root_params(episode, model)
+    model.zero_grad(set_to_none=True)
+    loss = solver.root_loss(model, frozen)
+    assert loss.requires_grad
+    loss.backward()
+    assert all(
+        param.grad is not None and float(param.grad.abs().sum()) > 0.0
+        for param in p_params
+    )
+    equity_child = solver.frozen_child_equity(
+        model, frozen.p0, detach_child=False
+    )
+    grads_child = torch.autograd.grad(
+        equity_child.sum(), p_params, allow_unused=True
+    )
+    assert any(
+        grad is not None and float(grad.abs().sum()) > 0.0 for grad in grads_child
+    )
+
+
+# --- Test 3: Q 保持 Natural --------------------------------------------------
+
+def test_inner3_p_uses_balanced_eta_and_q_keeps_natural(monkeypatch):
+    episode = _episode()
+    _enable_eta_balance(episode)
+    episode.hyperparams.firm_inner_cycles = 3
+    episode.hyperparams.p_policy_iterations_per_inner = 3
+    train = _skewed_batch(episode.device, n_rows=20, eta1_rows=1, seed=4)
+    validation = _skewed_batch(episode.device, n_rows=10, eta1_rows=0, seed=5)
+    q_calls = []
+
+    def _fake_q(batches, *args, **kwargs):
+        q_calls.append(batches)
+        return {
+            "status": "accepted",
+            "q_stage_required_gate_passed": True,
+            "optimizer_steps": 7,
+            "phases": ["zero", "default", "survival", "polish"],
+        }
+
+    monkeypatch.setattr(
+        episode,
+        "_run_q_bootstrap_stage",
+        lambda *a, **k: {"status": "accepted", "optimizer_steps": 0},
+    )
+    monkeypatch.setattr(episode, "_run_q_regime_training", _fake_q)
+    monkeypatch.setattr(episode, "_update_firm_target_now", lambda *_args: None)
+
+    result = episode._run_policy_value_staged([train], [validation], n_epochs=1)
+    metadata = result["metadata"]
+    assert metadata["policy_value_stage_status"] == "accepted"
+
+    # 9 次 P Policy Iteration 全部使用 Balanced Parent η（balanced 验证口径
+    # 每层 η=0/η=1 各占一半）。
+    cycles = metadata["inner_cycle_diagnostics"]
+    assert len(cycles) == 3
+    total_iterations = 0
+    for cycle in cycles:
+        for record in cycle["p_policy_iterations"]:
+            total_iterations += 1
+            frozen_p0 = record["frozen_policy_p0_residual"]
+            assert frozen_p0["eta0_n"] == frozen_p0["eta1_n"] == 5.0
+            assert record["natural_validation"] is not None
+            assert record["natural_validation"]["eta1_share"] == 0.0
+    assert total_iterations == 9
+
+    # 3 次 Q Regime Training 使用原始 Natural η：对象未被替换、η 未被重分配。
+    assert len(q_calls) == 3
+    for batches in q_calls:
+        assert batches[0] is train
+        assert torch.equal(batches[0]["parent"], train["parent"])
+    eta_summary = metadata["inner_cycle_diagnostics"][0]["p_eta_balance"]
+    assert eta_summary["q_train_eta1_share_before"] == 0.05
+    assert eta_summary["q_train_eta1_share_after"] == 0.05
+    assert eta_summary["p_train_eta1_share_after"] == 0.5
+    assert eta_summary["p_eta_sampling_method"] == "counterfactual_parent_eta_balance"
+
+    # FC1/SDF 不更新；BP Head 不训练。
+    for cycle in cycles:
+        assert cycle["sdf_fc1_hash"] == cycle["sdf_fc1_hash_after"]
+    bp_stage = metadata["bp_distillation_stage"]
+    assert bp_stage["status"] == "diagnostic_only_training_disabled"
+    assert bp_stage["bp_head_optimizer_steps"] == 0
+
+
+# --- Test 4: Child η Exact Integration --------------------------------------
+
+def test_child_eta_exact_integration_weights_untouched_by_balance():
+    episode = _episode()
+    _enable_eta_balance(episode)
+    batch = _skewed_batch(episode.device, n_rows=6, eta1_rows=1, seed=6)
+    children = batch["children"]
+    _raw_m, m_list = episode._build_policy_m_lists(batch["parent"], children, 0.7, 1.3)
+    _, _, _, weights_natural = episode._expand_policy_expectation_children(
+        children, m_list, m_list
+    )
+
+    balanced, _ = episode._balance_p_current_eta_batches([batch], stream="train")
+    b_children = balanced[0]["children"]
+    _raw_m_b, m_list_b = episode._build_policy_m_lists(
+        balanced[0]["parent"], b_children, 0.7, 1.3
+    )
+    expanded_b, _, _, weights_balanced = episode._expand_policy_expectation_children(
+        b_children, m_list_b, m_list_b
+    )
+
+    # Parent η Balance 不改变 Child η_next 的期望权重。
+    assert torch.equal(weights_natural, weights_balanced)
+    assert weights_balanced is not None
+    # 权重仍是 Config.ZETA 的 Bernoulli 概率（相邻 η 对：先 η=0 后 η=1），
+    # 绝不会因 Parent 50/50 而变成 50/50。
+    zeta = float(Config.ZETA)
+    assert abs(zeta - 0.5) > 1e-6
+    w = weights_balanced
+    w_pairs = w.reshape(w.shape[0], -1, 2)
+    base = w_pairs[:, :, 0] / (1.0 - zeta)
+    assert torch.allclose(w_pairs[:, :, 1], base * zeta, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(
+        w.sum(dim=-1), torch.ones(w.shape[0], device=w.device, dtype=w.dtype), atol=1e-6
+    )
+    # Child Shock Identity 与 M 口径未改变：扩展成员除 η_next 列外逐行与
+    # 某个原始 child 完全一致（冲击/M 原样保留），η_next 恰好覆盖 {0,1}。
+    keep = [c for c in range(children[0].shape[-1]) if c != 2]
+    for entry in expanded_b:
+        per_child = torch.stack(
+            [
+                (entry[:, keep] - original[:, keep]).abs().amax(dim=1)
+                for original in children
+            ],
+            dim=0,
+        )
+        assert float(per_child.amin(dim=0).max()) == 0.0
+    eta_next_all = torch.cat([entry[:, 2] for entry in expanded_b])
+    assert set(eta_next_all.unique().tolist()) == {0.0, 1.0}
+
+
+# --- Test 5: Validation 双口径 ------------------------------------------------
+
+def test_dual_caliber_validation_reporting_and_revert_not_mislabeled(monkeypatch):
+    episode = _episode()
+    model = episode.models["policy_value"]
+    _set_head_bias(model, 2.0)
+    _enable_eta_balance(episode)
+    train = _skewed_batch(episode.device, n_rows=12, eta1_rows=1, seed=7)
+    validation = _skewed_batch(episode.device, n_rows=10, eta1_rows=0, seed=8)
+    p_train, _ = episode._balance_p_current_eta_batches([train], stream="train")
+    p_val, _ = episode._balance_p_current_eta_batches([validation], stream="validation")
+
+    # 强制“无改善”路径：优化器保持初始状态但计为有效步，必须得到
+    # accepted_reverted，且不得被误记为训练改善。
+    def _stub_adam(**kwargs):
+        eval0 = solver.evaluate_problem(kwargs["model"], kwargs["validation"])
+        return [eval0], solver._clone_state(kwargs["model"]), dict(eval0), 1, "ok"
+
+    def _stub_lbfgs(**kwargs):
+        eval0 = solver.evaluate_problem(kwargs["model"], kwargs["validation"])
+        counters = {
+            "LBFGS_ITERATION_BUDGET": int(kwargs["max_iter"]),
+            "LBFGS_ACTUAL_ITERATIONS": 1,
+            "LBFGS_CLOSURE_CALLS": 0,
+            "LBFGS_NONFINITE_CLOSURES": 0,
+        }
+        return [eval0], solver._clone_state(kwargs["model"]), dict(eval0), "max_iter_reached", counters
+
+    monkeypatch.setattr(solver, "run_adam", _stub_adam)
+    monkeypatch.setattr(solver, "run_lbfgs_chunked", _stub_lbfgs)
+
+    summary = solver.run_p_policy_iteration(
+        episode,
+        model,
+        train_batches=p_train,
+        validation_batches=p_val,
+        q_model=model,
+        inner_index=1,
+        iteration_index=1,
+        adam_steps=1,
+        adam_lr=1e-3,
+        adam_clip=10.0,
+        eval_every=1,
+        lbfgs_max_iter=1,
+        lbfgs_chunk_iterations=1,
+        lbfgs_history_size=2,
+        natural_validation_batches=[validation],
+    )
+
+    # Balanced Validation 口径：η=0/η=1 各 5 行，P0/PI 误差分层可独立读取。
+    frozen_p0 = summary["frozen_policy_p0_residual"]
+    frozen_pi = summary["frozen_policy_pi_residual"]
+    for block in (frozen_p0, frozen_pi):
+        assert block["eta0_n"] == 5.0
+        assert block["eta1_n"] == 5.0
+        assert block["eta0_mae"] is not None
+        assert block["eta1_mae"] is not None
+    # Fresh Greedy 同样分 η。
+    fresh = summary["fresh_greedy_residual"]
+    assert fresh["fresh_greedy_p0_norm_eta0_n_total"] == 5.0
+    assert fresh["fresh_greedy_p0_norm_eta1_n_total"] == 5.0
+
+    # Natural Validation 口径：未被覆盖（η1 share 保持自然 0.0），指标双出。
+    natural = summary["natural_validation"]
+    assert natural is not None
+    assert natural["caliber"] == "natural_parent_eta"
+    assert natural["eta1_share"] == 0.0
+    assert natural["n_parents"] == 10
+    assert natural["total_residual_initial"] is not None
+    assert natural["total_residual_final"] is not None
+    nat_final = natural["frozen_policy_final"]
+    assert nat_final["p0_norm_eta0_n_total"] == 10.0
+    assert nat_final["p0_norm_eta1_n_total"] == 0.0
+
+    # 回退不得被误记为训练改善。
+    assert summary["status"] == "accepted_reverted"
+    assert summary["frozen_residual_improved"] is False
+    assert summary["full_bellman_fixed_point_improvement"] is False
+    assert natural["frozen_improved"] is False
+    assert natural["natural_worsened"] is False
