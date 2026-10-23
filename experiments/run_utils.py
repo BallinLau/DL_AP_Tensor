@@ -877,7 +877,12 @@ def plot_distributions(
     cols = ["b", "z", "ETA", "i", "x", "Hatcf", "LnKF"]
     X = torch.tensor(parent_df[cols].values, device=device, dtype=torch.float32)
     with torch.no_grad():
-        bp = pv_model(X).bp.cpu().numpy()
+        # 诊断绘图：全量 parent 行一次性前向会随 pool 规模（entry 复利增长）线性
+        # 膨胀激活显存，在训练态驻留较大时直接 OOM；按行分块使峰值与 pool 规模无关。
+        bp_chunks = []
+        for start in range(0, int(X.shape[0]), 262144):
+            bp_chunks.append(pv_model(X[start:start + 262144]).bp.cpu().numpy())
+        bp = np.concatenate(bp_chunks) if bp_chunks else np.empty(0)
 
     plt.figure(figsize=(5, 3))
     plt.hist(bp, bins=40)
