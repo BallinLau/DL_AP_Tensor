@@ -1987,13 +1987,17 @@ class Episode:
             return torch.zeros(n, dtype=torch.bool, device=parent_keys.device), torch.zeros(
                 n, dtype=torch.long, device=parent_keys.device
             )
-        order = torch.argsort(child_keys)
-        sorted_keys = child_keys[order]
-        sorted_child_idx = child_indices[order]
+        # Peak-memory lean variant: gather matched rows through the sort
+        # permutation instead of materialising a full sorted child-index
+        # tensor, and free the sort intermediates eagerly. The returned
+        # values are identical to the argsort + double-gather formulation.
+        sorted_keys, order = torch.sort(child_keys)
         pos = torch.searchsorted(sorted_keys, parent_keys)
         pos_clamped = pos.clamp(max=max(sorted_keys.numel() - 1, 0))
         valid = (pos < sorted_keys.numel()) & (sorted_keys[pos_clamped] == parent_keys)
-        return valid, sorted_child_idx[pos_clamped]
+        matched_rows = order[pos_clamped]
+        del order, sorted_keys
+        return valid, child_indices[matched_rows]
 
     def _build_batches_from_parent_children(
         self,
@@ -2070,23 +2074,30 @@ class Episode:
         if id_col is None:
             raise ValueError("Tensor firm table missing id column ('firm' or 'ID').")
 
-        path = data[:, col['path']].long()
-        ident = data[:, col[id_col]].long()
-        branch = data[:, col['branch']].long()
+        # Column extractions stay as zero-copy views of the panel (no .long()
+        # materialisation): _encode_int_keys converts the small row subsets to
+        # int64 internally, so the encoded keys are unchanged while the
+        # full-column int64 copies (multi-GiB on late-episode pools) stay out
+        # of the peak. Transient subset tensors are freed eagerly.
+        path = data[:, col['path']]
+        ident = data[:, col[id_col]]
+        branch = data[:, col['branch']]
         has_t = 't' in col
-        t = data[:, col['t']].long() if has_t else torch.zeros_like(path)
+        t = data[:, col['t']] if has_t else torch.zeros_like(path)
         parent_branch = -1 if int(branch.min().item()) < 0 else 0
         key_max_id = int(ident.max().item()) + 1 if ident.numel() > 0 else 1
         key_max_t = int(t.max().item()) + 2 if t.numel() > 0 else 2
 
         parent_mask = (branch == parent_branch)
         parent_idx = torch.nonzero(parent_mask, as_tuple=False).squeeze(-1)
+        del parent_mask
         if parent_idx.numel() == 0:
             return None
         parent_path = path[parent_idx]
         parent_id = ident[parent_idx]
         parent_t = t[parent_idx] if (has_t and parent_branch < 0) else torch.zeros_like(parent_path)
         parent_key = self._encode_int_keys(parent_path, parent_id, parent_t, max_id=key_max_id, max_t=key_max_t)
+        del parent_path, parent_id, parent_t
 
         active = torch.ones(parent_idx.shape[0], dtype=torch.bool, device=data.device)
         child_selected: List[torch.Tensor] = []
@@ -2094,6 +2105,7 @@ class Episode:
             child_branch = k if parent_branch < 0 else (k + 1)
             child_mask = (branch == child_branch)
             child_idx = torch.nonzero(child_mask, as_tuple=False).squeeze(-1)
+            del child_mask
             child_path = path[child_idx]
             child_id = ident[child_idx]
             if has_t and parent_branch < 0:
@@ -2103,7 +2115,9 @@ class Episode:
             child_key = self._encode_int_keys(
                 child_path, child_id, child_t_parent, max_id=key_max_id, max_t=key_max_t
             )
+            del child_path, child_id, child_t_parent
             valid, matched_idx = self._match_keys(parent_key, child_key, child_idx)
+            del child_key
             active = active & valid
             child_selected.append(matched_idx)
 
