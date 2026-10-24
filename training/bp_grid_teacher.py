@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -265,32 +265,57 @@ def _gather_by_index(values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     return values.gather(1, index).reshape(-1, 1)
 
 
-def _concat_chunk_outputs(chunks: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    if not chunks:
+def _concat_chunk_outputs(
+    chunks: Iterable[Dict[str, torch.Tensor]],
+    *,
+    total_rows: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
+    """Concatenate per-chunk outputs along dim 0.
+
+    When ``total_rows`` is given, ``chunks`` may be a lazy iterator: on the CUDA
+    inference path each chunk is computed, copied into one preallocated result
+    and dropped immediately, so peak device memory stays near a single output
+    copy plus one chunk instead of all chunks plus the full result.
+    """
+    chunk_iter = iter(chunks)
+    try:
+        first = next(chunk_iter)
+    except StopIteration:
         return {}
-    keys = list(chunks[0].keys())
+    keys = list(first.keys())
     if not keys:
         return {}
-    device = chunks[0][keys[0]].device
-    if device.type != "cuda" or any(
-        tensor.requires_grad for chunk in chunks for tensor in chunk.values()
+    chunk_list: Optional[List[Dict[str, torch.Tensor]]] = None
+    if total_rows is None:
+        chunk_list = [first, *chunk_iter]
+        total_rows = sum(int(chunk[keys[0]].shape[0]) for chunk in chunk_list)
+    device = first[keys[0]].device
+    if device.type != "cuda" or (
+        chunk_list is not None
+        and any(tensor.requires_grad for chunk in chunk_list for tensor in chunk.values())
     ):
-        return {k: torch.cat([chunk[k] for chunk in chunks], dim=0) for k in keys}
+        if chunk_list is None:
+            chunk_list = [first, *chunk_iter]
+        return {k: torch.cat([chunk[k] for chunk in chunk_list], dim=0) for k in keys}
     # CUDA inference path: stream each chunk into one preallocated result and
     # drop the chunk immediately so peak device memory stays near a single
     # output copy instead of all chunks plus the concatenated copy.
-    total_rows = sum(int(chunk[keys[0]].shape[0]) for chunk in chunks)
     out = {
         k: torch.empty(
-            (total_rows,) + tuple(chunks[0][k].shape[1:]),
-            dtype=chunks[0][k].dtype,
+            (total_rows,) + tuple(first[k].shape[1:]),
+            dtype=first[k].dtype,
             device=device,
         )
         for k in keys
     }
     offset = 0
-    while chunks:
-        chunk = chunks.pop(0)
+    rows = int(first[keys[0]].shape[0])
+    for k in keys:
+        out[k][offset:offset + rows].copy_(first[k])
+    offset += rows
+    del first
+    remaining = chunk_list[1:] if chunk_list is not None else chunk_iter
+    for chunk in remaining:
         rows = int(chunk[keys[0]].shape[0])
         for k in keys:
             out[k][offset:offset + rows].copy_(chunk[k])
@@ -560,8 +585,9 @@ class BPGridTeacher:
                 f"keys: {sorted(set(active_out) ^ set(forced_out))}"
             )
         merged: Dict[str, torch.Tensor] = {}
-        for key, active_value in active_out.items():
-            forced_value = forced_out[key]
+        for key in list(active_out):
+            active_value = active_out.pop(key)
+            forced_value = forced_out.pop(key)
             # The two row groups have different sizes by construction, so only
             # the per-row tail shapes must agree.
             if active_value.shape[1:] != forced_value.shape[1:]:
@@ -646,9 +672,7 @@ class BPGridTeacher:
             self._log_grid_chunk_plan(plan)
         parent_chunk_size = min(plan.parent_chunk_effective for plan in plans)
         if parent_state.shape[0] > parent_chunk_size:
-            chunks = []
-            for start in range(0, parent_state.shape[0], parent_chunk_size):
-                stop = min(start + parent_chunk_size, parent_state.shape[0])
+            def _compute_chunk(start: int, stop: int) -> Dict[str, torch.Tensor]:
                 child_chunk = _slice_child_axis(children, start, stop)
                 m_chunk = _slice_child_axis(m_list, start, stop)
                 bp_chunk = bp_pred[start:stop] if bp_pred is not None else None
@@ -658,18 +682,23 @@ class BPGridTeacher:
                     if child_weights is not None and child_weights.ndim == 1
                     else child_weights[start:stop] if child_weights is not None else None
                 )
-                chunks.append(
-                    self._compute_no_parent_chunk(
-                        parent_state[start:stop],
-                        child_chunk,
-                        m_chunk,
-                        branch=branch,
-                        bp_pred=bp_chunk,
-                        mix_weight=mix_chunk,
-                        child_weights=weight_chunk,
-                    )
+                return self._compute_no_parent_chunk(
+                    parent_state[start:stop],
+                    child_chunk,
+                    m_chunk,
+                    branch=branch,
+                    bp_pred=bp_chunk,
+                    mix_weight=mix_chunk,
+                    child_weights=weight_chunk,
                 )
-            return _concat_chunk_outputs(chunks)
+
+            return _concat_chunk_outputs(
+                (
+                    _compute_chunk(start, min(start + parent_chunk_size, parent_state.shape[0]))
+                    for start in range(0, parent_state.shape[0], parent_chunk_size)
+                ),
+                total_rows=int(parent_state.shape[0]),
+            )
         return self._compute_no_parent_chunk(
             parent_state,
             children,
@@ -709,24 +738,27 @@ class BPGridTeacher:
         self._log_grid_chunk_plan(plan)
         parent_chunk_size = plan.parent_chunk_effective
         if parent_state.shape[0] > parent_chunk_size:
-            chunks = []
-            for start in range(0, parent_state.shape[0], parent_chunk_size):
-                stop = min(start + parent_chunk_size, parent_state.shape[0])
-                chunks.append(
-                    self._compute_forced_no_parent_chunk(
-                        parent_state[start:stop],
-                        _slice_child_axis(children, start, stop),
-                        _slice_child_axis(m_list, start, stop),
-                        branch=branch,
-                        mix_weight=mix_weight[start:stop] if mix_weight is not None else None,
-                        child_weights=(
-                            child_weights
-                            if child_weights is not None and child_weights.ndim == 1
-                            else child_weights[start:stop] if child_weights is not None else None
-                        ),
-                    )
+            def _compute_chunk(start: int, stop: int) -> Dict[str, torch.Tensor]:
+                return self._compute_forced_no_parent_chunk(
+                    parent_state[start:stop],
+                    _slice_child_axis(children, start, stop),
+                    _slice_child_axis(m_list, start, stop),
+                    branch=branch,
+                    mix_weight=mix_weight[start:stop] if mix_weight is not None else None,
+                    child_weights=(
+                        child_weights
+                        if child_weights is not None and child_weights.ndim == 1
+                        else child_weights[start:stop] if child_weights is not None else None
+                    ),
                 )
-            return _concat_chunk_outputs(chunks)
+
+            return _concat_chunk_outputs(
+                (
+                    _compute_chunk(start, min(start + parent_chunk_size, parent_state.shape[0]))
+                    for start in range(0, parent_state.shape[0], parent_chunk_size)
+                ),
+                total_rows=int(parent_state.shape[0]),
+            )
         return self._compute_forced_no_parent_chunk(
             parent_state,
             children,
@@ -940,23 +972,26 @@ class BPGridTeacher:
             self._log_grid_chunk_plan(plan)
         parent_chunk_size = min(plan.parent_chunk_effective for plan in plans)
         if parent_state.shape[0] > parent_chunk_size:
-            chunks = []
-            for start in range(0, parent_state.shape[0], parent_chunk_size):
-                stop = min(start + parent_chunk_size, parent_state.shape[0])
-                chunks.append(
-                    self._compute_value_target_no_parent_chunk(
-                        parent_state[start:stop],
-                        _slice_child_axis(children, start, stop),
-                        _slice_child_axis(m_list, start, stop),
-                        branch=branch,
-                        child_weights=(
-                            child_weights
-                            if child_weights is not None and child_weights.ndim == 1
-                            else child_weights[start:stop] if child_weights is not None else None
-                        ),
-                    )
+            def _compute_chunk(start: int, stop: int) -> Dict[str, torch.Tensor]:
+                return self._compute_value_target_no_parent_chunk(
+                    parent_state[start:stop],
+                    _slice_child_axis(children, start, stop),
+                    _slice_child_axis(m_list, start, stop),
+                    branch=branch,
+                    child_weights=(
+                        child_weights
+                        if child_weights is not None and child_weights.ndim == 1
+                        else child_weights[start:stop] if child_weights is not None else None
+                    ),
                 )
-            return _concat_chunk_outputs(chunks)
+
+            return _concat_chunk_outputs(
+                (
+                    _compute_chunk(start, min(start + parent_chunk_size, parent_state.shape[0]))
+                    for start in range(0, parent_state.shape[0], parent_chunk_size)
+                ),
+                total_rows=int(parent_state.shape[0]),
+            )
         return self._compute_value_target_no_parent_chunk(
             parent_state,
             children,
@@ -987,23 +1022,26 @@ class BPGridTeacher:
         self._log_grid_chunk_plan(plan)
         parent_chunk_size = plan.parent_chunk_effective
         if parent_state.shape[0] > parent_chunk_size:
-            chunks = []
-            for start in range(0, parent_state.shape[0], parent_chunk_size):
-                stop = min(start + parent_chunk_size, parent_state.shape[0])
-                chunks.append(
-                    self._compute_value_target_forced_no_parent_chunk(
-                        parent_state[start:stop],
-                        _slice_child_axis(children, start, stop),
-                        _slice_child_axis(m_list, start, stop),
-                        branch=branch,
-                        child_weights=(
-                            child_weights
-                            if child_weights is not None and child_weights.ndim == 1
-                            else child_weights[start:stop] if child_weights is not None else None
-                        ),
-                    )
+            def _compute_chunk(start: int, stop: int) -> Dict[str, torch.Tensor]:
+                return self._compute_value_target_forced_no_parent_chunk(
+                    parent_state[start:stop],
+                    _slice_child_axis(children, start, stop),
+                    _slice_child_axis(m_list, start, stop),
+                    branch=branch,
+                    child_weights=(
+                        child_weights
+                        if child_weights is not None and child_weights.ndim == 1
+                        else child_weights[start:stop] if child_weights is not None else None
+                    ),
                 )
-            return _concat_chunk_outputs(chunks)
+
+            return _concat_chunk_outputs(
+                (
+                    _compute_chunk(start, min(start + parent_chunk_size, parent_state.shape[0]))
+                    for start in range(0, parent_state.shape[0], parent_chunk_size)
+                ),
+                total_rows=int(parent_state.shape[0]),
+            )
         return self._compute_value_target_forced_no_parent_chunk(
             parent_state,
             children,
