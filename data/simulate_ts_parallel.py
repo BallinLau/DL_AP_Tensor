@@ -607,6 +607,13 @@ def _polish_initial_hstar_root(
     gate。此处在同一声明容差下要求两种单位都满足，用有界定点抛光
     （每步一次生产算子评价、批量化）把根收敛到声明精度——这是收紧验收，
     不放宽任何容差、不改变 root support 或候选集合。
+
+    两段式加固（不改任何验收门）：
+    Phase 1 原有全步定点；逐行监测停滞/振荡，必要时切换阻尼步
+    （``h ← (h + hatc_expected)/2``）。Phase 2 仅对仍未收敛的行做
+    ``G`` 符号括区 + 二分回退（对收缩率不敏感），每个候选点都过同一
+    双单位验收门。始终找不到合法根的行诚实失败（不伪造），并附带
+    有限迭代轨迹（``trajectory``）供审计定位（慢收缩/振荡/跳变）。
     """
     device = h_rows.device
     n_rows = int(rows.numel())
@@ -619,6 +626,67 @@ def _polish_initial_hstar_root(
     failures: Dict[int, str] = {}
     done = torch.zeros(n_rows, dtype=torch.bool, device=device)
     iterations_used = 0
+
+    # ---- 轨迹/最优跟踪（仅审计用途，不影响任何验收判定） ----
+    trajectory: Dict[int, List[Dict[str, float]]] = {}
+    traj_cap = 16
+    stagnation_window = 5
+    best_h = h.clone()
+    best_score = [float("inf")] * n_rows
+    stagnant = [0] * n_rows
+
+    def _row_deviations(record, h_value):
+        """(G_norm 偏差/门, hatc 偏差/门)；record 无效时返回 (inf, inf)。"""
+        if record is None:
+            return float("inf"), float("inf")
+        c = float(record["C_raw"])
+        k = float(record["K"])
+        g_norm = float(record["G_norm"])
+        if not (math.isfinite(c) and math.isfinite(k) and c > 0.0 and k > 0.0):
+            return float("inf"), float("inf")
+        hatc_expected = math.log(c / (k + 1e-8))
+        return (
+            abs(g_norm) / float(root_tolerance),
+            abs(hatc_expected - h_value) / float(polish_target),
+        )
+
+    def _row_ok(record, h_value):
+        if record is None:
+            return False
+        c = float(record["C_raw"])
+        k = float(record["K"])
+        g_norm = float(record["G_norm"])
+        finite_positive = (
+            math.isfinite(c) and math.isfinite(k) and c > 0.0 and k > 0.0
+        )
+        hatc_expected = (
+            math.log(c / (k + 1e-8)) if finite_positive else float("nan")
+        )
+        return (
+            finite_positive
+            and _candidate_residual_accepted(g_norm, root_tolerance)
+            and _candidate_residual_accepted(
+                hatc_expected - h_value, polish_target
+            )
+        )
+
+    def _push_traj(index, iteration, h_value, record):
+        entries = trajectory.setdefault(index, [])
+        if len(entries) >= traj_cap:
+            return
+        if record is None:
+            entries.append({"iteration": iteration, "h": float(h_value)})
+            return
+        entries.append(
+            {
+                "iteration": iteration,
+                "h": float(h_value),
+                "g_norm": float(record["G_norm"]),
+                "c_raw": float(record["C_raw"]),
+                "k": float(record["K"]),
+            }
+        )
+
     for iteration in range(1, max(1, int(max_iterations)) + 1):
         iterations_used = iteration
         records, failures, _trial = _initial_hstar_evaluate_rows(
@@ -633,33 +701,145 @@ def _polish_initial_hstar_root(
         step_to = h.clone()
         for index in range(n_rows):
             record = records[index]
+            _push_traj(index, iteration, float(h[index]), record)
             if record is None:
                 done[index] = False
+                stagnant[index] += 1
                 continue
             c = float(record["C_raw"])
             k = float(record["K"])
-            g_norm = float(record["G_norm"])
             finite_positive = (
                 math.isfinite(c) and math.isfinite(k) and c > 0.0 and k > 0.0
             )
-            hatc_expected = (
-                math.log(c / (k + 1e-8)) if finite_positive else float("nan")
-            )
-            ok = (
-                finite_positive
-                and _candidate_residual_accepted(g_norm, root_tolerance)
-                and _candidate_residual_accepted(
-                    hatc_expected - float(h[index]), polish_target
-                )
-            )
-            if ok:
+            if _row_ok(record, float(h[index])):
                 done[index] = True
-            elif finite_positive:
+                continue
+            if not finite_positive:
+                stagnant[index] += 1
+                continue
+            hatc_expected = math.log(c / (k + 1e-8))
+            # 最优跟踪 + 停滞检测：得分 = 两个单位偏差/门 的最大值。
+            dev_g, dev_h = _row_deviations(record, float(h[index]))
+            score = max(dev_g, dev_h)
+            if score < best_score[index]:
+                best_score[index] = score
+                best_h[index] = h[index]
+                stagnant[index] = 0
+            else:
+                stagnant[index] += 1
+            # 停滞 → 阻尼步（收缩率 |T'|>1 或慢收缩时防止振荡/耗尽预算）。
+            if stagnant[index] >= stagnation_window:
+                step_to[index] = 0.5 * (h[index] + hatc_expected)
+            else:
                 step_to[index] = hatc_expected
         if bool(done.all()):
             break
         h = torch.where(done, h, step_to)
-    return h, records, failures, done, iterations_used
+
+    # ---- Phase 2：G 符号括区 + 二分回退（仅未收敛行；同一验收门） ----
+    pending = (~done).nonzero(as_tuple=False).reshape(-1)
+    if pending.numel():
+        for pos in range(int(pending.numel())):
+            index = int(pending[pos])
+            if done[index]:
+                continue
+            h_star = float(best_h[index])
+            delta = 0.05
+            lo, hi = h_star - delta, h_star + delta
+            rec_lo = rec_hi = None
+            g_lo = g_hi = float("nan")
+            bracketed = False
+            for _ in range(6):
+                sub_rows = rows[index : index + 1]
+                pair_h = torch.tensor([lo, hi], device=device, dtype=h.dtype)
+                pair_rows = torch.cat([sub_rows, sub_rows], dim=0)
+                pair_records, failures2, _trial2 = _initial_hstar_evaluate_rows(
+                    sim,
+                    base_state,
+                    pair_rows,
+                    pair_h,
+                    rng_cpu=rng_cpu,
+                    rng_cuda=rng_cuda,
+                    return_state=True,
+                )
+                failures.update(failures2)
+                rec_lo, rec_hi = pair_records[0], pair_records[1]
+                g_lo = float(rec_lo["G"]) if rec_lo is not None else float("nan")
+                g_hi = float(rec_hi["G"]) if rec_hi is not None else float("nan")
+                bracket_hit = False
+                for rec_, hv in ((rec_lo, lo), (rec_hi, hi)):
+                    if rec_ is not None and _row_ok(rec_, hv):
+                        done[index] = True
+                        records[index] = rec_
+                        best_h[index] = torch.tensor(hv, device=device, dtype=h.dtype)
+                        bracket_hit = True
+                        break
+                if bracket_hit:
+                    break
+                if (
+                    math.isfinite(g_lo)
+                    and math.isfinite(g_hi)
+                    and g_lo * g_hi < 0.0
+                ):
+                    bracketed = True
+                    break
+                delta *= 4.0
+                lo, hi = h_star - delta, h_star + delta
+            if done[index]:
+                _push_traj(
+                    index, iterations_used + 1, float(best_h[index]), records[index]
+                )
+                continue
+            if not bracketed:
+                _push_traj(index, iterations_used + 1, h_star, None)
+                continue
+            # 二分到机器精度级别宽度；每个中点同样过双单位验收门。
+            for _ in range(40):
+                mid = 0.5 * (lo + hi)
+                sub_rows = rows[index : index + 1]
+                mid_h = torch.tensor([mid], device=device, dtype=h.dtype)
+                mid_records, failures2, _trial2 = _initial_hstar_evaluate_rows(
+                    sim,
+                    base_state,
+                    sub_rows,
+                    mid_h,
+                    rng_cpu=rng_cpu,
+                    rng_cuda=rng_cuda,
+                    return_state=True,
+                )
+                failures.update(failures2)
+                rec_mid = mid_records[0]
+                if rec_mid is None:
+                    # 生产算子在中点拒绝：二分无法继续，保留最优并退出。
+                    break
+                if _row_ok(rec_mid, mid):
+                    done[index] = True
+                    records[index] = rec_mid
+                    best_h[index] = torch.tensor(mid, device=device, dtype=h.dtype)
+                    break
+                dev_g, dev_h = _row_deviations(rec_mid, mid)
+                score = max(dev_g, dev_h)
+                if score < best_score[index]:
+                    best_score[index] = score
+                    best_h[index] = torch.tensor(mid, device=device, dtype=h.dtype)
+                    records[index] = rec_mid
+                g_mid = float(rec_mid["G"])
+                if math.isfinite(g_lo) and g_mid * g_lo < 0.0:
+                    hi = mid
+                    g_hi = g_mid
+                else:
+                    lo = mid
+                    g_lo = g_mid
+                if (hi - lo) <= 1e-13:
+                    break
+            _push_traj(
+                index, iterations_used + 1, float(best_h[index]), records[index]
+            )
+        # Phase 2 处理过的行统一回填最终 h：成功=成功点，未收敛=历史最优。
+        for pos in range(int(pending.numel())):
+            index = int(pending[pos])
+            h[index] = best_h[index]
+    return h, records, failures, done, iterations_used, trajectory
 
 
 def _initial_hstar_gather_state(state: Dict[str, torch.Tensor], rows, device):
@@ -1353,7 +1533,7 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
     polish_converged = torch.zeros(n_paths, dtype=torch.bool, device=device)
     polish_iterations = 0
     if polish_rows.numel():
-        h_polished, polish_records, polish_failures, done_mask, polish_iterations = (
+        h_polished, polish_records, polish_failures, done_mask, polish_iterations, polish_trajectory = (
             _polish_initial_hstar_root(
                 sim,
                 state,
@@ -1369,6 +1549,10 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
         selected_h[polish_rows] = h_polished.to(dtype)
         for offset, path in enumerate(polish_rows.tolist()):
             polish_converged[path] = bool(done_mask[offset])
+            if not bool(done_mask[offset]):
+                traj = polish_trajectory.get(int(offset))
+                if traj:
+                    root_records[path]["polish_trajectory"] = traj
             record = polish_records[offset]
             if record is None:
                 continue
