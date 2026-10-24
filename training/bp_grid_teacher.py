@@ -268,8 +268,34 @@ def _gather_by_index(values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
 def _concat_chunk_outputs(chunks: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     if not chunks:
         return {}
-    keys = chunks[0].keys()
-    return {k: torch.cat([chunk[k] for chunk in chunks], dim=0) for k in keys}
+    keys = list(chunks[0].keys())
+    if not keys:
+        return {}
+    device = chunks[0][keys[0]].device
+    if device.type != "cuda" or any(
+        tensor.requires_grad for chunk in chunks for tensor in chunk.values()
+    ):
+        return {k: torch.cat([chunk[k] for chunk in chunks], dim=0) for k in keys}
+    # CUDA inference path: stream each chunk into one preallocated result and
+    # drop the chunk immediately so peak device memory stays near a single
+    # output copy instead of all chunks plus the concatenated copy.
+    total_rows = sum(int(chunk[keys[0]].shape[0]) for chunk in chunks)
+    out = {
+        k: torch.empty(
+            (total_rows,) + tuple(chunks[0][k].shape[1:]),
+            dtype=chunks[0][k].dtype,
+            device=device,
+        )
+        for k in keys
+    }
+    offset = 0
+    while chunks:
+        chunk = chunks.pop(0)
+        rows = int(chunk[keys[0]].shape[0])
+        for k in keys:
+            out[k][offset:offset + rows].copy_(chunk[k])
+        offset += rows
+    return out
 
 
 def _quadratic_refine(
