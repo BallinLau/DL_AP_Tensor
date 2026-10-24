@@ -2171,12 +2171,15 @@ def run_p_policy_iteration(
         episode.hyperparams,
         q_target_model=q_model,
     )
+    phase_seconds: Dict[str, float] = {}
+    _t_phase = time.perf_counter()
     train_problem, train_parity = build_problem(
         episode, model, teacher, train_batches, q_model=q_model
     )
     validation_problem, val_parity = build_problem(
         episode, model, teacher, validation_batches or train_batches, q_model=q_model
     )
+    phase_seconds["problem_build"] = time.perf_counter() - _t_phase
     # Natural Validation 诊断模式（Prompt §1）：
     #   reuse_validation — 主 Validation 即 Natural 口径（η Balance 关闭，或
     #                      Validation 未被 η 平衡），直接复用其诊断，零额外
@@ -2199,9 +2202,11 @@ def run_p_policy_iteration(
         natural_diag_mode = "not_evaluable"
     natural_diag_state: Optional[Dict[str, Any]] = None
     natural_diag_failure: Optional[Dict[str, Any]] = None
+    _t_phase = time.perf_counter()
     initial, validation_rows_initial = evaluate_problem_rows(
         model, validation_problem
     )
+    phase_seconds["eval_initial"] = time.perf_counter() - _t_phase
     with torch.no_grad():
         start_p0, start_pi = model._value_outputs(validation_problem[0].parent)
     start_model_hash = _module_state_hash(model)
@@ -2303,9 +2308,11 @@ def run_p_policy_iteration(
 
     # Fresh-greedy 基线（同一固定 Validation/CRN），用于如实记录 Frozen
     # Residual 改善而 Fresh Greedy 恶化的情况。
+    _t_phase = time.perf_counter()
     fresh_rows_initial = _fresh_greedy_rows(
         episode, model, teacher, validation_batches or train_batches, q_model=q_model
     )
+    phase_seconds["fresh_greedy_initial"] = time.perf_counter() - _t_phase
     fresh_initial = _fresh_stats_from_rows(fresh_rows_initial)
     if not fresh_initial.get("all_finite", False):
         return _reject(
@@ -2323,6 +2330,7 @@ def run_p_policy_iteration(
         )
         diag_config = natural_diag_config or {}
         try:
+            _t_phase = time.perf_counter()
             natural_diag_state = natural_diag_prepare(
                 episode,
                 model,
@@ -2333,6 +2341,7 @@ def run_p_policy_iteration(
                 chunk_size=int(diag_config.get("chunk_size", 512)),
                 seed=int(diag_config.get("seed", 97531)),
             )
+            phase_seconds["natural_diag_prepare"] = time.perf_counter() - _t_phase
         except torch.cuda.OutOfMemoryError as exc:
             logger.error("Natural diagnostic CUDA OOM; safe-stopping: %s", exc)
             raise RuntimeError(
@@ -2354,6 +2363,7 @@ def run_p_policy_iteration(
             if rng_cuda_diag is not None:
                 torch.cuda.set_rng_state_all(rng_cuda_diag)
 
+        _t_phase = time.perf_counter()
     adam_history, adam_state, adam_best, adam_steps_done, adam_status = run_adam(
         model=model,
         params=params,
@@ -2364,6 +2374,7 @@ def run_p_policy_iteration(
         clip=adam_clip,
         eval_every=eval_every,
     )
+        phase_seconds["adam"] = time.perf_counter() - _t_phase
     if adam_status != "ok":
         return _reject("rejected_numerical", f"adam_{adam_status}", {
             "adam_history_tail": adam_history[-3:],
@@ -2380,6 +2391,7 @@ def run_p_policy_iteration(
             "LBFGS_NONFINITE_CLOSURES": 0,
         }
     else:
+            _t_phase = time.perf_counter()
         lbfgs_history, best_state, best, stop_reason, lbfgs_counters = run_lbfgs_chunked(
             model=model,
             params=params,
@@ -2390,6 +2402,7 @@ def run_p_policy_iteration(
             history_size=lbfgs_history_size,
             target_residual=target_residual,
         )
+            phase_seconds["lbfgs"] = time.perf_counter() - _t_phase
     # --- L-BFGS Nonfinite Closure 保守拒绝（Prompt §1.2）：即使 Adam 曾取得
     # 合法改善，本次求解也不得报告为 accepted_improved，必须恢复完整的
     # Iteration Start，不向下一次 P Iteration 或 Q 传递。
@@ -2407,7 +2420,9 @@ def run_p_policy_iteration(
             },
         )
     _restore_state(model, best_state)
+        _t_phase = time.perf_counter()
     final, validation_rows_final = evaluate_problem_rows(model, validation_problem)
+        phase_seconds["eval_final"] = time.perf_counter() - _t_phase
     if not final.get("all_finite", False):
         return _reject(
             "rejected_numerical",
@@ -2430,9 +2445,11 @@ def run_p_policy_iteration(
         )
 
     # 冻结策略残差 + 重新 Greedy 残差（独立固定 Validation/CRN）。
+    _t_phase = time.perf_counter()
     fresh_rows_final = _fresh_greedy_rows(
         episode, model, teacher, validation_batches or train_batches, q_model=q_model
     )
+    phase_seconds["fresh_greedy_final"] = time.perf_counter() - _t_phase
     fresh = _fresh_stats_from_rows(fresh_rows_final)
     if not fresh.get("all_finite", False):
         return _reject(
@@ -2441,6 +2458,7 @@ def run_p_policy_iteration(
 
     # Greedy BP drift: frozen iteration policy vs fresh greedy at the accepted
     # state, on every train batch.
+    _t_phase = time.perf_counter()
     bp0_drift, bpi_drift = [], []
     with torch.no_grad():
         for frozen_batch, source_batch in zip(train_problem, train_batches):
@@ -2456,6 +2474,7 @@ def run_p_policy_iteration(
         drift_p0 = float((end_p0 - start_p0).abs().mean())
         drift_pi = float((end_pi - start_pi).abs().mean())
 
+    phase_seconds["bp_drift_recompute"] = time.perf_counter() - _t_phase
     q_hash_after = episode._params_content_hash(q_params)
     if q_hash_after != q_hash_before:
         raise RuntimeError("P policy iteration mutated Q parameters")
@@ -2697,6 +2716,7 @@ def run_p_policy_iteration(
             "final_n_total": int(final.get("n_total", 0)),
         },
         "fresh_greedy_residual": fresh,
+        "phase_seconds": dict(phase_seconds),
         "fresh_greedy_initial": fresh_initial,
         "frozen_residual_improved": bool(frozen_improved),
         "fresh_greedy_worsened": bool(fresh_worsened),
