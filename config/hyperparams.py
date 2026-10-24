@@ -189,6 +189,16 @@ class HyperParams:
     p_root_lbfgs_chunk_iterations: int = 20
     p_root_lbfgs_history_size: int = 50
     p_root_target_residual: Optional[float] = None
+    # Execution-layer P solver performance switches.  They only choose how much
+    # redundant observation work each P policy iteration performs and never
+    # change training, acceptance or rollback semantics.  The defaults
+    # reproduce the legacy behaviour.
+    #   pv_bp_drift_mode: "full" = greedy BP drift on every train batch x
+    #       branch, "subset" = fixed-seed row sample of at most
+    #       p_bp_drift_subset_rows, "off" = skip the greedy re-solve and
+    #       report NaN drift stats.
+    pv_bp_drift_mode: str = "full"
+    p_bp_drift_subset_rows: int = 4096
     # Q stage solver. Only the EP3 regime-staged Q training (Q0/QD/QS/Polish)
     # is permitted; this flag exists for provenance and hard validation.
     q_solver: str = "ep3_regime_staged"

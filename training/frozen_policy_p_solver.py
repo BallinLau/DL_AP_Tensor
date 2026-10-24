@@ -2148,6 +2148,8 @@ def run_p_policy_iteration(
     natural_calibers_identical: bool = False,
 ) -> Dict[str, Any]:
     """One frozen-policy P iteration: greedy refresh -> residual solve -> best state."""
+    # 执行层性能开关（绝不改变训练/Acceptance/回滚语义）：非法取值立即失败。
+    bp_drift_mode, bp_drift_subset_rows = _p_perf_switches(episode)
     device = next(model.parameters()).device
     params = p_root_params(episode, model)
     root_ids = {id(param) for param in params}
@@ -2457,19 +2459,53 @@ def run_p_policy_iteration(
         )
 
     # Greedy BP drift: frozen iteration policy vs fresh greedy at the accepted
-    # state, on every train batch.
+    # state. 纯观测口径（全仓无消费方）：pv_bp_drift_mode 可降级为固定种子行
+    # 子样本（subset）或完全跳过 _recompute_bp_star 重解（off）；廉价的
+    # value_output_drift（两次 _value_outputs）在所有模式下照常记录。
     _t_phase = time.perf_counter()
     bp0_drift, bpi_drift = [], []
+    bp_drift_rows = 0
     with torch.no_grad():
-        for frozen_batch, source_batch in zip(train_problem, train_batches):
-            for branch_name, drift_sink in (("p0", bp0_drift), ("pi", bpi_drift)):
-                fresh_bp = _recompute_bp_star(
-                    episode, model, teacher, source_batch, branch_name, q_model
+        if bp_drift_mode != "off":
+            if bp_drift_mode == "subset":
+                row_plan, bp_drift_rows = _bp_drift_row_plan(
+                    train_problem, bp_drift_subset_rows
                 )
-                frozen_branch = getattr(frozen_batch, branch_name)
-                drift_sink.append(
-                    (frozen_branch.bp_star - fresh_bp).abs().reshape(-1)
+            else:
+                row_plan = [None] * len(train_problem)
+                bp_drift_rows = int(
+                    sum(
+                        int(frozen_batch.parent.shape[0])
+                        for frozen_batch in train_problem
+                    )
                 )
+            for frozen_batch, source_batch, rows in zip(
+                train_problem, train_batches, row_plan
+            ):
+                for branch_name, drift_sink in (("p0", bp0_drift), ("pi", bpi_drift)):
+                    if rows is None:
+                        fresh_bp = _recompute_bp_star(
+                            episode, model, teacher, source_batch, branch_name, q_model
+                        )
+                        frozen_branch = getattr(frozen_batch, branch_name)
+                    else:
+                        if rows.numel() == 0:
+                            continue
+                        fresh_bp = _recompute_bp_star(
+                            episode,
+                            model,
+                            teacher,
+                            _batch_row_subset(source_batch, rows),
+                            branch_name,
+                            q_model,
+                        )
+                        frozen_branch = getattr(frozen_batch, branch_name)
+                    frozen_bp = frozen_branch.bp_star
+                    if rows is not None:
+                        frozen_bp = frozen_bp.index_select(0, rows.to(frozen_bp.device))
+                    drift_sink.append(
+                        (frozen_bp - fresh_bp).abs().reshape(-1)
+                    )
         end_p0, end_pi = model._value_outputs(validation_problem[0].parent)
         drift_p0 = float((end_p0 - start_p0).abs().mean())
         drift_pi = float((end_pi - start_pi).abs().mean())
@@ -2756,6 +2792,15 @@ def run_p_policy_iteration(
         "adam_history_len": len(adam_history),
         "lbfgs_history_len": len(lbfgs_history),
     }
+    # 口径标注：仅非默认模式写入；默认（full/resolve）summary 形状逐位不变。
+    drift_block = summary["greedy_bp_drift"]
+    if bp_drift_mode == "subset":
+        drift_block["mode"] = "subset"
+        drift_block["n_rows"] = int(bp_drift_rows)
+    elif bp_drift_mode == "off":
+        for _drift_key in ("p0_mean_abs", "pi_mean_abs", "p0_p90", "pi_p90"):
+            drift_block[_drift_key] = float("nan")
+        drift_block["mode"] = "off"
     return summary
 
 
@@ -2786,3 +2831,77 @@ def _recompute_bp_star(
         child_weights=child_weights,
     )
     return target["bp_star"]
+
+
+# ---------------------------------------------------------------------------
+# Execution-layer performance switches (observation-only; never economic)
+# ---------------------------------------------------------------------------
+#
+# ``pv_bp_drift_mode`` only chooses how much of the greedy BP drift
+# observation each P policy iteration performs.  Training,
+# Acceptance (``frozen_improved`` reads validation residuals only) and rollback
+# are identical in every mode; the defaults reproduce the legacy behaviour.
+
+BP_DRIFT_MODES = ("full", "subset", "off")
+
+# Fixed seed for the ``subset`` row sample (deterministic across runs).
+_BP_DRIFT_SUBSET_SEED = 20261024
+
+
+def _p_perf_switches(episode: Any) -> Tuple[str, int]:
+    """Resolve ``(pv_bp_drift_mode, p_bp_drift_subset_rows)``.
+
+    Fail fast with a clear ``ValueError`` on any illegal value.
+    """
+    hyperparams = episode.hyperparams
+    bp_drift_mode = str(getattr(hyperparams, "pv_bp_drift_mode", "full")).lower()
+    if bp_drift_mode not in BP_DRIFT_MODES:
+        raise ValueError(
+            "pv_bp_drift_mode must be one of "
+            f"{list(BP_DRIFT_MODES)}, got {bp_drift_mode!r}"
+        )
+    subset_rows = int(getattr(hyperparams, "p_bp_drift_subset_rows", 4096))
+    if subset_rows < 1:
+        raise ValueError(
+            f"p_bp_drift_subset_rows must be at least 1, got {subset_rows!r}"
+        )
+    return bp_drift_mode, subset_rows
+
+
+def _bp_drift_row_plan(
+    problem: Sequence[FrozenPolicyBatch], max_rows: int
+) -> Tuple[List[torch.Tensor], int]:
+    """Fixed-seed row subset plan for ``pv_bp_drift_mode='subset'``.
+
+    Returns ``(per_batch_row_indices, n_rows)`` with ``n_rows <= max_rows``.
+    """
+    counts = [int(batch.parent.shape[0]) for batch in problem]
+    total = int(sum(counts))
+    if total <= int(max_rows):
+        return [torch.arange(count, dtype=torch.long) for count in counts], total
+    generator = torch.Generator().manual_seed(int(_BP_DRIFT_SUBSET_SEED))
+    chosen = torch.randperm(total, generator=generator)[: int(max_rows)]
+    plan: List[torch.Tensor] = []
+    offset = 0
+    for count in counts:
+        mask = (chosen >= offset) & (chosen < offset + count)
+        plan.append(torch.sort(chosen[mask] - offset).values.to(torch.long))
+        offset += count
+    return plan, int(max_rows)
+
+
+def _batch_row_subset(
+    batch: Dict[str, torch.Tensor], rows: torch.Tensor
+) -> Dict[str, torch.Tensor]:
+    """Row-slice the source-batch fields consumed by ``_recompute_bp_star``."""
+    index = rows.to(device=batch["parent"].device, dtype=torch.long)
+    subset: Dict[str, torch.Tensor] = {
+        "parent": batch["parent"].index_select(0, index)
+    }
+    children = batch.get("children", [])
+    if children:
+        subset["children"] = [child.index_select(0, index) for child in children]
+    if batch.get("child0") is not None:
+        subset["child0"] = batch["child0"].index_select(0, index)
+        subset["child1"] = batch["child1"].index_select(0, index)
+    return subset

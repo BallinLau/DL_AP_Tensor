@@ -697,6 +697,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p-root-lbfgs-history-size", type=int, default=None, help="L-BFGS history size")
     parser.add_argument("--p-root-target-residual", type=float, default=None, help="Optional early-stop normalized residual target")
     parser.add_argument(
+        "--pv-bp-drift-mode",
+        type=str.lower,
+        default=None,
+        choices=["full", "subset", "off"],
+        help="Greedy BP drift observation density for P policy iterations",
+    )
+    parser.add_argument(
+        "--p-bp-drift-subset-rows",
+        type=int,
+        default=None,
+        help="Max re-solved train rows for greedy BP drift in subset mode",
+    )
+    parser.add_argument(
         "--q-solver",
         type=str,
         default=None,
@@ -1553,6 +1566,10 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.p_root_lbfgs_history_size = args.p_root_lbfgs_history_size
     if args.p_root_target_residual is not None:
         hyperparams.p_root_target_residual = args.p_root_target_residual
+    if args.pv_bp_drift_mode is not None:
+        hyperparams.pv_bp_drift_mode = str(args.pv_bp_drift_mode)
+    if args.p_bp_drift_subset_rows is not None:
+        hyperparams.p_bp_drift_subset_rows = int(args.p_bp_drift_subset_rows)
     if args.q_solver is not None:
         hyperparams.q_solver = args.q_solver
     if args.initial_hstar_enabled is not None:
@@ -1656,6 +1673,14 @@ def configure_hyperparams(args: argparse.Namespace):
             "p_eta_natural_diag_frequency must be 'firm_inner_end', "
             "'per_p_iteration' or 'off'"
         )
+    if str(getattr(hyperparams, "pv_bp_drift_mode", "full")).lower() not in {
+        "full",
+        "subset",
+        "off",
+    }:
+        raise ValueError("pv_bp_drift_mode must be 'full', 'subset' or 'off'")
+    if int(getattr(hyperparams, "p_bp_drift_subset_rows", 4096)) < 1:
+        raise ValueError("p_bp_drift_subset_rows must be at least 1")
     if int(getattr(hyperparams, "bp_distill_max_optimizer_steps", 0)) < 0:
         raise ValueError("bp_distill_max_optimizer_steps must be non-negative")
     current_eta_share = float(
@@ -2569,6 +2594,8 @@ def main():
                     ),
                     "p_root_lbfgs_history_size": hyperparams.p_root_lbfgs_history_size,
                     "p_root_target_residual": hyperparams.p_root_target_residual,
+                    "pv_bp_drift_mode": hyperparams.pv_bp_drift_mode,
+                    "p_bp_drift_subset_rows": hyperparams.p_bp_drift_subset_rows,
                     "q_solver": hyperparams.q_solver,
                     "initial_hstar_enabled": hyperparams.initial_hstar_enabled,
                     "initial_hstar_residual_tolerance": (
