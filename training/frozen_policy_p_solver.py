@@ -2363,7 +2363,7 @@ def run_p_policy_iteration(
             if rng_cuda_diag is not None:
                 torch.cuda.set_rng_state_all(rng_cuda_diag)
 
-        _t_phase = time.perf_counter()
+    _t_phase = time.perf_counter()
     adam_history, adam_state, adam_best, adam_steps_done, adam_status = run_adam(
         model=model,
         params=params,
@@ -2374,7 +2374,7 @@ def run_p_policy_iteration(
         clip=adam_clip,
         eval_every=eval_every,
     )
-        phase_seconds["adam"] = time.perf_counter() - _t_phase
+    phase_seconds["adam"] = time.perf_counter() - _t_phase
     if adam_status != "ok":
         return _reject("rejected_numerical", f"adam_{adam_status}", {
             "adam_history_tail": adam_history[-3:],
@@ -2391,7 +2391,7 @@ def run_p_policy_iteration(
             "LBFGS_NONFINITE_CLOSURES": 0,
         }
     else:
-            _t_phase = time.perf_counter()
+        _t_phase = time.perf_counter()
         lbfgs_history, best_state, best, stop_reason, lbfgs_counters = run_lbfgs_chunked(
             model=model,
             params=params,
@@ -2402,7 +2402,7 @@ def run_p_policy_iteration(
             history_size=lbfgs_history_size,
             target_residual=target_residual,
         )
-            phase_seconds["lbfgs"] = time.perf_counter() - _t_phase
+        phase_seconds["lbfgs"] = time.perf_counter() - _t_phase
     # --- L-BFGS Nonfinite Closure 保守拒绝（Prompt §1.2）：即使 Adam 曾取得
     # 合法改善，本次求解也不得报告为 accepted_improved，必须恢复完整的
     # Iteration Start，不向下一次 P Iteration 或 Q 传递。
@@ -2420,9 +2420,9 @@ def run_p_policy_iteration(
             },
         )
     _restore_state(model, best_state)
-        _t_phase = time.perf_counter()
+    _t_phase = time.perf_counter()
     final, validation_rows_final = evaluate_problem_rows(model, validation_problem)
-        phase_seconds["eval_final"] = time.perf_counter() - _t_phase
+    phase_seconds["eval_final"] = time.perf_counter() - _t_phase
     if not final.get("all_finite", False):
         return _reject(
             "rejected_numerical",
