@@ -13061,6 +13061,16 @@ class Episode:
         export_df: bool = False,
         initial_state: Optional[Dict[str, torch.Tensor]] = None,
     ) -> None:
+        # This call unconditionally replaces tensor_firm/tensor_macro (and the
+        # exported frames) below. Release the previous panels before running:
+        # late-episode firm panels are too large for the old and the new panel
+        # to co-reside on the GPU, and the final cat_rows assembly would OOM.
+        self.tensor_firm = None
+        self.tensor_macro = None
+        self.df = None
+        self.df_macro = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         sim_kwargs = self._prepare_simulation_kwargs(simulate_kwargs)
         simulator = SimulateTS(
             models=self.models,
