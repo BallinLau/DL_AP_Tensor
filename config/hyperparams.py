@@ -199,6 +199,10 @@ class HyperParams:
     #       report NaN drift stats.
     pv_bp_drift_mode: str = "full"
     p_bp_drift_subset_rows: int = 4096
+    #   pv_fresh_initial_source: "resolve" = re-solve the fresh greedy for the
+    #       initial residual rows, "reuse_build" = derive them from the frozen
+    #       problem built on the same model snapshot (same greedy mapping).
+    pv_fresh_initial_source: str = "resolve"
     # Q stage solver. Only the EP3 regime-staged Q training (Q0/QD/QS/Polish)
     # is permitted; this flag exists for provenance and hard validation.
     q_solver: str = "ep3_regime_staged"

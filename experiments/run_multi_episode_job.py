@@ -710,6 +710,13 @@ def parse_args() -> argparse.Namespace:
         help="Max re-solved train rows for greedy BP drift in subset mode",
     )
     parser.add_argument(
+        "--pv-fresh-initial-source",
+        type=str.lower,
+        default=None,
+        choices=["resolve", "reuse_build"],
+        help="Source of the fresh-greedy initial residual rows",
+    )
+    parser.add_argument(
         "--q-solver",
         type=str,
         default=None,
@@ -1570,6 +1577,8 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.pv_bp_drift_mode = str(args.pv_bp_drift_mode)
     if args.p_bp_drift_subset_rows is not None:
         hyperparams.p_bp_drift_subset_rows = int(args.p_bp_drift_subset_rows)
+    if args.pv_fresh_initial_source is not None:
+        hyperparams.pv_fresh_initial_source = str(args.pv_fresh_initial_source)
     if args.q_solver is not None:
         hyperparams.q_solver = args.q_solver
     if args.initial_hstar_enabled is not None:
@@ -1681,6 +1690,11 @@ def configure_hyperparams(args: argparse.Namespace):
         raise ValueError("pv_bp_drift_mode must be 'full', 'subset' or 'off'")
     if int(getattr(hyperparams, "p_bp_drift_subset_rows", 4096)) < 1:
         raise ValueError("p_bp_drift_subset_rows must be at least 1")
+    if str(getattr(hyperparams, "pv_fresh_initial_source", "resolve")).lower() not in {
+        "resolve",
+        "reuse_build",
+    }:
+        raise ValueError("pv_fresh_initial_source must be 'resolve' or 'reuse_build'")
     if int(getattr(hyperparams, "bp_distill_max_optimizer_steps", 0)) < 0:
         raise ValueError("bp_distill_max_optimizer_steps must be non-negative")
     current_eta_share = float(
@@ -2596,6 +2610,7 @@ def main():
                     "p_root_target_residual": hyperparams.p_root_target_residual,
                     "pv_bp_drift_mode": hyperparams.pv_bp_drift_mode,
                     "p_bp_drift_subset_rows": hyperparams.p_bp_drift_subset_rows,
+                    "pv_fresh_initial_source": hyperparams.pv_fresh_initial_source,
                     "q_solver": hyperparams.q_solver,
                     "initial_hstar_enabled": hyperparams.initial_hstar_enabled,
                     "initial_hstar_residual_tolerance": (

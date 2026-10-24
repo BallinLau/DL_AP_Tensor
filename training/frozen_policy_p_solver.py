@@ -2149,7 +2149,9 @@ def run_p_policy_iteration(
 ) -> Dict[str, Any]:
     """One frozen-policy P iteration: greedy refresh -> residual solve -> best state."""
     # 执行层性能开关（绝不改变训练/Acceptance/回滚语义）：非法取值立即失败。
-    bp_drift_mode, bp_drift_subset_rows = _p_perf_switches(episode)
+    bp_drift_mode, bp_drift_subset_rows, fresh_initial_source = _p_perf_switches(
+        episode
+    )
     device = next(model.parameters()).device
     params = p_root_params(episode, model)
     root_ids = {id(param) for param in params}
@@ -2311,11 +2313,22 @@ def run_p_policy_iteration(
     # Fresh-greedy 基线（同一固定 Validation/CRN），用于如实记录 Frozen
     # Residual 改善而 Fresh Greedy 恶化的情况。
     _t_phase = time.perf_counter()
-    fresh_rows_initial = _fresh_greedy_rows(
-        episode, model, teacher, validation_batches or train_batches, q_model=q_model
-    )
+    if fresh_initial_source == "reuse_build":
+        # 执行层性能开关 reuse_build：build_problem 已在同一 model 快照上解过
+        # 同一贪心映射（value_star 冻结在各 FrozenBranchBatch.production_value，
+        # parity 门保证 rhs_snapshot == value_star），直接从已构建的冻结问题
+        # 派生逐行 fresh 初评残差，不再二次调用 teacher.compute_value_target。
+        fresh_rows_initial = _fresh_rows_from_frozen_problem(
+            model, validation_problem
+        )
+    else:
+        fresh_rows_initial = _fresh_greedy_rows(
+            episode, model, teacher, validation_batches or train_batches, q_model=q_model
+        )
     phase_seconds["fresh_greedy_initial"] = time.perf_counter() - _t_phase
     fresh_initial = _fresh_stats_from_rows(fresh_rows_initial)
+    if fresh_initial_source != "resolve":
+        fresh_initial["fresh_initial_source"] = fresh_initial_source
     if not fresh_initial.get("all_finite", False):
         return _reject(
             "rejected_numerical", "fresh_greedy_nonfinite_initial", fresh_initial
@@ -2837,19 +2850,20 @@ def _recompute_bp_star(
 # Execution-layer performance switches (observation-only; never economic)
 # ---------------------------------------------------------------------------
 #
-# ``pv_bp_drift_mode`` only chooses how much of the greedy BP drift
-# observation each P policy iteration performs.  Training,
+# ``pv_bp_drift_mode`` / ``pv_fresh_initial_source`` only choose how much
+# redundant observation work each P policy iteration performs.  Training,
 # Acceptance (``frozen_improved`` reads validation residuals only) and rollback
 # are identical in every mode; the defaults reproduce the legacy behaviour.
 
 BP_DRIFT_MODES = ("full", "subset", "off")
+FRESH_INITIAL_SOURCES = ("resolve", "reuse_build")
 
 # Fixed seed for the ``subset`` row sample (deterministic across runs).
 _BP_DRIFT_SUBSET_SEED = 20261024
 
 
-def _p_perf_switches(episode: Any) -> Tuple[str, int]:
-    """Resolve ``(pv_bp_drift_mode, p_bp_drift_subset_rows)``.
+def _p_perf_switches(episode: Any) -> Tuple[str, int, str]:
+    """Resolve ``(pv_bp_drift_mode, p_bp_drift_subset_rows, pv_fresh_initial_source)``.
 
     Fail fast with a clear ``ValueError`` on any illegal value.
     """
@@ -2865,7 +2879,15 @@ def _p_perf_switches(episode: Any) -> Tuple[str, int]:
         raise ValueError(
             f"p_bp_drift_subset_rows must be at least 1, got {subset_rows!r}"
         )
-    return bp_drift_mode, subset_rows
+    fresh_initial_source = str(
+        getattr(hyperparams, "pv_fresh_initial_source", "resolve")
+    ).lower()
+    if fresh_initial_source not in FRESH_INITIAL_SOURCES:
+        raise ValueError(
+            "pv_fresh_initial_source must be one of "
+            f"{list(FRESH_INITIAL_SOURCES)}, got {fresh_initial_source!r}"
+        )
+    return bp_drift_mode, subset_rows, fresh_initial_source
 
 
 def _bp_drift_row_plan(
@@ -2905,3 +2927,76 @@ def _batch_row_subset(
         subset["child0"] = batch["child0"].index_select(0, index)
         subset["child1"] = batch["child1"].index_select(0, index)
     return subset
+
+
+def _fresh_rows_from_frozen_problem(
+    model: torch.nn.Module,
+    problem: Sequence[FrozenPolicyBatch],
+) -> Dict[str, torch.Tensor]:
+    """``_fresh_greedy_rows`` shape/semantics derived from the built frozen problem.
+
+    ``build_problem`` solved the same greedy mapping on the same model
+    snapshot, so each branch's frozen ``production_value`` (teacher
+    ``value_star``, parity-gated to ``rhs_snapshot``) replaces the redundant
+    ``teacher.compute_value_target`` pass.  Row fields (``fg_p0_norm`` /
+    ``fg_pi_norm`` / ``eta`` / ``source`` / ``row_finite``) keep the exact
+    ``_fresh_greedy_rows`` semantics so Natural-Validation row grouping and
+    ``_fresh_stats_from_rows`` stay unchanged.
+    """
+    r0: List[torch.Tensor] = []
+    ri: List[torch.Tensor] = []
+    eta_sinks: List[torch.Tensor] = []
+    source_sinks: List[torch.Tensor] = []
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for batch in problem:
+                p0_online, pi_online = model._value_outputs(batch.parent)
+                r0.append(
+                    ((p0_online - batch.p0.production_value) / batch.p0.scale)
+                    .detach()
+                    .reshape(-1)
+                    .cpu()
+                )
+                ri.append(
+                    ((pi_online - batch.pi.production_value) / batch.pi.scale)
+                    .detach()
+                    .reshape(-1)
+                    .cpu()
+                )
+                eta_sinks.append(
+                    batch.parent[:, 2].detach().reshape(-1).to(torch.float32).cpu()
+                )
+                source_ids = batch.source_id
+                if source_ids is None:
+                    source_sinks.append(
+                        torch.full(
+                            (int(batch.parent.shape[0]),), -1, dtype=torch.long
+                        )
+                    )
+                else:
+                    source_sinks.append(
+                        source_ids.detach().reshape(-1).to(torch.long).cpu()
+                    )
+    finally:
+        model.train(was_training)
+    r0_flat = torch.cat(r0) if r0 else torch.empty(0)
+    ri_flat = torch.cat(ri) if ri else torch.empty(0)
+    return {
+        "fg_p0_norm": r0_flat,
+        "fg_pi_norm": ri_flat,
+        "eta": (
+            torch.cat(eta_sinks).reshape(-1) if eta_sinks else torch.empty(0)
+        ),
+        "source": (
+            torch.cat(source_sinks).reshape(-1)
+            if source_sinks
+            else torch.empty(0, dtype=torch.long)
+        ),
+        "row_finite": (
+            torch.isfinite(r0_flat) & torch.isfinite(ri_flat)
+            if r0_flat.numel()
+            else torch.empty(0, dtype=torch.bool)
+        ),
+    }
