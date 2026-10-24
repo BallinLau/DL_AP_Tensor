@@ -2126,26 +2126,35 @@ class Episode:
 
         parent_take = parent_idx[active]
         child_take = [idx[active] for idx in child_selected]
+        del parent_idx, active, child_selected
 
         feat_names = ['b', 'z', 'ETA', 'i', 'x', 'Hatcf', 'LnKF']
         feat_idx = [col[nm] for nm in feat_names]
-        # 列优先 gather：行优先的高级索引会整行宽复制临时张量，而随后的基本
-        # 切片是该临时拷贝的视图，会一直持有整行宽内存直到函数结束，晚期
-        # episode 的大 pool 下足以打爆显存。列先切再按行 gather，峰值只与
-        # gather 结果同阶，数值完全一致。
-        def _gather_columns(row_idx: torch.Tensor, cols: List[int]) -> torch.Tensor:
-            return torch.cat([data[:, c][row_idx].unsqueeze(1) for c in cols], dim=1)
+        # 列优先 gather 直接写入预分配 float32 输出缓冲，并逐个构建
+        # parent/children 后立刻释放逐项中间量：此前“先分别 gather 7 列特征与
+        # M 列、再 cat 成 8 列并 cast”会让每个 parent/child 的 7 列临时量、M 列
+        # 临时量与 cat 结果同时驻留，晚期 episode 的大 pool 下足以打爆显存。
+        # 逐列赋值与先 gather 后 cat/cast 逐位一致。
+        m_col = col['M'] if 'M' in col else None
+        n_out_cols = len(feat_idx) + 1
 
-        parent_feat = _gather_columns(parent_take, feat_idx)
-        children_feat = [_gather_columns(idx, feat_idx) for idx in child_take]
-        if 'M' in col:
-            parent_m = _gather_columns(parent_take, [col['M']])
-            children_m = [_gather_columns(idx, [col['M']]) for idx in child_take]
-        else:
-            parent_m = torch.ones(parent_feat.shape[0], 1, device=data.device, dtype=data.dtype)
-            children_m = [torch.ones(c.shape[0], 1, device=data.device, dtype=data.dtype) for c in children_feat]
-        parent = torch.cat([parent_feat, parent_m], dim=1).to(torch.float32)
-        children = [torch.cat([c, m], dim=1).to(torch.float32) for c, m in zip(children_feat, children_m)]
+        def _gather_columns(row_idx: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                (row_idx.shape[0], n_out_cols), dtype=torch.float32, device=data.device
+            )
+            for j, c in enumerate(feat_idx):
+                out[:, j] = data[:, c][row_idx]
+            if m_col is not None:
+                out[:, n_out_cols - 1] = data[:, m_col][row_idx]
+            else:
+                out[:, n_out_cols - 1] = 1.0
+            return out
+
+        parent = _gather_columns(parent_take)
+        children = []
+        for idx in child_take:
+            children.append(_gather_columns(idx))
+        del child_take
         source_tensor = torch.full(
             (parent.shape[0],),
             int(source_id),
