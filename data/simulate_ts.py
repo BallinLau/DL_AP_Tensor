@@ -9,6 +9,7 @@ SimulateTS 类：树状分支模拟器
 """
 
 import math
+import warnings
 
 import torch
 import pandas as pd
@@ -137,6 +138,8 @@ class SimulateTS:
         initial_hstar_width_tolerance: float = 1e-5,
         initial_hstar_audit_output_dir: Optional[str] = None,
         initial_hstar_audit_episode_id: int = -1,
+        hstar_recalib_count: int = 0,
+        hstar_recalib_every: int = 0,
         initial_state: Optional[Dict[str, torch.Tensor]] = None,
         state_bank_capture=None,
     ):
@@ -293,6 +296,31 @@ class SimulateTS:
             raise ValueError("initial h-star support must have positive width")
         if self.initial_hstar_width_tolerance <= 0.0:
             raise ValueError("initial_hstar_width_tolerance must be positive")
+        # 周期 h* 校正唯一换算点：count（用户面次数）优先于 every（引擎面步距）。
+        self.hstar_recalib_count = int(hstar_recalib_count)
+        if self.hstar_recalib_count < 0:
+            raise ValueError(
+                "hstar_recalib_count must be nonnegative (0 disables the "
+                "experimental periodic h-star recalibration)"
+            )
+        self.hstar_recalib_every = int(hstar_recalib_every)
+        if self.hstar_recalib_every < 0:
+            raise ValueError(
+                "hstar_recalib_every must be nonnegative (0 disables the "
+                "experimental periodic h-star recalibration)"
+            )
+        if self.hstar_recalib_count > 0:
+            if self.hstar_recalib_every > 0:
+                warnings.warn(
+                    "hstar_recalib_count and hstar_recalib_every are both "
+                    f"nonzero (count={self.hstar_recalib_count}, "
+                    f"every={self.hstar_recalib_every}); count wins and "
+                    "every is recomputed as max(1, horizon // (count + 1))",
+                    stacklevel=2,
+                )
+            self.hstar_recalib_every = max(
+                1, int(self.horizon) // (self.hstar_recalib_count + 1)
+            )
         self._initial_hstar_diagnostics = None
         self.initial_state = initial_state
         self.state_bank_capture = state_bank_capture

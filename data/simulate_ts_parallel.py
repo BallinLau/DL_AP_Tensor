@@ -1089,7 +1089,13 @@ def _initial_hstar_grid_evaluate(
 
 
 @torch.no_grad()
-def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dict:
+def _calibrate_initial_hstar_batched(
+    sim,
+    state: Dict[str, torch.Tensor],
+    *,
+    scope: str = "t0_initial_only",
+    raise_on_failure: bool = True,
+) -> Dict:
     """STRICT_GLOBAL initial (t=0) macro clearing on the production operator.
 
     Only the root-search mathematics follows the verified b291c64
@@ -1627,7 +1633,7 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
         audit_path.parent.mkdir(parents=True, exist_ok=True)
         with open(audit_path, "w", encoding="utf-8") as handle:
             json.dump(audit, handle, indent=2)
-    if bool(no_root.any()):
+    if bool(no_root.any()) and bool(raise_on_failure):
         bad = torch.nonzero(no_root, as_tuple=False).reshape(-1).tolist()
         reasons = {}
         for path in bad:
@@ -1657,24 +1663,28 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
     # Final decision-record reconstruction at the selected root: this exact
     # production t=0 evaluation is the candidate reference for the independent
     # production parity gate in simulate_tensor_parallel.
+    recon_rows = torch.nonzero(strict_ok, as_tuple=False).reshape(-1)
     final_records, final_failures, final_trial = _initial_hstar_evaluate_rows(
         sim,
         state,
-        full_rows,
-        selected_h.to(dtype).reshape(-1),
+        recon_rows,
+        selected_h[recon_rows].to(dtype).reshape(-1),
         rng_cpu=rng_cpu,
         rng_cuda=rng_cuda,
         return_state=True,
     )
+    path_records: List[Optional[Dict]] = [None] * n_paths
+    for position, path_index in enumerate(recon_rows.tolist()):
+        path_records[path_index] = final_records[position]
     if final_failures or any(record is None for record in final_records):
         failed_paths = sorted(
             {
-                int(index)
+                int(recon_rows[index])
                 for index, reason in final_failures.items()
                 if reason
             }
             | {
-                int(index)
+                int(recon_rows[index])
                 for index, record in enumerate(final_records)
                 if record is None
             }
@@ -1683,8 +1693,13 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
             "initial h-star final decision reconstruction failed on paths "
             f"{failed_paths[:20]} (n={len(failed_paths)})"
         )
-    state["hatcf"] = selected_h.to(state["hatcf"].dtype)
-    sim._initial_hstar_verified_state = final_trial
+    if int(recon_rows.numel()) > 0:
+        state["hatcf"].index_copy_(
+            0, recon_rows, selected_h[recon_rows].to(state["hatcf"].dtype)
+        )
+    sim._initial_hstar_verified_state = (
+        final_trial if int(recon_rows.numel()) == int(n_paths) else None
+    )
     sim._initial_hstar_selected_h = selected_h.to(state["hatcf"].dtype)
 
     # 逐 Root 审计：raw/normalized residual、floor flag 与合法性随审计落盘。
@@ -1692,7 +1707,7 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
         audit_record = root_records[path]
         if audit_record["terminal_status"] != "ROOT_FOUND":
             continue
-        final_record = final_records[path]
+        final_record = path_records[path]
         audit_record["normalized_residual"] = float(selected_norm[path])
         audit_record["raw_residual"] = float(selected_raw_g[path])
         audit_record["C_raw_at_root"] = float(selected_c[path])
@@ -1710,6 +1725,10 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
 
     residual_raw = selected_raw_g[strict_ok]
     residual_norm = selected_norm[strict_ok]
+    selected_ok = selected_h[strict_ok]
+
+    def _stat(values: torch.Tensor, fn) -> float:
+        return float(fn(values)) if int(values.numel()) > 0 else float("nan")
     multi_root_paths = sum(
         1 for record in root_records if record["root_count"] > 1
     )
@@ -1719,12 +1738,12 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
         if record["discontinuity_bracket_count"] > 0
     )
     floor_applied_count = 0
-    for index, record in enumerate(final_records):
+    for record in path_records:
         if record is not None and bool(record["floor_applied"]):
             floor_applied_count += 1
     diagnostics = {
         "enabled": True,
-        "scope": "t0_initial_only",
+        "scope": str(scope),
         "root_solver": "strict_global_batched_production_node_operator",
         "root_policy_source": str(getattr(sim, "bp_action_source", "head")),
         "n_paths": int(n_paths),
@@ -1740,14 +1759,14 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
         "width_tolerance": width_tolerance,
         "audit_path": str(audit_path) if audit_path else None,
         "initial_belief_mean": float(initial_belief.mean()),
-        "selected_hstar_mean": float(selected_h[strict_ok].mean()),
-        "selected_hstar_p50": float(selected_h[strict_ok].median()),
-        "raw_residual_mean": float(residual_raw.mean()),
-        "raw_residual_p90": float(torch.quantile(residual_raw, 0.9)),
-        "raw_residual_abs_max": float(residual_raw.abs().max()),
-        "normalized_residual_mean": float(residual_norm.mean()),
-        "normalized_residual_p90": float(torch.quantile(residual_norm, 0.9)),
-        "normalized_residual_abs_max": float(residual_norm.abs().max()),
+        "selected_hstar_mean": _stat(selected_ok, lambda v: v.mean()),
+        "selected_hstar_p50": _stat(selected_ok, lambda v: v.median()),
+        "raw_residual_mean": _stat(residual_raw, lambda v: v.mean()),
+        "raw_residual_p90": _stat(residual_raw, lambda v: torch.quantile(v, 0.9)),
+        "raw_residual_abs_max": _stat(residual_raw, lambda v: v.abs().max()),
+        "normalized_residual_mean": _stat(residual_norm, lambda v: v.mean()),
+        "normalized_residual_p90": _stat(residual_norm, lambda v: torch.quantile(v, 0.9)),
+        "normalized_residual_abs_max": _stat(residual_norm, lambda v: v.abs().max()),
         "multi_root_path_count": multi_root_paths,
         "discontinuity_path_count": discontinuity_paths,
         "floor_applied_root_count": floor_applied_count,
@@ -1760,6 +1779,456 @@ def _calibrate_initial_hstar_batched(sim, state: Dict[str, torch.Tensor]) -> Dic
         "per_path_audit": root_records,
     }
     return diagnostics
+
+
+def _hstar_polish_fast_path(
+    sim,
+    sub: Dict[str, torch.Tensor],
+    h_init: torch.Tensor,
+    *,
+    rng_cpu,
+    rng_cuda,
+    tolerance: float,
+) -> Dict:
+    """定点抛光优先的周期校正快速路径（仅 t>0 周期校正调用）。
+
+    与 t=0 全局重搜共用同一抛光器 ``_polish_initial_hstar_root`` 与同一双单位
+    验收门（``|G_norm| <= tolerance`` 且 ``|log(C_raw/(K+1e-8)) - h| <=
+    0.25 * tolerance``），并沿用全局链路的 float64 残差回放与经济可行性复核。
+    三项全过的行才被接受（绝不伪造合法根）；其余行由调用方回退全局重搜。
+    """
+    device = sub["hatcf"].device
+    dtype = sub["hatcf"].dtype
+    n_rows = int(sub["hatcf"].shape[0])
+    rows = torch.arange(n_rows, device=device)
+    h_polished, records, _failures, done_mask, iterations, trajectory = (
+        _polish_initial_hstar_root(
+            sim,
+            sub,
+            rows,
+            h_init.to(dtype).reshape(-1),
+            rng_cpu=rng_cpu,
+            rng_cuda=rng_cuda,
+            strict_tolerance=tolerance,
+            root_tolerance=tolerance,
+            max_iterations=max(1, int(sim.initial_hstar_max_iterations)),
+        )
+    )
+    selected_h = torch.full(
+        (n_rows,), float("nan"), device=device, dtype=dtype
+    )
+    selected_norm = torch.full(
+        (n_rows,), float("nan"), device=device, dtype=torch.float32
+    )
+    selected_raw_g = torch.full(
+        (n_rows,), float("nan"), device=device, dtype=torch.float32
+    )
+    selected_c = torch.full(
+        (n_rows,), float("nan"), device=device, dtype=torch.float32
+    )
+    selected_k = torch.full(
+        (n_rows,), float("nan"), device=device, dtype=torch.float32
+    )
+    accepted = torch.zeros(n_rows, dtype=torch.bool, device=device)
+    audit_rows: List[Dict] = []
+    for index in range(n_rows):
+        record = records[index]
+        converged = bool(done_mask[index])
+        audit = {
+            "path": index,
+            "h_belief": float(h_init[index]),
+            "all_valid_roots": [],
+            "selected_root": None,
+            "root_count": 0,
+            "valid_root_count": 0,
+            "discontinuity_bracket_count": 0,
+            "unresolved_bracket_count": 0,
+            "coarse_evaluation_failure_count": 0,
+            "candidate_rejection_reasons": [],
+            "terminal_status": "NO_ROOT",
+            "failure_reason": None,
+            "normalized_residual": None,
+            "raw_residual": None,
+            "floor_applied_at_root": None,
+            "resource_feasible_at_root": None,
+            "root_solver": "polish_fast_path",
+            "polish_converged": converged,
+            "polish_iterations": int(iterations),
+        }
+        h_value = float(h_polished[index])
+        norm64 = float("nan")
+        raw64 = float("nan")
+        c64 = float("nan")
+        k64 = float("nan")
+        row_ok = False
+        if converged and record is not None:
+            c64 = float(record["C_raw"])
+            k64 = float(record["K"])
+            raw64 = math.exp(h_value) * k64 - c64
+            scale64 = max(1.0, abs(c64), abs(k64))
+            norm64 = raw64 / scale64
+            row_ok = (
+                math.isfinite(norm64)
+                and abs(norm64) <= float(tolerance)
+                and bool(record["feasible"])
+            )
+        if not row_ok:
+            if not converged:
+                reason = "POLISH_DID_NOT_CONVERGE"
+            elif record is None:
+                reason = "POLISH_RESULT_REJECTED_BY_PRODUCTION_OPERATOR"
+            elif not bool(record["feasible"]):
+                reason = "ECONOMICALLY_INFEASIBLE_CANDIDATE"
+            else:
+                reason = "FP64_REPLAY_RESIDUAL_TOLERANCE_FAILED"
+            audit["failure_reason"] = reason
+            audit["terminal_status"] = "NO_ROOT_" + reason
+            audit_rows.append(audit)
+            continue
+        accepted[index] = True
+        selected_h[index] = h_polished[index].to(dtype)
+        selected_norm[index] = norm64
+        selected_raw_g[index] = raw64
+        selected_c[index] = c64
+        selected_k[index] = k64
+        audit["all_valid_roots"] = [h_value]
+        audit["selected_root"] = h_value
+        audit["root_count"] = 1
+        audit["valid_root_count"] = 1
+        audit["terminal_status"] = "ROOT_FOUND"
+        audit["normalized_residual"] = norm64
+        audit["raw_residual"] = raw64
+        audit["C_raw_at_root"] = c64
+        audit["K_ledger_at_root"] = k64
+        audit["floor_applied_at_root"] = bool(record["floor_applied"])
+        audit["resource_feasible_at_root"] = bool(record["feasible"])
+        audit_rows.append(audit)
+    return {
+        "selected_h": selected_h,
+        "selected_norm": selected_norm,
+        "selected_raw_g": selected_raw_g,
+        "selected_c": selected_c,
+        "selected_k": selected_k,
+        "accepted": accepted,
+        "audit_rows": audit_rows,
+        "iterations": int(iterations),
+        "trajectory": trajectory,
+    }
+
+
+def _hstar_record_stats(path_records: List[Optional[Dict]]) -> Dict:
+    """Aggregate merged per-path audit records (fast path + global fallback)."""
+    found = [
+        record
+        for record in path_records
+        if record is not None and record.get("terminal_status") == "ROOT_FOUND"
+    ]
+
+    def _stat(values: torch.Tensor, fn) -> float:
+        return float(fn(values)) if int(values.numel()) > 0 else float("nan")
+
+    def _column(key: str) -> torch.Tensor:
+        return torch.tensor(
+            [float(record[key]) for record in found], dtype=torch.float32
+        )
+
+    selected_h = _column("selected_root")
+    residual_raw = _column("raw_residual")
+    residual_norm = _column("normalized_residual")
+    return {
+        "success_count": len(found),
+        "selected_hstar_mean": _stat(selected_h, lambda v: v.mean()),
+        "selected_hstar_p50": _stat(selected_h, lambda v: v.median()),
+        "raw_residual_mean": _stat(residual_raw, lambda v: v.mean()),
+        "raw_residual_p90": _stat(
+            residual_raw, lambda v: torch.quantile(v, 0.9)
+        ),
+        "raw_residual_abs_max": _stat(residual_raw, lambda v: v.abs().max()),
+        "normalized_residual_mean": _stat(residual_norm, lambda v: v.mean()),
+        "normalized_residual_p90": _stat(
+            residual_norm, lambda v: torch.quantile(v, 0.9)
+        ),
+        "normalized_residual_abs_max": _stat(
+            residual_norm, lambda v: v.abs().max()
+        ),
+        "floor_applied_root_count": sum(
+            1 for record in found if bool(record.get("floor_applied_at_root"))
+        ),
+        "selected_C_raw_mean": _stat(
+            _column("C_raw_at_root"), lambda v: v.mean()
+        ),
+        "selected_K_ledger_mean": _stat(
+            _column("K_ledger_at_root"), lambda v: v.mean()
+        ),
+    }
+
+
+def _periodic_hstar_recalibration(
+    sim,
+    state: Dict[str, torch.Tensor],
+    t: int,
+    *,
+    fast_path: bool = False,
+) -> Dict:
+    """Experimental every-N-steps h-star recalibration on the current ledger.
+
+    Triggered only by the default-off ``SimulateTS.hstar_recalib_every`` switch:
+    re-solves the STRICT_GLOBAL clearing root on the node-``t`` resource ledger
+    and overwrites the macro beliefs ``(hatcf, lnkf)`` with the calibrated
+    values (``lnkf`` = log ledger capital for every healthy path, ``hatcf`` =
+    the accepted root).  Paths without positive finite capital are skipped and
+    paths without a valid root keep their previous ``hatcf``; every timepoint is
+    recorded so the caller can audit the recalibration.
+
+    ``fast_path=True``（t>0 周期校正）先用上一次校正得到的 h*（若可用）或当前
+    信念 ``hatcf`` 作初值跑定点抛光，双单位验收 + float64 残差回放 + 经济可行性
+    全过的行直接接受、不进全局搜索；其余行逐 path 回退 t=0 同款全局重搜
+    （``_calibrate_initial_hstar_batched``，原链路），绝不伪造合法根。t=0 事件
+    保持全局重搜不变。
+    """
+    device = sim.device
+    n_paths = int(sim.n_paths)
+    capital = (state["K"] * state["alive"].to(state["K"].dtype)).sum(dim=1)
+    healthy = (
+        state["alive"].any(dim=1)
+        & torch.isfinite(capital)
+        & (capital > 0.0)
+    )
+    rows = torch.nonzero(healthy, as_tuple=False).reshape(-1)
+    scope = f"t{int(t)}_periodic_recalib"
+    event: Dict = {
+        "t": int(t),
+        "scope": scope,
+        "n_paths": n_paths,
+        "n_paths_healthy": int(rows.numel()),
+        "n_paths_skipped_unhealthy": int(n_paths - int(rows.numel())),
+        "polish_fast_path_enabled": bool(fast_path),
+        "polish_fast_path_count": 0,
+        "fallback_global_count": 0,
+        "polish_iterations": 0,
+        "polish_trajectory": {},
+    }
+    if int(rows.numel()) == 0:
+        event["status"] = "NO_HEALTHY_PATH"
+        return event
+
+    sub = _initial_hstar_gather_state(state, rows, device)
+    dtype = sub["hatcf"].dtype
+    n_sub = int(rows.numel())
+    initial_belief_mean = float(sub["hatcf"].to(torch.float32).mean())
+
+    path_records: List[Optional[Dict]] = [None] * n_sub
+    if fast_path:
+        tolerance = float(sim.initial_hstar_residual_tolerance)
+        rng_cpu = torch.get_rng_state()
+        rng_cuda = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        )
+        # 与全局链路同款 lnkf：log(ledger capital)，逐 path 覆盖健康行。
+        alive_sub = sub["alive"].to(torch.bool)
+        k_sub = sub["K"].to(torch.float32)
+        capital_sub = (k_sub * alive_sub.to(k_sub.dtype)).sum(dim=1)
+        sub["lnkf"] = torch.log(capital_sub).to(sub["lnkf"].dtype)
+        # 抛光初值优先级：上一次校正得到的 h*（若有）→ 当前信念 hatcf。
+        h_init = sub["hatcf"].to(dtype).clone()
+        for attr in ("_hstar_recalib_last_h", "_initial_hstar_selected_h"):
+            prior = getattr(sim, attr, None)
+            if not torch.is_tensor(prior) or int(prior.numel()) != n_paths:
+                continue
+            prev = prior.index_select(0, rows).to(dtype)
+            usable = torch.isfinite(prev.to(torch.float32))
+            if bool(usable.any()):
+                h_init = torch.where(usable, prev, h_init)
+        fast = _hstar_polish_fast_path(
+            sim,
+            sub,
+            h_init,
+            rng_cpu=rng_cpu,
+            rng_cuda=rng_cuda,
+            tolerance=tolerance,
+        )
+        accepted = fast["accepted"]
+        selected_h = fast["selected_h"]
+        polish_converged_count = int(accepted.sum())
+        event["polish_fast_path_count"] = int(accepted.sum())
+        event["polish_iterations"] = int(fast["iterations"])
+        for offset in range(n_sub):
+            record = dict(fast["audit_rows"][offset])
+            record["path"] = int(rows[offset])
+            path_records[offset] = record
+            trajectory = (fast["trajectory"] or {}).get(int(offset))
+            if trajectory:
+                event["polish_trajectory"][int(rows[offset])] = trajectory
+        if bool(accepted.any()):
+            accepted_rows = torch.nonzero(accepted, as_tuple=False).reshape(-1)
+            sub["hatcf"].index_copy_(
+                0, accepted_rows, selected_h[accepted_rows].to(dtype)
+            )
+        fallback_rows = torch.nonzero(~accepted, as_tuple=False).reshape(-1)
+        if int(fallback_rows.numel()) > 0:
+            event["fallback_global_count"] = int(fallback_rows.numel())
+            sub_fb = _initial_hstar_gather_state(sub, fallback_rows, device)
+            fallback_diagnostics = _calibrate_initial_hstar_batched(
+                sim,
+                sub_fb,
+                scope=scope + "_fallback_global",
+                raise_on_failure=False,
+            )
+            polish_converged_count += int(
+                fallback_diagnostics.get("root_polish_converged_count", 0)
+            )
+            fallback_selected = getattr(sim, "_initial_hstar_selected_h", None)
+            fallback_ok = (
+                torch.isfinite(fallback_selected.to(torch.float32))
+                if fallback_selected is not None
+                else torch.zeros(
+                    int(fallback_rows.numel()), dtype=torch.bool, device=device
+                )
+            ).to(torch.bool)
+            if bool(fallback_ok.any()):
+                sub["hatcf"].index_copy_(
+                    0,
+                    fallback_rows[fallback_ok],
+                    sub_fb["hatcf"][fallback_ok].to(dtype),
+                )
+                selected_h[fallback_rows[fallback_ok]] = (
+                    fallback_selected[fallback_ok].to(dtype)
+                )
+            for offset, record in enumerate(
+                fallback_diagnostics.get("per_path_audit", []) or []
+            ):
+                if offset >= int(fallback_rows.numel()):
+                    break
+                if not isinstance(record, dict):
+                    continue
+                merged = dict(record)
+                merged["path"] = int(rows[int(fallback_rows[offset])])
+                merged.setdefault(
+                    "root_solver",
+                    "strict_global_batched_production_node_operator",
+                )
+                path_records[int(fallback_rows[offset])] = merged
+        stats = _hstar_record_stats(path_records)
+        diagnostics = {
+            "enabled": True,
+            "scope": str(scope),
+            "root_solver": "polish_fast_path_with_strict_global_fallback",
+            "root_policy_source": str(getattr(sim, "bp_action_source", "head")),
+            "n_paths": n_sub,
+            "success_count": stats["success_count"],
+            "fail_count": n_sub - int(stats["success_count"]),
+            "residual_tolerance": tolerance,
+            "inner_acceptance_tolerance": tolerance * 0.5,
+            "coarse_points": int(sim.initial_hstar_coarse_points),
+            "refinement_points": int(sim.initial_hstar_refinement_points),
+            "max_refinement_rounds": int(
+                sim.initial_hstar_max_refinement_rounds
+            ),
+            "support_lower": float(sim.initial_hstar_support_lower),
+            "support_upper": float(sim.initial_hstar_support_upper),
+            "width_tolerance": float(sim.initial_hstar_width_tolerance),
+            "audit_path": None,
+            "initial_belief_mean": initial_belief_mean,
+            "selected_hstar_mean": stats["selected_hstar_mean"],
+            "selected_hstar_p50": stats["selected_hstar_p50"],
+            "raw_residual_mean": stats["raw_residual_mean"],
+            "raw_residual_p90": stats["raw_residual_p90"],
+            "raw_residual_abs_max": stats["raw_residual_abs_max"],
+            "normalized_residual_mean": stats["normalized_residual_mean"],
+            "normalized_residual_p90": stats["normalized_residual_p90"],
+            "normalized_residual_abs_max": stats["normalized_residual_abs_max"],
+            "multi_root_path_count": sum(
+                1
+                for record in path_records
+                if record is not None and int(record.get("root_count") or 0) > 1
+            ),
+            "discontinuity_path_count": sum(
+                1
+                for record in path_records
+                if record is not None
+                and int(record.get("discontinuity_bracket_count") or 0) > 0
+            ),
+            "floor_applied_root_count": stats["floor_applied_root_count"],
+            "root_polish_iterations": int(fast["iterations"]),
+            "root_polish_converged_count": int(polish_converged_count),
+            "root_polish_required_count": n_sub,
+            "initial_capital_mean": float(capital_sub.mean()),
+            "selected_C_raw_mean": stats["selected_C_raw_mean"],
+            "selected_K_ledger_mean": stats["selected_K_ledger_mean"],
+            "per_path_audit": path_records,
+        }
+        sim._initial_hstar_selected_h = selected_h.to(state["hatcf"].dtype)
+    else:
+        diagnostics = _calibrate_initial_hstar_batched(
+            sim, sub, scope=scope, raise_on_failure=False
+        )
+
+    selected_h = getattr(sim, "_initial_hstar_selected_h", None)
+    ok = (
+        torch.isfinite(selected_h.to(torch.float32))
+        if selected_h is not None
+        else torch.zeros(int(rows.numel()), dtype=torch.bool, device=device)
+    )
+    ok = ok.to(torch.bool)
+    if bool(ok.any()):
+        state["hatcf"].index_copy_(
+            0,
+            rows[ok],
+            sub["hatcf"][ok].to(state["hatcf"].dtype),
+        )
+    state["lnkf"].index_copy_(
+        0, rows, sub["lnkf"].to(state["lnkf"].dtype)
+    )
+    sim._initial_hstar_verified_state = None
+    # 周期校正先验缓存：记录本次校正得到的 h*，供下一次 t>0 校正作抛光初值。
+    last_h = getattr(sim, "_hstar_recalib_last_h", None)
+    if not torch.is_tensor(last_h) or int(last_h.numel()) != n_paths:
+        last_h = torch.full(
+            (n_paths,), float("nan"), device=device, dtype=state["hatcf"].dtype
+        )
+    if bool(ok.any()):
+        last_h[rows[ok]] = sub["hatcf"][ok].to(last_h.dtype)
+    sim._hstar_recalib_last_h = last_h
+    reasons: Dict[str, int] = {}
+    for record in diagnostics.get("per_path_audit", []) or []:
+        reason = record.get("failure_reason") if isinstance(record, dict) else None
+        if reason:
+            reasons[str(reason)] = int(reasons.get(str(reason), 0)) + 1
+    event.update(
+        {
+            "status": "OK",
+            "n_paths_calibrated": int(diagnostics.get("success_count", 0)),
+            "n_paths_no_root": int(diagnostics.get("fail_count", 0)),
+            "n_paths_hstar_written": int(ok.sum()),
+            "initial_belief_mean": diagnostics.get("initial_belief_mean"),
+            "selected_hstar_mean": diagnostics.get("selected_hstar_mean"),
+            "selected_hstar_p50": diagnostics.get("selected_hstar_p50"),
+            "raw_residual_mean": diagnostics.get("raw_residual_mean"),
+            "raw_residual_p90": diagnostics.get("raw_residual_p90"),
+            "raw_residual_abs_max": diagnostics.get("raw_residual_abs_max"),
+            "normalized_residual_mean": diagnostics.get(
+                "normalized_residual_mean"
+            ),
+            "normalized_residual_p90": diagnostics.get(
+                "normalized_residual_p90"
+            ),
+            "normalized_residual_abs_max": diagnostics.get(
+                "normalized_residual_abs_max"
+            ),
+            "floor_applied_root_count": diagnostics.get(
+                "floor_applied_root_count"
+            ),
+            "root_polish_converged_count": diagnostics.get(
+                "root_polish_converged_count"
+            ),
+            "multi_root_path_count": diagnostics.get("multi_root_path_count"),
+            "discontinuity_path_count": diagnostics.get(
+                "discontinuity_path_count"
+            ),
+            "failure_reasons": reasons,
+        }
+    )
+    return event
 
 
 def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
@@ -1788,6 +2257,13 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
         _ensure_entry_state_fields(state)
         max_firms = int(state["b"].shape[1])
     sim._max_firms_observed = max(int(sim._max_firms_observed), int(max_firms))
+
+    hstar_recalib_every = int(getattr(sim, "hstar_recalib_every", 0) or 0)
+    hstar_recalib_events: List[Dict] = []
+    if hstar_recalib_every > 0:
+        # Reset the per-rollout recalibration prior cache so a previous
+        # rollout's h-star can never leak into this one.
+        sim._hstar_recalib_last_h = None
 
     initial_hstar_diagnostics = None
     if bool(getattr(sim, "initial_hstar_enabled", False)):
@@ -1828,6 +2304,16 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
     sim._last_parent_bp_grid_resolved = False
 
     for t in tqdm(range(sim.horizon), desc="Simulating steps (tensor)"):
+        if (
+            hstar_recalib_every > 0
+            and t % hstar_recalib_every == 0
+            and not (t == 0 and initial_hstar_diagnostics is not None)
+        ):
+            hstar_recalib_events.append(
+                _periodic_hstar_recalibration(
+                    sim, state, t, fast_path=bool(t > 0)
+                )
+            )
         state_bank_capture = getattr(sim, "state_bank_capture", None)
         if state_bank_capture is not None:
             # State Bank v1 contract: capture the complete parent-ready state
@@ -2207,6 +2693,8 @@ def simulate_tensor_parallel(sim) -> TensorSimulationOutput:
             "n_extinct_paths": len(extinct_paths),
             "path_stop_times": path_stop_times,
             "initial_hstar": initial_hstar_diagnostics,
+            "hstar_recalib_every": hstar_recalib_every,
+            "hstar_recalib_events": hstar_recalib_events,
             "simulation_bp_transition_evidence": getattr(
                 sim, "_bp_transition_evidence", None
             ),
