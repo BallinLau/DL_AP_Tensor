@@ -82,4 +82,22 @@ def cat_rows(rows: Iterable[torch.Tensor], n_cols: int, device: torch.device) ->
         out_cpu[offset:offset + n].copy_(row)
         offset += n
         rows_list[idx] = None
-    return out_cpu.to(device)
+    if device.type != "cuda":
+        return out_cpu.to(device)
+    # Late-episode firm panels can exceed total GPU capacity on their own
+    # (the full panel no longer fits no matter how much is freed). In that
+    # case keep the assembled panel host-resident: downstream consumers lift
+    # only their working columns to the GPU, so results are unchanged.
+    headroom = 256 * 1024 * 1024
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+    except Exception:
+        free_bytes = 0
+    if free_bytes and out_cpu.nbytes + headroom > free_bytes:
+        return out_cpu
+    try:
+        return out_cpu.to(device)
+    except torch.OutOfMemoryError:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return out_cpu

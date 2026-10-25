@@ -2074,6 +2074,29 @@ class Episode:
         if id_col is None:
             raise ValueError("Tensor firm table missing id column ('firm' or 'ID').")
 
+        # Host-resident panels (see the cat_rows GPU-capacity fallback) are too
+        # large to live on the GPU whole. Lift only the working columns onto
+        # the compute device as one compact copy; the values are exact copies,
+        # so key matching and all gathers stay bit-identical to the
+        # device-resident path. The copy is released when this function exits.
+        work_copy: Optional[torch.Tensor] = None
+        compute_device = torch.device(self.device)
+        if data.device.type == 'cpu' and compute_device.type == 'cuda':
+            keep_names: List[str] = []
+            for name in (
+                'path', 'branch', id_col, 't', 'b', 'z', 'ETA', 'i', 'x',
+                'Hatcf', 'LnKF', 'M', 'lineage_id',
+            ):
+                if name in col and name not in keep_names:
+                    keep_names.append(name)
+            work_copy = torch.empty(
+                (data.shape[0], len(keep_names)), dtype=data.dtype, device=compute_device
+            )
+            for j, name in enumerate(keep_names):
+                work_copy[:, j] = data[:, col[name]]
+            data = work_copy
+            col = {name: j for j, name in enumerate(keep_names)}
+
         # Column extractions stay as zero-copy views of the panel (no .long()
         # materialisation): _encode_int_keys converts the small row subsets to
         # int64 internally, so the encoded keys are unchanged while the
