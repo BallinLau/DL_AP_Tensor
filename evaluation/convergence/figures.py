@@ -116,136 +116,199 @@ FIGURE_IDS = tuple(FIGURE_FILENAMES)
 
 CAPTIONS = {
     "F01": (
-        "F01 企业价值与策略曲面（P0/PI/P，3D + 等高线）。P0 是不投资分支的股权价值、"
-        "PI 是投资分支的股权价值、P 是投资选择后的混合股权价值；Q_claim 是发行定价用的债权"
-        "求偿权价值、Grid bp0*/bpI* 是 Grid-BP 正式策略给出的两个分支最优下一期杠杆。"
-        "曲面随生产率 z 递增、随杠杆 b 递减刻画了债务积压（debt overhang）：同样资产净值下"
-        "杠杆越高、股权越便宜。等高线图上叠加 Phat=0 违约边界，边界以下为硬违约区。"
+        "F01 firm value and policy surfaces (P0/PI/P, 3D + contours). "
+        "P0 is the equity value of the no-investment branch, PI that of the investment branch, "
+        "and P the blended equity value after the investment choice. Q_claim is the debt claim "
+        "value used for issuance pricing, and Grid bp0*/bpI* are the optimal next-period leverage "
+        "of the two branches from the formal Grid-BP policy. Surfaces rise in productivity z and "
+        "fall in leverage b, capturing debt overhang: at equal net asset value, higher leverage "
+        "makes equity cheaper. Contours overlay the Phat=0 default boundary; below it lies the "
+        "hard-default region."
     ),
     "F02": (
-        "F02 违约边界与违约概率（Gomes 风格 2D）。左列给出软违约概率 bar_z=1-sigmoid(Phat/tau_z)"
-        "的曲面与 Phat=0 硬违约边界；bar_z 是软概率、不是生产率门槛。右列给出硬边界 z_default(b)、"
-        "软边界 bar_z=0.5 与条件违约概率的对照。经济含义：违约边界随杠杆 b 上移（越容易违约），"
-        "硬/软边界之差度量软惩罚与硬门之间的口径落差。"
+        "F02 default boundary and default probability (Gomes-style 2D). "
+        "The left column shows the soft default probability bar_z=1-sigmoid(Phat/tau_z) together "
+        "with the Phat=0 hard default boundary; bar_z is a soft probability, not a productivity "
+        "threshold. The right column contrasts the hard boundary z_default(b), the soft boundary "
+        "bar_z=0.5 and the conditional default probability. Economic meaning: the default boundary "
+        "rises with leverage b (default becomes easier), and the hard-soft gap measures the caliber "
+        "wedge between the soft penalty and the hard gate."
     ),
     "F03": (
-        "F03 Q 四口径曲面与违约区（Q Claim / Q Unit / Recovery / Q Effective）。Q_claim=b₊·q_unit"
-        "是发行定价与 Bellman 残差唯一允许的口径；q_unit 是单位债券价；recovery=φ(1-δ+exp(x+z)) 是"
-        "违约回收值；Q_effective 是结算口径（hybrid 才含违约硬门）。图中深色区域为 Phat≤0 的硬违约区。"
-        "经济含义：违约区求偿权价值塌缩到回收值，存活区 Q_claim 随 b 先升后降体现最优资本结构。"
+        "F03 Q surfaces in four calibers and the default region (Q Claim / Q Unit / Recovery / Q Effective). "
+        "Q_claim=b₊·q_unit is the only caliber allowed for issuance pricing and the Bellman residual. "
+        "q_unit is the unit bond price, recovery=φ(1-δ+exp(x+z)) is the default recovery value, and "
+        "Q_effective is the settlement caliber (only hybrid includes the hard default gate). Dark "
+        "regions mark the hard-default area Phat≤0. Economic meaning: inside the default region the "
+        "claim value collapses to recovery, while in the surviving region Q_claim first rises and then "
+        "falls in b, reflecting the optimal capital structure."
     ),
     "F04": (
-        "F04 Grid BP 策略与投资边界（3D + 2D）。Grid bp0*/bpI* 是 Grid-BP 教师在候选杠杆网格上"
-        "求得的正式策略（PolicyValueModel 的 bp 头仅兼容输出），投资边界 i*(b,z) 是 PI-V0 沿投资成本"
-        "轴的零点。经济含义：生产率越高、最优杠杆越高；投资边界以下才投资，且多零点/无零点状态被"
-        "显式分类（always/never/single/multiple）。"
+        "F04 Grid BP policy and investment boundary (3D + 2D). "
+        "Grid bp0*/bpI* are the formal policies solved by the Grid-BP teacher on the candidate "
+        "leverage grid (the PolicyValueModel bp head is compatibility output only), and the "
+        "investment boundary i*(b,z) is the zero of PI-V0 along the investment cost axis. Economic "
+        "meaning: higher productivity supports higher optimal leverage. Investment happens only "
+        "below the investment boundary, and multi-root/no-root states are explicitly classified "
+        "(always/never/single/multiple)."
     ),
     "F05": (
-        "F05 Bellman 残差随 Episode 收敛（Line + P90）。frozen 残差是训练冻结策略下的 Bellman 恒等式"
-        "残差，fresh 残差是当前模型重新贪心求解后的最优性残差（最优性证据以 fresh 为准）。"
-        "P90/P99 与 MAE 同画以避免均值掩盖尾部。经济含义：残差随 episode 下降到量级 1e-3 以内才构成"
-        "均衡收敛的必要条件；训练 loss 不作收敛证据。"
+        "F05 Bellman residual convergence across episodes (line + P90). "
+        "The frozen residual is the Bellman identity residual under the training-frozen policy, and "
+        "the fresh residual is the optimality residual after re-solving greedily with the current "
+        "model (optimality evidence uses fresh). P90/P99 are drawn together with MAE so the mean "
+        "cannot mask the tail. Economic meaning: only residuals falling to the 1e-3 scale constitute "
+        "a necessary condition for equilibrium convergence; training loss is not convergence evidence."
     ),
     "F06": (
-        "F06 P / Q / Policy 跨 Episode 漂移（多面板 Line）。在同一固定 EvalBank 状态上逐行比较相邻"
-        "episode 的 P（股权价值）、Q（发行定价）与 Grid BP 策略，另报 policy/default/investment flip rate。"
-        "经济含义：函数漂移趋零是均衡收敛的直接证据；flip rate 刻画决策面的离散翻转比例。"
+        "F06 P / Q / policy drift across episodes (multi-panel lines). "
+        "On the same fixed EvalBank states, consecutive episodes are compared row by row for P "
+        "(equity value), Q (issuance pricing) and the Grid BP policy, plus policy/default/investment "
+        "flip rates. Economic meaning: function drift vanishing is direct evidence of equilibrium "
+        "convergence; flip rates measure the discrete switching share of the decision surface."
     ),
     "F07": (
-        "F07 FC1 预测 vs 实际（Scatter + Path）。hatcf_t/lnkf_t 是 t-1 对节点 t 的信念预测，"
-        "hatc_t/lnk_t 是节点 t 的实现聚合，同行对齐即 shift=0 的一步预测。经济含义：预测点越贴近 45° 线"
-        "信念体系越准；偏离 45° 的系统性斜率/截距反映预测偏差而非噪声。"
+        "F07 FC1 predicted vs realized (scatter + path). "
+        "hatcf_t/lnkf_t are the t-1 belief forecasts of node t, hatc_t/lnk_t are the realized "
+        "aggregates at node t, and same-row alignment gives the shift=0 one-step forecast. Economic "
+        "meaning: forecast points hugging the 45-degree line mean the belief system is accurate; "
+        "systematic slope/offset away from 45 degrees reflects forecast bias rather than noise."
     ),
     "F08": (
-        "F08 宏观动态与 SDF（Time Series）。给出 Bank C 宏观锚点（Recession/Normal/Expansion）上"
-        "FC1 递归路径、SDF 条件残差按宏观态分解与 M 的均值/标准误。经济含义：递归路径是否漂移出训练范围"
-        "决定长期模拟可信度；SDF 条件矩在三态间应稳定，否则资产定价核不一致。"
+        "F08 macro dynamics and SDF (time series). "
+        "On the Bank C macro anchors (Recession/Normal/Expansion): FC1 recursion paths, SDF "
+        "conditional residuals decomposed by macro state, and the mean/standard error of M. Economic "
+        "meaning: whether recursion paths drift out of the training range bounds the credibility of "
+        "long simulations; SDF conditional moments should be stable across the three states, "
+        "otherwise the asset-pricing kernel is inconsistent."
     ),
     "F09": (
-        "F09 分宏观态杠杆分布（Gomes 风格直方图）。按 x 分位把截面切成 Recession/Normal/Expansion，"
-        "分别给出企业计数加权与资本加权两种口径的杠杆分布。经济含义：衰退态分布应左移（去杠杆）、"
-        "资本加权口径右移（大企业杠杆更高）；两种口径的差异即规模-杠杆相关性。"
+        "F09 leverage distribution by macro state (Gomes-style histogram). "
+        "The cross-section is split into Recession/Normal/Expansion by x quantiles, and leverage "
+        "distributions are shown under firm-count weighting and capital weighting. Economic meaning: "
+        "the recession distribution should shift left (deleveraging) and the capital-weighted one "
+        "shift right (larger firms carry more leverage); the gap between the two calibers is the "
+        "size-leverage correlation."
     ),
     "F10": (
-        "F10 b-z 联合分布随时间（Heatmap + 边缘分布）。固定网格上的归一化联合直方图与其 b/z 边缘分布，"
-        "计数加权与资本加权双口径。经济含义：联合分布随时间的形态演化反映选择效应与内生退出；"
-        "灭绝 path 显式标注、不从统计中删除。"
+        "F10 b-z joint distribution over time (heatmap + marginals). "
+        "Normalized joint histograms on the fixed grid with their b/z marginals, under both count "
+        "and capital weighting. Economic meaning: the evolving shape of the joint distribution "
+        "reflects selection effects and endogenous exit; extinct paths are flagged explicitly and "
+        "never dropped from the statistics."
     ),
     "F11": (
-        "F11 t0→t1 资本 Waterfall 与存活核算。按资本增长分解恒等式逐期画瀑布：期末资本 = 期初资本 "
-        "+ 存续企业 ΔK + 进入资本（端点口径）- 退出资本 + 记账残差；同节点进出企业是备忘行、不进恒等式。"
-        "并排给出存活/违约/活跃 path 逐期账。经济含义：残差应贴近 0，否则资本账本口径有缺口。"
+        "F11 t0→t1 capital waterfall and survival accounting. "
+        "Per-period waterfall of the capital growth decomposition identity: ending capital = initial "
+        "capital + ΔK of survivors + entrant capital (endpoint caliber) - exiting capital + "
+        "accounting residual. Same-node entrants/exits are memo rows and stay outside the identity. "
+        "Side-by-side period accounts of surviving/default/active paths are shown. Economic meaning: "
+        "the residual should stay near zero, otherwise the capital ledger caliber has a gap."
     ),
     "F12": (
-        "F12 一般均衡收敛 Dashboard。汇总 Bellman 残差、P/Q/策略漂移、FC1 一步误差、SDF 矩与分布距离"
-        "随 episode 的轨迹。经济含义：只有当企业价值/策略、宏观信念与定价核同时稳定时，才是一般均衡意义"
-        "上的收敛；任一面板不收敛即整体不收敛。"
+        "F12 general-equilibrium convergence dashboard. "
+        "Trajectories across episodes of the Bellman residual, P/Q/policy drift, FC1 one-step error, "
+        "SDF moments and distribution distances. Economic meaning: convergence in the "
+        "general-equilibrium sense requires firm values/policies, macro beliefs and the pricing "
+        "kernel to stabilize at the same time; any non-converging panel means the whole system has "
+        "not converged."
     ),
     "V01": (
-        "V01 P0 曲面（不投资分支股权价值）。叠加 Phat=0 违约边界；η=0 与 η=1 两个反事实视图并列，"
-        "统一 b/z 范围与色标以便跨集比较。经济含义：P0 是放弃投资机会后的清算-存续价值。"
+        "V01 P0 surface (no-investment branch equity value). "
+        "Overlays the Phat=0 default boundary. The η=0 and η=1 counterfactual views are placed side "
+        "by side on unified b/z ranges and colour scale for cross-episode comparison. Economic "
+        "meaning: P0 is the liquidation-continuation value after forgoing the investment opportunity."
     ),
     "V02": (
-        "V02 PI 曲面（投资分支股权价值，标注投资成本 i）。在固定参考投资成本 i_mid（10/50/90 分位的"
-        "中位档）处求值。经济含义：PI-P0 的符号决定是否投资，i 越高投资分支越不利。"
+        "V02 PI surface (investment branch equity value, labelled by investment cost i). "
+        "Evaluated at the fixed reference cost i_mid (the median tier of the 10/50/90 quantiles). "
+        "Economic meaning: the sign of PI-P0 decides whether to invest, and a higher i makes the "
+        "investment branch less attractive."
     ),
     "V03": (
-        "V03 股权价值 P 与 Phat≤0 违约区。P 是投资选择后的混合股权价值，Phat≤0 是硬违约指示（模型口径），"
-        "与 bar_z 软概率严格区分。经济含义：违约区内股权价值归零/塌缩，边界附近的价值梯度最大。"
+        "V03 equity value P and the Phat≤0 default region. "
+        "P is the blended equity value after the investment choice, and Phat≤0 is the hard-default "
+        "indicator (model caliber), strictly distinct from the soft probability bar_z. Economic "
+        "meaning: inside the default region equity value collapses to zero, and the value gradient "
+        "is steepest near the boundary."
     ),
     "V04": (
-        "V04 Q 四口径对照（Q Claim / Q Unit / Q Effective / Recovery）。发行与残差一律使用 claim 口径，"
-        "effective 与回收值只用于结算语义。经济含义：四口径在违约区的分离度量了违约硬门与软惩罚的差异。"
+        "V04 four Q calibers compared (Q Claim / Q Unit / Q Effective / Recovery). "
+        "Issuance and residuals always use the claim caliber; effective and recovery carry "
+        "settlement semantics only. Economic meaning: the separation of the four calibers in the "
+        "default region measures the gap between the hard default gate and the soft penalty."
     ),
     "V05": (
-        "V05 价值等高线 + 违约边界。P0/PI/P 的等高线叠加 Phat=0 硬边界与 bar_z=0.5 软边界。"
-        "经济含义：等高线在违约边界处的折点显示债务积压对边际价值的抑制。"
+        "V05 value contours + default boundary. "
+        "Contours of P0/PI/P overlaid with the hard Phat=0 boundary and the soft bar_z=0.5 "
+        "boundary. Economic meaning: the kink of the contours at the default boundary shows debt "
+        "overhang depressing marginal value."
     ),
     "V06": (
-        "V06 跨集价值漂移（Value Drift）。相邻 episode 之间 P0/PI/P 曲面的逐点差与汇总统计。"
-        "经济含义：漂移趋零说明值函数在固定 bank 状态上已稳定，是收敛的必要证据。"
+        "V06 value drift across episodes (value drift). "
+        "Pointwise differences and summary statistics of the P0/PI/P surfaces between consecutive "
+        "episodes. Economic meaning: drift vanishing shows the value function has stabilized on the "
+        "fixed bank states, a necessary condition for convergence."
     ),
     "P01": (
-        "P01 Grid bp0* 曲面（不投资分支最优下一期杠杆）。来自 Grid-BP 教师的贪心解，不是 bp0 头输出。"
-        "经济含义：最优杠杆随生产率上升、随当前杠杆下降（均值回复）。"
+        "P01 Grid bp0* surface (optimal next-period leverage of the no-investment branch). "
+        "The greedy solution of the Grid-BP teacher, not the bp0 head output. Economic meaning: "
+        "optimal leverage rises with productivity and falls with current leverage (mean reversion)."
     ),
     "P02": (
-        "P02 Grid bpI* 曲面（投资分支最优下一期杠杆）。投资分支需要额外融资，最优杠杆系统性高于 bp0*。"
+        "P02 Grid bpI* surface (optimal next-period leverage of the investment branch). "
+        "The investment branch needs extra financing, so its optimal leverage is systematically "
+        "above bp0*."
     ),
     "P03": (
-        "P03 有效债务策略（实际 b_next）。b_next = η·bp* + (1-η)·b：η=0 时强制 b_next=b（再融资关闭），"
-        "η=1 时 b_next=bp*。图中同时给出头输出 vs Grid BP 的差距。经济含义：融资门决定了策略的实际执行，"
-        "意愿策略与执行策略必须分开统计。"
+        "P03 effective debt policy (realized b_next). "
+        "b_next = η·bp* + (1-η)·b: η=0 forces b_next=b (refinancing off), η=1 gives b_next=bp*. The "
+        "figure also shows the gap between the head output and Grid BP. Economic meaning: the "
+        "refinancing gate determines what the policy actually executes, and intended vs executed "
+        "policy must be reported separately."
     ),
     "P04": (
-        "P04 Bellman 目标 vs 候选 bp（叠加 Q Claim）。代表性状态下 Bellman 右端随候选杠杆的变化与"
-        "发行 Q_claim 的对照。经济含义：目标曲线的峰值即 Grid bp*，η=0 行必须是常数（融资门强制）。"
+        "P04 Bellman objective vs candidate bp (Q Claim overlaid). "
+        "At representative states: the Bellman right-hand side across candidate leverage versus "
+        "issuance Q_claim. Economic meaning: the peak of the objective curve is Grid bp*, and the "
+        "η=0 row must be flat (financing gate enforced)."
     ),
     "M01": (
-        "M01 FC1 一步预测散点。hatcf_t vs hatc_t、lnkf_t vs lnk_t（shift=0 同行对齐），附 45° 线与 R²。"
-        "经济含义：预测无偏且贴线是宏观信念体系一致的必要条件。"
+        "M01 FC1 one-step forecast scatter. "
+        "hatcf_t vs hatc_t and lnkf_t vs lnk_t (shift=0 same-row alignment), with the 45-degree line "
+        "and R². Economic meaning: unbiased, on-line forecasts are a necessary condition for a "
+        "consistent macro belief system."
     ),
     "M02": (
-        "M02 Hatcf vs Hatc 路径。按 path 画预测消费增长率信念与实现值的时间路径。"
-        "经济含义：信念应围绕实现值波动而非系统性偏离。"
+        "M02 Hatcf vs Hatc paths. "
+        "Time paths per path of the belief forecast of the aggregate and its realization. Economic "
+        "meaning: beliefs should fluctuate around realizations rather than deviate systematically."
     ),
     "M03": (
-        "M03 LnKF vs LnK 路径。按 path 画资本信念与实现值的时间路径。"
-        "经济含义：资本信念的持续偏离会累积成错误的融资/投资决策。"
+        "M03 LnKF vs LnK paths. "
+        "Time paths per path of capital belief and realization. Economic meaning: persistent "
+        "capital-belief deviation accumulates into wrong financing/investment decisions."
     ),
     "M04": (
-        "M04 宏观递归预测误差。production_one_step（每次喂父节点算得宏观态，正式模拟调用规则）与 "
-        "autonomous_recursive（完全自回归）两口径分开报，误差随 horizon 的斜率即漂移速度。"
-        "经济含义：autonomous 口径的漂移斜率决定长期模拟的可信上限。"
+        "M04 macro recursive forecast error. "
+        "production_one_step (macro state computed from the parent node at every call, the formal "
+        "simulation rule) and autonomous_recursive (fully autoregressive) are reported separately, "
+        "and the slope of the error over horizon is the drift speed. Economic meaning: the drift "
+        "slope under the autonomous caliber sets the credibility bound of long simulations."
     ),
     "M05": (
-        "M05 SDF 分布与约束。M 的均值/方差、按宏观态分解的条件残差、Signed AiO 估计（含标准误与解读护栏）"
-        "以及矩约束违反量 g_mean_low/g_mean_high/g_var_high。经济含义：负的 Signed AiO 样本均值不等于负的"
-        "总体条件矩；约束违反量才是数值安全的判据。"
+        "M05 SDF distribution and constraints. "
+        "Mean/variance of M, conditional residuals by macro state, the Signed AiO estimate (with "
+        "standard errors and interpretation guardrails) and the moment-constraint violations "
+        "g_mean_low/g_mean_high/g_var_high. Economic meaning: a negative sample mean of Signed AiO "
+        "is not a negative population conditional moment; constraint violations are the numerically "
+        "safe criterion."
     ),
     "M06": (
-        "M06 C/K、K、C、Y、I 随时间。宏观聚合量的逐期轨迹（C/K 由 Hatc=log(C/K) 还原）。"
-        "经济含义：宏观稳态意味着这些聚合量不再漂移；持续趋势说明一般均衡未收敛。"
+        "M06 C/K, K, C, Y, I over time. "
+        "Period paths of macro aggregates (C/K recovered from Hatc=log(C/K)). Economic meaning: a "
+        "macro steady state means these aggregates stop drifting; persistent trends mean general "
+        "equilibrium has not converged."
     ),
 }
 
@@ -562,14 +625,14 @@ def _style_meta(style: FigureStyle):
 
 def _annotation_lines(annotations, **overrides):
     values = {
-        "Episode": "未提供",
-        "Macro Anchor": "未提供",
-        "η": "未提供",
-        "i": "未提供",
-        "数据分布来源": "未提供",
-        "n": "未提供",
-        "资本加权": "未提供",
-        "灭绝 path": "未提供",
+        "Episode": "Not provided",
+        "Macro Anchor": "Not provided",
+        "η": "Not provided",
+        "i": "Not provided",
+        "Data source": "Not provided",
+        "n": "Not provided",
+        "Capital weighted": "Not provided",
+        "Extinct paths": "Not provided",
     }
     if isinstance(annotations, Mapping):
         values.update({str(key): value for key, value in annotations.items()})
@@ -581,7 +644,7 @@ def _annotation_lines(annotations, **overrides):
 
 def _describe_macro_anchor(bank) -> str:
     if not isinstance(bank, Mapping):
-        return "未提供"
+        return "Not provided"
     candidates = [bank]
     for key in ("C", "c", "bank_c", "bank_C"):
         if isinstance(bank.get(key), Mapping):
@@ -597,12 +660,12 @@ def _describe_macro_anchor(bank) -> str:
         metadata = candidate.get("metadata")
         if isinstance(metadata, Mapping) and metadata.get("macro_anchor_source"):
             return str(metadata["macro_anchor_source"])
-    return "未提供"
+    return "Not provided"
 
 
 def _describe_bank_source(bank) -> str:
     if not isinstance(bank, Mapping):
-        return "未提供"
+        return "Not provided"
     bank_id = bank.get("bank_id")
     bank_kind = bank.get("bank_kind")
     if bank_id or bank_kind:
@@ -611,18 +674,18 @@ def _describe_bank_source(bank) -> str:
         entry = bank.get(key)
         if isinstance(entry, Mapping) and entry.get("bank_id"):
             return f"{entry['bank_id']} ({entry.get('bank_kind', 'unknown')})"
-    return "未提供"
+    return "Not provided"
 
 
 def _describe_extinct(sim_result) -> str:
     if isinstance(sim_result, Mapping):
         episodes = _as_episode_map(sim_result)
         if not episodes:
-            return "未提供"
+            return "Not provided"
         sim_result = list(episodes.values())[-1]
     status = _pick_table(sim_result, "path_status")
     if status is None or "extinct" not in status.columns:
-        return "未提供"
+        return "Not provided"
     flags = status["extinct"].astype(bool).to_numpy()
     return f"{int(flags.sum())}/{int(flags.size)}"
 
@@ -688,8 +751,8 @@ def _draw_surface_3d(ax, panel: _Panel, style: FigureStyle) -> bool:
         rstride=1,
         cstride=1,
     )
-    ax.set_xlabel(panel.xlabel or "b = 杠杆率 (债务/资本)")
-    ax.set_ylabel(panel.ylabel or "z = 企业生产率冲击")
+    ax.set_xlabel(panel.xlabel or "b = leverage ratio (debt/capital)")
+    ax.set_ylabel(panel.ylabel or "z = firm productivity shock")
     ax.set_zlabel(panel.zlabel or panel.title)
     ax.view_init(elev=style.elev, azim=style.azim)
     ax.set_title(panel.title)
@@ -766,8 +829,8 @@ def _draw_contour(ax, panel: _Panel, style: FigureStyle) -> bool:
     fig = ax.get_figure()
     if fig is not None:
         fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.04)
-    ax.set_xlabel(panel.xlabel or "b = 杠杆率 (债务/资本)")
-    ax.set_ylabel(panel.ylabel or "z = 企业生产率冲击")
+    ax.set_xlabel(panel.xlabel or "b = leverage ratio (debt/capital)")
+    ax.set_ylabel(panel.ylabel or "z = firm productivity shock")
     ax.set_title(panel.title)
     _set_xy_limits(ax, style)
     return True
@@ -794,8 +857,8 @@ def _draw_heatmap(ax, panel: _Panel, style: FigureStyle) -> bool:
     fig = ax.get_figure()
     if fig is not None:
         fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.04)
-    ax.set_xlabel(panel.xlabel or "b = 杠杆率 (债务/资本)")
-    ax.set_ylabel(panel.ylabel or "z = 企业生产率冲击")
+    ax.set_xlabel(panel.xlabel or "b = leverage ratio (debt/capital)")
+    ax.set_ylabel(panel.ylabel or "z = firm productivity shock")
     ax.set_title(panel.title)
     _set_xy_limits(ax, style)
     return True
@@ -996,7 +1059,7 @@ def _render_grid(
             drawn = bool(_DRAW[panel.kind](ax, panel, style))
         except Exception as exc:  # a malformed panel must not fake a success figure
             drawn = False
-            panel.title = f"{panel.title} [绘制失败: {type(exc).__name__}: {str(exc)[:160]}]"
+            panel.title = f"{panel.title} [render failed: {type(exc).__name__}: {str(exc)[:160]}]"
         drawn_any = drawn_any or drawn
         used.append({"title": panel.title, "drawn": bool(drawn)})
     full_meta["panel_status"] = used
@@ -1015,7 +1078,8 @@ def _render_grid(
             meta=full_meta,
         )
 
-    fig.suptitle(f"{figure_id}: {caption.split('。')[0]}", fontsize=style.title_size + 1.5)
+    first_sentence = re.split(r"(?:。|\.\s)", caption, maxsplit=1)[0]
+    fig.suptitle(f"{figure_id}: {first_sentence}", fontsize=style.title_size + 1.5)
     fig.subplots_adjust(
         left=0.07, right=0.955, top=0.90, bottom=0.115, hspace=0.55, wspace=0.32
     )
@@ -1131,7 +1195,7 @@ def _boundary_overlay(result, style: FigureStyle):
         b = _table_column(frame, "b")
         z = _table_column(frame, "z_default")
         if b is not None and z is not None:
-            overlays.append({"x": b, "y": z, "label": "违约边界 Phat=0", "color": "black"})
+            overlays.append({"x": b, "y": z, "label": "default boundary Phat=0", "color": "black"})
     hard = _pick_table(result, "hard_soft_boundary")
     if hard is not None and {"b", "z_soft_barz0p5"}.issubset(hard.columns):
         b = _table_column(hard, "b")
@@ -1141,7 +1205,7 @@ def _boundary_overlay(result, style: FigureStyle):
                 {
                     "x": b,
                     "y": z,
-                    "label": "软边界 bar_z=0.5",
+                    "label": "soft boundary bar_z=0.5",
                     "color": "tab:red",
                     "linestyle": "--",
                 }
@@ -1164,7 +1228,7 @@ def _default_region(result, grid_shape):
 
 
 def _eta_label(view: str) -> str:
-    return "η=1（refi_active，b_next=bp*）" if view == "eta1" else "η=0（refi 关闭，b_next=b）"
+    return "η=1 (refi active, b_next=bp*)" if view == "eta1" else "η=0 (refi off, b_next=b)"
 
 
 def _base_meta(
@@ -1211,11 +1275,11 @@ def _annotation_dict(
     if i_slice is not None:
         merged["i"] = i_slice
     if data_source is not None:
-        merged["数据分布来源"] = data_source
+        merged["Data source"] = data_source
     if capital_weighted is not None:
-        merged["资本加权"] = capital_weighted
+        merged["Capital weighted"] = capital_weighted
     if extinct_paths is not None:
-        merged["灭绝 path"] = extinct_paths
+        merged["Extinct paths"] = extinct_paths
     if n_samples is not None:
         merged["n"] = n_samples
     return merged
@@ -1243,7 +1307,7 @@ def _i_slice_text(policy_result) -> str:
     reference = diagnostics.get("reference_i") if isinstance(diagnostics, Mapping) else None
     if reference is not None:
         return f"i_mid={reference}"
-    return "i=i_mid（bank i 中位数）"
+    return "i=i_mid (bank i median)"
 
 
 # ---------------------------------------------------------------------------
@@ -1290,7 +1354,7 @@ def render_f01(
         panels.append(
             _Panel(
                 kind="contour",
-                title=f"等高线 {name} + 违约边界",
+                title=f"contour {name} + default boundary",
                 family=_family_of(name),
                 values=canonical[name],
                 options={
@@ -1308,7 +1372,7 @@ def render_f01(
         eta="η=1",
         i_slice=_i_slice_text(result),
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否（曲面在固定 bank 网格上求值）",
+        capital_weighted="no (surfaces evaluated on the fixed bank grid)",
         n_samples=n_samples,
         extra={
             "canonical_3d": list(CANONICAL_3D_NAMES),
@@ -1331,7 +1395,7 @@ def render_f01(
             eta="η=1",
             i_slice=_i_slice_text(result),
             data_source=str(meta["data_source"]),
-            capital_weighted="否",
+            capital_weighted="no",
             n_samples=n_samples,
         ),
     )
@@ -1370,7 +1434,7 @@ def render_f02(
         panels.append(
             _Panel(
                 kind="heatmap",
-                title="bar_z = 1-sigmoid(Phat/τz)（软违约概率）",
+                title="bar_z = 1-sigmoid(Phat/tau_z) (soft default probability)",
                 family="prob",
                 values=bar_z,
                 options={
@@ -1385,7 +1449,7 @@ def render_f02(
         panels.append(
             _Panel(
                 kind="heatmap",
-                title="Phat(b,z)（股权值判别；≤0 为硬违约）",
+                title="Phat(b,z) (equity value discriminant; ≤0 = hard default)",
                 family="value",
                 values=phat,
                 options={
@@ -1403,7 +1467,7 @@ def render_f02(
             {
                 "x": _table_column(default_table, "b"),
                 "y": _table_column(default_table, "z_default"),
-                "label": "Phat=0（硬）",
+                "label": "Phat=0 (hard)",
                 "color": "black",
             }
         )
@@ -1412,7 +1476,7 @@ def render_f02(
             {
                 "x": _table_column(hard_soft, "b"),
                 "y": _table_column(hard_soft, "z_soft_barz0p5"),
-                "label": "bar_z=0.5（软）",
+                "label": "bar_z=0.5 (soft)",
                 "color": "tab:red",
                 "linestyle": "--",
             }
@@ -1420,9 +1484,9 @@ def render_f02(
     panels.append(
         _Panel(
             kind="line",
-            title="违约边界 z_default(b)：硬 vs 软",
-            xlabel="b = 杠杆率 (债务/资本)",
-            ylabel="z = 企业生产率冲击（违约门槛）",
+            title="default boundary z_default(b): hard vs soft",
+            xlabel="b = leverage ratio (debt/capital)",
+            ylabel="z = firm productivity shock (default threshold)",
             options={"series": boundary_series},
         )
     )
@@ -1432,15 +1496,15 @@ def render_f02(
         panels.append(
             _Panel(
                 kind="scatter",
-                title="条件违约概率 vs 杠杆（来自生产率转移，非 bar_z）",
-                xlabel="b = 杠杆率",
+                title="conditional default probability (z transitions, not bar_z)",
+                xlabel="b = leverage ratio",
                 ylabel="Pr(Phat_child ≤ 0 | b_next)",
                 options={
                     "series": [
                         {
                             "x": _table_column(rows, "b"),
                             "y": _table_column(rows, "conditional_default_prob"),
-                            "label": "条件违约概率",
+                            "label": "conditional default probability",
                         }
                     ],
                     "diag": False,
@@ -1451,9 +1515,9 @@ def render_f02(
         panels.append(
             _Panel(
                 kind="text",
-                title="条件违约概率",
+                title="conditional default probability",
                 options={
-                    "text": "policy_rows 无 conditional_default_prob 列\n（本面板省略，不伪造空白图）"
+                    "text": "policy_rows has no conditional_default_prob column\n(panel omitted; no blank figure is fabricated)"
                 },
             )
         )
@@ -1468,7 +1532,7 @@ def render_f02(
         eta="η=1",
         i_slice=_i_slice_text(result),
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={"boundary_status_counts": status_counts},
     )
@@ -1488,7 +1552,7 @@ def render_f02(
             eta="η=1",
             i_slice=_i_slice_text(result),
             data_source=str(meta["data_source"]),
-            capital_weighted="否",
+            capital_weighted="no",
             n_samples=n_samples,
         ),
     )
@@ -1525,31 +1589,31 @@ def render_f03(
     region = _default_region(result, shape)
 
     panels = [
-        _Panel(kind="3d", title="3D Q_claim（Q Claim 发行定价口径）", family="q", values=q_claim,
+        _Panel(kind="3d", title="3D Q_claim (issuance pricing caliber)", family="q", values=q_claim,
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D q_unit（单位债券价）", family="q", values=q_unit,
+        _Panel(kind="3d", title="3D q_unit (unit bond price)", family="q", values=q_unit,
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D Recovery（违约回收值）", family="q", values=recovery,
+        _Panel(kind="3d", title="3D Recovery (default recovery value)", family="q", values=recovery,
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D Q Effective（结算口径）", family="q",
+        _Panel(kind="3d", title="3D Q Effective (settlement caliber)", family="q",
                values=q_effective if q_effective is not None else np.full(shape, np.nan),
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D P0（canonical）", family="value", values=canonical["P0"],
+        _Panel(kind="3d", title="3D P0 (canonical)", family="value", values=canonical["P0"],
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D PI（canonical）", family="value", values=canonical["PI"],
+        _Panel(kind="3d", title="3D PI (canonical)", family="value", values=canonical["PI"],
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D P（canonical）", family="value", values=canonical["P"],
+        _Panel(kind="3d", title="3D P (canonical)", family="value", values=canonical["P"],
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D Grid bp0*（canonical）", family="bp", values=canonical["Grid bp0*"],
+        _Panel(kind="3d", title="3D Grid bp0* (canonical)", family="bp", values=canonical["Grid bp0*"],
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D Grid bpI*（canonical）", family="bp", values=canonical["Grid bpI*"],
+        _Panel(kind="3d", title="3D Grid bpI* (canonical)", family="bp", values=canonical["Grid bpI*"],
                options={"b_values": b_values, "z_values": z_values}),
     ]
     for name, values in (("Q Claim", q_claim), ("q_unit", q_unit), ("Recovery", recovery)):
         panels.append(
             _Panel(
                 kind="contour",
-                title=f"{name} + Phat≤0 违约区",
+                title=f"{name} + Phat≤0 default region",
                 family="q",
                 values=values,
                 options={"b_values": b_values, "z_values": z_values, "region": region,
@@ -1563,7 +1627,7 @@ def render_f03(
         eta="η=1",
         i_slice=_i_slice_text(result),
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={"q_calibers": ["Q_claim", "q_unit", "Q_effective", "recovery"],
                "canonical_3d": list(CANONICAL_3D_NAMES)},
@@ -1580,7 +1644,7 @@ def render_f03(
         n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=episode_key, eta="η=1", i_slice=_i_slice_text(result),
-            data_source=str(meta["data_source"]), capital_weighted="否", n_samples=n_samples,
+            data_source=str(meta["data_source"]), capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -1614,42 +1678,42 @@ def render_f04(
     region = _default_region(result, shape)
 
     panels = [
-        _Panel(kind="3d", title="3D Grid bp0*（不投资分支）", family="bp", values=canonical["Grid bp0*"],
+        _Panel(kind="3d", title="3D Grid bp0* (no-investment branch)", family="bp", values=canonical["Grid bp0*"],
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D Grid bpI*（投资分支）", family="bp", values=canonical["Grid bpI*"],
+        _Panel(kind="3d", title="3D Grid bpI* (investment branch)", family="bp", values=canonical["Grid bpI*"],
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D 投资边界 i*(b,z)", family="bp",
+        _Panel(kind="3d", title="3D investment boundary i*(b,z)", family="bp",
                values=i_star if i_star is not None else np.full(shape, np.nan),
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D P0（canonical）", family="value", values=canonical["P0"],
+        _Panel(kind="3d", title="3D P0 (canonical)", family="value", values=canonical["P0"],
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D PI（canonical）", family="value", values=canonical["PI"],
+        _Panel(kind="3d", title="3D PI (canonical)", family="value", values=canonical["PI"],
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D P（canonical）", family="value", values=canonical["P"],
+        _Panel(kind="3d", title="3D P (canonical)", family="value", values=canonical["P"],
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="3d", title="3D Q_claim（canonical）", family="q", values=canonical["Q_claim"],
+        _Panel(kind="3d", title="3D Q_claim (canonical)", family="q", values=canonical["Q_claim"],
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="contour", title="Grid bp0* + 违约边界", family="bp", values=canonical["Grid bp0*"],
+        _Panel(kind="contour", title="Grid bp0* + default boundary", family="bp", values=canonical["Grid bp0*"],
                options={"b_values": b_values, "z_values": z_values, "region": region,
                         "overlays": _boundary_overlay(result, style)}),
-        _Panel(kind="contour", title="Grid bpI* + 违约边界", family="bp", values=canonical["Grid bpI*"],
+        _Panel(kind="contour", title="Grid bpI* + default boundary", family="bp", values=canonical["Grid bpI*"],
                options={"b_values": b_values, "z_values": z_values, "region": region,
                         "overlays": _boundary_overlay(result, style)}),
-        _Panel(kind="contour", title="投资边界 i*(b,z)（PI-V0 零点）", family="bp",
+        _Panel(kind="contour", title="investment boundary i*(b,z) (PI-V0 zero)", family="bp",
                values=i_star if i_star is not None else np.full(shape, np.nan),
                options={"b_values": b_values, "z_values": z_values, "region": region,
                         "overlays": _boundary_overlay(result, style)}),
-        _Panel(kind="heatmap", title="Bar_i_model（投资意愿）", family="prob",
+        _Panel(kind="heatmap", title="Bar_i_model (investment intent)", family="prob",
                values=_or_nan(_surface(result, "eta1_bar_i_cond"), shape),
                options={"b_values": b_values, "z_values": z_values, "region": region}),
-        _Panel(kind="heatmap", title="Bar_i_executed（执行投资）", family="prob",
+        _Panel(kind="heatmap", title="Bar_i_executed (executed investment)", family="prob",
                values=_or_nan(_surface(result, "eta1_bar_i_eff"), shape),
                options={"b_values": b_values, "z_values": z_values, "region": region}),
-        _Panel(kind="contour", title="Grid bpI* - bp0*（投资分支杠杆溢价）", family="residual",
+        _Panel(kind="contour", title="Grid bpI* - bp0* (investment-branch leverage premium)", family="residual",
                values=_or_nan(canonical["Grid bpI*"] - canonical["Grid bp0*"], shape),
                options={"b_values": b_values, "z_values": z_values, "region": region,
                         "overlays": _boundary_overlay(result, style)}),
-        _Panel(kind="heatmap", title="存活区指示（Phat>0）", family="prob",
+        _Panel(kind="heatmap", title="survival indicator (Phat>0)", family="prob",
                values=_or_nan((1.0 - region.astype(np.float64)) if region is not None else None, shape),
                options={"b_values": b_values, "z_values": z_values,
                         "overlays": _boundary_overlay(result, style)}),
@@ -1679,7 +1743,7 @@ def render_f04(
         panels.append(
             _Panel(
                 kind="heatmap",
-                title="投资边界分类（0=" + ",1=".join(labels) + "）",
+                title="investment boundary classification (0=" + ",1=".join(labels) + ")",
                 family="bp",
                 values=pivoted,
                 options={"b_values": b_values, "z_values": z_values, "region": region},
@@ -1697,7 +1761,7 @@ def render_f04(
         eta="η=1",
         i_slice=_i_slice_text(result),
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={"canonical_3d": list(CANONICAL_3D_NAMES),
                "investment_status_counts": status_counts},
@@ -1714,7 +1778,7 @@ def render_f04(
         n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=episode_key, eta="η=1", i_slice=_i_slice_text(result),
-            data_source=str(meta["data_source"]), capital_weighted="否", n_samples=n_samples,
+            data_source=str(meta["data_source"]), capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -1733,12 +1797,12 @@ def render_f05(
     x = np.arange(len(episodes), dtype=np.float64)
     keys = list(episodes)
     styles = (
-        ("fresh_p0_normalized", "fresh P0 残差（normalized）"),
-        ("fresh_pi_normalized", "fresh PI 残差（normalized）"),
-        ("frozen_p0_normalized", "frozen P0 残差（normalized）"),
-        ("frozen_pi_normalized", "frozen PI 残差（normalized）"),
-        ("fresh_p0_physical", "fresh P0 残差（physical）"),
-        ("fresh_pi_physical", "fresh PI 残差（physical）"),
+        ("fresh_p0_normalized", "fresh P0 residual (normalized)"),
+        ("fresh_pi_normalized", "fresh PI residual (normalized)"),
+        ("frozen_p0_normalized", "frozen P0 residual (normalized)"),
+        ("frozen_pi_normalized", "frozen PI residual (normalized)"),
+        ("fresh_p0_physical", "fresh P0 residual (physical)"),
+        ("fresh_pi_physical", "fresh PI residual (physical)"),
     )
     panels = []
     total = 0
@@ -1762,15 +1826,15 @@ def render_f05(
                 _Panel(
                     kind="line",
                     title=label,
-                    xlabel="Episode（训练集数）",
-                    ylabel="残差 |R|（normalized=R/(1+exp(clamp(x+z)))）",
+                    xlabel="Episode (training rounds)",
+                    ylabel="residual |R| (normalized=R/(1+exp(clamp(x+z))))",
                     options={"series": series, "logy": "symlog"},
                 )
             )
     if not panels:
         return _skip("F05", REASON_NO_BELLMAN_METRICS)
     while len(panels) < 6:
-        panels.append(_Panel(kind="text", title="（无数据）", options={"text": "该口径未报残差统计"}))
+        panels.append(_Panel(kind="text", title="(no data)", options={"text": "no residual statistics reported for this caliber"}))
 
     counts = []
     for key in keys:
@@ -1779,16 +1843,16 @@ def render_f05(
     n_samples = int(sum(counts)) if sum(counts) else total
     meta = _base_meta(
         episode=f"{keys[0]}..{keys[-1]}",
-        eta="η∈{0,1} 混合（residual_stat_block 全体）",
-        i_slice="i=bank 全体",
+        eta="η∈{0,1} mixed (full residual_stat_block)",
+        i_slice="all bank states",
         data_source=_describe_bank_source(getattr(episodes[keys[-1]], "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={
             "episodes": [key for key in keys],
             "residual_definition": (
-                "frozen=训练冻结策略 Bellman 恒等式残差; "
-                "fresh=当前模型重新贪心求解的最优性残差"
+                "frozen=Bellman identity residual under the training-frozen policy; "
+                "fresh=optimality residual after re-solving greedily with the current model"
             ),
         },
     )
@@ -1806,9 +1870,9 @@ def render_f05(
             annotations,
             episode=meta["episode"],
             eta="η∈{0,1}",
-            i_slice="bank 全体",
+            i_slice="all bank states",
             data_source=str(meta["data_source"]),
-            capital_weighted="否",
+            capital_weighted="no",
             n_samples=n_samples,
         ),
     )
@@ -1877,9 +1941,9 @@ def render_f06(
         panels.append(
             _Panel(
                 kind="line",
-                title=f"{column} 跨集漂移",
-                xlabel="Episode e（相对 e-1 的差分）",
-                ylabel="mean |f_e - f_{e-1}|（固定 bank 状态逐行）",
+                title=f"{column} drift across episodes",
+                xlabel="Episode e (difference vs e-1)",
+                ylabel="mean |f_e - f_{e-1}| (row-by-row on fixed bank states)",
                 family=_family_of(column),
                 options={"series": [{"x": x, "y": array, "label": column}]},
             )
@@ -1937,9 +2001,9 @@ def render_f06(
         panels.append(
             _Panel(
                 kind="line",
-                title="决策翻转率（flip rate）",
-                xlabel="Episode e（相对 e-1 的差分）",
-                ylabel="翻转比例（阈值 policy_flip_tol）",
+                title="decision flip rate",
+                xlabel="Episode e (difference vs e-1)",
+                ylabel="flip share (threshold policy_flip_tol)",
                 options={"series": flip_series},
             )
         )
@@ -1961,7 +2025,7 @@ def render_f06(
         panels.append(
             _Panel(
                 kind="line",
-                title="comparator 工件漂移（comparison）",
+                title="comparator artifact drift (comparison)",
                 xlabel="Episode",
                 ylabel="mean_abs_diff",
                 options={"series": comparison_series},
@@ -1971,27 +2035,27 @@ def render_f06(
         panels.append(
             _Panel(
                 kind="text",
-                title="comparator 输入",
+                title="comparator input",
                 options={
-                    "text": "comparison=None 或格式不适用\n（本面板省略，漂移由 policy_rows 逐行重算）"
+                    "text": "comparison=None or unsupported format\n(panel omitted; drift is recomputed row-by-row from policy_rows)"
                 },
             )
         )
 
     while len(panels) < 9:
-        panels.append(_Panel(kind="text", title="（无数据）", options={"text": "该漂移口径不可用"}))
+        panels.append(_Panel(kind="text", title="(no data)", options={"text": "drift caliber unavailable"}))
 
     n_samples = int(len(next(iter(frames.values())))) * max(len(keys) - 1, 1)
     meta = _base_meta(
         episode=f"{keys[0]}..{keys[-1]}",
-        eta="η∈{0,1}（flip 统计在 η=1 行）",
-        i_slice="bank 全体",
+        eta="η∈{0,1} (flip statistics on the η=1 row)",
+        i_slice="all bank states",
         data_source=_describe_bank_source(getattr(episodes[keys[-1]], "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={
             "episodes": [key for key in keys],
-            "drift_definition": "同一固定 bank 状态逐行 |f_e - f_{e-1}| 的均值",
+            "drift_definition": "mean of row-wise |f_e - f_{e-1}| on the same fixed bank states",
         },
     )
     return _render_grid(
@@ -2005,8 +2069,8 @@ def render_f06(
         meta=meta,
         n_samples=n_samples,
         annotations=_annotation_dict(
-            annotations, episode=meta["episode"], eta="η∈{0,1}", i_slice="bank 全体",
-            data_source=str(meta["data_source"]), capital_weighted="否", n_samples=n_samples,
+            annotations, episode=meta["episode"], eta="η∈{0,1}", i_slice="all bank states",
+            data_source=str(meta["data_source"]), capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -2046,17 +2110,17 @@ def render_f07(
     panels = [
         _Panel(
             kind="scatter",
-            title="Hatcf_t vs Hatc_t（一步预测 vs 实现，shift=0）",
-            xlabel="Hatc_t = log(C/K) 实现聚合",
-            ylabel="Hatcf_t = 对 t 的信念预测",
-            options={"series": [{"x": hatc_x, "y": hatc_y, "label": "Bank D 宏观持有期"}]},
+            title="Hatcf_t vs Hatc_t (one-step forecast vs realized, shift=0)",
+            xlabel="Hatc_t = log(C/K) realized aggregate",
+            ylabel="Hatcf_t = belief forecast of t",
+            options={"series": [{"x": hatc_x, "y": hatc_y, "label": "Bank D macro holding period"}]},
         ),
         _Panel(
             kind="scatter",
-            title="LnKF_t vs LnK_t（资本信念 vs 实现）",
-            xlabel="LnK_t = log(ΣK) 实现聚合",
-            ylabel="LnKF_t = 对 t 的信念预测",
-            options={"series": [{"x": lnk_x, "y": lnk_y, "label": "Bank D 宏观持有期"}]},
+            title="LnKF_t vs LnK_t (capital belief vs realized)",
+            xlabel="LnK_t = log(ΣK) realized aggregate",
+            ylabel="LnKF_t = belief forecast of t",
+            options={"series": [{"x": lnk_x, "y": lnk_y, "label": "Bank D macro holding period"}]},
         ),
     ]
 
@@ -2069,24 +2133,24 @@ def render_f07(
             subset = frame.loc[path_column == path_id].sort_values("t", kind="mergesort")
             t_values = _table_column(subset, "t")
             path_series_hatc.append(
-                {"x": t_values, "y": _table_column(subset, "hatc_t"), "label": f"path {int(path_id)} 实现"}
+                {"x": t_values, "y": _table_column(subset, "hatc_t"), "label": f"path {int(path_id)} realized"}
             )
             path_series_hatc.append(
                 {"x": t_values, "y": _table_column(subset, "hatcf_t"),
-                 "label": f"path {int(path_id)} 预测", "linestyle": "--"}
+                 "label": f"path {int(path_id)} forecast", "linestyle": "--"}
             )
             path_series_lnk.append(
-                {"x": t_values, "y": _table_column(subset, "lnk_t"), "label": f"path {int(path_id)} 实现"}
+                {"x": t_values, "y": _table_column(subset, "lnk_t"), "label": f"path {int(path_id)} realized"}
             )
             path_series_lnk.append(
                 {"x": t_values, "y": _table_column(subset, "lnkf_t"),
-                 "label": f"path {int(path_id)} 预测", "linestyle": "--"}
+                 "label": f"path {int(path_id)} forecast", "linestyle": "--"}
             )
     panels.append(
         _Panel(
             kind="line",
-            title="Hatcf vs Hatc 路径（前 4 条 path）",
-            xlabel="t（宏观节点）",
+            title="Hatcf vs Hatc paths (first 4 paths)",
+            xlabel="t (macro node)",
             ylabel="Hatc / Hatcf",
             options={"series": path_series_hatc},
         )
@@ -2094,8 +2158,8 @@ def render_f07(
     panels.append(
         _Panel(
             kind="line",
-            title="LnKF vs LnK 路径（前 4 条 path）",
-            xlabel="t（宏观节点）",
+            title="LnKF vs LnK paths (first 4 paths)",
+            xlabel="t (macro node)",
             ylabel="LnK / LnKF",
             options={"series": path_series_lnk},
         )
@@ -2111,18 +2175,18 @@ def render_f07(
                 f"Bias={np.mean(err):.4g}  RMSE={np.sqrt(np.mean(err ** 2)):.4g}"
             )
     panels.append(
-        _Panel(kind="text", title="一步预测误差汇总", options={"text": "\n".join(stats_text) or "无数据"})
+        _Panel(kind="text", title="one-step forecast error summary", options={"text": "\n".join(stats_text) or "no data"})
     )
     panels.append(
         _Panel(
             kind="text",
-            title="口径说明",
+            title="caliber notes",
             options={
                 "text": (
-                    "hatcf/lnkf 是信念（firm 状态第 5/6 列）\n"
-                    "Hatc/LnK 是实现聚合\n"
-                    "同行 hatcf_t vs Hatc_t 即 shift=0 一步预测\n"
-                    "配对只走 (path,t,branch,economic_node_id) 键"
+                    "hatcf/lnkf are beliefs (firm state columns 5/6)\n"
+                    "Hatc/LnK are realized aggregates\n"
+                    "same-row hatcf_t vs Hatc_t is the shift=0 one-step forecast\n"
+                    "pairing uses only (path,t,branch,economic_node_id) keys"
                 )
             },
         )
@@ -2131,10 +2195,10 @@ def render_f07(
     n_samples = int(len(frame))
     meta = _base_meta(
         episode=key,
-        eta="不适用（宏观行）",
-        i_slice="不适用",
+        eta="n/a (macro rows)",
+        i_slice="n/a",
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={"pair_keys": ["path", "t", "branch", "economic_node_id"], "shift": 0},
     )
@@ -2150,7 +2214,7 @@ def render_f07(
         n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=key, data_source=str(meta["data_source"]),
-            capital_weighted="否", n_samples=n_samples,
+            capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -2192,9 +2256,9 @@ def render_f08(
         panels.append(
             _Panel(
                 kind="line",
-                title=f"宏观锚点递归路径 {name.replace('fc1_anchor_recursion_', '')}",
-                xlabel="递归步数 h",
-                ylabel="预测值（hatc_pred / lnk_pred）",
+                title=f"macro-anchor recursion path {name.replace('fc1_anchor_recursion_', '')}",
+                xlabel="recursion step h",
+                ylabel="forecast (hatc_pred / lnk_pred)",
                 options={
                     "series": [
                         {"x": _table_column(frame, "step"), "y": _table_column(frame, "hatc_pred"),
@@ -2212,9 +2276,9 @@ def render_f08(
         panels.append(
             _Panel(
                 kind="bar",
-                title="SDF M 条件均值（按宏观态）",
-                xlabel="宏观态（x 分位：Recession/Normal/Expansion）",
-                ylabel="E[M | 宏观态]（± 标准误）",
+                title="SDF M conditional mean (by macro state)",
+                xlabel="macro state (x quantile: Recession/Normal/Expansion)",
+                ylabel="E[M | macro state] (± standard error)",
                 options={"labels": labels, "values": _table_column(sdf_table, "M_mean"),
                          "yerr": _table_column(sdf_table, "M_mean_se"), "rotation": 15},
             )
@@ -2222,9 +2286,9 @@ def render_f08(
         panels.append(
             _Panel(
                 kind="bar",
-                title="归一化财富 Euler 残差（按宏观态）",
-                xlabel="宏观态",
-                ylabel="mean residual（± 标准误）",
+                title="normalized wealth Euler residual (by macro state)",
+                xlabel="macro state",
+                ylabel="mean residual (± standard error)",
                 options={"labels": labels, "values": _table_column(sdf_table, "mean_residual"),
                          "yerr": _table_column(sdf_table, "se_residual"), "rotation": 15},
             )
@@ -2242,30 +2306,30 @@ def render_f08(
         if name in metrics:
             lines.append(f"{name} = {float(metrics[name]):.6g}")
     panels.append(
-        _Panel(kind="text", title="SDF 数值安全与矩约束", options={"text": "\n".join(lines) or "无 SDF 指标"})
+        _Panel(kind="text", title="SDF numerical safety and moment constraints", options={"text": "\n".join(lines) or "no SDF metrics"})
     )
     panels.append(
         _Panel(
             kind="text",
-            title="口径护栏",
+            title="interpretation guardrails",
             options={
                 "text": (
-                    "Signed AiO 样本均值 ≠ 总体条件矩\n"
-                    "总体目标另报 sdf_population_target_*\n"
-                    "矩约束 g_* 与 AiO 分开报告，不混池"
+                    "sample mean of Signed AiO ≠ population conditional moment\n"
+                    "population targets are reported as sdf_population_target_*\n"
+                    "moment constraints g_* and AiO are reported separately, never pooled"
                 )
             },
         )
     )
     while len(panels) < 9:
-        panels.append(_Panel(kind="text", title="（无数据）", options={"text": "该面板数据缺失"}))
+        panels.append(_Panel(kind="text", title="(no data)", options={"text": "panel data missing"}))
 
     meta = _base_meta(
         episode=key,
-        eta="不适用（宏观行）",
-        i_slice="不适用",
+        eta="n/a (macro rows)",
+        i_slice="n/a",
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={"macro_anchors": sorted(anchors), "sdf_table_present": sdf_table is not None},
     )
@@ -2281,7 +2345,7 @@ def render_f08(
         n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=key, data_source=str(meta["data_source"]),
-            capital_weighted="否", n_samples=n_samples,
+            capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -2364,8 +2428,8 @@ def render_f09(
     panels = []
     n_samples = 0
     for caliber, weights, label in (
-        ("count", np.ones_like(b_values), "计数加权"),
-        ("capital", k_values, "资本加权"),
+        ("count", np.ones_like(b_values), "count weighted"),
+        ("capital", k_values, "capital weighted"),
     ):
         for state in ("recession", "normal", "expansion"):
             series = []
@@ -2387,16 +2451,16 @@ def render_f09(
                     {
                         "x": centers,
                         "y": hist,
-                        "label": f"t={slice_value:g}" if math.isfinite(slice_value) else "全部 t",
+                        "label": f"t={slice_value:g}" if math.isfinite(slice_value) else "all t",
                     }
                 )
                 n_samples += int(np.isfinite(subset).sum())
             panels.append(
                 _Panel(
                     kind="hist",
-                    title=f"{state}｜{label}",
-                    xlabel="b = 杠杆率 (债务/资本)",
-                    ylabel="分布质量（归一化）",
+                    title=f"{state} | {label}",
+                    xlabel="b = leverage ratio (debt/capital)",
+                    ylabel="distribution mass (normalized)",
                     options={"series": series, "fill": caliber == "count"},
                 )
             )
@@ -2405,13 +2469,13 @@ def render_f09(
 
     meta = _base_meta(
         episode=key,
-        eta="不适用（模拟截面）",
-        i_slice="不适用",
+        eta="n/a (simulation cross-section)",
+        i_slice="n/a",
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="计数加权与资本加权双口径（上行计数、下行资本）",
+        capital_weighted="count and capital weighted (top row count, bottom row capital)",
         extinct_paths=_describe_extinct(result),
         n_samples=n_samples,
-        extra={"macro_state_rule": "x 分位 (1/3, 2/3) → recession/normal/expansion",
+        extra={"macro_state_rule": "x quantiles (1/3, 2/3) → recession/normal/expansion",
                "time_slices": [float(v) for v in slices]},
     )
     return _render_grid(
@@ -2426,7 +2490,7 @@ def render_f09(
         n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=key, data_source=str(meta["data_source"]),
-            capital_weighted="双口径", extinct_paths=str(meta["extinct_paths"]),
+            capital_weighted="both calibers", extinct_paths=str(meta["extinct_paths"]),
             n_samples=n_samples,
         ),
     )
@@ -2491,18 +2555,18 @@ def render_f10(
             b_edges, z_edges, normalised.T, shading="flat", cmap=_cmap(style.cmap_density)
         )
         fig.colorbar(mesh, ax=ax_main, fraction=0.046, pad=0.02)
-        ax_main.set_xlabel("b = 杠杆率")
-        ax_main.set_ylabel("z = 企业生产率冲击")
+        ax_main.set_xlabel("b = leverage ratio")
+        ax_main.set_ylabel("z = firm productivity shock")
         ax_main.set_xlim(float(b_range[0]), float(b_range[1]))
         ax_main.set_ylim(float(z_range[0]), float(z_range[1]))
 
         ax_top.plot(b_centers, normalised.sum(axis=1), color="tab:blue")
         ax_top.fill_between(b_centers, normalised.sum(axis=1), alpha=0.25, color="tab:blue")
-        ax_top.set_ylabel("b 边缘")
+        ax_top.set_ylabel("b marginal")
         ax_top.tick_params(labelbottom=False)
         ax_side.plot(normalised.sum(axis=0), z_centers, color="tab:orange")
         ax_side.fill_betweenx(z_centers, normalised.sum(axis=0), alpha=0.25, color="tab:orange")
-        ax_side.set_xlabel("z 边缘")
+        ax_side.set_xlabel("z marginal")
         ax_side.tick_params(labelleft=False)
 
         if marginals is not None and {"t", "caliber", "axis", "bin_center", "weight"}.issubset(
@@ -2525,7 +2589,7 @@ def render_f10(
                     axis.plot(weights, centers, color="black", linestyle="--", linewidth=1.0)
 
         ax_top.set_title(
-            f"t={t_slice}｜caliber={caliber}（{'资本加权' if caliber == 'capital' else '计数加权'}）"
+            f"t={t_slice} | caliber={caliber} ({'capital weighted' if caliber == 'capital' else 'count weighted'})"
         )
         drawn += 1
         used.append({"title": f"t={t_slice}/{caliber}", "drawn": True})
@@ -2534,7 +2598,8 @@ def render_f10(
         plt.close(fig)
         return _skip("F10", REASON_NO_JOINT_HIST)
 
-    fig.suptitle(f"F10: {CAPTIONS['F10'].split('。')[0]}", fontsize=style.title_size + 1.5)
+    first_sentence = re.split(r"(?:。|\.\s)", CAPTIONS["F10"], maxsplit=1)[0]
+    fig.suptitle(f"F10: {first_sentence}", fontsize=style.title_size + 1.5)
     fig.subplots_adjust(left=0.06, right=0.955, top=0.90, bottom=0.115)
     footer = " | ".join(
         _annotation_lines(
@@ -2542,7 +2607,7 @@ def render_f10(
                 annotations,
                 episode=key,
                 data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-                capital_weighted="count/capital 双口径",
+                capital_weighted="count/capital dual caliber",
                 extinct_paths=_describe_extinct(result),
                 n_samples=total_cells,
             )
@@ -2554,10 +2619,10 @@ def render_f10(
 
     meta = _base_meta(
         episode=key,
-        eta="不适用（模拟截面）",
-        i_slice="不适用",
+        eta="n/a (simulation cross-section)",
+        i_slice="n/a",
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="count/capital 双口径",
+        capital_weighted="count/capital dual caliber",
         extinct_paths=_describe_extinct(result),
         n_samples=total_cells,
         extra={"time_slices": [{"t": t, "caliber": c} for t, c in selected],
@@ -2634,7 +2699,7 @@ def render_f11_waterfall(
         if row is None:
             ax.axis("off")
             continue
-        labels = ["期初资本", "存续 ΔK", "进入资本", "退出资本", "记账残差", "期末资本"]
+        labels = ["initial capital", "survivor ΔK", "entrant capital", "exiting capital", "accounting residual", "ending capital"]
         values = [
             float(row["initial_capital"]),
             float(row["incumbent_dk"]),
@@ -2666,12 +2731,12 @@ def render_f11_waterfall(
         ax.bar(np.arange(len(labels)), heights, bottom=bottoms, color=colors, alpha=0.85)
         ax.set_xticks(np.arange(len(labels)))
         ax.set_xticklabels(labels, rotation=25, ha="right")
-        ax.set_ylabel("资本（K）")
-        ax.set_title(f"资本 Waterfall t={int(t_from)}→{int(t_to)}")
+        ax.set_ylabel("capital (K)")
+        ax.set_title(f"capital waterfall t={int(t_from)}→{int(t_to)}")
         ax.grid(alpha=0.2, axis="y")
         residual = float(row.get("accounting_residual", float("nan")))
         ax.text(
-            0.02, 0.96, f"恒等式残差 = {residual:.3e}",
+            0.02, 0.96, f"identity residual = {residual:.3e}",
             transform=ax.transAxes, va="top", fontsize=style.legend_size,
         )
 
@@ -2679,18 +2744,18 @@ def render_f11_waterfall(
     if period_counts is not None and {"t", "active_paths"}.issubset(period_counts.columns):
         t_values = _table_column(period_counts, "t")
         for column, label in (
-            ("active_paths", "活跃 path"),
-            ("extinct_paths", "灭绝 path"),
-            ("n_alive_firms", "存活企业"),
-            ("n_defaults", "违约/退出数"),
-            ("n_entrants", "进入数"),
+            ("active_paths", "active paths"),
+            ("extinct_paths", "extinct paths"),
+            ("n_alive_firms", "surviving firms"),
+            ("n_defaults", "defaults/exits"),
+            ("n_entrants", "entrants"),
         ):
             values = _table_column(period_counts, column)
             if values is not None:
                 ax.plot(t_values, values, marker="o", markersize=3, label=label)
-        ax.set_xlabel("t（模拟期）")
-        ax.set_ylabel("计数")
-        ax.set_title("存活 / 违约 / 活跃 path 逐期账")
+        ax.set_xlabel("t (simulation period)")
+        ax.set_ylabel("count")
+        ax.set_title("surviving / default / active path account by period")
         ax.legend()
         ax.grid(alpha=0.25)
     elif path_status is not None and {"path", "extinct"}.issubset(path_status.columns):
@@ -2698,8 +2763,8 @@ def render_f11_waterfall(
         ax.bar(np.arange(2), [int((~flags).sum()), int(flags.sum())],
                color=["tab:green", "tab:red"])
         ax.set_xticks([0, 1])
-        ax.set_xticklabels(["存活 path", "灭绝 path"])
-        ax.set_title("path 状态（灭绝 path 保留在统计中）")
+        ax.set_xticklabels(["surviving paths", "extinct paths"])
+        ax.set_title("path status (extinct paths stay in the statistics)")
         ax.grid(alpha=0.2, axis="y")
 
     ax = fig.add_subplot(grid[1, 1])
@@ -2714,8 +2779,8 @@ def render_f11_waterfall(
             if values is not None:
                 ax.plot(t_values, values, marker="o", markersize=3, label=label)
         ax.set_xlabel("t")
-        ax.set_ylabel("计数")
-        ax.set_title("逐期事件计数")
+        ax.set_ylabel("count")
+        ax.set_title("period event counts")
         ax.legend()
         ax.grid(alpha=0.25)
     elif {"default_rate", "survival_rate"}.issubset(waterfall.columns):
@@ -2723,8 +2788,8 @@ def render_f11_waterfall(
         ax.plot(t_to, _table_column(waterfall, "survival_rate"), marker="o", label="survival_rate")
         ax.plot(t_to, _table_column(waterfall, "default_rate"), marker="o", label="default_rate")
         ax.set_xlabel("t_to")
-        ax.set_ylabel("比率")
-        ax.set_title("存活率 / 违约率")
+        ax.set_ylabel("rate")
+        ax.set_title("survival rate / default rate")
         ax.legend()
         ax.grid(alpha=0.25)
 
@@ -2736,10 +2801,11 @@ def render_f11_waterfall(
         ax.axhline(0.0, color="black", linewidth=1.0)
         ax.set_xlabel("t_to")
         ax.set_ylabel("accounting_residual")
-        ax.set_title("资本恒等式残差（应贴近 0）")
+        ax.set_title("capital identity residual (should stay near 0)")
         ax.grid(alpha=0.25)
 
-    fig.suptitle(f"F11: {CAPTIONS['F11'].split('。')[0]}", fontsize=style.title_size + 1.5)
+    first_sentence = re.split(r"(?:。|\.\s)", CAPTIONS["F11"], maxsplit=1)[0]
+    fig.suptitle(f"F11: {first_sentence}", fontsize=style.title_size + 1.5)
     fig.subplots_adjust(left=0.05, right=0.98, top=0.90, bottom=0.135, hspace=0.55, wspace=0.30)
     footer = " | ".join(
         _annotation_lines(
@@ -2747,7 +2813,7 @@ def render_f11_waterfall(
                 annotations,
                 episode=key,
                 data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-                capital_weighted="资本账本（总量口径）",
+                capital_weighted="capital ledger (aggregate caliber)",
                 extinct_paths=_describe_extinct(result),
                 n_samples=n_samples,
             )
@@ -2759,10 +2825,10 @@ def render_f11_waterfall(
 
     meta = _base_meta(
         episode=key,
-        eta="不适用（模拟截面）",
-        i_slice="不适用",
+        eta="n/a (simulation cross-section)",
+        i_slice="n/a",
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="资本账本（总量口径）",
+        capital_weighted="capital ledger (aggregate caliber)",
         extinct_paths=_describe_extinct(result),
         n_samples=n_samples,
         extra={
@@ -2830,14 +2896,14 @@ def render_f12(
         panels.append(
             _Panel(
                 kind="line",
-                title="Bellman 残差收敛",
+                title="Bellman residual convergence",
                 xlabel="Episode",
-                ylabel="MAE（normalized）",
+                ylabel="MAE (normalized)",
                 options={"series": series, "logy": "symlog"},
             )
         )
     else:
-        panels.append(_Panel(kind="text", title="Bellman", options={"text": "无 bellman 结果"}))
+        panels.append(_Panel(kind="text", title="Bellman", options={"text": "no bellman results"}))
 
     policy = blocks["policy"]
     if len(policy) >= 2:
@@ -2861,14 +2927,14 @@ def render_f12(
         panels.append(
             _Panel(
                 kind="line",
-                title="P / 策略漂移",
-                xlabel="Episode e（相对 e-1）",
+                title="P / policy drift",
+                xlabel="Episode e (vs e-1)",
                 ylabel="mean |Δ|",
                 options={"series": series},
             )
         )
     else:
-        panels.append(_Panel(kind="text", title="价值/策略漂移", options={"text": "episode 数不足（<2）"}))
+        panels.append(_Panel(kind="text", title="value/policy drift", options={"text": "insufficient episodes (<2)"}))
 
     macro = blocks["macro"]
     if macro:
@@ -2876,9 +2942,9 @@ def render_f12(
         x = np.arange(len(keys), dtype=np.float64)
         series = []
         for metric, label in (
-            ("fc1_one_step_hatc_mae", "hatc 一步 MAE"),
-            ("fc1_one_step_lnk_mae", "lnk 一步 MAE"),
-            ("sdf_g_max", "SDF 矩约束最大违反"),
+            ("fc1_one_step_hatc_mae", "hatc one-step MAE"),
+            ("fc1_one_step_lnk_mae", "lnk one-step MAE"),
+            ("sdf_g_max", "max SDF moment-constraint violation"),
         ):
             array = np.asarray(
                 [float(_result_metrics(macro[key]).get(metric, float("nan"))) for key in keys],
@@ -2890,14 +2956,14 @@ def render_f12(
         panels.append(
             _Panel(
                 kind="line",
-                title="FC1 一步误差与 SDF 约束",
+                title="FC1 one-step error and SDF constraints",
                 xlabel="Episode",
-                ylabel="指标值",
+                ylabel="metric value",
                 options={"series": series},
             )
         )
     else:
-        panels.append(_Panel(kind="text", title="宏观 / SDF", options={"text": "无 macro 结果"}))
+        panels.append(_Panel(kind="text", title="macro / SDF", options={"text": "no macro results"}))
 
     sim = blocks["sim"]
     if sim:
@@ -2905,8 +2971,8 @@ def render_f12(
         x = np.arange(len(keys), dtype=np.float64)
         series = []
         for metric, label in (
-            ("sim_baseline_capital_change_t0_t1", "t0→t1 资本变化"),
-            ("sim_baseline_initial_cohort_default_share_t1", "初始 cohort 违约份额"),
+            ("sim_baseline_capital_change_t0_t1", "capital change t0→t1"),
+            ("sim_baseline_initial_cohort_default_share_t1", "initial cohort default share"),
         ):
             array = np.asarray(
                 [float(_result_metrics(sim[key]).get(metric, float("nan"))) for key in keys],
@@ -2918,39 +2984,40 @@ def render_f12(
         panels.append(
             _Panel(
                 kind="line",
-                title="固定冲击 rollout 汇总",
+                title="fixed-shock rollout summary",
                 xlabel="Episode",
-                ylabel="指标值",
+                ylabel="metric value",
                 options={"series": series},
             )
         )
     else:
-        panels.append(_Panel(kind="text", title="模拟 / 分布", options={"text": "无 sim 结果"}))
+        panels.append(_Panel(kind="text", title="simulation / distribution", options={"text": "no sim results"}))
 
-    coverage = "结果块覆盖：" + ", ".join(
-        f"{name}={'有' if blocks[name] else '无'}" for name in blocks
+    coverage = "result block coverage: " + ", ".join(
+        f"{name}={'yes' if blocks[name] else 'no'}" for name in blocks
     )
-    panels.append(_Panel(kind="text", title="数据覆盖", options={"text": coverage}))
+    panels.append(_Panel(kind="text", title="data coverage", options={"text": coverage}))
     panels.append(
         _Panel(
             kind="text",
-            title="判据说明",
+            title="criterion notes",
             options={
                 "text": (
-                    "收敛 = 企业值/策略 + 宏观信念 + 定价核 同时稳定\n"
-                    "训练 loss 不作收敛证据\n"
-                    "阈值未配置时不判 PASS/FAIL（THRESHOLD_NOT_CONFIGURED）"
+                    "convergence = firm values/policies + macro beliefs + pricing kernel all stable\n"
+                    "training loss is not convergence evidence\n"
+                    "no PASS/FAIL verdict when thresholds are unconfigured\n"
+                    "(THRESHOLD_NOT_CONFIGURED)"
                 )
             },
         )
     )
 
     meta = _base_meta(
-        episode="多 episode 汇总",
+        episode="multi-episode summary",
         eta="η∈{0,1}",
-        i_slice="bank 全体",
-        data_source="多 bank 汇总",
-        capital_weighted="各面板见自身口径",
+        i_slice="all bank states",
+        data_source="multi-bank summary",
+        capital_weighted="per-panel caliber",
         n_samples=n_samples,
         extra={"result_blocks": present},
     )
@@ -2965,8 +3032,8 @@ def render_f12(
         meta=meta,
         n_samples=n_samples,
         annotations=_annotation_dict(
-            annotations, episode="多 episode", eta="η∈{0,1}",
-            data_source="多 bank 汇总", capital_weighted="混合口径", n_samples=n_samples,
+            annotations, episode="multi-episode", eta="η∈{0,1}",
+            data_source="multi-bank summary", capital_weighted="mixed calibers", n_samples=n_samples,
         ),
     )
 
@@ -3011,7 +3078,7 @@ def _value_series_figure(
         panels.append(
             _Panel(
                 kind="3d",
-                title=f"3D {surface_key}（{_eta_label(view)}）",
+                title=f"3D {surface_key} ({_eta_label(view)})",
                 family=family,
                 values=view_values,
                 options={"b_values": b_values, "z_values": z_values},
@@ -3020,7 +3087,7 @@ def _value_series_figure(
         panels.append(
             _Panel(
                 kind="contour",
-                title=f"等高线 {surface_key}（{_eta_label(view)}）+ 违约边界",
+                title=f"contour {surface_key} ({_eta_label(view)}) + default boundary",
                 family=family,
                 values=view_values,
                 options={"b_values": b_values, "z_values": z_values,
@@ -3028,17 +3095,17 @@ def _value_series_figure(
             )
         )
     while len(panels) < 4:
-        panels.append(_Panel(kind="text", title="（无数据）", options={"text": "该 η 视图曲面缺失"}))
+        panels.append(_Panel(kind="text", title="(no data)", options={"text": "surface missing for this η view"}))
 
     n_samples = int(sum(_n_finite(item.values) for item in panels if item.values is not None))
     meta = _base_meta(
         episode=episode_key,
-        eta="η=1 / η=0 双视图",
+        eta="η=1 / η=0 dual view",
         i_slice=_i_slice_text(result),
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
-        extra={"surface": surface_key, "canonical_3d_note": "canonical 集见 F01"},
+        extra={"surface": surface_key, "canonical_3d_note": "canonical set: see F01"},
     )
     return _render_grid(
         figure_id,
@@ -3052,7 +3119,7 @@ def _value_series_figure(
         n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=episode_key, eta="η=1/η=0", i_slice=_i_slice_text(result),
-            data_source=str(meta["data_source"]), capital_weighted="否", n_samples=n_samples,
+            data_source=str(meta["data_source"]), capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -3090,15 +3157,15 @@ def render_v03(*, policy_results, output_dir, style=None, episode=None, annotati
     region = phat <= 0.0
     overlays = _boundary_overlay(result, style)
     panels = [
-        _Panel(kind="3d", title="3D P（η=1，投资选择后股权价值）", family="value", values=p_values,
+        _Panel(kind="3d", title="3D P (η=1, equity value after investment choice)", family="value", values=p_values,
                options={"b_values": b_values, "z_values": z_values}),
-        _Panel(kind="contour", title="P + Phat≤0 违约区", family="value", values=p_values,
+        _Panel(kind="contour", title="P + Phat≤0 default region", family="value", values=p_values,
                options={"b_values": b_values, "z_values": z_values,
                         "region": region, "overlays": overlays}),
-        _Panel(kind="heatmap", title="Phat(b,z)（硬违约判别，≤0 违约）", family="value", values=phat,
+        _Panel(kind="heatmap", title="Phat(b,z) (hard-default discriminant, ≤0 = default)", family="value", values=phat,
                options={"b_values": b_values, "z_values": z_values,
                         "region": region, "overlays": overlays}),
-        _Panel(kind="heatmap", title="违约区指示（Phat≤0）", family="prob",
+        _Panel(kind="heatmap", title="default region indicator (Phat≤0)", family="prob",
                values=region.astype(np.float64),
                options={"b_values": b_values, "z_values": z_values, "overlays": overlays}),
     ]
@@ -3108,17 +3175,17 @@ def render_v03(*, policy_results, output_dir, style=None, episode=None, annotati
         eta="η=1",
         i_slice=_i_slice_text(result),
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={"default_region_share": float(region.mean()),
-               "phat_semantics": "Phat≤0 为硬违约；bar_z 是软概率，不混用"},
+               "phat_semantics": "Phat≤0 = hard default; bar_z is a soft probability, never mixed"},
     )
     return _render_grid(
         "V03", panels, rows=2, cols=2, output_dir=Path(output_dir), style=style,
         caption=CAPTIONS["V03"], meta=meta, n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=episode_key, eta="η=1", i_slice=_i_slice_text(result),
-            data_source=str(meta["data_source"]), capital_weighted="否", n_samples=n_samples,
+            data_source=str(meta["data_source"]), capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -3133,10 +3200,10 @@ def render_v04(*, policy_results, output_dir, style=None, episode=None, annotati
         return _skip("V04", REASON_NO_GRID_AXES)
     b_values, z_values = axes_pair
     spec = (
-        ("eta1_Q_claim", "Q Claim = b₊·q_unit（发行定价口径）"),
-        ("eta1_q_unit", "q_unit（单位债券价）"),
-        ("eta1_Q_effective", "Q Effective（结算口径，hybrid 含违约硬门）"),
-        ("eta1_recovery", "recovery = φ(1-δ+exp(x+z))（违约回收）"),
+        ("eta1_Q_claim", "Q Claim = b₊·q_unit (issuance pricing caliber)"),
+        ("eta1_q_unit", "q_unit (unit bond price)"),
+        ("eta1_Q_effective", "Q Effective (settlement caliber, hybrid includes the hard default gate)"),
+        ("eta1_recovery", "recovery = φ(1-δ+exp(x+z)) (default recovery)"),
     )
     panels = []
     for key, label in spec:
@@ -3161,7 +3228,7 @@ def render_v04(*, policy_results, output_dir, style=None, episode=None, annotati
         eta="η=1",
         i_slice=_i_slice_text(result),
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={"q_calibers": ["Q_claim", "q_unit", "Q_effective", "recovery"]},
     )
@@ -3170,7 +3237,7 @@ def render_v04(*, policy_results, output_dir, style=None, episode=None, annotati
         caption=CAPTIONS["V04"], meta=meta, n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=episode_key, eta="η=1", i_slice=_i_slice_text(result),
-            data_source=str(meta["data_source"]), capital_weighted="否", n_samples=n_samples,
+            data_source=str(meta["data_source"]), capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -3195,7 +3262,7 @@ def render_v05(*, policy_results, output_dir, style=None, episode=None, annotati
         panels.append(
             _Panel(
                 kind="contour",
-                title=f"{label} 等高线 + 硬/软违约边界",
+                title=f"{label} contours + hard/soft default boundaries",
                 family=_family_of(key),
                 values=values,
                 options={"b_values": b_values, "z_values": z_values,
@@ -3207,9 +3274,9 @@ def render_v05(*, policy_results, output_dir, style=None, episode=None, annotati
         panels.append(
             _Panel(
                 kind="line",
-                title="硬边界 Phat=0 vs 软边界 bar_z=0.5",
-                xlabel="b = 杠杆率",
-                ylabel="z 边界",
+                title="hard boundary Phat=0 vs soft boundary bar_z=0.5",
+                xlabel="b = leverage ratio",
+                ylabel="z boundary",
                 options={
                     "series": [
                         {"x": _table_column(hard_soft, "b"),
@@ -3222,14 +3289,14 @@ def render_v05(*, policy_results, output_dir, style=None, episode=None, annotati
             )
         )
     else:
-        panels.append(_Panel(kind="text", title="边界对照", options={"text": "hard_soft_boundary 表缺失"}))
+        panels.append(_Panel(kind="text", title="boundary comparison", options={"text": "hard_soft_boundary table missing"}))
     n_samples = int(sum(_n_finite(item.values) for item in panels if item.values is not None))
     meta = _base_meta(
         episode=episode_key,
         eta="η=1",
         i_slice=_i_slice_text(result),
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
     )
     return _render_grid(
@@ -3237,7 +3304,7 @@ def render_v05(*, policy_results, output_dir, style=None, episode=None, annotati
         caption=CAPTIONS["V05"], meta=meta, n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=episode_key, eta="η=1", i_slice=_i_slice_text(result),
-            data_source=str(meta["data_source"]), capital_weighted="否", n_samples=n_samples,
+            data_source=str(meta["data_source"]), capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -3282,7 +3349,7 @@ def render_v06(*, policy_results, output_dir, style=None, annotations=None) -> F
             panels.append(
                 _Panel(
                     kind="heatmap",
-                    title=f"Δ{family}（{keys[-2]} → {keys[-1]}）",
+                    title=f"Δ{family} ({keys[-2]} → {keys[-1]})",
                     family="residual",
                     values=last_delta,
                     options={"b_values": b_values, "z_values": z_values,
@@ -3293,12 +3360,12 @@ def render_v06(*, policy_results, output_dir, style=None, annotations=None) -> F
     if not panels:
         return _skip("V06", REASON_NO_POLICY_SURFACES)
     while len(panels) < 3:
-        panels.append(_Panel(kind="text", title="（无数据）", options={"text": "该曲面缺失"}))
+        panels.append(_Panel(kind="text", title="(no data)", options={"text": "surface missing"}))
     panels.append(
         _Panel(
             kind="line",
-            title="跨集价值漂移汇总",
-            xlabel="Episode e（相对 e-1）",
+            title="value drift summary",
+            xlabel="Episode e (vs e-1)",
             ylabel="mean |Δvalue|",
             options={"series": summary_series},
         )
@@ -3308,7 +3375,7 @@ def render_v06(*, policy_results, output_dir, style=None, annotations=None) -> F
         eta="η=1",
         i_slice=_i_slice_text(episodes[keys[-1]]),
         data_source=_describe_bank_source(getattr(episodes[keys[-1]], "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={"episodes": [key for key in keys]},
     )
@@ -3317,7 +3384,7 @@ def render_v06(*, policy_results, output_dir, style=None, annotations=None) -> F
         caption=CAPTIONS["V06"], meta=meta, n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=meta["episode"], eta="η=1", i_slice=meta["i_slice"],
-            data_source=str(meta["data_source"]), capital_weighted="否", n_samples=n_samples,
+            data_source=str(meta["data_source"]), capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -3368,20 +3435,20 @@ def render_p03(*, policy_results, output_dir, style=None, episode=None, annotati
     panels = [
         _Panel(
             kind="scatter",
-            title="b_next vs b（η=0 强制 b_next=b）",
-            xlabel="b 当前杠杆",
+            title="b_next vs b (η=0 forces b_next=b)",
+            xlabel="b current leverage",
             ylabel="b_next = η·bp* + (1-η)·b",
             options={
                 "series": [
-                    {"x": b[eta0], "y": b_next[eta0], "label": "η=0（refi 关闭）", "color": "tab:blue"},
-                    {"x": b[eta1], "y": b_next[eta1], "label": "η=1（refi active）", "color": "tab:orange"},
+                    {"x": b[eta0], "y": b_next[eta0], "label": "η=0 (refi off)", "color": "tab:blue"},
+                    {"x": b[eta1], "y": b_next[eta1], "label": "η=1 (refi active)", "color": "tab:orange"},
                 ]
             },
         ),
         _Panel(
             kind="scatter",
-            title="b_next vs z（生产率对执行杠杆的影响）",
-            xlabel="z = 企业生产率冲击",
+            title="b_next vs z (productivity effect on executed leverage)",
+            xlabel="z = firm productivity shock",
             ylabel="b_next",
             options={
                 "series": [
@@ -3393,9 +3460,9 @@ def render_p03(*, policy_results, output_dir, style=None, episode=None, annotati
         ),
         _Panel(
             kind="scatter",
-            title="Grid bp* vs 头输出 bp_head（头仅兼容）",
-            xlabel="Grid bp*（正式策略）",
-            ylabel="bp_head（兼容输出）",
+            title="Grid bp* vs head output bp_head (head is compatibility only)",
+            xlabel="Grid bp* (formal policy)",
+            ylabel="bp_head (compatibility output)",
             options={
                 "series": [
                     {"x": bp_star[eta1],
@@ -3409,12 +3476,12 @@ def render_p03(*, policy_results, output_dir, style=None, episode=None, annotati
     panels.append(
         _Panel(
             kind="line",
-            title="Δb = b_next - b（按 η）",
-            xlabel="b 当前杠杆",
+            title="Δb = b_next - b (by η)",
+            xlabel="b current leverage",
             ylabel="Δb",
             options={
                 "series": [
-                    {"x": b[eta0], "y": delta[eta0], "label": "η=0（应恒为 0）",
+                    {"x": b[eta0], "y": delta[eta0], "label": "η=0 (must be 0)",
                      "marker": "o", "markersize": 2},
                     {"x": b[eta1], "y": delta[eta1], "label": "η=1",
                      "marker": "o", "markersize": 2},
@@ -3430,7 +3497,7 @@ def render_p03(*, policy_results, output_dir, style=None, episode=None, annotati
         eta="η=0 / η=1",
         i_slice=_i_slice_text(result),
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={
             "financing_gate": "b_next = eta_t * bp + (1 - eta_t) * b_t",
@@ -3443,7 +3510,7 @@ def render_p03(*, policy_results, output_dir, style=None, episode=None, annotati
         caption=CAPTIONS["P03"], meta=meta, n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=episode_key, eta="η=0/η=1", i_slice=meta["i_slice"],
-            data_source=str(meta["data_source"]), capital_weighted="否", n_samples=n_samples,
+            data_source=str(meta["data_source"]), capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -3474,29 +3541,29 @@ def render_p04(*, policy_results, output_dir, style=None, episode=None, annotati
         if continuation is not None:
             series.append({"x": bp, "y": continuation, "label": "continuation", "linestyle": ":"})
         if q_claim is not None:
-            series.append({"x": bp, "y": q_claim, "label": "Q_claim（发行定价）", "linestyle": "-."})
+            series.append({"x": bp, "y": q_claim, "label": "Q_claim (issuance pricing)", "linestyle": "-."})
         eta_value = float(group["eta"].iloc[0]) if "eta" in group.columns else float("nan")
         panels.append(
             _Panel(
                 kind="line",
-                title=f"row {int(row_index)}｜branch={branch}｜η={eta_value:g}",
-                xlabel="候选下一期杠杆 bp",
-                ylabel="目标值 / 发行定价",
+                title=f"row {int(row_index)} | branch={branch} | η={eta_value:g}",
+                xlabel="candidate next-period leverage bp",
+                ylabel="objective value / issuance pricing",
                 options={"series": series},
             )
         )
         n_samples += int(len(group))
     while len(panels) < 4:
-        panels.append(_Panel(kind="text", title="（无数据）", options={"text": "代表性状态不足"}))
+        panels.append(_Panel(kind="text", title="(no data)", options={"text": "insufficient representative states"}))
 
     metrics = _result_metrics(result)
     flatness = float(metrics.get("objective_slice_eta0_flatness_max_abs", float("nan")))
     meta = _base_meta(
         episode=episode_key,
-        eta="η=0 / η=1（η=0 目标应为常数）",
+        eta="η=0 / η=1 (η=0 objective must be flat)",
         i_slice=_i_slice_text(result),
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={"eta0_objective_flatness_max_abs": flatness,
                "representative_states": sorted({int(v) for v in slices["row_index"].tolist()})},
@@ -3506,7 +3573,7 @@ def render_p04(*, policy_results, output_dir, style=None, episode=None, annotati
         caption=CAPTIONS["P04"], meta=meta, n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=episode_key, eta="η=0/η=1", i_slice=meta["i_slice"],
-            data_source=str(meta["data_source"]), capital_weighted="否", n_samples=n_samples,
+            data_source=str(meta["data_source"]), capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -3549,20 +3616,20 @@ def render_m01(*, macro_results, output_dir, style=None, annotations=None) -> Fi
         _Panel(
             kind="scatter",
             title="Hatcf_t vs Hatc_t",
-            xlabel="Hatc_t 实现（log(C/K)）",
-            ylabel="Hatcf_t 信念预测",
+            xlabel="Hatc_t realized (log(C/K))",
+            ylabel="Hatcf_t belief forecast",
             options={"series": [{"x": hatc_x, "y": hatc_y, "label": "hatc"}]},
         ),
         _Panel(
             kind="scatter",
             title="LnKF_t vs LnK_t",
-            xlabel="LnK_t 实现（log ΣK）",
-            ylabel="LnKF_t 信念预测",
+            xlabel="LnK_t realized (log ΣK)",
+            ylabel="LnKF_t belief forecast",
             options={"series": [{"x": lnk_x, "y": lnk_y, "label": "lnk"}]},
         ),
         _Panel(
             kind="text",
-            title="一步预测统计",
+            title="one-step forecast statistics",
             options={
                 "text": (
                     "hatc: " + _regression_stats(hatc_x, hatc_y) + "\n"
@@ -3572,13 +3639,13 @@ def render_m01(*, macro_results, output_dir, style=None, annotations=None) -> Fi
         ),
         _Panel(
             kind="text",
-            title="对齐语义",
+            title="alignment semantics",
             options={
                 "text": (
-                    "hatcf_t/lnkf_t = t-1 对节点 t 的预测\n"
-                    "hatc_t/lnk_t = 节点 t 实现聚合\n"
-                    "同行对齐 = shift=0（一步预测）\n"
-                    "配对键 (path,t,branch,economic_node_id)"
+                    "hatcf_t/lnkf_t = t-1 forecasts of node t\n"
+                    "hatc_t/lnk_t = node t realized aggregates\n"
+                    "same-row alignment = shift=0 (one-step forecast)\n"
+                    "pairing key (path,t,branch,economic_node_id)"
                 )
             },
         ),
@@ -3586,10 +3653,10 @@ def render_m01(*, macro_results, output_dir, style=None, annotations=None) -> Fi
     n_samples = int(len(frame))
     meta = _base_meta(
         episode=key,
-        eta="不适用",
-        i_slice="不适用",
+        eta="n/a",
+        i_slice="n/a",
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
     )
     return _render_grid(
@@ -3597,7 +3664,7 @@ def render_m01(*, macro_results, output_dir, style=None, annotations=None) -> Fi
         caption=CAPTIONS["M01"], meta=meta, n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=key, data_source=str(meta["data_source"]),
-            capital_weighted="否", n_samples=n_samples,
+            capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -3634,8 +3701,8 @@ def _path_figure(
         panels.append(
             _Panel(
                 kind="line",
-                title=f"{title}｜path {int(path_id)}",
-                xlabel="t（宏观节点）",
+                title=f"{title} | path {int(path_id)}",
+                xlabel="t (macro node)",
                 ylabel=ylabel,
                 options={
                     "series": [
@@ -3651,14 +3718,14 @@ def _path_figure(
     if not panels:
         return _skip(figure_id, REASON_NO_MACRO_PAIRS)
     while len(panels) < 6:
-        panels.append(_Panel(kind="text", title="（无数据）", options={"text": "path 数量不足"}))
+        panels.append(_Panel(kind="text", title="(no data)", options={"text": "insufficient paths"}))
 
     meta = _base_meta(
         episode=key,
-        eta="不适用",
-        i_slice="不适用",
+        eta="n/a",
+        i_slice="n/a",
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={"paths": [int(value) for value in selected], "n_paths_total": int(len(paths))},
     )
@@ -3667,7 +3734,7 @@ def _path_figure(
         caption=CAPTIONS[figure_id], meta=meta, n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=key, data_source=str(meta["data_source"]),
-            capital_weighted="否", n_samples=n_samples,
+            capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -3719,18 +3786,18 @@ def render_m04(*, macro_results, output_dir, style=None, annotations=None) -> Fi
         panels.append(
             _Panel(
                 kind="line",
-                title=f"{label} 递归误差 vs horizon",
-                xlabel="horizon h（递归步数）",
-                ylabel="误差（MAE / RMSE）",
+                title=f"{label} recursion error vs horizon",
+                xlabel="horizon h (recursion steps)",
+                ylabel="error (MAE / RMSE)",
                 options={"series": series_mae},
             )
         )
         panels.append(
             _Panel(
                 kind="line",
-                title=f"{label} 递归偏差 vs horizon",
+                title=f"{label} recursion bias vs horizon",
                 xlabel="horizon h",
-                ylabel="bias（forecast - realized）",
+                ylabel="bias (forecast - realized)",
                 options={"series": series_bias},
             )
         )
@@ -3740,31 +3807,31 @@ def render_m04(*, macro_results, output_dir, style=None, annotations=None) -> Fi
         for name in sorted(metrics)
         if "drift_slope" in name or "out_of_training_range" in name or name.endswith("_diverged")
     ]
-    panels.append(_Panel(kind="text", title="漂移与出训练范围",
-                         options={"text": "\n".join(lines[:18]) or "无"}))
+    panels.append(_Panel(kind="text", title="drift and out-of-training-range",
+                         options={"text": "\n".join(lines[:18]) or "none"}))
     panels.append(
         _Panel(
             kind="text",
-            title="两口径定义",
+            title="two-caliber definitions",
             options={
                 "text": (
-                    "production_one_step：每次 FC1 喂父节点算得宏观态\n"
-                    "autonomous_recursive：完全自回归，误差随 h 累积\n"
-                    "两口径分开报，不合并"
+                    "production_one_step: macro state computed from the parent node at every call\n"
+                    "autonomous_recursive: fully autoregressive, error accumulates with h\n"
+                    "the two calibers are reported separately, never merged"
                 )
             },
         )
     )
     while len(panels) < 6:
-        panels.append(_Panel(kind="text", title="（无数据）", options={"text": "该变量缺失"}))
+        panels.append(_Panel(kind="text", title="(no data)", options={"text": "variable missing"}))
 
     n_samples = int(table["n"].sum()) if "n" in table.columns else int(len(table))
     meta = _base_meta(
         episode=key,
-        eta="不适用",
-        i_slice="不适用",
+        eta="n/a",
+        i_slice="n/a",
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={"calibers": sorted(set(table["caliber"].astype(str)))},
     )
@@ -3773,7 +3840,7 @@ def render_m04(*, macro_results, output_dir, style=None, annotations=None) -> Fi
         caption=CAPTIONS["M04"], meta=meta, n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=key, data_source=str(meta["data_source"]),
-            capital_weighted="否", n_samples=n_samples,
+            capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -3796,27 +3863,27 @@ def render_m05(*, macro_results, output_dir, style=None, annotations=None) -> Fi
     if table is not None and not table.empty:
         labels = table["macro_state"].astype(str).tolist()
         panels.append(
-            _Panel(kind="bar", title="E[M | 宏观态]（± 标准误）",
-                   xlabel="宏观态", ylabel="M 均值",
+            _Panel(kind="bar", title="E[M | macro state] (± standard error)",
+                   xlabel="macro state", ylabel="M mean",
                    options={"labels": labels, "values": _table_column(table, "M_mean"),
                             "yerr": _table_column(table, "M_mean_se"), "rotation": 15})
         )
         panels.append(
-            _Panel(kind="bar", title="归一化财富 Euler 残差（± 标准误）",
-                   xlabel="宏观态", ylabel="mean residual",
+            _Panel(kind="bar", title="normalized wealth Euler residual (± standard error)",
+                   xlabel="macro state", ylabel="mean residual",
                    options={"labels": labels, "values": _table_column(table, "mean_residual"),
                             "yerr": _table_column(table, "se_residual"), "rotation": 15})
         )
         panels.append(
-            _Panel(kind="bar", title="各宏观态样本量",
-                   xlabel="宏观态", ylabel="n_parents",
+            _Panel(kind="bar", title="sample count by macro state",
+                   xlabel="macro state", ylabel="n_parents",
                    options={"labels": labels, "values": _table_column(table, "n_parents"),
                             "rotation": 15})
         )
     else:
-        for title in ("宏观态分解", "残差分解", "样本量"):
+        for title in ("macro-state decomposition", "residual decomposition", "sample size"):
             panels.append(_Panel(kind="text", title=title,
-                                 options={"text": "sdf_macro_state_summary 缺失"}))
+                                 options={"text": "sdf_macro_state_summary missing"}))
 
     labels = []
     values = []
@@ -3825,8 +3892,8 @@ def render_m05(*, macro_results, output_dir, style=None, annotations=None) -> Fi
             labels.append(name.replace("sdf_", ""))
             values.append(float(sdf_metrics[name]))
     panels.append(
-        _Panel(kind="bar", title="矩约束违反量（g_*，应为 ≤0）",
-               xlabel="约束", ylabel="违反量",
+        _Panel(kind="bar", title="moment-constraint violations (g_*, should be ≤0)",
+               xlabel="constraint", ylabel="violation",
                options={"labels": labels, "values": np.asarray(values, dtype=np.float64),
                         "rotation": 15})
     )
@@ -3840,24 +3907,24 @@ def render_m05(*, macro_results, output_dir, style=None, annotations=None) -> Fi
     ):
         if name in sdf_metrics:
             lines.append(f"{name} = {float(sdf_metrics[name]):.6g}")
-    panels.append(_Panel(kind="text", title="SDF 分布与数值安全",
-                         options={"text": "\n".join(lines) or "无"}))
+    panels.append(_Panel(kind="text", title="SDF distribution and numerical safety",
+                         options={"text": "\n".join(lines) or "none"}))
     panels.append(
         _Panel(
             kind="text",
-            title="解读护栏",
+            title="interpretation guardrails",
             options={
                 "text": (
-                    "Signed AiO 负样本均值 ≠ 负总体条件矩\n"
-                    "总体目标另报 sdf_population_target_*\n"
-                    "约束违反量与 AiO 分开报告\n"
-                    "M 口径：rawM vs trainM(clipped) 须声明"
+                    "negative sample mean of Signed AiO ≠ negative population conditional moment\n"
+                    "population targets are reported as sdf_population_target_*\n"
+                    "constraint violations and AiO are reported separately\n"
+                    "M caliber: rawM vs trainM(clipped) must be declared"
                 )
             },
         )
     )
     while len(panels) < 6:
-        panels.append(_Panel(kind="text", title="（无数据）", options={"text": "该面板数据缺失"}))
+        panels.append(_Panel(kind="text", title="(no data)", options={"text": "panel data missing"}))
 
     n_samples = (
         int(table["n_parents"].sum())
@@ -3866,10 +3933,10 @@ def render_m05(*, macro_results, output_dir, style=None, annotations=None) -> Fi
     )
     meta = _base_meta(
         episode=key,
-        eta="不适用",
-        i_slice="不适用",
+        eta="n/a",
+        i_slice="n/a",
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="否",
+        capital_weighted="no",
         n_samples=n_samples,
         extra={"sdf_metric_count": len(sdf_metrics)},
     )
@@ -3878,7 +3945,7 @@ def render_m05(*, macro_results, output_dir, style=None, annotations=None) -> Fi
         caption=CAPTIONS["M05"], meta=meta, n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=key, data_source=str(meta["data_source"]),
-            capital_weighted="否", n_samples=n_samples,
+            capital_weighted="no", n_samples=n_samples,
         ),
     )
 
@@ -3923,18 +3990,18 @@ def render_m06(*, sim_results, output_dir, style=None, annotations=None) -> Figu
     panels = []
     if ck_series is not None and t_h is not None:
         panels.append(
-            _Panel(kind="line", title="C/K（= exp(Hatc)，Hatc=log(C/K)）",
-                   xlabel="t（模拟期）", ylabel="C/K",
+            _Panel(kind="line", title="C/K (= exp(Hatc), Hatc=log(C/K))",
+                   xlabel="t (simulation period)", ylabel="C/K",
                    options={"series": [{"x": t_h, "y": ck_series, "label": "C/K"}]})
         )
     if k_series is not None:
         panels.append(
-            _Panel(kind="line", title="总资本 K", xlabel="t", ylabel="K = Σ K_i",
+            _Panel(kind="line", title="total capital K", xlabel="t", ylabel="K = Σ K_i",
                    options={"series": [{"x": t_k, "y": k_series, "label": "K"}]})
         )
     if c_series is not None:
         panels.append(
-            _Panel(kind="line", title="总消费 C", xlabel="t", ylabel="C",
+            _Panel(kind="line", title="total consumption C", xlabel="t", ylabel="C",
                    options={"series": [{"x": t_c, "y": c_series, "label": "C"}]})
         )
 
@@ -3944,16 +4011,16 @@ def render_m06(*, sim_results, output_dir, style=None, annotations=None) -> Figu
             {"t": _table_column(firm_panel, "t"), "v": _table_column(firm_panel, "Y")}
         ).groupby("t", sort=True)["v"].sum()
         panels.append(
-            _Panel(kind="line", title="总产出 Y", xlabel="t", ylabel="Y = Σ Y_i",
+            _Panel(kind="line", title="total output Y", xlabel="t", ylabel="Y = Σ Y_i",
                    options={"series": [{"x": grouped.index.to_numpy(dtype=np.float64),
                                         "y": grouped.to_numpy(dtype=np.float64), "label": "Y"}]})
         )
     else:
-        panels.append(_Panel(kind="text", title="总产出 Y",
-                             options={"text": "firm_panel 无 Y 列（本面板省略）"}))
+        panels.append(_Panel(kind="text", title="total output Y",
+                             options={"text": "firm_panel has no Y column (panel omitted)"}))
 
     drawn_investment = False
-    for column, label in (("I_total", "总投资 I"), ("I_oper", "运营投资"), ("I_entry", "进入投资")):
+    for column, label in (("I_total", "total investment I"), ("I_oper", "operating investment"), ("I_entry", "entry investment")):
         if column in frame.columns:
             t_i, values = _aggregate(_table_column(frame, column))
             if values is not None and t_i is not None:
@@ -3964,30 +4031,30 @@ def render_m06(*, sim_results, output_dir, style=None, annotations=None) -> Figu
                 drawn_investment = True
                 break
     if not drawn_investment:
-        panels.append(_Panel(kind="text", title="投资 I",
-                             options={"text": "macro_panel 无 I_* 列（本面板省略）"}))
+        panels.append(_Panel(kind="text", title="investment I",
+                             options={"text": "macro_panel has no I_* columns (panel omitted)"}))
 
     while len(panels) < 6:
-        panels.append(_Panel(kind="text", title="（无数据）", options={"text": "该聚合量缺失"}))
+        panels.append(_Panel(kind="text", title="(no data)", options={"text": "aggregate missing"}))
 
     n_samples = int(len(frame))
     meta = _base_meta(
         episode=key,
-        eta="不适用（模拟聚合）",
-        i_slice="不适用",
+        eta="n/a (simulation aggregates)",
+        i_slice="n/a",
         data_source=_describe_bank_source(getattr(result, "diagnostics", None)),
-        capital_weighted="总量口径（Σ）",
+        capital_weighted="aggregate caliber (Σ)",
         extinct_paths=_describe_extinct(result),
         n_samples=n_samples,
-        extra={"aggregation": "同 (path,t) 内跨企业求和/均值，path 间再平均",
-               "view_filter": "branch<0 优先（parent 视图），否则 branch==0"},
+        extra={"aggregation": "sum/mean across firms within (path,t), then averaged across paths",
+               "view_filter": "branch<0 preferred (parent view), else branch==0"},
     )
     return _render_grid(
         "M06", panels, rows=2, cols=3, output_dir=Path(output_dir), style=style,
         caption=CAPTIONS["M06"], meta=meta, n_samples=n_samples,
         annotations=_annotation_dict(
             annotations, episode=key, data_source=str(meta["data_source"]),
-            capital_weighted="总量口径", extinct_paths=str(meta["extinct_paths"]),
+            capital_weighted="aggregate caliber", extinct_paths=str(meta["extinct_paths"]),
             n_samples=n_samples,
         ),
     )
@@ -4058,9 +4125,9 @@ def render_all_figures(
 
     annotations = {
         "Macro Anchor": _describe_macro_anchor(bank),
-        "数据分布来源": _describe_bank_source(bank),
-        "资本加权": "各图见自身口径",
-        "灭绝 path": _describe_extinct(sim_results),
+        "Data source": _describe_bank_source(bank),
+        "Capital weighted": "see each figure's caliber",
+        "Extinct paths": _describe_extinct(sim_results),
     }
 
     inputs = {
