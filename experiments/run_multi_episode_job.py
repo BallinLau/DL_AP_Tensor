@@ -803,6 +803,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Episode id stamped into the h-star audit filename",
     )
+    parser.add_argument(
+        "--hstar-recalib-count",
+        type=int,
+        default=None,
+        help="Number of periodic h-star recalibrations per simulation rollout "
+        "(t=0 initial calibration excluded); resolves to every=max(1, horizon//(count+1)); "
+        "0 = initial calibration only",
+    )
+    parser.add_argument(
+        "--hstar-recalib-every",
+        type=int,
+        default=None,
+        help="Engine-level periodic h-star recalibration cadence in time steps "
+        "(0 = initial calibration only); ignored when --hstar-recalib-count > 0",
+    )
     parser.add_argument("--bp-distill-patience", type=int, default=None, help="BP distillation early-stop patience")
     parser.add_argument("--bp-distill-min-delta", type=float, default=None, help="BP distillation validation min delta")
     parser.add_argument(
@@ -1617,6 +1632,10 @@ def configure_hyperparams(args: argparse.Namespace):
         )
     if args.initial_hstar_audit_episode_id is not None:
         hyperparams.initial_hstar_audit_episode_id = args.initial_hstar_audit_episode_id
+    if args.hstar_recalib_count is not None:
+        hyperparams.hstar_recalib_count = int(args.hstar_recalib_count)
+    if args.hstar_recalib_every is not None:
+        hyperparams.hstar_recalib_every = int(args.hstar_recalib_every)
     if args.bp_distill_patience is not None:
         hyperparams.bp_distill_patience = args.bp_distill_patience
     if args.bp_distill_min_delta is not None:
@@ -1808,6 +1827,10 @@ def configure_hyperparams(args: argparse.Namespace):
             raise ValueError("initial_hstar_residual_tolerance must be positive.")
         if float(getattr(hyperparams, "initial_hstar_parity_tolerance", 1e-5)) <= 0.0:
             raise ValueError("initial_hstar_parity_tolerance must be positive.")
+    if int(getattr(hyperparams, "hstar_recalib_count", 0)) < 0:
+        raise ValueError("hstar_recalib_count must be nonnegative.")
+    if int(getattr(hyperparams, "hstar_recalib_every", 0)) < 0:
+        raise ValueError("hstar_recalib_every must be nonnegative.")
     hyperparams.policy_value_bellman_only = args.ablation_mode == "bellman_only"
     hyperparams.pv_fixed_sdf = args.ablation_mode == "fixed_sdf"
     hyperparams.pv_fixed_policy = args.ablation_mode == "fixed_policy"

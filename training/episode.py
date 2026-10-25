@@ -1223,6 +1223,12 @@ class Episode:
             self.hyperparams, "initial_hstar_audit_output_dir", None
         )
         sim_kwargs["initial_hstar_audit_episode_id"] = int(self.episode_id)
+        sim_kwargs["hstar_recalib_count"] = int(
+            getattr(self.hyperparams, "hstar_recalib_count", 0)
+        )
+        sim_kwargs["hstar_recalib_every"] = int(
+            getattr(self.hyperparams, "hstar_recalib_every", 0)
+        )
         source = self._simulation_bp_action_source()
         # The formal source is controlled only by HyperParams. This prevents a
         # stale caller-provided kwarg from silently switching a replay back to

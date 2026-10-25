@@ -174,6 +174,17 @@ class HyperParams:
     initial_hstar_width_tolerance: float = 1e-5
     initial_hstar_audit_output_dir: Optional[str] = None
     initial_hstar_audit_episode_id: int = -1
+    # Experimental periodic h-star recalibration on the production ledger.
+    # User-facing knob: `hstar_recalib_count` = number of PERIODIC
+    # recalibrations per simulation rollout (the t=0 initial calibration above
+    # is counted separately and never duplicated).  count > 0 resolves to
+    # every = max(1, horizon // (count + 1)) and wins over `hstar_recalib_every`
+    # with a warning when both are nonzero.
+    # Engine-facing knob: `hstar_recalib_every` = one event at every t with
+    # t % N == 0 (t=0 only when the initial calibration is off).
+    # Both 0 keep the initial-calibration-only (legacy) behavior.
+    hstar_recalib_count: int = 0
+    hstar_recalib_every: int = 0
     # Hybrid Firm P solver. ``fixed_target_cache`` keeps the legacy EP3 P stage
     # (frozen Teacher value target + Huber regression); the formal Hybrid
     # configuration uses ``frozen_policy_dynamic_residual``: each Firm Inner
