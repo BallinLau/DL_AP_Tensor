@@ -835,6 +835,10 @@ def evaluate_firm_policy(
         )
         for name, values in view_surfaces.items():
             surfaces[f"{prefix}{name}"] = np.asarray(values)
+        # ``evaluate_firm_surfaces`` keeps ``PI`` per i-slice only; roll the
+        # ``i_mid`` slice up under the plain name like P0/P/Q (see OUTPUT_FIELDS).
+        if f"{prefix}PI_mid" in surfaces:
+            surfaces.setdefault(f"{prefix}PI", surfaces[f"{prefix}PI_mid"])
 
         investment_frame, investment_metrics, investment_arrays = solve_investment_boundary(
             model,

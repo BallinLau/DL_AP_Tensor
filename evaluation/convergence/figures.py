@@ -1082,12 +1082,27 @@ def grid_axes(result):
     return None
 
 
+# Key aliases for evaluator surfaces that are only exposed under a slice
+# qualifier: ``evaluation.firm_surfaces.evaluate_firm_surfaces`` rolls most
+# fields up under their plain name (the ``i_mid`` slice) but keeps ``PI`` only
+# per i-slice, so ``{prefix}PI`` lookups fall back to the ``i_mid`` slice.
+_SURFACE_KEY_ALIASES = {
+    "PI": ("PI_mid",),
+    "eta0_PI": ("eta0_PI_mid",),
+    "eta1_PI": ("eta1_PI_mid",),
+}
+
+
 def _surface(result, name: str):
-    values = _result_surfaces(result).get(name)
-    if values is None:
-        return None
-    array = np.asarray(values, dtype=np.float64)
-    return array if array.ndim == 2 else None
+    surfaces = _result_surfaces(result)
+    for key in (name, *_SURFACE_KEY_ALIASES.get(name, ())):
+        values = surfaces.get(key)
+        if values is None:
+            continue
+        array = np.asarray(values, dtype=np.float64)
+        if array.ndim == 2:
+            return array
+    return None
 
 
 def _canonical_surfaces(result):
