@@ -89,6 +89,43 @@ CALIBER_NOTE = (
 )
 
 
+def _module_device(model: torch.nn.Module) -> torch.device:
+    """Execution device of a model: the device of its parameters.
+
+    The model parameter device is authoritative: every chunk tensor must be
+    moved onto it before a forward call, and every statistic is moved back with
+    ``.cpu()`` before numpy export.
+    """
+    for parameter in model.parameters():
+        return parameter.device
+    return torch.device("cpu")
+
+
+def _bank_payload_on_device(
+    bank: Mapping[str, Any],
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Shallow-copy of a bank payload with its tensors moved to ``device``.
+
+    ``build_transition_for_checkpoint`` has no device parameter and rebuilds the
+    transition on the device of ``parent_states``; moving the payload here (in
+    the evaluator, without touching ``eval_bank``) lands every transition tensor
+    on the model device before any forward runs.
+    """
+    moved: Dict[str, Any] = dict(bank)
+    for key in ("parent_states", "hatc_cal", "lnk_cal"):
+        value = bank.get(key)
+        if torch.is_tensor(value):
+            moved[key] = value.to(device)
+    shock_payload = bank.get("shock_bank")
+    if isinstance(shock_payload, Mapping):
+        moved["shock_bank"] = {
+            key: value.to(device) if torch.is_tensor(value) else value
+            for key, value in shock_payload.items()
+        }
+    return moved
+
+
 def build_bellman_losses(
     economic_config: AnalysisEconomicConfig,
 ) -> Tuple[P0Loss, PILoss]:
@@ -174,12 +211,16 @@ def build_grid_teacher(
 
 def split_transition(
     transition: CheckpointTransition,
+    *,
+    device: Optional[torch.device] = None,
 ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split a checkpoint transition into teacher/frozen-solver inputs.
 
     Returns ``(children_list, m_used, m_raw, child_weights)`` where the child
     lists are ``2J`` tensors of shape ``[N, 7]`` (exact-eta expanded) and the M
     tensors keep the ``[N, 2J, 1]`` layout required by ``BPGridTeacher``.
+    ``device`` moves every returned tensor onto the model device before any
+    forward (a no-op when the transition already lives there).
     """
     children = transition.children
     n_parent, n_child, _ = children.shape
@@ -187,6 +228,11 @@ def split_transition(
     m_used = transition.m_used.reshape(n_parent, n_child, 1)
     m_raw = transition.m_raw.reshape(n_parent, n_child, 1)
     weights = transition.branch_weights.reshape(n_parent, n_child)
+    if device is not None:
+        children_list = [item.to(device) for item in children_list]
+        m_used = m_used.to(device)
+        m_raw = m_raw.to(device)
+        weights = weights.to(device)
     return children_list, m_used, m_raw, weights
 
 
@@ -310,9 +356,10 @@ def _forward_fields(
     *,
     chunk_size: int,
 ) -> Dict[str, torch.Tensor]:
+    device = _module_device(model)
     collected: Dict[str, List[torch.Tensor]] = {name: [] for name in fields}
     for start, stop in iter_row_chunks(states.shape[0], chunk_size):
-        output = model(states[start:stop])
+        output = model(states[start:stop].to(device))
         for name in fields:
             if isinstance(output, dict):
                 value = output[name]
@@ -322,10 +369,13 @@ def _forward_fields(
     return {name: torch.cat(parts, dim=0) for name, parts in collected.items()}
 
 
-def _call_chunked(fn, states: torch.Tensor, *, chunk_size: int) -> torch.Tensor:
+def _call_chunked(fn, states: torch.Tensor, *, chunk_size: int, device: Optional[torch.device] = None) -> torch.Tensor:
     parts = []
     for start, stop in iter_row_chunks(states.shape[0], chunk_size):
-        parts.append(fn(states[start:stop]).detach())
+        chunk = states[start:stop]
+        if device is not None:
+            chunk = chunk.to(device)
+        parts.append(fn(chunk).detach())
     return torch.cat(parts, dim=0)
 
 
@@ -347,11 +397,14 @@ def q_caliber_tensors(
     residuals; ``Q_effective`` is the settlement caliber and only diverges from
     the claim in ``hybrid_regime`` (realized-default hard gate).
     """
+    device = _module_device(model)
+    states = states.to(device)
     equity = {
         name: _call_chunked(
             lambda chunk, field=name: model.forward_equity(chunk)[field],
             states,
             chunk_size=chunk_size,
+            device=device,
         )
         for name in ("Phat", "P", "bar_z", "survival_prob")
     }
@@ -360,9 +413,9 @@ def q_caliber_tensors(
     x = states[:, 4:5]
     z = states[:, 1:2]
     q_parameterization = str(getattr(model, "q_parameterization", "direct"))
-    q_claim = _call_chunked(model._q_claim_output, states, chunk_size=chunk_size)
+    q_claim = _call_chunked(model._q_claim_output, states, chunk_size=chunk_size, device=device)
     if q_parameterization in {"b_times_unit", "hybrid_regime"}:
-        q_unit = _call_chunked(model._q_unit_output, states, chunk_size=chunk_size)
+        q_unit = _call_chunked(model._q_unit_output, states, chunk_size=chunk_size, device=device)
     else:
         # Direct mode predicts total debt value; q_unit is a derived reporting
         # ratio and is undefined at b <= 0 (no epsilon division).
@@ -373,7 +426,7 @@ def q_caliber_tensors(
         )
     recovery_fn = getattr(model, "_q_recovery_output", None)
     if callable(recovery_fn):
-        recovery = _call_chunked(recovery_fn, states, chunk_size=chunk_size)
+        recovery = _call_chunked(recovery_fn, states, chunk_size=chunk_size, device=device)
     else:
         recovery = compute_recovery_target(
             b, x, z,
@@ -391,7 +444,9 @@ def q_caliber_tensors(
         effective_parts = []
         for start, stop in iter_row_chunks(states.shape[0], chunk_size):
             effective_parts.append(
-                model._q_effective_output(states[start:stop], phat=phat[start:stop]).detach()
+                model._q_effective_output(
+                    states[start:stop].to(device), phat=phat[start:stop].to(device)
+                ).detach()
             )
         q_effective = torch.cat(effective_parts, dim=0)
     else:
@@ -423,6 +478,9 @@ def q_issue_claim_at_candidates(
     """
     if candidates.ndim != 2:
         raise ValueError("candidates must have shape [N, K]")
+    device = _module_device(model)
+    parent_states = parent_states.to(device)
+    candidates = candidates.to(device)
     n_rows, n_grid = candidates.shape
     issue_state = (
         parent_states.unsqueeze(1)
@@ -506,10 +564,11 @@ def q_bellman_targets(
     """
     if m_mode not in {"trainM", "rawM"}:
         raise ValueError(f"m_mode must be 'trainM' or 'rawM', got {m_mode!r}")
-    parent = transition.parent_states
-    children = transition.children[..., :7]
-    m_values = transition.m_used if m_mode == "trainM" else transition.m_raw
-    weights = transition.branch_weights.unsqueeze(-1)
+    device = _module_device(model)
+    parent = transition.parent_states.to(device)
+    children = transition.children[..., :7].to(device)
+    m_values = (transition.m_used if m_mode == "trainM" else transition.m_raw).to(device)
+    weights = transition.branch_weights.unsqueeze(-1).to(device)
 
     q_claim = q_calibers["Q_claim"]
     b = parent[:, 0:1]
@@ -670,8 +729,9 @@ def build_frozen_policy_problem(
         max_expanded_states=config.teacher_max_expanded_states,
     )
     p0_loss, pi_loss = build_bellman_losses(cp.economic_config)
-    parent = transition.parent_states
-    children_list, m_used, m_raw, weights = split_transition(transition)
+    device = _module_device(model)
+    parent = transition.parent_states.to(device)
+    children_list, m_used, m_raw, weights = split_transition(transition, device=device)
     n_rows = int(parent.shape[0])
 
     # Both calibers are always reported: residual_tensors exposes the physical
@@ -683,7 +743,7 @@ def build_frozen_policy_problem(
         normalize = has_scale
 
     if source is None:
-        source_ids = torch.full((n_rows,), -1, dtype=torch.long)
+        source_ids = torch.full((n_rows,), -1, dtype=torch.long, device=device)
     else:
         source_ids = torch.tensor(
             [
@@ -691,6 +751,7 @@ def build_frozen_policy_problem(
                 for label in source
             ],
             dtype=torch.long,
+            device=device,
         )
 
     problem: List[FrozenPolicyBatch] = []
@@ -698,18 +759,18 @@ def build_frozen_policy_problem(
     parity_rows: List[Dict[str, Any]] = []
     for start, stop in iter_row_chunks(n_rows, config.parent_chunk_size):
         chunk = slice(start, stop)
-        child_chunk = [item[chunk] for item in children_list]
+        child_chunk = [item[chunk].to(device) for item in children_list]
         p0_branch, err0, ok0 = build_frozen_branch(
             teacher=teacher,
             model=model,
             q_model=q_model,
             p0_loss=p0_loss,
             pi_loss=pi_loss,
-            parent=parent[chunk],
+            parent=parent[chunk].to(device),
             children=child_chunk,
-            m_used=m_used[chunk],
-            raw_m=m_raw[chunk],
-            child_weights=weights[chunk],
+            m_used=m_used[chunk].to(device),
+            raw_m=m_raw[chunk].to(device),
+            child_weights=weights[chunk].to(device),
             branch="p0",
             normalize_by_value_scale=normalize,
         )
@@ -719,11 +780,11 @@ def build_frozen_policy_problem(
             q_model=q_model,
             p0_loss=p0_loss,
             pi_loss=pi_loss,
-            parent=parent[chunk],
+            parent=parent[chunk].to(device),
             children=child_chunk,
-            m_used=m_used[chunk],
-            raw_m=m_raw[chunk],
-            child_weights=weights[chunk],
+            m_used=m_used[chunk].to(device),
+            raw_m=m_raw[chunk].to(device),
+            child_weights=weights[chunk].to(device),
             branch="pi",
             normalize_by_value_scale=normalize,
         )
@@ -800,14 +861,14 @@ def _collect_frozen_rows(
         valuei_rows.append(batch.pi.production_value.reshape(-1).detach().cpu())
 
     def _cat(items: List[torch.Tensor]) -> np.ndarray:
-        return torch.cat(items).to(torch.float64).numpy() if items else np.empty(0)
+        return torch.cat(items).to(torch.float64).cpu().numpy() if items else np.empty(0)
 
     return {
-        "frozen_r0_physical": frozen_rows["p0"].to(torch.float64).numpy(),
-        "frozen_ri_physical": frozen_rows["pi"].to(torch.float64).numpy(),
-        "frozen_r0_normalized": frozen_rows["p0_norm"].to(torch.float64).numpy(),
-        "frozen_ri_normalized": frozen_rows["pi_norm"].to(torch.float64).numpy(),
-        "frozen_row_finite": frozen_rows["row_finite"].numpy().astype(bool),
+        "frozen_r0_physical": frozen_rows["p0"].to(torch.float64).cpu().numpy(),
+        "frozen_ri_physical": frozen_rows["pi"].to(torch.float64).cpu().numpy(),
+        "frozen_r0_normalized": frozen_rows["p0_norm"].to(torch.float64).cpu().numpy(),
+        "frozen_ri_normalized": frozen_rows["pi_norm"].to(torch.float64).cpu().numpy(),
+        "frozen_row_finite": frozen_rows["row_finite"].cpu().numpy().astype(bool),
         "fresh_r0_physical": _cat(fresh_physical_p0),
         "fresh_ri_physical": _cat(fresh_physical_pi),
         "fresh_r0_normalized": _cat(fresh_norm_p0),
@@ -866,6 +927,13 @@ def _evaluate_grid_chunked(
     evaluator can evaluate extra candidate grids (dense discretization
     diagnostics, objective slices) without violating the expanded-state cap.
     """
+    device = _module_device(teacher.target_model)
+    parent_state = parent_state.to(device)
+    children = [item.to(device) for item in children] if not torch.is_tensor(children) else children.to(device)
+    m_list = m_list.to(device)
+    bp_grid = bp_grid.to(device)
+    if child_weights is not None:
+        child_weights = child_weights.to(device)
     n_parent = int(parent_state.shape[0])
     n_children = int(len(children))
     plan = resolve_grid_chunk_plan(
@@ -915,8 +983,9 @@ def _dense_grid_discretization(
     diagnostic of the coarse+fine Grid BP search.  eta = 0 rows are forced
     (flat objective) and are flagged rather than mixed into the gap statistics.
     """
-    parent = transition.parent_states
-    children_list, m_used, _m_raw, weights = split_transition(transition)
+    device = _module_device(teacher.target_model)
+    parent = transition.parent_states.to(device)
+    children_list, m_used, _m_raw, weights = split_transition(transition, device=device)
     n_rows = int(parent.shape[0])
     dense = torch.linspace(
         float(teacher.grid_min),
@@ -929,16 +998,16 @@ def _dense_grid_discretization(
     records: List[Dict[str, Any]] = []
     for start, stop in iter_row_chunks(n_rows, config.parent_chunk_size):
         chunk = slice(start, stop)
-        parent_chunk = parent[chunk]
+        parent_chunk = parent[chunk].to(device)
         dense_grid = dense.expand(parent_chunk.shape[0], dense.shape[1])
         values = _evaluate_grid_chunked(
             teacher,
             parent_chunk,
-            [item[chunk] for item in children_list],
-            m_used[chunk],
+            [item[chunk].to(device) for item in children_list],
+            m_used[chunk].to(device),
             dense_grid,
             branch="p0",
-            child_weights=weights[chunk],
+            child_weights=weights[chunk].to(device),
         )
         value_grid = values["value_grid"]
         argmax = value_grid.argmax(dim=1, keepdim=True)
@@ -947,10 +1016,10 @@ def _dense_grid_discretization(
         # Compare against the teacher's own coarse+fine star on the same rows.
         solved = teacher.compute_value_target(
             parent_state=parent_chunk,
-            children=[item[chunk] for item in children_list],
-            m_list=m_used[chunk],
+            children=[item[chunk].to(device) for item in children_list],
+            m_list=m_used[chunk].to(device),
             branch="p0",
-            child_weights=weights[chunk],
+            child_weights=weights[chunk].to(device),
         )
         grid_star = solved["bp_star"].reshape(-1)
         grid_value = solved["value_star"].reshape(-1)
@@ -987,6 +1056,7 @@ def evaluate_firm_bellman(
     """
     config = config if config is not None else BellmanEvalConfig()
     model = cp.models["policy_value"]
+    device = _module_device(model)
     n_rows = int(torch.as_tensor(bank["parent_states"]).shape[0])
     labels = source_labels(bank, n_rows)
     recovery_mode, recovery_source = _resolve_recovery_mode(cp, config)
@@ -996,12 +1066,12 @@ def evaluate_firm_bellman(
         for module in cp.models.values():
             module.eval()
         transition = build_transition_for_checkpoint(
-            bank,
+            _bank_payload_on_device(bank, device),
             cp.models["sdf_fc1"],
             cp.hyperparams,
             cp.economic_config,
         )
-        parent = transition.parent_states
+        parent = transition.parent_states.to(device)
         teacher = build_grid_teacher(
             cp,
             target_model=resolve_teacher_target_model(cp, teacher_target=config.teacher_target),
@@ -1019,7 +1089,7 @@ def evaluate_firm_bellman(
 
         # ---- fresh-greedy residual (explicit re-solve variant) ----
         if config.fresh_greedy_source == "resolve":
-            children_list, m_used, _m_raw, weights = split_transition(transition)
+            children_list, m_used, _m_raw, weights = split_transition(transition, device=device)
             fresh_p0: List[torch.Tensor] = []
             fresh_pi: List[torch.Tensor] = []
             fresh_physical_p0: List[torch.Tensor] = []
@@ -1029,7 +1099,7 @@ def evaluate_firm_bellman(
                 scale = (
                     model.equity_value_scale(parent[chunk]).clamp_min(1e-12)
                     if callable(getattr(model, "equity_value_scale", None))
-                    else torch.ones((stop - start, 1))
+                    else torch.ones((stop - start, 1), device=parent.device, dtype=parent.dtype)
                 )
                 p0_online, pi_online = model._value_outputs(parent[chunk])
                 for branch, online, sink, phys_sink in (
@@ -1037,19 +1107,19 @@ def evaluate_firm_bellman(
                     ("pi", pi_online, fresh_pi, fresh_physical_pi),
                 ):
                     target = teacher.compute_value_target(
-                        parent_state=parent[chunk],
-                        children=[item[chunk] for item in children_list],
-                        m_list=m_used[chunk],
+                        parent_state=parent[chunk].to(device),
+                        children=[item[chunk].to(device) for item in children_list],
+                        m_list=m_used[chunk].to(device),
                         branch=branch,
-                        child_weights=weights[chunk],
+                        child_weights=weights[chunk].to(device),
                     )
                     physical = online - target["value_star"]
                     phys_sink.append(physical.reshape(-1).detach().cpu())
                     sink.append((physical / scale).reshape(-1).detach().cpu())
-            collected["fresh_r0_normalized"] = torch.cat(fresh_p0).to(torch.float64).numpy()
-            collected["fresh_ri_normalized"] = torch.cat(fresh_pi).to(torch.float64).numpy()
-            collected["fresh_r0_physical"] = torch.cat(fresh_physical_p0).to(torch.float64).numpy()
-            collected["fresh_ri_physical"] = torch.cat(fresh_physical_pi).to(torch.float64).numpy()
+            collected["fresh_r0_normalized"] = torch.cat(fresh_p0).to(torch.float64).cpu().numpy()
+            collected["fresh_ri_normalized"] = torch.cat(fresh_pi).to(torch.float64).cpu().numpy()
+            collected["fresh_r0_physical"] = torch.cat(fresh_physical_p0).to(torch.float64).cpu().numpy()
+            collected["fresh_ri_physical"] = torch.cat(fresh_physical_pi).to(torch.float64).cpu().numpy()
 
         # ---- Q calibers and targets ----
         calibers = q_caliber_tensors(
@@ -1077,13 +1147,13 @@ def evaluate_firm_bellman(
         # ---- dense BP candidate grid discretization error ----
         discretization = _dense_grid_discretization(teacher, transition, config)
 
-    parent_np = parent.detach().to(torch.float64).numpy()
+    parent_np = parent.detach().to(torch.float64).cpu().numpy()
     eta = parent_np[:, 2]
     b = parent_np[:, 0]
     z = parent_np[:, 1]
     scale_np = collected["value_scale"]
-    phat_np = calibers["Phat"].detach().to(torch.float64).numpy().reshape(-1)
-    bar_z_np = calibers["bar_z"].detach().to(torch.float64).numpy().reshape(-1)
+    phat_np = calibers["Phat"].detach().to(torch.float64).cpu().numpy().reshape(-1)
+    bar_z_np = calibers["bar_z"].detach().to(torch.float64).cpu().numpy().reshape(-1)
 
     regions = q_region_masks(
         b,
@@ -1132,16 +1202,16 @@ def evaluate_firm_bellman(
     )
 
     # ---- Q region residual blocks (claim / unit / effective / recovery) ----
-    q_claim = calibers["Q_claim"].detach().to(torch.float64).numpy().reshape(-1)
-    q_unit = calibers["q_unit"].detach().to(torch.float64).numpy().reshape(-1)
-    q_effective = calibers["Q_effective"].detach().to(torch.float64).numpy().reshape(-1)
-    recovery = calibers["recovery"].detach().to(torch.float64).numpy().reshape(-1)
-    recovery_target = calibers["recovery_target"].detach().to(torch.float64).numpy().reshape(-1)
+    q_claim = calibers["Q_claim"].detach().to(torch.float64).cpu().numpy().reshape(-1)
+    q_unit = calibers["q_unit"].detach().to(torch.float64).cpu().numpy().reshape(-1)
+    q_effective = calibers["Q_effective"].detach().to(torch.float64).cpu().numpy().reshape(-1)
+    recovery = calibers["recovery"].detach().to(torch.float64).cpu().numpy().reshape(-1)
+    recovery_target = calibers["recovery_target"].detach().to(torch.float64).cpu().numpy().reshape(-1)
     q_region_rows: List[Dict[str, Any]] = []
     for m_mode in ("trainM", "rawM"):
         target = targets[m_mode]
-        q_target_bellman = target["q_target_bellman"].detach().to(torch.float64).numpy().reshape(-1)
-        q_target_training = target["q_target_training"].detach().to(torch.float64).numpy().reshape(-1)
+        q_target_bellman = target["q_target_bellman"].detach().to(torch.float64).cpu().numpy().reshape(-1)
+        q_target_training = target["q_target_training"].detach().to(torch.float64).cpu().numpy().reshape(-1)
         q_target_settlement = np.where(phat_np <= 0.0, recovery, q_target_bellman)
         unit_target = np.where(b > 0.0, q_target_bellman / np.maximum(b, 1e-12), np.nan)
         error_series = {
@@ -1262,19 +1332,19 @@ def evaluate_firm_bellman(
             "value_star_p0": collected["value_star_p0"],
             "value_star_pi": collected["value_star_pi"],
             "Phat": phat_np,
-            "P": calibers["P"].detach().to(torch.float64).numpy().reshape(-1),
+            "P": calibers["P"].detach().to(torch.float64).cpu().numpy().reshape(-1),
             "bar_z": bar_z_np,
             "q_unit": q_unit,
             "Q_claim": q_claim,
             "Q_effective": q_effective,
             "recovery": recovery,
             "recovery_target": recovery_target,
-            "q_target_bellman_trainM": targets["trainM"]["q_target_bellman"].detach().to(torch.float64).numpy().reshape(-1),
-            "q_target_bellman_rawM": targets["rawM"]["q_target_bellman"].detach().to(torch.float64).numpy().reshape(-1),
-            "rq_bellman_trainM": targets["trainM"]["rq_bellman_signed"].detach().to(torch.float64).numpy().reshape(-1),
-            "rq_bellman_rawM": targets["rawM"]["rq_bellman_signed"].detach().to(torch.float64).numpy().reshape(-1),
-            "q_target_training_trainM": targets["trainM"]["q_target_training"].detach().to(torch.float64).numpy().reshape(-1),
-            "rq_training_trainM": targets["trainM"]["rq_training_signed"].detach().to(torch.float64).numpy().reshape(-1),
+            "q_target_bellman_trainM": targets["trainM"]["q_target_bellman"].detach().to(torch.float64).cpu().numpy().reshape(-1),
+            "q_target_bellman_rawM": targets["rawM"]["q_target_bellman"].detach().to(torch.float64).cpu().numpy().reshape(-1),
+            "rq_bellman_trainM": targets["trainM"]["rq_bellman_signed"].detach().to(torch.float64).cpu().numpy().reshape(-1),
+            "rq_bellman_rawM": targets["rawM"]["rq_bellman_signed"].detach().to(torch.float64).cpu().numpy().reshape(-1),
+            "q_target_training_trainM": targets["trainM"]["q_target_training"].detach().to(torch.float64).cpu().numpy().reshape(-1),
+            "rq_training_trainM": targets["trainM"]["rq_training_signed"].detach().to(torch.float64).cpu().numpy().reshape(-1),
             "region_q0": regions["q0"],
             "region_qd": regions["qd"],
             "region_qs": regions["qs"],
@@ -1293,7 +1363,7 @@ def evaluate_firm_bellman(
         "PI_physical": collected["pi_output_physical"],
         "P0_normalized": collected["p0_output_physical"] / np.maximum(scale_np, 1e-12),
         "PI_normalized": collected["pi_output_physical"] / np.maximum(scale_np, 1e-12),
-        "P": calibers["P"].detach().to(torch.float64).numpy().reshape(-1),
+        "P": calibers["P"].detach().to(torch.float64).cpu().numpy().reshape(-1),
         "Phat": phat_np,
         "bar_z": bar_z_np,
         "q_unit": q_unit,
@@ -1308,10 +1378,10 @@ def evaluate_firm_bellman(
         "R0_fresh_normalized": collected["fresh_r0_normalized"],
         "RI_fresh_physical": collected["fresh_ri_physical"],
         "RI_fresh_normalized": collected["fresh_ri_normalized"],
-        "Q_target_bellman_trainM": targets["trainM"]["q_target_bellman"].detach().to(torch.float64).numpy().reshape(-1),
-        "Q_target_bellman_rawM": targets["rawM"]["q_target_bellman"].detach().to(torch.float64).numpy().reshape(-1),
-        "RQ_bellman_trainM": targets["trainM"]["rq_bellman_signed"].detach().to(torch.float64).numpy().reshape(-1),
-        "RQ_bellman_rawM": targets["rawM"]["rq_bellman_signed"].detach().to(torch.float64).numpy().reshape(-1),
+        "Q_target_bellman_trainM": targets["trainM"]["q_target_bellman"].detach().to(torch.float64).cpu().numpy().reshape(-1),
+        "Q_target_bellman_rawM": targets["rawM"]["q_target_bellman"].detach().to(torch.float64).cpu().numpy().reshape(-1),
+        "RQ_bellman_trainM": targets["trainM"]["rq_bellman_signed"].detach().to(torch.float64).cpu().numpy().reshape(-1),
+        "RQ_bellman_rawM": targets["rawM"]["rq_bellman_signed"].detach().to(torch.float64).cpu().numpy().reshape(-1),
         "bp0_star": collected["bp0_star"],
         "bpi_star": collected["bpi_star"],
         "value_star_p0": collected["value_star_p0"],

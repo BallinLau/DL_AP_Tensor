@@ -64,8 +64,10 @@ from utils.firm_transition import apply_refinancing_policy
 from .checkpoint_io import EvalCheckpoint, semantic_record
 from .eval_bank import CheckpointTransition, build_transition_for_checkpoint, content_sha256
 from .firm_bellman import (
+    _bank_payload_on_device,
     _evaluate_grid_chunked,
     _forward_fields,
+    _module_device,
     build_grid_teacher,
     iter_row_chunks,
     q_issue_claim_at_candidates,
@@ -250,8 +252,9 @@ def grid_policy_solution(
         target_model=resolve_teacher_target_model(cp, teacher_target=config.teacher_target),
         max_expanded_states=config.teacher_max_expanded_states,
     )
-    parent = transition.parent_states
-    children_list, m_used, _m_raw, weights = split_transition(transition)
+    device = _module_device(model)
+    parent = transition.parent_states.to(device)
+    children_list, m_used, _m_raw, weights = split_transition(transition, device=device)
     n_rows = int(parent.shape[0])
     fields = _forward_fields(
         model,
@@ -265,14 +268,21 @@ def grid_policy_solution(
         chunk = slice(start, stop)
         for branch, head_bp in (("p0", fields["bp0"]), ("pi", fields["bpI"])):
             result = teacher.compute(
-                parent[chunk],
-                [item[chunk] for item in children_list],
-                m_used[chunk],
+                parent[chunk].to(device),
+                [item[chunk].to(device) for item in children_list],
+                m_used[chunk].to(device),
                 branch=branch,
                 bp_pred=head_bp[chunk],
-                child_weights=weights[chunk],
+                child_weights=weights[chunk].to(device),
             )
             per_branch[branch].append(result)
+
+    def _merged_tensor(branch: str, key: str) -> torch.Tensor:
+        return (
+            torch.cat([part[key] for part in per_branch[branch]], dim=0)
+            .reshape(n_rows, -1)[:, 0]
+            .detach()
+        )
 
     def _merged(branch: str, key: str) -> np.ndarray:
         return (
@@ -280,7 +290,7 @@ def grid_policy_solution(
             .reshape(n_rows, -1)[:, 0]
             .detach()
             .to(torch.float64)
-            .numpy()
+            .cpu().numpy()
         )
 
     def _merged_full(branch: str, key: str) -> np.ndarray:
@@ -288,20 +298,20 @@ def grid_policy_solution(
             torch.cat([part[key] for part in per_branch[branch]], dim=0)
             .detach()
             .to(torch.float64)
-            .numpy()
+            .cpu().numpy()
         )
 
     b = parent[:, 0:1]
     eta = parent[:, 2:3]
-    bp0_star = torch.as_tensor(_merged("p0", "bp_star")).reshape(n_rows, 1)
-    bpi_star = torch.as_tensor(_merged("pi", "bp_star")).reshape(n_rows, 1)
+    bp0_star = _merged_tensor("p0", "bp_star").to(torch.float64).reshape(n_rows, 1)
+    bpi_star = _merged_tensor("pi", "bp_star").to(torch.float64).reshape(n_rows, 1)
     bar_i = fields["bar_i"].reshape(n_rows, 1)
     bp_star_mix = bar_i * bpi_star + (1.0 - bar_i) * bp0_star
     b_next_p0 = apply_refinancing_policy(b, bp0_star, eta).reshape(-1)
     b_next_pi = apply_refinancing_policy(b, bpi_star, eta).reshape(-1)
     b_next_mix = apply_refinancing_policy(b, bp_star_mix, eta).reshape(-1)
 
-    parent_np = parent.detach().to(torch.float64).numpy()
+    parent_np = parent.detach().to(torch.float64).cpu().numpy()
     rows = {
         "row_index": np.arange(n_rows, dtype=np.int64),
         "b": parent_np[:, 0],
@@ -309,16 +319,16 @@ def grid_policy_solution(
         "eta": parent_np[:, 2],
         "source_label": list(source) if source is not None else ["unknown"] * n_rows,
         "refi_active": _merged("p0", "refi_active"),
-        "bp0_star": bp0_star.reshape(-1).numpy(),
-        "bpi_star": bpi_star.reshape(-1).numpy(),
-        "bp_star_mix": bp_star_mix.reshape(-1).numpy(),
-        "b_next_p0": b_next_p0.numpy(),
-        "b_next_pi": b_next_pi.numpy(),
-        "b_next_mix": b_next_mix.numpy(),
-        "bp0_head": fields["bp0"].reshape(-1).detach().to(torch.float64).numpy(),
-        "bpI_head": fields["bpI"].reshape(-1).detach().to(torch.float64).numpy(),
-        "bar_i_model": fields["bar_i_cond"].reshape(-1).detach().to(torch.float64).numpy(),
-        "bar_i_executed": fields["bar_i_eff"].reshape(-1).detach().to(torch.float64).numpy(),
+        "bp0_star": bp0_star.reshape(-1).cpu().numpy(),
+        "bpi_star": bpi_star.reshape(-1).cpu().numpy(),
+        "bp_star_mix": bp_star_mix.reshape(-1).cpu().numpy(),
+        "b_next_p0": b_next_p0.cpu().numpy(),
+        "b_next_pi": b_next_pi.cpu().numpy(),
+        "b_next_mix": b_next_mix.cpu().numpy(),
+        "bp0_head": fields["bp0"].reshape(-1).detach().to(torch.float64).cpu().numpy(),
+        "bpI_head": fields["bpI"].reshape(-1).detach().to(torch.float64).cpu().numpy(),
+        "bar_i_model": fields["bar_i_cond"].reshape(-1).detach().to(torch.float64).cpu().numpy(),
+        "bar_i_executed": fields["bar_i_eff"].reshape(-1).detach().to(torch.float64).cpu().numpy(),
         "value_star_p0": _merged("p0", "value_star"),
         "value_star_pi": _merged("pi", "value_star"),
         "value_pred_p0_head": _merged("p0", "value_pred"),
@@ -343,11 +353,11 @@ def grid_policy_solution(
         "default_at_star_pi": _merged("pi", "default_at_star"),
         "eta_next_active_share": _merged("p0", "eta_next_active_share"),
         "child_b_mean": _merged("p0", "child_b_mean"),
-        "P0": fields["P0"].reshape(-1).detach().to(torch.float64).numpy(),
-        "PI": fields["PI"].reshape(-1).detach().to(torch.float64).numpy(),
-        "P": fields["P"].reshape(-1).detach().to(torch.float64).numpy(),
-        "Phat": fields["Phat"].reshape(-1).detach().to(torch.float64).numpy(),
-        "bar_z": fields["bar_z"].reshape(-1).detach().to(torch.float64).numpy(),
+        "P0": fields["P0"].reshape(-1).detach().to(torch.float64).cpu().numpy(),
+        "PI": fields["PI"].reshape(-1).detach().to(torch.float64).cpu().numpy(),
+        "P": fields["P"].reshape(-1).detach().to(torch.float64).cpu().numpy(),
+        "Phat": fields["Phat"].reshape(-1).detach().to(torch.float64).cpu().numpy(),
+        "bar_z": fields["bar_z"].reshape(-1).detach().to(torch.float64).cpu().numpy(),
     }
     return pd.DataFrame(rows), {
         "teacher_grid": {
@@ -548,17 +558,17 @@ def conditional_default_probability(
     default probability ``1 - sigmoid(Phat/tau_z)`` is a different object and
     is never relabelled here.
     """
-    parent = transition.parent_states
-    children = transition.children[..., :7].clone()
-    children[..., 0:1] = b_next.reshape(-1, 1, 1).to(children.dtype)
+    device = _module_device(model)
+    children = transition.children[..., :7].clone().to(device)
+    children[..., 0:1] = b_next.reshape(-1, 1, 1).to(device=children.device, dtype=children.dtype)
     n_parent, n_child, state_dim = children.shape
     flat = children.reshape(-1, state_dim)
     phat_parts = []
     for start, stop in iter_row_chunks(flat.shape[0], chunk_size):
-        phat_parts.append(model.forward_equity(flat[start:stop])["Phat"].detach())
+        phat_parts.append(model.forward_equity(flat[start:stop].to(device))["Phat"].detach())
     phat_child = torch.cat(phat_parts, dim=0).reshape(n_parent, n_child)
     default_child = (phat_child <= 0.0).to(torch.float64)
-    weights = transition.branch_weights.to(torch.float64)
+    weights = transition.branch_weights.to(device=device, dtype=torch.float64)
     return (weights * default_child).sum(dim=1).cpu().numpy()
 
 
@@ -585,8 +595,9 @@ def objective_slices(
         target_model=resolve_teacher_target_model(cp, teacher_target=config.teacher_target),
         max_expanded_states=config.teacher_max_expanded_states,
     )
-    parent = transition.parent_states
-    children_list, m_used, _m_raw, weights = split_transition(transition)
+    device = _module_device(model)
+    parent = transition.parent_states.to(device)
+    children_list, m_used, _m_raw, weights = split_transition(transition, device=device)
     n_rows = int(parent.shape[0])
     if representative is None:
         count = max(1, int(config.representative_count))
@@ -622,13 +633,13 @@ def objective_slices(
                 branch=branch,
                 child_weights=weights_row,
             )
-            value_grid = values["value_grid"][0].detach().to(torch.float64).numpy()
-            cashflow = values["cashflow_grid_mean"][0].detach().to(torch.float64).numpy()
-            continuation = values["continuation_grid_mean"][0].detach().to(torch.float64).numpy()
-            p_child = values["p_child_grid_mean"][0].detach().to(torch.float64).numpy()
-            default_share = values["default_grid_mean"][0].detach().to(torch.float64).numpy()
-            q_claim = q_issue[0].detach().to(torch.float64).numpy()
-            for index, bp_value in enumerate(grid_row[0].detach().to(torch.float64).numpy()):
+            value_grid = values["value_grid"][0].detach().to(torch.float64).cpu().numpy()
+            cashflow = values["cashflow_grid_mean"][0].detach().to(torch.float64).cpu().numpy()
+            continuation = values["continuation_grid_mean"][0].detach().to(torch.float64).cpu().numpy()
+            p_child = values["p_child_grid_mean"][0].detach().to(torch.float64).cpu().numpy()
+            default_share = values["default_grid_mean"][0].detach().to(torch.float64).cpu().numpy()
+            q_claim = q_issue[0].detach().to(torch.float64).cpu().numpy()
+            for index, bp_value in enumerate(grid_row[0].detach().to(torch.float64).cpu().numpy()):
                 records.append(
                     {
                         "row_index": row,
@@ -665,6 +676,7 @@ def evaluate_firm_policy(
     """Evaluate the value/policy surfaces and boundaries of ``cp`` on a bank entry."""
     config = config if config is not None else PolicyEvalConfig()
     model = cp.models["policy_value"]
+    device = _module_device(model)
     n_rows = int(torch.as_tensor(bank["parent_states"]).shape[0])
     labels = source_labels(bank, n_rows)
     metrics: Dict[str, float] = {}
@@ -675,7 +687,7 @@ def evaluate_firm_policy(
         for module in cp.models.values():
             module.eval()
         transition = build_transition_for_checkpoint(
-            bank,
+            _bank_payload_on_device(bank, device),
             cp.models["sdf_fc1"],
             cp.hyperparams,
             cp.economic_config,
@@ -791,7 +803,7 @@ def evaluate_firm_policy(
 
     # ---- conditional default probability (not bar_z) ----
     b_next_mix = torch.as_tensor(
-        policy_rows["b_next_mix"].to_numpy(), dtype=transition.parent_states.dtype
+        policy_rows["b_next_mix"].to_numpy(), dtype=transition.parent_states.dtype, device=transition.parent_states.device
     ).reshape(-1, 1)
     conditional_default = conditional_default_probability(
         model, transition, b_next=b_next_mix, chunk_size=config.chunk_size
@@ -817,7 +829,7 @@ def evaluate_firm_policy(
     for view in config.eta_views:
         prefix = f"eta{int(round(float(view)))}_"
         reference = build_policy_reference(bank, eta=float(view), config=config)
-        grid = build_policy_grid(bank, reference, config=config)
+        grid = build_policy_grid(bank, reference, config=config, device=device)
         view_surfaces = evaluate_firm_surfaces(
             model, grid, reference, chunk_size=int(config.chunk_size)
         )
