@@ -234,6 +234,19 @@ class HyperParams:
     pv_current_eta1_train_share: float = 0.50
     pv_current_eta_balance_validation: bool = True
     pv_current_eta_balance_seed: int = 97531
+    # P-only eta=1 b-distribution augmentation (train stream only). When the
+    # counterfactual eta balance is active, "uniform" mode draws a configurable
+    # share of the eta=1 half as full row bundles (parent + children/M kept
+    # verbatim, only parent eta set to 1) sampled from the global train pool
+    # with inverse-density weights over parent b, so the eta=1 collocation mass
+    # is spread uniformly over b in [0, 1] instead of the natural low-b
+    # concentration.  Validation stream and Q/BP/FC1/SDF batches are never
+    # augmented; sampling is with replacement so rare high-b states can be
+    # deliberately upweighted.
+    pv_eta1_b_augment_mode: str = "none"  # "none" | "uniform"
+    pv_eta1_b_augment_share: float = 1.0  # fraction of the eta=1 half
+    pv_eta1_b_augment_bins: int = 10
+    pv_eta1_b_augment_seed: int = 20261101
     # Natural Validation Diagnostic（纯诊断，绝不参与 P Acceptance）。仅当
     # 确实存在第二种 Validation 口径（eta balance 同时作用于 Train 与
     # Validation）时独立计算；否则直接复用主 Validation 诊断。

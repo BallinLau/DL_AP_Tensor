@@ -12687,6 +12687,106 @@ class Episode:
             "eta1_share": float(eta1_count / total) if total > 0 else float("nan"),
         }
 
+    @staticmethod
+    def _append_eta1_augmented_rows(
+        base_batch: Dict[str, torch.Tensor],
+        source_batches: List[Dict[str, torch.Tensor]],
+        offsets: np.ndarray,
+        sampled: np.ndarray,
+    ) -> Dict[str, torch.Tensor]:
+        """Append counterfactually eta=1-labeled rows to a balanced P batch.
+
+        Each sampled global row keeps its source parent state and its full
+        children / M bundle verbatim; only the parent eta column is set to 1.
+        Sampling is with replacement (rare high-b states may repeat).  Per-row
+        side tensors (source_id / source_index / lineage_id /
+        parent_source_index) are carried over when present in the base batch
+        and in every source batch; parent_index is renumbered over the merged
+        rows.  Original batch tensors are never mutated.
+        """
+        src = np.searchsorted(offsets, sampled, side="right") - 1
+        local = sampled - offsets[src]
+        perm = np.argsort(src, kind="stable")
+        inv = np.empty_like(perm)
+        inv[perm] = np.arange(perm.size)
+        device = base_batch["parent"].device
+        side_keys = [
+            key
+            for key in (
+                "source_id",
+                "source_index",
+                "lineage_id",
+                "parent_source_index",
+            )
+            if torch.is_tensor(base_batch.get(key))
+            and all(torch.is_tensor(b.get(key)) for b in source_batches)
+        ]
+        base_children = base_batch.get("children") or [
+            c
+            for c in (base_batch.get("child0"), base_batch.get("child1"))
+            if c is not None
+        ]
+        parent_parts: List[torch.Tensor] = []
+        children_parts: Optional[List[List[torch.Tensor]]] = None
+        side_parts: Dict[str, List[torch.Tensor]] = {key: [] for key in side_keys}
+        src_sorted = src[perm]
+        local_sorted = local[perm]
+        for s in np.unique(src_sorted):
+            rows = torch.as_tensor(
+                local_sorted[src_sorted == s], dtype=torch.long, device=device
+            )
+            source = source_batches[int(s)]
+            parent_parts.append(source["parent"].index_select(0, rows))
+            children = source.get("children") or [
+                c
+                for c in (source.get("child0"), source.get("child1"))
+                if c is not None
+            ]
+            if children_parts is None:
+                children_parts = [[] for _ in children]
+            if len(children) != len(base_children):
+                raise ValueError(
+                    "eta1 augmentation branch-count mismatch: "
+                    f"{len(children)} vs {len(base_children)}"
+                )
+            for k, child in enumerate(children):
+                children_parts[k].append(child.index_select(0, rows))
+            for key in side_keys:
+                side_parts[key].append(source[key].index_select(0, rows))
+        inv_t = torch.as_tensor(inv, dtype=torch.long, device=device)
+        aug_parent = (
+            torch.cat(parent_parts, dim=0).index_select(0, inv_t).clone()
+        )
+        aug_parent[:, 2] = 1.0
+        merged = dict(base_batch)
+        merged["parent"] = torch.cat([base_batch["parent"], aug_parent], dim=0)
+        if children_parts:
+            merged["children"] = [
+                torch.cat(
+                    [
+                        base_children[k],
+                        torch.cat(parts, dim=0).index_select(0, inv_t),
+                    ],
+                    dim=0,
+                )
+                for k, parts in enumerate(children_parts)
+            ]
+            if base_batch.get("child0") is not None:
+                merged["child0"] = merged["children"][0]
+            if base_batch.get("child1") is not None and len(merged["children"]) > 1:
+                merged["child1"] = merged["children"][1]
+        for key in side_keys:
+            aug_value = torch.cat(side_parts[key], dim=0).index_select(0, inv_t)
+            merged[key] = torch.cat([base_batch[key], aug_value], dim=0)
+        parent_index = base_batch.get("parent_index")
+        if torch.is_tensor(parent_index):
+            merged["parent_index"] = torch.arange(
+                int(merged["parent"].shape[0]),
+                device=device,
+                dtype=parent_index.dtype,
+            )
+        return merged
+
     def _balance_p_current_eta_batches(
         self,
         batches: List[Dict[str, torch.Tensor]],
@@ -12725,6 +12825,85 @@ class Episode:
             + int(self.episode_id) * 100003
             + stream_offset * 1000003
         )
+        # --- eta=1 b-distribution augmentation (train stream only) ---
+        # The augmented share of the eta=1 half is drawn from the GLOBAL train
+        # pool with inverse-density weights over parent b, so the eta=1
+        # collocation mass is spread uniformly over b in [0, 1] instead of the
+        # natural low-b concentration.  Appended rows keep their source bundle
+        # (children / M) verbatim; only parent eta is set to 1.
+        augment_mode = str(
+            getattr(self.hyperparams, "pv_eta1_b_augment_mode", "none")
+        ).strip().lower()
+        augment_share = float(
+            getattr(self.hyperparams, "pv_eta1_b_augment_share", 1.0)
+        )
+        augment_bins = max(
+            2, int(getattr(self.hyperparams, "pv_eta1_b_augment_bins", 10))
+        )
+        augment_active = (
+            stream == "train"
+            and augment_mode in ("uniform", "b_uniform")
+            and 0.0 < augment_share <= 1.0
+        )
+        augment_rows_total = 0
+        augment_valid: List[Dict[str, torch.Tensor]] = []
+        augment_offsets: Optional[np.ndarray] = None
+        augment_probs: Optional[np.ndarray] = None
+        augment_rng = None
+        if augment_active:
+            augment_valid = [
+                b
+                for b in batches
+                if torch.is_tensor(b.get("parent"))
+                and b["parent"].ndim >= 2
+                and b["parent"].shape[1] >= 3
+            ]
+            if not augment_valid:
+                augment_active = False
+            else:
+                flat_b = torch.cat(
+                    [
+                        b["parent"][:, 0]
+                        .detach()
+                        .reshape(-1)
+                        .to(torch.float32)
+                        .cpu()
+                        for b in augment_valid
+                    ]
+                ).numpy()
+                edges = np.linspace(0.0, 1.0, augment_bins + 1)
+                bin_idx = np.clip(
+                    np.digitize(flat_b, edges[1:-1], right=True),
+                    0,
+                    augment_bins - 1,
+                )
+                counts = np.bincount(
+                    bin_idx, minlength=augment_bins
+                ).astype(np.float64)
+                density = counts[bin_idx]
+                weights = np.where(
+                    density > 0.0, 1.0 / np.maximum(density, 1.0), 0.0
+                )
+                total_w = float(weights.sum())
+                if total_w <= 0.0:
+                    augment_active = False
+                else:
+                    augment_probs = weights / total_w
+                    sizes = [int(b["parent"].shape[0]) for b in augment_valid]
+                    augment_offsets = np.concatenate(
+                        ([0], np.cumsum(sizes))
+                    ).astype(np.int64)
+                    augment_rng = np.random.default_rng(
+                        int(
+                            getattr(
+                                self.hyperparams,
+                                "pv_eta1_b_augment_seed",
+                                20261101,
+                            )
+                        )
+                        + int(self.episode_id) * 100003
+                        + stream_offset * 7717
+                    )
         # 原批次完整性校验（轻量摘要）：反事实重分配只允许写 P 专用副本；
         # 不再保留整批 Parent 快照张量，改为 GPU 端列和摘要在结束时单次比对，
         # 计数也全部张量化累计、末尾单次同步（Prompt §2.5）。
@@ -12742,13 +12921,28 @@ class Episode:
             original_children_refs.append(batch.get("children"))
             n_rows = int(parent.shape[0])
             n_eta1 = int(round(n_rows * target_share))
+            n_aug = (
+                int(round(n_eta1 * augment_share)) if augment_active else 0
+            )
+            n_nat = n_eta1 - n_aug
             order = torch.randperm(n_rows, generator=generator)
             eta_cpu = torch.zeros(n_rows, dtype=parent.dtype)
-            eta_cpu[order[:n_eta1]] = 1.0
+            eta_cpu[order[:n_nat]] = 1.0
             cloned = dict(batch)
             cloned_parent = parent.clone()
             cloned_parent[:, 2] = eta_cpu.to(parent.device)
             cloned["parent"] = cloned_parent
+            if n_aug > 0:
+                sampled = augment_rng.choice(
+                    int(augment_offsets[-1]), size=n_aug, p=augment_probs
+                )
+                cloned = self._append_eta1_augmented_rows(
+                    cloned,
+                    augment_valid,
+                    augment_offsets,
+                    sampled,
+                )
+                augment_rows_total += n_aug
             balanced.append(cloned)
             eta_before_rows = parent[:, 2].detach()
             eta_after_rows = cloned_parent[:, 2].detach()
@@ -12812,10 +13006,32 @@ class Episode:
                 ),
             }
         after = self._current_eta_counts_from_batches(balanced)
+        eta1_b_hist_after = None
+        if augment_active:
+            eta1_b_values = torch.cat(
+                [
+                    b["parent"][:, 0][b["parent"][:, 2] > 0.5]
+                    .detach()
+                    .reshape(-1)
+                    .to(torch.float32)
+                    .cpu()
+                    for b in balanced
+                    if torch.is_tensor(b.get("parent")) and b["parent"].numel() > 0
+                ]
+            ).numpy()
+            hist_counts, _ = np.histogram(
+                eta1_b_values, bins=augment_bins, range=(0.0, 1.0)
+            )
+            eta1_b_hist_after = [int(x) for x in hist_counts]
+        sampling_method = (
+            "counterfactual_eta_balance_b_uniform"
+            if augment_active
+            else "counterfactual_parent_eta_balance"
+        )
         return balanced, {
             "enabled": True,
             "stream": stream,
-            "p_eta_sampling_method": "counterfactual_parent_eta_balance",
+            "p_eta_sampling_method": sampling_method,
             **before,
             "eta0_count_after": after["eta0_count"],
             "eta1_count_after": after["eta1_count"],
@@ -12823,6 +13039,12 @@ class Episode:
             "reassigned_count": int(reassigned_count),
             "source_eta_shares": source_eta_shares,
             "original_parent_child_preserved": bool(originals_preserved),
+            "pv_eta1_b_augment_mode": augment_mode if augment_active else "none",
+            "pv_eta1_b_augment_share": (
+                float(augment_share) if augment_active else 0.0
+            ),
+            "augmented_rows": int(augment_rows_total),
+            "eta1_b_hist_after": eta1_b_hist_after,
         }
 
     def _run_batches(

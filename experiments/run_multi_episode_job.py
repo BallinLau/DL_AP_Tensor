@@ -818,6 +818,34 @@ def parse_args() -> argparse.Namespace:
         help="Engine-level periodic h-star recalibration cadence in time steps "
         "(0 = initial calibration only); ignored when --hstar-recalib-count > 0",
     )
+    parser.add_argument(
+        "--pv-eta1-b-augment-mode",
+        type=str,
+        default=None,
+        choices=["none", "uniform", "b_uniform"],
+        help="P-stage eta=1 b-distribution augmentation (train stream only); "
+        "'uniform' draws the configured share of the eta=1 half from the "
+        "global train pool with inverse-density weights over parent b. "
+        "Requires pv-current-eta-balance-enabled",
+    )
+    parser.add_argument(
+        "--pv-eta1-b-augment-share",
+        type=float,
+        default=None,
+        help="Fraction of the eta=1 half drawn from the global b-uniform pool",
+    )
+    parser.add_argument(
+        "--pv-eta1-b-augment-bins",
+        type=int,
+        default=None,
+        help="Parent-b histogram bins for inverse-density sampling weights",
+    )
+    parser.add_argument(
+        "--pv-eta1-b-augment-seed",
+        type=int,
+        default=None,
+        help="Seed for the eta=1 b-uniform augmentation sampler",
+    )
     parser.add_argument("--bp-distill-patience", type=int, default=None, help="BP distillation early-stop patience")
     parser.add_argument("--bp-distill-min-delta", type=float, default=None, help="BP distillation validation min delta")
     parser.add_argument(
@@ -1634,6 +1662,14 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.initial_hstar_audit_episode_id = args.initial_hstar_audit_episode_id
     if args.hstar_recalib_count is not None:
         hyperparams.hstar_recalib_count = int(args.hstar_recalib_count)
+    if getattr(args, "pv_eta1_b_augment_mode", None) is not None:
+        hyperparams.pv_eta1_b_augment_mode = str(args.pv_eta1_b_augment_mode)
+    if getattr(args, "pv_eta1_b_augment_share", None) is not None:
+        hyperparams.pv_eta1_b_augment_share = float(args.pv_eta1_b_augment_share)
+    if getattr(args, "pv_eta1_b_augment_bins", None) is not None:
+        hyperparams.pv_eta1_b_augment_bins = int(args.pv_eta1_b_augment_bins)
+    if getattr(args, "pv_eta1_b_augment_seed", None) is not None:
+        hyperparams.pv_eta1_b_augment_seed = int(args.pv_eta1_b_augment_seed)
     if args.hstar_recalib_every is not None:
         hyperparams.hstar_recalib_every = int(args.hstar_recalib_every)
     if args.bp_distill_patience is not None:
