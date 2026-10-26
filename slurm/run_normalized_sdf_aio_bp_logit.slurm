@@ -14,6 +14,11 @@ set -euo pipefail
 source /apps/soft/anaconda3/bin/activate
 conda activate DL_HL
 
+# Late-simulation CUDA OOMs showed massive reserved-but-unallocated cache
+# (fragmentation), not a true live-set overflow; expandable segments let the
+# allocator return fragmented pages instead of failing small requests.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 WORK_ROOT="${WORK_ROOT:-/home/fit/zhuyingz/WORK/LiuHao}"
 REPO_DIR="${REPO_DIR:-$WORK_ROOT/DL_AP_Tensor}"
 LOG_DIR="${LOG_DIR:-$WORK_ROOT/logs}"
