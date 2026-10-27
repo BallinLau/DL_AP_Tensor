@@ -261,6 +261,39 @@ def _safe_top2_margin(value_grid: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return (vals[:, 0:1] - vals[:, 1:2]), idx[:, 0:1]
 
 
+ARGMAX_TIE_RTOL = 1e-6
+
+
+def _deterministic_argmax(
+    value_grid: torch.Tensor, *, tie_rtol: float = ARGMAX_TIE_RTOL
+) -> torch.Tensor:
+    """Argmax over the candidate axis with deterministic near-tie resolution.
+
+    Two evaluations of the same objective grid can differ at float-rounding
+    scale (batch-reduction order, FP64-vs-FP32 replay), and plain ``argmax``
+    then flips between near-equal candidates across evaluations.  That flip
+    breaks the t=0 root/production decision-parity gate (``decisions_bp``).
+    Candidates within ``tie_rtol`` (relative to ``max(|vmax|, 1)``) of the row
+    maximum are treated as tied, and the LOWEST candidate index wins.
+    Rows without any finite tie candidate (e.g. all-NaN rows) fall back to the
+    legacy ``argmax`` behaviour.
+    """
+    vmax = value_grid.max(dim=1, keepdim=True).values
+    tol = tie_rtol * torch.maximum(vmax.abs(), torch.ones_like(vmax))
+    tied = value_grid >= (vmax - tol)
+    n_grid = int(value_grid.shape[1])
+    index_row = torch.arange(
+        n_grid, device=value_grid.device, dtype=torch.long
+    ).unsqueeze(0).expand_as(tied)
+    chosen = (
+        torch.where(tied, index_row, torch.full_like(index_row, n_grid))
+        .min(dim=1, keepdim=True)
+        .values
+    )
+    fallback = value_grid.argmax(dim=1, keepdim=True)
+    return torch.where(tied.any(dim=1, keepdim=True), chosen, fallback)
+
+
 def _gather_by_index(values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     return values.gather(1, index).reshape(-1, 1)
 
@@ -1312,8 +1345,8 @@ class BPGridTeacher:
                                     [part[_key] for part in parts], dim=1
                                 )
                             coarse["q_current_claim"] = parts[0]["q_current_claim"]
-                        coarse["argmax_index"] = coarse["value_grid"].argmax(
-                            dim=1, keepdim=True
+                        coarse["argmax_index"] = _deterministic_argmax(
+                            coarse["value_grid"]
                         )
                         bp_pred = None
                         if bp_preds is not None and bp_preds[index] is not None:
@@ -1679,7 +1712,9 @@ class BPGridTeacher:
             "child_b_mean": torch.cat([c["child_b_mean"] for c in chunks], dim=1),
             "child_b_eta0_mean": torch.cat([c["child_b_eta0_mean"] for c in chunks], dim=1),
             "child_b_eta1_mean": torch.cat([c["child_b_eta1_mean"] for c in chunks], dim=1),
-            "argmax_index": torch.cat([c["value_grid"] for c in chunks], dim=1).argmax(dim=1, keepdim=True),
+            "argmax_index": _deterministic_argmax(
+                torch.cat([c["value_grid"] for c in chunks], dim=1)
+            ),
         }
         for key in (
             "q_issue_claim_grid",
@@ -1877,7 +1912,7 @@ class BPGridTeacher:
 
         child_b_eta0_mean = _conditional_child_b((eta_next <= 0.5).to(child_b_grid.dtype))
         child_b_eta1_mean = _conditional_child_b((eta_next > 0.5).to(child_b_grid.dtype))
-        argmax_index = value_grid.argmax(dim=1, keepdim=True)
+        argmax_index = _deterministic_argmax(value_grid)
 
         result = {
             "bp_grid": bp_grid,
