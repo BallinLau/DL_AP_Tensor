@@ -41,7 +41,9 @@ def test_jitter_stability_no_flip():
     jitter = torch.tensor([[1e-8, -1e-8, 1e-8, -1e-8]], dtype=torch.float32)
     a = _deterministic_argmax(base + jitter)
     b = _deterministic_argmax(base - jitter)
-    assert int(a[0, 0]) == int(b[0, 0]) == 0  # all three near-tied -> lowest
+    # candidates 1 and 2 are within the tie tolerance of the row max; 0.2 is
+    # not. Both evaluations must pick the same tied member (lowest index = 1)
+    assert int(a[0, 0]) == int(b[0, 0]) == 1
 
 
 def test_rows_independent():
