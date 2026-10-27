@@ -39,6 +39,8 @@ from experiments.run_utils import (  # noqa: E402
     save_models,
     save_stage_df,
     plot_surfaces,
+    plot_bari_istar_heatmap,
+    plot_i_star_b,
     plot_distributions,
     plot_macro_series,
     plot_firm_b_window_distribution,
@@ -2862,6 +2864,29 @@ def main():
             device,
             resolve_base_dir(run_root, ROOT),
         )
+        # Diagnostics-only additions: BARI threshold line + i*(b) curves.
+        # Failures must never kill the training loop.
+        try:
+            plot_bari_istar_heatmap(
+                ep,
+                models["policy_value"],
+                models.get("sdf_fc1"),
+                ref_state,
+                device,
+                resolve_base_dir(run_root, ROOT),
+            )
+        except Exception as exc:
+            print(f"WARNING: bari/istar heatmap plotting failed for Episode {ep}: {exc}")
+        try:
+            plot_i_star_b(
+                ep,
+                models["policy_value"],
+                ref_state,
+                device,
+                resolve_base_dir(run_root, ROOT),
+            )
+        except Exception as exc:
+            print(f"WARNING: i*(b) plotting failed for Episode {ep}: {exc}")
         plot_distributions(
             ep,
             episode.df,

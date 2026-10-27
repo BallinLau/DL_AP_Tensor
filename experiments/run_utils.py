@@ -818,6 +818,244 @@ def plot_surfaces(
         plt.close()
 
 
+def plot_bari_istar_heatmap(
+    ep: int,
+    pv_model: PolicyValueModel,
+    sdf_model: SDFFC1Combined | None,
+    ref_state: dict,
+    device: torch.device,
+    base_dir: Path,
+):
+    """BARI heatmap with the PI = P0 investment-threshold line (bar_i_cond = 0.5).
+
+    Same grid / ref-state caliber as ``plot_surfaces``: b in [0,1] x z in [-4,4]
+    (50x50), eta = ref_state["eta"], remaining state at the provided medians.
+    The red contour is Delta = PI - P0 = 0 at the fixed investment cost i of the
+    reference state, i.e. the locus where the conditional investment indicator
+    crosses 0.5.  Non-surviving cells are masked to NaN.
+    """
+    figs_dir = base_dir / "experiments" / "figs"
+    figs_dir.mkdir(parents=True, exist_ok=True)
+    b_grid = torch.linspace(0, 1, 50, device=device)
+    z_grid = torch.linspace(-4, 4, 50, device=device)
+    B, Z = torch.meshgrid(b_grid, z_grid, indexing="ij")
+    eta_ref = float(ref_state["eta"])
+    i_ref = float(ref_state["i"])
+
+    base = torch.stack(
+        [
+            B.reshape(-1),
+            Z.reshape(-1),
+            torch.full_like(B.reshape(-1), eta_ref),
+            torch.full_like(B.reshape(-1), i_ref),
+            torch.full_like(B.reshape(-1), float(ref_state["x"])),
+            torch.full_like(B.reshape(-1), float(ref_state["hatcf"])),
+            torch.full_like(B.reshape(-1), float(ref_state["lnkf"])),
+        ],
+        dim=1,
+    )
+    with torch.no_grad():
+        out, _ = _compute_policy_diagnostic_surfaces(
+            pv_model, sdf_model, base, eta_next_assumed=1.0
+        )
+    P0 = out.P0.reshape(B.shape).cpu().numpy().astype(np.float64)
+    PI = out.PI.reshape(B.shape).cpu().numpy().astype(np.float64)
+    P = out.P.reshape(B.shape).cpu().numpy().astype(np.float64)
+    bar_i = out.bar_i.reshape(B.shape).cpu().numpy().astype(np.float64)
+    bar_z = out.bar_z.reshape(B.shape).cpu().numpy().astype(np.float64)
+
+    survive_mask = (P > 0.0) & (bar_z < 0.5)
+    bari_plot = np.where(survive_mask, bar_i, np.nan)
+    delta = np.where(survive_mask, PI - P0, np.nan)
+
+    Bn, Zn = B.cpu().numpy(), Z.cpu().numpy()
+    plt.figure(figsize=(7.0, 4.6))
+    cs = plt.contourf(Bn, Zn, bari_plot, levels=30, cmap="viridis")
+    plt.colorbar(cs)
+    dmin, dmax = np.nanmin(delta), np.nanmax(delta)
+    if np.isfinite(dmin) and np.isfinite(dmax) and dmin <= 0.0 <= dmax:
+        plt.contour(Bn, Zn, delta, levels=[0.0], colors="red", linewidths=2.0)
+        plt.plot([], [], color="red", lw=2.0,
+                 label=r"$\bar{\iota}_{cond}=0.5$  (PI = P0)")
+    plt.xlabel("b")
+    plt.ylabel("z")
+    plt.title(
+        f"EP{ep} BARI heatmap + investment threshold (PI = P0)\n"
+        f"i = {i_ref:.4f}   (eta = {eta_ref:g}, "
+        f"x = {float(ref_state['x']):.4f}, hatcf = {float(ref_state['hatcf']):.4f}, "
+        f"lnkf = {float(ref_state['lnkf']):.4f})"
+    )
+    plt.legend(loc="best", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(figs_dir / f"ep{ep}_bari_heatmap_istar.png", dpi=150)
+    plt.close()
+    print(
+        f"[Episode {ep}] bari+istar heatmap: survive={int(survive_mask.sum())}/{delta.size} "
+        f"i={i_ref:.4f} -> {figs_dir / f'ep{ep}_bari_heatmap_istar.png'}",
+        flush=True,
+    )
+
+
+_ISTAR_B_GRID = np.linspace(0.0, 1.0, 101)
+_ISTAR_I_GRID = np.linspace(0.0, 0.5, 101)
+_ISTAR_Z_STD = 0.36 / np.sqrt(1.0 - 0.90 ** 2)  # stationary sigma_z of z
+
+
+def _solve_i_star_threshold(delta_row):
+    """First + -> - crossing of Delta(i) = PI - P0 on the i grid, interpolated."""
+    if not np.isfinite(delta_row).all():
+        return float("nan"), "nonfinite"
+    pos = delta_row > 0.0
+    if pos.all():
+        return float(_ISTAR_I_GRID[-1]), "always_invest"
+    if not pos.any():
+        return float(_ISTAR_I_GRID[0]), "never_invest"
+    down = np.nonzero((delta_row[:-1] > 0.0) & (delta_row[1:] <= 0.0))[0]
+    if down.size == 0:
+        return float("nan"), "anomaly"
+    k = int(down[0])
+    d0, d1 = delta_row[k], delta_row[k + 1]
+    i_star = _ISTAR_I_GRID[k] + (d0 / (d0 - d1)) * (_ISTAR_I_GRID[k + 1] - _ISTAR_I_GRID[k])
+    return float(i_star), ("anomaly" if down.size > 1 else "cross")
+
+
+def _i_star_curve_for_b(pv_model, ref_state, eta, z_val, device):
+    """i*(b) at fixed (eta, z) with PI(s, i*) = P0(s).
+
+    Threshold states (b, z, eta, i*) where the firm does not survive
+    (P <= 0 or bar_z >= 0.5) are masked to NaN, mirroring the eval-work
+    i*(b) caliber.
+    """
+    bb, ii = np.meshgrid(_ISTAR_B_GRID, _ISTAR_I_GRID, indexing="ij")
+    s = np.zeros((bb.size, 7), np.float32)
+    s[:, 0] = bb.reshape(-1)
+    s[:, 1] = z_val
+    s[:, 2] = eta
+    s[:, 3] = ii.reshape(-1)
+    s[:, 4] = float(ref_state["x"])
+    s[:, 5] = float(ref_state["hatcf"])
+    s[:, 6] = float(ref_state["lnkf"])
+    ts = torch.as_tensor(s, device=device)
+    v0_parts, vi_parts = [], []
+    with torch.no_grad():
+        for lo in range(0, ts.shape[0], 8192):
+            comp = pv_model.forward_value_components(ts[lo:lo + 8192])
+            v0_parts.append(comp["V0_physical"].detach().cpu().reshape(-1).numpy())
+            vi_parts.append(comp["VI_physical"].detach().cpu().reshape(-1).numpy())
+    V0 = np.concatenate(v0_parts).reshape(bb.shape).astype(np.float64)
+    VI = np.concatenate(vi_parts).reshape(bb.shape).astype(np.float64)
+    delta = VI - V0
+
+    i_star = np.full(len(_ISTAR_B_GRID), np.nan)
+    statuses = []
+    for r in range(len(_ISTAR_B_GRID)):
+        i_star[r], st = _solve_i_star_threshold(delta[r])
+        statuses.append(st)
+    counts = {k: int(sum(1 for s_ in statuses if s_ == k))
+              for k in ("cross", "always_invest", "never_invest", "anomaly", "nonfinite")}
+
+    valid = np.isfinite(i_star)
+    survive = np.zeros(len(_ISTAR_B_GRID), dtype=bool)
+    if valid.any():
+        rows = np.zeros((int(valid.sum()), 7), np.float32)
+        rows[:, 0] = _ISTAR_B_GRID[valid]
+        rows[:, 1] = z_val
+        rows[:, 2] = eta
+        rows[:, 3] = i_star[valid]
+        rows[:, 4] = float(ref_state["x"])
+        rows[:, 5] = float(ref_state["hatcf"])
+        rows[:, 6] = float(ref_state["lnkf"])
+        with torch.no_grad():
+            out = pv_model.forward(torch.as_tensor(rows, device=device))
+        P_at = out.P.reshape(-1).detach().cpu().numpy().astype(np.float64)
+        bar_z_at = out.bar_z.reshape(-1).detach().cpu().numpy().astype(np.float64)
+        survive[valid] = (P_at > 0.0) & (bar_z_at < 0.5)
+    counts["default_masked"] = int((valid & ~survive).sum())
+    i_star = np.where(valid & survive, i_star, np.nan)
+    counts["plotted"] = int(np.isfinite(i_star).sum())
+
+    finite = np.isfinite(i_star)
+    slope = float("nan")
+    if finite.sum() >= 5:
+        slope = float(np.polyfit(_ISTAR_B_GRID[finite], i_star[finite], 1)[0])
+    counts["slope_per_unit_b"] = slope
+    return i_star, counts
+
+
+def plot_i_star_b(
+    ep: int,
+    pv_model: PolicyValueModel,
+    ref_state: dict,
+    device: torch.device,
+    base_dir: Path,
+):
+    """i*(b): investment-threshold curves with PI(s, i*) = P0(s).
+
+    One panel per eta in {0, 1}; z in {stationary mean, +/- sigma_z}; x/hatcf/
+    lnkf at the provided reference medians.  Same caliber as the eval-work
+    i*(b) series (101-point b and i grids, bankruptcy-masked threshold states).
+    """
+    figs_dir = base_dir / "experiments" / "figs"
+    figs_dir.mkdir(parents=True, exist_ok=True)
+    z_levels = {"zmean": 0.0, "zplus": _ISTAR_Z_STD, "zminus": -_ISTAR_Z_STD}
+
+    curves = {}
+    for eta in (0.0, 1.0):
+        for zname, zval in z_levels.items():
+            curves[(eta, zname)] = _i_star_curve_for_b(
+                pv_model, ref_state, eta, zval, device
+            )
+
+    pd.DataFrame(
+        {"b": _ISTAR_B_GRID,
+         **{f"istar_eta{int(eta)}_{zname}": curves[(eta, zname)][0]
+            for eta in (0.0, 1.0) for zname in z_levels}}
+    ).to_csv(figs_dir / f"ep{ep}_istar_b.csv", index=False)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.6), sharey=True)
+    for ax, eta in zip(axes, (0.0, 1.0)):
+        ax.plot(_ISTAR_B_GRID, curves[(eta, "zmean")][0], "-", color="C0", lw=1.8,
+                label="z = 0.000 (stationary mean)")
+        ax.plot(_ISTAR_B_GRID, curves[(eta, "zplus")][0], "--", color="C2", lw=1.4,
+                label=f"z = +{_ISTAR_Z_STD:.3f} (+1 sigma_z)")
+        ax.plot(_ISTAR_B_GRID, curves[(eta, "zminus")][0], "--", color="C3", lw=1.4,
+                label=f"z = -{_ISTAR_Z_STD:.3f} (-1 sigma_z)")
+        ax.set_xlabel("b", fontsize=9)
+        ax.set_title(f"eta = {int(eta)}", fontsize=11)
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(-0.02, 0.52)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8, loc="best")
+    axes[0].set_ylabel("i*(b): investment threshold (PI = P0)", fontsize=9)
+    fig.suptitle(
+        f"EP{ep} investment threshold i*(b): PI(s, i*) = P0(s)   "
+        f"(i* = 0.5 means always-invest within [0, 0.5]; NaN = no crossing or "
+        f"bankrupt at the threshold state; x={float(ref_state['x']):.4g}, "
+        f"hatcf={float(ref_state['hatcf']):.4g}, lnkf={float(ref_state['lnkf']):.4g})",
+        fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.savefig(figs_dir / f"ep{ep}_istar_b.png", dpi=140)
+    plt.close(fig)
+
+    summary = {
+        "ref_state": {k: float(v) for k, v in ref_state.items()},
+        "z_std": float(_ISTAR_Z_STD),
+        "curves": {f"eta{int(eta)}_{zname}": curves[(eta, zname)][1]
+                   for eta in (0.0, 1.0) for zname in z_levels},
+    }
+    (figs_dir / f"ep{ep}_istar_b_summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+
+    c1 = summary["curves"]["eta1_zmean"]
+    print(
+        f"[Episode {ep}] i*(b) eta=1/z=0: slope={c1['slope_per_unit_b']:+.4f}/b "
+        f"plotted={c1['plotted']}/101 masked={c1['default_masked']} -> "
+        f"{figs_dir / f'ep{ep}_istar_b.png'}",
+        flush=True,
+    )
+
+
 def plot_distributions(
     ep: int,
     df: pd.DataFrame,
