@@ -2448,6 +2448,11 @@ def main():
     # build_optimizers 之后注入——生成器不进任何优化器（实验设计决定：
     # 若生成器接受经济损失梯度，实验就变成"自适应选择训练分布"）。
     simulation_b_sampler = None
+    # 注意作用域：配置解析块在参数解析函数里，其局部变量在 main() 不可见，
+    # 这里从 hyperparams 重新取 source。
+    _binit_source = str(
+        getattr(hyperparams, "simulation_b_init_source", "uniform")
+    ).strip().lower()
     if _binit_source == "conditional_quantile_network":
         simulation_b_sampler = build_initial_b_sampler(
             generator_checkpoint=hyperparams.simulation_b_init_generator_checkpoint,
