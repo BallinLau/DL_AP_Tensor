@@ -247,6 +247,17 @@ class HyperParams:
     pv_eta1_b_augment_share: float = 1.0  # fraction of the eta=1 half
     pv_eta1_b_augment_bins: int = 10
     pv_eta1_b_augment_seed: int = 20261101
+    # 初始 b 分布实验（SimulateTS._sample_initial_b 的 dist_b 钩子）。
+    # "uniform" = 保持原 SIM_B_INIT_MIN/MAX 均匀回退（行为不变）；
+    # "conditional_quantile_network" = 冻结的条件分位数生成器
+    # （models/conditional_quantile_generator.py）按固定编码 c_v 采样：
+    #   b⁰ = Q(u; distribution_code)，u 用共享随机数（配对设计），per-episode
+    #   种子 = simulation_b_init_seed + episode，同集内多次重模拟确定性重放。
+    # 生成器冻结：不进任何优化器、不接受经济损失梯度。
+    simulation_b_init_source: str = "uniform"
+    simulation_b_init_generator_checkpoint: str = ""
+    simulation_b_init_distribution_code: str = ""  # 逗号分隔的 c_v（长度=code_dim）
+    simulation_b_init_seed: int = 20261109
     # Natural Validation Diagnostic（纯诊断，绝不参与 P Acceptance）。仅当
     # 确实存在第二种 Validation 口径（eta balance 同时作用于 Train 与
     # Validation）时独立计算；否则直接复用主 Validation 诊断。

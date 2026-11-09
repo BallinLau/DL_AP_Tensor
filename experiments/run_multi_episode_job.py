@@ -12,6 +12,7 @@ import argparse
 import random
 from datetime import datetime
 from pathlib import Path
+import os
 import sys
 import json
 import warnings
@@ -29,6 +30,9 @@ from data.state_bank import (  # noqa: E402
     summarize_stored_economic_feasibility,
 )
 from data.simulate_ts import SimulateTS  # noqa: E402
+from models.conditional_quantile_generator import (  # noqa: E402
+    build_initial_b_sampler,
+)
 from experiments.run_utils import (  # noqa: E402
     resolve_base_dir,
     build_models,
@@ -847,6 +851,39 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Seed for the eta=1 b-uniform augmentation sampler",
+    )
+    parser.add_argument(
+        "--simulation-b-init-source",
+        type=str,
+        default=None,
+        choices=["uniform", "conditional_quantile_network"],
+        help="Initial-b sampling source for SimulateTS: 'uniform' keeps the "
+        "legacy SIM_B_INIT_MIN/MAX fallback; 'conditional_quantile_network' "
+        "uses the frozen conditional quantile generator (paired common U, "
+        "fixed distribution code per run). Env fallback: SIM_B_INIT_SOURCE",
+    )
+    parser.add_argument(
+        "--simulation-b-init-generator-checkpoint",
+        type=str,
+        default=None,
+        help="Frozen conditional-quantile-generator checkpoint (.pt). "
+        "Env fallback: SIM_B_INIT_GENERATOR_CHECKPOINT",
+    )
+    parser.add_argument(
+        "--simulation-b-init-distribution-code",
+        type=str,
+        default=None,
+        help="Comma-separated fixed distribution code c_v (one code = one "
+        "distribution; length must equal the generator code_dim). "
+        "Env fallback: SIM_B_INIT_DISTRIBUTION_CODE",
+    )
+    parser.add_argument(
+        "--simulation-b-init-seed",
+        type=int,
+        default=None,
+        help="Base seed for the common uniforms U; per-episode U seed = "
+        "base + episode, shared across paired versions. "
+        "Env fallback: SIM_B_INIT_SEED",
     )
     parser.add_argument("--bp-distill-patience", type=int, default=None, help="BP distillation early-stop patience")
     parser.add_argument("--bp-distill-min-delta", type=float, default=None, help="BP distillation validation min delta")
@@ -1672,6 +1709,44 @@ def configure_hyperparams(args: argparse.Namespace):
         hyperparams.pv_eta1_b_augment_bins = int(args.pv_eta1_b_augment_bins)
     if getattr(args, "pv_eta1_b_augment_seed", None) is not None:
         hyperparams.pv_eta1_b_augment_seed = int(args.pv_eta1_b_augment_seed)
+    # 初始 b 分布实验接口：CLI 参数 > SIM_B_INIT_* 环境变量 > hyperparams 默认。
+    # env 兜底使启动链只需 export SIM_B_INIT_* 即可传入，无需改 slurm 脚本。
+    _binit_env_map = {
+        "simulation_b_init_source": ("SIM_B_INIT_SOURCE", str),
+        "simulation_b_init_generator_checkpoint": (
+            "SIM_B_INIT_GENERATOR_CHECKPOINT",
+            str,
+        ),
+        "simulation_b_init_distribution_code": (
+            "SIM_B_INIT_DISTRIBUTION_CODE",
+            str,
+        ),
+        "simulation_b_init_seed": ("SIM_B_INIT_SEED", int),
+    }
+    for _field, (_env_key, _cast) in _binit_env_map.items():
+        _val = getattr(args, _field, None)
+        if _val is None:
+            _val = os.environ.get(_env_key) or None
+        if _val is not None:
+            setattr(hyperparams, _field, _cast(_val))
+    _binit_source = str(hyperparams.simulation_b_init_source).strip().lower()
+    if _binit_source == "conditional_quantile_network":
+        if not str(hyperparams.simulation_b_init_generator_checkpoint).strip():
+            raise ValueError(
+                "simulation_b_init_source=conditional_quantile_network 需要 "
+                "generator checkpoint（--simulation-b-init-generator-checkpoint "
+                "或 SIM_B_INIT_GENERATOR_CHECKPOINT）"
+            )
+        if not str(hyperparams.simulation_b_init_distribution_code).strip():
+            raise ValueError(
+                "simulation_b_init_source=conditional_quantile_network 需要 "
+                "distribution code（--simulation-b-init-distribution-code "
+                "或 SIM_B_INIT_DISTRIBUTION_CODE）"
+            )
+    elif _binit_source != "uniform":
+        raise ValueError(
+            f"未知 simulation_b_init_source: {hyperparams.simulation_b_init_source!r}"
+        )
     if args.hstar_recalib_every is not None:
         hyperparams.hstar_recalib_every = int(args.hstar_recalib_every)
     if args.bp_distill_patience is not None:
@@ -2368,6 +2443,28 @@ def main():
     else:
         print("Model initialization: fresh Xavier weights with fresh optimizers")
     optimizers = build_optimizers(models, hyperparams)
+    # 初始 b 分布实验：冻结的条件分位数生成器注入 models['dist_b']，
+    # 由 SimulateTS._sample_initial_b 的 callable 分支消费。必须放在
+    # build_optimizers 之后注入——生成器不进任何优化器（实验设计决定：
+    # 若生成器接受经济损失梯度，实验就变成"自适应选择训练分布"）。
+    simulation_b_sampler = None
+    if _binit_source == "conditional_quantile_network":
+        simulation_b_sampler = build_initial_b_sampler(
+            generator_checkpoint=hyperparams.simulation_b_init_generator_checkpoint,
+            distribution_code=hyperparams.simulation_b_init_distribution_code,
+            seed=int(hyperparams.simulation_b_init_seed),
+            lower=float(Config.SIM_B_INIT_MIN),
+            upper=float(Config.SIM_B_INIT_MAX),
+        )
+        models["dist_b"] = simulation_b_sampler
+        print(
+            "simulation_b_init: "
+            + json.dumps(simulation_b_sampler.describe(), sort_keys=True)
+        )
+    else:
+        print(
+            "simulation_b_init: uniform (SIM_B_INIT_MIN/MAX fallback)"
+        )
     post0_n_paths = args.post0_n_paths if args.post0_n_paths is not None else hyperparams.n_paths
     simulate_group_size = args.simulate_group_size if args.simulate_group_size is not None else Config.SIMULATE_GROUP_SIZE
 
@@ -2418,6 +2515,12 @@ def main():
     for episode_offset in range(args.n_episodes):
         ep = start_episode + episode_offset
         episode.episode_id = ep  # update episode ID for logging/saving
+        if simulation_b_sampler is not None:
+            # 共享随机数：不同集换新 U（base + episode）；同一集内多次重模拟
+            # 因采样器确定性重放而共用相同 U；配对版本共享 base seed、只差编码。
+            simulation_b_sampler.set_seed(
+                int(hyperparams.simulation_b_init_seed) + int(ep)
+            )
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
 
@@ -2834,6 +2937,11 @@ def main():
             extra_metadata={
                 "episode_mode": episode_mode,
                 "warmstart": warmstart_provenance,
+                "simulation_b_init": (
+                    simulation_b_sampler.describe()
+                    if simulation_b_sampler is not None
+                    else {"source": "uniform"}
+                ),
                 # P 专用 Collocation Augmentation 的采样方法标记：这是对
                 # Bellman 状态空间的反事实 Parent η 覆盖，不是对真实 η=1
                 # 企业的 oversampling，也不是对真实 η 分布的重新估计。
